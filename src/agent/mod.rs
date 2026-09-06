@@ -1096,7 +1096,7 @@ impl Agent {
                 // The leader-stagger signal above has already fired (first
                 // call completed, success or failure): a stripped leader's next
                 // request diverges from its followers' byte-stable prefix —
-                // fail-open by design, and moot for the direct-chat Artist
+                // fail-open by design, and moot for the direct-chat Assistant
                 // scenario that exercises this path (management rounds never
                 // send images). Note: the retried call re-runs the tool-round-0
                 // `notify_one` above, but the stagger has a single waiter (the
@@ -4428,7 +4428,7 @@ mod tests {
     /// Same code, text variant — must NOT trigger the strip.
     const TEXT_REJECTION_BODY: &str = r#"{"error":{"message":"Input data may contain inappropriate content.","code":"data_inspection_failed","type":"invalid_request_error"}}"#;
 
-    /// Seed empty model catalogs so the Artist active-models block renders
+    /// Seed empty model catalogs so the Assistant active-models block renders
     /// nothing and performs no network fetch (hermetic e2e).
     fn seed_empty_catalogs() {
         crate::tools::media_catalog::image::seed_cache(Some(std::sync::Arc::new(
@@ -4452,7 +4452,7 @@ mod tests {
         seed_empty_catalogs();
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
 
-        let agent_id = "e2e_artist_image_reject";
+        let agent_id = "e2e_assistant_image_reject";
         let fake = std::sync::Arc::new(
             FakeProvider::new()
                 .err_http(400, IMAGE_REJECTION_BODY)
@@ -4461,7 +4461,7 @@ mod tests {
         let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
         let _provider_guard = install_fake_provider(provider);
 
-        let mut agent = make_agent_with_role(vec![], crate::Role::Artist);
+        let mut agent = make_agent_with_role(vec![], crate::Role::Assistant);
         agent.agent_id = agent_id.to_string();
         let resp = agent
             .work("[IMAGE:/tmp/photo.png] describe this photo", false)
@@ -4474,7 +4474,7 @@ mod tests {
 
         // The corrected message reached the model: the second request's
         // message list carries the phrase and no image marker in the user
-        // message (the Artist system prompt mentions "[IMAGE:path]" markers
+        // message (the Assistant system prompt mentions "[IMAGE:path]" markers
         // literally — the assertion must target the user segment).
         let messages = fake.request_messages.lock().unwrap().clone();
         assert_eq!(messages.len(), 2, "rejected attempt + normal-loop retry");
@@ -4539,12 +4539,12 @@ mod tests {
         seed_empty_catalogs();
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
 
-        let agent_id = "e2e_artist_text_reject";
+        let agent_id = "e2e_assistant_text_reject";
         let fake = std::sync::Arc::new(FakeProvider::new().err_http(400, TEXT_REJECTION_BODY));
         let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
         let _provider_guard = install_fake_provider(provider);
 
-        let mut agent = make_agent_with_role(vec![], crate::Role::Artist);
+        let mut agent = make_agent_with_role(vec![], crate::Role::Assistant);
         agent.agent_id = agent_id.to_string();
         let result = agent
             .work("[IMAGE:/tmp/photo.png] describe this photo", false)
@@ -4580,7 +4580,7 @@ mod tests {
         seed_empty_catalogs();
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
 
-        let agent_id = "e2e_artist_second_failure";
+        let agent_id = "e2e_assistant_second_failure";
         let fake = std::sync::Arc::new(
             FakeProvider::new()
                 .err_http(400, IMAGE_REJECTION_BODY)
@@ -4589,7 +4589,7 @@ mod tests {
         let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
         let _provider_guard = install_fake_provider(provider);
 
-        let mut agent = make_agent_with_role(vec![], crate::Role::Artist);
+        let mut agent = make_agent_with_role(vec![], crate::Role::Assistant);
         agent.agent_id = agent_id.to_string();
         let result = agent
             .work("[IMAGE:/tmp/photo.png] describe this photo", false)

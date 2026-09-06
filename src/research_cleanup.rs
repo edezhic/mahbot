@@ -34,10 +34,10 @@
 //! mechanism from filesystem reclamation). The agent's final response is
 //! logged for observability; there is no report archive.
 //!
-//! ## Artist media sweep
+//! ## Assistant media sweep
 //!
-//! `sweep_media` deletes generated/uploads files in userspaces that no Artist
-//! session mentions (keep-detection is strictly session-based).
+//! `sweep_media` deletes generated/uploads files in userspaces that no
+//! Assistant session mentions (keep-detection is strictly session-based).
 //! It is orthogonal to research-run cleanup and stays in the periodic
 //! cleanup loop.
 
@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 /// The dump is intent for the Sanitation cleanup agent, not a report body,
 /// so the cap is deliberately generous.
 pub(crate) const COMMAND_DUMP_CAP_BYTES: usize = 10 * 1024 * 1024;
-/// Per-tick artist-session scan budget (bytes of session content). Typical
+/// Per-tick assistant-session scan budget (bytes of session content). Typical
 /// bases (~3 MB) fit in one tick; pathological growth is cut across ticks.
 const MEDIA_SCAN_BUDGET_BYTES: usize = 10 * 1024 * 1024;
 /// Video extensions for case-insensitive keep-matching.
@@ -648,7 +648,7 @@ pub(crate) async fn resume_research_cleanup(job_id: &str, ws: &Workspace) {
     run_cleanup_agent_and_finish(job_id, None, ws, &prompt).await;
 }
 
-// ── Sweep: artist generated/uploads keep-detection ────────────────────────
+// ── Sweep: assistant generated/uploads keep-detection ──────────────────────
 
 /// Per-user keep-scan cursor (in-memory; a restart resets it — safe, because
 /// files only become deletion candidates after a full coverage pass within
@@ -672,9 +672,9 @@ struct MediaCursor {
     scanned: HashMap<String, String>,
     /// Agent id → stripped content contribution. REPLACED on re-scan, never
     /// re-appended: `last_activity` bumps on every message append, so an
-    /// active artist session would otherwise duplicate its whole history into
-    /// the keep-set every tick — daemon memory growth plus a premature hit of
-    /// the overflow cap that permanently disables the user's sweep.
+    /// active assistant session would otherwise duplicate its whole history
+    /// into the keep-set every tick — daemon memory growth plus a premature
+    /// hit of the overflow cap that permanently disables the user's sweep.
     session_content: HashMap<String, String>,
     /// Entire session base scanned (files become candidates only then).
     /// Stays true after the deletion pass — the keep-set grows incrementally
@@ -746,16 +746,17 @@ async fn list_files(dir: &Path) -> Vec<PathBuf> {
     .unwrap_or_default()
 }
 
-/// Artist sessions for a user: `session_metadata` rows with role=artist and
-/// the user's name (agent id + last_activity, most-recent-first — the activity
-/// doubles as the content-change signal for the scan cursor). A DB error is
-/// returned (NOT swallowed as empty — an empty list would trivially satisfy
-/// full coverage and trigger mass deletion against an empty keep-set).
-async fn artist_session_ids(user_name: &str) -> anyhow::Result<Vec<(String, String)>> {
+/// Assistant sessions for a user: `session_metadata` rows with role=assistant
+/// and the user's name (agent id + last_activity, most-recent-first — the
+/// activity doubles as the content-change signal for the scan cursor). A DB
+/// error is returned (NOT swallowed as empty — an empty list would trivially
+/// satisfy full coverage and trigger mass deletion against an empty
+/// keep-set).
+async fn assistant_session_ids(user_name: &str) -> anyhow::Result<Vec<(String, String)>> {
     let rows = crate::session::store()
         .conn
         .query(
-            "SELECT agent_id, last_activity FROM session_metadata WHERE role = 'artist' \
+            "SELECT agent_id, last_activity FROM session_metadata WHERE role = 'assistant' \
              AND user_name = ?1 ORDER BY last_activity DESC",
             params![user_name],
         )
@@ -773,13 +774,13 @@ async fn artist_session_ids(user_name: &str) -> anyhow::Result<Vec<(String, Stri
     Ok(out)
 }
 
-/// One artist session's message content (fail-open only via the `Result` —
+/// One assistant session's message content (fail-open only via the `Result` —
 /// a DB read failure must not masquerade as an empty session: the sweep would
 /// advance coverage and delete files the unread session mentions). Fail
 /// CLOSED on a malformed row (same deletion-safety class as
-/// [`artist_session_ids`]: a row failing to decode loses its mentions from
+/// [`assistant_session_ids`]: a row failing to decode loses its mentions from
 /// the keep-set while the session still counts as scanned).
-async fn artist_session_content(agent_id: &str) -> anyhow::Result<String> {
+async fn assistant_session_content(agent_id: &str) -> anyhow::Result<String> {
     let rows = crate::session::store()
         .conn
         .query(
@@ -803,7 +804,8 @@ pub async fn sweep_media() -> Result<u64> {
     sweep_media_at(&crate::users::userspaces_root()).await
 }
 
-/// Artist-media sweep over an explicit userspaces root (injectable for tests).
+/// Assistant-media sweep over an explicit userspaces root (injectable for
+/// tests).
 pub(crate) async fn sweep_media_at(userspaces_root: &Path) -> Result<u64> {
     sweep_media_at_budgeted(userspaces_root, MEDIA_SCAN_BUDGET_BYTES).await
 }
@@ -885,10 +887,10 @@ async fn sweep_user_media(
 ) -> u64 {
     let cursor = cursors.entry(user_name.to_string()).or_default();
     // Fail-open on DB trouble: a transient read failure must not be confused
-    // with "no artist sessions" — the latter trivially satisfies coverage and
-    // would delete EVERY file. Skip the user for this tick instead.
-    let Ok(session_ids) = artist_session_ids(user_name).await else {
-        tracing::warn!(user = %user_name, "Media sweep: artist-session query failed — user skipped for this tick");
+    // with "no assistant sessions" — the latter trivially satisfies coverage
+    // and would delete EVERY file. Skip the user for this tick instead.
+    let Ok(session_ids) = assistant_session_ids(user_name).await else {
+        tracing::warn!(user = %user_name, "Media sweep: assistant-session query failed — user skipped for this tick");
         return 0;
     };
     // A DELETED session (e.g. /clear) invalidates the accumulated keep-set:
@@ -911,7 +913,7 @@ async fn sweep_user_media(
         cursor.covered = false;
         cursor.overflowed = false;
     }
-    // No artist sessions → nothing was ever scanned → deleting everything
+    // No assistant sessions → nothing was ever scanned → deleting everything
     // would violate the safe direction ("never delete a file whose mention
     // was not scanned"). Keep the user's files. This deliberately conflicts
     // with the accepted consequence that a /clear turns its files into sweep
@@ -920,7 +922,7 @@ async fn sweep_user_media(
     // delete on no evidence; the rotation fires only when at least one
     // session remains.
     if session_ids.is_empty() {
-        tracing::debug!(user = %user_name, "Media sweep: no artist sessions — files kept");
+        tracing::debug!(user = %user_name, "Media sweep: no assistant sessions — files kept");
         return 0;
     }
     // Overflowed keep-set (incomplete evidence): the safe direction is never
@@ -951,7 +953,7 @@ async fn sweep_user_media(
         if *budget == 0 {
             break;
         }
-        let Ok(content) = artist_session_content(id).await else {
+        let Ok(content) = assistant_session_content(id).await else {
             tracing::warn!(user = %user_name, "Media sweep: session read failed — user skipped for this tick");
             return 0;
         };
@@ -1130,9 +1132,9 @@ mod tests {
         let upload_orphan = up.join("photo_1.jpg");
         tokio::fs::write(&upload_orphan, "x").await.unwrap();
 
-        // One artist session mentioning the first file by absolute path.
+        // One assistant session mentioning the first file by absolute path.
         let session = format!("[IMAGE:{}]", mentioned.canonicalize().unwrap().display());
-        insert_artist_session("artist_a", "alice", &session).await;
+        insert_assistant_session("assistant_a", "alice", &session).await;
 
         reset_media_cursors().await;
         let n = sweep_media_at(userspaces.path()).await.unwrap();
@@ -1141,7 +1143,7 @@ mod tests {
         assert!(!orphan.exists());
         assert!(!upload_orphan.exists());
 
-        // A second pass after a NEW artist-session mention: the freshly
+        // A second pass after a NEW assistant-session mention: the freshly
         // mentioned orphan stays; the still-unmentioned image_3 is deleted.
         tokio::fs::write(&orphan, "x").await.unwrap();
         let image3 = files[0].parent().unwrap().join("image_3.png");
@@ -1150,7 +1152,7 @@ mod tests {
         let now = crate::db::now();
         conn.execute(
             "INSERT INTO sessions (agent_id, role, content, created_at) \
-             VALUES ('artist_a', 'assistant', ?1, ?2)",
+             VALUES ('assistant_a', 'assistant', ?1, ?2)",
             params![
                 format!("[IMAGE:{}]", orphan.canonicalize().unwrap().display()),
                 now
@@ -1169,14 +1171,14 @@ mod tests {
     async fn sweep_media_deleted_session_rotates_files() {
         let userspaces = media_fixture("clr").await;
         let files = write_gen_files(userspaces.path(), "clr", &["f_a.png", "f_b.png"]).await;
-        insert_artist_session(
-            "artist_clr1",
+        insert_assistant_session(
+            "assistant_clr1",
             "clr",
             &format!("[IMAGE:{}]", files[0].canonicalize().unwrap().display()),
         )
         .await;
-        insert_artist_session(
-            "artist_clr2",
+        insert_assistant_session(
+            "assistant_clr2",
             "clr",
             &format!("[IMAGE:{}]", files[1].canonicalize().unwrap().display()),
         )
@@ -1186,12 +1188,12 @@ mod tests {
         assert_eq!(sweep_media_at(userspaces.path()).await.unwrap(), 0);
         assert!(files[0].exists());
         assert!(files[1].exists());
-        // /clear deletes artist_clr1's session: its stale mention must not
+        // /clear deletes assistant_clr1's session: its stale mention must not
         // keep f_a forever — the cursor resets and f_a becomes a candidate.
         crate::session::store()
             .conn
             .execute(
-                "DELETE FROM session_metadata WHERE agent_id = 'artist_clr1'",
+                "DELETE FROM session_metadata WHERE agent_id = 'assistant_clr1'",
                 (),
             )
             .await
@@ -1388,13 +1390,13 @@ mod tests {
         );
     }
 
-    /// Insert one artist session (metadata + one message) for a user.
-    async fn insert_artist_session(agent_id: &str, user: &str, content: &str) {
+    /// Insert one assistant session (metadata + one message) for a user.
+    async fn insert_assistant_session(agent_id: &str, user: &str, content: &str) {
         let conn = &crate::session::store().conn;
         let now = crate::db::now();
         conn.execute(
             "INSERT INTO session_metadata (agent_id, last_activity, user_name, workspace_name, role, created_at) \
-             VALUES (?1, ?2, ?3, ?4, 'artist', ?2)",
+             VALUES (?1, ?2, ?3, ?4, 'assistant', ?2)",
             params![agent_id, now.clone(), user, format!("personal:{user}")],
         )
         .await
@@ -1420,21 +1422,21 @@ mod tests {
         .await;
         // Each session mentions its own file; the per-tick budget (1 byte)
         // fits exactly one session per tick.
-        insert_artist_session(
-            "artist_g1",
+        insert_assistant_session(
+            "assistant_g1",
             "gates",
             &format!("[IMAGE:{}]", files[0].canonicalize().unwrap().display()),
         )
         .await;
-        insert_artist_session(
-            "artist_g2",
+        insert_assistant_session(
+            "assistant_g2",
             "gates",
             &format!("[IMAGE:{}]", files[1].canonicalize().unwrap().display()),
         )
         .await;
         reset_media_cursors().await;
 
-        // Tick 1: only artist_b (newest) is scanned — f_c is unmentioned but
+        // Tick 1: only assistant_b (newest) is scanned — f_c is unmentioned but
         // must NOT be deleted until the whole session base is covered.
         let n = sweep_media_at_budgeted(userspaces.path(), 1).await.unwrap();
         assert_eq!(n, 0, "no deletion before full coverage");
@@ -1454,33 +1456,33 @@ mod tests {
     async fn sweep_media_cursor_survives_list_reorder() {
         let userspaces = media_fixture("reorder").await;
         let files = write_gen_files(userspaces.path(), "reorder", &["f_a.png", "f_b.png"]).await;
-        insert_artist_session(
-            "artist_r1",
+        insert_assistant_session(
+            "assistant_r1",
             "reorder",
             &format!("[IMAGE:{}]", files[0].canonicalize().unwrap().display()),
         )
         .await;
-        insert_artist_session(
-            "artist_r2",
+        insert_assistant_session(
+            "assistant_r2",
             "reorder",
             &format!("[IMAGE:{}]", files[1].canonicalize().unwrap().display()),
         )
         .await;
         reset_media_cursors().await;
 
-        // Tick 1: scans artist_b (newest) only.
+        // Tick 1: scans assistant_b (newest) only.
         assert_eq!(
             sweep_media_at_budgeted(userspaces.path(), 1).await.unwrap(),
             0
         );
 
-        // artist_a gets newer activity — the ordered list flips. The cursor is
-        // keyed by scanned agent id, so artist_a is still scanned on tick 2
-        // (an index cursor would re-scan artist_b and declare coverage with
-        // artist_a's mention missing from the keep-set — deleting f_a).
+        // assistant_a gets newer activity — the ordered list flips. The cursor is
+        // keyed by scanned agent id, so assistant_a is still scanned on tick 2
+        // (an index cursor would re-scan assistant_b and declare coverage with
+        // assistant_a's mention missing from the keep-set — deleting f_a).
         let conn = &crate::session::store().conn;
         conn.execute(
-            "UPDATE session_metadata SET last_activity = ?1 WHERE agent_id = 'artist_r1'",
+            "UPDATE session_metadata SET last_activity = ?1 WHERE agent_id = 'assistant_r1'",
             params![crate::db::now()],
         )
         .await
@@ -1500,7 +1502,12 @@ mod tests {
         let userspaces = media_fixture("duri").await;
         let files = write_gen_files(userspaces.path(), "duri", &["thumb.png"]).await;
         // The filename appears only INSIDE a data URI — not a file mention.
-        insert_artist_session("artist_d1", "duri", "data:image/png;base64,AAAAthumb.png").await;
+        insert_assistant_session(
+            "assistant_d1",
+            "duri",
+            "data:image/png;base64,AAAAthumb.png",
+        )
+        .await;
         reset_media_cursors().await;
         let n = sweep_media_at(userspaces.path()).await.unwrap();
         assert_eq!(n, 1);
@@ -1526,9 +1533,14 @@ mod tests {
         tokio::fs::write(&bf, "x").await.unwrap();
         // bob's sessions mention alice's a1 by absolute path — that must NOT
         // keep alice's files (keep-sets are per-user).
-        insert_artist_session("artist_iso1", "pualice", "a log line with no file mentions").await;
-        insert_artist_session(
-            "artist_iso2",
+        insert_assistant_session(
+            "assistant_iso1",
+            "pualice",
+            "a log line with no file mentions",
+        )
+        .await;
+        insert_assistant_session(
+            "assistant_iso2",
             "pubob",
             &format!(
                 "[IMAGE:{}]",
@@ -1536,8 +1548,8 @@ mod tests {
             ),
         )
         .await;
-        insert_artist_session(
-            "artist_iso3",
+        insert_assistant_session(
+            "assistant_iso3",
             "pubob",
             &format!("[IMAGE:{}]", bf.canonicalize().unwrap().display()),
         )
@@ -1558,12 +1570,12 @@ mod tests {
     async fn sweep_media_empty_session_base_keeps_files() {
         let userspaces = media_fixture("guard").await;
         let files = write_gen_files(userspaces.path(), "guard", &["legacy.png"]).await;
-        // Zero artist sessions: coverage would be vacuously true and delete
+        // Zero assistant sessions: coverage would be vacuously true and delete
         // every file — but nothing was ever scanned, so nothing is deleted
         // (the safe direction). Brand-new users / legacy uploads are kept.
         reset_media_cursors().await;
         let n = sweep_media_at(userspaces.path()).await.unwrap();
-        assert_eq!(n, 0, "no artist sessions → no deletion");
+        assert_eq!(n, 0, "no assistant sessions → no deletion");
         assert!(files[0].exists(), "unscanned files are never deleted");
     }
 
@@ -1577,14 +1589,14 @@ mod tests {
             &["f_a.png", "f_b.png", "f_c.png"],
         )
         .await;
-        insert_artist_session(
-            "artist_grow1",
+        insert_assistant_session(
+            "assistant_grow1",
             "grow",
             &format!("[IMAGE:{}]", files[0].canonicalize().unwrap().display()),
         )
         .await;
-        insert_artist_session(
-            "artist_grow2",
+        insert_assistant_session(
+            "assistant_grow2",
             "grow",
             &format!("[IMAGE:{}]", files[1].canonicalize().unwrap().display()),
         )
@@ -1592,7 +1604,7 @@ mod tests {
         // Deterministic scan order: grow2 is the newest session (scanned first).
         let conn = &crate::session::store().conn;
         conn.execute(
-            "UPDATE session_metadata SET last_activity = ?1 WHERE agent_id = 'artist_grow1'",
+            "UPDATE session_metadata SET last_activity = ?1 WHERE agent_id = 'assistant_grow1'",
             params![(chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()],
         )
         .await
@@ -1613,7 +1625,7 @@ mod tests {
         // would be deleted against the stale keep-set.
         conn.execute(
             "INSERT INTO sessions (agent_id, role, content, created_at) \
-             VALUES ('artist_grow2', 'assistant', ?1, ?2)",
+             VALUES ('assistant_grow2', 'assistant', ?1, ?2)",
             params![
                 format!("[IMAGE:{}]", files[2].canonicalize().unwrap().display()),
                 crate::db::now()
@@ -1622,7 +1634,7 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "UPDATE session_metadata SET last_activity = ?1 WHERE agent_id = 'artist_grow2'",
+            "UPDATE session_metadata SET last_activity = ?1 WHERE agent_id = 'assistant_grow2'",
             params![crate::db::now()],
         )
         .await
@@ -1682,8 +1694,8 @@ mod tests {
             }
             let orphan = format!("{u}_orphan.png");
             write_gen_files(userspaces.path(), u, &[&orphan]).await;
-            insert_artist_session(
-                &format!("artist_{u}"),
+            insert_assistant_session(
+                &format!("assistant_{u}"),
                 u,
                 "a log line with no file mentions",
             )
@@ -1735,7 +1747,7 @@ mod tests {
         // the mention cannot be
         // attributed to one duplicate, so deleting either could destroy a
         // mentioned file.
-        insert_artist_session("artist_b1", "base", "here is pic.png").await;
+        insert_assistant_session("assistant_b1", "base", "here is pic.png").await;
         reset_media_cursors().await;
         let n = sweep_media_at(userspaces.path()).await.unwrap();
         assert_eq!(n, 0, "ambiguous basename keeps both files");
@@ -1745,8 +1757,8 @@ mod tests {
         // An absolute mention of one duplicate still keeps the OTHER: its
         // basename remains ambiguous across the union (the absolute path
         // matching is per-file, the ambiguity rule is per-union).
-        insert_artist_session(
-            "artist_b2",
+        insert_assistant_session(
+            "assistant_b2",
             "base",
             &format!("[IMAGE:{}]", u.canonicalize().unwrap().display()),
         )
@@ -1766,7 +1778,7 @@ mod tests {
     async fn sweep_media_prunes_cursors_of_vanished_users() {
         let userspaces = media_fixture("gone").await;
         write_gen_files(userspaces.path(), "gone", &["f_a.png"]).await;
-        insert_artist_session("artist_gone1", "gone", "no file mentions").await;
+        insert_assistant_session("assistant_gone1", "gone", "no file mentions").await;
         reset_media_cursors().await;
         assert_eq!(sweep_media_at(userspaces.path()).await.unwrap(), 1);
         assert!(
@@ -1800,7 +1812,7 @@ mod tests {
         let files = write_gen_files(userspaces.path(), "video", &["clip.mp4", "Photo.PNG"]).await;
         // Mentions in a different case: video matches case-insensitively,
         // non-video extensions do not.
-        insert_artist_session("artist_v1", "video", "[VIDEO:CLIP.MP4] photo.png").await;
+        insert_assistant_session("assistant_v1", "video", "[VIDEO:CLIP.MP4] photo.png").await;
         reset_media_cursors().await;
         let n = sweep_media_at(userspaces.path()).await.unwrap();
         assert_eq!(n, 1);
@@ -1819,8 +1831,8 @@ mod tests {
         // A bloated session (>4× scan budget) overflows the keep-set cap:
         // nothing can be safely deleted while it is in the base.
         let huge = "x".repeat(MEDIA_SCAN_BUDGET_BYTES * 4 + 1);
-        insert_artist_session(
-            "artist_ovf1",
+        insert_assistant_session(
+            "assistant_ovf1",
             "ovf",
             &format!(
                 "[IMAGE:{}] {huge}",
@@ -1840,13 +1852,13 @@ mod tests {
         crate::session::store()
             .conn
             .execute(
-                "DELETE FROM session_metadata WHERE agent_id = 'artist_ovf1'",
+                "DELETE FROM session_metadata WHERE agent_id = 'assistant_ovf1'",
                 (),
             )
             .await
             .unwrap();
-        insert_artist_session(
-            "artist_ovf2",
+        insert_assistant_session(
+            "assistant_ovf2",
             "ovf",
             &format!("[IMAGE:{}]", files[1].canonicalize().unwrap().display()),
         )
@@ -1878,13 +1890,13 @@ mod tests {
             .join("generated")
             .join("linked");
         symlink(outside.path(), &link).unwrap();
-        // An artist session mentioning ONE real file: the deletion pass must
+        // An assistant session mentioning ONE real file: the deletion pass must
         // actually run (the unmentioned file below is a candidate) — without
         // sessions the empty-base guard short-circuits and the no-follow
         // logic would never be exercised.
         let files = write_gen_files(userspaces.path(), "sym", &["kept.png", "orphan.png"]).await;
-        insert_artist_session(
-            "artist_sym",
+        insert_assistant_session(
+            "assistant_sym",
             "sym",
             &format!("[IMAGE:{}]", files[0].canonicalize().unwrap().display()),
         )
@@ -1913,7 +1925,7 @@ mod tests {
         let gen_dir = userspaces.path().join("topsym").join("generated");
         tokio::fs::remove_dir_all(&gen_dir).await.unwrap();
         symlink(outside.path(), &gen_dir).unwrap();
-        // An artist session mentioning ONE uploads file proves the deletion
+        // An assistant session mentioning ONE uploads file proves the deletion
         // pass ran (the unmentioned orphan below is a candidate) while the
         // symlinked generated/ tree stays untouched.
         let up = userspaces.path().join("topsym").join("uploads");
@@ -1921,8 +1933,8 @@ mod tests {
         let orphan = up.join("orphan.png");
         tokio::fs::write(&kept, "x").await.unwrap();
         tokio::fs::write(&orphan, "x").await.unwrap();
-        insert_artist_session(
-            "artist_topsym",
+        insert_assistant_session(
+            "assistant_topsym",
             "topsym",
             &format!("[IMAGE:{}]", kept.canonicalize().unwrap().display()),
         )

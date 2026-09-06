@@ -463,13 +463,13 @@ fn is_admin_permissions(permissions: Option<&str>) -> bool {
 
 /// The role pool for a permissions value, derived at read time (no `user_roles`
 /// table). Full-permissions (admin) users get the onboarding pool; all other
-/// users are limited to the personal assistant roles.
+/// users are limited to the personal assistant role.
 #[must_use]
 fn role_pool_for_permissions(permissions: Option<&str>) -> Vec<Role> {
     if is_admin_permissions(permissions) {
-        vec![Role::Support, Role::Assistant, Role::Manager, Role::Artist]
+        vec![Role::Support, Role::Assistant, Role::Manager]
     } else {
-        vec![Role::Assistant, Role::Artist]
+        vec![Role::Assistant]
     }
 }
 
@@ -600,7 +600,7 @@ pub async fn resolve_video_model(user_name: &str) -> String {
 }
 
 /// Read a user's model column via a single-column SELECT (this is a
-/// per-tool-call/per-Artist-turn hot path, so no full `UserRecord` load).
+/// per-tool-call/per-Assistant-turn hot path, so no full `UserRecord` load).
 /// `None` — user missing, column unset/empty, or a DB error (logged; fail-open
 /// to the default, matching the generation tools' semantics).
 async fn resolve_user_model_column(user_name: &str, column: &str) -> Option<String> {
@@ -795,12 +795,12 @@ fn resolve_effective_role(role: Role, ws_name: &str, pool: &[Role]) -> Role {
 /// The user-facing roles pinned to the user's personal workspace.
 #[must_use]
 fn is_pinned_role(role: Role) -> bool {
-    matches!(role, Role::Assistant | Role::Artist | Role::Support)
+    matches!(role, Role::Assistant | Role::Support)
 }
 
 /// Whether an agent role is pinned to the user's personal workspace:
-/// Assistant, Artist, and Support always work there regardless of the
-/// selected workspace. An empty `user_name` disables pinning — there is no
+/// Assistant and Support always work there regardless of the selected
+/// workspace. An empty `user_name` disables pinning — there is no
 /// personal identity to pin to, so callers with an unresolvable user must
 /// pass the real user explicitly (the voice admin fallback passes "admin").
 #[must_use]
@@ -808,7 +808,7 @@ fn pins_to_personal(role: Role, ws_name: &str, user_name: &str) -> bool {
     !user_name.is_empty() && is_pinned_role(role) && !is_personal_workspace(ws_name)
 }
 
-/// Execution-time invariant enforcer: a pinned role (Assistant/Artist/Support)
+/// Execution-time invariant enforcer: a pinned role (Assistant/Support)
 /// must never run outside the envelope user's OWN personal workspace,
 /// regardless of what a producer stored — a non-personal workspace is
 /// re-pinned to `personal:{user}`, and a personal workspace belonging to a
@@ -832,17 +832,17 @@ pub(crate) fn enforce_personal_pinning(
     Some(personal_workspace_name(user_name))
 }
 
-/// Resolve the [`Workspace`] an agent role actually operates in: Assistant,
-/// Artist, and Support always work in the user's personal workspace
-/// regardless of the selected workspace, giving path-dependent callers
-/// (enrichment uploads, generated-media writes) the personal workspace's
-/// filesystem path.
+/// Resolve the [`Workspace`] an agent role actually operates in: Assistant
+/// and Support always work in the user's personal workspace regardless of
+/// the selected workspace, giving path-dependent callers (enrichment
+/// uploads, generated-media writes) the personal workspace's filesystem
+/// path.
 /// An empty `user_name` disables pinning (no personal identity to pin to),
 /// so callers must pass a resolvable user (the voice admin fallback passes
 /// "admin").
 /// Accepted user decision (no migration): media written before pinning to a
 /// project workspace's `uploads/`/`generated/` stays there and is no longer
-/// reachable by Artist tools (e.g. video_edit path confinement).
+/// reachable by Assistant tools (e.g. video_edit path confinement).
 #[must_use]
 pub(crate) fn effective_workspace_for_role(
     role: Role,
@@ -865,7 +865,7 @@ pub(crate) fn effective_workspace_for_role(
 
 /// Resolve the effective (role, workspace) pair atomically: apply
 /// `resolve_effective_role` (Manager→Assistant in personal workspaces) then
-/// pin Assistant/Artist/Support to the user's personal workspace via
+/// pin Assistant/Support to the user's personal workspace via
 /// `effective_workspace_for_role`. The transformations act on disjoint role
 /// sets, but a single call keeps session identity and the pinned workspace
 /// consistent at every routing entry point.
@@ -886,7 +886,7 @@ pub fn effective_role_and_workspace(
 /// Telegram /clear always clear the actual recipient: the DB-selected
 /// workspace, the pool-clamped active role (Assistant fallback for an
 /// empty pool), the personal-workspace Manager→Assistant remap, and
-/// Assistant/Artist/Support pinning.
+/// Assistant/Support pinning.
 pub async fn resolve_session_target(user_name: &str) -> (Role, Workspace) {
     let (ws, pool) = tokio::join!(
         resolve_workspace_for_user_name(user_name),
@@ -1025,15 +1025,12 @@ mod tests {
     #[test]
     fn role_pool_for_permissions_is_permission_derived() {
         // Full-permissions (admin) → the onboarding pool; everyone else → the
-        // personal assistant roles. The default (first) role drives routing.
+        // personal assistant role. The default (first) role drives routing.
         assert_eq!(
             role_pool_for_permissions(Some("full")),
-            vec![Role::Support, Role::Assistant, Role::Manager, Role::Artist]
+            vec![Role::Support, Role::Assistant, Role::Manager]
         );
-        assert_eq!(
-            role_pool_for_permissions(None),
-            vec![Role::Assistant, Role::Artist]
-        );
+        assert_eq!(role_pool_for_permissions(None), vec![Role::Assistant]);
     }
 
     #[tokio::test]
@@ -1047,12 +1044,9 @@ mod tests {
             .add_user("pool_user", None, Role::Assistant)
             .await
             .unwrap();
-        // A non-full user's permission-derived pool is always
-        // [Assistant, Artist]; the persisted default role resolves as active.
-        assert_eq!(
-            role_pool("pool_user").await,
-            vec![Role::Assistant, Role::Artist]
-        );
+        // A non-full user's permission-derived pool is always [Assistant];
+        // the persisted default role resolves as active.
+        assert_eq!(role_pool("pool_user").await, vec![Role::Assistant]);
         assert_eq!(
             resolve_active_role("pool_user").await,
             Some(Role::Assistant)
@@ -1164,10 +1158,9 @@ mod tests {
     }
 
     #[test]
-    fn pinning_helpers_pin_assistant_artist_support_to_personal() {
-        // Assistant/Artist/Support + non-personal workspace + non-empty user pin.
+    fn pinning_helpers_pin_assistant_support_to_personal() {
+        // Assistant/Support + non-personal workspace + non-empty user pin.
         assert!(pins_to_personal(Role::Assistant, "ws1", "alice"));
-        assert!(pins_to_personal(Role::Artist, "ws1", "alice"));
         assert!(pins_to_personal(Role::Support, "ws1", "alice"));
         // Already personal, other roles, and empty user_name never pin.
         assert!(!pins_to_personal(
@@ -1192,11 +1185,11 @@ mod tests {
         // Manager keeps the project workspace; already-personal passes through.
         let kept = effective_workspace_for_role(Role::Manager, project.clone(), "alice");
         assert_eq!(kept.name, "ws1");
-        let already = effective_workspace_for_role(Role::Artist, personal.clone(), "alice");
+        let already = effective_workspace_for_role(Role::Support, personal.clone(), "alice");
         assert_eq!(already.name, "personal:alice");
 
         // Atomic composition: Manager→Assistant remap in personal workspaces and
-        // Assistant/Artist/Support pinning resolve in one call. A pool that
+        // Assistant/Support pinning resolve in one call. A pool that
         // contains Assistant remaps Manager; without Assistant the Manager
         // selection is kept (the active-role invariant).
         let (role, ws) = effective_role_and_workspace(
@@ -1225,7 +1218,7 @@ mod tests {
     #[test]
     fn enforce_personal_pinning_repins_pinned_roles_and_refuses_empty_user() {
         // Pinned roles in a non-personal workspace re-pin to the user's personal.
-        for role in [Role::Assistant, Role::Artist, Role::Support] {
+        for role in [Role::Assistant, Role::Support] {
             assert_eq!(
                 enforce_personal_pinning(role, "proj-ws", "alice"),
                 Some("personal:alice".to_string())
@@ -1256,7 +1249,6 @@ mod tests {
             enforce_personal_pinning(Role::Assistant, "proj-ws", ""),
             None
         );
-        assert_eq!(enforce_personal_pinning(Role::Artist, "proj-ws", ""), None);
         assert_eq!(enforce_personal_pinning(Role::Support, "proj-ws", ""), None);
     }
 

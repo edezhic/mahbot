@@ -369,7 +369,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
 /// and validated that the role can be parsed.  The routing is fire-and-forget
 /// (sends on an mpsc channel).
 fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
-    // Execution-time invariant: pinned roles (Assistant/Artist/Support) never
+    // Execution-time invariant: pinned roles (Assistant/Support) never
     // run outside the user's personal workspace, even on recovery. A pinned
     // role with an empty user has no personal identity — refuse the retry.
     let Some(workspace_name) =

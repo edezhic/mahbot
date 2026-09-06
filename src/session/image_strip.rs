@@ -31,7 +31,7 @@
 //! - A later injected message that itself carries an `[IMAGE:` marker is
 //!   stripped instead of the earlier image-bearing one — an inherent
 //!   consequence of the "most recent User-role message" rule (accepted; a
-//!   ticket comment carrying an image marker is not a realistic Artist-chat
+//!   ticket comment carrying an image marker is not a realistic Assistant-chat
 //!   scenario).
 
 use crate::prompt::{load_prompt, substitute};

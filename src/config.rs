@@ -61,7 +61,7 @@
 //!
 //! > Manager group (`Role::Manager`, `Role::Assistant`, `Role::Discovery`,
 //! > `Role::Engineer`, `Role::Support`, `Role::Maintainer`) → manager slot;
-//! > every other role (Artist, Analyst, Coder, QA, Reviewer, Sanitation) →
+//! > every other role (Analyst, Coder, QA, Reviewer, Sanitation) →
 //! > worker slot.
 //!
 //! Unset slots fall back to their `DEFAULT_*_MODEL` constant.
@@ -239,7 +239,7 @@ pub struct ConfigData {
     /// Model slot for the Manager group (Manager, Assistant, Discovery,
     /// Engineer, Support, Maintainer).
     pub manager_model: Option<String>,
-    /// Model slot for all worker roles (Artist, Analyst, Coder, QA,
+    /// Model slot for all worker roles (Analyst, Coder, QA,
     /// Reviewer, Sanitation).
     pub worker_model: Option<String>,
     /// Newline-separated list of available image generation models (for selection UI).
@@ -897,8 +897,8 @@ impl ConfigReload {
     /// Resolve the configured model for a role from the two model slots.
     ///
     /// The manager group (Manager, Assistant, Discovery, Engineer, Support,
-    /// Maintainer) uses the manager slot; every other role (Artist, Analyst,
-    /// Coder, QA, Reviewer, Sanitation) uses the worker slot. Unset slots
+    /// Maintainer) uses the manager slot; every other role (Analyst, Coder,
+    /// QA, Reviewer, Sanitation) uses the worker slot. Unset slots
     /// fall back to their code default.
     #[must_use]
     pub fn role_model(&self, role: Role) -> String {
@@ -1654,7 +1654,6 @@ mod tests {
             Role::Coder,
             Role::Qa,
             Role::Reviewer,
-            Role::Artist,
             Role::Sanitation,
         ] {
             assert_eq!(reload.role_model(role), "worker-slot-model");

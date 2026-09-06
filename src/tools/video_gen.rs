@@ -31,7 +31,7 @@ impl Tool for VideoGenTool {
     fn preserve_full_output(&self) -> bool {
         // Result is the marker plus an LLM transcription capped at
         // 2048 tokens/3-min timeout that can exceed the 5 KB budget —
-        // the Artist needs the full description to reason about its output.
+        // the Assistant needs the full description to reason about its output.
         true
     }
 
@@ -146,7 +146,7 @@ impl Tool for VideoGenTool {
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::GENERATION).await?;
 
         // Save to workspace/generated/ and format the media marker. The marker
-        // stays first; the transcription is appended for the Artist to reason
+        // stays first; the transcription is appended for the Assistant to reason
         // about its own output (fail-open: marker-only on transcription failure).
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
         let marker = self.format_media_result(&output_path);

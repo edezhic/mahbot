@@ -2287,7 +2287,7 @@ mod tests {
     async fn test_init_listener_dispatches_speak() {
         // Initialize test stores and give the broadcast user an Assistant
         // active role (the permission-derived pool for a non-full user is
-        // [Assistant, Artist]; Assistant is what the listener matches below).
+        // [Assistant]; Assistant is what the listener matches below).
         crate::util::test::init_test_stores().await;
         crate::users::store()
             .add_user("testuser", None, crate::Role::Assistant)

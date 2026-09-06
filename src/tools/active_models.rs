@@ -2,10 +2,10 @@
 //! model catalogs, plus the persisted model snapshot used for mid-session
 //! change detection.
 //!
-//! The block is injected into Artist sessions at session start and re-emitted
-//! after compaction; only typed catalog fields are rendered — never raw model
-//! name/description strings. Static per-model video-edit nuances (see
-//! [`crate::tools::video_edit::video_edit_nuances`]) render whenever the
+//! The block is injected into Assistant sessions at session start and
+//! re-emitted after compaction; only typed catalog fields are rendered — never
+//! raw model name/description strings. Static per-model video-edit nuances
+//! (see [`crate::tools::video_edit::video_edit_nuances`]) render whenever the
 //! active video model matches, independently of catalog availability; the
 //! remaining sections are omitted (fail-open) when their catalog is
 //! unavailable and the static tool schema applies.
@@ -15,7 +15,8 @@ use std::fmt::Write;
 use crate::tools::media_catalog::image::{self, ImageModelInfo, ParameterConstraint};
 use crate::tools::media_catalog::video::{self, VideoModelInfo};
 
-/// Cap per-list rendering — future catalogs must not bloat every Artist turn.
+/// Cap per-list rendering — future catalogs must not bloat every Assistant
+/// turn.
 const MAX_LIST_VALUES: usize = 16;
 
 /// Snapshot of the model ids rendered in the current `<active-models-opts>`
@@ -276,7 +277,7 @@ fn render_video_section(model: &str, info: Option<&VideoModelInfo>) -> Option<St
 }
 
 /// Join values, capping the rendered list so future catalogs cannot bloat
-/// every Artist turn.
+/// every Assistant turn.
 fn join_capped(values: &[String], cap: usize) -> String {
     if values.len() <= cap {
         values.join(", ")
@@ -480,7 +481,8 @@ mod tests {
             render_video_section("bytedance/seedance-2.5", None).expect("nuance rendered");
         assert!(seedance.contains("- editing: whole-frame restyle"));
         // Edit vs generation disambiguation: the catalog duration range is
-        // generation-only, so the Artist is not misled into passing it for edits.
+        // generation-only, so the Assistant is not misled into passing it for
+        // edits.
         assert!(seedance.contains("applies to generation, not edits"));
         // 2.0-mini differs: edit-mode duration is explicit (not 'auto').
         let mini =

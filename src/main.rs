@@ -175,12 +175,13 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
                 // the TTL guard after the purge cascade removes their job rows.
                 let purged = mahbot::jobs::purge_stale_jobs(&cutoff).await?;
                 let cleaned = mahbot::session::cleanup_old_transient_sessions(&cutoff).await?;
-                // Artist generated/uploads keep-detection — after the purge so
-                // the jobs-state is final; artist sessions are never transient,
-                // so keep-evidence is live regardless of ordering. (Research
-                // run folders are NOT swept here — `release_run_folder` is the
-                // single release point, invoked per-job by completion, the cancel
-                // sweep, and boot resume; crash leftovers are the OS's job.)
+                // Assistant generated/uploads keep-detection — after the purge
+                // so the jobs-state is final; assistant sessions are never
+                // transient, so keep-evidence is live regardless of ordering.
+                // (Research run folders are NOT swept here — `release_run_folder`
+                // is the single release point, invoked per-job by completion,
+                // the cancel sweep, and boot resume; crash leftovers are the
+                // OS's job.)
                 let media = mahbot::research_cleanup::sweep_media().await?;
                 Ok(purged + cleaned + media)
             },
@@ -729,20 +730,10 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
     match cmd {
         BotCommand::Start => handle_start_command(msg).await,
         BotCommand::Clear => handle_clear_session(msg).await,
-        // Artist-gated commands: denial when Artist is not in the user's pool.
+        // Media model selection is available to every user (models are stored
+        // per-user, and every user has the Assistant role).
         BotCommand::ImageModels | BotCommand::VideoModels => {
-            if mahbot::users::role_pool(&msg.user_name)
-                .await
-                .contains(&Role::Artist)
-            {
-                handle_models_command(msg, cmd == BotCommand::ImageModels).await;
-            } else {
-                send_telegram_reply(
-                    msg,
-                    "This command is only available to Artist users.".to_string(),
-                )
-                .await;
-            }
+            handle_models_command(msg, cmd == BotCommand::ImageModels).await;
         }
         // Role-switch entry: opens the inline role picker (pool-gated).
         BotCommand::Agents => handle_agents_command(msg).await,
@@ -849,6 +840,15 @@ async fn handle_agents_command(msg: &ChannelMessage) {
         .await;
         return;
     }
+    if pool.len() <= 1 {
+        // Non-admin users now route to a single role (Assistant).
+        send_telegram_reply(
+            msg,
+            "You have only the Assistant role — there is nothing to switch.".to_string(),
+        )
+        .await;
+        return;
+    }
     let active = mahbot::users::resolve_active_role_from_pool(&msg.user_name, &pool).await;
     let _ = mahbot::channels::telegram::send_direct(
         &msg.reply_target,
@@ -898,7 +898,7 @@ async fn handle_clear_session(msg: &ChannelMessage) {
     // Clear the session the user actually talks to: the same (role, workspace)
     // resolution as routing — DB-selected workspace, pool-clamped active role
     // with Assistant fallback, personal-workspace Manager→Assistant remap, and
-    // Assistant/Artist/Support pinning.
+    // Assistant/Support pinning.
     let (effective_role, ws) = mahbot::users::resolve_session_target(&msg.user_name).await;
     let reply = match clear_session(&msg.user_name, effective_role.as_str(), &ws.name).await {
         Ok(reply) => reply,
@@ -940,7 +940,7 @@ async fn deliver_clear_reply(
 }
 
 /// Handle `/image_models` / `/video_models` commands for Telegram — shows
-/// the image or video model selection keyboard (Artist role).
+/// the image or video model selection keyboard.
 async fn handle_models_command(msg: &ChannelMessage, is_image: bool) {
     let reply_markup = build_models_keyboard(is_image, &msg.user_name).await;
     let content = if is_image {
@@ -1329,7 +1329,7 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     let role = mahbot::users::resolve_active_role_from_pool(&msg.user_name, &pool).await;
 
     // Personal workspaces map Manager→Assistant (pool-clamped), and
-    // Assistant/Artist/Support always work in the user's personal workspace
+    // Assistant/Support always work in the user's personal workspace
     // regardless of the selected workspace — both resolve atomically, before
     // enrichment and before `msg.workspace` is set so uploads, broadcast,
     // persist and chat_history stay consistent with the routed workspace.
@@ -1355,17 +1355,17 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // Runs BEFORE broadcast so the GUI receives transcription text instead
     // of raw `[AUDIO:path]` markers.  Media-marker enrichment handles images
     // for all roles (native data-URI parts, compressed for every role except
-    // Artist) and videos for all roles (workspace copy + transcription).
+    // Assistant) and videos for all roles (workspace copy + transcription).
     // Link enrichment runs separately AFTER broadcast to avoid showing
     // AI-generated URL summaries in the user's own message bubble.
-    let is_artist = matches!(effective_role, Some(mahbot::Role::Artist));
+    let is_assistant = matches!(effective_role, Some(mahbot::Role::Assistant));
     let strategy = mahbot::channels::EnrichmentStrategy {
         // Only attach a workspace path when an agent will actually see the
         // message: a no-role user's message is broadcast but never routed, so
         // workspace copies and the video transcription they trigger would be
         // discarded work (the transcription is an LLM call).
         workspace_path: effective_role.is_some().then(|| ws.as_path().to_path_buf()),
-        compress_images: !is_artist,
+        compress_images: !is_assistant,
     };
     mahbot::channels::enrich_message(&mut msg, &strategy).await;
 

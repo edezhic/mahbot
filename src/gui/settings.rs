@@ -317,9 +317,6 @@ pub enum SettingsMessage {
     ToggleAddUserModal,
     /// Add-user modal fields.
     AddUserSender(EditorAction),
-    /// Select the default agent in the add-user modal (index into
-    /// `[Role::Assistant, Role::Artist]`).
-    AddUserDefaultRole(usize),
     /// Submit the add-user modal.
     SubmitAddUser,
     /// Result of user add.
@@ -527,9 +524,6 @@ pub struct SettingsState {
     show_add_user_modal: bool,
     /// Name field in the add-user modal.
     add_user_sender: SingleLineEditorState,
-    /// Default agent for the new user, as an index into
-    /// `[Role::Assistant, Role::Artist]` (0 = Assistant).
-    add_user_default: usize,
     /// Whether the add-user operation is in flight.
     add_user_adding: bool,
 
@@ -600,7 +594,6 @@ impl SettingsState {
             add_workspace_adding: false,
             show_add_user_modal: false,
             add_user_sender: SingleLineEditorState::new(""),
-            add_user_default: 0,
             add_user_adding: false,
             model_picker_inputs: std::array::from_fn(|_| SingleLineEditorState::new("")),
             voice_toggle_gen: 0,
@@ -775,7 +768,6 @@ impl SettingsState {
     fn close_add_user_modal(&mut self) {
         self.show_add_user_modal = false;
         self.add_user_sender.clear();
-        self.add_user_default = 0;
         self.add_user_adding = false;
     }
 
@@ -1435,10 +1427,7 @@ impl SettingsState {
 
             SettingsMessage::ToggleAddUserModal => {
                 self.show_add_user_modal = !self.show_add_user_modal;
-                if self.show_add_user_modal {
-                    // Fresh default-agent selection.
-                    self.add_user_default = 0;
-                } else {
+                if !self.show_add_user_modal {
                     self.close_add_user_modal();
                 }
                 Task::none()
@@ -1446,20 +1435,14 @@ impl SettingsState {
             SettingsMessage::AddUserSender(action) => {
                 apply_simple_editor_action(&mut self.add_user_sender, action)
             }
-            SettingsMessage::AddUserDefaultRole(idx) => {
-                if idx < [Role::Assistant, Role::Artist].len() {
-                    self.add_user_default = idx;
-                }
-                Task::none()
-            }
             SettingsMessage::SubmitAddUser => {
                 if self.add_user_sender.text().is_empty() {
                     return Task::none();
                 }
                 // The permission-derived role pool no longer stores per-user
-                // roles; the manual Settings bypass picks a single default agent
-                // from the hard-coded {Assistant, Artist} pool.
-                let default_role = [Role::Assistant, Role::Artist][self.add_user_default];
+                // roles; the manual Settings bypass always assigns the
+                // Assistant as the single default agent.
+                let default_role = Role::Assistant;
                 self.add_user_adding = true;
                 let sender = self.add_user_sender.text();
                 Task::perform(
@@ -2464,26 +2447,7 @@ impl SettingsState {
                 id: "add_user_sender",
                 on_input: SettingsMessage::AddUserSender,
             }],
-            Some(
-                column![
-                    text("Default agent")
-                        .size(theme::TEXT_12)
-                        .color(theme::TEXT_SECONDARY),
-                    pick_list(
-                        vec![Role::Assistant, Role::Artist],
-                        Some([Role::Assistant, Role::Artist][self.add_user_default]),
-                        |r| match r {
-                            Role::Artist => SettingsMessage::AddUserDefaultRole(1),
-                            _ => SettingsMessage::AddUserDefaultRole(0),
-                        },
-                    )
-                    .style(theme::pick_list_style)
-                    .menu_style(theme::pick_list_menu_style)
-                    .padding([theme::PAD_4, theme::PAD_8]),
-                    Space::new().height(8),
-                ]
-                .into(),
-            ),
+            None,
             "Add",
             self.add_user_adding,
             !self.add_user_sender.text().is_empty(),
@@ -2756,7 +2720,7 @@ impl SettingsState {
             "Worker",
             crate::config::DEFAULT_WORKER_MODEL,
             CONFIG_KEY_WORKER_MODEL,
-            Some("Artist, Analyst, Coder, QA, Reviewer, Sanitation"),
+            Some("Analyst, Coder, QA, Reviewer, Sanitation"),
         );
         section(
             "Models",

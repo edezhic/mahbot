@@ -86,7 +86,7 @@ pub struct RoleInfo {
 ///
 /// Used via struct update syntax (`..BASE_ROLE_INFO`) to keep each arm
 /// concise and make future field additions cheap. Arms that spell out every
-/// field (Discovery, Artist, Assistant, Support) do so because clippy's
+/// field (Discovery, Assistant, Support) do so because clippy's
 /// `needless_update` fires when the base contributes nothing, so the update
 /// syntax is only valid when at least one field comes from the base.
 const BASE_ROLE_INFO: RoleInfo = RoleInfo {
@@ -141,12 +141,6 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             default_reasoning_effort: "xhigh",
             badge_fg: (0.227, 0.663, 0.624),
             display_label: "Discovery",
-        },
-        Role::Artist => &RoleInfo {
-            has_discovery: false,
-            badge_fg: (0.808, 0.365, 0.592),
-            default_reasoning_effort: "high",
-            display_label: "Artist",
         },
         Role::Maintainer => &RoleInfo {
             badge_fg: (0.753, 0.376, 0.502),
@@ -311,7 +305,6 @@ impl Role {
     /// the agent's `BrowserTool` so every session the run opens is closed at
     /// run end.
     #[must_use]
-    #[expect(clippy::too_many_lines)]
     pub(crate) fn tools(
         self,
         ws: &Workspace,
@@ -368,14 +361,6 @@ impl Role {
                     Box::new(ShellTool::new(ShellMode::ReadOnly)),
                 ]
             }
-            Role::Artist => {
-                vec![
-                    Box::new(SearchTool),
-                    Box::new(ImageGenTool),
-                    Box::new(VideoGenTool),
-                    Box::new(VideoEditTool),
-                ]
-            }
             Role::Maintainer => {
                 let mut t = Self::readonly_core_tools();
                 t.push(Box::new(AnalyzeTool::new(
@@ -394,10 +379,17 @@ impl Role {
                     Box::new(EditTool),
                     Box::new(SearchTool),
                     Box::new(SleepTool),
+                    // Media tools serve every Assistant (base and full-access
+                    // alike): the media models they use resolve per-user, so
+                    // no access-level gate applies.
+                    Box::new(ImageGenTool),
+                    Box::new(VideoGenTool),
+                    Box::new(VideoEditTool),
                 ];
-                // Base Assistant is workspace-bounded (strict read only);
-                // full-access retains the general ReadTool so it can also read
-                // dependency sources / temp files.
+                // Base Assistant read access is workspace-bounded; full-access
+                // retains the general ReadTool so it can also read dependency
+                // sources / temp files. (Media tools write only into the
+                // workspace's generated/ tree in both modes.)
                 if full_access {
                     t.push(Box::new(ReadTool::general()));
                 } else {
@@ -612,7 +604,6 @@ mod tests {
             (crate::Role::Qa, false),
             (crate::Role::Reviewer, false),
             (crate::Role::Discovery, false),
-            (crate::Role::Artist, false),
             (crate::Role::Maintainer, false),
             (crate::Role::Sanitation, false),
             (crate::Role::Assistant, false),

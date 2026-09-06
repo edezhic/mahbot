@@ -180,7 +180,7 @@ impl Tool for AddUserTool {
                 },
                 "default_agent": {
                     "type": "string",
-                    "description": "The default agent for this user: 'assistant' or 'artist'."
+                    "description": "The default agent for this user: 'assistant'."
                 }
             }),
             &["name", "telegram_handle", "default_agent"],
@@ -196,9 +196,9 @@ impl Tool for AddUserTool {
         let handle = super::get_str(&args, "telegram_handle")?;
         let agent = super::get_str(&args, "default_agent")?
             .parse::<Role>()
-            .context("default_agent must be 'assistant' or 'artist'")?;
-        if !matches!(agent, Role::Assistant | Role::Artist) {
-            return Err(err("default_agent must be 'assistant' or 'artist'"));
+            .context("default_agent must be 'assistant'")?;
+        if agent != Role::Assistant {
+            return Err(err("default_agent must be 'assistant'"));
         }
 
         let store = crate::users::store();
@@ -247,7 +247,7 @@ impl Tool for AddUserTool {
         store.bind_channel(name, "telegram", &handle).await?;
 
         let role_note = "They are a regular (non-admin) user: they can chat with the \
-                         Assistant and Artist agents only.";
+                         Assistant agent only.";
         if existing_unbound {
             Ok(format!(
                 "Bound @{handle} to the existing user '{name}' and set their default agent to \
@@ -389,7 +389,7 @@ impl Tool for FinalizeTool {
             &json!({
                 "agent": {
                     "type": "string",
-                    "description": "The agent to switch to after onboarding: 'assistant', 'manager', or 'artist'."
+                    "description": "The agent to switch to after onboarding: 'assistant' or 'manager'."
                 }
             }),
             &["agent"],
@@ -403,8 +403,8 @@ impl Tool for FinalizeTool {
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         let user = acting_user(ws).to_string();
         let agent = super::get_str(&args, "agent")?.parse::<Role>()?;
-        if !matches!(agent, Role::Assistant | Role::Manager | Role::Artist) {
-            return Err(err("agent must be 'assistant', 'manager', or 'artist'"));
+        if !matches!(agent, Role::Assistant | Role::Manager) {
+            return Err(err("agent must be 'assistant', 'manager'"));
         }
 
         // Switch the active role BEFORE persisting `Finished` (mirrors

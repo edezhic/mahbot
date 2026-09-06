@@ -423,7 +423,7 @@ pub(crate) async fn local_image_to_data_uri(path: &std::path::Path) -> anyhow::R
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(&bytes)))
 }
 
-/// Inbound-photo compression bounds for non-Artist roles: the
+/// Inbound-photo compression bounds for non-Assistant roles: the
 /// longest-side cap and JPEG quality of the single ingestion-time re-encode.
 pub(crate) const INBOUND_IMAGE_MAX_SIDE: u32 = 1024;
 const INBOUND_IMAGE_JPEG_QUALITY: u8 = 85;

@@ -3,7 +3,7 @@ use crate::channels::reply::normalize_reply_text;
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
 use crate::util::media_target::{self, MediaTarget};
 use crate::util::{TELEGRAM_MEDIA_MARKER_RE, UnwrapPoison, is_http_url, parse_media_marker};
-use crate::{Channel, ChannelMessage, Role, SendMessage};
+use crate::{Channel, ChannelMessage, SendMessage};
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
@@ -23,9 +23,9 @@ const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 const CLEAR_COMMAND_DESC: &str = "Reset your session";
 /// Description for the `/agents` command (inline role picker).
 const AGENTS_COMMAND_DESC: &str = "Switch your active role";
-/// Description for the `/image_models` command (Artist role).
+/// Description for the `/image_models` command.
 const IMAGE_MODELS_COMMAND_DESC: &str = "Select image generation model";
-/// Description for the `/video_models` command (Artist role).
+/// Description for the `/video_models` command.
 const VIDEO_MODELS_COMMAND_DESC: &str = "Select video model";
 /// Description for the `/board` command (admin).
 const BOARD_COMMAND_DESC: &str = "List active workspace tickets";
@@ -2732,8 +2732,11 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
     let pool = crate::users::role_pool(user_name).await;
 
     // Single role-switch entry — opens the inline role picker listing only
-    // the user's pool roles. Registered for every user; leads the menu.
-    entries.push(("agents".to_string(), AGENTS_COMMAND_DESC.to_string()));
+    // the user's pool roles. Only registered when the pool has more than one
+    // role (single-role users have nothing to switch to); leads the menu.
+    if pool.len() > 1 {
+        entries.push(("agents".to_string(), AGENTS_COMMAND_DESC.to_string()));
+    }
 
     if crate::users::is_admin(user_name).await {
         entries.push(("board".to_string(), BOARD_COMMAND_DESC.to_string()));
@@ -2772,18 +2775,16 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
         }
     }
 
-    // Artist model-selection commands are available whenever Artist is in the
-    // user's pool (they can switch to Artist and use them).
-    if pool.contains(&Role::Artist) {
-        entries.push((
-            "image_models".to_string(),
-            IMAGE_MODELS_COMMAND_DESC.to_string(),
-        ));
-        entries.push((
-            "video_models".to_string(),
-            VIDEO_MODELS_COMMAND_DESC.to_string(),
-        ));
-    }
+    // Media model-selection commands are available to every user (the media
+    // models are stored per-user, and every user has the Assistant role).
+    entries.push((
+        "image_models".to_string(),
+        IMAGE_MODELS_COMMAND_DESC.to_string(),
+    ));
+    entries.push((
+        "video_models".to_string(),
+        VIDEO_MODELS_COMMAND_DESC.to_string(),
+    ));
 
     // Session clear is the least frequent action — keep it last.
     entries.push(("clear".to_string(), CLEAR_COMMAND_DESC.to_string()));

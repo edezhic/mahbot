@@ -16,10 +16,9 @@ Batteries included:
 - __Background maintenance__ process to clean up the usual videcoding bloat as well as other code quality issues
 - __Full history__ of the previous work in the tickets with efficient hybrid search over it
 - __Out-of-the-box__ workspace discovery for per-role contexts, auto-detected diagnostics commands. No need for plugins, AGENTS/CLAUDE/other.md files or custom configurations. Just add the API key and state your wishes
-- __General assistant__ adaptive agent for Q&A, research, prototyping and basically any other purposes
-- __Specialized artist__ agent for image & video generation/editing as a little treat on top
+- __General assistant__ adaptive agent for Q&A, research, prototyping, image & video generation/editing and basically any other purposes
 
-OpenRouter is the default provider; manager-side roles default to GLM 5.3 Flash and worker-side roles to DeepSeek 4 Flash. A custom self-hosted OpenAI-compatible endpoint (llama.cpp, vLLM, or alike) can be configured in Settings for chat requests. Note that artists tools are currently tied to OpenRouter — so its key is still needed for those even when a custom endpoint handles dev agents. Also, should work quite well with smaller models like Qwen 3.8 27b, and local + open-source mode is the primary long-term focus.
+OpenRouter is the default provider; manager-side roles default to GLM 5.3 Flash and worker-side roles to DeepSeek 4 Flash. A custom self-hosted OpenAI-compatible endpoint (llama.cpp, vLLM, or alike) can be configured in Settings for chat requests. Note that media tools are currently tied to OpenRouter — so its key is still needed for those even when a custom endpoint handles dev agents. Also, should work quite well with smaller models like Qwen 3.8 27b, and local + open-source mode is the primary long-term focus.
 
 ## The Pipeline
 

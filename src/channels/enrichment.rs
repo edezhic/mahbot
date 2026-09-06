@@ -5,7 +5,7 @@
 //! agent pipeline. It handles:
 //! - **Media markers** (`[IMAGE: ...]`, `[AUDIO: ...]`, `[VIDEO: ...]`)
 //!   → inbound local images become native data-URI parts for EVERY role
-//!   (byte-identical for Artist, bounded-JPEG compressed for all others);
+//!   (byte-identical for Assistant, bounded-JPEG compressed for all others);
 //!   audio is transcribed to text; video handling is workspace copy +
 //!   transcription for every role (no role split)
 //! - **Link enrichment** → prepends webpage summaries for URLs in the message
@@ -135,8 +135,8 @@ pub struct EnrichmentStrategy {
     /// disables copies).
     pub workspace_path: Option<std::path::PathBuf>,
     /// Downscale/compress inbound local images to a bounded JPEG before they
-    /// enter the session — every role EXCEPT Artist. Artist passes through
-    /// full-resolution byte-identical.
+    /// enter the session — every role EXCEPT Assistant. Assistant passes
+    /// through full-resolution byte-identical.
     pub compress_images: bool,
 }
 
@@ -199,8 +199,8 @@ async fn bounded_image_data_uri(path: &std::path::Path, compress: bool) -> anyho
 /// Handle an IMAGE marker — convert to a data URI, invalid reference, or (for
 /// out-of-scope paths) a plain-text annotation. Saves a workspace copy if
 /// `uploads_dir` is available. When `compress` is set the data URI is a
-/// bounded-JPEG re-encode (non-Artist roles); otherwise the original bytes
-/// pass through byte-identical (Artist). The returned action's `delete_temp`
+/// bounded-JPEG re-encode (non-Assistant roles); otherwise the original bytes
+/// pass through byte-identical (Assistant). The returned action's `delete_temp`
 /// tells the caller whether the source temp file was consumed from the
 /// Telegram temp dir and may be cleaned up.
 async fn handle_image(
@@ -388,7 +388,7 @@ async fn transcribe_saved_video(
 ///
 /// | Kind | Behavior |
 /// |------|----------|
-/// | IMAGE | data URI conversion (byte-identical for Artist, bounded-JPEG compression for every other role) + workspace copy when in scope |
+/// | IMAGE | data URI conversion (byte-identical for Assistant, bounded-JPEG compression for every other role) + workspace copy when in scope |
 /// | AUDIO | transcription (unchanged for all roles) |
 /// | VIDEO | workspace copy + `[Saved video: path]` + transcription (every role) |
 ///
@@ -1154,7 +1154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_non_artist_image_compressed_to_jpeg_data_uri() {
+    async fn enrich_non_assistant_image_compressed_to_jpeg_data_uri() {
         // Real 1100x800 PNG: the longest side exceeds the 1024 px cap, so the
         // ingestion-time re-encode must downscale it to a bounded JPEG while
         // the workspace copy stays the full-resolution original.
@@ -1216,11 +1216,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_artist_image_byte_identical_data_uri() {
+    async fn enrich_assistant_image_byte_identical_data_uri() {
         let source_bytes = real_png(64, 48);
         let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
         tokio::fs::create_dir_all(&tg_dir).await.unwrap();
-        let tmp = tg_dir.join(format!("test_enrich_artist_{}.png", std::process::id()));
+        let tmp = tg_dir.join(format!("test_enrich_assistant_{}.png", std::process::id()));
         tokio::fs::write(&tmp, &source_bytes).await.unwrap();
         let path_str = tmp.to_string_lossy().to_string();
 
@@ -1237,7 +1237,7 @@ mod tests {
         );
         assert!(
             msg.content.contains(&expected),
-            "Artist data URI must be byte-identical to the source, got: {}",
+            "Assistant data URI must be byte-identical to the source, got: {}",
             msg.content
         );
         // Temp file deleted
@@ -1332,7 +1332,7 @@ mod tests {
 
     #[tokio::test]
     async fn enrich_image_corrupt_raster_byte_identical_does_not_fail_open() {
-        // The Artist (compress=false) path sends the original bytes untouched;
+        // The Assistant (compress=false) path sends the original bytes untouched;
         // a corrupt-but-magic-valid file that passed the structural gate must not
         // be base64-encoded into a junk data URI — it degrades to an invalid
         // reference instead.

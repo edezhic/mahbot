@@ -2516,10 +2516,6 @@ mod transient_prefix_tests {
             direct_agent_id("alice", "assistant", "personal:alice"),
             "alice_personal:assistant",
         );
-        assert_eq!(
-            direct_agent_id("alice", "artist", "personal:alice"),
-            "alice_personal:artist",
-        );
 
         // Another user's personal workspace keeps the full form.
         assert_eq!(

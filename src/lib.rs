@@ -372,9 +372,9 @@ pub enum BotCommand {
     Start,
     /// `/clear` — reset the user's current session.
     Clear,
-    /// `/image_models` — show image model selection keyboard (Artist).
+    /// `/image_models` — show image model selection keyboard.
     ImageModels,
-    /// `/video_models` — show video model selection keyboard (Artist).
+    /// `/video_models` — show video model selection keyboard.
     VideoModels,
     /// `/board` — list the active workspace's tickets (admin).
     Board,
@@ -687,7 +687,6 @@ pub enum Role {
     Qa,
     Reviewer,
     Discovery,
-    Artist,
     Maintainer,
     Sanitation,
     Assistant,

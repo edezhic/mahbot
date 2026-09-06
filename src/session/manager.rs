@@ -177,7 +177,7 @@ impl Session {
                     .await?;
                 self.history.extend(msgs);
 
-                if matches!(role, Role::Artist) {
+                if matches!(role, Role::Assistant) {
                     Self::persist_active_models_snapshot(agent_id, &snapshot).await;
                 }
             } else {
@@ -185,7 +185,7 @@ impl Session {
                 // (see doc comment above). The session DB caches the full
                 // first-turn message set. The only rebuild path is
                 // `apply_summary` below.
-                let (content, new_snapshot) = if matches!(role, Role::Artist) {
+                let (content, new_snapshot) = if matches!(role, Role::Assistant) {
                     Self::prepend_model_change(agent_id, msg, user_name).await
                 } else {
                     (msg.to_string(), None)
@@ -502,7 +502,7 @@ impl Session {
             // until the next compaction or /new (accepted fail-open gap: the
             // block is only re-rendered through this path).
             let block_rendered = snapshot.image.is_some() || snapshot.video.is_some();
-            if matches!(role, Role::Artist) && block_rendered {
+            if matches!(role, Role::Assistant) && block_rendered {
                 let merged = Self::merge_active_models_snapshot(agent_id, &snapshot).await;
                 Self::persist_active_models_snapshot(agent_id, &merged).await;
             }
@@ -532,12 +532,12 @@ impl Session {
 
     /// Build fresh system prompt + ticket context for the current turn.
     /// Returns the system-level messages plus the model snapshot rendered in
-    /// the `<active-models-opts>` block (Artist only; `Default` when no block
-    /// was injected). Messages appear in this order:
+    /// the `<active-models-opts>` block (Assistant only; `Default` when no
+    /// block was injected). Messages appear in this order:
     ///
     /// ```text
     /// role_description       — from src/prompt/role/{role}.md (always)
-    /// active_models_opts     — Artist only, when the catalogs are available
+    /// active_models_opts     — Assistant only, when the catalogs are available
     /// workspace boilerplate  — from src/prompt/context/workspace.md, substituted (always)
     /// skills                 — if any skills exist in the workspace
     /// alarms                 — Assistant only, when the user has active alarms
@@ -550,7 +550,7 @@ impl Session {
     /// This function is called directly by
     /// [`Session::apply_summary`] when rebuilding context after compaction.
     /// [`Self::build_turn_messages`] wraps it to add the per-turn user message.
-    /// The Artist block is re-emitted on compaction, so long sessions never
+    /// The Assistant block is re-emitted on compaction, so long sessions never
     /// lose the capability info.
     async fn build_context_messages(
         ws: &Workspace,
@@ -606,12 +606,12 @@ impl Session {
         let mut msgs = Vec::with_capacity(6);
         msgs.push(ChatMessage::system(&role_description));
 
-        // Artist sessions carry the <active-models-opts> block: the active
+        // Assistant sessions carry the <active-models-opts> block: the active
         // image/video models' parameter envelope, rendered from the live
         // catalogs plus static per-model video-edit nuances. Fail-open — no
         // block when nothing renders (catalogs unavailable, no nuances).
         let mut snapshot = ModelSnapshot::default();
-        if matches!(role, Role::Artist)
+        if matches!(role, Role::Assistant)
             && let Some((block, rendered)) =
                 crate::tools::active_models::render_block(user_name).await
         {
@@ -645,8 +645,8 @@ impl Session {
     /// current turn.
     /// Returns messages: [role_description, active_models_opts?, workspace_boilerplate,
     /// skills?, alarms?, workspaces?, board_context?, ticket_block?, user_msg]
-    /// plus the rendered active-models snapshot (Artist only; `Default` when no
-    /// block injected).
+    /// plus the rendered active-models snapshot (Assistant only; `Default` when
+    /// no block injected).
     ///
     /// # Caching contract
     /// The output of this function is intended to be persisted to the session
@@ -672,7 +672,7 @@ impl Session {
         (msgs, snapshot)
     }
 
-    // ── Active-models snapshot (Artist mid-session change detection) ──
+    // ── Active-models snapshot (Assistant mid-session change detection) ──
 
     /// Persist the `<active-models-opts>` baseline after the system prompt
     /// (re)build. Only the model ids actually rendered in the block are
@@ -972,7 +972,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(active_models)]
     async fn prepend_model_change_detects_switch_and_refreshes_baseline() {
-        let user = "test_artist_change_user";
+        let user = "test_assistant_change_user";
         crate::util::test::init_test_stores().await;
         // Empty-catalog seeds: both catalog lookups return a fresh (empty)
         // catalog with no network fetch, so render_section finds no model and
@@ -985,7 +985,7 @@ mod tests {
         crate::tools::media_catalog::video::seed_cache(Some(std::sync::Arc::new(
             crate::tools::media_catalog::video::VideoCatalog::default(),
         )));
-        let agent_id = "test_artist_change";
+        let agent_id = "test_assistant_change";
 
         crate::users::store()
             .set_image_gen_model(user, "model-a")
@@ -1036,7 +1036,8 @@ mod tests {
     async fn prepend_model_change_without_baseline_is_noop() {
         crate::util::test::init_test_stores().await;
         let (out, snapshot) =
-            Session::prepend_model_change("test_artist_no_baseline", "hello", "no_such_user").await;
+            Session::prepend_model_change("test_assistant_no_baseline", "hello", "no_such_user")
+                .await;
         assert_eq!(out, "hello");
         assert!(snapshot.is_none());
     }
@@ -1047,7 +1048,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(active_models)]
     async fn prepend_model_change_preserves_absent_sections() {
-        let user = "test_artist_partial_user";
+        let user = "test_assistant_partial_user";
         crate::util::test::init_test_stores().await;
         crate::tools::media_catalog::image::seed_cache(Some(std::sync::Arc::new(
             crate::tools::media_catalog::image::ImageCatalog::default(),
@@ -1055,7 +1056,7 @@ mod tests {
         crate::tools::media_catalog::video::seed_cache(Some(std::sync::Arc::new(
             crate::tools::media_catalog::video::VideoCatalog::default(),
         )));
-        let agent_id = "test_artist_partial";
+        let agent_id = "test_assistant_partial";
 
         // Session started with only the video section rendered (image catalog
         // was down at session start) — the image id is NOT in the baseline.
@@ -1112,7 +1113,7 @@ mod tests {
             video: Some("video-a".into()),
         };
         crate::session::store()
-            .set_active_models("test_artist_merge", Some(&previous.to_json()))
+            .set_active_models("test_assistant_merge", Some(&previous.to_json()))
             .await
             .expect("baseline persisted");
 
@@ -1121,7 +1122,7 @@ mod tests {
             image: Some("model-b".into()),
             video: None,
         };
-        let merged = Session::merge_active_models_snapshot("test_artist_merge", &rendered).await;
+        let merged = Session::merge_active_models_snapshot("test_assistant_merge", &rendered).await;
         assert_eq!(
             merged,
             ModelSnapshot {
@@ -1132,7 +1133,8 @@ mod tests {
 
         // No prior baseline → the merged snapshot is exactly the rendered one.
         let merged =
-            Session::merge_active_models_snapshot("test_artist_no_merge_baseline", &rendered).await;
+            Session::merge_active_models_snapshot("test_assistant_no_merge_baseline", &rendered)
+                .await;
         assert_eq!(merged, rendered);
     }
 

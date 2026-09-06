@@ -1736,6 +1736,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 let selected_role: Option<String> = row.get(2)?;
                 let sel = selected_role.unwrap_or_default();
                 let needs_default = sel.is_empty() || {
+                    // 'artist' stays accepted here: this migration body already
+                    // ran on older stores, and re-running it on a mid-chain
+                    // upgrade must not clobber legacy 'artist' rows — the
+                    // runtime pool clamp resolves them instead (admin → first
+                    // pool role). New writes can never produce 'artist'.
                     let in_pool = if permissions.as_deref() == Some("full") {
                         matches!(sel.as_str(), "support" | "assistant" | "manager" | "artist")
                     } else {

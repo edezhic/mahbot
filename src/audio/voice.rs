@@ -1634,7 +1634,7 @@ async fn route_to_agent(text: String) {
 ///
 /// Pool-gating applies to both callers: the routed role stays inside the
 /// pool — including the same personal-workspace Manager→Assistant clamp and
-/// Assistant/Artist/Support pinning to the personal workspace, atomically.
+/// Assistant/Support pinning to the personal workspace, atomically.
 ///
 /// The routed user_name is the active user, or "admin" (the seeded admin
 /// identity) for the no-active-user fallback — an empty name would produce
@@ -2355,7 +2355,7 @@ impl PipelineCtx {
         }
         let role = crate::users::resolve_active_role(&user_name).await;
         let ws = crate::users::resolve_workspace_for_user_name(&user_name).await;
-        // Assistant/Artist conversations live in the user's personal workspace;
+        // Assistant/Support conversations live in the user's personal workspace;
         // a None role (empty pool or store failure) fails closed to the
         // resolved workspace — the notice stays visible in the current view.
         let ws = match role {

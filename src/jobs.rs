@@ -1426,7 +1426,7 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
             }
             continue;
         }
-        // Execution-time invariant: re-pin pinned roles (Assistant/Artist/Support)
+        // Execution-time invariant: re-pin pinned roles (Assistant/Support)
         // to the user's personal workspace; a pinned role with an empty user is
         // refused and the poisoned envelope deleted so it is not replayed forever.
         let Some(workspace_name) =

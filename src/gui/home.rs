@@ -399,7 +399,7 @@ pub struct HomeState {
 
 /// The chat view for the selected user: two workspaces — the picker-resolved
 /// one plus a merge partner. Symmetric visibility: the picker only selects
-/// the recipient, it never filters the view (personal Assistant/Artist
+/// the recipient, it never filters the view (personal Assistant/Support
 /// messages show at any picker, and the user's project chat shows at the
 /// Personal picker).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,7 +491,7 @@ impl HomeState {
     }
 
     /// Whether `workspace` is the selected user's personal workspace
-    /// (`personal:{user}`) — the Assistant/Artist chat shown at any picker.
+    /// (`personal:{user}`) — the Assistant/Support chat shown at any picker.
     fn is_selected_user_personal_workspace(&self, workspace: &str) -> bool {
         self.selected_user
             .as_deref()
@@ -2470,7 +2470,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // personal-workspace visibility (Assistant/Artist at any picker)
+    // personal-workspace visibility (Assistant/Support at any picker)
     // ------------------------------------------------------------------
 
     #[test]
@@ -2487,7 +2487,7 @@ mod tests {
         assert!(project.workspace_visible("ws1"));
         assert!(
             project.workspace_visible("personal:alice"),
-            "personal Assistant/Artist messages must be visible at any picker"
+            "personal Assistant/Support messages must be visible at any picker"
         );
         assert!(!project.workspace_visible("ws2"));
         assert!(
@@ -2707,7 +2707,7 @@ mod tests {
     #[test]
     fn test_call_site_wiring_symmetric_at_any_picker() {
         // (picker, message workspace, agent role, content) — both directions:
-        // at the project picker personal Assistant/Artist messages append and
+        // at the project picker personal Assistant/Support messages append and
         // clear sending/typing; at the personal picker the same holds for
         // Manager replies in the user's DB project workspace.
         let cases = [

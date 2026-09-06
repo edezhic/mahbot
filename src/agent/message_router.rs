@@ -66,7 +66,6 @@ fn telegram_role_emoji(role: Role) -> &'static str {
         Role::Qa => "🔨",
         Role::Reviewer => "✅",
         Role::Discovery => "🔎",
-        Role::Artist => "🎨",
         Role::Maintainer => "⚙️",
         Role::Sanitation => "🧼",
         Role::Assistant => "💬",
@@ -535,7 +534,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             }
         };
 
-        // Execution-time invariant: pinned roles (Assistant/Artist/Support)
+        // Execution-time invariant: pinned roles (Assistant/Support)
         // never run outside the user's personal workspace, no matter what the
         // producer stored. Empty-user envelopes for pinned roles are refused
         // outright.
@@ -1994,7 +1993,7 @@ mod tests {
         );
 
         // Non-Telegram channels never get a prefix, even with 2+ roles.
-        let multi = ["manager".to_string(), "artist".to_string()];
+        let multi = ["manager".to_string(), "assistant".to_string()];
         let content = telegram_delivery_content("gui", Role::Manager, &multi, response);
         assert_eq!(content, "plain answer");
         assert!(

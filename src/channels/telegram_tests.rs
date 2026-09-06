@@ -2211,8 +2211,8 @@ async fn user_command_entries_reflect_admin_state() {
         .await
         .unwrap();
 
-    // alice: admin (full permissions), pool = onboarding roles + Artist →
-    // the single role-switch entry plus Artist model commands and
+    // alice: admin (full permissions), pool = onboarding roles →
+    // the single role-switch entry plus unconditional model commands and
     // state-aware admin commands. In the (LocalCheckout) test environment
     // the shared availability cache seeds `available = true`, so `/update`
     // is present for the admin.
@@ -2229,10 +2229,10 @@ async fn user_command_entries_reflect_admin_state() {
     assert!(!cmds.contains(&"maintenance_off"));
     // Per-role switch commands are removed — the inline picker replaces them
     // (the pool is still reflected in the picker's buttons, not the menu).
-    for cmd in ["manager", "support", "assistant", "artist", "engineer"] {
+    for cmd in ["manager", "support", "assistant", "engineer"] {
         assert!(!cmds.contains(&cmd));
     }
-    // Artist is in the pool → model commands present.
+    // Model commands are unconditional (every user has the Assistant role).
     assert!(cmds.contains(&"image_models"));
     assert!(cmds.contains(&"video_models"));
     // Menu order: role-switch entry first, then board/admin (+ /update),
@@ -2271,21 +2271,21 @@ async fn user_command_entries_reflect_admin_state() {
         assert!(!hidden_cmds.contains(&"update"));
     }
 
-    // bob: restricted user — no admin commands and no per-role switch
-    // commands (the inline picker replaces them), but Artist being in his
-    // pool still exposes the model commands.
+    // bob: restricted user — no admin commands and, with a single-role pool
+    // ([Assistant]), no role-switch entry either. Model commands remain
+    // available.
     let bob = user_command_entries("bob").await;
     let cmds: Vec<&str> = bob.iter().map(|(c, _)| c.as_str()).collect();
-    assert_eq!(cmds[0], "agents");
+    assert!(!cmds.contains(&"agents"));
     assert!(!cmds.contains(&"board"));
     assert!(!cmds.contains(&"update"));
     assert!(!cmds.contains(&"pause"));
     assert!(!cmds.contains(&"unpause"));
-    // Restricted user: pool is [Assistant, Artist] — per-role commands are
-    // removed, but Artist in the pool keeps the model commands present.
+    // Restricted user: pool is [Assistant] — per-role switch commands are
+    // absent, but model commands are unconditional.
     assert!(!cmds.contains(&"assistant"));
-    assert!(!cmds.contains(&"artist"));
     assert!(!cmds.contains(&"manager"));
     assert!(cmds.contains(&"image_models"));
     assert!(cmds.contains(&"video_models"));
+    assert_eq!(cmds[0], "image_models");
 }
