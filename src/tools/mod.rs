@@ -329,13 +329,12 @@ impl std::error::Error for CallSuspended {}
 
 // ── Sync durable-core glue ──────────────────────────────────────────────
 //
-// The sync analyze/implement dispatch paths are byte-for-byte mirror twins
-// (read the CURRENT_TOOL_* task-locals, generate a fresh job id, run the
-// durable core with a caller-owned jobs row, then terminalize-or-surface
-// `CallSuspended`), and the resume cores are twins too. This glue lives here
-// so both tools share ONE implementation instead of four near-identical
-// bodies; the sync-dispatch wrappers (`run_sync_analyze`/`run_sync_implement`)
-// and the boot-resume rounds delegate to it.
+// The analyze/implement durable lifecycle is mirrored by the two tools
+// (sync dispatch, async dispatch, boot resume, result envelopes). ALL of
+// that glue lives on [`SyncDurableCore`] so there is exactly one
+// implementation: the per-tool sync wrappers (`run_sync_analyze` /
+// `run_sync_implement`), the async-dispatch tool branches, and the
+// boot-resume rounds delegate to it.
 
 /// The job-scoped parameters every durable sync core takes. Beyond
 /// `(ws, task)` these are the values the sync wrappers read from the
@@ -535,98 +534,267 @@ impl SyncDurableCore {
             Err(e) => Err(e),
         }
     }
-}
 
-// ── Async dispatch scaffold (analyze/implement) ──────────────────────────
+    /// Lowercase tool name ("analyze" / "implement") — the panic-site tag of the
+    /// async dispatch scaffold.
+    #[must_use]
+    pub(crate) fn tool_name(self) -> &'static str {
+        match self {
+            Self::Analyze => "analyze",
+            Self::Implement => "implement",
+        }
+    }
 
-/// Knobs that pair the panic-path envelope with the success-path envelope of
-/// an async analyze/implement dispatch. Bundled as a struct so the call site
-/// cannot silently mismatch a kind with its tag or builder.
-pub(crate) struct AsyncDispatchParams {
-    pub workspace_name: String,
-    pub caller_role: crate::Role,
-    pub user_name: String,
-    pub channel: String,
-    pub kind: MessageKind,
-    /// Panic-site label ("analyze" / "implement") used in the error log line
-    /// and the panic-path error text.
-    pub tag: &'static str,
-    /// Panic-path envelope-content builder — the same named wrapper that
-    /// builds the success-path envelope inside the dispatch future.
-    pub build_message: fn(&anyhow::Result<String>) -> String,
-}
+    /// Message kind of the async result envelope routed to the caller.
+    #[must_use]
+    pub(crate) fn message_kind(self) -> MessageKind {
+        match self {
+            Self::Analyze => MessageKind::AnalyzeToolResult,
+            Self::Implement => MessageKind::ImplementResult,
+        }
+    }
 
-/// Shared async-dispatch scaffold of [`crate::tools::analyze::AnalyzeTool`]
-/// and [`crate::tools::implement::ImplementTool`]: spawn a durable dispatch,
-/// catch its panics, and route the resulting envelope to the caller's agent
-/// channel.
-///
-/// The dispatch future is constructed BY THE CALL SITE (its owned clones of
-/// the workspace + task are passed by reference to the module-private
-/// `dispatch_durable_*` fns, whose borrowing signatures must not change) and
-/// yields the fully-built `AgentJob` envelope. Semantics, in order:
-///
-/// 1. `tokio::spawn` + `catch_unwind` so a panic in the dispatch task can
-///    never leave the caller waiting forever on a result that can never
-///    arrive — the panic path rebuilds an error envelope here.
-/// 2. The dispatch builds the success envelope itself (with pending_job_id
-///    set by the completion tx) — route it as-is so the persisted copy and
-///    the routed copy can never drift.
-/// 3. `Ok(None)` = drain-cut: the job stays status='launched' for boot
-///    resume — route NOTHING now (a spurious error envelope during the drain
-///    would discard the checkpointed outcome; the result envelope is
-///    delivered after boot resume). This silent return is deliberately
-///    BEFORE the aborting() guard.
-/// 4. `crate::shutdown::aborting()` guard: drain/shutdown fired between the
-///    dispatch and the route — the pending row (if any) survives for boot
-///    replay; skip routing rather than deliver into a consumer that has
-///    stopped pulling. (If the pending INSERT had failed, this also
-///    suppresses the insert-failure policy's best-effort route — the
-///    surviving launched job row is resumed at the next boot, so the result
-///    is deferred, never lost.)
-/// 5. `crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope)`.
-///
-/// Note: src/tools/research.rs deliberately does NOT share this scaffold —
-/// its Ok(None) also covers manual cancel, it logs "ended without delivery",
-/// and it omits the pre-route aborting() guard (at-least-once rationale).
-pub(crate) fn spawn_dispatch_and_route(
-    dispatch: impl std::future::Future<Output = Option<AgentJob>> + Send + 'static,
-    params: AsyncDispatchParams,
-) {
-    tokio::spawn(async move {
-        let round = std::panic::AssertUnwindSafe(dispatch).catch_unwind().await;
-        let envelope = match round {
-            Ok(Some(envelope)) => envelope,
-            Ok(None) => {
-                // Drain-cut (see fn docs): silently route nothing.
+    /// Build the async `<tag>` envelope message delivered to the caller's agent
+    /// channel for this core's round results (success and failure paths).
+    #[must_use]
+    pub(crate) fn build_async_message(self, result: &anyhow::Result<String>) -> String {
+        let tag = match self {
+            Self::Analyze => "analyze-tool-result",
+            Self::Implement => "implement-tool-result",
+        };
+        build_async_result_envelope(result, tag)
+    }
+
+    /// Durable async dispatch (SPAWN → run → CHECKPOINT → COMPLETE): generate a
+    /// fresh job id, run the core with `resume: false` and no session pin, then
+    /// terminalize into the durable envelope. Returns `None` only when the round
+    /// was cut by drain/shutdown — the job stays status='launched' for boot
+    /// resume and NOTHING is routed now. On error the envelope still routes
+    /// (errors wrapped in the core's envelope tag) and the job is terminalized.
+    pub(crate) async fn dispatch_durable(
+        self,
+        ws: &crate::Workspace,
+        task: &str,
+        caller_role: crate::Role,
+        user_name: &str,
+        channel: &str,
+    ) -> Option<AgentJob> {
+        let job_id = crate::generate_id();
+        let result = match self
+            .run(
+                ws,
+                task,
+                CoreJobArgs {
+                    job_id: &job_id,
+                    caller_role,
+                    user_name,
+                    channel,
+                    resume: false,
+                    caller_agent_id: None,
+                    fail_on_checkpoint_error: false,
+                },
+            )
+            .await
+        {
+            Ok(SyncCoreOutcome::DrainCut) => {
+                // Drain-cut: the round's outcomes are already checkpointed — leave
+                // the job status='launched' for boot resume. No terminalization, no
+                // error envelope: a spurious envelope here would discard the
+                // checkpointed outcomes and contradict "jobs stay status='launched'
+                // for boot resume".
+                tracing::info!(
+                    job = %job_id,
+                    "{} round cut short by drain — job stays launched for boot resume",
+                    self.label(),
+                );
+                return None;
+            }
+            Ok(SyncCoreOutcome::Terminal(result)) => result,
+            Err(e) => Err(e),
+        };
+        Some(
+            crate::jobs::complete_durable_job(
+                &job_id,
+                self.build_async_message(&result),
+                self.message_kind(),
+                caller_role,
+                user_name,
+                channel,
+                &ws.name,
+            )
+            .await,
+        )
+    }
+
+    /// Boot-resume a durable round: run the core with `resume: true` through
+    /// [`Self::resume_sync_core`], then terminalize into a durable envelope and
+    /// route it to the ORIGINAL caller (role/user/channel persisted on the job
+    /// row at spawn), never the Manager.
+    ///
+    /// Aborts quietly on shutdown/drain: no routing, no terminalization — the
+    /// job row stays for the next boot (checkpointed outcomes are reused, so
+    /// already-completed LLM work is never lost or duplicated).
+    pub(crate) async fn resume_durable_round(self, job_id: &str, ws: &crate::Workspace) {
+        let label = self.label();
+        let (caller_role, caller, result) = match self.resume_sync_core(ws, job_id, false).await {
+            Ok(crate::jobs::SyncResumeOutcome::Terminal(caller_role, caller, result)) => {
+                (caller_role, caller, result)
+            }
+            // Drain-cut mid-resume / job row gone (explicitly abandoned): abort
+            // quietly — the core logs the reason; a gone job was already noted.
+            Ok(crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::Gone) => {
                 return;
             }
-            Err(panic) => {
-                let panic = crate::util::panic_message(&*panic);
-                let tag = params.tag;
-                tracing::error!(panic = %panic, "{tag} round dispatch panicked");
-                AgentJob {
-                    content: (params.build_message)(&Err(anyhow::anyhow!(
-                        "{tag} round dispatch panicked: {panic}"
-                    ))),
-                    workspace_name: params.workspace_name,
-                    user_name: params.user_name,
-                    channel: params.channel,
-                    kind: params.kind,
-                    role: params.caller_role,
-                    reply_target: None,
-                    pending_job_id: None,
-                    reply_to_agent_id: None,
-                    reply_workspace_name: None,
-                }
+            // Resume infra failure (roster load / checkpoint) — deliver an error
+            // envelope to the ORIGINAL caller, exactly like a round-level failure.
+            // The job row is still present (the core never terminalizes), so the
+            // caller identity can be re-loaded for the route.
+            Err(e) => {
+                let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
+                    &crate::session::store().conn,
+                    job_id,
+                    &format!("{label} resume"),
+                    &format!("{label} resume"),
+                )
+                .await
+                else {
+                    return;
+                };
+                let envelope = crate::jobs::complete_durable_job(
+                    job_id,
+                    self.build_async_message(&Err(e)),
+                    self.message_kind(),
+                    caller_role,
+                    &caller.user_name,
+                    &caller.channel,
+                    &ws.name,
+                )
+                .await;
+                crate::agent::message_router::route(
+                    &crate::jobs::envelope_target(&envelope),
+                    envelope,
+                );
+                return;
             }
         };
-
+        // Drain/shutdown fired after the round returned: abort quietly WITHOUT
+        // routing and WITHOUT deleting the row — the outcomes are checkpointed
+        // (next boot reuses them) and routing a partial result here would race
+        // the exit.
         if crate::shutdown::aborting() {
+            tracing::info!(
+                job = %job_id,
+                "{label} resume aborted after the round completed — job stays for next boot",
+            );
             return;
         }
+        let envelope = crate::jobs::complete_durable_job(
+            job_id,
+            self.build_async_message(&result),
+            self.message_kind(),
+            caller_role,
+            &caller.user_name,
+            &caller.channel,
+            &ws.name,
+        )
+        .await;
         crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
-    });
+    }
+
+    /// Async dispatch entry of [`crate::tools::analyze::AnalyzeTool`] and
+    /// [`crate::tools::implement::ImplementTool`]: read the caller identity from
+    /// the `CURRENT_TOOL_*` task-locals, spawn the core's durable dispatch in the
+    /// background, catch its panics, and route the resulting envelope to the
+    /// caller's agent channel. The core is the single source of the envelope
+    /// kind, tag and builder — no call-site knobs can drift.
+    ///
+    /// Semantics, in order:
+    ///
+    /// 1. `tokio::spawn` + `catch_unwind` so a panic in the dispatch task can
+    ///    never leave the caller waiting forever on a result that can never
+    ///    arrive — the panic path rebuilds an error envelope here.
+    /// 2. The dispatch builds the success envelope itself (with pending_job_id
+    ///    set by the completion tx) — route it as-is so the persisted copy and
+    ///    the routed copy can never drift.
+    /// 3. `Ok(None)` = drain-cut: the job stays status='launched' for boot
+    ///    resume — route NOTHING now (a spurious error envelope during the drain
+    ///    would discard the checkpointed outcome; the result envelope is
+    ///    delivered after boot resume). This silent return is deliberately
+    ///    BEFORE the aborting() guard.
+    /// 4. `crate::shutdown::aborting()` guard: drain/shutdown fired between the
+    ///    dispatch and the route — the pending row (if any) survives for boot
+    ///    replay; skip routing rather than deliver into a consumer that has
+    ///    stopped pulling. (If the pending INSERT had failed, this also
+    ///    suppresses the insert-failure policy's best-effort route — the
+    ///    surviving launched job row is resumed at the next boot, so the result
+    ///    is deferred, never lost.)
+    /// 5. `crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope)`.
+    ///
+    /// Note: src/tools/research.rs deliberately does NOT share this scaffold —
+    /// its Ok(None) also covers manual cancel, it logs "ended without delivery",
+    /// and it omits the pre-route aborting() guard (at-least-once rationale).
+    pub(crate) fn spawn_dispatch(
+        self,
+        ws: &crate::Workspace,
+        task: &str,
+        caller_role: crate::Role,
+    ) {
+        let user_name = crate::agent::tool_user_name();
+        let channel = crate::agent::tool_channel();
+        let (ws, task) = (ws.clone(), task.to_string());
+        let ws_name = ws.name.clone();
+        tokio::spawn(async move {
+            let round = std::panic::AssertUnwindSafe(async {
+                self.dispatch_durable(&ws, &task, caller_role, &user_name, &channel)
+                    .await
+            })
+            .catch_unwind()
+            .await;
+            let envelope = match round {
+                Ok(Some(envelope)) => envelope,
+                Ok(None) => {
+                    // Drain-cut (see doc point 3): silently route nothing.
+                    return;
+                }
+                Err(panic) => {
+                    let panic = crate::util::panic_message(&*panic);
+                    let tag = self.tool_name();
+                    tracing::error!(panic = %panic, "{tag} round dispatch panicked");
+                    AgentJob {
+                        content: self.build_async_message(&Err(anyhow::anyhow!(
+                            "{tag} round dispatch panicked: {panic}"
+                        ))),
+                        workspace_name: ws_name,
+                        user_name,
+                        channel,
+                        kind: self.message_kind(),
+                        role: caller_role,
+                        reply_target: None,
+                        pending_job_id: None,
+                        reply_to_agent_id: None,
+                        reply_workspace_name: None,
+                    }
+                }
+            };
+            if crate::shutdown::aborting() {
+                return;
+            }
+            crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
+        });
+    }
+}
+
+/// Wrap a sub-agent/tool result in the async `<tag>` envelope delivered to
+/// the caller's agent channel. Failures carry an explicit marker — findings
+/// are never silently dropped. Shared with the deep research tool.
+pub(crate) fn build_async_result_envelope(result: &anyhow::Result<String>, tag: &str) -> String {
+    match result {
+        Ok(text) => format!("<{tag}>\n\n{text}</{tag}>"),
+        Err(e) => {
+            tracing::debug!(error = %e, %tag, "async tool result failed");
+            format!("<{tag}>\n\nAn error occurred: {e}</{tag}>")
+        }
+    }
 }
 
 /// Outcome for a tool execution.

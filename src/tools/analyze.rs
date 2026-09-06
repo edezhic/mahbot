@@ -15,7 +15,6 @@
 //! of fresh analysts, appended as a `## Verification` section. Fail-open is
 //! preserved throughout: findings are never silently lost.
 
-use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::agent::{run_agent, run_default_agent};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::tools::Tool;
@@ -128,43 +127,11 @@ impl Tool for AnalyzeTool {
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let analyze = super::get_str(&args, "analyze")?;
 
-        // Async dispatch path — delegate to analysts in background. Read user
-        // context from task-locals (set once per tool batch by the Agent work
-        // loop) so the queued result carries the correct user identity for
-        // per-user delivery. Spawn/catch-unwind/route semantics live in
-        // `spawn_dispatch_and_route`.
+        // Async dispatch path — delegate to analysts in the background.
+        // Spawn/identity/drain-cut/panic/route semantics live in
+        // `SyncDurableCore::spawn_dispatch`.
         if self.dispatch_mode.is_async() {
-            let ws = ws.clone();
-            let analyze = analyze.to_string();
-            let caller_role = self.caller_role;
-            let user_name = crate::agent::tool_user_name();
-            let channel = crate::agent::tool_channel();
-            let ws_name = ws.name.clone();
-            let dispatch_user_name = user_name.clone();
-            let dispatch_channel = channel.clone();
-
-            super::spawn_dispatch_and_route(
-                async move {
-                    dispatch_durable_analyze(
-                        &ws,
-                        &analyze,
-                        caller_role,
-                        dispatch_user_name,
-                        dispatch_channel,
-                    )
-                    .await
-                },
-                super::AsyncDispatchParams {
-                    workspace_name: ws_name,
-                    caller_role,
-                    user_name,
-                    channel,
-                    kind: MessageKind::AnalyzeToolResult,
-                    tag: "analyze",
-                    build_message: build_async_analyze_message,
-                },
-            );
-
+            super::SyncDurableCore::Analyze.spawn_dispatch(ws, analyze, self.caller_role);
             return Ok("Sub-agent dispatched. Results will follow shortly.".to_string());
         }
 
@@ -183,72 +150,6 @@ impl Tool for AnalyzeTool {
 struct AnalyzeSlot {
     agent_id: String,
     task: String,
-}
-
-/// Durable async analyze dispatch (SPAWN → run → CHECKPOINT → COMPLETE).
-///
-/// 1. SPAWN: one tx — INSERT jobs (kind=analyze, task=question) + INSERT agents
-///    (all pre-generated analyst ids with final tasks). MUST commit before
-///    the analysts' first session writes.
-/// 2. RUN: parallel analysts.
-/// 3. CHECKPOINT: per-agent raw-response outcomes.
-/// 4. COMPLETE: one tx — INSERT pending_jobs (envelope id = job id) + DELETE
-///    jobs row — the exactly-once persistence boundary.
-///
-/// Returns `None` only when the round was cut by drain/shutdown (job left
-/// status='launched' for boot resume — nothing to route now). On error the
-/// envelope still routes (errors wrapped in `<analyze-tool-result>`), and the
-/// job is terminalized.
-async fn dispatch_durable_analyze(
-    ws: &Workspace,
-    analyze: &str,
-    caller_role: Role,
-    user_name: String,
-    channel: String,
-) -> Option<AgentJob> {
-    let job_id = crate::generate_id();
-    let result = match run_analyze_with_job(
-        ws,
-        analyze,
-        crate::tools::CoreJobArgs {
-            job_id: &job_id,
-            caller_role,
-            user_name: &user_name,
-            channel: &channel,
-            resume: false,
-            caller_agent_id: None,
-            fail_on_checkpoint_error: false,
-        },
-    )
-    .await
-    {
-        Ok(crate::tools::SyncCoreOutcome::DrainCut) => {
-            // Drain-cut: analyst outcomes are already
-            // checkpointed — leave the job status='launched' for boot resume
-            // (recoverable from the agent outcome checkpoints). No terminalization, no
-            // error envelope: a spurious envelope here would discard the
-            // checkpointed outcomes and contradict "jobs stay status='launched'
-            // for boot resume".
-            tracing::info!(
-                job = %job_id,
-                "Analyze round cut short by drain — job stays launched for boot resume",
-            );
-            return None;
-        }
-        Ok(crate::tools::SyncCoreOutcome::Terminal(result)) => result,
-        Err(e) => Err(e),
-    };
-    let envelope = crate::jobs::complete_durable_job(
-        &job_id,
-        build_async_analyze_message(&result),
-        MessageKind::AnalyzeToolResult,
-        caller_role,
-        &user_name,
-        &channel,
-        &ws.name,
-    )
-    .await;
-    Some(envelope)
 }
 
 /// Spawn the analyze job + roster (one tx), run the analysts, checkpoint per-agent
@@ -476,122 +377,12 @@ async fn run_analyze_slots(
         .collect()
 }
 
-/// Boot resume of an analyze round: re-run not-done roster slots with
-/// their stored tasks, reconstruct done slots from stored outcomes, then
-/// re-consolidate. The consolidated result is terminalized into a pending
-/// envelope exactly like a fresh dispatch — delivered to the ORIGINAL caller
-/// (role/user/channel persisted on the job row at spawn), never the Manager.
-///
-/// Aborts quietly on shutdown/drain: no routing, no terminalization — the job
-/// row stays for the next boot (checkpointed outcomes are reused, so the
-/// already-completed LLM work is never lost or duplicated).
+/// Boot-resume a durable analyze round — thin wrapper over
+/// [`crate::tools::SyncDurableCore::resume_durable_round`].
 pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace) {
-    let (caller_role, caller, result) = match crate::tools::SyncDurableCore::Analyze
-        .resume_sync_core(ws, job_id, false)
-        .await
-    {
-        Ok(crate::jobs::SyncResumeOutcome::Terminal(caller_role, caller, result)) => {
-            (caller_role, caller, result)
-        }
-        // Drain-cut mid-resume / job row gone (explicitly abandoned): abort
-        // quietly — the core logs the reason; a gone job was already noted.
-        Ok(crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::Gone) => {
-            return;
-        }
-        // Resume infra failure (roster load / checkpoint) — deliver an error
-        // envelope to the ORIGINAL caller, exactly like a round-level failure.
-        // The job row is still present (the core never terminalizes), so the
-        // caller identity can be re-loaded for the route.
-        Err(e) => {
-            let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
-                &crate::session::store().conn,
-                job_id,
-                "Analyze resume",
-                "Analyze resume",
-            )
-            .await
-            else {
-                return;
-            };
-            complete_durable_job_and_route(
-                job_id,
-                build_async_analyze_message(&Err(e)),
-                MessageKind::AnalyzeToolResult,
-                caller_role,
-                &caller,
-                &ws.name,
-            )
-            .await;
-            return;
-        }
-    };
-    // Drain/shutdown fired after the round returned: abort quietly WITHOUT
-    // routing and WITHOUT deleting the row — the outcomes are checkpointed
-    // (next boot reuses them) and routing a partial result here would race
-    // the exit.
-    if crate::shutdown::aborting() {
-        tracing::info!(
-            job = %job_id,
-            "Analyze resume aborted after analysts completed — job stays for next boot",
-        );
-        return;
-    }
-    complete_durable_job_and_route(
-        job_id,
-        build_async_analyze_message(&result),
-        MessageKind::AnalyzeToolResult,
-        caller_role,
-        &caller,
-        &ws.name,
-    )
-    .await;
-}
-
-/// Build the `<analyze-tool-result>` envelope message for an async analyze dispatch.
-///
-/// Shared by the async dispatch path (the `tokio::spawn` body in
-/// [`AnalyzeTool::execute`]) and tests — the envelope shape that reaches the
-/// caller's agent channel is production code, not a test re-wrap.
-fn build_async_analyze_message(result: &anyhow::Result<String>) -> String {
-    build_async_result_envelope(result, "analyze-tool-result")
-}
-
-/// Wrap a sub-agent/tool result in the async `<tag>` envelope delivered to
-/// the caller's agent channel. Failures carry an explicit marker — findings
-/// are never silently dropped. Shared with the deep research tool.
-pub(crate) fn build_async_result_envelope(result: &anyhow::Result<String>, tag: &str) -> String {
-    match result {
-        Ok(text) => format!("<{tag}>\n\n{text}</{tag}>"),
-        Err(e) => {
-            tracing::debug!(error = %e, %tag, "async tool result failed");
-            format!("<{tag}>\n\nAn error occurred: {e}</{tag}>")
-        }
-    }
-}
-
-/// Tail of the analyze resume paths: terminalize a durable analyze job and
-/// route its envelope to the stored caller. Takes pre-built content so the
-/// caller's named wrapper keeps kind and tag paired; the INSERT-failure
-/// best-effort route lives inside [`crate::jobs::complete_durable_job`].
-async fn complete_durable_job_and_route(
-    job_id: &str,
-    content: String,
-    kind: MessageKind,
-    caller_role: Role,
-    caller: &crate::jobs::JobCaller,
-    workspace_name: &str,
-) {
-    let envelope = crate::jobs::complete_durable_job(
-        job_id,
-        content,
-        kind,
-        caller_role,
-        &caller.user_name,
-        &caller.channel,
-        workspace_name,
-    )
-    .await;
-    crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
+    crate::tools::SyncDurableCore::Analyze
+        .resume_durable_round(job_id, ws)
+        .await;
 }
 
 // ── Structured claim-level findings ──────────────────────────────────────
@@ -2375,10 +2166,10 @@ mod tests {
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_consolidation_async_envelope_carries_marker() {
         // The async dispatch path (tokio::spawn in AnalyzeTool::execute) builds
-        // its envelope via build_async_analyze_message — this test drives the REAL
-        // fail-open consolidation result through that production builder
-        // (not a manual re-wrap), asserting the exact envelope + marker shape
-        // that reaches the caller's agent channel.
+        // its envelope via SyncDurableCore::Analyze.build_async_message — this
+        // test drives the REAL fail-open consolidation result through that
+        // production builder (not a manual re-wrap), asserting the exact
+        // envelope + marker shape that reaches the caller's agent channel.
         let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -2388,7 +2179,7 @@ mod tests {
             .err(crate::retry::FailureClass::Transport, "down");
         let result =
             consolidate_with_script(agreed_outcomes("raw report", "raw report 2"), fake).await;
-        let envelope = build_async_analyze_message(&result);
+        let envelope = crate::tools::SyncDurableCore::Analyze.build_async_message(&result);
         assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
         assert!(
             envelope.contains("unconsolidated — consolidation failed"),
@@ -2405,7 +2196,8 @@ mod tests {
     async fn async_envelope_wraps_sub_agent_errors() {
         // The async dispatch path's error branch: a failed sub-agent is
         // wrapped in the same envelope with the error text.
-        let envelope = build_async_analyze_message(&Err(anyhow::anyhow!("sub-agent exploded")));
+        let envelope = crate::tools::SyncDurableCore::Analyze
+            .build_async_message(&Err(anyhow::anyhow!("sub-agent exploded")));
         assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
         assert!(
             envelope.contains("An error occurred: sub-agent exploded"),

@@ -11,7 +11,6 @@
 //!   channel via [`crate::agent::message_router::route`] as an
 //!   [`MessageKind::ImplementResult`] envelope.
 
-use crate::agent::message_router::{self, AgentJob, MessageKind};
 use crate::agent::run_agent;
 use crate::session::analyze_agent_id;
 use crate::tools::Tool;
@@ -81,42 +80,10 @@ impl Tool for ImplementTool {
         let task = super::get_str(&args, "task")?;
 
         // Async dispatch path — delegate to a single durable coder in the
-        // background. Read user context from task-locals (set once per tool
-        // batch by the Agent work loop) so the queued result carries the
-        // correct user identity for per-user delivery. Spawn/catch-unwind/route
-        // semantics live in `spawn_dispatch_and_route`.
+        // background. Spawn/identity/drain-cut/panic/route semantics live in
+        // `SyncDurableCore::spawn_dispatch`.
         if self.dispatch_mode.is_async() {
-            let ws = ws.clone();
-            let task = task.to_string();
-            let caller_role = self.caller_role;
-            let user_name = crate::agent::tool_user_name();
-            let channel = crate::agent::tool_channel();
-            let ws_name = ws.name.clone();
-            let dispatch_user_name = user_name.clone();
-            let dispatch_channel = channel.clone();
-
-            super::spawn_dispatch_and_route(
-                async move {
-                    dispatch_durable_implement(
-                        &ws,
-                        &task,
-                        caller_role,
-                        dispatch_user_name,
-                        dispatch_channel,
-                    )
-                    .await
-                },
-                super::AsyncDispatchParams {
-                    workspace_name: ws_name,
-                    caller_role,
-                    user_name,
-                    channel,
-                    kind: MessageKind::ImplementResult,
-                    tag: "implement",
-                    build_message: build_async_implement_message,
-                },
-            );
-
+            super::SyncDurableCore::Implement.spawn_dispatch(ws, task, self.caller_role);
             return Ok("Sub-agent dispatched. Results will follow shortly.".to_string());
         }
 
@@ -132,73 +99,6 @@ impl Tool for ImplementTool {
         // the Running Agents view groups it under the same parent.
         run_sync_implement(ws, task, self.caller_role).await
     }
-}
-
-// ── Durable async dispatch (SPAWN → run → CHECKPOINT → COMPLETE) ─────────
-
-/// Durable async implement dispatch (SPAWN → run → CHECKPOINT → COMPLETE).
-///
-/// 1. SPAWN: one tx — INSERT jobs (kind=implement, task) + INSERT agents (the
-///    single pre-generated coder id). MUST commit before the coder's first
-///    session write.
-/// 2. RUN: the single coder.
-/// 3. CHECKPOINT: the coder's terminal outcome.
-/// 4. COMPLETE: one tx — INSERT pending_jobs (envelope id = job id) + DELETE
-///    jobs row — the exactly-once persistence boundary.
-///
-/// Returns `None` only when the round was cut by drain/shutdown (job left
-/// status='launched' for boot resume — nothing to route now). On error the
-/// envelope still routes (errors wrapped in `<implement-tool-result>`), and the
-/// job is terminalized.
-async fn dispatch_durable_implement(
-    ws: &Workspace,
-    task: &str,
-    caller_role: Role,
-    user_name: String,
-    channel: String,
-) -> Option<AgentJob> {
-    let job_id = crate::generate_id();
-    let result = match run_implement_with_job(
-        ws,
-        task,
-        crate::tools::CoreJobArgs {
-            job_id: &job_id,
-            caller_role,
-            user_name: &user_name,
-            channel: &channel,
-            resume: false,
-            caller_agent_id: None,
-            fail_on_checkpoint_error: false,
-        },
-    )
-    .await
-    {
-        Ok(crate::tools::SyncCoreOutcome::DrainCut) => {
-            // Drain-cut: the coder's outcome is checkpointed — leave the job
-            // status='launched' for boot resume (recoverable from the roster
-            // outcome). No terminalization, no error envelope: a spurious
-            // envelope here would discard the checkpointed outcome and
-            // contradict "jobs stay status='launched' for boot resume".
-            tracing::info!(
-                job = %job_id,
-                "Implement round cut short by drain — job stays launched for boot resume",
-            );
-            return None;
-        }
-        Ok(crate::tools::SyncCoreOutcome::Terminal(result)) => result,
-        Err(e) => Err(e),
-    };
-    let envelope = crate::jobs::complete_durable_job(
-        &job_id,
-        build_async_implement_message(&result),
-        MessageKind::ImplementResult,
-        caller_role,
-        &user_name,
-        &channel,
-        &ws.name,
-    )
-    .await;
-    Some(envelope)
 }
 
 // ── Sync dispatch ────────────────────────────────────────────────────────
@@ -348,80 +248,12 @@ pub(crate) async fn run_implement_with_job(
     }))
 }
 
-/// Boot resume of an implement round: re-run (or reconstruct) the single coder
-/// and terminalize the result into a pending envelope like a fresh dispatch —
-/// delivered to the ORIGINAL caller (role/user/channel persisted on the job row
-/// at spawn).
-///
-/// Aborts quietly on shutdown/drain: no routing, no terminalization — the job
-/// row stays for the next boot (the checkpointed outcome is reused).
+/// Boot-resume a durable implement round — thin wrapper over
+/// [`crate::tools::SyncDurableCore::resume_durable_round`].
 pub(crate) async fn resume_implement_round(job_id: &str, ws: &Workspace) {
-    let (caller_role, caller, result) = match crate::tools::SyncDurableCore::Implement
-        .resume_sync_core(ws, job_id, false)
-        .await
-    {
-        Ok(crate::jobs::SyncResumeOutcome::Terminal(caller_role, caller, result)) => {
-            (caller_role, caller, result)
-        }
-        // Drain-cut mid-resume / job row gone (explicitly abandoned): abort
-        // quietly — the core logs the reason; a gone job was already noted.
-        Ok(crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::Gone) => {
-            return;
-        }
-        // Resume infra failure (roster load / checkpoint) — deliver an error
-        // envelope to the ORIGINAL caller, exactly like a round-level failure.
-        // The job row is still present (the core never terminalizes), so the
-        // caller identity can be re-loaded for the route.
-        Err(e) => {
-            let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
-                &crate::session::store().conn,
-                job_id,
-                "Implement resume",
-                "Implement resume",
-            )
-            .await
-            else {
-                return;
-            };
-            let envelope = crate::jobs::complete_durable_job(
-                job_id,
-                build_async_implement_message(&Err(e)),
-                MessageKind::ImplementResult,
-                caller_role,
-                &caller.user_name,
-                &caller.channel,
-                &ws.name,
-            )
-            .await;
-            message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
-            return;
-        }
-    };
-    // Drain/shutdown fired after the round returned: abort quietly WITHOUT
-    // routing and WITHOUT deleting the row — the outcome is checkpointed (next
-    // boot reuses it) and routing a partial result here would race the exit.
-    if crate::shutdown::aborting() {
-        tracing::info!(job = %job_id, "Implement resume aborted — job stays for next boot");
-        return;
-    }
-    let envelope = crate::jobs::complete_durable_job(
-        job_id,
-        build_async_implement_message(&result),
-        MessageKind::ImplementResult,
-        caller_role,
-        &caller.user_name,
-        &caller.channel,
-        &ws.name,
-    )
-    .await;
-    message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
-}
-
-/// Build the `<implement-tool-result>` envelope message for an async implement
-/// dispatch. Reuses the shared analyze builder — the envelope shape that
-/// reaches the caller's agent channel is production code.
-fn build_async_implement_message(result: &anyhow::Result<String>) -> String {
-    crate::tools::analyze::build_async_result_envelope(result, "implement-tool-result")
+    crate::tools::SyncDurableCore::Implement
+        .resume_durable_round(job_id, ws)
+        .await;
 }
 
 #[cfg(test)]

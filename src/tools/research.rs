@@ -34,13 +34,13 @@ use crate::agent::message_router::{self, AgentJob, MessageKind};
 use crate::agent::{chat_request, role_tools_and_specs, run_default_agent};
 use crate::prompt::{load_prompt, substitute};
 use crate::retry::FailureClass;
-use crate::tools::Tool;
 use crate::tools::analyze::{
     AnalystFindings, Claim, RoundMember, VerificationResult, VerificationTarget,
-    await_round_members, build_async_result_envelope, dispatch_claim_verifiers, escape_fences,
-    extract_query_telemetry, extract_query_telemetry_from_history, load_analyst_angles,
-    max_confidence, normalize_claim, round_timeout,
+    await_round_members, dispatch_claim_verifiers, escape_fences, extract_query_telemetry,
+    extract_query_telemetry_from_history, load_analyst_angles, max_confidence, normalize_claim,
+    round_timeout,
 };
+use crate::tools::{Tool, build_async_result_envelope};
 use crate::{ChatMessage, ChatRequest, ChatRequestMeta, Role, ToolSpec, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
