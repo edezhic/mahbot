@@ -33,11 +33,18 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// URL regex: matches http:// and https:// URLs, stopping at whitespace, angle
 /// brackets, or double-quotes.
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).expect("URL regex must compile"));
+
+/// Process-global sequence for link-enricher session names. The
+/// `link-enricher-` prefix is load-bearing: `is_mahbot_session_name` sweeps
+/// only sessions starting with it. Unique suffixes keep concurrent
+/// `enrich_links` runs from sharing a browser session.
+static LINK_ENRICHER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The audio-transcription icon combo (sound written into text). Used both as
 /// the transcription-failure fallback and as the annotation for out-of-scope
@@ -619,9 +626,12 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
     // Fetch all URLs concurrently.
     let browser = std::sync::Arc::new(BrowserTool::default());
     let mut tasks = Vec::with_capacity(urls.len());
-    for (i, url) in urls.iter().enumerate() {
+    for url in &urls {
         let url = url.clone();
-        let tab = format!("link-enricher-{i}");
+        let tab = format!(
+            "link-enricher-{}",
+            LINK_ENRICHER_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
         let browser = std::sync::Arc::clone(&browser);
         tasks.push(tokio::spawn(async move {
             let result = browser.fetch_page_text(&url, &tab).await;
