@@ -109,13 +109,15 @@ async fn run_folder_exists(job_id: &str) -> bool {
 
 /// Does the run folder hold its command dump (the cleanup intent)? The
 /// cancel-sweep folder-release guard: a folder with a dump must survive for
-/// the cleanup tail / OS sweep. Fail-closed on the SAFE side — the OPPOSITE
-/// direction from [`run_folder_exists`]'s deliberate fail-open: a transient IO
-/// error assumes the dump IS present, so the folder is never released
-/// uncleaned and the handoff never skips cleanup dispatch. [`run_folder_exists`]
-/// fails open because error⇒false guards against re-dispatching a completed
-/// cleanup (the safe direction there); here error⇒true protects the intent.
-/// Only a genuine `Ok(false)` means "no dump".
+/// the cleanup tail / OS sweep.
+///
+/// Errors resolve to `true` (`unwrap_or(true)`), the OPPOSITE default of
+/// [`run_folder_exists`]: a transient IO error assumes the dump IS present,
+/// so the folder is never released uncleaned and the handoff never skips
+/// cleanup dispatch. Only a genuine `Ok(false)` means "no dump". (On the
+/// replay path [`run_folder_exists`] defaults to `false` instead, because
+/// error⇒false guards against re-dispatching a cleanup for a run that
+/// already completed.)
 pub(crate) async fn command_dump_exists(job_id: &str) -> bool {
     tokio::fs::try_exists(run_root_path(job_id).join("commands.dump"))
         .await

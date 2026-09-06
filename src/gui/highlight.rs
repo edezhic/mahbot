@@ -1,13 +1,16 @@
-//! Tree-sitter syntax highlighting for diff code lines.
+//! Tree-sitter syntax highlighting for diff code lines and the code editor.
 //!
 //! Provides per-language highlight queries that classify token spans into
 //! categories (keyword, string, comment, type, function, number, operator).
 //!
-//! Files are parsed in their entirety — the caller reads the old version
-//! (via `git show HEAD:<path>`) and new version (from disk), then passes
-//! the complete source to [`parse_file_highlights`] which distributes
+//! Diff view: files are parsed in their entirety — the caller reads the old
+//! version (via `git show HEAD:<path>`) and new version (from disk), then
+//! passes the complete source to [`parse_file_highlights`] which distributes
 //! tree-sitter captures across lines. This preserves multi-line context
 //! for block comments, docstrings, and multi-line strings.
+//!
+//! Editor: [`parse_highlights`] classifies a single in-memory buffer the
+//! same way for the live editor widget.
 
 use iced::Color;
 use std::collections::HashMap;

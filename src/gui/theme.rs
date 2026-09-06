@@ -81,7 +81,7 @@ pub fn log_level_color(level: &str) -> (Color, Color) {
     }
 }
 
-// ── Role badge colors (from roleConfig.ts) ───────────────────────
+// ── Role badge colors ────────────────────────────────────────────
 
 /// Translucent pill background for a badge foreground color: the foreground
 /// at 0.1 alpha. Single source of the badge-background math — the second
