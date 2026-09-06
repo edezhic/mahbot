@@ -187,25 +187,11 @@ impl<Message> MenuItem<Message> {
         label: String,
         action: Message,
     ) -> Self {
-        let glyph = icon()
-            .0
-            .chars()
-            .next()
-            .expect("lucide glyph strings are single characters");
+        let glyph = lucide_glyph(icon);
         Self {
             label,
             action: Some(action),
             icon: Some(glyph),
-        }
-    }
-
-    /// Create a disabled menu item (no action, rendered in muted style).
-    #[must_use]
-    pub fn disabled(label: String) -> Self {
-        Self {
-            label,
-            action: None,
-            icon: None,
         }
     }
 }
@@ -1384,15 +1370,16 @@ fn check_glyph() -> char {
     lucide_glyph(iced_fonts::lucide::advanced_text::check)
 }
 
-/// Lucide glyph for each role, matching [`theme::role_icon`] one-to-one.
+/// Lucide glyph for each role, kept in sync with [`theme::role_icon`] by hand.
 ///
 /// The glyphs come from iced_fonts' generated `lucide::advanced_text`
 /// module: iced_fonts_macros derives those functions from the pinned
 /// `fonts/lucide.ttf` cmap at build time, and `theme::role_icon` renders
-/// the very same codepoints via the `lucide::*` widget constructors — so
-/// this mapping can never drift from the sidebar/chat icons. The overlay
-/// cannot use child widgets, so it renders the glyphs manually with
-/// [`iced_fonts::LUCIDE_FONT`].
+/// the same codepoints via the `lucide::*` widget constructors — so the
+/// codepoints themselves are stable. The role→icon bindings, however, are
+/// two separate hand-written matches (one here, one in theme.rs) with no
+/// compile-time link. The overlay cannot use child widgets, so it renders
+/// the glyphs manually with [`iced_fonts::LUCIDE_FONT`].
 fn role_icon_glyph(role: crate::Role) -> char {
     let glyph = match role {
         crate::Role::Manager => iced_fonts::lucide::advanced_text::bot,
