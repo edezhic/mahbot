@@ -410,8 +410,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
             if mahbot::self_update::update_is_finalizing() {
                 break;
             }
-            // One hygiene round: WAL checkpoint + integrity verification
-            // sharing a single coordination-state inspection per store.
+            // One hygiene round: WAL checkpoint + integrity verification.
             mahbot::db::checkpoint::periodic_checkpoint_and_verify().await;
         }
     });

@@ -23,9 +23,8 @@
 //! still live, but turso serializes via its checkpoint lock, so the practical
 //! effect is busy→warn, not corruption) and
 //! [`periodic_checkpoint_and_verify`] (non-truncating below the WAL-size cap,
-//! TRUNCATE above it, plus integrity verification sharing one
-//! coordination-state inspection per store — the auto-checkpoint loop spawned
-//! by the binary's background task set).
+//! TRUNCATE above it, plus an independent per-store integrity verification —
+//! the auto-checkpoint loop spawned by the binary's background task set).
 //!
 //! A failed periodic checkpoint triggers runtime corruption recovery: the
 //! ticket-title FTS index is detect+repaired (see
@@ -125,9 +124,8 @@ impl CheckpointPolicy {
 /// Iterate all stores via [`crate::db::iter_checkpoint_stores`] and run an
 /// async operation on each initialized store in parallel.
 ///
-/// This is the shared iteration pattern used by
-/// [`checkpoint_all_databases`] and
-/// [`periodic_checkpoint_and_verify`]. Stores that
+/// This is the shared iteration pattern behind both public entry points
+/// (via [`checkpoint_stores`]). Stores that
 /// haven't been initialized yet (connection is `None`) are silently skipped.
 ///
 /// The operation closure receives `(&'static str, &'static Connection)` — the
@@ -166,31 +164,26 @@ where
 /// Checkpoint all Turso database stores before hard process termination.
 ///
 /// `std::process::exit(0)` bypasses Rust destructors, so Turso WAL connections
-/// are never properly closed. The TRUNCATE leaves a header-only WAL for a clean
-/// store handoff; committed data is already fsync-durable at COMMIT.
+/// are never properly closed. Runs TRUNCATE checkpoints — the exit-time path
+/// leaves a header-only WAL for a clean store handoff; why TRUNCATE is safe
+/// here and avoided by the periodic loop is the module-level invariant at the
+/// top of this file. The TRUNCATE is downgraded to PASSIVE when free disk
+/// space is below the ENOSPC gate (`truncate_allowed`).
 ///
-/// Always runs TRUNCATE checkpoints — the exit-time path (self-update handoff
-/// is single-writer; GUI shutdown runs while background writers are still live,
-/// but turso's checkpoint lock serializes them, so the effect is busy→warn, not
-/// corruption). Periodic checkpointing uses
-/// [`periodic_checkpoint_and_verify`] instead, which avoids TRUNCATE under
-/// live writers.
-///
-/// Skips stores that haven't been initialized yet, and stores whose WAL is
-/// structurally damaged (a corrupt main-DB header would make the checkpoint
-/// fail loudly). Logs and swallows
-/// per-store errors to avoid blocking shutdown.
+/// Skips stores that haven't been initialized yet; per-store errors are
+/// logged and swallowed to avoid blocking shutdown — a structurally-corrupt
+/// store's checkpoint is still attempted, with its failure logged.
 ///
 /// The store entries come from [`crate::db::iter_checkpoint_stores`] — the
-/// single source of truth for which stores get checkpointed.
+/// single source of truth for which stores get checkpointed. Periodic
+/// checkpointing uses [`periodic_checkpoint_and_verify`] instead.
 pub async fn checkpoint_all_databases() {
     checkpoint_stores(CheckpointRound::Exit).await;
 }
 
-/// One 5-minute hygiene round: WAL checkpoint + integrity verification,
-/// sharing a single store inspection per store — the checkpoint
-/// and verify loops would otherwise each run an `inspect_store`
-/// back-to-back. Also the periodic-loop policy: PASSIVE below the WAL-size
+/// One 5-minute hygiene round: WAL checkpoint + integrity verification (an
+/// independent `quick_check` per store). Also the periodic-loop policy:
+/// PASSIVE below the WAL-size
 /// cap, TRUNCATE above it — TRUNCATE resets the shared WAL frame index (the
 /// live-writer corruption vector), so it is avoided under live
 /// writers; the TRUNCATE-above-cap branch is the only mechanism that shrinks
@@ -227,14 +220,13 @@ async fn checkpoint_stores(round: CheckpointRound) {
     for_each_store(|name, conn| {
         let root = root.clone();
         async move {
-            // Single-process mode has no `.tshm` coordination and no external
-            // writer, so there is no coordination identity to re-check. Only
-            // the WAL size (for the TRUNCATE-vs-PASSIVE cap) needs the
-            // store inspection below; a structurally-corrupt store's
-            // checkpoint is attempted and its failure logged like any other.
-            let status = root
-                .as_deref()
-                .map(|r| crate::db::wal_guard::inspect_store(r, name));
+            // Single-process mode has no `.tshm` coordination and no
+            // external writer, so there is no coordination identity to
+            // re-check, and a structurally-corrupt store's checkpoint is
+            // attempted and its failure logged like any other. The only
+            // consumer of a store inspection is the periodic round's
+            // TRUNCATE-vs-PASSIVE cap (WAL size), so the exit round never
+            // runs `inspect_store`.
             let truncate = match policy {
                 // Exit-time TRUNCATE (self-update handoff / shutdown): the
                 // ENOSPC gate below applies here too — a TRUNCATE that runs
@@ -246,13 +238,17 @@ async fn checkpoint_stores(round: CheckpointRound) {
                 // at COMMIT regardless).
                 CheckpointPolicy::Truncate => truncate_gate,
                 CheckpointPolicy::PassiveCapped(cap) => {
-                    // PASSIVE while the WAL is absent/unmeasurable (status
-                    // None — unresolvable root or an unregistered store) or
+                    // PASSIVE while the WAL is absent/unmeasurable (the
+                    // inspection yields nothing — unresolvable root) or
                     // below the cap; TRUNCATE only above it. `truncate_gate`
                     // adds the free-space check for resolvable roots — it is
-                    // moot when `status` is None, which is exactly the
-                    // unresolvable-root case (no stores initialized anyway).
-                    status.as_ref().is_some_and(|s| s.wal_size > cap) && truncate_gate
+                    // moot when the inspection yields nothing, which is
+                    // exactly the unresolvable-root case (no stores
+                    // initialized anyway).
+                    root.as_deref()
+                        .map(|r| crate::db::wal_guard::inspect_store(r, name))
+                        .is_some_and(|s| s.wal_size > cap)
+                        && truncate_gate
                 }
             };
             let outcome = conn.checkpoint_mode(truncate).await;
@@ -281,11 +277,11 @@ async fn checkpoint_stores(round: CheckpointRound) {
                     }
                 }
             }
-            // Integrity verification shares the inspect above when this is
-            // the periodic round. Log-only: runtime-detected btree/index
-            // desync is healed at the next store init (boot), not in place
-            // mid-run. (The known FTS count-mismatch false positive is
-            // already filtered by the quick_check row scan.)
+            // Integrity verification is independent of the checkpoint.
+            // Log-only: runtime-detected btree/index desync is healed at
+            // the next store init (boot), not in place mid-run. (The known
+            // FTS count-mismatch false positive is already filtered by the
+            // quick_check row scan.)
             if verify {
                 match conn.quick_check().await {
                     Ok(()) => debug!(db = %name, "Database integrity check passed"),
