@@ -35,6 +35,9 @@ use serde_json::json;
 
 use crate::bench_openrouter::discovery::{DiscoverySnapshot, EndpointInfo, Pricing};
 use crate::bench_openrouter::run::ProviderRun;
+use crate::bench_openrouter::select::{
+    VALIDATED_MIX_CACHED, VALIDATED_MIX_INPUT, VALIDATED_MIX_OUTPUT,
+};
 use crate::bench_openrouter::{BenchOptions, discovery::parse_price};
 
 // ── Paths ──────────────────────────────────────────────────────────
@@ -396,9 +399,10 @@ pub(crate) fn build_summary_md(meta: &RunMeta, report: &serde_json::Value) -> St
     out
 }
 
-/// Static price per 1M tokens at the validated mix (0.977 cached / 0.014
-/// input / 0.009 output), volume-independent, no per-request fee. `None` when
-/// pricing is entirely absent.
+/// Static price per 1M tokens at the validated mix
+/// ([`VALIDATED_MIX_CACHED`] / [`VALIDATED_MIX_INPUT`] / [`VALIDATED_MIX_OUTPUT`]),
+/// volume-independent, no per-request fee. `None` when pricing is entirely
+/// absent.
 #[must_use]
 pub(crate) fn static_price_usd_per_m(pricing: Option<&Pricing>) -> Option<f64> {
     let p = pricing?;
@@ -410,7 +414,13 @@ pub(crate) fn static_price_usd_per_m(pricing: Option<&Pricing>) -> Option<f64> {
     let prompt = p.prompt.as_deref().and_then(parse_price)?;
     let completion = p.completion.as_deref().and_then(parse_price)?;
     Some(session_cost(
-        1e6, cache_read, prompt, completion, 0.977, 0.014, 0.009,
+        1e6,
+        cache_read,
+        prompt,
+        completion,
+        VALIDATED_MIX_CACHED,
+        VALIDATED_MIX_INPUT,
+        VALIDATED_MIX_OUTPUT,
     ))
 }
 
@@ -419,7 +429,7 @@ pub(crate) fn static_price_usd_per_m(pricing: Option<&Pricing>) -> Option<f64> {
 /// Session cost in USD for `total_tokens` tokens at the given per-token mix:
 /// `total_tokens × (mix_cached×cache_read + mix_input×prompt + mix_output×completion)`.
 #[must_use]
-pub(crate) fn session_cost(
+fn session_cost(
     total_tokens: f64,
     cache_read: f64,
     prompt: f64,
@@ -618,7 +628,6 @@ mod tests {
         assert!(s.contains("\"***\""), "expected redaction markers in {s}");
         assert_eq!(manifest["args"][2], "--api-key");
         assert_eq!(manifest["args"][3], "***");
-        assert_eq!(manifest["args"][4], "--api-key=***");
         assert_eq!(manifest["args"][4], "--api-key=***");
         assert_eq!(manifest["config"]["model"], "acme/m1");
         assert_eq!(manifest["outcome"]["exit_code"], 0);

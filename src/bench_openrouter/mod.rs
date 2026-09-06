@@ -871,8 +871,7 @@ async fn full_run(opts: &BenchOptions) -> i32 {
     })
     .await;
     if join.is_err() {
-        ctx.abort.cancel();
-        *ctx.abort_reason.lock().unwrap_poison() = Some("outer 60-minute deadline".to_string());
+        ctx.abort("outer 60-minute deadline".to_string());
         while let Some(res) = tasks.join_next().await {
             match res {
                 Ok(run) => provider_runs.push(run),

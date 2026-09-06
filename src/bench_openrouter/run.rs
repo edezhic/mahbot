@@ -14,8 +14,7 @@
 //!   verified tool frames of prior rounds ([`build_request_body`] /
 //!   [`build_messages`]). The prompt prefix is byte-identical across a run's
 //!   warmup and ladder rounds, so provider-side prompt caches can be
-//!   measured. `serde_json::json!` builds BTreeMap objects → sorted keys →
-//!   canonical JSON ([`canonical_messages_json`]).
+//!   measured. `serde_json::json!` builds BTreeMap objects → sorted keys.
 //! - **Warmup gate**: two byte-identical warmup requests (W1, W2) establish
 //!   the base cache. W1 also gates auth/quota failures before any spend.
 //! - **Cache-hold predicate**: a provider "does not cache" ONLY when its raw
@@ -153,7 +152,7 @@ pub(crate) fn generate_filler(prefix_chars: usize) -> String {
 /// One verified tool-call frame: the model called `fast_tool` with a step, and
 /// the executor records the call id + any reasoning fields for the next
 /// round's message history.
-pub(crate) struct ToolFrame {
+struct ToolFrame {
     pub id: String,
     pub step: u64,
     pub reasoning: Option<serde_json::Value>,
@@ -168,7 +167,7 @@ pub(crate) struct ToolFrame {
 /// prompt prefix (that would change it per round and break the cache
 /// measurement); the caller verifies the response against it separately.
 #[must_use]
-pub(crate) fn build_messages(base: &BasePrompt, frames: &[ToolFrame]) -> Vec<serde_json::Value> {
+fn build_messages(base: &BasePrompt, frames: &[ToolFrame]) -> Vec<serde_json::Value> {
     let mut messages = vec![
         json!({"role": "system", "content": base.system}),
         json!({"role": "user", "content": base.user}),
@@ -215,7 +214,7 @@ pub(crate) fn build_messages(base: &BasePrompt, frames: &[ToolFrame]) -> Vec<ser
 /// body either — it lives in the tool results, keeping the prompt prefix
 /// byte-identical across rounds.
 #[must_use]
-pub(crate) fn build_request_body(
+fn build_request_body(
     model: &str,
     base: &BasePrompt,
     frames: &[ToolFrame],
@@ -247,21 +246,11 @@ pub(crate) fn build_request_body(
     body
 }
 
-/// Canonical serialization of a message array — stable across calls (sorted
-/// keys via BTreeMap, no whitespace) so byte-identity can be asserted.
-// Kept for the byte-identity test (`canonical_messages_json_deterministic`);
-// production code no longer hashes or logs the canonical form.
-#[allow(dead_code)]
-#[must_use]
-pub(crate) fn canonical_messages_json(messages: &[serde_json::Value]) -> String {
-    serde_json::to_string(messages).expect("serializing a message array cannot fail")
-}
-
 // ── Wire types (permissive Deserialize) ────────────────────────────
 
 /// Prompt-token detail of a usage object.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct PromptTokensDetails {
+struct PromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: Option<u64>,
 }
@@ -270,7 +259,7 @@ pub(crate) struct PromptTokensDetails {
 // Deliberately trimmed to what the run consumes (prompt, cached, cost); serde
 // ignores the other wire fields (completion, totals, cache-miss, etc.).
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct RawUsage {
+struct RawUsage {
     #[serde(default)]
     pub prompt_tokens: Option<u64>,
     #[serde(default)]
@@ -287,7 +276,7 @@ pub(crate) struct RawUsage {
 // `usage_from` / the tool-call extraction; serde ignores the other wire fields
 // (id, created, model, etc.).
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct RawEnvelope {
+struct RawEnvelope {
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
@@ -298,7 +287,7 @@ pub(crate) struct RawEnvelope {
 
 /// One choice of a chat-completions response.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct RawChoice {
+struct RawChoice {
     #[serde(default)]
     pub finish_reason: Option<String>,
     #[serde(default)]
@@ -307,7 +296,7 @@ pub(crate) struct RawChoice {
 
 /// The assistant message of a choice.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct RawMessage {
+struct RawMessage {
     #[serde(default)]
     pub tool_calls: Option<Vec<RawToolCall>>,
     #[serde(default)]
@@ -320,7 +309,7 @@ pub(crate) struct RawMessage {
 
 /// One tool call of an assistant message.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct RawToolCall {
+struct RawToolCall {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
@@ -329,7 +318,7 @@ pub(crate) struct RawToolCall {
 
 /// The `function` object of a tool call.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct RawToolCallFunction {
+struct RawToolCallFunction {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -340,13 +329,24 @@ pub(crate) struct RawToolCallFunction {
 /// retries).
 // The outcome exposes only what the ladder consumes: the parsed envelope, the
 // error class, the response-cache flag, and the extracted tool-call fields.
-pub(crate) struct RoundOutcome {
+struct RoundOutcome {
     pub envelope: Option<RawEnvelope>,
     pub error_class: Option<String>,
     pub response_cache_hit: bool,
     pub tool_call_step: Option<u64>,
     pub tool_call_id: Option<String>,
     pub reasoning: Option<serde_json::Value>,
+}
+
+impl RoundOutcome {
+    /// The invalid-round reason for a round without an envelope: the recorded
+    /// error class, or `"http_error"` when none was recorded.
+    fn error_reason(&self) -> String {
+        self.error_class
+            .as_deref()
+            .unwrap_or("http_error")
+            .to_string()
+    }
 }
 
 // ── HTTP round ─────────────────────────────────────────────────────
@@ -393,11 +393,7 @@ fn classify_http_error(status: reqwest::StatusCode) -> Option<&'static str> {
 /// - 401 → `"auth"`, 402 → `"quota"`, other 4xx → `"http_4xx"`, no retry.
 /// - 2xx → `x-openrouter-cache-status` inspected for response-cache hits, body
 ///   parsed (parse failure → `"parse"`).
-pub(crate) async fn send_round(
-    client: &reqwest::Client,
-    key: &str,
-    body: &serde_json::Value,
-) -> RoundOutcome {
+async fn send_round(client: &reqwest::Client, key: &str, body: &serde_json::Value) -> RoundOutcome {
     let mut attempts = 0u32;
     let mut http_status = 0u16;
     let mut envelope: Option<RawEnvelope> = None;
@@ -537,7 +533,7 @@ fn combine_reasoning(msg: &RawMessage) -> Option<serde_json::Value> {
 /// Aggregated usage of one round (derived from the raw envelope) — only the
 /// fields the cache-hold predicate and the budget need.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct RoundUsage {
+struct RoundUsage {
     pub prompt_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
     pub cost: Option<f64>,
@@ -614,6 +610,15 @@ impl RunBudget {
     pub(crate) fn total(&self) -> f64 {
         *self.total_spent.lock().unwrap_poison()
     }
+
+    /// The abort reason for an exceeded total spend cap.
+    fn cap_exceeded_reason(&self) -> String {
+        format!(
+            "spend cap exceeded (${:.4} > ${:.4})",
+            self.total(),
+            self.cap_usd
+        )
+    }
 }
 
 /// Shared context for one provider run: budget, abort token, abort reason and
@@ -623,6 +628,15 @@ pub(crate) struct RunContext {
     pub abort: tokio_util::sync::CancellationToken,
     pub abort_reason: std::sync::Mutex<Option<String>>,
     pub deadline: Instant,
+}
+
+impl RunContext {
+    /// Abort the whole run: cancel the abort token (every ladder sleep races
+    /// it) and record `reason` (reported in the manifest and the summary).
+    pub(crate) fn abort(&self, reason: String) {
+        self.abort.cancel();
+        *self.abort_reason.lock().unwrap_poison() = Some(reason);
+    }
 }
 
 // ── Per-provider run ───────────────────────────────────────────────
@@ -676,9 +690,7 @@ pub(crate) async fn run_provider(
     // token (no wasted W2 + ladder spend).
     if let Some(class) = outcome_w1.error_class.as_deref() {
         if class == "auth" || class == "quota" {
-            let reason = format!("warmup failed ({class}); provider '{tag}'");
-            context.abort.cancel();
-            *context.abort_reason.lock().unwrap_poison() = Some(reason.clone());
+            context.abort(format!("warmup failed ({class}); provider '{tag}'"));
             tracing::debug!(tag = %tag, class, "provider aborted during warmup");
             return ProviderRun::not_measured(tag);
         }
@@ -717,13 +729,7 @@ pub(crate) async fn run_provider(
         + usage_from(outcome_w2.envelope.as_ref()).cost.unwrap_or(0.0);
     let (over_guard, over_cap) = context.budget.record(&tag, w_cost);
     if over_cap {
-        let total = context.budget.total();
-        let reason = format!(
-            "spend cap exceeded (${total:.4} > ${:.4})",
-            context.budget.cap_usd
-        );
-        context.abort.cancel();
-        *context.abort_reason.lock().unwrap_poison() = Some(reason.clone());
+        context.abort(context.budget.cap_exceeded_reason());
         return ProviderRun::not_measured(tag);
     }
     if over_guard {
@@ -736,9 +742,7 @@ pub(crate) async fn run_provider(
     // burn the full ladder on likely-failing rounds).
     if let Some(class) = outcome_w2.error_class.as_deref() {
         if class == "auth" || class == "quota" {
-            let reason = format!("warmup failed ({class}); provider '{tag}'");
-            context.abort.cancel();
-            *context.abort_reason.lock().unwrap_poison() = Some(reason.clone());
+            context.abort(format!("warmup failed ({class}); provider '{tag}'"));
             tracing::debug!(tag = %tag, class, "provider aborted during warmup 2");
             return ProviderRun::not_measured(tag);
         }
@@ -771,9 +775,9 @@ pub(crate) async fn run_provider(
             ROUND_MAX_TOKENS,
         );
         let nominal_gap_secs = if r == 0 {
-            Some(0.0)
+            0.0
         } else {
-            Some(ladder_secs[r - 1] as f64)
+            ladder_secs[r - 1] as f64
         };
 
         let mut outcome = send_round(client, key, &body).await;
@@ -782,12 +786,7 @@ pub(crate) async fn run_provider(
 
         // 1. Envelope present? (send_round already recorded the error class.)
         if outcome.envelope.is_none() {
-            invalid_reason = Some(
-                outcome
-                    .error_class
-                    .clone()
-                    .unwrap_or_else(|| "http_error".to_string()),
-            );
+            invalid_reason = Some(outcome.error_reason());
         }
 
         // 2. Response-cache detection: a hit means OpenRouter answered from
@@ -799,12 +798,7 @@ pub(crate) async fn run_provider(
             if outcome.response_cache_hit {
                 invalid_reason = Some("response_cache".to_string());
             } else if outcome.envelope.is_none() {
-                invalid_reason = Some(
-                    outcome
-                        .error_class
-                        .clone()
-                        .unwrap_or_else(|| "http_error".to_string()),
-                );
+                invalid_reason = Some(outcome.error_reason());
             }
         }
 
@@ -819,12 +813,7 @@ pub(crate) async fn run_provider(
                 outcome = send_round(client, key, &body).await;
                 round_billed += usage_from(outcome.envelope.as_ref()).cost.unwrap_or(0.0);
                 if outcome.envelope.is_none() {
-                    invalid_reason = Some(
-                        outcome
-                            .error_class
-                            .clone()
-                            .unwrap_or_else(|| "http_error".to_string()),
-                    );
+                    invalid_reason = Some(outcome.error_reason());
                 } else {
                     let serving2 = outcome
                         .envelope
@@ -863,12 +852,7 @@ pub(crate) async fn run_provider(
                         outcome = send_round(client, key, &retry_body).await;
                         round_billed += usage_from(outcome.envelope.as_ref()).cost.unwrap_or(0.0);
                         if outcome.envelope.is_none() {
-                            invalid_reason = Some(
-                                outcome
-                                    .error_class
-                                    .clone()
-                                    .unwrap_or_else(|| "http_error".to_string()),
-                            );
+                            invalid_reason = Some(outcome.error_reason());
                         } else if outcome.tool_call_step != Some(next_step) {
                             invalid_reason = Some("no_tool_call".to_string());
                         }
@@ -906,7 +890,7 @@ pub(crate) async fn run_provider(
         };
         let classification_str = classification.as_str();
         classifications.push(classification);
-        nominal_gaps.push(nominal_gap_secs.unwrap_or(0.0));
+        nominal_gaps.push(nominal_gap_secs);
 
         // 6. Spend accounting.
         let (over_guard, over_cap) = context.budget.record(&tag, round_billed);
@@ -914,13 +898,7 @@ pub(crate) async fn run_provider(
             break;
         }
         if over_cap {
-            let total = context.budget.total();
-            let reason = format!(
-                "spend cap exceeded (${total:.4} > ${:.4})",
-                context.budget.cap_usd
-            );
-            context.abort.cancel();
-            *context.abort_reason.lock().unwrap_poison() = Some(reason.clone());
+            context.abort(context.budget.cap_exceeded_reason());
             break;
         }
 
@@ -934,8 +912,7 @@ pub(crate) async fn run_provider(
         }
 
         eprintln!(
-            "bench [{tag}] rung {r} gap={}s {}",
-            nominal_gap_secs.unwrap_or(0.0),
+            "bench [{tag}] rung {r} gap={nominal_gap_secs}s {}",
             invalid_reason.as_deref().unwrap_or(classification_str),
         );
 
@@ -1159,22 +1136,6 @@ mod tests {
         assert_eq!(
             classify_http_error(reqwest::StatusCode::BAD_REQUEST),
             Some("http_4xx")
-        );
-    }
-
-    #[test]
-    fn canonical_messages_json_deterministic() {
-        let msgs = build_messages(&base(), &[]);
-        let a = canonical_messages_json(&msgs);
-        let b = canonical_messages_json(&msgs);
-        assert_eq!(a, b);
-        assert!(a.contains("\"content\":\"sys\""));
-        assert!(a.contains("\"role\":\"system\""));
-        // Round 0's body must be byte-identical to W2's (the base prompt only).
-        let body = build_request_body("m", &base(), &[], "t", None, 128);
-        assert_eq!(
-            canonical_messages_json(body["messages"].as_array().expect("messages")),
-            a
         );
     }
 }
