@@ -1,7 +1,8 @@
 //! Code editor dashboard page — tabbed code editor with file tree, syntax-aware
 //! editing, and workspace-backed tab persistence.
 //!
-//! Layout: split view of a fixed-width file tree (left) and a tabbed editor
+//! Layout: split view of an auto-sizing file tree (left, widest visible
+//! row clamped to TREE_MIN_WIDTH..TREE_MAX_WIDTH) and a tabbed editor
 //! (right, filling the remaining width). Workspace selection is handled by
 //! the Dashboard workspace picker. Tabs persist to the workspace
 //! database and are restored on workspace selection.
@@ -135,14 +136,14 @@ fn bar_harness<'a>(bar: impl Into<Element<'a, EditorMessage>>) -> Element<'a, Ed
 
 /// File-system entry for the directory tree.
 #[derive(Debug, Clone)]
-pub struct FsEntry {
-    pub name: String,
+struct FsEntry {
+    name: String,
     /// Path relative to the workspace root.
-    pub full_path: String,
-    pub is_dir: bool,
+    full_path: String,
+    is_dir: bool,
     /// Error message if this entry couldn't be properly inspected
     /// (broken symlink, permission denied, etc.).
-    pub error: Option<String>,
+    error: Option<String>,
 }
 
 /// A single editor tab (metadata, no content).
@@ -250,7 +251,7 @@ enum GlobalSearchStatus {
 /// Owned representation of a single grep match, extracted from
 /// `fff_search::GrepResult` so it can cross async boundaries.
 #[derive(Debug, Clone)]
-pub struct OwnedGrepMatch {
+struct OwnedGrepMatch {
     /// Absolute filesystem path to the matched file.
     abs_path: String,
     /// Relative path (for display).
@@ -325,7 +326,7 @@ enum TabDirection {
 
 /// Data returned from the async file load operation.
 #[derive(Debug, Clone)]
-pub struct FileLoadData {
+struct FileLoadData {
     path: String,
     text: String,
     line_ending: LineEnding,
@@ -333,7 +334,7 @@ pub struct FileLoadData {
 
 /// What to do with a dirty tab when closing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CloseAction {
+enum CloseAction {
     Save,
     Discard,
     Cancel,
@@ -355,7 +356,7 @@ enum PendingCloseAction {
 
 /// Raw data loaded from a saved tab entry (string content, not Content).
 #[derive(Debug, Clone)]
-pub struct SavedTabData {
+struct SavedTabData {
     file_path: String,
     text: String,
     was_dirty: bool,
@@ -366,7 +367,11 @@ pub struct SavedTabData {
 
 // ── Messages ─────────────────────────────────────────────────────
 
+// EditorMessage's public variants carry editor-internal payload types
+// (FsEntry, OwnedGrepMatch, FileLoadData, CloseAction, SavedTabData,
+// ReadDirError); re-pub any of them only together with dropping this expect.
 #[derive(Debug, Clone)]
+#[expect(private_interfaces)]
 pub enum EditorMessage {
     /// Workspace selected via the Dashboard workspace picker (name,
     /// optional filesystem path).
@@ -775,7 +780,7 @@ fn update_entry_path(entry: &mut FsEntry, old_prefix: &str, new_prefix: &str) {
 /// silently) apart from real problems (permission denied, I/O errors)
 /// that still need to be surfaced.
 #[derive(Debug, Clone)]
-pub enum ReadDirError {
+enum ReadDirError {
     /// The directory does not exist, or is not a directory. This is a
     /// routine scenario — callers should silently forget the path.
     NotFound,
