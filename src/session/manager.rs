@@ -452,7 +452,7 @@ impl Session {
 
     /// Replace the in-memory and persisted history with a compacted version
     /// containing a fresh system prompt (via `build_context_messages`), the
-    /// given `summary_text`, and the latest [`crate::session::RETENTION_PER_SIDE`]
+    /// given `summary_text`, and the latest [`super::RETENTION_PER_SIDE`]
     /// user messages + assistant answers from the pre-compaction history
     /// (tool traffic excluded — see `select_retention_window`).
     ///

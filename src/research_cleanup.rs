@@ -1128,21 +1128,7 @@ mod tests {
 
         // One artist session mentioning the first file by absolute path.
         let session = format!("[IMAGE:{}]", mentioned.canonicalize().unwrap().display());
-        let conn = &crate::session::store().conn;
-        let now = crate::db::now();
-        conn.execute(
-            "INSERT INTO session_metadata (agent_id, last_activity, user_name, workspace_name, role, created_at) \
-             VALUES ('artist_a', ?1, 'alice', 'personal:alice', 'artist', ?1)",
-            params![now.clone()],
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO sessions (agent_id, role, content, created_at) VALUES ('artist_a', 'assistant', ?1, ?2)",
-            params![session, now],
-        )
-        .await
-        .unwrap();
+        insert_artist_session("artist_a", "alice", &session).await;
 
         reset_media_cursors().await;
         let n = sweep_media_at(userspaces.path()).await.unwrap();

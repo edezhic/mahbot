@@ -22,7 +22,7 @@
 //! # Exclusion list
 //!
 //! The poller skips `manager_*` (Manager has its own lifecycle) plus every
-//! prefix in [`crate::session::TRANSIENT_AGENT_ID_PREFIXES`] (transient or
+//! prefix in [`super::TRANSIENT_AGENT_ID_PREFIXES`] (transient or
 //! background-only agents).
 //!
 //! Only direct user-agent sessions (format `{user}_{ws}_{role}`, or the
@@ -380,7 +380,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
 
 /// Returns `true` if the agent ID belongs to a session that should NOT be
 /// recovered by the poller (`manager_` plus every
-/// [`crate::session::TRANSIENT_AGENT_ID_PREFIXES`] prefix).
+/// [`super::TRANSIENT_AGENT_ID_PREFIXES`] prefix).
 ///
 /// Note: the poller itself uses SQL-side filtering now — this function is
 /// retained for test coverage and as documentation of the exclusion criteria.
@@ -398,7 +398,7 @@ fn is_excluded_agent_id(agent_id: &str) -> bool {
 ///
 /// # Preconditions
 ///
-/// Caller must have already called [`get_session_context`](crate::session::SessionStore::get_session_context)
+/// Caller must have already called [`get_session_context`](super::SessionStore::get_session_context)
 /// and validated that the role can be parsed.  The routing is fire-and-forget
 /// (sends on an mpsc channel).
 fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {

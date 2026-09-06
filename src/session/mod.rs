@@ -50,7 +50,7 @@ pub(crate) const SUMMARIZATION_IMAGE_COUNT: usize = 10;
 
 /// Number of latest user messages / assistant answers retained per side
 /// after summarization compaction.
-pub(crate) const RETENTION_PER_SIDE: usize = 3;
+const RETENTION_PER_SIDE: usize = 3;
 
 /// Decode the tool-call payload of a native assistant history frame.
 /// Returns `Some(calls)` only when the message decodes as an assistant frame
@@ -76,7 +76,7 @@ fn is_tool_call_frame(msg: &ChatMessage) -> bool {
 /// dead-session recovery poller. Mirrors [`Session::pending_tool_calls`]:
 /// a frame that is the session TAIL can have no following result rows, so
 /// non-empty calls there means unresolved calls.
-pub(crate) fn is_dangling_tool_call_frame(role: ChatRole, content: &str) -> bool {
+fn is_dangling_tool_call_frame(role: ChatRole, content: &str) -> bool {
     decoded_tool_calls(&ChatMessage {
         role,
         content: content.to_string(),
@@ -181,7 +181,7 @@ crate::columns! {
 ///
 /// If a new agent role is added that can talk to users directly, its agent ID prefix
 /// must also be excluded from this list.
-pub(crate) const TRANSIENT_AGENT_ID_PREFIXES: &[&str] = &[
+const TRANSIENT_AGENT_ID_PREFIXES: &[&str] = &[
     "ticket_",
     "analyze_",
     "research_",
@@ -305,11 +305,7 @@ async fn insert_messages_in_transaction(
             // (the session's creation timestamp); it must never be touched by
             // the ON CONFLICT DO UPDATE clause below.
             let created_at = now.clone();
-            let count_clause = if replace {
-                "message_count = excluded.message_count"
-            } else {
-                "message_count = message_count + excluded.message_count"
-            };
+            let count_clause = message_count_clause(replace);
             tx.execute(
                 &format!(
                     "INSERT INTO session_metadata (agent_id, last_activity, message_count, \
@@ -341,11 +337,23 @@ async fn insert_messages_in_transaction(
     Ok(())
 }
 
+/// The `ON CONFLICT` message-count clause shared by both `session_metadata`
+/// upserts: `replace=true` overwrites (the old rows were already deleted, so
+/// a shared increment would double-count), `replace=false` appends. This must
+/// stay separate from the [`SessionStore::set_metadata_value`] upsert, which deliberately
+/// never touches `last_activity`.
+fn message_count_clause(replace: bool) -> &'static str {
+    if replace {
+        "message_count = excluded.message_count"
+    } else {
+        "message_count = message_count + excluded.message_count"
+    }
+}
+
 /// Upsert the context-free `session_metadata` count row: `last_activity` is
 /// stamped, `message_count` is added on append/settle (`replace=false`) or
-/// overwritten on the replace path (`replace=true`, where the old rows are
-/// already deleted so a shared increment would double-count). `created_at`
-/// is INSERT-only: it stamps the session's creation time and is never touched
+/// overwritten on the replace path (`replace=true`). `created_at` is
+/// INSERT-only: it stamps the session's creation time and is never touched
 /// by the ON CONFLICT clause.
 async fn upsert_message_count(
     tx: &TxGuard<'_>,
@@ -354,11 +362,7 @@ async fn upsert_message_count(
     now: &str,
     replace: bool,
 ) -> Result<()> {
-    let count_clause = if replace {
-        "message_count = excluded.message_count"
-    } else {
-        "message_count = message_count + excluded.message_count"
-    };
+    let count_clause = message_count_clause(replace);
     tx.execute(
         &format!(
             "INSERT INTO session_metadata (agent_id, last_activity, message_count, created_at) \
@@ -881,7 +885,7 @@ impl SessionStore {
     ///
     /// Uses parameterised `NOT LIKE ?N` placeholders with the prefix patterns
     /// passed as query parameters — no string interpolation into SQL.
-    pub(crate) async fn list_sessions_with_metadata_excluding(
+    async fn list_sessions_with_metadata_excluding(
         &self,
         exclude_prefixes: &[&str],
     ) -> Vec<SessionMetadata> {
@@ -935,7 +939,7 @@ impl SessionStore {
     /// Retrieve stored session context for a given agent ID.
     /// Returns `None` if the session has no metadata or the context columns
     /// are null.
-    pub(crate) async fn get_session_context(&self, agent_id: &str) -> Option<SessionContext> {
+    async fn get_session_context(&self, agent_id: &str) -> Option<SessionContext> {
         let rows = self
             .conn
             .query(
@@ -1103,15 +1107,12 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
         .join(" OR ");
     let prefix_patterns = format!("({likes})");
 
-    let build_params = {
-        let mut p = vec![Value::Text(cutoff.to_string())];
-        p.extend(
-            TRANSIENT_AGENT_ID_PREFIXES
-                .iter()
-                .map(|prefix| Value::Text(format!("{prefix}%"))),
-        );
-        p
-    };
+    let mut build_params = vec![Value::Text(cutoff.to_string())];
+    build_params.extend(
+        TRANSIENT_AGENT_ID_PREFIXES
+            .iter()
+            .map(|prefix| Value::Text(format!("{prefix}%"))),
+    );
 
     // Safety-critical predicate shared by both DELETEs. The agents table IS
     // the protection marker: a session referenced by any agents row is never
