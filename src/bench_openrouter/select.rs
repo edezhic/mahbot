@@ -183,7 +183,7 @@ pub(crate) fn is_healthy_status(s: Option<&str>) -> bool {
 
 /// True iff the endpoint tag is a `:free` variant.
 #[must_use]
-pub(crate) fn is_free_variant(tag: &str) -> bool {
+fn is_free_variant(tag: &str) -> bool {
     tag.ends_with(":free")
 }
 
@@ -193,7 +193,7 @@ pub(crate) fn is_free_variant(tag: &str) -> bool {
 ///
 /// Returns `(healthy, reason)`; `healthy` is `reason.is_none()`.
 #[must_use]
-pub(crate) fn classify_endpoint(
+fn classify_endpoint(
     endpoint: &EndpointInfo,
     min_context: i64,
     allowlist: Option<&[String]>,
@@ -391,7 +391,7 @@ fn pad_to_three(
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-pub(crate) fn selection_target(healthy_count: usize) -> usize {
+fn selection_target(healthy_count: usize) -> usize {
     (3usize).max((healthy_count as f64 * 0.8).ceil() as usize)
 }
 

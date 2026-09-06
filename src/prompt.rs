@@ -106,7 +106,7 @@ pub(crate) fn wrap_workspace_context(content: &str) -> String {
 /// (the same fallback role agents use). The block is stable per workspace —
 /// it does not vary between requests. Returns an empty string when no
 /// context source has content (no stored row and no context files).
-pub(crate) async fn build_general_workspace_context(ws: &crate::Workspace) -> String {
+async fn build_general_workspace_context(ws: &crate::Workspace) -> String {
     // Degrade to the file-derived fallback when the store is uninitialized
     // (e.g. early tests) — never panic on a missing global.
     let stored = match crate::workspace::WORKSPACES.get() {

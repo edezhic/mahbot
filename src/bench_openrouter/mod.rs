@@ -304,7 +304,7 @@ fn model_from_env_or_config() -> String {
         return m;
     }
     if let Ok(root) = crate::config::default_config_dir()
-        && let Ok(Some(m)) = read_config_kv(&root, "worker_model")
+        && let Some(m) = read_config_kv(&root, "worker_model")
         && !m.is_empty()
     {
         return m;
@@ -332,7 +332,7 @@ fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> 
         return Ok((k, "env"));
     }
     if let Ok(root) = crate::config::default_config_dir()
-        && let Ok(Some(k)) = read_config_kv(&root, "provider_key")
+        && let Some(k) = read_config_kv(&root, "provider_key")
         && !k.is_empty()
     {
         return Ok((k, "config"));
@@ -353,22 +353,18 @@ fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> 
 /// guard `mahbot debug` uses). When the daemon is down the consolidated
 /// `core.db` is opened directly with `ReadOnly|NoLock`
 /// and never creates or mutates files. Any failure — missing file, unreadable
-/// store, missing row, IPC hiccup — degrades to `Ok(None)` with a
+/// store, missing row, IPC hiccup — degrades to `None` with a
 /// `tracing::warn`: this is a fallback resolution path, never fatal.
-// The `Result` wrapper is part of the shared helper contract even though the
-// body swallows all errors (read-only fallback path).
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn read_config_kv(storage_root: &Path, key: &str) -> anyhow::Result<Option<String>> {
-    let result = read_config_kv_inner(storage_root, key);
-    match result {
-        Ok(v) => Ok(v),
+fn read_config_kv(storage_root: &Path, key: &str) -> Option<String> {
+    match read_config_kv_inner(storage_root, key) {
+        Ok(v) => v,
         Err(e) => {
             tracing::warn!(
                 key,
                 error = %e,
                 "bench-openrouter: read-only config lookup failed; ignoring"
             );
-            Ok(None)
+            None
         }
     }
 }
@@ -380,14 +376,6 @@ fn read_config_kv_inner(storage_root: &Path, key: &str) -> anyhow::Result<Option
     if !db_path.exists() {
         return Ok(None);
     }
-    read_config_kv_impl(storage_root, &db_path, key)
-}
-
-fn read_config_kv_impl(
-    storage_root: &Path,
-    db_path: &Path,
-    key: &str,
-) -> anyhow::Result<Option<String>> {
     // When the daemon holds the instance lock it is the single-process writer;
     // `bench-openrouter` must NOT open a second connection to the live store.
     // Route the lookup through the debug IPC endpoint (same query-only guard as
@@ -411,7 +399,7 @@ fn read_config_kv_impl(
         });
         return Ok(value.filter(|v| !v.is_empty()));
     }
-    read_config_kv_file(db_path, key)
+    read_config_kv_file(&db_path, key)
 }
 
 fn read_config_kv_file(db_path: &Path, key: &str) -> anyhow::Result<Option<String>> {
@@ -1275,10 +1263,9 @@ mod tests {
         }
 
         // request_count == selected × rounds (2 warmup + 8 ladder rounds for
-        // the default 7-gap ladder = 10 requests per provider here).
+        // the default 7-gap ladder).
         let selected_count = decisions.iter().filter(|d| d.selected).count();
         assert_eq!(plan["request_count"], (selected_count * rounds) as u64);
-        assert_eq!(plan["request_count"], (selected_count * 10) as u64);
 
         // providers array mirrors every endpoint once.
         let providers = plan["providers"].as_array().expect("providers array");

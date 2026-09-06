@@ -100,10 +100,7 @@ pub(crate) fn classify_round(cached: u64, expected_cached: u64) -> CacheClassifi
 ///   full default ladder; a shortened ladder reports its actual last gap).
 ///   Partial rounds count as held (they are not Drops).
 #[must_use]
-pub(crate) fn ttl_bucket(
-    classifications: &[CacheClassification],
-    nominal_gaps_secs: &[f64],
-) -> String {
+fn ttl_bucket(classifications: &[CacheClassification], nominal_gaps_secs: &[f64]) -> String {
     let ladder: Vec<(CacheClassification, f64)> = classifications
         .iter()
         .zip(nominal_gaps_secs)
@@ -214,7 +211,7 @@ pub(crate) fn cache_hold_result(
 /// `hi == ∞` renders `≥{lo}` (`lo == 0.0` → `≥0s`); a degenerate `(0, 0]`
 /// bucket renders `0s`.
 #[must_use]
-pub(crate) fn format_bucket(lo: f64, hi: f64) -> String {
+fn format_bucket(lo: f64, hi: f64) -> String {
     if hi.is_infinite() {
         format!("≥{}", format_duration(lo))
     } else if lo == 0.0 {
