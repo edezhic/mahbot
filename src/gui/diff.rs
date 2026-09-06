@@ -317,12 +317,12 @@ impl DiffState {
         self.current_commit_message.as_deref()
     }
 
-    /// The short hash (8 chars) of the commit currently being viewed, if any.
+    /// The short hash (7 chars) of the commit currently being viewed, if any.
     #[must_use]
     pub fn commit_short_hash(&self) -> Option<&str> {
         self.current_commit_ref
             .as_deref()
-            .map(|h| if h.len() > 8 { &h[..8] } else { h })
+            .map(|h| h.get(..7).unwrap_or(h))
     }
 
     pub fn subscription(&self) -> iced::Subscription<DiffMessage> {
@@ -759,7 +759,7 @@ impl DiffState {
         // Build the header row: commit controls or commit-view banner.
         let header = if let Some(ref hash) = self.current_commit_ref {
             // Historical commit view — show banner with Back button.
-            let short_hash: String = hash.chars().take(7).collect();
+            let short_hash = hash.get(..7).unwrap_or(hash);
             let back_btn = button("Back to working tree")
                 .on_press(DiffMessage::BackToWorkingTree)
                 .style(theme::button_secondary);

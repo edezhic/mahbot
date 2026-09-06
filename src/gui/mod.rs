@@ -2007,7 +2007,7 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
             .commit_message()
             .unwrap_or("(no commit message)")
             .to_string();
-        let hash = diff_state.commit_short_hash().unwrap_or("????????");
+        let hash = diff_state.commit_short_hash().unwrap_or("???????");
         column![
             widgets::section_heading(msg),
             text(hash).size(theme::TEXT_12).color(theme::TEXT_SECONDARY),
