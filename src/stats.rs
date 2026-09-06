@@ -23,7 +23,6 @@ crate::columns! {
         ERROR_MESSAGE  => "COALESCE(error_message, '') AS error_message",
         ARGUMENTS      => "arguments",
         DURATION_MS    => "duration_ms",
-        SUCCESS        => "success",
         WORKSPACE      => "workspace",
         RECORDED_AT    => "recorded_at",
     }
@@ -37,14 +36,11 @@ pub struct ToolErrorEntry {
     pub error_message: String,
     pub arguments: String,
     pub duration_ms: i64,
-    pub success: bool,
     pub workspace: String,
     pub recorded_at: String,
 }
 
 /// Query filters for [`crate::logs::LogStore::query_tool_errors`].
-///
-/// All fields are optional — `None` means no filter is applied.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ToolErrorQuery {
     /// Optional search text filter (substring match via `LIKE` on error text).
@@ -104,7 +100,6 @@ impl crate::logs::LogStore {
                 error_message: row.get::<String>(COL_TE_ERROR_MESSAGE)?,
                 arguments: row.get::<String>(COL_TE_ARGUMENTS)?,
                 duration_ms: row.get::<i64>(COL_TE_DURATION_MS)?,
-                success: row.get::<i64>(COL_TE_SUCCESS)? != 0,
                 workspace: row.get::<String>(COL_TE_WORKSPACE)?,
                 recorded_at: row.get::<String>(COL_TE_RECORDED_AT)?,
             });
@@ -535,7 +530,6 @@ mod tests {
         assert_eq!(errors.len(), 1, "should return 1 entry");
         assert_eq!(errors[0].tool_name, "write");
         assert!(errors[0].error_message.contains("permission denied"));
-        assert!(!errors[0].success);
         assert_eq!(errors[0].duration_ms, 0);
         assert_eq!(errors[0].arguments, r#"{"path":"src/lib.rs"}"#);
         assert_eq!(errors[0].role, "Engineer");
