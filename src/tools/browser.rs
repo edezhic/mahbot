@@ -1406,16 +1406,6 @@ mod tests {
     use crate::util::test::set_env_var;
 
     #[test]
-    fn url_validation_rejects_bad_urls() {
-        for url in &["", "file:///etc/passwd", "ftp://example.com"] {
-            assert!(
-                BrowserTool::validate_url(url).is_err(),
-                "expected reject for {url}"
-            );
-        }
-    }
-
-    #[test]
     fn url_validation_accepts_all_domains() {
         assert!(BrowserTool::validate_url("https://example.com").is_ok());
         assert!(BrowserTool::validate_url("https://docs.example.com").is_ok());

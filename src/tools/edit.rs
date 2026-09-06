@@ -949,44 +949,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_write_mode_creates_file() {
-        let dir = TempDir::new().unwrap();
+    async fn edit_write_mode_treats_omitted_and_empty_old_string_alike() {
+        struct Case {
+            name: &'static str,
+            old_string: Option<&'static str>,
+        }
+        for case in [
+            Case {
+                name: "omitted old_string",
+                old_string: None,
+            },
+            Case {
+                name: "empty old_string",
+                old_string: Some(""),
+            },
+        ] {
+            let dir = TempDir::new().unwrap();
 
-        let result = EditTool
-            .execute(
-                &Workspace::from_path(dir.path()),
-                json!({"path": "out.txt", "new_string": "written!"}),
-            )
-            .await;
-        assert!(result.is_ok(), "write mode should succeed: {result:?}");
-        let result = result.unwrap();
-        assert!(result.contains("8 bytes"));
+            let mut args = json!({"path": "out.txt", "new_string": "written!"});
+            if let Some(old) = case.old_string {
+                args["old_string"] = json!(old);
+            }
 
-        let content = tokio::fs::read_to_string(dir.path().join("out.txt"))
-            .await
-            .unwrap();
-        assert_eq!(content, "written!");
-    }
+            let result = EditTool.execute(&test_ws(dir.path()), args).await;
+            assert!(result.is_ok(), "{} should succeed: {result:?}", case.name);
+            assert!(
+                result.unwrap().contains("8 bytes"),
+                "{} should report written size",
+                case.name
+            );
 
-    #[tokio::test]
-    async fn edit_write_mode_with_empty_old_string() {
-        let dir = TempDir::new().unwrap();
-
-        let result = EditTool
-            .execute(
-                &test_ws(dir.path()),
-                json!({"path": "out.txt", "old_string": "", "new_string": "content"}),
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "write mode with empty old_string: {result:?}"
-        );
-
-        let content = tokio::fs::read_to_string(dir.path().join("out.txt"))
-            .await
-            .unwrap();
-        assert_eq!(content, "content");
+            let content = tokio::fs::read_to_string(dir.path().join("out.txt"))
+                .await
+                .unwrap();
+            assert_eq!(content, "written!", "{}", case.name);
+        }
     }
 
     #[tokio::test]
