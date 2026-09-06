@@ -195,6 +195,15 @@ use crate::util::json::{
     get_usize,
 };
 
+/// Prepend a note about argument normalization so the model can see what was
+/// silently corrected (e.g. flattened fields, XML wrapping).
+pub(crate) fn with_normalization_notes(output: String, notes: &[String]) -> String {
+    if notes.is_empty() {
+        return output;
+    }
+    format!("[normalized] {}\n{output}", notes.join("; "))
+}
+
 /// Build a JSON schema for tool parameters.
 ///
 /// Wraps `properties` in the standard `{"type": "object", "properties": {...}}`

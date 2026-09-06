@@ -46,7 +46,7 @@ impl BrowserResponse {
 /// Actions for navigating and extracting content from web pages.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum BrowserAction {
+enum BrowserAction {
     /// Navigate to a URL (returns page content automatically).
     Open { url: String },
     /// Get accessibility snapshot with element refs (`@e1`, `@e2`, …).
@@ -838,12 +838,12 @@ impl Tool for BrowserTool {
             } else {
                 format!("[Tab: {tab}] {output}")
             };
-            return Ok(Self::with_normalization_notes(body, &normalized_notes));
+            return Ok(super::with_normalization_notes(body, &normalized_notes));
         }
 
         if let BrowserAction::Screenshot { .. } = &action {
             let output = self.capture_screenshot(&tab).await?;
-            return Ok(Self::with_normalization_notes(output, &normalized_notes));
+            return Ok(super::with_normalization_notes(output, &normalized_notes));
         }
 
         let cli_args = Self::build_args(&action)?;
@@ -910,7 +910,7 @@ impl Tool for BrowserTool {
             format!("[Tab: {tab}] {output}")
         };
 
-        Ok(Self::with_normalization_notes(output, &normalized_notes))
+        Ok(super::with_normalization_notes(output, &normalized_notes))
     }
 
     async fn image_payload(
@@ -944,15 +944,6 @@ impl Tool for BrowserTool {
 }
 
 impl BrowserTool {
-    /// Prepend a note about argument normalization so the model can see what
-    /// was silently corrected (e.g. flattened fields, XML wrapping).
-    fn with_normalization_notes(output: String, notes: &[String]) -> String {
-        if notes.is_empty() {
-            return output;
-        }
-        format!("[normalized] {}\n{output}", notes.join("; "))
-    }
-
     /// Resolve the tab for a call. An explicit non-empty tab passes through
     /// unchanged; missing/empty falls back to the per-run default session — unique
     /// per `BrowserTool` instance (one agent run) so concurrent runs never collide
@@ -1756,25 +1747,65 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ensure_browser_env_sets_home_when_missing() {
-        let _guard = set_env_var("HOME", None);
-        let mut cmd = Command::new("true");
-        ensure_browser_env(&mut cmd);
+    /// Read an env var explicitly set on the command by `ensure_browser_env`.
+    fn cmd_env(cmd: &Command, key: &str) -> Option<String> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
     }
 
     #[test]
-    fn ensure_browser_env_sets_chromium_flags() {
-        let _guard = set_env_var("CHROMIUM_FLAGS", None);
-        let mut cmd = Command::new("true");
-        ensure_browser_env(&mut cmd);
+    fn ensure_browser_env_defaults_home_only_when_missing() {
+        {
+            let _guard = set_env_var("HOME", None);
+            let mut cmd = Command::new("true");
+            ensure_browser_env(&mut cmd);
+            assert_eq!(cmd_env(&cmd, "HOME").as_deref(), Some("/tmp"));
+        }
+        {
+            let _guard = set_env_var("HOME", Some("/home/user"));
+            let mut cmd = Command::new("true");
+            ensure_browser_env(&mut cmd);
+            assert_eq!(cmd_env(&cmd, "HOME"), None);
+        }
     }
 
     #[test]
-    fn ensure_browser_env_sets_idle_timeout() {
+    fn ensure_browser_env_defaults_chromium_flags_only_when_missing() {
+        {
+            let _guard = set_env_var("CHROMIUM_FLAGS", None);
+            let mut cmd = Command::new("true");
+            ensure_browser_env(&mut cmd);
+            assert_eq!(
+                cmd_env(&cmd, "CHROMIUM_FLAGS").as_deref(),
+                Some("--no-first-run --no-default-browser-check --disable-gpu")
+            );
+        }
+        {
+            let _guard = set_env_var("CHROMIUM_FLAGS", Some("--headless"));
+            let mut cmd = Command::new("true");
+            ensure_browser_env(&mut cmd);
+            assert_eq!(cmd_env(&cmd, "CHROMIUM_FLAGS"), None);
+        }
+    }
+
+    #[test]
+    fn ensure_browser_env_sets_fixed_env_vars() {
         let mut cmd = Command::new("true");
         ensure_browser_env(&mut cmd);
-        // Function completes without panic.
+        assert_eq!(
+            cmd_env(&cmd, "AGENT_BROWSER_DEFAULT_TIMEOUT").as_deref(),
+            Some("15000")
+        );
+        assert_eq!(
+            cmd_env(&cmd, "AGENT_BROWSER_IDLE_TIMEOUT_MS").as_deref(),
+            Some("300000")
+        );
+        assert_eq!(
+            cmd_env(&cmd, "AGENT_BROWSER_NO_AUTO_RECONNECT").as_deref(),
+            Some("1")
+        );
     }
 
     #[test]
@@ -2254,71 +2285,58 @@ mod tests {
     // ── parse_session_list: chrome-use envelope tolerance ───────────────
 
     #[test]
-    fn parse_session_list_latest_object_envelope() {
-        let v = serde_json::json!({
+    fn parse_session_list_extracts_names_from_all_envelope_shapes() {
+        // Latest chrome-use object envelope.
+        let latest = serde_json::json!({
             "ok": true,
             "sessions": [{"name": "default", "pid": 1, "owner": "me"}]
         });
-        assert_eq!(parse_session_list(&v), vec!["default"]);
-    }
+        assert_eq!(parse_session_list(&latest), vec!["default"]);
 
-    #[test]
-    fn parse_session_list_legacy_data_strings() {
-        let v = serde_json::json!({
+        // Legacy data-strings envelope.
+        let legacy = serde_json::json!({
             "success": true,
             "data": {"sessions": ["default", "docs"]}
         });
-        assert_eq!(parse_session_list(&v), vec!["default", "docs"]);
-    }
+        assert_eq!(parse_session_list(&legacy), vec!["default", "docs"]);
 
-    #[test]
-    fn parse_session_list_object_entries_under_data() {
-        let v = serde_json::json!({
+        // Object entries under data mix with plain strings.
+        let mixed = serde_json::json!({
             "success": true,
             "data": {"sessions": [{"name": "docs", "pid": 2}, "default"]}
         });
-        assert_eq!(parse_session_list(&v), vec!["docs", "default"]);
-    }
+        assert_eq!(parse_session_list(&mixed), vec!["docs", "default"]);
 
-    #[test]
-    fn parse_session_list_extracts_names_from_both_envelopes() {
         // Envelope-verdict gating lives in the caller (close_all_browser_sessions_inner);
         // this helper only extracts names.
-        let v = serde_json::json!({"ok": false, "error": "boom"});
-        assert!(parse_session_list(&v).is_empty());
-        let v2 = serde_json::json!({"success": false, "data": {"sessions": ["default"]}});
-        assert_eq!(parse_session_list(&v2), vec!["default"]);
+        let failed = serde_json::json!({"ok": false, "error": "boom"});
+        assert!(parse_session_list(&failed).is_empty());
+        let failed_legacy =
+            serde_json::json!({"success": false, "data": {"sessions": ["default"]}});
+        assert_eq!(parse_session_list(&failed_legacy), vec!["default"]);
+
+        // Garbage and missing keys yield empty.
+        assert!(
+            parse_session_list(&serde_json::json!({"ok": true, "sessions": "nope"})).is_empty()
+        );
+        assert!(parse_session_list(&serde_json::json!(null)).is_empty());
+        assert!(parse_session_list(&serde_json::json!({"ok": true, "data": {}})).is_empty());
     }
 
     #[test]
-    fn parse_session_list_garbage_is_empty() {
-        let v = serde_json::json!({"ok": true, "sessions": "nope"});
-        assert!(parse_session_list(&v).is_empty());
-        let v2 = serde_json::json!(null);
-        assert!(parse_session_list(&v2).is_empty());
-    }
-
-    #[test]
-    fn parse_session_list_missing_sessions_key_is_empty() {
-        let v = serde_json::json!({"ok": true, "data": {}});
-        assert!(parse_session_list(&v).is_empty());
-    }
-
-    #[test]
-    fn browser_response_accepts_ok_envelope() {
-        let resp: BrowserResponse =
+    fn browser_response_accepts_tolerant_envelopes() {
+        let ok: BrowserResponse =
             serde_json::from_str(r#"{"ok":true,"data":{}}"#).expect("tolerant deserialize");
-        assert!(resp.is_success());
-    }
+        assert!(ok.is_success());
 
-    #[test]
-    fn browser_response_accepts_success_envelope() {
-        let resp: BrowserResponse =
+        let success: BrowserResponse =
             serde_json::from_str(r#"{"success":true}"#).expect("tolerant deserialize");
-        assert!(resp.is_success());
+        assert!(success.is_success());
+
         let failed: BrowserResponse =
             serde_json::from_str(r#"{"success":false}"#).expect("tolerant deserialize");
         assert!(!failed.is_success());
+
         // Failure precedence — mirrors envelope_verdict: an explicit false on
         // either key loses over a contradicting success key.
         let mixed: BrowserResponse =

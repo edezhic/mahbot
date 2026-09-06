@@ -384,7 +384,7 @@ impl Tool for ComputerTool {
         let _lock = ACTION_LOCK.lock().await;
 
         let output = dispatch(&action).await?;
-        Ok(Self::with_normalization_notes(output, &notes))
+        Ok(super::with_normalization_notes(output, &notes))
     }
 
     async fn image_payload(
@@ -420,17 +420,6 @@ impl Tool for ComputerTool {
             None,
             crate::tools::ImagePayloadSource::Computer,
         ))
-    }
-}
-
-impl ComputerTool {
-    /// Prepend a note about argument normalization so the model can see what was
-    /// silently corrected.
-    fn with_normalization_notes(output: String, notes: &[String]) -> String {
-        if notes.is_empty() {
-            return output;
-        }
-        format!("[normalized] {}\n{output}", notes.join("; "))
     }
 }
 
