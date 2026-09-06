@@ -320,9 +320,8 @@ pub(crate) fn update_mode() -> UpdateMode {
 
 /// A point-in-time snapshot of the shared self-update availability cache.
 ///
-/// Passed by value to pure predicates like [`should_show_update`] so the
-/// registry-hidden and restricted-user branches are deterministically
-/// testable without a network call or a real newer version.
+/// Passed by value to pure predicates like [`should_show_update`] so they read
+/// a consistent two-field view instead of observing intermediate cache writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UpdateAvailability {
     /// Whether an update is available (mode-aware: local checkout always;
@@ -989,9 +988,8 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
     // 1. Begin the graceful drain.
     UPDATE_FINALIZING.store(true, Ordering::SeqCst);
     crate::shutdown::drain_begin();
-    while !crate::shutdown::shutdown_token().is_cancelled() {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
+    let token = crate::shutdown::shutdown_token();
+    token.cancelled().await;
     crate::tools::browser::close_all_browser_sessions().await;
 
     // 2. Checkpoint all databases BEFORE releasing the instance lock and
@@ -1173,12 +1171,13 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
     }
 
     // Fast path for an already-running update, then the atomic claim below.
-    if update_availability().in_progress {
+    let availability = update_availability();
+    if availability.in_progress {
         crate::channels::telegram::send_reply(&msg.reply_target, UPDATE_IN_PROGRESS_MSG).await;
         return;
     }
 
-    if !should_show_update(update_availability()) {
+    if !should_show_update(availability) {
         crate::channels::telegram::send_reply(
             &msg.reply_target,
             "No update is available at the moment.",
