@@ -456,10 +456,30 @@ async fn maybe_escalate_analysis(
     if extra_slots.is_empty() {
         return true;
     }
+    let (extra, extra_paused) =
+        run_blocker_verification(ticket, ws, job_id, &entries, &extra_slots, false).await;
+    results.extend(extra);
+    *paused |= extra_paused;
+    *escalation_entries = entries;
+    true
+}
+
+/// Dispatch the blocker-verification escalation round: load the shared
+/// extraction prompt, bake the escalation entries' texts into the extraction
+/// mode, and run `slots` on the phase job. Returns the round's verdicts and
+/// whether it was pause-frozen.
+async fn run_blocker_verification(
+    ticket: &Arc<Ticket>,
+    ws: &Workspace,
+    job_id: &str,
+    entries: &[EscalationEntry],
+    slots: &[AgentSlot],
+    resume: bool,
+) -> (Vec<ParallelVerdict>, bool) {
     let extraction_prompt = load_prompt("extraction/blocker_verification.md");
     let blockers_arc =
         Arc::<[String]>::from(entries.iter().map(|e| e.text.clone()).collect::<Vec<_>>());
-    let (extra, extra_paused) = run_parallel_agents(
+    run_parallel_agents(
         ticket,
         ws,
         Role::Analyst,
@@ -468,15 +488,11 @@ async fn maybe_escalate_analysis(
             blockers: blockers_arc,
         },
         job_id,
-        &extra_slots,
+        slots,
         TicketPhase::Analysis,
-        false,
+        resume,
     )
-    .await;
-    results.extend(extra);
-    *paused |= extra_paused;
-    *escalation_entries = entries;
-    true
+    .await
 }
 
 /// Spawn 3 parallel analyst agents (base) to research a backlog ticket on the
@@ -553,7 +569,6 @@ async fn finalize_analysis_round_with_grouping(
     let (round, outcome) = build_round_grouping(
         "Analysis",
         base_results,
-        /* threshold unused for analysis */ 0,
         Role::Analyst,
         ws,
         &ticket.id,
@@ -629,23 +644,8 @@ async fn resume_escalation_round(
     if let Err(e) = crate::jobs::rearm_roster_launched(conn, job_id, &not_done).await {
         warn!(ticket = %ticket.id, error = %e, "Failed to re-arm resumed escalation roster slots");
     }
-    let extraction_prompt = load_prompt("extraction/blocker_verification.md");
-    let blockers_arc =
-        Arc::<[String]>::from(entries.iter().map(|e| e.text.clone()).collect::<Vec<_>>());
-    let (extra, extra_paused) = run_parallel_agents(
-        ticket,
-        ws,
-        Role::Analyst,
-        &extraction_prompt,
-        ExtractionMode::BlockerVerification {
-            blockers: blockers_arc,
-        },
-        job_id,
-        &escalation_slots,
-        TicketPhase::Analysis,
-        true,
-    )
-    .await;
+    let (extra, extra_paused) =
+        run_blocker_verification(ticket, ws, job_id, &entries, &escalation_slots, true).await;
     if extra_paused {
         pause_freezing(ticket, job_id).await;
         return;
@@ -689,7 +689,6 @@ async fn run_analysis_round(
     let (round, outcome) = build_round_grouping(
         "Analysis",
         &base_results,
-        /* threshold unused for analysis */ 0,
         Role::Analyst,
         ws,
         &ticket.id,
