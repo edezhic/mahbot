@@ -73,7 +73,7 @@ use tracing::{debug, error, info, warn};
 // ── E2E integration test (voice-tests feature) ──────────────────────────
 #[cfg(feature = "voice-tests")]
 #[path = "voice_pipeline_e2e_test.rs"]
-pub(crate) mod voice_pipeline_e2e_test;
+mod voice_pipeline_e2e_test;
 
 /// Public entry point for the wake-word benchmark (three plain metrics).
 ///
@@ -87,7 +87,7 @@ pub fn run_wake_word_benchmark() {
 // Constants
 
 /// Target sample rate: 16 kHz mono.
-pub(crate) const SAMPLE_RATE: u32 = 16_000;
+const SAMPLE_RATE: u32 = 16_000;
 
 /// Convert a sample count to milliseconds (truncating integer division —
 /// callers rely on exact threshold semantics).
@@ -97,13 +97,13 @@ fn samples_to_ms(len: usize, rate: u32) -> u64 {
 }
 
 /// Frame size for VAD / quality frames (512 samples = 32ms at 16kHz).
-pub(crate) const FRAME_LENGTH: usize = 512;
+const FRAME_LENGTH: usize = 512;
 
 /// Hop length between frames (256 samples at 16 kHz).  This constant controls
 /// VAD frame iteration stride and silence tracking in the application code.
 /// The Qwen3-ASR mel frontend uses its own internal stride (160 samples =
 /// 10ms) — HOP_LENGTH does NOT affect mel frame spacing.
-pub(crate) const HOP_LENGTH: usize = 256;
+const HOP_LENGTH: usize = 256;
 
 /// Maximum command recording duration (10 minutes).
 const MAX_RECORD_SECS: usize = 600;
@@ -896,7 +896,7 @@ pub(crate) fn get_enrollment() -> Option<WakeWordEnrollment> {
 }
 
 /// Install a wake word enrollment into the global pipeline state.
-pub(crate) fn set_enrollment(enrollment: WakeWordEnrollment) {
+fn set_enrollment(enrollment: WakeWordEnrollment) {
     let mut state = voice_state().write().unwrap_poison();
     state.enrollment = Some(enrollment);
 }
@@ -919,7 +919,7 @@ pub fn send_command(cmd: VoiceCommand) {
 /// Processes ALL 256-sample chunks through the detector to keep its internal
 /// state (ring buffer + pre-emphasis filter) synchronized with the audio
 /// stream, even when speech is detected early in the frame.
-pub(crate) fn is_speech_with_detector(
+fn is_speech_with_detector(
     samples: &[f32],
     detector: &mut earshot::Detector,
     threshold: f32,
@@ -1695,7 +1695,7 @@ async fn route_voice_to_role(
 /// first [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames the function returns `None`,
 /// telling the caller to use the static threshold while the window fills.
 #[derive(Debug, Clone)]
-pub(crate) struct AdaptiveThresholdState {
+struct AdaptiveThresholdState {
     /// Rolling window of per-frame scores.
     scores: Vec<f32>,
     /// Running sum of scores in the window.
@@ -1708,7 +1708,7 @@ pub(crate) struct AdaptiveThresholdState {
 
 impl AdaptiveThresholdState {
     /// Create a new adaptive threshold tracker with empty statistics.
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             scores: Vec::with_capacity(ADAPTIVE_WINDOW_N),
             sum: 0.0,
@@ -1729,7 +1729,7 @@ impl AdaptiveThresholdState {
     /// being the caller's static detection threshold (per-enrollment,
     /// co-derived from the calibration), which keeps the anti-feedback-loop
     /// property.
-    pub(crate) fn feed(&mut self, score: f32, k: f32, harbor: f32) -> Option<f32> {
+    fn feed(&mut self, score: f32, k: f32, harbor: f32) -> Option<f32> {
         // ── Update rolling window statistics ──
         if self.scores.len() >= ADAPTIVE_WINDOW_N {
             let oldest = self.scores.remove(0);
@@ -1792,7 +1792,7 @@ impl AdaptiveThresholdState {
     ///
     /// This is used to avoid contaminating the background statistics with
     /// wake-word-like frames.
-    pub(crate) fn peek(&self, k: f32, harbor: f32) -> Option<f32> {
+    fn peek(&self, k: f32, harbor: f32) -> Option<f32> {
         if self.bootstrap_count < ADAPTIVE_BOOTSTRAP_FRAMES {
             return None;
         }
@@ -1813,12 +1813,12 @@ impl AdaptiveThresholdState {
     /// Production callers no longer consult this method (the feed/peek rule
     /// is now score-only); it exists for unit tests.
     #[cfg(test)]
-    pub(crate) fn is_bootstrapping(&self) -> bool {
+    fn is_bootstrapping(&self) -> bool {
         self.bootstrap_count < ADAPTIVE_BOOTSTRAP_FRAMES
     }
 
     /// Reset all statistics (called on pipeline reset / re-enrollment).
-    pub(crate) fn reset(&mut self) {
+    fn reset(&mut self) {
         self.scores.clear();
         self.sum = 0.0;
         self.sum_sq = 0.0;
@@ -1833,7 +1833,7 @@ impl AdaptiveThresholdState {
     /// value (~0.03) ensures the threshold immediately clamps to it,
     /// matching production behavior where real audio starts from silence.
     #[cfg(any(test, feature = "voice-tests"))]
-    pub(crate) fn warmed(harbor: f32) -> Self {
+    fn warmed(harbor: f32) -> Self {
         let mut state = Self::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.033, ADAPTIVE_K_DEFAULT, harbor);
@@ -1843,7 +1843,7 @@ impl AdaptiveThresholdState {
 
     /// The number of scores currently in the window.
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.scores.len()
     }
 }
@@ -1859,7 +1859,7 @@ impl AdaptiveThresholdState {
 /// (per-frame score triples, adaptive threshold trajectory, trigger index,
 /// per-hop VAD) were pruned with the old e2e bench — nothing reads them.
 #[cfg(feature = "voice-tests")]
-pub(crate) struct DetectionInstrumentation {
+struct DetectionInstrumentation {
     /// Count of VAD-positive 512-sample frames during streaming detection.
     pub vad_speech_frames: usize,
     /// Peak rolling-sum score across all segments in this detection session.
@@ -1878,7 +1878,7 @@ impl DetectionInstrumentation {
 
 /// Runtime state for the voice pipeline main loop.
 #[expect(clippy::struct_excessive_bools)]
-pub(crate) struct PipelineCtx {
+struct PipelineCtx {
     mic_rx: Option<mpsc::Receiver<Vec<f32>>>,
     mic_stream: Option<cpal::Stream>,
     is_listening: bool,
@@ -1953,7 +1953,7 @@ pub(crate) struct PipelineCtx {
     /// reset levels ([`ResetLevel`]): a bench worker's injected detector must
     /// survive the inter-event Soft resets the real-audio feed performs.
     #[cfg(feature = "voice-tests")]
-    pub(crate) injected_vad: Option<earshot::Detector>,
+    injected_vad: Option<earshot::Detector>,
     /// Raw audio ring for wake-word detection.  Accumulates raw mic samples
     /// (no AGC/NS) capped at [`AUDIO_BUFFER_MAX`]; the VAD frame loop walks it
     /// via [`vad_cursor`], and scoring encodes the VAD-gated
@@ -1998,7 +1998,7 @@ pub(crate) struct PipelineCtx {
     /// Timestamp of the last wake word detection.
     /// Used to enforce a cooldown period after detection to prevent rapid
     /// consecutive false triggers.
-    pub(crate) last_wake_word_detection: Option<Instant>,
+    last_wake_word_detection: Option<Instant>,
     /// Pre-speech noise RMS captured at the moment of first sustained speech
     /// detection during enrollment.  Computed from the raw audio ring so the
     /// SNR estimate reflects the true room noise floor.
@@ -2077,7 +2077,7 @@ enum ResetLevel {
 }
 
 impl PipelineCtx {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             mic_rx: None,
             mic_stream: None,
@@ -3481,7 +3481,7 @@ pub async fn run_voice_pipeline() {
 /// Normalize a wake word phrase (trim, lowercase, collapse whitespace).
 /// Empty input falls back to [`DEFAULT_WAKE_WORD_PHRASE`].
 #[must_use]
-pub(crate) fn normalize_phrase(s: &str) -> String {
+fn normalize_phrase(s: &str) -> String {
     let normalized = s
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -3744,7 +3744,7 @@ fn push_capped(buf: &mut Vec<f32>, samples: &[f32], cap: usize) -> usize {
 /// 5. **Detection→recording handoff** — on detection the ring is moved into
 ///    [`PipelineCtx::command_buffer`] with a Soft reset so recording starts
 ///    with the pre-wake context.
-pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
+fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
     // ── Cooldown check ──
     // If we recently detected the wake word, skip ALL processing for this
     // chunk to prevent rapid consecutive false triggers.  During cooldown

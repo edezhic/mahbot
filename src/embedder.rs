@@ -585,7 +585,7 @@ impl Embedder {
     /// Returns an error if files are missing, corrupted, or the model architecture
     /// is unexpected.
     #[expect(clippy::too_many_lines)]
-    pub(crate) fn load(model_path: &Path, tokenizer_path: &Path) -> Result<Self> {
+    fn load(model_path: &Path, tokenizer_path: &Path) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| {
             anyhow!(
                 "Failed to load tokenizer from {}: {e}",
@@ -732,12 +732,12 @@ impl Embedder {
     }
 
     /// Embed texts as queries (prefixed with `"Query: "`).
-    pub(crate) fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         self.embed_prefixed("Query: ", texts)
     }
 
     /// Embed texts as documents (prefixed with `"Document: "`).
-    pub(crate) fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         self.embed_prefixed("Document: ", texts)
     }
 
