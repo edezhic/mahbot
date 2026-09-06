@@ -169,21 +169,32 @@ fn normalize_action_name(name: &str) -> String {
     name.strip_prefix("AX").unwrap_or(name).to_lowercase()
 }
 
-/// Map an AXError to a taxonomy error per the contract.
-fn ax_error(err: AXError, ctx: impl std::fmt::Display) -> anyhow::Error {
+/// Arms shared by [`ax_error`] and [`ax_window_error`] — identical messages
+/// and taxonomy codes. `None` falls through to caller-specific handling.
+fn ax_error_shared(err: AXError, ctx: impl std::fmt::Display) -> Option<anyhow::Error> {
     match err {
-        AXError::CannotComplete => core::taxonomy_error(
+        AXError::CannotComplete => Some(core::taxonomy_error(
             core::ERR_DEGRADED,
             format!("transient AX failure, retry: {ctx}"),
-        ),
-        AXError::InvalidUIElement => core::taxonomy_error(
+        )),
+        AXError::InvalidUIElement => Some(core::taxonomy_error(
             core::ERR_STALE_ELEMENT,
             format!("window closed or changed — re-enumerate: {ctx}"),
-        ),
-        AXError::APIDisabled => core::taxonomy_error(
+        )),
+        AXError::APIDisabled => Some(core::taxonomy_error(
             core::ERR_PERMISSION_DENIED,
             format!("Accessibility TCC grant missing: {ctx}"),
-        ),
+        )),
+        _ => None,
+    }
+}
+
+/// Map an AXError to a taxonomy error per the contract.
+fn ax_error(err: AXError, ctx: impl std::fmt::Display) -> anyhow::Error {
+    if let Some(mapped) = ax_error_shared(err, &ctx) {
+        return mapped;
+    }
+    match err {
         AXError::AttributeUnsupported
         | AXError::ActionUnsupported
         | AXError::NoValue
@@ -199,24 +210,12 @@ fn ax_error(err: AXError, ctx: impl std::fmt::Display) -> anyhow::Error {
 
 /// Window-level error mapping (CannotComplete/InvalidUIElement are fatal).
 fn ax_window_error(err: AXError, ctx: impl std::fmt::Display) -> anyhow::Error {
-    match err {
-        AXError::CannotComplete => core::taxonomy_error(
-            core::ERR_DEGRADED,
-            format!("transient AX failure, retry: {ctx}"),
-        ),
-        AXError::InvalidUIElement => core::taxonomy_error(
-            core::ERR_STALE_ELEMENT,
-            format!("window closed or changed — re-enumerate: {ctx}"),
-        ),
-        AXError::APIDisabled => core::taxonomy_error(
-            core::ERR_PERMISSION_DENIED,
-            format!("Accessibility TCC grant missing: {ctx}"),
-        ),
-        _ => core::taxonomy_error(
+    ax_error_shared(err, &ctx).unwrap_or_else(|| {
+        core::taxonomy_error(
             core::ERR_NOT_MATCHED,
             format!("no windows enumerated — re-enumerate: {ctx}"),
-        ),
-    }
+        )
+    })
 }
 
 // ── AX tree walk ─────────────────────────────────────────────────────────
@@ -1406,23 +1405,12 @@ impl Backend for MacOsBackend {
         act: ElementAct,
     ) -> Result<(), anyhow::Error> {
         with_block_in_place(|| {
+            if matches!(target, TargetSpec::Screen) {
+                return Err(core::screen_act_error());
+            }
             let (window, _app) = resolve_window(target)?;
             let (root, handles) = build_tree(&window, window_origin(&window)?);
-            let matched = match core::resolve_locator(&root, locator) {
-                core::LocatorMatch::Path(node) | core::LocatorMatch::Unique(node) => node,
-                core::LocatorMatch::Ambiguous => {
-                    return Err(core::taxonomy_error(
-                        core::ERR_AMBIGUOUS_LOCATOR,
-                        "locator matches multiple elements — re-observe and pick a more specific ref",
-                    ));
-                }
-                core::LocatorMatch::NotFound => {
-                    return Err(core::taxonomy_error(
-                        core::ERR_NOT_MATCHED,
-                        "element no longer matches its locator — re-observe",
-                    ));
-                }
-            };
+            let matched = core::resolve_locator_checked(&root, locator)?;
             let element = &handles[core::pre_order_index(&root, matched)];
             match act {
                 ElementAct::Press => press_element(element),
@@ -1481,52 +1469,5 @@ mod tests {
         let (mods, parsed) = core::parse_key_chord("cmd+shift+t").unwrap();
         assert_eq!(mods, vec![Modifier::Cmd, Modifier::Shift]);
         assert_eq!(parsed, "t");
-    }
-
-    #[test]
-    fn virtual_desktop_bounding_rect_union() {
-        let rects = [
-            (0.0, 0.0, 1920.0, 1080.0),
-            (1920.0, 0.0, 1920.0, 1080.0),
-            (0.0, -100.0, 800.0, 600.0),
-        ];
-        let (mut min_x, mut min_y, mut max_x, mut max_y) = (
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-        );
-        for (x, y, w, h) in rects {
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x + w);
-            max_y = max_y.max(y + h);
-        }
-        let geo = SurfaceGeometry {
-            x: min_x,
-            y: min_y,
-            width: max_x - min_x,
-            height: max_y - min_y,
-        };
-        assert_eq!(
-            (geo.x, geo.y, geo.width, geo.height),
-            (0.0, -100.0, 3840.0, 1180.0)
-        );
-        let (px, py) = core::normalized_to_surface(500.0, 500.0, &geo).unwrap();
-        assert!((px - 1920.0).abs() < 1e-9, "x = {px}");
-        assert!((py - 490.0).abs() < 1e-9, "y = {py}");
-    }
-
-    #[test]
-    fn blit_rgba_clips_and_copies() {
-        let mut dest = vec![0u8; 4 * 4 * 4];
-        let src = Capture {
-            width: 2,
-            height: 2,
-            rgba: vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
-        };
-        core::blit_rgba(&mut dest, 4, 4, &src, 1, 1);
-        assert_eq!(&dest[4 * 4 + 4..4 * 4 + 8], &[1, 2, 3, 255]);
-        assert_eq!(&dest[4 * 4 + 8..4 * 4 + 12], &[4, 5, 6, 255]);
     }
 }

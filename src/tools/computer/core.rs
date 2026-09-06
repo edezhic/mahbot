@@ -88,10 +88,11 @@ pub(crate) struct SurfaceGeometry {
 
 /// Normalized 0-1000 region (corner order is normalized by consumers).
 ///
-/// `Default` yields an all-zero (degenerate/invalid) region. It is never
-/// constructed at runtime — it exists only so the `ComputerAction` `EnumIter`
-/// (used by the schema lockstep test) can build a `Zoom` variant via
-/// `Default::default()`.
+/// Constructed at runtime only via serde deserialization of
+/// `ComputerAction::Zoom` arguments. `Default` yields an all-zero
+/// (degenerate/invalid) region and exists only so the `ComputerAction`
+/// `EnumIter` (used by the schema lockstep test) can build a `Zoom` variant
+/// via `Default::default()`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Default)]
 pub(crate) struct Region {
     pub x0: f64,
@@ -928,6 +929,35 @@ pub(crate) fn resolve_locator<'a>(root: &'a UiNode, locator: &Locator) -> Locato
     search_locator(root, locator)
 }
 
+/// Resolve a locator, mapping the ambiguous/not-found outcomes to their
+/// taxonomy errors — the shared failure contract of both backends'
+/// `act_on_element`.
+pub(crate) fn resolve_locator_checked<'a>(
+    root: &'a UiNode,
+    locator: &Locator,
+) -> Result<&'a UiNode, anyhow::Error> {
+    match resolve_locator(root, locator) {
+        LocatorMatch::Path(node) | LocatorMatch::Unique(node) => Ok(node),
+        LocatorMatch::Ambiguous => Err(taxonomy_error(
+            ERR_AMBIGUOUS_LOCATOR,
+            "locator matches multiple elements — re-observe and pick a more specific ref",
+        )),
+        LocatorMatch::NotFound => Err(taxonomy_error(
+            ERR_NOT_MATCHED,
+            "element no longer matches its locator — re-observe",
+        )),
+    }
+}
+
+/// Shared refusal for acting on the `screen` target: acting addresses an
+/// element of a window, so both backends pre-check this before resolving one.
+pub(crate) fn screen_act_error() -> anyhow::Error {
+    taxonomy_error(
+        ERR_UNSUPPORTED,
+        "act targets a window — use apps/windows to pick one (use screenshot for the screen)",
+    )
+}
+
 fn node_matches(node: &UiNode, locator: &Locator) -> bool {
     let role_ok = normalized_role(&node.role).eq_ignore_ascii_case(normalized_role(&locator.role));
     let name_ok = match (&locator.name, &node.name) {
@@ -1063,6 +1093,28 @@ mod tests {
         assert!(normalized_to_surface(-1.0, 0.0, &geo).is_err());
         assert!(normalized_to_surface(0.0, 1001.0, &geo).is_err());
         assert!(normalized_to_surface(f64::NAN, 0.0, &geo).is_err());
+    }
+
+    #[test]
+    fn normalized_to_surface_handles_negative_origins() {
+        // A virtual-desktop bounding rect spanning a display with a negative origin.
+        let geo = surface(0.0, -100.0, 3840.0, 1180.0);
+        let (px, py) = normalized_to_surface(500.0, 500.0, &geo).unwrap();
+        assert!((px - 1920.0).abs() < 1e-9, "x = {px}");
+        assert!((py - 490.0).abs() < 1e-9, "y = {py}");
+    }
+
+    #[test]
+    fn blit_rgba_clips_and_copies() {
+        let mut dest = vec![0u8; 4 * 4 * 4];
+        let src = Capture {
+            width: 2,
+            height: 2,
+            rgba: vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
+        };
+        blit_rgba(&mut dest, 4, 4, &src, 1, 1);
+        assert_eq!(&dest[4 * 4 + 4..4 * 4 + 8], &[1, 2, 3, 255]);
+        assert_eq!(&dest[4 * 4 + 8..4 * 4 + 12], &[4, 5, 6, 255]);
     }
 
     #[test]

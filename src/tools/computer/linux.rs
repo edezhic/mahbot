@@ -1342,31 +1342,12 @@ impl Backend for LinuxBackend {
         act: ElementAct,
     ) -> Result<(), anyhow::Error> {
         let conn = self.conn().await?;
-        let (window_ref, _app) = match target {
-            TargetSpec::Screen => {
-                return Err(core::taxonomy_error(
-                    core::ERR_UNSUPPORTED,
-                    "act targets a window — use apps/windows to pick one",
-                ));
-            }
-            other => resolve_window(&conn, other).await?,
-        };
+        if matches!(target, TargetSpec::Screen) {
+            return Err(core::screen_act_error());
+        }
+        let (window_ref, _app) = resolve_window(&conn, target).await?;
         let (root, handles) = build_tree(&window_ref, &conn).await;
-        let matched = match core::resolve_locator(&root, locator) {
-            core::LocatorMatch::Path(node) | core::LocatorMatch::Unique(node) => node,
-            core::LocatorMatch::Ambiguous => {
-                return Err(core::taxonomy_error(
-                    core::ERR_AMBIGUOUS_LOCATOR,
-                    "locator matches multiple elements — re-observe and pick a more specific ref",
-                ));
-            }
-            core::LocatorMatch::NotFound => {
-                return Err(core::taxonomy_error(
-                    core::ERR_NOT_MATCHED,
-                    "element no longer matches its locator — re-observe",
-                ));
-            }
-        };
+        let matched = core::resolve_locator_checked(&root, locator)?;
         if handles.is_empty() {
             return Err(core::taxonomy_error(
                 core::ERR_STALE_ELEMENT,
