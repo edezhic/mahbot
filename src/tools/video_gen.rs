@@ -98,8 +98,7 @@ impl Tool for VideoGenTool {
         // Build the API base URL (strip /chat/completions if present).
         // Video generation always targets OpenRouter — a custom
         // chat endpoint never serves video models.
-        let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string();
-        let api_base = crate::providers::ensure_base_url(&endpoint);
+        let api_base = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
 
         // ── Build the video generation request body ─────────────────────
         let mut body = json!({

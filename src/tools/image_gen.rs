@@ -147,7 +147,7 @@ impl Tool for ImageGenTool {
 
         let response_body = match result {
             Ok(body) => body,
-            Err(failure) => anyhow::bail!("{}", failure.message),
+            Err(message) => anyhow::bail!("{message}"),
         };
 
         let (b64_json, media_type) = match extract_response_image(&response_body) {
@@ -168,17 +168,13 @@ impl Tool for ImageGenTool {
             }
         };
 
-        let output_path = match super::save_generated_file(
+        let output_path = super::save_generated_file(
             ws,
             &bytes,
             "image",
             extension_for_media_type(media_type.as_deref()),
         )
-        .await
-        {
-            Ok(path) => path,
-            Err(e) => return Err(e),
-        };
+        .await?;
 
         Ok(self.format_media_result(&output_path))
     }
@@ -264,11 +260,6 @@ impl AttemptFailure {
     }
 }
 
-/// Terminal request failure carrying the true cause for the surfaced error.
-struct ImageGenFailure {
-    message: String,
-}
-
 /// POST the image-generation request with bounded retries.
 ///
 /// Retry policy: auto-retry ONLY prompt failures — transport errors and HTTP
@@ -283,7 +274,7 @@ async fn generate_image_with_retries(
     url: &str,
     body: &serde_json::Value,
     auth: &str,
-) -> Result<serde_json::Value, ImageGenFailure> {
+) -> Result<serde_json::Value, String> {
     let mut failures: Vec<AttemptFailure> = Vec::new();
     for attempt in 1..=IMAGE_GEN_MAX_ATTEMPTS {
         match attempt_image_generation(url, body, auth).await {
@@ -292,9 +283,7 @@ async fn generate_image_with_retries(
                 let retryable = failure.retryable();
                 failures.push(failure);
                 if !retryable || attempt == IMAGE_GEN_MAX_ATTEMPTS {
-                    return Err(ImageGenFailure {
-                        message: build_terminal_message(&failures),
-                    });
+                    return Err(build_terminal_message(&failures));
                 }
                 let sleep_ms = failures
                     .last()
@@ -303,9 +292,7 @@ async fn generate_image_with_retries(
                         ms.clamp(IMAGE_GEN_BACKOFF_MS, RETRY_AFTER_MAX_MS)
                     });
                 if !crate::shutdown::sleep_or_shutdown(Duration::from_millis(sleep_ms)).await {
-                    return Err(ImageGenFailure {
-                        message: "Shutting down — image generation aborted".to_string(),
-                    });
+                    return Err("Shutting down — image generation aborted".to_string());
                 }
             }
         }

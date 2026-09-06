@@ -617,7 +617,9 @@ impl Tool for VideoEditTool {
                 },
                 "instruction": {
                     "type": "string",
-                    "description": "Text instruction describing the edit to apply (max 5000 chars)"
+                    "description": format!(
+                        "Text instruction describing the edit to apply (max {MAX_INSTRUCTION_CHARS} chars)"
+                    )
                 },
                 "duration": {
                     "type": "integer",
@@ -626,8 +628,14 @@ impl Tool for VideoEditTool {
                 "images": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "maxItems": 9,
-                    "description": "Paths or public HTTPS URLs of reference images guiding style/subject (max 9). Local paths are accepted from the workspace uploads dir (received attachments) or the generated dir (previously generated images). Requires video_url; mutually exclusive with first_frame/last_frame"
+                    "maxItems": MAX_REFERENCE_IMAGES,
+                    "description": format!(
+                        "Paths or public HTTPS URLs of reference images guiding style/subject \
+                         (max {MAX_REFERENCE_IMAGES}). Local paths are accepted from the workspace \
+                         uploads dir (received attachments) or the generated dir (previously \
+                         generated images). Requires video_url; mutually exclusive with \
+                         first_frame/last_frame"
+                    )
                 },
                 "first_frame": {
                     "type": "string",
@@ -759,8 +767,7 @@ impl Tool for VideoEditTool {
 
         // Video editing always targets OpenRouter — a custom
         // chat endpoint never serves video models.
-        let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string();
-        let api_base = crate::providers::ensure_base_url(&endpoint);
+        let api_base = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
 
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::EDIT).await?;
