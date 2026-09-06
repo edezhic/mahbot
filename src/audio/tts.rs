@@ -292,7 +292,7 @@ pub fn is_config_enabled() -> bool {
 }
 
 #[must_use]
-pub fn is_enabled() -> bool {
+fn is_enabled() -> bool {
     is_config_enabled() && STATE.load(Ordering::Acquire) == ModelState::Ready
 }
 
@@ -366,11 +366,12 @@ pub fn download_failed() -> bool {
 /// Try to load TTS engine from cache — returns `Ok(())` if models are
 /// ready after the call, or an error message explaining how to resolve.
 ///
-/// This is the shared utility for both production and benchmark code.
-/// It checks [`models_ready()`] first (fast path), then
-/// [`try_load_cached()`] (loads from disk if available), and only fails
-/// if neither succeeds.
-pub fn ensure_ready() -> Result<(), String> {
+/// Used only by the feature-gated e2e bench module
+/// (`voice::voice_pipeline_e2e_test`). It checks
+/// [`models_ready()`] first (fast path), then [`try_load_cached()`]
+/// (loads from disk if available), and only fails if neither succeeds.
+#[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
+pub(super) fn ensure_ready() -> Result<(), String> {
     if models_ready() {
         return Ok(());
     }
@@ -434,7 +435,7 @@ impl Drop for SuppressAudioDeviceGuard {
 /// **Note:** This does NOT trigger model initialization. Models must be loaded
 /// beforehand by [`init_global()`] + [`try_load_cached()`] / [`spawn_download()`].
 /// If models are not in `ModelState::Ready` this call is a silent no-op.
-pub fn speak(text: &str) {
+fn speak(text: &str) {
     #[cfg(test)]
     SPEAK_COUNT.fetch_add(1, Ordering::Release);
 
@@ -466,7 +467,7 @@ pub fn speak(text: &str) {
 /// **Note:** If ONNX synthesis is actively running inside a blocking thread,
 /// cancellation may take up to a single chunk synthesis cycle (~3–5s) to
 /// take effect, as the cancellation flag is only checked between chunks.
-pub fn cancel_playback() {
+fn cancel_playback() {
     if let Some(tx) = CANCEL_TX.get() {
         let _ = tx.send(());
     }
@@ -653,6 +654,20 @@ pub fn synthesize(
     }
 }
 
+/// Essential TTS model file paths for a given model directory, used to
+/// verify that the model is fully cached on disk. Shared between
+/// [`try_load_cached`] and the test module helpers so the file set stays
+/// in sync.
+fn essential_tts_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<_> = ONNX_TTS_FILES
+        .iter()
+        .map(|(name, _)| dir.join(ONNX_DIR).join(name))
+        .collect();
+    // Also check that at least the default voice style exists
+    paths.push(dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME));
+    paths
+}
+
 /// Try to load TTS models from cache at startup.
 /// Returns `true` if loaded, `false` if not (download will happen async).
 pub fn try_load_cached() -> bool {
@@ -668,16 +683,7 @@ pub fn try_load_cached() -> bool {
         return false;
     };
 
-    let mut paths: Vec<PathBuf> = ONNX_TTS_FILES
-        .iter()
-        .map(|(name, _)| dir.join(ONNX_DIR).join(name))
-        .collect();
-    // Also check that at least the default voice style exists
-    paths.push(dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME));
-
-    let all_exist = paths.iter().all(|p| p.exists());
-
-    if !all_exist {
+    if !essential_tts_paths(&dir).iter().all(|p| p.exists()) {
         return false;
     }
 
@@ -743,41 +749,30 @@ fn load_voice_style(dir: &Path, voice_name: &str) -> Result<(Tensor, Tensor)> {
     let device = Device::Cpu;
 
     // style_dp: HuggingFace stores as 3D [batch=1, rows=8, cols=16]
-    let dp_data = &voice.style_dp.data;
-    anyhow::ensure!(!dp_data.is_empty(), "Voice style has empty style_dp");
-    anyhow::ensure!(!dp_data[0].is_empty(), "Voice style has empty style_dp[0]");
-    let dp_rows = dp_data[0].len();
-    let dp_cols = dp_data[0][0].len();
-    let dp_flat: Vec<f32> = dp_data[0].iter().flat_map(|v| v.iter()).copied().collect();
-    anyhow::ensure!(
-        dp_flat.len() == dp_rows * dp_cols,
-        "Flat style_dp length {} doesn't match {}×{}",
-        dp_flat.len(),
-        dp_rows,
-        dp_cols,
-    );
-    let style_dp = Tensor::from_slice(&dp_flat, (1, dp_rows, dp_cols), &device)?;
+    let style_dp = style_tensor(&voice.style_dp.data, "style_dp", &device)?;
 
     // style_ttl: HuggingFace stores as 3D [batch=1, rows=50, cols=256]
-    let ttl_data = &voice.style_ttl.data;
-    anyhow::ensure!(!ttl_data.is_empty(), "Voice style has empty style_ttl");
-    anyhow::ensure!(
-        !ttl_data[0].is_empty(),
-        "Voice style has empty style_ttl[0]"
-    );
-    let ttl_rows = ttl_data[0].len();
-    let ttl_cols = ttl_data[0][0].len();
-    let ttl_flat: Vec<f32> = ttl_data[0].iter().flat_map(|v| v.iter()).copied().collect();
-    anyhow::ensure!(
-        ttl_flat.len() == ttl_rows * ttl_cols,
-        "Flat style_ttl length {} doesn't match {}×{}",
-        ttl_flat.len(),
-        ttl_rows,
-        ttl_cols,
-    );
-    let style_ttl = Tensor::from_slice(&ttl_flat, (1, ttl_rows, ttl_cols), &device)?;
+    let style_ttl = style_tensor(&voice.style_ttl.data, "style_ttl", &device)?;
 
     Ok((style_dp, style_ttl))
+}
+
+/// Flatten the first batch slice of a 3D `[batch, rows, cols]` style tensor
+/// and wrap it into a candle `Tensor` with the batch dimension restored.
+fn style_tensor(data: &[Vec<Vec<f32>>], label: &str, device: &Device) -> Result<Tensor> {
+    anyhow::ensure!(!data.is_empty(), "Voice style has empty {label}");
+    anyhow::ensure!(!data[0].is_empty(), "Voice style has empty {label}[0]");
+    let rows = data[0].len();
+    let cols = data[0][0].len();
+    let flat: Vec<f32> = data[0].iter().flat_map(|v| v.iter()).copied().collect();
+    anyhow::ensure!(
+        flat.len() == rows * cols,
+        "Flat {label} length {} doesn't match {}×{}",
+        flat.len(),
+        rows,
+        cols,
+    );
+    Ok(Tensor::from_slice(&flat, (1, rows, cols), device)?)
 }
 
 fn load_engine(dir: &Path) -> Result<TtsEngine> {
@@ -1471,9 +1466,7 @@ pub(crate) fn render_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
 // ── Async speak ──────────────────────────────────────────────────────
 
 #[expect(clippy::too_many_lines)]
-async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
-    let mut cancel_rx = cancel_rx;
-
+async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>>) {
     // Check cancellation before starting expensive work
     if let Some(ref mut rx) = cancel_rx
         && rx.try_recv().is_ok()
@@ -2163,20 +2156,6 @@ mod tests {
         }
 
         candidates
-    }
-
-    /// Return the list of essential TTS model file paths for a given model
-    /// directory, used to verify that the model is fully cached on disk.
-    ///
-    /// Shared between [`tts_models_cached`] (side-effect-free check) and
-    /// [`test_tts_engine`] (model loader) so the file set stays in sync.
-    fn essential_tts_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut paths: Vec<_> = ONNX_TTS_FILES
-            .iter()
-            .map(|(name, _)| dir.join(ONNX_DIR).join(name))
-            .collect();
-        paths.push(dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME));
-        paths
     }
 
     /// Helper to obtain a loaded [`TtsEngine`] for integration tests.
