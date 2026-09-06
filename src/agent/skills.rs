@@ -42,12 +42,11 @@ fn parse_frontmatter(content: &str) -> SkillMarkdownMeta {
     }
 
     let rest = &content[3..];
-    let end = rest.find("\n---").map_or(0, |i| i + 3);
-    if end < 3 {
+    let Some(idx) = rest.find("\n---") else {
         return SkillMarkdownMeta::default();
-    }
+    };
 
-    let frontmatter = rest[..end - 3].trim();
+    let frontmatter = rest[..idx].trim();
     let mut meta = SkillMarkdownMeta::default();
 
     for line in frontmatter.lines() {
@@ -195,24 +194,35 @@ fn render_skill_location(skill: &Skill, workspace: &Path) -> String {
     }
     skill.location.display().to_string()
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::workspace::test_ws;
     use std::path::PathBuf;
 
-    #[tokio::test]
-    async fn load_md_skill() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
-        let sd = skills_dir.join("my-skill");
+    /// Write a `SKILL.md` with frontmatter `name`/`description` at
+    /// `<root>/<rel>/<dir_name>/SKILL.md`. The body is filler — no test
+    /// asserts on it.
+    fn write_skill(root: &Path, rel: &str, dir_name: &str, name: &str, desc: &str) {
+        let sd = root.join(rel).join(dir_name);
         std::fs::create_dir_all(&sd).unwrap();
         std::fs::write(
             sd.join("SKILL.md"),
-            "---\nname: my-skill\ndescription: A markdown skill\n---\n\n# Instructions\nDo something.",
+            format!("---\nname: {name}\ndescription: {desc}\n---\n\nContent"),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_md_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path().join("skills").join("my-skill");
+        std::fs::create_dir_all(&sd).unwrap();
+        std::fs::write(
+                sd.join("SKILL.md"),
+                "---\nname: my-skill\ndescription: A markdown skill\n---\n\n# Instructions\nDo something.",
+            )
+            .unwrap();
         let skills = load_skills(&test_ws(dir.path())).await;
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "my-skill");
@@ -222,8 +232,7 @@ mod tests {
     #[tokio::test]
     async fn load_md_skill_without_frontmatter() {
         let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
-        let sd = skills_dir.join("bare-skill");
+        let sd = dir.path().join("skills").join("bare-skill");
         std::fs::create_dir_all(&sd).unwrap();
         std::fs::write(sd.join("SKILL.md"), "# Instructions\nDo something.").unwrap();
         let skills = load_skills(&test_ws(dir.path())).await;
@@ -273,28 +282,16 @@ mod tests {
         assert!(prompt.contains("skills/my-skill/SKILL.md"));
     }
 
-    #[test]
-    fn skills_to_prompt_no_instructions_inlined() {
-        let skill = Skill {
-            name: "quiet-skill".into(),
-            description: "Does stuff".into(),
-            location: PathBuf::from("skills/quiet-skill/SKILL.md"),
-        };
-        let prompt = skills_to_prompt(&[skill], &test_ws(Path::new("")));
-        assert!(prompt.contains("quiet-skill"));
-        assert!(prompt.contains("Does stuff"));
-    }
-
     #[tokio::test]
     async fn load_skills_from_claude_skills_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let sd = dir.path().join(".claude").join("skills").join("my-skill");
-        std::fs::create_dir_all(&sd).unwrap();
-        std::fs::write(
-            sd.join("SKILL.md"),
-            "---\nname: claude-skill\ndescription: From .claude/skills\n---\n\nContent",
-        )
-        .unwrap();
+        write_skill(
+            dir.path(),
+            ".claude/skills",
+            "my-skill",
+            "claude-skill",
+            "From .claude/skills",
+        );
         let skills = load_skills(&test_ws(dir.path())).await;
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "claude-skill");
@@ -303,13 +300,13 @@ mod tests {
     #[tokio::test]
     async fn load_skills_from_agents_skills_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let sd = dir.path().join(".agents").join("skills").join("my-skill");
-        std::fs::create_dir_all(&sd).unwrap();
-        std::fs::write(
-            sd.join("SKILL.md"),
-            "---\nname: agents-skill\ndescription: From .agents/skills\n---\n\nContent",
-        )
-        .unwrap();
+        write_skill(
+            dir.path(),
+            ".agents/skills",
+            "my-skill",
+            "agents-skill",
+            "From .agents/skills",
+        );
         let skills = load_skills(&test_ws(dir.path())).await;
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "agents-skill");
@@ -320,29 +317,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Same skill name in all three directories
-        let sd1 = dir.path().join("skills").join("common");
-        std::fs::create_dir_all(&sd1).unwrap();
-        std::fs::write(
-            sd1.join("SKILL.md"),
-            "---\nname: common\ndescription: From workspace skills/\n---\n\nContent",
-        )
-        .unwrap();
-
-        let sd2 = dir.path().join(".claude").join("skills").join("common");
-        std::fs::create_dir_all(&sd2).unwrap();
-        std::fs::write(
-            sd2.join("SKILL.md"),
-            "---\nname: common\ndescription: From .claude/skills\n---\n\nContent",
-        )
-        .unwrap();
-
-        let sd3 = dir.path().join(".agents").join("skills").join("common");
-        std::fs::create_dir_all(&sd3).unwrap();
-        std::fs::write(
-            sd3.join("SKILL.md"),
-            "---\nname: common\ndescription: From .agents/skills\n---\n\nContent",
-        )
-        .unwrap();
+        write_skill(
+            dir.path(),
+            "skills",
+            "common",
+            "common",
+            "From workspace skills/",
+        );
+        write_skill(
+            dir.path(),
+            ".claude/skills",
+            "common",
+            "common",
+            "From .claude/skills",
+        );
+        write_skill(
+            dir.path(),
+            ".agents/skills",
+            "common",
+            "common",
+            "From .agents/skills",
+        );
 
         let skills = load_skills(&test_ws(dir.path())).await;
         assert_eq!(skills.len(), 1);
@@ -354,21 +349,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Same skill name in claude and agents (no workspace/skills)
-        let sd2 = dir.path().join(".claude").join("skills").join("common");
-        std::fs::create_dir_all(&sd2).unwrap();
-        std::fs::write(
-            sd2.join("SKILL.md"),
-            "---\nname: common\ndescription: From .claude/skills\n---\n\nContent",
-        )
-        .unwrap();
-
-        let sd3 = dir.path().join(".agents").join("skills").join("common");
-        std::fs::create_dir_all(&sd3).unwrap();
-        std::fs::write(
-            sd3.join("SKILL.md"),
-            "---\nname: common\ndescription: From .agents/skills\n---\n\nContent",
-        )
-        .unwrap();
+        write_skill(
+            dir.path(),
+            ".claude/skills",
+            "common",
+            "common",
+            "From .claude/skills",
+        );
+        write_skill(
+            dir.path(),
+            ".agents/skills",
+            "common",
+            "common",
+            "From .agents/skills",
+        );
 
         let skills = load_skills(&test_ws(dir.path())).await;
         assert_eq!(skills.len(), 1);
@@ -378,20 +372,13 @@ mod tests {
     #[tokio::test]
     async fn load_skills_returns_deterministic_order() {
         let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
 
         // Create subdirs in deliberately scrambled order — `read_dir` order is
         // not guaranteed, so the loader must byte-sort by directory name for a
         // stable render. This asserts the sorted order directly (a byte-identical
         // two-render test would pass even pre-fix on APFS's stable-enough order).
         for name in ["zeta", "alpha", "middle"] {
-            let sd = skills_dir.join(name);
-            std::fs::create_dir_all(&sd).unwrap();
-            std::fs::write(
-                sd.join("SKILL.md"),
-                format!("---\nname: {name}\ndescription: Skill {name}\n---\n\nContent"),
-            )
-            .unwrap();
+            write_skill(dir.path(), "skills", name, name, &format!("Skill {name}"));
         }
 
         let skills = load_skills(&test_ws(dir.path())).await;
@@ -402,26 +389,12 @@ mod tests {
     #[tokio::test]
     async fn load_skills_duplicate_frontmatter_name_uses_sorted_dir_winner() {
         let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
 
         // Two subdirs declaring the same frontmatter name: the winner used to
         // be whatever `read_dir` yielded first (nondeterministic); with the
         // deterministic scan it is the byte-earliest directory name.
-        let sd_late = skills_dir.join("z-late");
-        std::fs::create_dir_all(&sd_late).unwrap();
-        std::fs::write(
-            sd_late.join("SKILL.md"),
-            "---\nname: common\ndescription: From z-late\n---\n\nContent",
-        )
-        .unwrap();
-
-        let sd_early = skills_dir.join("a-early");
-        std::fs::create_dir_all(&sd_early).unwrap();
-        std::fs::write(
-            sd_early.join("SKILL.md"),
-            "---\nname: common\ndescription: From a-early\n---\n\nContent",
-        )
-        .unwrap();
+        write_skill(dir.path(), "skills", "z-late", "common", "From z-late");
+        write_skill(dir.path(), "skills", "a-early", "common", "From a-early");
 
         let skills = load_skills(&test_ws(dir.path())).await;
         assert_eq!(skills.len(), 1);
@@ -432,29 +405,21 @@ mod tests {
     async fn load_skills_unique_names_from_multiple_dirs() {
         let dir = tempfile::tempdir().unwrap();
 
-        let sd1 = dir.path().join("skills").join("skill-a");
-        std::fs::create_dir_all(&sd1).unwrap();
-        std::fs::write(
-            sd1.join("SKILL.md"),
-            "---\nname: skill-a\ndescription: From workspace\n---\n\nContent",
-        )
-        .unwrap();
-
-        let sd2 = dir.path().join(".claude").join("skills").join("skill-b");
-        std::fs::create_dir_all(&sd2).unwrap();
-        std::fs::write(
-            sd2.join("SKILL.md"),
-            "---\nname: skill-b\ndescription: From .claude\n---\n\nContent",
-        )
-        .unwrap();
-
-        let sd3 = dir.path().join(".agents").join("skills").join("skill-c");
-        std::fs::create_dir_all(&sd3).unwrap();
-        std::fs::write(
-            sd3.join("SKILL.md"),
-            "---\nname: skill-c\ndescription: From .agents\n---\n\nContent",
-        )
-        .unwrap();
+        write_skill(dir.path(), "skills", "skill-a", "skill-a", "From workspace");
+        write_skill(
+            dir.path(),
+            ".claude/skills",
+            "skill-b",
+            "skill-b",
+            "From .claude",
+        );
+        write_skill(
+            dir.path(),
+            ".agents/skills",
+            "skill-c",
+            "skill-c",
+            "From .agents",
+        );
 
         let skills = load_skills(&test_ws(dir.path())).await;
         assert_eq!(skills.len(), 3);
