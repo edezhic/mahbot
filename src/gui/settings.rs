@@ -213,8 +213,8 @@ fn picker_list_field<'a>(
 /// persisted-form counterpart of [`picker_list_field`].
 fn picker_list_key(t: ModelPickerTarget) -> &'static str {
     match t {
-        ModelPickerTarget::ImageGen => "config:image_gen_models",
-        ModelPickerTarget::Video => "config:video_models",
+        ModelPickerTarget::ImageGen => CONFIG_FIELD_IMAGE_GEN_MODELS,
+        ModelPickerTarget::Video => CONFIG_FIELD_VIDEO_MODELS,
     }
 }
 
@@ -419,6 +419,12 @@ const CONFIG_FIELD_PROVIDER_ENDPOINT: &str = "config:provider_endpoint";
 /// Field id of the custom chat-endpoint API key (the `config:`-prefixed form
 /// of [`CONFIG_KEY_PROVIDER_ENDPOINT_KEY`]).
 const CONFIG_FIELD_PROVIDER_ENDPOINT_KEY: &str = "config:provider_endpoint_key";
+/// Field id of the web-search provider pick list.
+const CONFIG_FIELD_WEB_SEARCH_PROVIDER: &str = "config:web_search_provider";
+/// Field id of the image-generation model picker list.
+const CONFIG_FIELD_IMAGE_GEN_MODELS: &str = "config:image_gen_models";
+/// Field id of the video-generation model picker list.
+const CONFIG_FIELD_VIDEO_MODELS: &str = "config:video_models";
 
 /// The two routable model slots (manager + worker), resolved to their
 /// trimmed/default model names. This is the set of models represented by
@@ -994,9 +1000,9 @@ impl SettingsState {
     fn field_reverts_on_error(field: &str) -> bool {
         matches!(
             field,
-            "config:web_search_provider"
-                | "config:image_gen_models"
-                | "config:video_models"
+            CONFIG_FIELD_WEB_SEARCH_PROVIDER
+                | CONFIG_FIELD_IMAGE_GEN_MODELS
+                | CONFIG_FIELD_VIDEO_MODELS
                 | CONFIG_FIELD_PROVIDER_ENDPOINT
         )
     }
@@ -2766,7 +2772,7 @@ impl SettingsState {
                     &self.model_picker_inputs[ModelPickerTarget::ImageGen.idx()],
                     "model name (e.g. google/gemini-...)",
                     self.field_errors
-                        .get("config:image_gen_models")
+                        .get(CONFIG_FIELD_IMAGE_GEN_MODELS)
                         .map(String::as_str),
                 ),
                 Space::new().height(12),
@@ -2778,7 +2784,7 @@ impl SettingsState {
                     &self.model_picker_inputs[ModelPickerTarget::Video.idx()],
                     "model name (e.g. minimax/hailuo-3)",
                     self.field_errors
-                        .get("config:video_models")
+                        .get(CONFIG_FIELD_VIDEO_MODELS)
                         .map(String::as_str),
                 ),
             ]
@@ -2792,7 +2798,7 @@ impl SettingsState {
     // Detection, Text to Speech — each with the toggle and an inline status in
     // the same row. The wake-word enrollment UI (phrase input, Enroll button,
     // enrolled-phrase display, multi-line progress/Cancel) sits below the
-    // three rows, unchanged.
+    // three rows.
 
     #[expect(clippy::too_many_lines)]
     fn audio_section(&self) -> Element<'_, SettingsMessage> {
@@ -2914,7 +2920,7 @@ impl SettingsState {
             Some("Text-to-speech for agent responses"),
         );
 
-        // ── Wake-word enrollment UI (below the three rows, unchanged) ──
+        // ── Wake-word enrollment UI (below the three rows) ──
         // Enrolled-phrase display / phrase input / Enroll button (when voice
         // is on and transcription allows it — the push site below applies the
         // same guard, so the row collapses to nothing when either is off).
@@ -3101,7 +3107,7 @@ impl SettingsState {
             pick_list.into(),
             None,
             self.field_errors
-                .get("config:web_search_provider")
+                .get(CONFIG_FIELD_WEB_SEARCH_PROVIDER)
                 .map(String::as_str),
         );
 
