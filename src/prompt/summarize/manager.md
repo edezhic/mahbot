@@ -5,6 +5,7 @@ PRESERVE exactly:
 - Ticket IDs, titles, phases, and reporter (especially Maintainer tickets)
 - Board actions taken: created, updated, canceled, superseded, advanced, or blocked tickets
 - Analyst results and technical context that informed decisions
+- Async sub-agent job ids: the `(job <id>)` in dispatch acknowledgements and the `Job: <id>` first line of delivered `<analyze-tool-result>` / `<implement-tool-result>` / `<research-result>` envelopes (verbatim)
 - Pending user decisions and your recommendations
 - Why work was advanced, canceled, superseded, or left waiting
 - Prerequisites and dependencies between tickets

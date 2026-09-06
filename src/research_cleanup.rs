@@ -175,12 +175,12 @@ pub(crate) fn results_archive_path(job_id: &str) -> Option<PathBuf> {
 }
 
 /// Write the run's archived result to the shared results-archive location
-/// (question + delivered result, including partial terminalizations).
+/// (delivered result, including partial terminalizations).
 /// Overwrites idempotently on resume; a failed write is fail-open (the
 /// terminalization is never blocked on the archive). The storage root comes
 /// from CONFIG when set (test stores point it at a temp dir — no test writes
 /// into the real `~/.mahbot`), falling back to the default config dir.
-pub(crate) async fn write_results_md(job_id: &str, question: &str, result: &str) {
+pub(crate) async fn write_results_md(job_id: &str, result: &str) {
     let Some(path) = results_archive_path(job_id) else {
         tracing::warn!(job = %job_id, "results.md skipped — no config dir");
         return;
@@ -188,8 +188,7 @@ pub(crate) async fn write_results_md(job_id: &str, question: &str, result: &str)
     let dir = path
         .parent()
         .expect("archive path always ends in a file name");
-    let content =
-        format!("# Research {job_id}\n\n## Question\n\n{question}\n\n## Result\n\n{result}\n");
+    let content = format!("# Research {job_id}\n\n## Result\n\n{result}\n");
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         tracing::warn!(job = %job_id, error = %e, "results.md: failed to create archive dir");
     } else if let Err(e) = tokio::fs::write(&path, content).await {

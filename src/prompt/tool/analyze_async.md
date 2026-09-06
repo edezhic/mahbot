@@ -1,1 +1,1 @@
-The call is dispatched asynchronously, so the tool returns immediately without the findings. The consolidated results arrive later in your session as an injected follow-up result message (wrapped in an `<analyze-tool-result>` envelope).
+The call is dispatched asynchronously, so the tool returns immediately without the findings. The consolidated results arrive later in your session as an injected follow-up result message (wrapped in an `<analyze-tool-result>` envelope whose body starts with a `Job: <id>` line matching the id in the dispatch acknowledgement).

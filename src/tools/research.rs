@@ -439,12 +439,18 @@ impl Tool for ResearchTool {
         let question = super::get_str(&args, "question")?;
 
         // Read user context from task-locals BEFORE tokio::spawn so the
-        // single result envelope carries the correct user identity.
+        // single result envelope carries the correct user identity. The job id
+        // is generated here (before the spawn) so the immediate ack
+        // placeholder and the delivered envelope reference one identical id.
         let ws = ws.clone();
         let question = question.to_string();
         let caller_role = self.caller_role;
         let user_name = crate::agent::tool_user_name();
         let channel = crate::agent::tool_channel();
+        let job_id = crate::generate_id();
+        let ack = format!(
+            "Deep research dispatched (job {job_id}). One report will be delivered when the run completes."
+        );
 
         tokio::spawn(async move {
             // Catch panics so the caller ALWAYS receives the single result
@@ -457,6 +463,7 @@ impl Tool for ResearchTool {
                     caller_role,
                     user_name.clone(),
                     channel.clone(),
+                    &job_id,
                 )
                 .await
             })
@@ -481,16 +488,17 @@ impl Tool for ResearchTool {
                     let panic = crate::util::panic_message(&*panic);
                     tracing::error!(panic = %panic, "research dispatch panicked");
                     AgentJob {
-                        content: build_async_research_message(&Err(anyhow::anyhow!(
-                            "research dispatch panicked: {panic}"
-                        ))),
+                        content: build_async_research_message(
+                            &job_id,
+                            &Err(anyhow::anyhow!("research dispatch panicked: {panic}")),
+                        ),
                         workspace_name: ws.name.clone(),
                         user_name,
                         channel,
                         kind: MessageKind::ResearchResult,
                         role: caller_role,
                         reply_target: None,
-                        pending_job_id: None,
+                        pending_job_id: Some(job_id),
                         reply_to_agent_id: None,
                         reply_workspace_name: None,
                     }
@@ -505,10 +513,7 @@ impl Tool for ResearchTool {
             message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
         });
 
-        Ok(
-            "Deep research dispatched. One report will be delivered when the run completes."
-                .to_string(),
-        )
+        Ok(ack)
     }
 }
 
@@ -519,26 +524,28 @@ impl Tool for ResearchTool {
 /// (pending_job_id set by the tx), routed as-is so persisted and routed copies
 /// cannot drift. Returns `None` on a shutdown/drain abort AND on a manual
 /// cancel — the abort keeps the run alive for boot resume, the cancel stops
-/// the run permanently (cleanup handoff, nothing delivered).
+/// the run permanently (cleanup handoff, nothing delivered). The `job_id` is
+/// caller-generated (created in [`ResearchTool::execute`] BEFORE the spawn) so
+/// the immediate ack and the delivered envelope share one id.
 async fn dispatch_durable_research(
     ws: &Workspace,
     question: &str,
     caller_role: Role,
     user_name: String,
     channel: String,
+    job_id: &str,
 ) -> Option<AgentJob> {
-    let job_id = crate::generate_id();
     // The run's cancel signal lives for the whole invocation — fresh dispatch
     // and its terminalization tail. A manual cancel from the Running Agents
     // page fires it; the orchestrator's boundary gates observe it and stop
     // permanently (ResearchExit::Cancelled).
-    let _cancel_guard = crate::research_cancel::register(&job_id);
+    let _cancel_guard = crate::research_cancel::register(job_id);
     let spawn = async {
         // SPAWN: one tx — jobs + research_jobs child row (the shared in-tx
         // child pattern; a crash mid-spawn leaves either all or none).
         crate::jobs::spawn_job(
             &crate::session::store().conn,
-            &job_id,
+            job_id,
             question,
             &ws.name,
             &user_name,
@@ -554,7 +561,7 @@ async fn dispatch_durable_research(
     let spawn_out = spawn.await;
     let spawned = spawn_out.is_ok();
     let exit = match spawn_out {
-        Ok(()) => run_deep_research(ws, question, &job_id, false).await,
+        Ok(()) => run_deep_research(ws, question, job_id, false).await,
         Err(e) => ResearchExit::Terminal(Err(e)),
     };
     let result = match exit {
@@ -579,13 +586,13 @@ async fn dispatch_durable_research(
                 job = %job_id,
                 "Research run manually cancelled — permanent stop, nothing delivered"
             );
-            hand_off_cancelled_or_warn(&job_id, ws, question).await;
+            hand_off_cancelled_or_warn(job_id, ws, question).await;
             return None;
         }
         ResearchExit::Terminal(result) => result,
     };
     terminalize_research(
-        &job_id,
+        job_id,
         ws,
         &result,
         caller_role,
@@ -610,13 +617,8 @@ async fn dispatch_durable_research(
 /// `complete_durable_job` (the cleanup jobs row reuses id == run_id, so the
 /// completion DELETE must have run first); the [`terminalize_research`] tail
 /// dispatches it.
-async fn write_terminalization_artifacts(
-    job_id: &str,
-    question: &str,
-    delivered: &str,
-    state: &ResearchState,
-) {
-    crate::research_cleanup::write_results_md(job_id, question, delivered).await;
+async fn write_terminalization_artifacts(job_id: &str, delivered: &str, state: &ResearchState) {
+    crate::research_cleanup::write_results_md(job_id, delivered).await;
     let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
     crate::research_cleanup::write_command_dump(&run_root, job_id, &state.commands).await;
 }
@@ -656,7 +658,7 @@ async fn terminalize_research(
         hand_off_cancelled_or_warn(job_id, ws, question).await;
         return None;
     }
-    let delivered = build_async_research_message(result);
+    let delivered = build_async_research_message(job_id, result);
     // Terminalization artifacts BEFORE the exactly-once boundary, only for
     // runs that actually started (a spawn failure has no state to archive).
     // The aborted flag (not the global shutdown state) already gated aborts
@@ -664,7 +666,7 @@ async fn terminalize_research(
     // returned must not skip the artifacts.
     if spawned {
         let state = ResearchState::load(job_id).await;
-        write_terminalization_artifacts(job_id, question, &delivered, &state).await;
+        write_terminalization_artifacts(job_id, &delivered, &state).await;
     }
     // Complete BEFORE the cleanup dispatch (the cleanup jobs row reuses
     // id == run_id; the completion DELETE must free it first) and BEFORE the
@@ -779,10 +781,11 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
 }
 
 /// Build the `<research-result>` envelope message for the async research
-/// dispatch. Follows the analyze convention: failures are wrapped with an
-/// explicit marker, never silently dropped.
-fn build_async_research_message(result: &anyhow::Result<String>) -> String {
-    build_async_result_envelope(result, "research-result")
+/// dispatch. Follows the analyze convention: the caller-generated `job_id` is
+/// embedded so the delivered report is correlatable with the immediate ack,
+/// and failures are wrapped with an explicit marker, never silently dropped.
+fn build_async_research_message(job_id: &str, result: &anyhow::Result<String>) -> String {
+    build_async_result_envelope(job_id, result, "research-result")
 }
 
 // ── Evidence accumulation ────────────────────────────────────────────────
@@ -3148,15 +3151,12 @@ fn render_recovered_findings(recovered: &[AnalystFindings]) -> String {
 /// Shutdown/abort paths return `ResearchExit::Aborted`/`Cancelled` directly
 /// and never produce this report.
 fn partial_report(
-    question: &str,
     acc: &AccumulatedEvidence,
     reason: &str,
     recovered: &[AnalystFindings],
 ) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "## Research Report (incomplete — {reason})");
-    let _ = writeln!(out);
-    let _ = writeln!(out, "**Question**: {question}");
     let _ = writeln!(out);
     out.push_str(&render_recovered_findings(recovered));
     let _ = writeln!(out, "### Evidence Gathered So Far");
@@ -3335,7 +3335,6 @@ async fn run_deep_research(
         .await
         else {
             return ResearchExit::Terminal(Ok(partial_report(
-                question,
                 &state.acc,
                 "round 1 skipped — analyst budget exhausted",
                 &recovered,
@@ -3469,7 +3468,6 @@ async fn run_deep_research(
         }
         Err(e) => {
             return ResearchExit::Terminal(Ok(partial_report(
-                question,
                 &state.acc,
                 &format!("synthesis failed: {e}"),
                 &recovered,
@@ -3592,9 +3590,10 @@ mod tests {
     fn test_research_fail_open_envelope() {
         // All-decomposers-failed follows the analyze convention: an error envelope
         // with an explicit marker, never a silent drop.
-        let envelope = build_async_research_message(&Err(anyhow::anyhow!(
-            "all decomposition analysts failed"
-        )));
+        let envelope = build_async_research_message(
+            "job123",
+            &Err(anyhow::anyhow!("all decomposition analysts failed")),
+        );
         assert!(envelope.contains("<research-result>"), "{envelope}");
         assert!(
             envelope.contains("An error occurred: all decomposition analysts failed"),

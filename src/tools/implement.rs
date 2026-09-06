@@ -83,8 +83,16 @@ impl Tool for ImplementTool {
         // background. Spawn/identity/drain-cut/panic/route semantics live in
         // `SyncDurableCore::spawn_dispatch`.
         if self.dispatch_mode.is_async() {
-            super::SyncDurableCore::Implement.spawn_dispatch(ws, task, self.caller_role);
-            return Ok("Sub-agent dispatched. Results will follow shortly.".to_string());
+            let job_id = crate::generate_id();
+            super::SyncDurableCore::Implement.spawn_dispatch(
+                ws,
+                task,
+                self.caller_role,
+                job_id.clone(),
+            );
+            return Ok(format!(
+                "Sub-agent dispatched (job {job_id}). Results will follow shortly."
+            ));
         }
 
         // Sync path — spawn one coder and block until it completes, through

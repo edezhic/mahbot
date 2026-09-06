@@ -131,8 +131,16 @@ impl Tool for AnalyzeTool {
         // Spawn/identity/drain-cut/panic/route semantics live in
         // `SyncDurableCore::spawn_dispatch`.
         if self.dispatch_mode.is_async() {
-            super::SyncDurableCore::Analyze.spawn_dispatch(ws, analyze, self.caller_role);
-            return Ok("Sub-agent dispatched. Results will follow shortly.".to_string());
+            let job_id = crate::generate_id();
+            super::SyncDurableCore::Analyze.spawn_dispatch(
+                ws,
+                analyze,
+                self.caller_role,
+                job_id.clone(),
+            );
+            return Ok(format!(
+                "Sub-agent dispatched (job {job_id}). Results will follow shortly."
+            ));
         }
 
         // Sync path — blocks caller until the analysts complete. Runs through
@@ -925,14 +933,13 @@ async fn consolidate_findings(
     {
         crate::consensus::RepairOutcome::Repaired { output, references } => {
             // Annotation-only verification of disputed groups: fresh analysts
-            // re-check the contested findings, appended before the footer. The
-            // main grouped analysis is never re-run or re-rendered.
+            // re-check the contested findings, appended after the grouped
+            // analysis. The main grouped analysis is never re-run or re-rendered.
             let verification = verify_disputed_groups(
                 ws, analyze, &output, &table, &outcomes, round_key, deadline,
             )
             .await;
             Ok(render_analyze_groups(
-                analyze,
                 &output,
                 &references,
                 &table,
@@ -960,11 +967,10 @@ async fn consolidate_findings(
 /// as member metadata, never as contradictions.
 ///
 /// `verification` is the annotation-only `## Verification` section (empty when
-/// no disputed group was verified) — inserted before the `_Original question:`
-/// footer so the main grouped analysis is never disturbed.
+/// no disputed group was verified) — inserted after the grouped analysis so the
+/// main grouped analysis is never disturbed.
 #[must_use]
 fn render_analyze_groups(
-    analyze: &str,
     output: &crate::consensus::GroupingOutput,
     references: &[crate::consensus::GroupingReference],
     table: &crate::consensus::ItemTable<'_>,
@@ -1013,8 +1019,6 @@ fn render_analyze_groups(
     if !verification.is_empty() {
         let _ = write!(out, "\n\n{verification}");
     }
-    // Original question for context (answers are delivered out of band).
-    let _ = write!(out, "\n\n_Original question: {analyze}_");
     out
 }
 
@@ -1796,7 +1800,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes, "");
+        let text = render_analyze_groups(&output, &[], &table, 2, &outcomes, "");
         assert!(
             text.contains("**Alpha** [2/2]"),
             "consensus group renders [2/2] from distinct cited agents: {text}"
@@ -1848,7 +1852,7 @@ mod tests {
             }],
             ungrouped: vec![],
         };
-        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes, "");
+        let text = render_analyze_groups(&output, &[], &table, 2, &outcomes, "");
         assert!(
             text.contains("**Alpha** [2/2 · DISPUTED]"),
             "contradiction group renders [2/2 · DISPUTED]: {text}"
@@ -1889,7 +1893,7 @@ mod tests {
             }],
             ungrouped: vec![],
         };
-        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes, "");
+        let text = render_analyze_groups(&output, &[], &table, 2, &outcomes, "");
         assert!(
             text.contains("caveat: source B says alpha may be false"),
             "self-reported caveat renders as member metadata: {text}"
@@ -2179,7 +2183,8 @@ mod tests {
             .err(crate::retry::FailureClass::Transport, "down");
         let result =
             consolidate_with_script(agreed_outcomes("raw report", "raw report 2"), fake).await;
-        let envelope = crate::tools::SyncDurableCore::Analyze.build_async_message(&result);
+        let envelope =
+            crate::tools::SyncDurableCore::Analyze.build_async_message("job123", &result);
         assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
         assert!(
             envelope.contains("unconsolidated — consolidation failed"),
@@ -2197,7 +2202,7 @@ mod tests {
         // The async dispatch path's error branch: a failed sub-agent is
         // wrapped in the same envelope with the error text.
         let envelope = crate::tools::SyncDurableCore::Analyze
-            .build_async_message(&Err(anyhow::anyhow!("sub-agent exploded")));
+            .build_async_message("job123", &Err(anyhow::anyhow!("sub-agent exploded")));
         assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
         assert!(
             envelope.contains("An error occurred: sub-agent exploded"),
@@ -2279,7 +2284,7 @@ mod tests {
                 ..Default::default()
             },
         }];
-        let text = render_analyze_groups("q", &output, &references, &table, 2, &outcomes, "");
+        let text = render_analyze_groups(&output, &references, &table, 2, &outcomes, "");
         assert!(
             text.contains("Agent 1: actually unsafe [DISPUTED — contradicts group 0 \"Safety\"]"),
             "reference must render with DISPUTED + cross-ref: {text}"
@@ -2673,42 +2678,6 @@ mod tests {
         assert!(
             render_verification_section(&[]).is_empty(),
             "empty results render an empty section"
-        );
-    }
-
-    #[test]
-    fn render_analyze_groups_places_verification_before_footer() {
-        let outcomes = vec![
-            AnalystOutcome::Findings {
-                raw: "r1".into(),
-                findings: findings(vec![("alpha is true", "url1", "high")]),
-            },
-            AnalystOutcome::Findings {
-                raw: "r2".into(),
-                findings: findings(vec![("alpha is false", "url2", "high")]),
-            },
-        ];
-        let items = claims_per_agent(&outcomes);
-        let table = crate::consensus::ItemTable::new(&items);
-        let output = crate::consensus::GroupingOutput {
-            summary: "disputed.".into(),
-            groups: vec![disputed_group("Alpha", &[0, 1])],
-            ungrouped: vec![],
-        };
-        let verification = render_verification_section(&[VerificationResult {
-            claim: "Alpha: alpha is true; alpha is false".into(),
-            verdict: "unresolved".into(),
-            evidence: "not decided".into(),
-            tool_calls: 0,
-            searches: 0,
-            queries: vec![],
-        }]);
-        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes, &verification);
-        let footer = text.find("_Original question: q_").expect("footer present");
-        let verification_pos = text.find("## Verification").expect("verification present");
-        assert!(
-            verification_pos < footer,
-            "verification section inserted before the _Original question: footer"
         );
     }
 
