@@ -67,7 +67,7 @@ static LEGACY_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The pinned root path, if [`init_temp_root`] ran (production unix startup).
 #[must_use]
-pub(crate) fn temp_root() -> Option<&'static Path> {
+fn temp_root() -> Option<&'static Path> {
     TEMP_ROOT.get().map(PathBuf::as_path)
 }
 

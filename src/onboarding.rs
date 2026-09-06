@@ -56,35 +56,10 @@ pub fn parse_provider_input(raw: &str) -> ProviderInput {
         if crate::config::is_default_endpoint(lines[0]) && key.contains("sk-or-v1-") {
             return ProviderInput::OpenRouterKey(key);
         }
-        // The default endpoint is not a custom endpoint — a bare default URL (or
-        // default URL with a non-OpenRouter key) can't configure the provider, so
-        // reject it rather than persisting something that never becomes configured.
-        if crate::config::is_default_endpoint(lines[0]) {
-            return ProviderInput::Invalid;
-        }
-        if !is_clean_url_line(lines[0]) {
-            return ProviderInput::Invalid;
-        }
-        return ProviderInput::CustomEndpoint {
-            url: lines[0].to_string(),
-            key: Some(key),
-        };
+        return custom_endpoint(lines[0], Some(key));
     }
     if lines.len() == 1 && is_http_url(lines[0]) {
-        if crate::config::is_default_endpoint(lines[0]) {
-            return ProviderInput::Invalid;
-        }
-        // A URL can't contain a literal space — a single line with trailing junk
-        // (e.g. a key pasted on the same line) is a malformed entry outside the
-        // documented two-line grammar; reject it rather than persisting a broken
-        // endpoint that would report as configured.
-        if !is_clean_url_line(lines[0]) {
-            return ProviderInput::Invalid;
-        }
-        return ProviderInput::CustomEndpoint {
-            url: lines[0].to_string(),
-            key: None,
-        };
+        return custom_endpoint(lines[0], None);
     }
     // A line carrying a `sk-or-v1-` token is an OpenRouter key. Extract the key
     // line rather than the whole input, so a reversed entry (key line, then URL)
@@ -93,6 +68,23 @@ pub fn parse_provider_input(raw: &str) -> ProviderInput {
         return ProviderInput::OpenRouterKey(key_line.to_string());
     }
     ProviderInput::Invalid
+}
+
+/// Shared validation tail for both URL branches: reject the default endpoint
+/// (a bare default URL, or a default URL with a non-OpenRouter key, can't
+/// configure the provider — persisting it would never become configured) and
+/// malformed URL lines; otherwise build the custom endpoint.
+fn custom_endpoint(url_line: &str, key: Option<String>) -> ProviderInput {
+    if crate::config::is_default_endpoint(url_line) {
+        return ProviderInput::Invalid;
+    }
+    if !is_clean_url_line(url_line) {
+        return ProviderInput::Invalid;
+    }
+    ProviderInput::CustomEndpoint {
+        url: url_line.to_string(),
+        key,
+    }
 }
 
 // Deliberately case-insensitive, unlike the prefix-only `util::is_http_url`

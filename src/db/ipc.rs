@@ -30,17 +30,17 @@ pub(crate) const IPC_ROW_LIMIT: usize = 10_000;
 
 /// Socket file name for the debug IPC endpoint (a filesystem socket on Unix).
 #[cfg(not(windows))]
-pub(crate) const IPC_SOCKET_FILE_NAME: &str = "mahbot-debug.sock";
+const IPC_SOCKET_FILE_NAME: &str = "mahbot-debug.sock";
 /// Windows named-pipe name. Named pipes live in a global `\\.\pipe\` namespace
 /// with no per-directory scope, and the `GenericFilePath` name type only
 /// accepts `\\.\pipe\`-prefixed paths there — so this is not derived from the
 /// storage root. The instance lock already guarantees a single daemon.
 #[cfg(windows)]
-pub(crate) const IPC_PIPE_NAME: &str = r"\\.\pipe\mahbot-debug";
+const IPC_PIPE_NAME: &str = r"\\.\pipe\mahbot-debug";
 
 /// Total wall-clock bound for the daemon-up-but-socket-not-bound retry
 /// (flock held before the listener binds during boot / self-update handoff).
-pub(crate) const IPC_BOUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const IPC_BOUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Retry backoff schedule (ms) for the IPC socket-not-yet-bound window.
 const IPC_RETRY_BACKOFF_MS: [u64; 6] = [50, 100, 200, 400, 800, 1600];
@@ -61,7 +61,7 @@ const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// a path under the storage root. Both the listener and the clients call this
 /// so they agree on the endpoint name.
 #[must_use]
-pub(crate) fn socket_path(storage_root: &Path) -> PathBuf {
+fn socket_path(storage_root: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let _ = storage_root;
