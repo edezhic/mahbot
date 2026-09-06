@@ -95,7 +95,7 @@ impl OpenAiCompatibleProvider {
 
     /// Shared pool for warmup + scoped calls, no total timeout; warmup
     /// bounds itself per-request via [`Self::WARMUP_TOTAL_TIMEOUT`].
-    pub(crate) fn http_client(&self) -> &Client {
+    fn http_client(&self) -> &Client {
         self.http_client.get_or_init(|| self.build_client())
     }
 }
@@ -407,12 +407,12 @@ struct ImageUrlPart {
 
 /// Convert a role+content pair into the appropriate [`MessageContent`] variant.
 ///
-/// For [`ChatRole::User`] content, native image payloads (data URIs that
-/// decode to a real jpeg/png/webp raster) are parsed into
-/// [`MessagePart::ImageUrl`] entries alongside the cleaned text — every role now
-/// emits native image parts. Remote http(s) IMAGE markers are never injected
-/// (they stay as literal text); prose/path markers and fake/truncated data URIs
-/// also stay in the text. Everything else is returned as [`MessageContent::Text`].
+/// Only [`ChatRole::User`] content gets native image payloads (data URIs that
+/// decode to a real jpeg/png/webp raster) parsed into
+/// [`MessagePart::ImageUrl`] entries alongside the cleaned text; every other
+/// role is returned as [`MessageContent::Text`] verbatim. Remote http(s) IMAGE
+/// markers are never injected (they stay as literal text); prose/path markers
+/// and fake/truncated data URIs also stay in the text.
 ///
 /// This conversion is the only place marker parsing lives.
 fn to_message_content(role: ChatRole, content: &str) -> MessageContent {
@@ -432,11 +432,8 @@ fn to_message_content(role: ChatRole, content: &str) -> MessageContent {
     }
 
     let mut parts = Vec::with_capacity(image_refs.len() + 1);
-    let trimmed_text = cleaned_text.trim();
-    if !trimmed_text.is_empty() {
-        parts.push(MessagePart::Text {
-            text: trimmed_text.to_string(),
-        });
+    if !cleaned_text.is_empty() {
+        parts.push(MessagePart::Text { text: cleaned_text });
     }
 
     for image_ref in image_refs {
@@ -690,7 +687,7 @@ impl OpenAiCompatibleProvider {
                 cost_details: u.cost_details,
             }
         });
-        let upstream_provider = native_response.provider.clone();
+        let upstream_provider = native_response.provider;
         let choice = native_response.choices.into_iter().next().ok_or_else(|| {
             scoped_simple_error(
                 anyhow::anyhow!("No response from {}", self.name),
@@ -970,9 +967,8 @@ async fn read_body_idle(response: reqwest::Response, idle_timeout: Duration) -> 
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     loop {
-        let wait_bound = idle_timeout;
         let next_chunk = crate::shutdown::race_shutdown(stream.next());
-        let chunk = match tokio::time::timeout(wait_bound, next_chunk).await {
+        let chunk = match tokio::time::timeout(idle_timeout, next_chunk).await {
             Err(_) => {
                 return BodyReadOutcome::Failed {
                     partial: body,
@@ -1638,10 +1634,6 @@ mod tests {
             );
         }
     }
-
-    // ----------------------------------------------------------
-    // URL endpoint tests
-    // ----------------------------------------------------------
 
     #[test]
     fn parse_native_response_preserves_tool_call_id() {
