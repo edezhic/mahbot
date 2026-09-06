@@ -276,17 +276,12 @@ impl BoardState {
     /// re-checks the phase at execution, so the real
     /// pause decision is always authoritative regardless of staleness here.
     fn cancel_confirmation_needed(&self, ticket_id: &str) -> bool {
-        if let Some(ref ticket) = self.selected_ticket {
-            if ticket.id == ticket_id {
-                return ticket.phase.is_pipeline_occupied();
-            }
-        }
-        if let Some(ticket) = self.search_results.iter().find(|t| t.id == ticket_id) {
-            return ticket.phase.is_pipeline_occupied();
-        }
-        self.tickets
-            .iter()
-            .any(|t| t.id == ticket_id && t.phase.is_pipeline_occupied())
+        self.selected_ticket
+            .as_ref()
+            .filter(|t| t.id == ticket_id)
+            .or_else(|| self.search_results.iter().find(|t| t.id == ticket_id))
+            .or_else(|| self.tickets.iter().find(|t| t.id == ticket_id))
+            .is_some_and(|t| t.phase.is_pipeline_occupied())
     }
 
     /// Reset all modal-related state fields (close detail modal).
@@ -304,6 +299,13 @@ impl BoardState {
         self.commit_stats = None;
         self.commit_stats_loading = false;
         self.commit_stats_generation += 1;
+        self.reset_comment_state();
+    }
+
+    /// Clear the comment draft and related state, and bump
+    /// `comment_generation` so in-flight comment callbacks for the
+    /// previous ticket no longer match.
+    fn reset_comment_state(&mut self) {
         self.comment_input.clear();
         self.sending_comment = false;
         self.comment_focused = false;
@@ -659,7 +661,6 @@ impl BoardState {
         }
     }
 
-    /// Phase transition actions (ported from Board.tsx `availableActions`)
     fn available_actions(phase: TicketPhase) -> Vec<(&'static str, TicketPhase)> {
         match phase {
             TicketPhase::Queued => vec![
@@ -949,15 +950,9 @@ impl BoardState {
                 let stats_task = self.apply_ticket_display(ticket);
                 self.selected_loading = false;
                 // Bump generation to invalidate any in-flight comment
-                // callbacks for the previous ticket.
-                self.comment_generation += 1;
-                // Clear comment input state when switching to a new ticket
-                // to prevent a draft from the previous ticket being
-                // accidentally sent to the new one.
-                self.comment_input.clear();
-                self.sending_comment = false;
-                self.comment_focused = false;
-                self.undo_stack.clear();
+                // callbacks for the previous ticket, and clear the draft
+                // so it is not accidentally sent to the new ticket.
+                self.reset_comment_state();
                 stats_task
             }
             BoardMessage::TicketDetailsRefreshed(generation, ticket) => {
@@ -1587,9 +1582,19 @@ impl BoardState {
     }
 
     /// Whether a ticket detail modal is currently open (or loading).
-    #[must_use]
-    pub const fn is_modal_open(&self) -> bool {
+    const fn is_modal_open(&self) -> bool {
         self.selected_ticket.is_some() || self.selected_loading || self.detail_error.is_some()
+    }
+
+    /// Shared detail-modal shell: `dialog_shell` at `width` on the
+    /// close-on-click backdrop.
+    fn modal_dialog<'a>(
+        content: impl Into<Element<'a, BoardMessage>>,
+        width: f32,
+    ) -> Element<'a, BoardMessage> {
+        let dialog = dialog::dialog_shell(content, width, 24.0);
+
+        widgets::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
     }
 
     /// Render the modal overlay for ticket detail.
@@ -1605,7 +1610,7 @@ impl BoardState {
     pub fn render_modal_overlay(&self) -> Element<'_, BoardMessage> {
         let detail_layer = if self.is_modal_open() {
             if self.selected_loading {
-                let dialog = dialog::dialog_shell(
+                Self::modal_dialog(
                     column![
                         text("Loading details\u{2026}")
                             .size(theme::TEXT_16)
@@ -1617,14 +1622,11 @@ impl BoardState {
                     ]
                     .align_x(Alignment::Center),
                     400.0,
-                    24.0,
-                );
-
-                widgets::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
+                )
             } else if self.selected_ticket.is_none()
                 && let Some(ref err) = self.detail_error
             {
-                let dialog = dialog::dialog_shell(
+                Self::modal_dialog(
                     column![
                         text("Failed to load ticket")
                             .size(theme::TEXT_16)
@@ -1643,15 +1645,9 @@ impl BoardState {
                     ]
                     .align_x(Alignment::Center),
                     400.0,
-                    24.0,
-                );
-
-                widgets::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
+                )
             } else {
-                let detail = self.modal_detail();
-                let dialog = dialog::dialog_shell(detail, 720.0, 24.0);
-
-                widgets::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
+                Self::modal_dialog(self.modal_detail(), 720.0)
             }
         } else {
             // Keep Stack widget type stable to prevent MouseArea state
