@@ -566,7 +566,7 @@ impl SessionsState {
                     .height(Length::Fill)
                     .padding(theme::PAD_16)
                     .into()
-            } else if let Some(ref _key) = self.selected_session {
+            } else if self.selected_session.is_some() {
                 let entries = &self.entries;
                 let entry_md = &self.entry_md;
                 let expanded = &self.expanded;
@@ -631,7 +631,7 @@ fn common_entry_prefix(old: &[SessionEntry], new: &[SessionEntry]) -> usize {
 
 /// Author label above a bubble, aligned to the bubble's side. One non-accent
 /// color for every role, so roles stay visually consistent.
-fn author_label<'a>(role: crate::ChatRole, assistant: bool) -> Element<'a, SessionsMessage> {
+fn author_label<'a>(role: crate::ChatRole) -> Element<'a, SessionsMessage> {
     let name = match role {
         crate::ChatRole::System => "System",
         crate::ChatRole::User => "User",
@@ -641,7 +641,7 @@ fn author_label<'a>(role: crate::ChatRole, assistant: bool) -> Element<'a, Sessi
     let label = text(name).size(theme::TEXT_11).color(theme::TEXT_SECONDARY);
     align_bubble(
         label,
-        if assistant {
+        if matches!(role, crate::ChatRole::Assistant) {
             BubbleSide::Right
         } else {
             BubbleSide::Left
@@ -654,9 +654,9 @@ fn author_label<'a>(role: crate::ChatRole, assistant: bool) -> Element<'a, Sessi
 /// left). Same background/typography as the Home chat bubbles.
 fn bubble_row(
     role: crate::ChatRole,
-    assistant: bool,
     body: Column<'_, SessionsMessage>,
 ) -> Element<'_, SessionsMessage> {
+    let assistant = matches!(role, crate::ChatRole::Assistant);
     let bubble = container(body)
         .padding(theme::PAD_10)
         .style(theme::bubble_style(
@@ -669,7 +669,7 @@ fn bubble_row(
         ))
         .width(Length::FillPortion(3));
     column![
-        author_label(role, assistant),
+        author_label(role),
         align_bubble(
             bubble,
             if assistant {
@@ -834,7 +834,7 @@ fn plain_collapsible<'a>(
         is_expanded,
         preview,
         color,
-        11.0,
+        theme::TEXT_11,
         theme::FONT_REGULAR,
         selectable_text(content, color).size(theme::TEXT_11).into(),
     );
@@ -867,7 +867,7 @@ fn thinking_block<'a>(
         is_expanded,
         preview,
         theme::TEXT_MUTED,
-        11.0,
+        theme::TEXT_11,
         theme::FONT_REGULAR,
         selectable_text(content, theme::TEXT_MUTED)
             .size(theme::TEXT_11)
@@ -1026,7 +1026,7 @@ fn render_tool_round<'a>(
 
     // One bubble for the whole round, same container as assistant text rounds
     // (right-aligned, 75% width, author label above).
-    bubble_row(crate::ChatRole::Assistant, true, bubble_col)
+    bubble_row(crate::ChatRole::Assistant, bubble_col)
 }
 
 /// Render one ledger entry as a chat-bubble row: a `Message` renders its own
@@ -1041,7 +1041,6 @@ fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Element<'a, SessionsMe
             content,
             thinking,
         } => {
-            let assistant = matches!(role, crate::ChatRole::Assistant);
             let mut bubble_col = Column::new().spacing(theme::SPACE_4);
             if let Some(thinking) = thinking {
                 bubble_col = bubble_col.push(thinking_block(ctx, (i, 1), thinking));
@@ -1050,10 +1049,10 @@ fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Element<'a, SessionsMe
                 bubble_col = bubble_col.push(body_block(ctx, (i, 0), content, md, false));
             }
             if thinking.is_some() || content.is_some() {
-                bubble_row(*role, assistant, bubble_col)
+                bubble_row(*role, bubble_col)
             } else {
                 // Nothing to show but the author.
-                author_label(*role, assistant)
+                author_label(*role)
             }
         }
         SessionEntry::ToolRound {

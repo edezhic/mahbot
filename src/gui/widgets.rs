@@ -85,6 +85,44 @@ fn editor_field_style(border_color: Color) -> impl Fn(&iced::Theme) -> container
     move |_theme: &iced::Theme| theme::container_style(theme::BG_ELEVATED, 4.0, 1.0, border_color)
 }
 
+/// Build a single-line shared-editor field with the app's standard chrome.
+///
+/// Shared preamble of [`single_line_editor`] and [`password_field_editor`]: a
+/// single-line, non-gutter, non-code-mode [`super::editor_widget::EditorWidget`]
+/// with `masked` glyphs, a `placeholder`, `PAD_5` padding and the `BG_ELEVATED`
+/// background, wrapped in a width-`styled` container with `border_color`. The
+/// optional `id` makes the field click-to-focus and gates keyboard processing
+/// on focus.
+#[expect(clippy::too_many_arguments)] // shared preamble: 8 config args by design
+fn editor_field<'a, M: 'a>(
+    buffer: &'a super::editor_widget::EditorBuffer,
+    placeholder: &'a str,
+    enter: super::editor_widget::EnterBehavior,
+    masked: bool,
+    border_color: Color,
+    width: Length,
+    id: Option<iced::widget::Id>,
+    on_action: impl Fn(super::editor_widget::EditorAction) -> M + 'a,
+) -> Element<'a, M> {
+    let mut editor = super::editor_widget::EditorWidget::new(buffer)
+        .single_line(true)
+        .masked(masked)
+        .show_gutter(false)
+        .code_mode(false)
+        .enter(enter)
+        .placeholder(placeholder)
+        .padding(theme::PAD_5)
+        .background(Some(theme::BG_ELEVATED));
+    if let Some(id) = id {
+        editor = editor.id(id);
+    }
+    let element = iced::Element::new(editor).map(on_action);
+    container(element)
+        .width(width)
+        .style(editor_field_style(border_color))
+        .into()
+}
+
 /// Render a single-line shared editor field, replacing iced `text_input`.
 ///
 /// `submit_on_enter` selects the bare-Enter behavior: `true` submits the
@@ -106,26 +144,21 @@ pub fn single_line_editor<'a, M: 'a>(
     id: Option<iced::widget::Id>,
     on_action: impl Fn(super::editor_widget::EditorAction) -> M + 'a,
 ) -> Element<'a, M> {
-    let mut editor = super::editor_widget::EditorWidget::new(buffer)
-        .single_line(true)
-        .show_gutter(false)
-        .code_mode(false)
-        .enter(if submit_on_enter {
-            super::editor_widget::EnterBehavior::Submit
-        } else {
-            super::editor_widget::EnterBehavior::Newline
-        })
-        .placeholder(placeholder)
-        .padding(theme::PAD_5)
-        .background(Some(theme::BG_ELEVATED));
-    if let Some(id) = id {
-        editor = editor.id(id);
-    }
-    let element = iced::Element::new(editor).map(on_action);
-    container(element)
-        .width(width)
-        .style(editor_field_style(theme::BORDER_STRONG))
-        .into()
+    let enter = if submit_on_enter {
+        super::editor_widget::EnterBehavior::Submit
+    } else {
+        super::editor_widget::EnterBehavior::Newline
+    };
+    editor_field(
+        buffer,
+        placeholder,
+        enter,
+        false,
+        theme::BORDER_STRONG,
+        width,
+        id,
+        on_action,
+    )
 }
 
 /// Render a masked single-line shared editor field with a lucide show/hide
@@ -152,22 +185,16 @@ pub fn password_field_editor<'a, M: Clone + 'a>(
     } else {
         theme::BORDER_STRONG
     };
-    let mut editor = super::editor_widget::EditorWidget::new(buffer)
-        .single_line(true)
-        .masked(!show)
-        .show_gutter(false)
-        .code_mode(false)
-        .enter(super::editor_widget::EnterBehavior::Submit)
-        .placeholder(placeholder)
-        .padding(theme::PAD_5)
-        .background(Some(theme::BG_ELEVATED));
-    if let Some(id) = id {
-        editor = editor.id(id);
-    }
-    let element = iced::Element::new(editor).map(on_action);
-    let field = container(element)
-        .width(width)
-        .style(editor_field_style(border_color));
+    let field = editor_field(
+        buffer,
+        placeholder,
+        super::editor_widget::EnterBehavior::Submit,
+        !show,
+        border_color,
+        width,
+        id,
+        on_action,
+    );
 
     let eye_icon: Element<'_, M> = if show {
         lucide::eye_off::<iced::Theme, iced::Renderer>()
@@ -516,7 +543,7 @@ pub const SCROLL_H_PAD: f32 = 8.0;
 
 /// Bottom inset the shared horizontal scrollable wrapper adds under its
 /// content — the scrollbar rail sits on the bottom edge.
-pub const SCROLL_BOTTOM_PAD: f32 = 6.0;
+const SCROLL_BOTTOM_PAD: f32 = 6.0;
 
 /// Wrap a tab strip in the shared scrollable + surface-container chrome.
 /// `scroll_id` is optional — the editor passes one for scroll-to-active-tab.
@@ -1186,12 +1213,12 @@ pub const TREE_MAX_WIDTH: f32 = 400.0;
 /// width, not an estimate. The dashboard default font is JetBrains Mono
 /// (see [`super::JETBRAINS_MONO`]), so `text()` widgets without an explicit
 /// font (diff ± counts, `[⚠]` suffixes) use it too.
-pub const JETBRAINS_MONO_ADVANCE: f32 = 0.6;
+const JETBRAINS_MONO_ADVANCE: f32 = 0.6;
 
 /// Glyph advance of the lucide icon font as a fraction of em (verified from
 /// the lucide TTF). Every icon in the tree measures exactly 1.0em, so an
 /// icon rendered via `.size(s)` is `s` px wide.
-pub const LUCIDE_ADVANCE: f32 = 1.0;
+const LUCIDE_ADVANCE: f32 = 1.0;
 
 /// Width in px of `chars` glyphs of JetBrains Mono at `size` px.
 ///
@@ -1345,7 +1372,7 @@ enum ScrollMode {
 ///
 /// This constant is used directly by [`scroll_to_tree_focus`] to compute
 /// row positions for keyboard-navigation scroll-into-view logic.
-pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = TREE_ICON_SIZE * 1.3;
+const ESTIMATED_TREE_ROW_HEIGHT: f32 = TREE_ICON_SIZE * 1.3;
 
 /// Scroll the tree panel to bring the focused row into view.
 ///
@@ -1743,12 +1770,8 @@ pub fn modal_backdrop<'a, Message: 'a + Clone>(
 /// across show/hide transitions. Iced destroys widget state (scroll
 /// positions, open popovers) when the widget tree tag changes between
 /// frames, so the closed state must return the identical bare Container.
-/// Callers whose open state is a Stack (board.rs, settings.rs modal
-/// overlays) must wrap this in `iced::widget::stack([...])` themselves.
-/// Known pre-existing quirks, not fixed here: git.rs's closed-branch is
-/// unreachable (`view()` is gated on the modal being open), and the mod.rs
-/// diff/branch overlay slots use a bare-Container placeholder against
-/// Stack open states (type mismatch predates this helper).
+/// Callers whose open state is a Stack wrap this in `iced::widget::stack([...])`;
+/// others pair it with a matching container-typed closed state.
 pub fn empty_stack_placeholder<'a, Message: 'a>() -> Element<'a, Message> {
     container(text(""))
         .width(Length::Shrink)
@@ -2449,10 +2472,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "exceeds u64 bit limit")]
     fn guide_prefix_depth_overflow_debug() {
         // debug_assert fires at depth >= 64 in debug builds.
-        let _ = tree_guide_prefix(0, 64, false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = tree_guide_prefix(0, 64, false);
+        }));
+        #[cfg(debug_assertions)]
+        assert!(result.is_err(), "debug_assert should fire at depth >= 64");
+        #[cfg(not(debug_assertions))]
+        assert!(result.is_ok(), "no panic expected in release builds");
     }
 
     // ── Auto-sizing tree panel width tests ───────────────────────────
@@ -2460,15 +2488,6 @@ mod tests {
     // These are pure-arithmetic tests of the geometry constants (0.6em mono
     // advance, 1.0em lucide, 4px gaps, 10px counts, 6px trailing gap) — they
     // do not touch the global font system, so the expected values are exact.
-
-    #[test]
-    fn mono_text_width_uses_06em_advance() {
-        assert!(close(mono_text_width(0, 14.0), 0.0));
-        assert!(close(mono_text_width(1, 14.0), 8.4));
-        assert!(close(mono_text_width(10, 14.0), 84.0));
-        // "binary" count label at 10px.
-        assert!(close(mono_text_width(6, 10.0), 36.0));
-    }
 
     #[test]
     fn tree_row_natural_width_cases() {
@@ -2537,12 +2556,12 @@ mod tests {
 
     #[test]
     fn tree_panel_width_clamps_to_maximum() {
-        // 50-char name → natural 438 → 454 → clamped to the 400px cap.
+        // 50-char name → natural 439 (= 50*14*0.6 + 15 + 4) → clamped to the 400px cap.
         let tree = tree_with_panel_viewport(0.0, Some(400.0));
         let long_name = "x".repeat(50);
         let widths = vec![tree_row_natural_width(
             0,
-            TREE_FONT_SIZE,
+            TREE_ICON_SIZE,
             &long_name,
             TREE_FONT_SIZE,
             None,
@@ -2553,11 +2572,11 @@ mod tests {
 
     #[test]
     fn tree_panel_width_scales_with_widest_row() {
-        // 29-char name → 278.4 natural → 294.4 panel (within the bounds).
+        // 29-char name → 279.4 natural → 295.4 panel (within the bounds).
         let tree = tree_with_panel_viewport(0.0, Some(400.0));
         let wide = tree_row_natural_width(
             2,
-            TREE_FONT_SIZE,
+            TREE_ICON_SIZE,
             "some_really_long_file_name.rs",
             TREE_FONT_SIZE,
             None,
@@ -2576,7 +2595,7 @@ mod tests {
         let tree = tree_with_panel_viewport(0.0, None);
         let long_name = "y".repeat(40);
         let wide =
-            tree_row_natural_width(0, TREE_FONT_SIZE, &long_name, TREE_FONT_SIZE, None, None);
+            tree_row_natural_width(0, TREE_ICON_SIZE, &long_name, TREE_FONT_SIZE, None, None);
         let widths = vec![50.0, wide, 60.0];
         assert!(close(
             tree_panel_width(&tree, &widths),

@@ -2,8 +2,9 @@
 //!
 //! Shows staged + unstaged changes via `git diff HEAD`, untracked files
 //! via `git status --porcelain`, with per-file tree-sitter syntax highlighting.
-//! Files are parsed in their entirety (old version from HEAD, new version from
-//! disk) for correct multi-line token coloring.
+//! Files are parsed in their entirety for correct multi-line token coloring;
+//! working-tree diffs read the old version from HEAD and the new version from
+//! disk, while commit views read both sides via git (`run_git_show`).
 //!
 //! The page layout splits into an auto-sizing directory tree sidebar (left)
 //! and a scrollable diff panel (right, filling the remaining width). Click a
@@ -48,8 +49,9 @@ const MAX_HUNKS: usize = 1000;
 /// # Behavioural invariant
 ///
 /// This filter must be applied identically in `compute_truncation_index`,
-/// `build_file_buffers`, and `DiffState::view()` so that truncation boundaries
-/// and rendered content agree.  This function is the single point of truth.
+/// `build_diff_content`, and `diff_widget::build_file_buffers` so that
+/// truncation boundaries and rendered content agree.  This function is the
+/// single point of truth.
 pub(super) fn file_matches_selection(file: &DiffFile, selected_file: Option<&str>) -> bool {
     selected_file.is_none_or(|sel| file.path == sel)
 }
@@ -757,9 +759,8 @@ impl DiffState {
             self.current_commit_ref.is_none() && has_changes && self.error.is_none();
 
         // Build the header row: commit controls or commit-view banner.
-        let header = if let Some(ref hash) = self.current_commit_ref {
+        let header = if let Some(short_hash) = self.commit_short_hash() {
             // Historical commit view — show banner with Back button.
-            let short_hash = hash.get(..7).unwrap_or(hash);
             let back_btn = button("Back to working tree")
                 .on_press(DiffMessage::BackToWorkingTree)
                 .style(theme::button_secondary);
@@ -988,19 +989,12 @@ impl DiffState {
             Some(DiffMessage::ToggleDir(full_path.clone())),
         );
 
-        // Show context menu with "Discard changes" for working-tree diffs only.
-        let header_element: Element<'_, DiffMessage> = if self.current_commit_ref.is_some() {
-            header_btn
-        } else {
-            ContextMenu::new(
-                header_btn,
-                vec![MenuItem::new(
-                    "Discard changes".into(),
-                    DiffMessage::DiscardPath(full_path, DiscardTarget::Directory),
-                )],
-            )
-            .into()
-        };
+        let header_element: Element<'_, DiffMessage> = discard_menu_button(
+            header_btn,
+            full_path,
+            DiscardTarget::Directory,
+            self.current_commit_ref.is_some(),
+        );
 
         let mut col = column![header_element].spacing(0);
         if is_expanded {
@@ -1091,18 +1085,12 @@ impl DiffState {
             Some(DiffMessage::SelectFile(full_path.clone())),
         );
 
-        if self.current_commit_ref.is_some() {
-            file_btn
-        } else {
-            ContextMenu::new(
-                file_btn,
-                vec![MenuItem::new(
-                    "Discard changes".into(),
-                    DiffMessage::DiscardPath(full_path, DiscardTarget::File),
-                )],
-            )
-            .into()
-        }
+        discard_menu_button(
+            file_btn,
+            full_path,
+            DiscardTarget::File,
+            self.current_commit_ref.is_some(),
+        )
     }
 
     /// Return the diff content panel: file headers, binary/too-large placeholders,
@@ -1448,6 +1436,27 @@ async fn compute_new_highlights(
     };
 
     parse_highlights(&content, lang)
+}
+
+/// Wrap a tree-row button in the "Discard changes" context menu; commit views
+/// return the button unchanged (discarding only applies to the working tree).
+fn discard_menu_button(
+    btn: Element<'_, DiffMessage>,
+    full_path: String,
+    target: DiscardTarget,
+    commit_view: bool,
+) -> Element<'_, DiffMessage> {
+    if commit_view {
+        return btn;
+    }
+    ContextMenu::new(
+        btn,
+        vec![MenuItem::new(
+            "Discard changes".into(),
+            DiffMessage::DiscardPath(full_path, target),
+        )],
+    )
+    .into()
 }
 
 /// Build a directory tree from the list of diff files.
@@ -2338,24 +2347,22 @@ mod tests {
     }
 
     #[test]
-    fn test_navigate_to_commit_clears_stale_diff_files() {
+    fn test_context_switches_clear_stale_diff_files() {
+        // Navigating to a commit clears stale working-tree diff state.
         let mut state = make_state_with_stale_data();
         let _task = state.update(DiffMessage::NavigateToCommit(
             "test-ws".into(),
             "abc123".into(),
         ));
         assert_diff_state_reset(&state);
-    }
 
-    #[test]
-    fn test_workspace_selected_clears_stale_diff_files() {
+        // Selecting a workspace clears stale diff state.
         let mut state = make_state_with_stale_data();
         let _task = state.update(DiffMessage::WorkspaceSelected("new-ws".into(), None));
         assert_diff_state_reset(&state);
-    }
 
-    #[test]
-    fn test_back_to_working_tree_clears_stale_diff_files() {
+        // Returning to the working tree clears stale commit-view state; the
+        // handler early-returns without a selected workspace, so set one.
         let mut state = make_state_with_stale_data();
         state.selected_workspace_name = Some("test-ws".into());
         let _task = state.update(DiffMessage::BackToWorkingTree);
