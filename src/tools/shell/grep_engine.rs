@@ -304,13 +304,13 @@ const FLAG_ORDER: &[char] = &[
     'n', 'i', 'v', 'w', 'x', 'a', 'h', 'H', 's', 'r', 'o', 'z', 'c', 'l', 'm', 'C', 'A', 'B',
 ];
 
-/// Best-effort scan of a command/segment for a skipped grep's telemetry
-/// fields: detects `-r`/`-R` (recursive), counts whitespace-separated
-/// non-flag words after the verb (rough operand count), and collects the
-/// short-flag letters in canonical order. Not a full parse — feeds telemetry
-/// only. Case-sensitive distinctions (`-h`/`-H`, `-A`/`-B`/`-C`, `-r`/`-R`)
-/// are collapsed to lowercase, so a skipped member's flag string is a
-/// best-effort approximation of `flags_surface` (which has the parsed struct).
+/// Telemetry scan of a command/segment for a skipped grep: detects
+/// `-r`/`-R` (recursive), counts whitespace-separated non-flag words after
+/// the verb (rough operand count), and collects the short-flag letters in
+/// canonical order. Not a full parse — feeds telemetry only. Flag letters
+/// keep their case so `-h`/`-H`, `-c`/`-C`, `-A`/`-B`/`-a` are
+/// distinguishable, matching `flags_surface`'s encoding; `-L` is dropped
+/// (absent from `FLAG_ORDER`).
 fn lightweight_scan(command: &str) -> (bool, usize, String) {
     let mut recursive = false;
     let mut operand_count = 0usize;
@@ -337,7 +337,9 @@ fn lightweight_scan(command: &str) -> (bool, usize, String) {
                 if c == 'r' || c == 'R' {
                     recursive = true;
                 }
-                flags.insert(c.to_ascii_lowercase());
+                // `-R` is parsed into `flags.r`, so record it as 'r' to match
+                // `flags_surface` (FLAG_ORDER has no uppercase 'R').
+                flags.insert(if c == 'R' { 'r' } else { c });
             }
             continue;
         }
@@ -1116,10 +1118,10 @@ fn flags_surface(flags: &GrepFlags) -> String {
         s.push('C');
     } else {
         if flags.before > 0 {
-            s.push('A');
+            s.push('B');
         }
         if flags.after > 0 {
-            s.push('B');
+            s.push('A');
         }
     }
     s
