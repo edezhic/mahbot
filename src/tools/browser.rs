@@ -429,8 +429,8 @@ impl BrowserTool {
         Ok(text)
     }
 
-    /// Agent-browser supports multiple subcommand styles — this builds the correct
-    /// argument list for each action.
+    /// The chrome-use CLI takes a different argument shape per action — this
+    /// builds the correct argument list for each action.
     fn build_args(action: &BrowserAction) -> anyhow::Result<Vec<String>> {
         match action {
             BrowserAction::Open { url } => {

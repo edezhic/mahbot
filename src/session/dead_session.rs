@@ -148,13 +148,15 @@ impl DeadSessionTracker {
         state.backoff_minutes = (state.backoff_minutes * 2).min(MAX_BACKOFF_MINUTES);
     }
 
-    /// Remove the tracking entry for a session that has self-healed.
+    /// Remove the tracking entry for a session that no longer needs recovery.
     ///
-    /// Called when the poller detects that a session is healthy (the last
-    /// message is an assistant reply — the turn completed).  This ensures the
-    /// retry cap counts *consecutive* failures per episode, matching the
-    /// ticket spec — a session that fails, recovers, then fails again starts
-    /// with a fresh retry budget.
+    /// Called from `recover_dead_sessions` on the self-heal paths (the tail
+    /// is a completed assistant reply, or the turn ended via the `sleep`
+    /// tool), on stale-entry cleanup (empty tail — no recovery candidate),
+    /// and on permanent-abandon paths (missing session context, invalid
+    /// role). In every case the retry cap counts *consecutive* failures per
+    /// episode — a session that fails, recovers (or is abandoned), then
+    /// fails again starts with a fresh retry budget.
     ///
     /// Safe to call for untracked sessions (no-op).
     fn cleanup(&self, agent_id: &str) {

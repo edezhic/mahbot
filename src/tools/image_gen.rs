@@ -122,7 +122,8 @@ impl Tool for ImageGenTool {
 
         // Aggregate body budget: per-image caps don't bound multi-reference
         // totals, so compress references further until the serialized request
-        // fits the provider's ~2 MB body limit.
+        // fits the ~2 MB client-side body budget (not a documented OpenRouter
+        // number).
         super::fit_request_body_budget(&mut body, &mut references, super::MAX_REQUEST_BODY_BYTES)?;
 
         // Image generation always targets OpenRouter — a custom
@@ -272,7 +273,10 @@ struct ImageGenFailure {
 ///
 /// Retry policy: auto-retry ONLY prompt failures — transport errors and HTTP
 /// 429/502/503/524/529 — with backoff (Retry-After when present, else 5 s)
-/// and at most one retry. Never retry: full-timeout hangs, any 4xx (402 =
+/// and at most one retry. Every retryable arm is additionally gated by
+/// `IMAGE_GEN_QUICK_FAILURE_MS`: a failure outside the quick-failure window
+/// means a long generation was in flight — possibly billed, never re-submitted.
+/// Never retry: full-timeout hangs, any 4xx (402 =
 /// insufficient credits), body-read failures after a 2xx (may have been
 /// billed), or 200-with-error bodies (completed and billed).
 async fn generate_image_with_retries(

@@ -138,8 +138,9 @@ impl Tool for VideoGenTool {
         }
 
         // Aggregate body budget: a single reference at the per-image cap
-        // already approaches the ~2 MB body limit once base64 + JSON overhead
-        // is added, so verify the serialized body before submitting.
+        // already approaches the ~2 MB client-side body budget (not a
+        // documented OpenRouter number) once base64 + JSON overhead is added,
+        // so verify the serialized body before submitting.
         super::fit_request_body_budget(&mut body, &mut references, super::MAX_REQUEST_BODY_BYTES)?;
 
         let video_bytes =

@@ -890,8 +890,9 @@ async fn sweep_user_media(
         return 0;
     };
     // A DELETED session (e.g. /clear) invalidates the accumulated keep-set:
-    // its mentions would otherwise keep files forever (accepted consequence
-    // "/clear → файлы-кандидаты"). Reset the cursor so the remaining base is
+    // its mentions would otherwise keep files forever (accepted consequence:
+    // after /clear its files become sweep candidates). Reset the cursor so
+    // the remaining base is
     // re-scanned from scratch — reorders/additions never reset (incremental).
     // The overflowed flag is reset here too: a shrunk base can be re-scanned,
     // so /clear must re-enable an overflowed user's sweep (without this, the
@@ -910,11 +911,12 @@ async fn sweep_user_media(
     }
     // No artist sessions → nothing was ever scanned → deleting everything
     // would violate the safe direction ("never delete a file whose mention
-    // was not scanned"). Keep the user's files. Deliberate conflict with the
-    // accepted "/clear → файлы-кандидаты" consequence: a FULL /clear (zero
-    // sessions) is indistinguishable from a brand-new user, so its files are
-    // kept too (safe direction wins — never delete on no evidence; the
-    // rotation fires only when at least one session remains).
+    // was not scanned"). Keep the user's files. This deliberately conflicts
+    // with the accepted consequence that a /clear turns its files into sweep
+    // candidates: a FULL /clear (zero sessions) is indistinguishable from a
+    // brand-new user, so its files are kept too. Safe direction wins — never
+    // delete on no evidence; the rotation fires only when at least one
+    // session remains.
     if session_ids.is_empty() {
         tracing::debug!(user = %user_name, "Media sweep: no artist sessions — files kept");
         return 0;
@@ -1049,8 +1051,8 @@ async fn sweep_user_media(
 
 /// Keep-detection for one file: mentioned by basename when that basename is
 /// unique in the user's generated+uploads union. An AMBIGUOUS basename
-/// (duplicate across the union) is KEPT — the design's safe direction
-/// ("иначе файл сохраняется — пере-держать"): a bare-basename mention cannot
+/// (duplicate across the union) is KEPT — the design's safe direction: a
+/// bare-basename mention cannot
 /// be attributed to one of the duplicates, so deleting either could destroy a
 /// mentioned file. Video extensions match case-insensitively (`content_lower`
 /// is the precomputed lowercase keep-set — shared by every file).
@@ -1727,8 +1729,8 @@ mod tests {
         tokio::fs::write(&g, "x").await.unwrap();
         tokio::fs::write(&u, "x").await.unwrap();
         // A bare basename mention is ambiguous (duplicate across the
-        // generated+uploads UNION) — the design's safe direction keeps BOTH
-        // ("иначе файл сохраняется — пере-держать"): the mention cannot be
+        // generated+uploads UNION) — the design's safe direction keeps BOTH:
+        // the mention cannot be
         // attributed to one duplicate, so deleting either could destroy a
         // mentioned file.
         insert_artist_session("artist_b1", "base", "here is pic.png").await;

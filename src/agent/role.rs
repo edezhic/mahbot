@@ -38,16 +38,20 @@ pub(crate) const SYSTEM_ROLE: &str = "system";
 
 /// All static metadata for a [`Role`] variant.
 ///
-/// Every accessor goes through a single match in [`role_info()`], replacing
-/// the match statements that were previously scattered across the codebase
-/// for role metadata lookups. Icon widgets live in `theme::role_icon()`.
+/// Static role metadata lives here and is looked up through a single match in
+/// [`role_info()`], replacing the match statements that were previously
+/// scattered across the codebase for role metadata lookups. Exception:
+/// prompt-loading accessors (`role_description`, `role_description_for`,
+/// `discovery_prompt`, `summary_prompt`) read the embedded `.md` assets
+/// directly. Icon widgets live in `theme::role_icon()`.
 ///
 /// Adding a new role requires updating the [`Role`] enum in `lib.rs`,
 /// creating prompt files at `src/prompt/role/{name}.md` and
 /// `src/prompt/summarize/{name}.md` (and optionally
 /// `src/prompt/discovery/{name}.md` if `has_discovery` is true),
 /// adding an arm in this match, the [`Role::tools()`] method,
-/// and the `theme::role_icon()` match.
+/// the `theme::role_icon()` match, and the exhaustive `telegram_role_emoji`
+/// match in `agent/message_router.rs`.
 /// The compiler will catch missing arms in exhaustive matches, but it
 /// cannot catch an arm that returns an empty tool set or silently uses
 /// struct update defaults — the tests in this module guard against those:
@@ -81,8 +85,8 @@ pub struct RoleInfo {
 /// Default values shared by most [`Role`] variants in [`role_info()`].
 ///
 /// Used via struct update syntax (`..BASE_ROLE_INFO`) to keep each arm
-/// concise and make future field additions cheap. Arms that override every
-/// field (Discovery, Artist, Assistant) spell them out — clippy's
+/// concise and make future field additions cheap. Arms that spell out every
+/// field (Discovery, Artist, Assistant, Support) do so because clippy's
 /// `needless_update` fires when the base contributes nothing, so the update
 /// syntax is only valid when at least one field comes from the base.
 const BASE_ROLE_INFO: RoleInfo = RoleInfo {

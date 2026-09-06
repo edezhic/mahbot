@@ -1538,7 +1538,8 @@ async fn clear_implementation_roster(conn: &crate::db::Connection, job_id: &str,
 
 // ── Bounce breaker (unified validation non-success) ─────────────────────
 
-/// Aggregate per-agent failure reasons for a failed verifier round.
+/// Comment posted when the bounce breaker trips: a fixed failure notice that
+/// names the "circuit breaker" and the configured `MAX_BOUNCES` budget.
 fn bounce_breaker_trip_comment() -> String {
     let max = MAX_BOUNCES;
     format!(

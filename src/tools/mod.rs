@@ -33,9 +33,10 @@ pub(crate) mod web_search;
 /// SearchTool and the Iced Editor use `MAX_FILE_SIZE_BYTES` directly.
 pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Maximum size for a single reference image in bytes.
-/// OpenRouter enforces a ~2 MB request body limit; base64 adds ~33% overhead so
-/// we cap raw image data at 1.5 MB (1_500_000 bytes) to stay well under.
+/// Maximum size for a single reference image in bytes. The 2 MB figure is a
+/// client-side sanity budget, not a documented OpenRouter number; base64 adds
+/// ~33% overhead so we cap raw image data at 1.5 MB (1_500_000 bytes) to stay
+/// well under.
 /// Over-cap references are compressed by the loader (see `load_reference_image`).
 /// Note: the aggregate body budget (`MAX_REQUEST_BODY_BYTES`) re-encodes even
 /// under-cap references when the serialized request exceeds it, so literal

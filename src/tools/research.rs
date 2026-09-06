@@ -16,9 +16,11 @@
 //! snapshot of frozen chat params replays the KV-cache prefix for accumulated
 //! findings); sub-agent shell commands are captured per round into the run
 //! folder. Stopping is artifact-based — coverage completion, answerability
-//! abstention (every structural quiet round), a verification gate, and a hard
-//! analyst-spawn cap (never self-assessment) — plus budget exhaustion,
-//! deadline expiry, shutdown, and manual cancel. Exactly one envelope reaches
+//! abstention (every structural quiet round), and a hard analyst-spawn cap
+//! (never self-assessment) — plus budget exhaustion, deadline expiry,
+//! shutdown, and manual cancel. The verification pass runs after synthesis
+//! and only appends a "## Verification" section; it never stops the run.
+//! Exactly one envelope reaches
 //! the calling agent asynchronously; intermediate rounds never reach the
 //! user, and exhaustion delivers a partial report rather than nothing.
 //!
@@ -559,7 +561,8 @@ async fn dispatch_durable_research(
         // survives as 'launched' and boot-recovery re-enters the checkpointed
         // run, so the result (and the artifacts) arrive at the real
         // terminalization. Nothing is written or routed here (design pin:
-        // "Shutdown/drain abort НЕ терминализация — ран жив, resume позже").
+        // "a shutdown/drain abort is not terminalization — the run is alive,
+        // resume later").
         ResearchExit::Aborted => {
             tracing::info!(
                 job = %job_id,
@@ -2055,7 +2058,7 @@ async fn run_gap_round(
 /// (key ≥ 1) is dispatched only as a side-effect of a progress event inside
 /// the gap loop, so a gate-skip after a long gap round is FINAL — the loop's
 /// already-advanced round_index never revisits the key. That is fail-open per
-/// design ("Тихих пропусков нет" — the marker IS the report note; the run
+/// design (no silent skips — the marker IS the report note; the run
 /// continues without the prototype).
 fn set_coder_marker(state: &mut ResearchState, round_key: usize, suffix: &str) {
     let marker = format!("coder round {round_key} {suffix}");
@@ -2106,7 +2109,7 @@ fn unclaim_coder_round(state: &mut ResearchState, round_key: usize) {
 /// revisits the key. No speculative inline retry: `run_agent` already
 /// exhausts its internal retry bounds before returning Failed, so a second
 /// full coder session would only double the LLM spend of a confirmed failure
-/// (design: "Сбой кодера = fail-open").
+/// (design: a coder failure is fail-open).
 #[expect(clippy::too_many_arguments)]
 async fn run_coder_round(
     job_id: &str,
@@ -2223,8 +2226,8 @@ async fn run_coder_round(
 /// per-round checkpoint. Boot-resume re-attempts ONLY the pre-loop key-0
 /// round (the `!coder_rounds_done.contains(&0)` check below); a skipped or
 /// failed post-progress round (key ≥ 1) is FINAL — the loop resumes at the
-/// advanced round_index and never revisits the key (fail-open per design:
-/// "Сбой кодера = fail-open", skip marker in the report).
+/// advanced round_index and never revisits the key (fail-open per design,
+/// skip marker in the report).
 #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn gap_rounds(
     ws: &Workspace,
