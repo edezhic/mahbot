@@ -1389,7 +1389,7 @@ impl Agent {
                                 success: true,
                                 image_payload,
                                 suspended: false,
-                                ends_turn: tool.ends_turn_for_args(&tool_arguments),
+                                ends_turn: tool.ends_turn_on_success(),
                             },
                             String::new(),
                         )
@@ -3169,8 +3169,6 @@ mod tests {
             role: crate::Role::Manager,
             reply_target: None,
             pending_job_id: None,
-            reply_to_agent_id: None,
-            reply_workspace_name: None,
         };
         let _ = tx.send(job);
 
@@ -3212,8 +3210,6 @@ mod tests {
             role: crate::Role::Assistant,
             reply_target: None,
             pending_job_id: None,
-            reply_to_agent_id: None,
-            reply_workspace_name: None,
         };
         let _ = tx.send(job);
 

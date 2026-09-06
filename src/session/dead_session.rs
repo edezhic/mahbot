@@ -410,8 +410,6 @@ fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
         // users.  This is an accepted limitation.
         reply_target: None,
         pending_job_id: None,
-        reply_to_agent_id: None,
-        reply_workspace_name: None,
     };
 
     crate::agent::message_router::route(agent_id, job);

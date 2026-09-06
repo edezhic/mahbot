@@ -165,7 +165,7 @@ pub(crate) use edit::EditTool;
 pub(crate) use image_gen::ImageGenTool;
 pub(crate) use implement::ImplementTool;
 pub(crate) use mahbot_debug::MahbotDebugTool;
-pub(crate) use manager_chat::{ReadManagerChatTool, SendMessageToManagerTool};
+pub(crate) use manager_chat::SendMessageToManagerTool;
 pub(crate) use read::ReadTool;
 pub(crate) use research::ResearchTool;
 pub(crate) use search::SearchTool;
@@ -794,8 +794,6 @@ impl SyncDurableCore {
                         role: caller_role,
                         reply_target: None,
                         pending_job_id: Some(job_id),
-                        reply_to_agent_id: None,
-                        reply_workspace_name: None,
                     }
                 }
             };

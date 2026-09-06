@@ -997,8 +997,6 @@ async fn notify_ticket(
             role: crate::Role::Manager,
             reply_target: None,
             pending_job_id: None,
-            reply_to_agent_id: None,
-            reply_workspace_name: None,
         },
     );
 }

@@ -342,11 +342,15 @@ impl UserStore {
         self.list_users_where("", db::params![]).await
     }
 
-    /// Find the user with admin (full) permissions, if any.
-    pub async fn find_admin(&self) -> Result<Option<UserRecord>> {
+    /// Find all users with admin (full) permissions.
+    pub async fn find_admins(&self) -> Result<Vec<UserRecord>> {
         self.list_users_where("WHERE permissions = ?1", db::params!["full"])
             .await
-            .map(|users| users.into_iter().next())
+    }
+
+    /// Find the user with admin (full) permissions, if any.
+    pub async fn find_admin(&self) -> Result<Option<UserRecord>> {
+        Ok(self.find_admins().await?.into_iter().next())
     }
 
     /// Atomically update user preferences (role, workspace, permissions) in a single

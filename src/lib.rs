@@ -1162,18 +1162,9 @@ pub(crate) trait Tool: Send + Sync {
 
     /// Whether a SUCCESSFUL execution ends the agent's run gracefully after the
     /// current tool round commits (no further LLM call). Failed outcomes never
-    /// end the turn. This is the `sleep` tool's trigger; turn-end can also be
-    /// args-dependent via [`Tool::ends_turn_for_args`] (send_message_to_manager
-    /// with `wait=true`), which is likewise only consulted on success.
+    /// end the turn. This is the `sleep` tool's trigger.
     fn ends_turn_on_success(&self) -> bool {
         false
-    }
-
-    /// Per-call variant of [`Tool::ends_turn_on_success`]: decides turn-end from
-    /// the actual call arguments. Defaults to [`Tool::ends_turn_on_success`].
-    /// Used by tools whose turn-end depends on a parameter (e.g. a `wait` flag).
-    fn ends_turn_for_args(&self, _args: &serde_json::Value) -> bool {
-        self.ends_turn_on_success()
     }
 
     /// Whether the tool should be advertised to the model right now.

@@ -129,11 +129,17 @@ pub enum MessageKind {
     /// distinct from `UserMessage` so the failure-emoji gate (`== UserMessage`)
     /// structurally excludes it.
     AgentMessage,
-    /// Durable, user-invisible copy of a Manager's response, addressed back
-    /// into the originating Assistant agent's session (`<manager-reply>`
-    /// envelope). Appended to the session like other result kinds; never
-    /// broadcast/persisted to chat_history.
-    ManagerReply,
+    /// Durable auto-delivery copy of a Manager's response, routed into every
+    /// admin (full-access) user's Assistant session (`<manager-message>`
+    /// envelope; the job's workspace is the admin's personal one, the source
+    /// workspace travels only in the envelope's `workspace` attribute).
+    /// Appended to the session like other result kinds; never
+    /// broadcast/persisted to chat_history. Deliberately distinct from
+    /// `UserMessage` so the failure-emoji gate (`== UserMessage`) structurally
+    /// excludes it. The serde alias keeps pre-unification `ManagerReply`
+    /// pending rows deserializable at boot replay.
+    #[serde(alias = "ManagerReply")]
+    ManagerNotify,
 }
 
 /// A single unit of work for an agent consumer.
@@ -162,18 +168,6 @@ pub struct AgentJob {
     /// `run_agent` returns — the at-least-once delivery boundary.
     #[serde(default)]
     pub pending_job_id: Option<String>,
-    /// Agent session the response to this job must be addressed to. Set only on
-    /// [`MessageKind::AgentMessage`] jobs (the originating Assistant's agent id,
-    /// copied onto the resulting [`MessageKind::ManagerReply`] envelope job) and on
-    /// `ManagerReply` jobs themselves (the addressed target). `None` on legacy
-    /// persisted envelopes — `serde(default)` keeps them deserializing.
-    #[serde(default)]
-    pub reply_to_agent_id: Option<String>,
-    /// Workspace of the session a response must be routed back into. Set on
-    /// [`MessageKind::AgentMessage`] jobs (the originating Assistant's own
-    /// workspace, consumed by `route_manager_reply`); `None` elsewhere.
-    #[serde(default)]
-    pub reply_workspace_name: Option<String>,
 }
 
 // ── Global router ─────────────────────────────────────────────────────────
@@ -319,12 +313,10 @@ pub async fn route_user_message(
         role,
         reply_target,
         pending_job_id: None,
-        reply_to_agent_id: None,
-        reply_workspace_name: None,
     };
 
-    // Manager-bound UserMessage is durable: DURABLE kinds =
-    // UserMessage (manager-bound only), AnalyzeToolResult, ResearchResult.
+    // DURABLE kinds = UserMessage (manager-bound), AgentMessage, ManagerNotify,
+    // AnalyzeToolResult, ResearchResult.
     if job.role == Role::Manager {
         stamp_and_route(job, &agent_id, "manager message").await;
         return;
@@ -376,16 +368,9 @@ async fn stamp_and_route(mut job: AgentJob, target: &str, producer: &str) {
     route(target, job);
 }
 
-/// Build the `AgentMessage` envelope: the assistant's message normalized and
-/// addressed to the workspace Manager, carrying the originating Assistant's
-/// agent id + workspace for the addressed reply leg.
-fn agent_message_job(
-    content: String,
-    workspace_name: String,
-    origin_workspace_name: String,
-    user_name: &str,
-    reply_to_agent_id: String,
-) -> AgentJob {
+/// Build the `<assistant-message>` envelope job addressed to the workspace
+/// Manager (`MessageKind::AgentMessage`, durable).
+fn agent_message_job(content: String, workspace_name: String, user_name: &str) -> AgentJob {
     let user_name =
         crate::session::normalize_user_name(user_name, "route_agent_message_to_manager")
             .to_string();
@@ -398,29 +383,19 @@ fn agent_message_job(
         role: Role::Manager,
         reply_target: None,
         pending_job_id: None,
-        reply_to_agent_id: Some(reply_to_agent_id),
-        reply_workspace_name: Some(origin_workspace_name),
     }
 }
 
 /// Route a message from an assistant agent into the workspace Manager's
-/// session (`MessageKind::AgentMessage`).
-/// `reply_to_agent_id` is the originating Assistant's agent id — the Manager's
-/// response is additionally addressed back into that session.
+/// session (`MessageKind::AgentMessage`). No addressed reply leg anymore — the
+/// Manager's response auto-delivers to admin assistants via
+/// [`route_manager_notify`].
 pub async fn route_agent_message_to_manager(
     content: String,
     workspace_name: String,
-    origin_workspace_name: String,
     user_name: String,
-    reply_to_agent_id: String,
 ) {
-    let job = agent_message_job(
-        content,
-        workspace_name,
-        origin_workspace_name,
-        &user_name,
-        reply_to_agent_id,
-    );
+    let job = agent_message_job(content, workspace_name, &user_name);
     let target = crate::jobs::envelope_target(&job);
     stamp_and_route(job, &target, "agent message").await;
 }
@@ -671,7 +646,8 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         let Some(response) = response else {
             // Send emoji error only for UserMessage jobs where the agent truly
             // failed (not cancelled or shutdown). Internal job kinds
-            // (TicketNotify, AnalyzeToolResult, ResearchResult) get no feedback.
+            // (TicketNotify, AnalyzeToolResult, ResearchResult, ManagerNotify)
+            // get no feedback.
             //
             // We check both the agent-specific token AND the
             // global shutdown token because during SIGTERM/SIGINT the global
@@ -706,9 +682,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         match role {
             Role::Manager => {
                 deliver_manager_response(&response, &users, &job).await;
-                if let Some(reply_to) = job.reply_to_agent_id.clone() {
-                    route_manager_reply(&response, &job, reply_to).await;
-                }
+                route_manager_notify(&response, &job.workspace_name).await;
             }
             _ => {
                 if users.is_empty() {
@@ -852,62 +826,56 @@ async fn deliver_on_channel(
     }
 }
 
-/// Build the addressed `<manager-reply>` envelope (user-invisible, routed into
-/// the originating Assistant's session). `None` when `response` is empty or
-/// when the reply's pinned workspace cannot be resolved (no user identity).
-fn manager_reply_job(response: &str, job: &AgentJob, reply_to: &str) -> Option<AgentJob> {
+/// Auto-delivery hook: EVERY Manager response is additionally routed as a
+/// durable `<manager-message>` envelope into each admin (full-access) user's
+/// Assistant session — the only manager→assistant delivery path. The job
+/// targets the admin's personal workspace so addressed routing resolves the
+/// admin's real assistant session; the SOURCE workspace travels only inside
+/// the envelope's `workspace` attribute. Empty responses deliver nothing
+/// (sleep-ended/failed turns never reach the delivery branch at all).
+async fn route_manager_notify(response: &str, source_workspace: &str) {
     if response.is_empty() {
-        return None;
+        return;
     }
+    let Some(store) = crate::users::USER_STORE.get() else {
+        warn!("Message router [manager]: user store unavailable — admin notify leg skipped");
+        return;
+    };
+    let admins = match store.find_admins().await {
+        Ok(admins) => admins,
+        Err(e) => {
+            warn!(error = %e, "Message router [manager]: admin lookup failed — notify leg skipped");
+            return;
+        }
+    };
     let content = crate::prompt::substitute(
-        &crate::prompt::load_prompt("manager_reply.md"),
+        &crate::prompt::load_prompt("manager_message.md"),
         &[
-            ("{{workspace}}", job.workspace_name.as_str()),
+            ("{{workspace}}", source_workspace),
             ("{{message}}", response),
         ],
     );
-    // Reply leg targets the originating Assistant's own pinned personal
-    // workspace (carried via reply_workspace_name); legacy in-flight
-    // envelopes predate the field. Re-apply the personal pin so a stale
-    // project-workspace value can never route the reply outside the personal
-    // session. No resolvable user -> refuse the reply leg.
-    let reply_ws = job
-        .reply_workspace_name
-        .clone()
-        .unwrap_or_else(|| crate::users::personal_workspace_name(&job.user_name));
-    let Some(workspace_name) =
-        crate::users::enforce_personal_pinning(crate::Role::Assistant, &reply_ws, &job.user_name)
-    else {
-        error!(
-            reply_to_agent_id = %reply_to,
-            workspace = %reply_ws,
-            "Manager reply leg: pinned role with empty user — refusing to route unpinned, dropping reply"
-        );
-        return None;
-    };
-    Some(AgentJob {
-        content,
-        workspace_name,
-        user_name: job.user_name.clone(),
-        channel: "gui".to_string(),
-        kind: MessageKind::ManagerReply,
-        role: crate::Role::Assistant,
-        reply_target: None,
-        pending_job_id: None,
-        reply_to_agent_id: Some(reply_to.into()),
-        reply_workspace_name: None,
-    })
-}
-
-/// Addressed reply leg for `AgentMessage` jobs: after the Manager's response
-/// is broadcast (unchanged semantics), a durable user-invisible copy is routed
-/// into the originating Assistant's session so it wakes even after a restart.
-async fn route_manager_reply(response: &str, job: &AgentJob, reply_to: String) {
-    let Some(reply_job) = manager_reply_job(response, job, &reply_to) else {
-        return;
-    };
-    let target = crate::jobs::envelope_target(&reply_job);
-    stamp_and_route(reply_job, &target, "manager reply envelope").await;
+    for admin in admins {
+        let Some(workspace_name) = crate::users::enforce_personal_pinning(
+            Role::Assistant,
+            &crate::users::personal_workspace_name(&admin.name),
+            &admin.name,
+        ) else {
+            continue;
+        };
+        let job = AgentJob {
+            content: content.clone(),
+            workspace_name,
+            user_name: admin.name.clone(),
+            channel: "gui".to_string(),
+            kind: MessageKind::ManagerNotify,
+            role: Role::Assistant,
+            reply_target: None,
+            pending_job_id: None,
+        };
+        let target = crate::jobs::envelope_target(&job);
+        stamp_and_route(job, &target, "manager notify envelope").await;
+    }
 }
 
 /// Deliver a response to all workspace users (Manager role).
@@ -1158,8 +1126,6 @@ mod tests {
             role,
             reply_target: None,
             pending_job_id: None,
-            reply_to_agent_id: None,
-            reply_workspace_name: None,
         }
     }
 
@@ -1479,8 +1445,6 @@ mod tests {
             role: Role::Assistant,
             reply_target: Some("chat_123".to_string()),
             pending_job_id: None,
-            reply_to_agent_id: None,
-            reply_workspace_name: None,
         };
 
         // Should complete without panic.
@@ -1517,8 +1481,6 @@ mod tests {
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
-            reply_to_agent_id: None,
-            reply_workspace_name: None,
         };
 
         // Should complete without panic — broadcasts to the "gui" binding.
@@ -1546,8 +1508,6 @@ mod tests {
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
-            reply_to_agent_id: None,
-            reply_workspace_name: None,
         };
 
         // Should complete without panic — broadcast+persist runs, transport
@@ -1596,8 +1556,6 @@ mod tests {
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
-            reply_to_agent_id: None,
-            reply_workspace_name: None,
         };
 
         deliver_single_user_response("broadcast to all bindings", &user, &job, &Role::Assistant)
@@ -1634,8 +1592,6 @@ mod tests {
             role: Role::Manager,
             reply_target: None,
             pending_job_id: None,
-            reply_to_agent_id: None,
-            reply_workspace_name: None,
         };
 
         deliver_manager_response("manager response", &[user], &job).await;
@@ -1686,8 +1642,6 @@ mod tests {
             role: Role::Manager,
             reply_target: None,
             pending_job_id: None,
-            reply_to_agent_id: None,
-            reply_workspace_name: None,
         };
 
         deliver_manager_response("manager response", &[user], &job).await;
@@ -1708,117 +1662,56 @@ mod tests {
 
     // ── Job builder tests ───────────────────────────────────────────────
 
-    /// `agent_message_job` threads the normalized identity + addressing fields.
+    /// `agent_message_job` threads the normalized identity + durable kind.
     #[test]
     fn agent_message_job_threading() {
-        let job = agent_message_job(
-            "hello".to_string(),
-            "proj_ws".to_string(),
-            "origin_ws".to_string(),
-            "alice",
-            "agent_123".to_string(),
-        );
+        let job = agent_message_job("hello".to_string(), "proj_ws".to_string(), "alice");
         assert_eq!(job.user_name, "alice");
         assert_eq!(job.kind, MessageKind::AgentMessage);
         assert_eq!(job.role, Role::Manager);
         assert_eq!(job.workspace_name, "proj_ws");
-        assert_eq!(job.reply_to_agent_id.as_deref(), Some("agent_123"));
-        assert_eq!(job.reply_workspace_name.as_deref(), Some("origin_ws"));
 
         // Empty user_name normalizes to the seeded 'admin'.
-        let job = agent_message_job(
-            "hello".to_string(),
-            "proj_ws".to_string(),
-            "origin_ws".to_string(),
-            "",
-            "agent_124".to_string(),
-        );
+        let job = agent_message_job("hello".to_string(), "proj_ws".to_string(), "");
         assert_eq!(job.user_name, "admin");
     }
 
-    /// `manager_reply_job` addresses the reply into the originating Assistant's
-    /// session; the carried reply workspace is re-pinned to the Assistant's
-    /// personal workspace (pinned roles never run in a non-personal workspace).
-    #[test]
-    fn manager_reply_job_threading() {
-        let source = AgentJob {
-            content: "assistant msg".to_string(),
-            workspace_name: "team_ws".to_string(),
-            user_name: "alice".to_string(),
-            channel: "gui".to_string(),
-            kind: MessageKind::AgentMessage,
-            role: Role::Manager,
-            reply_target: None,
-            pending_job_id: None,
-            reply_to_agent_id: Some("assistant_agent_1".to_string()),
-            reply_workspace_name: Some("proj_ws".to_string()),
-        };
-        let reply = manager_reply_job("reply text", &source, "assistant_agent_1")
-            .expect("non-empty response builds a reply job");
-        // The reply routes into the originating Assistant's personal workspace
-        // (the carried project workspace is re-pinned), while the envelope tags
-        // the Manager's workspace (job.workspace_name).
-        assert_eq!(reply.workspace_name, "personal:alice");
-        assert_eq!(reply.kind, MessageKind::ManagerReply);
-        assert_eq!(reply.role, Role::Assistant);
-        assert_eq!(
-            reply.reply_to_agent_id.as_deref(),
-            Some("assistant_agent_1")
-        );
-        assert_eq!(reply.user_name, "alice");
-        assert!(reply.content.contains("team_ws"));
-        assert!(reply.content.contains("reply text"));
-    }
-
-    /// Legacy in-flight AgentMessage envelopes predate `reply_workspace_name`;
-    /// the reply leg falls back to the personal-workspace pin.
-    #[test]
-    fn manager_reply_job_legacy_fallback() {
-        let source = AgentJob {
-            content: "assistant msg".to_string(),
-            workspace_name: "team_ws".to_string(),
-            user_name: "bob".to_string(),
-            channel: "gui".to_string(),
-            kind: MessageKind::AgentMessage,
-            role: Role::Manager,
-            reply_target: None,
-            pending_job_id: None,
-            reply_to_agent_id: Some("assistant_agent_2".to_string()),
-            reply_workspace_name: None,
-        };
-        let reply = manager_reply_job("reply text", &source, "assistant_agent_2")
-            .expect("non-empty response builds a reply job");
-        assert_eq!(
-            reply.workspace_name,
-            crate::users::personal_workspace_name("bob")
-        );
-    }
-
-    /// Persist-before-route round trip: a ManagerReply envelope written to
-    /// pending_jobs reads back as the same job (kind + workspace), targeted at
-    /// the addressed reply_to_agent_id. Cleans up its row so other tests'
-    /// boot-replay paths never see it.
+    /// Auto-delivery round trip: a Manager response persists one durable
+    /// `<manager-message>` envelope per admin, addressed to the admin's
+    /// personal Assistant session, carrying the FULL untruncated response and
+    /// the source workspace only in the envelope attribute. Empty responses
+    /// persist nothing. Cleans up its rows/user so other tests' boot-replay
+    /// paths never see them.
     #[tokio::test]
     #[serial_test::serial(provider)]
-    async fn manager_reply_persist_round_trip() {
+    async fn manager_notify_delivers_to_admin_assistant() {
         setup_response_test_infra().await;
-        let source = AgentJob {
-            content: "assistant msg".to_string(),
-            workspace_name: "team_ws".to_string(),
-            user_name: "alice".to_string(),
-            channel: "gui".to_string(),
-            kind: MessageKind::AgentMessage,
-            role: Role::Manager,
-            reply_target: None,
-            pending_job_id: None,
-            reply_to_agent_id: Some("assistant_agent_roundtrip".to_string()),
-            reply_workspace_name: Some("proj_ws".to_string()),
-        };
-        let job = manager_reply_job("reply text", &source, "assistant_agent_roundtrip")
-            .expect("non-empty response builds a reply job");
-        let (persisted, id) = persist_manager_envelope(&job, "test").await;
-        assert!(persisted, "persist should succeed");
-        let id = id.expect("a persisted row id should be returned");
+        let store = crate::users::USER_STORE
+            .get()
+            .expect("user store initialized");
+        store
+            .add_user("__notify_admin", Some("full"), Role::Assistant)
+            .await
+            .expect("add admin user");
+        let target = crate::session::resolve_agent_id(
+            "__notify_admin",
+            "assistant",
+            "personal:__notify_admin",
+        );
+
+        // Snapshot existing rows so cleanup removes ONLY rows this test created.
+        let before: HashSet<String> = crate::jobs::list_pending_jobs(&crate::session::store().conn)
+            .await
+            .expect("list pending")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        // Empty response: nothing persisted.
+        route_manager_notify("", "team_ws").await;
+        // Real response: one durable envelope with the full content.
+        let response = "FULL RESPONSE BODY — must survive verbatim §1 ✓";
+        route_manager_notify(response, "team_ws").await;
 
         let conn = &crate::session::store().conn;
         let pending = crate::jobs::list_pending_jobs(conn)
@@ -1826,19 +1719,46 @@ mod tests {
             .expect("list pending");
         let matching: Vec<_> = pending
             .iter()
-            .filter(|r| r.target_agent_id == crate::jobs::envelope_target(&job))
+            .filter(|r| r.target_agent_id == target)
             .collect();
-        assert_eq!(matching.len(), 1, "exactly one addressed pending row");
-        let row = matching[0];
-        assert_eq!(row.id, id);
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one notify row for the admin's assistant"
+        );
         let deserialized: AgentJob =
-            serde_json::from_str(&row.envelope).expect("envelope deserializes to AgentJob");
-        assert_eq!(deserialized.kind, MessageKind::ManagerReply);
-        assert_eq!(deserialized.workspace_name, "personal:alice");
+            serde_json::from_str(&matching[0].envelope).expect("envelope deserializes to AgentJob");
+        assert_eq!(deserialized.kind, MessageKind::ManagerNotify);
+        assert_eq!(deserialized.workspace_name, "personal:__notify_admin");
+        assert_eq!(deserialized.user_name, "__notify_admin");
+        assert!(
+            deserialized
+                .content
+                .contains("<manager-message workspace=\"team_ws\">")
+                && deserialized.content.contains(response),
+            "envelope must carry the source workspace and the FULL response: {}",
+            deserialized.content
+        );
 
-        crate::jobs::delete_pending_job(conn, &id)
+        // Pre-unification ManagerReply rows must stay replayable (serde alias).
+        let legacy: AgentJob = serde_json::from_str(
+            r#"{"content":"<manager-reply workspace=\"old_ws\">hi</manager-reply>","workspace_name":"personal:alice","user_name":"alice","channel":"gui","kind":"ManagerReply","role":"Assistant","reply_target":null}"#,
+        )
+        .expect("legacy ManagerReply row deserializes");
+        assert_eq!(legacy.kind, MessageKind::ManagerNotify);
+
+        // The notify call fans out to every admin — including the auto-seeded
+        // 'admin' — so clean up ALL rows created by this test, not just the
+        // asserted one.
+        for row in pending.iter().filter(|r| !before.contains(&r.id)) {
+            crate::jobs::delete_pending_job(conn, &row.id)
+                .await
+                .expect("delete pending row");
+        }
+        store
+            .delete_user("__notify_admin")
             .await
-            .expect("delete pending row");
+            .expect("delete user");
     }
 
     // ── register_agent / unregister_agent / try_route tests ────────────
@@ -2023,7 +1943,7 @@ mod tests {
     /// because the equality check is specific to `UserMessage`.
     ///
     /// The same structural invariant holds for the Assistant↔Manager kinds:
-    /// `AgentMessage` and `ManagerReply` are deliberately distinct from
+    /// `AgentMessage` and `ManagerNotify` are deliberately distinct from
     /// `UserMessage` (see the `MessageKind` docs) so the emoji gate excludes them
     /// without any `matches!` broadening.
     ///

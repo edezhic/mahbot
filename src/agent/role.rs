@@ -262,7 +262,7 @@ use crate::tools::{
     AddAlarmTool, AddCommentTool, AddUserTool, AddWorkspaceTool, AnalyzeTool, BindTelegramTool,
     BrowserTool, ComputerTool, CreateTicketTool, DispatchMode, EditTool, FinalizeTool,
     GetTicketTool, ImageGenTool, ImplementTool, InstallChromeUseTool, ListAlarmsTool,
-    ListTicketsTool, MahbotDebugTool, ReadManagerChatTool, ReadTool, RemoveAlarmTool, ResearchTool,
+    ListTicketsTool, MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool,
     SearchArchivedTicketsTool, SearchTool, SendMessageToManagerTool, SetupTelegramBotTool,
     SetupWebSearchTool, ShellMode, ShellTool, SleepTool, UpdateTicketTool, VideoEditTool,
     VideoGenTool, WebSearchBackend, WebSearchTool,
@@ -408,10 +408,10 @@ impl Role {
                     // construction). No structural authorization gate beyond
                     // `full_access`, matching the full shell widening.
                     t.push(Box::new(ComputerTool));
-                    // Assistant↔Manager communication (admin/full-access only):
-                    // address the Manager of a project workspace and read its chat.
+                    // Assistant→Manager channel (admin/full-access only):
+                    // address the Manager of a project workspace. The
+                    // Manager's messages auto-deliver back (see message_router).
                     t.push(Box::new(SendMessageToManagerTool));
-                    t.push(Box::new(ReadManagerChatTool));
                 }
                 t
             }
@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn manager_chat_tools_only_in_full_access_assistant() {
-        // Acceptance pin: the Assistant↔Manager chat tools are granted ONLY
+        // Acceptance pin: the Assistant→Manager send tool is granted ONLY
         // to the full-access Assistant. Every other role (base or full) and
         // the base Assistant never communicate with a Manager directly.
         let ws = crate::workspace::test_ws("test");
@@ -699,18 +699,17 @@ mod tests {
                     .iter()
                     .map(|t| t.name())
                     .collect();
-                for name in ["send_message_to_manager", "read_manager_chat"] {
-                    let has = names.contains(&name);
-                    if role == crate::Role::Assistant && full_access {
-                        assert!(has, "full-access Assistant must advertise `{name}`");
-                    } else {
-                        assert!(
-                            !has,
-                            "{}{} must not advertise `{name}`",
-                            role.as_str(),
-                            if full_access { " (full)" } else { "" }
-                        );
-                    }
+                let name = "send_message_to_manager";
+                let has = names.contains(&name);
+                if role == crate::Role::Assistant && full_access {
+                    assert!(has, "full-access Assistant must advertise `{name}`");
+                } else {
+                    assert!(
+                        !has,
+                        "{}{} must not advertise `{name}`",
+                        role.as_str(),
+                        if full_access { " (full)" } else { "" }
+                    );
                 }
             }
         }
