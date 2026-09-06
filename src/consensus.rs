@@ -483,8 +483,10 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
         } else {
             reject(
                 &mut outcome,
-                // Every reason-pushing branch above sets a cause, so this is
-                // never None.
+                // Never None: the pre-member guards above set a cause
+                // directly, and every member/collapsed-id rejection is
+                // followed by a `get_or_insert(FailureClass::Membership)`
+                // in the member loops.
                 cause.unwrap(),
                 format!("group {i}: {}", reasons.join("; ")),
             );

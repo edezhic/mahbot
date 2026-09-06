@@ -199,8 +199,10 @@ pub fn init_global() -> anyhow::Result<()> {
 ///
 /// # Fast path
 ///
-/// Locks the router for reading only, looks up the agent ID, clones the
-/// sender, drops the lock, and sends. If the sender exists, we are done.
+/// Locks the router for reading only, looks up the agent ID, and — when a
+/// consumer exists — sends the job through the sender borrowed from the read
+/// guard, holding the guard until the block ends. If the sender exists, we
+/// are done.
 ///
 /// # Slow path
 ///

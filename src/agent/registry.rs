@@ -5,9 +5,11 @@
 //! These register here on start and remove themselves on completion via a RAII
 //! guard. Calls originating inside an agent run (the agent loop, verdict
 //! extraction, summarization) never register; agents are tracked separately in
-//! [`AGENT_REGISTRY`]. The call tracking is purely observational — it carries
-//! no cancellation semantics and never affects call behavior, retries, or
-//! results.
+//! [`AGENT_REGISTRY`], and in-agent utility LLM calls (e.g. media
+//! transcription) surface on the agent's card as an activity label via
+//! [`AgentRegistry::activity_started`]. The call tracking is purely
+//! observational — it carries no cancellation semantics and never affects
+//! call behavior, retries, or results.
 //!
 //! Every mutation that changes the live view (agent/call lifecycle, activity
 //! instrumentation) publishes
@@ -54,9 +56,9 @@ pub enum ParentKey {
     Research(String),
 }
 
-/// One tool transmitted in the running-agent ledger projection — the tool
-/// payload carried by the GUI's session ledger (see `session_view`) for the
-/// Running Agents page.
+/// One tool call in the GUI's session-ledger projection (`session_view`) —
+/// the payload of a ledger tool block, consumed by both the session ledger
+/// views and the Running Agents page (whose cards render ledger entries).
 ///
 /// `args` holds the tool's arguments as STRUCTURED key-value pairs with FULL,
 /// untruncated values, deliberately NOT credential-scrubbed: the Running
@@ -95,9 +97,11 @@ pub struct AgentHandle {
     pub agent_id: String,
     pub role: String,
     pub ticket_id: Option<String>,
-    /// Filesystem path of the workspace (not the name) — this is used for
-    /// agent display/location and is intentionally distinct from the
-    /// workspace_name identifier used in the board database.
+    /// Filesystem path of the workspace (not the name) — intentionally
+    /// distinct from the workspace_name identifier. Not used for GUI display
+    /// (the GUI groups by `workspace_name`); the only reader is
+    /// [`cancel_by_role_and_workspace_path`](AgentRegistry::cancel_by_role_and_workspace_path),
+    /// which matches maintenance-disable cancellations against the path.
     pub workspace_path: String,
     /// Workspace NAME — the identifier used by the board database and the
     /// dashboard's workspace map. Displayed on Running Agents cards/group
