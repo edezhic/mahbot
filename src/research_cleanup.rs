@@ -15,11 +15,13 @@
 //! release point, invoked per-job (never as a sweep) from the completion tail
 //! ([`run_cleanup_agent_and_finish`]) and — dump-guarded — from the cancel
 //! sweep ([`crate::research_cancel::sweep_cancelled_run`]) for folders with
-//! NO cleanup intent. A folder WITH a command dump is never deleted except by
-//! the cleanup tail. There is no periodic or scan-based run-folder sweep
-//! anywhere in the daemon, so folders of crashed runs are left for the OS
-//! temp sweep (see `crate::temp` — the temp-dir cleaner protects research run
-//! folders only by prompt instruction, never programmatically).
+//! NO cleanup intent. A folder WITH a command dump is normally released by
+//! the cleanup tail; the only other way it goes away is orphaning — e.g. a
+//! failed cleanup dispatch — to the OS temp sweep. There is no periodic or
+//! scan-based run-folder sweep anywhere in the daemon, so folders of crashed
+//! runs are likewise left for the OS temp sweep (see `crate::temp` — the
+//! temp-dir cleaner protects research run folders only by prompt
+//! instruction, never programmatically).
 //!
 //! ## Command dump + Sanitation cleanup
 //!
@@ -55,6 +57,10 @@ use std::path::{Path, PathBuf};
 /// The dump is intent for the Sanitation cleanup agent, not a report body,
 /// so the cap is deliberately generous.
 pub(crate) const COMMAND_DUMP_CAP_BYTES: usize = 10 * 1024 * 1024;
+/// Filename of the raw shell-command dump inside a run folder. Load-bearing:
+/// the cancel sweep spares a folder iff this file exists (see
+/// [`command_dump_exists`]) and the cleanup prompt receives its path.
+pub(crate) const COMMAND_DUMP_FILE: &str = "commands.dump";
 /// Per-tick assistant-session scan budget (bytes of session content). Typical
 /// bases (~3 MB) fit in one tick; pathological growth is cut across ticks.
 const MEDIA_SCAN_BUDGET_BYTES: usize = 10 * 1024 * 1024;
@@ -119,7 +125,7 @@ async fn run_folder_exists(job_id: &str) -> bool {
 /// error⇒false guards against re-dispatching a cleanup for a run that
 /// already completed.)
 pub(crate) async fn command_dump_exists(job_id: &str) -> bool {
-    tokio::fs::try_exists(run_root_path(job_id).join("commands.dump"))
+    tokio::fs::try_exists(run_root_path(job_id).join(COMMAND_DUMP_FILE))
         .await
         .unwrap_or(true)
 }
@@ -133,8 +139,10 @@ pub(crate) async fn command_dump_exists(job_id: &str) -> bool {
 /// before row terminalize) and the cancel sweep
 /// ([`crate::research_cancel::sweep_cancelled_run`]) only for folders with NO
 /// command dump (dump-guarded upstream in [`command_dump_exists`]); a folder
-/// WITH a `commands.dump` is released only by the cleanup tail. The cleanup
-/// jobs row is NOT touched here: callers own row removal.
+/// WITH a dump is normally released by the cleanup tail — though a failed
+/// cleanup dispatch (see `crate::tools::research`) orphans it to the OS temp
+/// sweep, like a crashed run. The cleanup jobs row is NOT touched here:
+/// callers own row removal.
 ///
 /// Removal failure is swallowed (the folder is "left for the OS") and the row
 /// is still terminalized by the caller — the crash-window classifier then
@@ -305,7 +313,7 @@ pub(crate) fn cap_command_dump(commands: &mut Vec<String>, cap: usize) {
 /// ensure the run root exists); a missing folder is the normal end-state when
 /// a cancel sweep released it, so that is a debug, not a warning.
 pub(crate) async fn write_command_dump(run_root: &Path, job_id: &str, commands: &[String]) {
-    let path = run_root.join("commands.dump");
+    let path = run_root.join(COMMAND_DUMP_FILE);
     let mut deduped = dedup_newest_wins(commands);
     cap_command_dump(&mut deduped, COMMAND_DUMP_CAP_BYTES);
     let content = deduped.join("\n") + "\n";
@@ -325,7 +333,7 @@ pub(crate) async fn write_command_dump(run_root: &Path, job_id: &str, commands: 
 /// already TTL'd — the dump is the only surviving capture). Missing/unreadable
 /// dump → empty (fresh run or OS-swept folder — fail-open).
 pub(crate) async fn read_command_dump(run_root: &Path) -> Vec<String> {
-    let path = run_root.join("commands.dump");
+    let path = run_root.join(COMMAND_DUMP_FILE);
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => content.lines().map(str::to_string).collect(),
         Err(_) => Vec::new(),
@@ -461,7 +469,7 @@ pub(crate) async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Resu
     // fresh path: an OS temp sweep between research terminalization and the
     // cleanup dispatch would otherwise hand the agent a prompt pointing at a
     // missing folder.
-    let dump_path = run_root.join("commands.dump");
+    let dump_path = run_root.join(COMMAND_DUMP_FILE);
     let prompt = build_cleanup_prompt(job_id, &run_root, &dump_path, ws);
 
     // Durable jobs row: id == run_id (folder name) → the row holds the folder
@@ -1246,7 +1254,7 @@ mod tests {
             .map(crate::util::scrub_credentials)
             .collect();
         write_command_dump(run_root, "test", &commands).await;
-        let content = tokio::fs::read_to_string(run_root.join("commands.dump"))
+        let content = tokio::fs::read_to_string(run_root.join(COMMAND_DUMP_FILE))
             .await
             .unwrap();
         assert!(content.contains("/tmp/x"));
@@ -1297,7 +1305,7 @@ mod tests {
     async fn cleanup_prompt_builds_with_context() {
         let td = tempfile::tempdir().unwrap();
         let run_root = td.path();
-        let dump_path = run_root.join("commands.dump");
+        let dump_path = run_root.join(COMMAND_DUMP_FILE);
         let ws = crate::workspace::test_ws_named(
             run_root.to_str().expect("temp path is utf8"),
             "cleanup_ws",

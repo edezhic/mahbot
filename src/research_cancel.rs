@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Workspace;
 use crate::agent::registry::ParentKey;
+use crate::research_cleanup::COMMAND_DUMP_FILE;
 use crate::util::UnwrapPoison;
 
 /// Per-run cancel signals. An entry exists from the moment a run's
@@ -252,7 +253,7 @@ async fn hand_off_rows(job_id: &str, ws: &Workspace) -> Result<Option<String>, S
     let run_root = tokio::fs::canonicalize(crate::research_cleanup::run_root_path(job_id))
         .await
         .map_err(|e| format!("{e:#}"))?;
-    let dump_path = run_root.join("commands.dump");
+    let dump_path = run_root.join(COMMAND_DUMP_FILE);
     let prompt = crate::research_cleanup::build_cleanup_prompt(job_id, &run_root, &dump_path, ws);
     crate::jobs::transition_research_to_cleanup(conn, job_id, &prompt, &ws.name)
         .await
@@ -458,7 +459,7 @@ mod tests {
         .await
         .unwrap();
         let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
-        tokio::fs::write(run_root.join("commands.dump"), "shell cmd")
+        tokio::fs::write(run_root.join(COMMAND_DUMP_FILE), "shell cmd")
             .await
             .unwrap();
         let archive = crate::research_cleanup::results_archive_path(job_id).unwrap();
@@ -490,7 +491,7 @@ mod tests {
             "run folder held — cleanup intent present"
         );
         assert!(
-            run_root.join("commands.dump").exists(),
+            run_root.join(COMMAND_DUMP_FILE).exists(),
             "command dump survives"
         );
         assert!(!archive.exists(), "results.md archive removed");
@@ -533,7 +534,7 @@ mod tests {
         .await
         .unwrap();
         let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
-        tokio::fs::write(run_root.join("commands.dump"), "shell cmd")
+        tokio::fs::write(run_root.join(COMMAND_DUMP_FILE), "shell cmd")
             .await
             .unwrap();
         let archive = crate::research_cleanup::results_archive_path(job_id).unwrap();
@@ -603,7 +604,7 @@ mod tests {
         );
         assert!(run_root.exists(), "run folder held for the cleanup tail");
         assert!(
-            run_root.join("commands.dump").exists(),
+            run_root.join(COMMAND_DUMP_FILE).exists(),
             "command dump survives — cleanup intent preserved"
         );
         assert!(!archive.exists(), "results.md archive removed");
