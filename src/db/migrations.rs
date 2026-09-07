@@ -29,9 +29,11 @@
 //! `jobs.mode` discriminator, the `session_metadata.sleep_ended` marker, the
 //! `alarms.command` column, the `chat_history.broadcast_id` column, and the
 //! `tickets.last_transition_actor` / `ticket_chronicle.actor` columns on
-//! one-delta-behind / current databases.
+//! one-delta-behind / current databases. Entry `36` is a data migration: it
+//! detaches non-admin users from shared workspaces by clearing
+//! `users.selected_workspace`.
 //!
-//! Future schema changes resume the chain at id `35` with monotonically
+//! Future schema changes resume the chain at id `37` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -537,6 +539,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Logs,
         body: MigrationBody::Sql(ADD_LLM_FAILURES),
     },
+    Migration {
+        id: "36",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(detach_non_admin_workspaces),
+    },
 ];
 
 /// Apply the migration catalog to `conn` for one physical database.
@@ -813,6 +820,31 @@ fn add_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 /// re-runnable until recorded).
 async fn run_add_alarms_command(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "alarms", "command").await
+}
+
+fn detach_non_admin_workspaces(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_detach_non_admin_workspaces(conn))
+}
+
+/// Data migration: workspace membership becomes admin-only.
+///
+/// Detaches every non-admin user from shared workspaces by clearing
+/// `users.selected_workspace` (NULL = the user's personal workspace). The
+/// admin predicate is exactly `permissions = 'full'` — the same single
+/// predicate the runtime guards use, so migration and runtime can never
+/// disagree. Users, chat history, personal workspaces and alarms are
+/// preserved — detach, not deletion. Idempotent: re-running matches no rows
+/// (non-transactional like every Rust body, re-runnable until recorded).
+async fn run_detach_non_admin_workspaces(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE users SET selected_workspace = NULL \
+         WHERE selected_workspace IS NOT NULL \
+         AND (permissions IS NULL OR permissions <> 'full')",
+        (),
+    )
+    .await
+    .with_context(|| "Failed to detach non-admin users from shared workspaces")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2154,9 +2186,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "31".to_string(),
                 "32".to_string(),
                 "33".to_string(),
-                "34".to_string()
+                "34".to_string(),
+                "36".to_string()
             ],
-            "fresh core applies baseline 24/25/27/28/29/30/31/32/33/34 exactly"
+            "fresh core applies baseline 24/25/27/28/29/30/31/32/33/34 + data 36 exactly"
         );
     }
 
@@ -2423,7 +2456,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`/`28`/`29`/`30`/`31`/`32`/`33`) as a
+    /// the new baseline (`24`/`25`/`27`/`28`/`29`/`30`/`31`/`32`/`33`/`36`) as a
     /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
     /// column upfill, the delta-28 `jobs.caller_agent_id` /
     /// `session_metadata.created_at` column upfills (plus the delta-28
@@ -2432,8 +2465,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `sleep_ended` column upfill, the delta-32 `alarms.command` column
     /// upfill, and the delta-33 `chat_history.broadcast_id` column upfill, and
     /// the delta-34 `tickets.last_transition_actor` /
-    /// `ticket_chronicle.actor` column upfill, all
-    /// asserted explicitly. This also proves
+    /// `ticket_chronicle.actor` column upfill — plus the delta-36 data
+    /// rewrite, which detaches the seeded non-admin from `users.selected_workspace`
+    /// (row counts unchanged; the snapshot compares only counts, chat content
+    /// and tickets). All asserted explicitly. This also proves
     /// Turso honors `IF NOT EXISTS` on the FTS index when the baseline re-runs it.
     #[tokio::test]
     #[expect(clippy::too_many_lines)]
@@ -2469,12 +2504,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("32".to_string());
         expected_ids.push("33".to_string());
         expected_ids.push("34".to_string());
+        expected_ids.push("36".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34"
+            "reopen must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34/36"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -2482,7 +2518,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         // (delta 30), session_metadata.sleep_ended (delta 31),
         // alarms.command (delta 32) and chat_history.broadcast_id (delta 33)
         // gain their columns, appended at the end by the ALTER, and the
-        // delta-28 `idx_jobs_caller_agent` index is added.
+        // delta-28 `idx_jobs_caller_agent` index is added. Delta `36` rewrites
+        // `users.selected_workspace` data (detaching the seeded non-admin),
+        // which leaves row counts unchanged — the snapshot compares only
+        // counts, chat content and tickets, so the no-op assertions still hold.
         assert_core_catalog_unchanged(
             &conn,
             &before,
@@ -2659,8 +2698,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// partial index), entry `30` adds `jobs.mode`, entry `31` adds
     /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
     /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
-    /// `tickets.last_transition_actor` / `ticket_chronicle.actor`,
-    /// leaving every row and every other table's schema untouched.
+    /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. Entry `36`
+    /// is a data migration (detaching non-admins from shared workspaces), so
+    /// the recorded ids grow by `36`; every other row and table's schema is
+    /// untouched.
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
@@ -2770,12 +2811,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("32".to_string());
         expected_ids.push("33".to_string());
         expected_ids.push("34".to_string());
+        expected_ids.push("36".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34"
+            "upgrade must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34/36"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -2817,5 +2859,86 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
              alarms.command (delta 32) and tickets/ticket_chronicle (delta 34) \
              columns may change on the 0.5.0 upgrade"
         );
+    }
+
+    /// Read every `users` row as `name → selected_workspace` for the
+    /// delta-36 behavioral pin.
+    async fn users_selected_workspaces(
+        conn: &Connection,
+    ) -> std::collections::BTreeMap<String, Option<String>> {
+        conn.query("SELECT name, selected_workspace FROM users", ())
+            .await
+            .expect("read users")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String>(0).expect("user name"),
+                    row.get::<Option<String>>(1).expect("selected_workspace"),
+                )
+            })
+            .collect()
+    }
+
+    /// Behavioral pin for delta `36`: workspace membership is admin-only, so the
+    /// migration detaches every non-admin from shared workspaces (clearing
+    /// `selected_workspace` → NULL) while leaving admins attached. Idempotent:
+    /// re-running matches no rows and changes nothing.
+    #[tokio::test]
+    async fn detach_non_admin_workspaces_clears_only_non_admins() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(root, crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        // Catalog front entries 24 (baseline core schema — creates `users`) and
+        // 25 (chat_history reply columns) suffice to bring up the table.
+        run_catalog(&conn, TargetDb::Core, &MIGRATIONS[..2])
+            .await
+            .expect("baseline catalog");
+
+        // Admin with a shared workspace, a non-admin sharing it, and a non-admin
+        // already on their personal workspace (NULL).
+        conn.execute(
+            "INSERT INTO users (name, permissions, selected_workspace) \
+             VALUES ('admin_user', 'full', 'shared_ws')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO users (name, permissions, selected_workspace) \
+             VALUES ('non_admin_shared', NULL, 'shared_ws')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO users (name, permissions, selected_workspace) \
+             VALUES ('non_admin_null', NULL, NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        run_detach_non_admin_workspaces(&conn).await.unwrap();
+
+        let after = users_selected_workspaces(&conn).await;
+        assert_eq!(
+            after["admin_user"],
+            Some("shared_ws".to_string()),
+            "admins keep their shared workspace"
+        );
+        assert_eq!(
+            after["non_admin_shared"], None,
+            "non-admins are detached from shared workspaces"
+        );
+        assert_eq!(after["non_admin_null"], None, "already-personal stays NULL");
+
+        // Idempotence: re-running matches no rows and changes nothing.
+        run_detach_non_admin_workspaces(&conn).await.unwrap();
+        assert_eq!(users_selected_workspaces(&conn).await, after);
     }
 }

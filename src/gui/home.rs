@@ -540,16 +540,19 @@ impl HomeState {
     /// change cascading to [`WorkspaceChanged`] → `refresh_history`);
     /// otherwise it refreshes history directly.
     ///
+    /// Membership is admin-only: [`crate::users::resolve_selected_workspace_name`]
+    /// clamps a non-admin to their personal workspace, so a shared workspace is
+    /// never surfaced in the sidebar for them. `None` (missing row / read
+    /// failure) leaves the current sidebar selection untouched.
+    ///
     /// NOTE: The Dashboard-level switch emitted here writes the same value back
     /// to the user's DB record via `select_workspace` — idempotent by design,
     /// since the DB is the single source of truth for the selection.
     async fn resolve_user_workspace_sync(user: String, current_ws: Option<String>) -> HomeMessage {
-        match crate::users::get_raw_selected_workspace(&user).await {
-            Ok(Some(ws_name)) => {
-                // User has an explicit stored workspace preference. Normalize
-                // a personal stored value to the GUI-wide `personal:{user}` name;
-                // the project workspace is the merge partner at the Personal
-                // picker.
+        match crate::users::resolve_selected_workspace_name(&user).await {
+            Some(ws_name) => {
+                // The primitive already normalized a personal value to the
+                // GUI-wide `personal:{user}` name; a shared value is kept.
                 let (sidebar_ws, project_ws) = if crate::users::is_personal_workspace(&ws_name) {
                     (crate::users::personal_workspace_name(&user), None)
                 } else {
@@ -561,16 +564,8 @@ impl HomeState {
                     project_ws,
                 }
             }
-            Ok(None) => {
-                // User has no stored preference — keep current sidebar selection.
-                HomeMessage::ResolveUserSelected {
-                    user,
-                    sidebar_ws: current_ws.clone(),
-                    project_ws: None,
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to get raw workspace for user {user}: {e}");
+            None => {
+                // Missing row / read failure — keep current sidebar selection.
                 HomeMessage::ResolveUserSelected {
                     user,
                     sidebar_ws: current_ws.clone(),
@@ -583,12 +578,13 @@ impl HomeState {
     /// The user's DB-selected project workspace (None when unset or
     /// personal). The Personal-picker merge partner — re-read on workspace
     /// changes so it never goes stale (Users-page edits flow through
-    /// [`WorkspaceChanged`]).
+    /// [`WorkspaceChanged`]). Because membership is admin-only, a non-admin
+    /// always resolves to their personal workspace, so this returns `None`
+    /// for them — their prior shared-workspace chat history simply becomes
+    /// invisible.
     async fn project_workspace_for(user: String) -> Option<String> {
-        crate::users::get_raw_selected_workspace(&user)
+        crate::users::resolve_selected_workspace_name(&user)
             .await
-            .ok()
-            .flatten()
             .filter(|ws| !crate::users::is_personal_workspace(ws))
     }
 
@@ -2701,6 +2697,47 @@ mod tests {
                 .await
                 .as_deref(),
             Some("ws_home_project_workspace_for")
+        );
+    }
+
+    #[tokio::test]
+    async fn project_workspace_for_is_admin_gated() {
+        crate::util::test::init_test_stores().await;
+        let store = crate::users::USER_STORE
+            .get()
+            .expect("users store initialized");
+        // Seed an admin and a non-admin with the same shared selected_workspace
+        // directly (bypassing add_user's personal-workspace side effects so the
+        // test controls the exact stored state).
+        store
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO users (name, permissions, selected_workspace) \
+                 VALUES (?1, ?2, ?3)",
+                crate::db::params!["adm_merge_gui", Some("full"), Some("ws_merge_gui")],
+            )
+            .await
+            .expect("seed admin");
+        store
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO users (name, permissions, selected_workspace) \
+                 VALUES (?1, ?2, ?3)",
+                crate::db::params!["nonadm_merge_gui", None::<&str>, Some("ws_merge_gui")],
+            )
+            .await
+            .expect("seed non-admin");
+
+        // An admin keeps the shared workspace as their merge partner...
+        assert_eq!(
+            HomeState::project_workspace_for("adm_merge_gui".to_string()).await,
+            Some("ws_merge_gui".to_string())
+        );
+        // ...while a non-admin is clamped off it (membership is admin-only),
+        // making their prior shared-workspace chat history simply invisible.
+        assert_eq!(
+            HomeState::project_workspace_for("nonadm_merge_gui".to_string()).await,
+            None
         );
     }
 

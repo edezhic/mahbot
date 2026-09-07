@@ -1585,9 +1585,14 @@ impl SettingsState {
 
     // ── View ─────────────────────────────────────────────────────
 
-    pub fn view(&self, active_user: Option<&str>) -> Element<'_, SettingsMessage> {
-        // Workspace management section (top)
-        let ws_section = self.workspaces_section();
+    pub fn view(
+        &self,
+        active_user: Option<&str>,
+        active_is_admin: bool,
+    ) -> Element<'_, SettingsMessage> {
+        // Workspace management section (top). The workspace list & add form are
+        // gated on the active user's admin status (shared membership is admin-only).
+        let ws_section = self.workspaces_section(active_is_admin);
 
         // User management section (second)
         let us_section = self.users_section(active_user);
@@ -1644,9 +1649,25 @@ impl SettingsState {
 
     /// Render the workspaces section for the Settings page. No inner
     /// scrollable — rows expand the outer Settings scrollable naturally.
+    ///
+    /// Shared-workspace membership is admin-only: when the active user is not
+    /// an admin, the row list and the add-workspace form are hidden entirely
+    /// and a single muted explanatory line is rendered instead (the error
+    /// banner, if present, is still shown).
     #[expect(clippy::too_many_lines)]
-    fn workspaces_section(&self) -> Element<'_, SettingsMessage> {
+    fn workspaces_section(&self, active_is_admin: bool) -> Element<'_, SettingsMessage> {
         let ws = &self.workspaces_state;
+
+        if !active_is_admin {
+            let mut rows = Column::new().spacing(theme::SPACE_4);
+            rows = widgets::push_error_banner(rows, ws.load_state.error());
+            rows = rows.push(
+                text("Shared workspaces are available to admin users only.")
+                    .size(theme::TEXT_12)
+                    .color(theme::TEXT_MUTED),
+            );
+            return section_impl("Workspaces", None, rows);
+        }
 
         let mut rows = Column::new().spacing(theme::SPACE_4);
 
@@ -2220,44 +2241,60 @@ impl SettingsState {
                         // Workspace column (FillPortion: 20)
                         {
                             // The shared option list carries one Personal
-                            // entry (options[0], value = the impersonated
-                            // user's `personal:{user}` name) reused by every
-                            // row: a personal/NULL stored selection for ANY
-                            // user displays as that entry, and selecting it
-                            // persists NULL — which means the ROW user's own
-                            // personal workspace — so no per-row value is
-                            // needed.
-                            let personal_value = us
-                                .workspace_options
-                                .first()
-                                .map(|o| o.value.clone())
-                                .unwrap_or_default();
-                            let ws_value = user
-                                .selected_workspace
-                                .as_deref()
-                                .filter(|ws| !crate::users::is_personal_workspace(ws))
-                                .map_or(personal_value, str::to_string);
-                            let ws_selected = us
-                                .workspace_options
-                                .iter()
-                                .find(|o| o.value == ws_value)
-                                .cloned();
-                            container(widgets::tooltip_hint(
-                                pick_list(us.workspace_options.as_slice(), ws_selected, |opt| {
-                                    SettingsMessage::UserMsg(users::UsersMessage::UpdateWorkspace(
-                                        user.name.clone(),
-                                        opt.value,
-                                    ))
-                                })
-                                .style(theme::pick_list_style)
-                                .menu_style(theme::pick_list_menu_style)
-                                .padding([theme::PAD_4, theme::PAD_8])
-                                .width(Length::Fixed(120.0)),
-                                "Active workspace",
-                            ))
-                            .width(Length::FillPortion(20))
-                            .align_x(Alignment::Start)
-                            .align_y(Alignment::Center)
+                            // entry (options[0], value = `""`) reused by every
+                            // admin row: a personal/NULL stored selection for
+                            // ANY user displays as that empty entry, and
+                            // selecting it persists NULL — which means the ROW
+                            // user's own personal workspace — so no per-row
+                            // value is needed. The option list is
+                            // impersonation-independent. Non-admin rows have no
+                            // picker at all (membership is admin-only) and show
+                            // a muted "Personal" label instead.
+                            let ws_cell: iced::Element<'_, SettingsMessage> = if user.is_admin() {
+                                let personal_value = us
+                                    .workspace_options
+                                    .first()
+                                    .map(|o| o.value.clone())
+                                    .unwrap_or_default();
+                                let ws_value = user
+                                    .selected_workspace
+                                    .as_deref()
+                                    .filter(|ws| !crate::users::is_personal_workspace(ws))
+                                    .map_or(personal_value, str::to_string);
+                                let ws_selected = us
+                                    .workspace_options
+                                    .iter()
+                                    .find(|o| o.value == ws_value)
+                                    .cloned();
+                                widgets::tooltip_hint(
+                                    pick_list(
+                                        us.workspace_options.as_slice(),
+                                        ws_selected,
+                                        |opt| {
+                                            SettingsMessage::UserMsg(
+                                                users::UsersMessage::UpdateWorkspace(
+                                                    user.name.clone(),
+                                                    opt.value,
+                                                ),
+                                            )
+                                        },
+                                    )
+                                    .style(theme::pick_list_style)
+                                    .menu_style(theme::pick_list_menu_style)
+                                    .padding([theme::PAD_4, theme::PAD_8])
+                                    .width(Length::Fixed(120.0)),
+                                    "Active workspace",
+                                )
+                            } else {
+                                text("Personal")
+                                    .size(theme::TEXT_12)
+                                    .color(theme::TEXT_MUTED)
+                                    .into()
+                            };
+                            container(ws_cell)
+                                .width(Length::FillPortion(20))
+                                .align_x(Alignment::Start)
+                                .align_y(Alignment::Center)
                         },
                         // Role column (FillPortion: 15) — active role
                         // picker (permission-derived pool)

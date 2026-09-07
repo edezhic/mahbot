@@ -163,6 +163,23 @@ impl UserStore {
         self.user_column("selected_workspace", user_name).await
     }
 
+    /// Read the user's `(selected_workspace, permissions)` pair in one query.
+    /// `None` when no user row exists.
+    async fn get_selected_workspace_and_permissions(
+        &self,
+        user_name: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        self.conn
+            .query_optional(
+                "SELECT selected_workspace, permissions FROM users WHERE name = ?1",
+                db::params![user_name],
+                |row| -> turso::Result<(Option<String>, Option<String>)> {
+                    Ok((row.get::<Option<String>>(0)?, row.get::<Option<String>>(1)?))
+                },
+            )
+            .await
+    }
+
     /// Get the active role for a user, if any.
     async fn get_active_role(&self, user_name: &str) -> Result<Option<String>> {
         self.user_column("selected_role", user_name).await
@@ -322,11 +339,19 @@ impl UserStore {
         Ok(users)
     }
 
-    /// Find all users whose `selected_workspace` matches the given name
-    /// (shared workspaces only — personal workspace users with NULL are excluded).
+    /// Find the users attached to the given shared workspace — admin-filtered.
+    ///
+    /// Workspace membership is admin-only: the Manager broadcast and the
+    /// Assistant→Manager mirror deliver only to admin (full-permissions)
+    /// members, so a rogue non-admin re-attachment can never receive
+    /// shared-workspace traffic (defense in depth on top of the runtime
+    /// resolution clamp).
     pub async fn find_by_workspace(&self, workspace_name: &str) -> Result<Vec<UserRecord>> {
-        self.list_users_where("WHERE selected_workspace = ?1", db::params![workspace_name])
-            .await
+        self.list_users_where(
+            "WHERE selected_workspace = ?1 AND permissions = ?2",
+            db::params![workspace_name, "full"],
+        )
+        .await
     }
 
     /// Find a single user by exact name, returning their full record with channel bindings.
@@ -583,6 +608,10 @@ pub(crate) async fn ensure_personal_workspace(name: &str) {
 /// Returns `None` if the user has no stored preference (NULL) or if the
 /// user doesn't exist.  Unlike [`get_workspace`], this does NOT synthesize
 /// a personal workspace fallback — the caller decides how to interpret NULL.
+///
+/// User-facing resolution must go through [`resolve_selected_workspace_name`]
+/// (which applies the admin-only membership clamp); the remaining callers of
+/// this raw read are admin-gated Telegram admin-command paths.
 pub async fn get_raw_selected_workspace(user_name: &str) -> Result<Option<String>> {
     store().get_selected_workspace_name(user_name).await
 }
@@ -619,18 +648,55 @@ async fn resolve_user_model_column(user_name: &str, column: &str) -> Option<Stri
     }
 }
 
-/// Get the current active workspace for a user.
+/// Resolve the user's admin-aware selected workspace name — THE single
+/// admin-aware resolution primitive, shared by message routing and the GUI
+/// (boot restore, reverse-sync, merge partner).
 ///
-/// If `selected_workspace` is set, looks up from the `workspaces` table.
-/// If NULL, constructs a personal workspace from the user's name
-/// (path: `~/.mahbot/userspaces/<user_name>/`).
+/// Workspace membership is admin-only: an admin (permissions = "full") gets
+/// their stored selection (a legacy stored personal value normalizes to the
+/// canonical `personal:{user}` name); a non-admin ALWAYS yields their
+/// `personal:{user}` name, never a shared workspace (a shared selection is
+/// clamped, with a warning — defense in depth against rogue re-attachment).
+/// A NULL `selected_workspace` also yields `personal:{user}`; `None` means
+/// no user row or a read failure (warned) — the caller applies its own
+/// personal default. The admin predicate is exactly `permissions = "full"`,
+/// the same one the data migration and `find_by_workspace` use.
+pub(crate) async fn resolve_selected_workspace_name(user_name: &str) -> Option<String> {
+    match store()
+        .get_selected_workspace_and_permissions(user_name)
+        .await
+    {
+        Ok(Some((ws, perms))) if is_admin_permissions(perms.as_deref()) => Some(match ws {
+            Some(ws) if !is_personal_workspace(&ws) => ws,
+            _ => personal_workspace_name(user_name),
+        }),
+        Ok(Some((Some(ws), _))) if !is_personal_workspace(&ws) => {
+            warn!(
+                user_name = %user_name,
+                workspace = %ws,
+                "non-admin has a shared selected_workspace — clamping to their personal workspace"
+            );
+            Some(personal_workspace_name(user_name))
+        }
+        Ok(Some(_)) => Some(personal_workspace_name(user_name)),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(user_name = %user_name, error = %e, "Failed to read selected workspace");
+            None
+        }
+    }
+}
+
+/// Get the current active workspace for a user, admin-aware.
+///
+/// Resolves through [`resolve_selected_workspace_name`]: admins get their
+/// stored workspace (shared or personal), non-admins always resolve to their
+/// personal workspace. `None` (missing row / read failure) yields the
+/// personal workspace.
 async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
-    let s = store();
-    let selected = s.get_selected_workspace_name(user_name).await?;
-    if let Some(ws_name) = selected {
-        crate::workspace::get_by_name(&ws_name).await
-    } else {
-        Ok(Some(personal_workspace_struct(user_name)))
+    match resolve_selected_workspace_name(user_name).await {
+        Some(ws_name) => resolve_workspace(&ws_name).await,
+        None => Ok(Some(personal_workspace_struct(user_name))),
     }
 }
 
@@ -724,6 +790,25 @@ pub async fn role_pool_status(user_name: &str) -> (Vec<Role>, bool) {
 /// legitimate admin-permission classification.
 pub async fn role_pool(user_name: &str) -> Vec<Role> {
     role_pool_status(user_name).await.0
+}
+
+/// The user's admin flag and role pool in a single permissions read — the
+/// shape the GUI role/admin cache needs. Fail-closed: a read failure yields
+/// `(false, [])` with a warning.
+pub(crate) async fn admin_and_pool(user_name: &str) -> (bool, Vec<Role>) {
+    match store().get_permissions(user_name).await {
+        Ok(perms) => {
+            let perms = perms.as_deref();
+            (
+                is_admin_permissions(perms),
+                role_pool_for_permissions(perms),
+            )
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, user_name, "Failed to read role pool");
+            (false, Vec::new())
+        }
+    }
 }
 
 /// Persist a user's active role. Callers must ensure `role` is in the
@@ -1317,5 +1402,103 @@ mod tests {
         let (role, ws) = resolve_session_target(user).await;
         assert_eq!(role, Role::Assistant);
         assert_eq!(ws.name, "personal:home_clear_target");
+    }
+
+    /// Seed a `users` row directly via SQL with explicit permissions and a
+    /// selected workspace (bypassing `add_user`'s personal-workspace side
+    /// effects so the test controls the exact stored state).
+    async fn seed_user(
+        store: &UserStore,
+        name: &str,
+        permissions: Option<&str>,
+        workspace: Option<&str>,
+    ) {
+        store
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO users (name, permissions, selected_workspace) \
+                 VALUES (?1, ?2, ?3)",
+                db::params![name, permissions, workspace],
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolve_selected_workspace_name_is_admin_aware() {
+        crate::util::test::init_test_stores().await;
+        let store = store();
+
+        // Admin (full) + shared selection → keeps the shared workspace.
+        seed_user(&store, "adm_shared", Some("full"), Some("ws_shared")).await;
+        assert_eq!(
+            resolve_selected_workspace_name("adm_shared").await,
+            Some("ws_shared".to_string())
+        );
+        // Admin + stored personal value → normalized to the canonical personal name.
+        seed_user(
+            &store,
+            "adm_personal",
+            Some("full"),
+            Some("personal:adm_personal"),
+        )
+        .await;
+        assert_eq!(
+            resolve_selected_workspace_name("adm_personal").await,
+            Some("personal:adm_personal".to_string())
+        );
+        // Admin + NULL selection → personal.
+        seed_user(&store, "adm_null", Some("full"), None).await;
+        assert_eq!(
+            resolve_selected_workspace_name("adm_null").await,
+            Some("personal:adm_null".to_string())
+        );
+        // Non-admin (NULL permissions) + shared selection → clamped to personal.
+        seed_user(&store, "u_shared", None, Some("ws_shared")).await;
+        assert_eq!(
+            resolve_selected_workspace_name("u_shared").await,
+            Some("personal:u_shared".to_string())
+        );
+        // Non-admin + NULL selection → personal.
+        seed_user(&store, "u_null", None, None).await;
+        assert_eq!(
+            resolve_selected_workspace_name("u_null").await,
+            Some("personal:u_null".to_string())
+        );
+        // Missing user → None.
+        assert_eq!(resolve_selected_workspace_name("no_such_user").await, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_workspace_for_user_name_is_admin_aware() {
+        crate::util::test::init_test_stores().await;
+        let store = store();
+        crate::util::test::create_test_workspace("/tmp/resolve_admin_aware_ws", "ws_admin_aware")
+            .await;
+
+        // Non-admin with a shared selection that exists in the table is still
+        // clamped to the personal workspace (never a shared one).
+        seed_user(&store, "u_shared", None, Some("ws_admin_aware")).await;
+        let ws = resolve_workspace_for_user_name("u_shared").await;
+        assert_eq!(ws.name, "personal:u_shared");
+
+        // Admin with a shared selection that exists keeps the shared workspace.
+        seed_user(&store, "adm_shared", Some("full"), Some("ws_admin_aware")).await;
+        let ws = resolve_workspace_for_user_name("adm_shared").await;
+        assert_eq!(ws.name, "ws_admin_aware");
+    }
+
+    #[tokio::test]
+    async fn find_by_workspace_filters_to_admin_members() {
+        crate::util::test::init_test_stores().await;
+        let store = store();
+
+        // The same shared workspace attached by an admin and a non-admin.
+        seed_user(&store, "adm_member", Some("full"), Some("ws_shared_x")).await;
+        seed_user(&store, "non_admin_member", None, Some("ws_shared_x")).await;
+
+        let members = store.find_by_workspace("ws_shared_x").await.unwrap();
+        assert_eq!(members.len(), 1, "only the admin member must be returned");
+        assert_eq!(members[0].name, "adm_member");
     }
 }

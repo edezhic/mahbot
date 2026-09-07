@@ -358,6 +358,7 @@ pub enum Message {
     RoleAndPoolLoaded {
         role: Option<Role>,
         pool: Vec<Role>,
+        is_admin: bool,
     },
     /// A role switch failed — refresh the role cache so the composer's
     /// optimistic role icon reverts to the persisted active role.
@@ -554,6 +555,10 @@ pub struct Dashboard {
     /// Cached role pool for the current user — the switchable roles shown in
     /// the composer role dropdown.
     selected_user_roles: Vec<Role>,
+    /// Cached admin status for the current user — the single reliable source
+    /// of the active user's admin flag, used to gate shared-workspace
+    /// membership across all GUI surfaces. Fail-closed: `false` until loaded.
+    selected_user_is_admin: bool,
     /// True when a genuine window close was requested while the update was in
     /// its finalizing window (daemon shut down; checkpoint + spawn + exit
     /// pending). Only a user close (`CloseRequested`) sets this — the update's
@@ -615,6 +620,7 @@ impl Dashboard {
             selected_user_name: None,
             selected_user_role: None,
             selected_user_roles: Vec::new(),
+            selected_user_is_admin: false,
             exit_requested_during_update: false,
             draining: false,
             show_update_confirm: false,
@@ -800,7 +806,8 @@ impl Dashboard {
                 let board_refresh = self.board_state.refresh().map(Message::Board);
                 Task::batch([load_users, snap, board_refresh])
             }
-            Page::Sessions => sessions::SessionsState::refresh().map(Message::Sessions),
+            Page::Sessions => sessions::SessionsState::refresh(!self.selected_user_is_admin)
+                .map(Message::Sessions),
             Page::Settings => {
                 self.settings_state.refresh();
                 // Workspace list + users picker options come from the shared
@@ -826,20 +833,25 @@ impl Dashboard {
     /// section list (sorted by name, matching the store's `ORDER BY name`) and
     /// the users-page workspace picker options. No DB read — the map is the
     /// single source of truth.
+    ///
+    /// Shared-workspace membership is admin-only: when the active user is not
+    /// an admin, the Workspaces settings list is emptied (every `workspaces`
+    /// table row is a shared workspace; personal workspaces never live in the
+    /// map). The users-page picker options are still assigned — they only carry
+    /// shared names, and non-admin rows substitute a muted "Personal" label.
     fn sync_settings_lists_from_map(&mut self) {
         let mut list: Vec<Workspace> = self.workspaces.values().cloned().collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
+        if !self.selected_user_is_admin {
+            // Fail-closed: hide all shared workspaces from a non-admin.
+            list.clear();
+        }
         self.settings_state.workspaces_state.workspaces = list;
-        // The Personal option value is the impersonated user's personal name
-        // (`personal:{user}`). The settings page replaces it with each row's
-        // own personal name when rendering per-user pickers.
-        let personal_name = self
-            .selected_user_name
-            .as_deref()
-            .map(crate::users::personal_workspace_name)
-            .unwrap_or_default();
+        // The Personal option value is now the empty string (`""`); the
+        // settings page replaces it with each row's own personal name when
+        // rendering per-user pickers.
         self.settings_state.users_state.workspace_options =
-            workspace_pick_options(&self.workspaces, &personal_name);
+            workspace_pick_options(&self.workspaces);
     }
 
     /// Toggle the selected workspace's pause or maintainer state.
@@ -972,13 +984,17 @@ impl Dashboard {
             return Task::none();
         };
         let user = user.clone();
-        // Single task, single pool read: resolve the role from the
-        // already-fetched pool instead of re-querying it.
+        // Single task, single permissions read: admin flag + pool together,
+        // then the role resolved from the already-fetched pool.
         Task::perform(
             async move {
-                let pool = crate::users::role_pool(&user).await;
+                let (is_admin, pool) = crate::users::admin_and_pool(&user).await;
                 let role = crate::users::resolve_active_role_from_pool(&user, &pool).await;
-                Message::RoleAndPoolLoaded { role, pool }
+                Message::RoleAndPoolLoaded {
+                    role,
+                    pool,
+                    is_admin,
+                }
             },
             std::convert::identity,
         )
@@ -1255,6 +1271,7 @@ impl Dashboard {
                     self.board_state.current_user_name = Some(user.clone());
                     self.selected_user_role = None; // reset until loaded
                     self.selected_user_roles = Vec::new();
+                    self.selected_user_is_admin = false; // fail-closed until loaded
                     crate::audio::voice::set_active_user_name(user);
                     self.persist_window_state();
                     let role_cache = self.refresh_selected_user_role_cache();
@@ -1525,9 +1542,26 @@ impl Dashboard {
             // own recovery.
             Message::UsersCdcChanged => self.refresh_settings_users(),
             Message::Nop => Task::none(),
-            Message::RoleAndPoolLoaded { role, pool } => {
+            Message::RoleAndPoolLoaded {
+                role,
+                pool,
+                is_admin,
+            } => {
                 self.selected_user_role = role;
                 self.selected_user_roles = pool;
+                let admin_changed = self.selected_user_is_admin != is_admin;
+                self.selected_user_is_admin = is_admin;
+                // The Settings lists and the Sessions page are filtered by
+                // the active user's admin status, so they must re-sync once
+                // it settles (a change toggles whether shared workspaces
+                // appear). Running Agents reads the flag at render time and
+                // needs no refresh.
+                if admin_changed {
+                    self.sync_settings_lists_from_map();
+                    if self.page == Page::Sessions {
+                        return sessions::SessionsState::refresh(!is_admin).map(Message::Sessions);
+                    }
+                }
                 Task::none()
             }
             Message::RoleSwitchFailed(e) => {
@@ -1637,6 +1671,21 @@ impl Dashboard {
     /// DB dangling. Personal names are always persisted (as NULL). The
     /// in-memory selection still applies; a subsequent
     /// [`Message::WorkspacesReloaded`] re-resolves it to "Personal".
+    ///
+    /// No admin clamp is applied here: every producer of a selection is
+    /// already admin-aware (the Home reverse-sync resolves through
+    /// [`crate::users::resolve_selected_workspace_name`], the Settings
+    /// per-row picker is gated by the row user's permissions), so a
+    /// non-admin can never request a shared workspace — and clamping against
+    /// the async-loaded `selected_user_is_admin` cache would race a user
+    /// switch and wrongly detach an admin from their shared workspace.
+    ///
+    /// Residual edge (accepted): if the user-store read fails mid-switch to
+    /// a non-admin, the reverse-sync keeps the previous user's shared
+    /// in-memory selection and a map reload preserves it — a display-only
+    /// stale view that self-corrects on the next successful reverse-sync
+    /// (routing always re-resolves from the DB per message, so agents never
+    /// route by it).
     fn select_workspace(&mut self, name: &str) -> Task<Message> {
         let propagate = self.apply_workspace_selection(name);
         let known = name.is_empty()
@@ -1884,12 +1933,16 @@ impl Dashboard {
                 .map(Message::Editor),
             Page::Settings => self
                 .settings_state
-                .view(self.selected_user_name.as_deref())
+                .view(
+                    self.selected_user_name.as_deref(),
+                    self.selected_user_is_admin,
+                )
                 .map(Message::Settings),
             Page::RunningAgents => running::view(
                 &self.workspaces,
                 self.pending_research_cancel.as_deref(),
                 &self.running_expanded,
+                self.selected_user_is_admin,
             ),
         };
 
@@ -3214,20 +3267,16 @@ fn resolve_workspace_selection(
 
 /// Load the full workspace map during boot and resolve the selected
 /// workspace from the DB (`users.selected_workspace` for the impersonated
-/// user — the single source of truth). Degrades to the "Personal" default
-/// (`personal:{user}`) when no user is selected, the stored value is
-/// NULL/personal, the read fails, or the stored workspace is missing from the
-/// map (the boot path must complete).
+/// user — the single source of truth) via the admin-aware
+/// [`crate::users::resolve_selected_workspace_name`] primitive. Degrades to
+/// the "Personal" default (`personal:{user}`) when no user is selected, the
+/// stored value is NULL/personal, the read fails, or the stored workspace is
+/// missing from the map (the boot path must complete). Because membership is
+/// admin-only, a non-admin's shared selection is clamped to their personal
+/// workspace by the primitive before this resolver ever sees it.
 async fn load_workspace_options(user: Option<String>) -> Message {
     let prev = match user.as_deref() {
-        Some(user) => match crate::users::get_raw_selected_workspace(user).await {
-            Ok(Some(ws)) if !crate::users::is_personal_workspace(&ws) => Some(ws),
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!(error = %e, user = %user, "Failed to read selected workspace at boot");
-                None
-            }
-        },
+        Some(user) => crate::users::resolve_selected_workspace_name(user).await,
         None => None,
     };
     let workspaces = read_workspace_map().await.unwrap_or_default();
@@ -3242,18 +3291,15 @@ async fn load_workspace_options(user: Option<String>) -> Message {
 }
 
 /// Build the Settings users-page workspace picker options from the shared
-/// workspace map: "Personal" prepended (value = the impersonated user's
-/// `personal:{user}` name), then map values sorted by name. The Settings page
-/// swaps the Personal value for each row's own personal name at render time.
-/// The labels match those previously produced by the same `store.list()` rows.
+/// workspace map: "Personal" prepended (value = `""` — "selecting" it persists
+/// a NULL because `update_user_field` maps empty→Clear, which decouples the
+/// option list from the impersonated user), then map values sorted by name,
+/// labeled by each workspace's display name.
 #[must_use]
-fn workspace_pick_options(
-    map: &HashMap<String, Workspace>,
-    personal_name: &str,
-) -> Vec<widgets::PickOption> {
+fn workspace_pick_options(map: &HashMap<String, Workspace>) -> Vec<widgets::PickOption> {
     let mut options = Vec::with_capacity(map.len() + 1);
     options.push(widgets::PickOption {
-        value: personal_name.to_string(),
+        value: String::new(),
         label: "Personal".to_string(),
     });
     let mut values: Vec<&Workspace> = map.values().collect();
@@ -3415,7 +3461,9 @@ mod tests {
             ("beta".to_string(), ws("beta")),
             ("alpha".to_string(), ws("alpha")),
         ]);
-        let _ = dash.update(Message::WorkspacesReloaded(map));
+        // Admin active (shared membership): the shared workspace list appears.
+        dash.selected_user_is_admin = true;
+        let _ = dash.update(Message::WorkspacesReloaded(map.clone()));
 
         // Settings workspace list = map values sorted by name.
         let ws_names: Vec<&str> = dash
@@ -3427,8 +3475,8 @@ mod tests {
             .collect();
         assert_eq!(ws_names, vec!["alpha", "beta"]);
 
-        // Users picker options = Personal prepended, then display_name labels
-        // sorted by name.
+        // Users picker options = Personal prepended (value ""), then
+        // display_name labels sorted by name.
         let options = &dash.settings_state.users_state.workspace_options;
         assert_eq!(options.len(), 3);
         assert_eq!(
@@ -3443,11 +3491,23 @@ mod tests {
             (options[2].value.as_str(), options[2].label.as_str()),
             ("beta", "beta")
         );
+
+        // Non-admin active (fail-closed): the shared workspace list is emptied;
+        // the picker options still carry the shared names (non-admin rows
+        // substitute a muted "Personal" label at render time).
+        dash.selected_user_is_admin = false;
+        let _ = dash.update(Message::WorkspacesReloaded(map));
+        assert!(dash.settings_state.workspaces_state.workspaces.is_empty());
+        let options = &dash.settings_state.users_state.workspace_options;
+        assert_eq!(options.len(), 3);
     }
 
-    /// The DB-sourced boot resolution: a shared stored workspace present in
-    /// the map is restored; personal, stale, and NULL stored values (and no
-    /// user at all) all resolve to the "Personal" default.
+    /// The DB-sourced boot resolution: an admin (permissions='full') with a
+    /// shared stored workspace present in the map restores it; non-admins
+    /// (permissions NULL) with shared, personal, stale, and NULL stored values
+    /// (and no user at all) all resolve to the "Personal" default — a shared
+    /// stored value is clamped to the user's personal workspace because
+    /// membership is admin-only.
     #[tokio::test]
     async fn boot_workspace_options_resolve_from_db() {
         crate::util::test::init_test_stores().await;
@@ -3461,24 +3521,27 @@ mod tests {
             )
             .await
             .expect("seed workspace");
-        for (name, selected) in [
-            ("boot_alice_gui", Some("boot_ws_gui")),
-            ("boot_bob_gui", Some("personal:bob_gui")),
-            ("boot_carol_gui", Some("gone_ws_gui")),
-            ("boot_dave_gui", None),
+        for (name, permissions, selected) in [
+            ("boot_admin_gui", Some("full"), Some("boot_ws_gui")),
+            ("boot_alice_gui", None, Some("boot_ws_gui")),
+            ("boot_bob_gui", None, Some("personal:bob_gui")),
+            ("boot_carol_gui", None, Some("gone_ws_gui")),
+            ("boot_dave_gui", None, None),
         ] {
             crate::users::store()
                 .conn
                 .execute(
-                    "INSERT OR IGNORE INTO users (name, selected_workspace) VALUES (?1, ?2)",
-                    crate::db::params![name, selected],
+                    "INSERT OR IGNORE INTO users (name, permissions, selected_workspace) \
+                     VALUES (?1, ?2, ?3)",
+                    crate::db::params![name, permissions, selected],
                 )
                 .await
                 .expect("seed user");
         }
 
+        // Admin with a shared stored workspace present in the map → restored.
         let Message::BootWorkspaces(map, restored) =
-            load_workspace_options(Some("boot_alice_gui".to_string())).await
+            load_workspace_options(Some("boot_admin_gui".to_string())).await
         else {
             panic!("expected BootWorkspaces");
         };
@@ -3486,6 +3549,11 @@ mod tests {
         assert_eq!(restored, "boot_ws_gui");
 
         for (user, why, expected) in [
+            (
+                Some("boot_alice_gui".to_string()),
+                "non-admin with a shared stored value — clamped",
+                "personal:boot_alice_gui",
+            ),
             (
                 Some("boot_bob_gui".to_string()),
                 "personal stored value",
