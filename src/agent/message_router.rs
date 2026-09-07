@@ -112,7 +112,7 @@ pub enum MessageKind {
     /// caller's agent session.
     ImplementResult,
     /// Result from an async deep research run (ResearchTool), injected back
-    /// into the Manager's agent session. Exactly one envelope per run.
+    /// into the calling agent's session. Exactly one envelope per run.
     ResearchResult,
     /// Comment added to a ticket while an agent is working on it.
     /// Delivered mid-work via the agent's inbox (not a consumer loop).

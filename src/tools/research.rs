@@ -1,5 +1,5 @@
 //! ResearchTool — deep multi-round research orchestrator used by the
-//! Manager and (in full-permission mode) the Assistant.
+//! Assistant in full-permission mode.
 //!
 //! Unlike [`AnalyzeTool`](super::analyze::AnalyzeTool) (one round of parallel analysts
 //! for quick clarification), the pipeline is: round 0 decomposes the question
@@ -396,8 +396,8 @@ impl ResearchBudget {
 // ── Tool ─────────────────────────────────────────────────────────────────
 
 pub struct ResearchTool {
-    /// The role of the calling agent (Manager, or Assistant in
-    /// full-permission mode) — set via [`ResearchTool::new`].
+    /// The role of the calling agent (Assistant in full-permission mode) —
+    /// set via [`ResearchTool::new`].
     caller_role: Role,
 }
 
@@ -433,9 +433,9 @@ impl Tool for ResearchTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        // Used by the Manager and (in full-permission mode) the Assistant —
-        // `caller_role` is threaded through so the single result envelope
-        // routes back to the correct caller session.
+        // Used by the Assistant in full-permission mode — `caller_role` is
+        // threaded through so the single result envelope routes back to the
+        // correct caller session.
         let question = super::get_str(&args, "question")?;
 
         // Read user context from task-locals BEFORE tokio::spawn so the
@@ -2978,7 +2978,7 @@ fn source_or_na(source: &str) -> &str {
     if source.is_empty() { "n/a" } else { source }
 }
 
-/// Unanswered section; `escape` fences entries for the manager-visible
+/// Unanswered section; `escape` fences entries for the caller-visible
 /// partial report (the orchestrator-prompt view stays raw).
 fn render_unanswered(out: &mut String, unanswered: &[String], escape: bool) {
     if unanswered.is_empty() {
@@ -3505,7 +3505,7 @@ async fn run_deep_research(
     };
 
     // Fail-open markers survive delivery: head-placed so they survive the
-    // manager's sandwich truncation of long reports. The recovered-findings
+    // caller's sandwich truncation of long reports. The recovered-findings
     // section is head-placed right after them for the same reason.
     let mut report = String::new();
     if !state.markers.is_empty() {

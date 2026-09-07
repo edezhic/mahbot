@@ -334,9 +334,8 @@ impl Role {
                     Box::new(AddCommentTool::new(ws)),
                     Box::new(SearchArchivedTicketsTool::new(ws)),
                     Box::new(AnalyzeTool::new(DispatchMode::Async, Role::Manager)),
-                    Box::new(ResearchTool::new(Role::Manager)),
                     // The Manager often has nothing to say until a ticket
-                    // advances or an async analysis/research lands — sleep
+                    // advances or an async analysis lands — sleep
                     // ends the turn instead of a premature/no-op reply.
                     Box::new(SleepTool),
                 ]
@@ -582,6 +581,20 @@ mod tests {
             names,
             ["read", "shell"],
             "Sanitation toolset must be exactly read + read-only shell, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn manager_does_not_advertise_research() {
+        // Acceptance pin: the Manager has no `research` grant — deep research
+        // runs are dispatched by the full-permission Assistant only (pinned
+        // in `assistant_toolset_gates_full_access_tools`). The Manager's
+        // single delegation path is `analyze`.
+        let tools =
+            crate::Role::Manager.tools(&crate::workspace::test_ws("test"), false, test_sessions());
+        assert!(
+            !tools.iter().any(|t| t.name() == "research"),
+            "Manager toolset must not contain 'research'"
         );
     }
 
