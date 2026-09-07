@@ -73,10 +73,11 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     let policy = policy_override
         .cloned()
         .unwrap_or_else(RetryPolicy::current);
-    let mut loop_state = RetryLoop::new(&policy);
+    let mut loop_state = RetryLoop::new_scoped(&policy, &record_request);
     let mut last_raw: Option<String> = None;
 
     for attempt in 1..=policy.max_attempts {
+        loop_state.begin_attempt(Instant::now());
         let request = ChatRequest {
             messages: extraction_history.clone(),
             ..record_request.clone()
@@ -123,8 +124,13 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                 };
 
                 let err = anyhow::anyhow!("{detail}");
-                let rec = RetryFailureRecord::new_simple(class, &err, None);
-                loop_state.record(rec);
+                let rec = RetryFailureRecord::with_metadata(
+                    class,
+                    &err,
+                    response.finish_reason.clone(),
+                    None,
+                );
+                loop_state.record(rec).await;
 
                 // Re-prompt: push raw assistant text + retry prompt. Only
                 // needed when another attempt will actually run — the final
@@ -145,7 +151,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                 // ticket comment never labels it 'last attempt'.
                 last_raw = None;
                 let non_retryable = !scoped_err.class.is_retryable();
-                loop_state.record(scoped_err.record);
+                loop_state.record(scoped_err.record).await;
                 if non_retryable {
                     let exhausted = RetryExhausted::with_last_raw(
                         loop_state.into_failures(),

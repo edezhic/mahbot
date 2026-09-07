@@ -184,6 +184,37 @@ impl crate::logs::LogStore {
             .await?;
         Ok(())
     }
+
+    /// Persist one per-attempt LLM failure row to the `llm_failures` table.
+    async fn record_llm_failure_row(&self, rec: &LlmFailureRow) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO llm_failures \
+                 (operation_id, recorded_at, purpose, agent_id, role, workspace, ticket_id, \
+                  model, routing, attempt, attempt_duration_ms, failure_class, finish_reason, \
+                  retry_after_ms, error_chain) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                db::params![
+                    rec.operation_id.clone(),
+                    rec.recorded_at.clone(),
+                    rec.purpose,
+                    rec.agent_id.clone(),
+                    rec.role.clone(),
+                    rec.workspace.clone(),
+                    rec.ticket_id.clone(),
+                    rec.model.clone(),
+                    rec.routing.clone(),
+                    i64::from(rec.attempt),
+                    rec.attempt_duration_ms.map(i64::try_from).transpose()?,
+                    rec.failure_class.clone(),
+                    rec.finish_reason.clone(),
+                    rec.retry_after_ms.map(i64::try_from).transpose()?,
+                    rec.error_chain.clone(),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 /// One per-operation LLM request stat row (the `llm_requests` table).
@@ -225,6 +256,35 @@ struct LlmRequestRecord {
     pub recorded_at: String,
 }
 
+/// One per-attempt LLM failure row (the `llm_failures` table).
+///
+/// One row per FAILED attempt of an LLM operation — including intermediate
+/// failures of operations that later succeeded and the terminal exhausted
+/// attempt. Grouped per operation via [`LlmFailureRow::operation_id`].
+#[derive(Debug, Clone)]
+struct LlmFailureRow {
+    /// Groups the attempts of one LLM operation (generated at operation start).
+    pub operation_id: String,
+    pub purpose: &'static str,
+    pub agent_id: String,
+    pub role: String,
+    pub workspace: String,
+    pub ticket_id: Option<String>,
+    pub model: String,
+    /// Requested provider routing (provider_order); "default" when unset.
+    pub routing: String,
+    /// 1-based sequential failure index within the operation, as counted by
+    /// the loop that recorded it.
+    pub attempt: u32,
+    /// Elapsed time of the failed attempt; NULL where not tracked.
+    pub attempt_duration_ms: Option<u64>,
+    pub failure_class: String,
+    pub finish_reason: Option<String>,
+    pub retry_after_ms: Option<u64>,
+    pub error_chain: String,
+    pub recorded_at: String,
+}
+
 /// The request fields the durable `llm_requests` row actually reads — the
 /// minimal carrier for calls made outside the `ChatRequest` retry pipeline
 /// (e.g. raw-HTTP media transcription), where synthesizing a full request
@@ -234,6 +294,32 @@ pub(crate) struct LlmCallMeta {
     pub model: String,
     /// Requested provider routing (provider_order); `None` = provider default.
     pub provider_order: Option<String>,
+}
+
+/// Per-operation context for `llm_failures` persistence: an operation id
+/// generated at operation start plus the request identity, so every failed
+/// attempt of one operation shares the id and groups back without heuristics.
+pub(crate) struct LlmOperationCtx {
+    pub operation_id: String,
+    pub call: LlmCallMeta,
+}
+
+impl LlmOperationCtx {
+    /// Derive the context from a `ChatRequest`. `None` when the request
+    /// carries no metadata — the same gating as the `llm_requests` rows
+    /// (context-free calls are never logged).
+    #[must_use]
+    pub(crate) fn from_request(request: &crate::ChatRequest) -> Option<Self> {
+        let meta = request.meta.as_ref()?;
+        Some(Self {
+            operation_id: crate::generate_id(),
+            call: LlmCallMeta {
+                meta: meta.clone(),
+                model: request.model.clone(),
+                provider_order: request.provider_order.clone(),
+            },
+        })
+    }
 }
 
 /// Build an [`LlmRequestRecord`] from explicit metadata (see
@@ -379,6 +465,104 @@ async fn persist_llm_request(rec: &LlmRequestRecord) {
     };
     if let Err(e) = store.record_llm_request(rec).await {
         tracing::debug!(error = %e, "Failed to persist LLM request stat");
+    }
+}
+
+/// What happened on one failed attempt, beyond the operation identity —
+/// bundles the per-attempt fields so the row builder stays readable.
+struct LlmAttemptOutcome {
+    attempt: u32,
+    attempt_duration_ms: Option<u64>,
+    failure_class: String,
+    finish_reason: Option<String>,
+    retry_after_ms: Option<u64>,
+    error_chain: String,
+}
+
+/// Build the failure row shared by both emit entry points below.
+fn llm_failure_row(
+    operation_id: &str,
+    call: &LlmCallMeta,
+    outcome: LlmAttemptOutcome,
+) -> LlmFailureRow {
+    LlmFailureRow {
+        operation_id: operation_id.to_string(),
+        purpose: call.meta.purpose,
+        agent_id: call.meta.agent_id.clone(),
+        role: call.meta.role.clone(),
+        workspace: call.meta.workspace.clone(),
+        ticket_id: call.meta.ticket_id.clone(),
+        model: call.model.clone(),
+        routing: call
+            .provider_order
+            .clone()
+            .unwrap_or_else(|| "default".to_string()),
+        attempt: outcome.attempt,
+        attempt_duration_ms: outcome.attempt_duration_ms,
+        failure_class: outcome.failure_class,
+        finish_reason: outcome.finish_reason,
+        retry_after_ms: outcome.retry_after_ms,
+        error_chain: outcome.error_chain,
+        recorded_at: crate::db::now(),
+    }
+}
+
+/// Emit one per-attempt `llm_failures` row for a failed attempt inside an
+/// outer retry loop. `attempt_started` is the failed attempt's launch instant
+/// (`None` when the caller does not track it → NULL `attempt_duration_ms`).
+/// Same fail-open semantics as [`persist_llm_request`]: a store write failure
+/// is logged and never propagates.
+pub(crate) async fn record_llm_attempt_failure(
+    ctx: &LlmOperationCtx,
+    attempt: u32,
+    rec: &crate::retry::RetryFailureRecord,
+    attempt_started: Option<std::time::Instant>,
+) {
+    let outcome = LlmAttemptOutcome {
+        attempt,
+        attempt_duration_ms: elapsed_ms(attempt_started),
+        failure_class: rec.class.label().to_string(),
+        finish_reason: rec.finish_reason.clone(),
+        retry_after_ms: rec.retry_after_ms,
+        error_chain: rec.error_chain.clone(),
+    };
+    persist_llm_failure(&llm_failure_row(&ctx.operation_id, &ctx.call, outcome)).await;
+}
+
+/// Emit one per-attempt `llm_failures` row from explicit metadata — for
+/// single-shot calls outside the `ChatRequest` retry pipeline (raw-HTTP media
+/// transcription), which carry no [`crate::retry::RetryFailureRecord`].
+pub(crate) async fn record_llm_attempt_failure_meta(
+    call: &LlmCallMeta,
+    operation_id: &str,
+    failure_class: &str,
+    error_chain: &str,
+    attempt_started: std::time::Instant,
+) {
+    let outcome = LlmAttemptOutcome {
+        attempt: 1,
+        attempt_duration_ms: elapsed_ms(Some(attempt_started)),
+        failure_class: failure_class.to_string(),
+        finish_reason: None,
+        retry_after_ms: None,
+        error_chain: error_chain.to_string(),
+    };
+    persist_llm_failure(&llm_failure_row(operation_id, call, outcome)).await;
+}
+
+/// Elapsed milliseconds since `started`, if tracked.
+fn elapsed_ms(started: Option<std::time::Instant>) -> Option<u64> {
+    started.and_then(|t| u64::try_from(t.elapsed().as_millis()).ok())
+}
+
+/// Best-effort, fail-open persist of an [`LlmFailureRow`]; silently skipped
+/// when the store is not yet open.
+async fn persist_llm_failure(row: &LlmFailureRow) {
+    let Some(store) = log_store_for_stats() else {
+        return;
+    };
+    if let Err(e) = store.record_llm_failure_row(row).await {
+        tracing::debug!(error = %e, "Failed to persist LLM attempt failure row");
     }
 }
 
@@ -648,6 +832,83 @@ mod tests {
         );
         assert_eq!(row.get::<Option<String>>(18).expect("failure_class"), None);
         assert_eq!(row.get::<i64>(19).expect("success"), 1);
+        assert!(rows.next().is_none(), "only one row expected");
+    }
+
+    /// `llm_failures` insert round-trip — verifies the delta-35 schema and the
+    /// parameterized insert are valid against a real store, including the
+    /// nullable `attempt_duration_ms`.
+    #[tokio::test]
+    async fn record_llm_failure_row_round_trip() {
+        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let rec = LlmFailureRow {
+            operation_id: "opAb3xYz012".to_string(),
+            purpose: "agent",
+            agent_id: "alice_ws1_engineer".to_string(),
+            role: "engineer".to_string(),
+            workspace: "ws1".to_string(),
+            ticket_id: Some("42".to_string()),
+            model: "deepseek/deepseek-v4-flash-0731".to_string(),
+            routing: "deepseek".to_string(),
+            attempt: 3,
+            attempt_duration_ms: Some(1_500),
+            failure_class: "transport".to_string(),
+            finish_reason: Some("length".to_string()),
+            retry_after_ms: Some(5_000),
+            error_chain: "HTTP 429: rate limited".to_string(),
+            recorded_at: crate::db::now(),
+        };
+
+        store
+            .record_llm_failure_row(&rec)
+            .await
+            .expect("insert llm failure");
+
+        let rows = store
+            .conn
+            .query(
+                "SELECT operation_id, purpose, agent_id, role, workspace, ticket_id, model, \
+                        routing, attempt, attempt_duration_ms, failure_class, finish_reason, \
+                        retry_after_ms, error_chain \
+                 FROM llm_failures WHERE operation_id = ?1",
+                crate::db::params!["opAb3xYz012"],
+            )
+            .await
+            .expect("query llm failure");
+        let mut rows = rows.into_iter();
+        let row = rows.next().expect("row must exist");
+        assert_eq!(row.get::<String>(0).expect("operation_id"), "opAb3xYz012");
+        assert_eq!(row.get::<String>(1).expect("purpose"), "agent");
+        assert_eq!(
+            row.get::<String>(2).expect("agent_id"),
+            "alice_ws1_engineer"
+        );
+        assert_eq!(row.get::<String>(3).expect("role"), "engineer");
+        assert_eq!(row.get::<String>(4).expect("workspace"), "ws1");
+        assert_eq!(
+            row.get::<Option<String>>(5).expect("ticket_id"),
+            Some("42".to_string())
+        );
+        assert_eq!(
+            row.get::<String>(6).expect("model"),
+            "deepseek/deepseek-v4-flash-0731"
+        );
+        assert_eq!(row.get::<String>(7).expect("routing"), "deepseek");
+        assert_eq!(row.get::<i64>(8).expect("attempt"), 3);
+        assert_eq!(row.get::<Option<i64>>(9).expect("duration"), Some(1_500));
+        assert_eq!(row.get::<String>(10).expect("failure_class"), "transport");
+        assert_eq!(
+            row.get::<Option<String>>(11).expect("finish_reason"),
+            Some("length".to_string())
+        );
+        assert_eq!(
+            row.get::<Option<i64>>(12).expect("retry_after"),
+            Some(5_000)
+        );
+        assert_eq!(
+            row.get::<String>(13).expect("error_chain"),
+            "HTTP 429: rate limited"
+        );
         assert!(rows.next().is_none(), "only one row expected");
     }
 }

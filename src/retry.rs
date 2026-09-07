@@ -63,8 +63,10 @@
 //! Every failed attempt produces a [`RetryFailureRecord`] appended to the
 //! in-memory failure trail; terminal exhaustion surfaces it through
 //! [`RetryExhausted`], which feeds the live `llm_requests` stats rows
-//! (retry_attempts / finish_reason / failure_class). Nothing is persisted
-//! per-attempt — the trail lives only in memory for the operation's lifetime.
+//! (retry_attempts / finish_reason / failure_class). Every failed attempt of a
+//! metadata-carrying operation also persists one `llm_failures` row (attempt
+//! index, class, finish_reason, Retry-After, error chain) grouped by a
+//! per-operation id — see [`RetryLoop::record`].
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -512,17 +514,44 @@ pub(crate) struct RetryLoop {
     backoffs: Vec<u64>,
     failures: Vec<RetryFailureRecord>,
     last_retry_after: Option<u64>,
+    /// 1-based index the NEXT recorded failure gets. Only real failed
+    /// attempts advance it — `record_trail_only` appends do not, so a
+    /// trail-only entry can never inflate a later row's attempt index.
+    attempts_failed: u32,
+    /// `llm_failures` persistence context — `None` when the request carries
+    /// no metadata (the same gating as the `llm_requests` rows) or when the
+    /// loop was built without a request (tests).
+    operation: Option<crate::stats::LlmOperationCtx>,
+    /// Start of the in-flight attempt — seeds the next failure row's
+    /// per-attempt duration.
+    attempt_started: Option<Instant>,
 }
 
 impl RetryLoop {
-    /// Start a new operation.
+    /// Start a metadata-less operation (no `llm_failures` rows) — the pure
+    /// schedule/trail core behind [`RetryLoop::new_scoped`], also used
+    /// directly by the schedule/trail tests.
     #[must_use]
-    pub(crate) fn new(policy: &RetryPolicy) -> Self {
+    fn new(policy: &RetryPolicy) -> Self {
         Self {
             policy: policy.clone(),
             backoffs: backoff_sequence(policy),
             failures: Vec::new(),
             last_retry_after: None,
+            attempts_failed: 0,
+            operation: None,
+            attempt_started: None,
+        }
+    }
+
+    /// Start a scoped operation. Per-attempt failures persist to
+    /// `llm_failures` when the request carries metadata (same gating as the
+    /// `llm_requests` row).
+    #[must_use]
+    pub(crate) fn new_scoped(policy: &RetryPolicy, request: &ChatRequest) -> Self {
+        Self {
+            operation: crate::stats::LlmOperationCtx::from_request(request),
+            ..Self::new(policy)
         }
     }
 
@@ -538,11 +567,38 @@ impl RetryLoop {
         !self.failures.is_empty()
     }
 
-    /// Record a failed attempt, updating the sticky Retry-After. A record
-    /// without a Retry-After (parse / NoResponse failures) clears any stale
-    /// value from an earlier attempt, so a 429 Retry-After never bleeds into
-    /// later sleeps.
-    pub(crate) fn record(&mut self, rec: RetryFailureRecord) {
+    /// Mark the start of one attempt with the caller's attempt-start instant —
+    /// seeds the per-attempt duration recorded on the next failure row
+    /// (absent → NULL `attempt_duration_ms`).
+    pub(crate) fn begin_attempt(&mut self, started: Instant) {
+        self.attempt_started = Some(started);
+    }
+
+    /// Record a failed attempt, updating the sticky Retry-After and
+    /// persisting one `llm_failures` row (fail-open, direct-awaited like the
+    /// `llm_requests` rows). A record without a Retry-After (parse /
+    /// NoResponse failures) clears any stale value from an earlier attempt.
+    /// `attempt` is the 1-based sequential failure index within the operation.
+    pub(crate) async fn record(&mut self, rec: RetryFailureRecord) {
+        self.last_retry_after = rec.retry_after_ms;
+        self.attempts_failed = self.attempts_failed.saturating_add(1);
+        let attempt_started = self.attempt_started.take();
+        if let Some(operation) = self.operation.as_ref() {
+            crate::stats::record_llm_attempt_failure(
+                operation,
+                self.attempts_failed,
+                &rec,
+                attempt_started,
+            )
+            .await;
+        }
+        self.failures.push(rec);
+    }
+
+    /// Append a trail-only failure record — no `llm_failures` row. For
+    /// synthetic trail entries that do not correspond to a failed HTTP
+    /// attempt (the consensus fallback keeps its trail non-empty this way).
+    pub(crate) fn record_trail_only(&mut self, rec: RetryFailureRecord) {
         self.last_retry_after = rec.retry_after_ms;
         self.failures.push(rec);
     }
@@ -593,10 +649,11 @@ pub(crate) async fn agent_chat(
     request: ChatRequest,
     policy: &RetryPolicy,
 ) -> Result<ChatResponse, RetryExhausted> {
-    let mut loop_state = RetryLoop::new(policy);
+    let mut loop_state = RetryLoop::new_scoped(policy, &request);
     let operation_started = Instant::now();
 
     for attempt in 1..=policy.max_attempts {
+        loop_state.begin_attempt(Instant::now());
         match crate::providers::chat_scoped(request.clone()).await {
             Ok(resp) => {
                 crate::stats::record_llm_success(&request, operation_started, attempt, &resp).await;
@@ -604,7 +661,7 @@ pub(crate) async fn agent_chat(
             }
             Err(err) => {
                 let non_retryable = !err.class.is_retryable();
-                loop_state.record(err.record);
+                loop_state.record(err.record).await;
                 if non_retryable {
                     let exhausted = RetryExhausted::new(loop_state.into_failures(), err.class);
                     return fail_exhausted(&request, operation_started, exhausted).await;
@@ -676,8 +733,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stale_retry_after_does_not_stick_across_failures() {
+    #[tokio::test]
+    async fn stale_retry_after_does_not_stick_across_failures() {
         // A 429 Retry-After applies only to the sleep following the 429. A
         // later non-429 failure (parse / NoResponse, no Retry-After) must
         // clear it — otherwise a stale value wastes up to 60 s of the retry
@@ -691,7 +748,7 @@ mod tests {
             &anyhow::anyhow!("429 rate limited"),
             Some(60_000),
         );
-        loop_state.record(rec);
+        loop_state.record(rec).await;
         assert_eq!(loop_state.last_retry_after, Some(60_000));
 
         // A later parse/NoResponse failure has no Retry-After → clears it.
@@ -700,7 +757,7 @@ mod tests {
             &anyhow::anyhow!("empty response"),
             None,
         );
-        loop_state.record(rec);
+        loop_state.record(rec).await;
         assert_eq!(
             loop_state.last_retry_after, None,
             "stale Retry-After must not stick to later sleeps"

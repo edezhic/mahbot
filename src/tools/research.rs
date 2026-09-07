@@ -2721,7 +2721,7 @@ async fn synthesize(
     }
     let policy = crate::retry::RetryPolicy::synthesis();
     let mut params = orchestrator_params(ws, "synthesize");
-    let mut loop_state = crate::retry::RetryLoop::new(&policy);
+    let mut loop_state = crate::retry::RetryLoop::new_scoped(&policy, &params);
     let operation_started = Instant::now();
     let mut prefix = Vec::with_capacity(2);
     crate::prompt::prepend_general_context(&mut prefix, ws).await;
@@ -2732,6 +2732,7 @@ async fn synthesize(
     let mut transport_failures = 0u32;
 
     for attempt in 1..=policy.max_attempts {
+        loop_state.begin_attempt(Instant::now());
         let mut user = base_user.clone();
         if !feedback.is_empty() {
             let _ = writeln!(user, "\n\n# Previous Attempt Feedback\n\n{feedback}");
@@ -2748,12 +2749,13 @@ async fn synthesize(
                     let err = anyhow::anyhow!(
                         "synthesis truncated by the provider (finish_reason=length)"
                     );
-                    let rec = crate::retry::RetryFailureRecord::new_simple(
+                    let rec = crate::retry::RetryFailureRecord::with_metadata(
                         FailureClass::TruncatedOutput,
                         &err,
+                        resp.finish_reason.clone(),
                         None,
                     );
-                    loop_state.record(rec);
+                    loop_state.record(rec).await;
                     feedback = "Your previous report was truncated by the output limit — \
                                 produce a SHORTER, more compressed version. Keep every \
                                 load-bearing claim and its source, but tighten the prose so \
@@ -2767,12 +2769,13 @@ async fn synthesize(
                 }
                 if text.trim().is_empty() {
                     let err = anyhow::anyhow!("synthesis attempt returned empty text");
-                    let rec = crate::retry::RetryFailureRecord::new_simple(
+                    let rec = crate::retry::RetryFailureRecord::with_metadata(
                         FailureClass::NoResponse,
                         &err,
+                        resp.finish_reason.clone(),
                         None,
                     );
-                    loop_state.record(rec);
+                    loop_state.record(rec).await;
                     feedback = "Your previous attempt returned an empty response — \
                                 produce the report now."
                         .to_string();
@@ -2784,7 +2787,7 @@ async fn synthesize(
             }
             Err(err) => {
                 let non_retryable = !err.class.is_retryable();
-                loop_state.record(err.record);
+                loop_state.record(err.record).await;
                 if non_retryable {
                     break;
                 }

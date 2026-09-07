@@ -775,7 +775,7 @@ pub(crate) async fn run_grouping_repair(
     );
     crate::prompt::prepend_general_context(&mut request.messages, ws).await;
     let policy = RetryPolicy::synthesis();
-    let mut loop_state = RetryLoop::new(&policy);
+    let mut loop_state = RetryLoop::new_scoped(&policy, &request);
     let operation_started = Instant::now();
     let mut state = RepairState::new(items_by_agent);
     // Rejection reasons fed to the next repair round; cleared only once a
@@ -788,15 +788,16 @@ pub(crate) async fn run_grouping_repair(
     let mut transport_failures: u32 = 0;
 
     for round in 1..=policy.max_attempts {
+        let attempt_started = Instant::now();
+        loop_state.begin_attempt(attempt_started);
         if round > 1 {
             append_repair_instructions(&mut request, round, &state, &rejections, prev_round);
         }
-        let attempt_started = Instant::now();
         let resp = match crate::providers::chat_scoped(request.clone()).await {
             Ok(resp) => resp,
             Err(err) => {
                 let non_retryable = !err.class.is_retryable();
-                loop_state.record(err.record);
+                loop_state.record(err.record).await;
                 if non_retryable {
                     break;
                 }
@@ -815,12 +816,13 @@ pub(crate) async fn run_grouping_repair(
         // A tool-call response parses as empty text — classify it explicitly
         // so the retry trail distinguishes it (same taxonomy as extraction).
         if !resp.tool_calls.is_empty() {
-            let rec = RetryFailureRecord::new_simple(
+            let rec = RetryFailureRecord::with_metadata(
                 FailureClass::Parse,
                 &anyhow::anyhow!("grouping response returned a tool call instead of JSON"),
+                resp.finish_reason.clone(),
                 None,
             );
-            loop_state.record(rec);
+            loop_state.record(rec).await;
             prev_round = PrevRound::Parse;
             continue;
         }
@@ -854,8 +856,13 @@ pub(crate) async fn run_grouping_repair(
                 outcome
             }
             Err(e) => {
-                let rec = RetryFailureRecord::new_simple(FailureClass::Parse, &e, None);
-                loop_state.record(rec);
+                let rec = RetryFailureRecord::with_metadata(
+                    FailureClass::Parse,
+                    &e,
+                    resp.finish_reason.clone(),
+                    None,
+                );
+                loop_state.record(rec).await;
                 prev_round = PrevRound::Parse;
                 continue;
             }
@@ -905,8 +912,9 @@ pub(crate) async fn run_grouping_repair(
                 rejections.join("; ")
             };
             let err = anyhow::anyhow!("grouping validation failed: {detail}");
-            let rec = RetryFailureRecord::new_simple(cause, &err, None);
-            loop_state.record(rec);
+            let rec =
+                RetryFailureRecord::with_metadata(cause, &err, resp.finish_reason.clone(), None);
+            loop_state.record(rec).await;
         }
         if state.complete() {
             break; // every item is frozen or pinned — nothing left to place
@@ -938,7 +946,8 @@ pub(crate) async fn run_grouping_repair(
                 &anyhow::anyhow!("{detail}"),
                 None,
             );
-            loop_state.record(rec);
+            // Trail-only: no HTTP attempt failed here — no llm_failures row.
+            loop_state.record_trail_only(rec);
         }
         let final_class = loop_state.final_class();
         let exhausted = crate::retry::RetryExhausted::with_last_raw(

@@ -1595,7 +1595,9 @@ impl Agent {
     /// `retry_attempts` = the total attempt count and the last attempt's
     /// finish_reason carried on its failure record. Any response with visible
     /// text or parsed tool calls resolves the turn and is persisted normally
-    /// by the caller.
+    /// by the caller. Each failed attempt additionally persists one
+    /// `llm_failures` row under the operation's id (the synthetic
+    /// shutdown/cancellation trail entries excepted — no request is made).
     ///
     /// Exhaustion returns a [`crate::retry::RetryExhausted`] with
     /// `last_raw: None` and a final class derived from the last recorded
@@ -1618,6 +1620,10 @@ impl Agent {
             .to_string();
         let mut failures: Vec<crate::retry::RetryFailureRecord> = Vec::new();
         let mut last_request: Option<ChatRequest> = None;
+        // Per-attempt `llm_failures` context — derived from the first built
+        // request; `None` when the operation carries no metadata (same gating
+        // as the `llm_requests` rows).
+        let mut operation: Option<crate::stats::LlmOperationCtx> = None;
 
         // Seed the tail with the FIRST in-class response's reasoning (empty
         // content) + the continuation nudge. Each LATER in-class response
@@ -1640,6 +1646,7 @@ impl Agent {
         let mut tail_grew = true;
 
         for attempt in 1..=policy.max_attempts {
+            let attempt_started = Instant::now();
             // The global abort dominates: it also cancels every per-agent
             // token, so classify it as shutdown, not cancellation.
             if crate::shutdown::aborting() {
@@ -1659,6 +1666,9 @@ impl Agent {
                 let mut messages = base.clone();
                 messages.extend(tail.iter().cloned());
                 let built = self.build_chat_request(messages, purpose);
+                if operation.is_none() {
+                    operation = crate::stats::LlmOperationCtx::from_request(&built);
+                }
                 last_request = Some(built.clone());
                 built
             } else {
@@ -1672,7 +1682,7 @@ impl Agent {
                 // finish_reason, so the terminal failure row keeps it), append
                 // the NEW reasoning as the next tail pair, and continue.
                 Ok(resp) if is_reasoning_only_stop(&resp) => {
-                    failures.push(crate::retry::RetryFailureRecord::with_metadata(
+                    let rec = crate::retry::RetryFailureRecord::with_metadata(
                         crate::retry::FailureClass::NoResponse,
                         &anyhow::anyhow!(
                             "model returned only reasoning with no answer \
@@ -1680,7 +1690,10 @@ impl Agent {
                         ),
                         resp.finish_reason.clone(),
                         None,
-                    ));
+                    );
+                    record_continuation_failure(operation.as_ref(), attempt, &rec, attempt_started)
+                        .await;
+                    failures.push(rec);
                     tail.push(ChatMessage::assistant(
                         assistant_replay_payload(None, &[], resp.reasoning.as_ref()).to_string(),
                     ));
@@ -1697,6 +1710,13 @@ impl Agent {
                 // 400 must not burn the budget); otherwise the next iteration
                 // re-sends the byte-identical request (tail untouched).
                 Err(err) => {
+                    record_continuation_failure(
+                        operation.as_ref(),
+                        attempt,
+                        &err.record,
+                        attempt_started,
+                    )
+                    .await;
                     failures.push(err.record);
                     if !err.class.is_retryable() {
                         break;
@@ -2244,6 +2264,21 @@ struct PreparedAssistantTurn {
 #[must_use]
 fn is_reasoning_only_stop(response: &ChatResponse) -> bool {
     response.tool_calls.is_empty() && response.text.as_deref().is_none_or(|t| t.trim().is_empty())
+}
+
+/// Persist one continuation-attempt failure row when the operation is
+/// metadata-tracked (fail-open; see
+/// [`crate::stats::record_llm_attempt_failure`]). The per-attempt duration is
+/// measured from `attempt_started` (the attempt's launch instant).
+async fn record_continuation_failure(
+    operation: Option<&crate::stats::LlmOperationCtx>,
+    attempt: u32,
+    rec: &crate::retry::RetryFailureRecord,
+    attempt_started: Instant,
+) {
+    if let Some(op) = operation {
+        crate::stats::record_llm_attempt_failure(op, attempt, rec, Some(attempt_started)).await;
+    }
 }
 
 /// Context for a failed LLM step: the run-local tool-round counter plus the

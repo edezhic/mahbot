@@ -309,10 +309,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_chronicle_dedup ON ticket_chronicle
 CREATE INDEX IF NOT EXISTS idx_alarms_due ON alarms(status, next_fire_at);
 CREATE INDEX IF NOT EXISTS idx_tickets_workspace_phase ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);";
 
-/// The full current-shape logs schema: `logs`, `tool_calls`, `llm_requests`
-/// (the observability tables) plus the `grep_telemetry` table and all of their
-/// indexes. Every statement is `IF NOT EXISTS`, so on an already-current
-/// database the whole batch is a no-op.
+/// The full current-shape logs schema: `logs`, `tool_calls`, `llm_requests`,
+/// `llm_failures` (the observability tables) plus the `grep_telemetry` table
+/// and all of their indexes. Every statement is `IF NOT EXISTS`, so on an
+/// already-current database the whole batch is a no-op.
 const BASELINE_LOGS_SCHEMA: &str = "\
 -- ── Logs / tool calls / LLM requests ───────────────────────────────────
 CREATE TABLE IF NOT EXISTS logs (
@@ -401,7 +401,54 @@ CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
 CREATE INDEX IF NOT EXISTS idx_grep_telemetry_recorded_at ON grep_telemetry(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_grep_telemetry_served ON grep_telemetry(served);
 CREATE INDEX IF NOT EXISTS idx_grep_telemetry_reason ON grep_telemetry(reason);
-CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command);";
+CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command);
+-- ── Per-attempt LLM failure trail ──────────────────────────────────────
+CREATE TABLE IF NOT EXISTS llm_failures (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id        TEXT NOT NULL,
+    recorded_at         TEXT NOT NULL,
+    purpose             TEXT NOT NULL,
+    agent_id            TEXT NOT NULL DEFAULT '',
+    role                TEXT NOT NULL DEFAULT '',
+    workspace           TEXT NOT NULL DEFAULT '',
+    ticket_id           TEXT,
+    model               TEXT NOT NULL,
+    routing             TEXT NOT NULL DEFAULT '',
+    attempt             INTEGER NOT NULL,
+    attempt_duration_ms INTEGER,
+    failure_class       TEXT NOT NULL,
+    finish_reason       TEXT,
+    retry_after_ms      INTEGER,
+    error_chain         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_llm_failures_recorded_at ON llm_failures(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_llm_failures_operation_id ON llm_failures(operation_id);
+CREATE INDEX IF NOT EXISTS idx_llm_failures_failure_class ON llm_failures(failure_class);";
+
+/// Delta `35` (existing installs): the per-attempt `llm_failures` trail for
+/// the logs store. Fresh installs create the table in the baseline (`26`),
+/// making this a no-op there; every statement is `IF NOT EXISTS`.
+const ADD_LLM_FAILURES: &str = "CREATE TABLE IF NOT EXISTS llm_failures (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id        TEXT NOT NULL,
+    recorded_at         TEXT NOT NULL,
+    purpose             TEXT NOT NULL,
+    agent_id            TEXT NOT NULL DEFAULT '',
+    role                TEXT NOT NULL DEFAULT '',
+    workspace           TEXT NOT NULL DEFAULT '',
+    ticket_id           TEXT,
+    model               TEXT NOT NULL,
+    routing             TEXT NOT NULL DEFAULT '',
+    attempt             INTEGER NOT NULL,
+    attempt_duration_ms INTEGER,
+    failure_class       TEXT NOT NULL,
+    finish_reason       TEXT,
+    retry_after_ms      INTEGER,
+    error_chain         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_llm_failures_recorded_at ON llm_failures(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_llm_failures_operation_id ON llm_failures(operation_id);
+CREATE INDEX IF NOT EXISTS idx_llm_failures_failure_class ON llm_failures(failure_class);";
 
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
@@ -427,6 +474,8 @@ CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command)
 /// - `33` adds the nullable `chat_history.broadcast_id` column.
 /// - `34` adds the `tickets.last_transition_actor` and
 ///   `ticket_chronicle.actor` columns for phase-transition actor attribution.
+/// - `35` adds the per-attempt `llm_failures` table to the logs store
+///   (baseline `26` already carries it for fresh installs).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -482,6 +531,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "34",
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_ticket_transition_actor),
+    },
+    Migration {
+        id: "35",
+        target: TargetDb::Logs,
+        body: MigrationBody::Sql(ADD_LLM_FAILURES),
     },
 ];
 
@@ -1120,6 +1174,27 @@ mod tests {
             ],
         ),
         (
+            "llm_failures",
+            &[
+                "id",
+                "operation_id",
+                "recorded_at",
+                "purpose",
+                "agent_id",
+                "role",
+                "workspace",
+                "ticket_id",
+                "model",
+                "routing",
+                "attempt",
+                "attempt_duration_ms",
+                "failure_class",
+                "finish_reason",
+                "retry_after_ms",
+                "error_chain",
+            ],
+        ),
+        (
             "llm_requests",
             &[
                 "id",
@@ -1195,6 +1270,9 @@ mod tests {
         "idx_llm_requests_agent_id",
         "idx_llm_requests_model",
         "idx_llm_requests_purpose",
+        "idx_llm_failures_recorded_at",
+        "idx_llm_failures_operation_id",
+        "idx_llm_failures_failure_class",
         "idx_grep_telemetry_recorded_at",
         "idx_grep_telemetry_served",
         "idx_grep_telemetry_reason",
@@ -2082,8 +2160,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         );
     }
 
-    /// A fresh logs store runs the baseline (`26`) and converges to the exact
-    /// current logs shape (logs/tool_calls/llm_requests + grep_telemetry).
+    /// A fresh logs store runs the baseline (`26`) plus the delta `35`
+    /// upfill and converges to the exact current logs shape
+    /// (logs/tool_calls/llm_requests/llm_failures + grep_telemetry).
     #[tokio::test]
     async fn fresh_logs_install_converges_to_expected_shape() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2110,9 +2189,65 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         applied.sort();
         assert_eq!(
             applied,
-            vec!["26".to_string()],
-            "fresh logs applies baseline 26 exactly"
+            vec!["26".to_string(), "35".to_string()],
+            "fresh logs applies baseline 26 + delta 35 exactly"
         );
+    }
+
+    /// The common upgrade path: a database that already applied the logs
+    /// baseline (`26`) — no `llm_failures` — gains the table through delta
+    /// `35` on reopen.
+    #[tokio::test]
+    async fn baseline_logs_db_gains_llm_failures_via_delta_35() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(root, crate::db::LOG_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open logs");
+        // Apply only through the baseline: the catalog prefix 24–26 (the
+        // core-target entries are skipped, so exactly entry `26` lands). The
+        // CURRENT baseline DDL already carries `llm_failures` — drop it to
+        // reproduce the previous release's baseline-26 shape.
+        run_catalog(&conn, TargetDb::Logs, &MIGRATIONS[..3])
+            .await
+            .expect("baseline only");
+        conn.execute("DROP TABLE llm_failures", ()).await.unwrap();
+        assert!(!table_defs(&conn).await.contains_key("llm_failures"));
+
+        run_migrations(&conn, TargetDb::Logs)
+            .await
+            .expect("delta 35");
+
+        let mut applied = applied_ids(&conn).await;
+        applied.sort();
+        assert_eq!(
+            applied,
+            vec!["26".to_string(), "35".to_string()],
+            "reopen must record exactly 26 + 35"
+        );
+        let (_, cols) = EXPECTED_LOGS_TABLE_COLUMNS
+            .iter()
+            .find(|(n, _)| *n == "llm_failures")
+            .expect("pinned llm_failures shape");
+        let expected_cols: Vec<String> = cols.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(
+            column_names(&conn, "llm_failures").await,
+            expected_cols,
+            "delta 35 must create llm_failures with the pinned shape"
+        );
+        for idx in [
+            "idx_llm_failures_recorded_at",
+            "idx_llm_failures_operation_id",
+            "idx_llm_failures_failure_class",
+        ] {
+            assert!(
+                index_defs(&conn).await.contains_key(idx),
+                "delta 35 must create index {idx}"
+            );
+        }
     }
 
     /// Seed representative domain rows into a fully current-shape core
@@ -2426,10 +2561,26 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     }
 
     /// The logs fleet-wide boot-safety pin: an old-catalog logs store (ids
-    /// `8`/`9`/`14`) reopens through the logs baseline (`26`) as a strict
-    /// no-op — schema and data unchanged.
+    /// `8`/`9`/`14`) reopens through the logs baseline (`26`) and the delta
+    /// `35` upfill — everything except the new `llm_failures` table (and its
+    /// indexes) is unchanged, and the upfill lands the new table on existing
+    /// installs.
     #[tokio::test]
     async fn old_catalog_logs_db_reopens_as_noop() {
+        const NEW_TABLE: &str = "llm_failures";
+        const NEW_INDEXES: [&str; 3] = [
+            "idx_llm_failures_recorded_at",
+            "idx_llm_failures_operation_id",
+            "idx_llm_failures_failure_class",
+        ];
+        // `llm_failures` does not exist in the old-catalog shape — exclude it
+        // (and its indexes) from the unchanged-reopen comparison; its arrival
+        // on reopen is asserted below. Row counts are compared over the tables
+        // that exist on both sides.
+        let counts_tables: Vec<&str> = expected_logs_domain_tables()
+            .into_iter()
+            .filter(|n| *n != NEW_TABLE)
+            .collect();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let conn = crate::db::open_with_schema(
@@ -2451,7 +2602,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let before_ids = applied_ids(&conn).await;
         let before_tables = table_defs(&conn).await;
         let before_indexes = index_defs(&conn).await;
-        let before_counts = table_row_counts(&conn, &expected_logs_domain_tables()).await;
+        let before_counts = table_row_counts(&conn, &counts_tables).await;
 
         run_migrations(&conn, TargetDb::Logs)
             .await
@@ -2459,29 +2610,45 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
         let mut expected_ids = before_ids.clone();
         expected_ids.push("26".to_string());
+        expected_ids.push("35".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "logs reopen must record exactly old ids ∪ 26"
+            "logs reopen must record exactly old ids ∪ 26 ∪ 35"
         );
 
         assert_eq!(
-            table_defs(&conn).await,
-            before_tables,
-            "logs table DDL must be unchanged on reopen"
+            without(&table_defs(&conn).await, &[NEW_TABLE]),
+            without(&before_tables, &[NEW_TABLE]),
+            "logs table DDL (except {NEW_TABLE}) must be unchanged on reopen"
         );
         assert_eq!(
-            index_defs(&conn).await,
-            before_indexes,
-            "logs index definitions must be unchanged on reopen"
+            without(&index_defs(&conn).await, &NEW_INDEXES),
+            without(&before_indexes, &NEW_INDEXES),
+            "logs index definitions (except {NEW_INDEXES:?}) must be unchanged on reopen"
         );
         assert_eq!(
-            table_row_counts(&conn, &expected_logs_domain_tables()).await,
+            table_row_counts(&conn, &counts_tables).await,
             before_counts,
             "logs row counts must be unchanged on reopen"
         );
+
+        // Delta `35` must land the per-attempt failure trail on existing
+        // installs — the whole point of the two-sided migration.
+        let after_tables = table_defs(&conn).await;
+        assert!(
+            after_tables.contains_key(NEW_TABLE),
+            "delta 35 must create {NEW_TABLE} on existing installs"
+        );
+        let after_indexes = index_defs(&conn).await;
+        for idx in NEW_INDEXES {
+            assert!(
+                after_indexes.contains_key(idx),
+                "delta 35 must create index {idx}"
+            );
+        }
     }
 
     /// The 0.5.0 (one-delta-behind) upgrade: a database built by the retired

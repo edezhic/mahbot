@@ -1415,8 +1415,9 @@ impl ChatResponse {
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
 // ── Voice pipeline shared constants ─────────────────────────────────────────
-/// Operation metadata for per-request LLM stats logging (`llm_requests` table
-/// in logs.db). Attached by call sites with agent/ticket context; requests
+/// Operation metadata for per-request LLM stats logging (the `llm_requests`
+/// operation table and the `llm_failures` per-attempt failure trail in
+/// logs.db). Attached by call sites with agent/ticket context; requests
 /// without metadata (test doubles, ad-hoc calls) are not logged.
 #[derive(Debug, Clone)]
 pub(crate) struct ChatRequestMeta {
