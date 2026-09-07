@@ -2731,13 +2731,6 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
 
     let pool = crate::users::role_pool(user_name).await;
 
-    // Single role-switch entry — opens the inline role picker listing only
-    // the user's pool roles. Only registered when the pool has more than one
-    // role (single-role users have nothing to switch to); leads the menu.
-    if pool.len() > 1 {
-        entries.push(("agents".to_string(), AGENTS_COMMAND_DESC.to_string()));
-    }
-
     if crate::users::is_admin(user_name).await {
         entries.push(("board".to_string(), BOARD_COMMAND_DESC.to_string()));
         entries.push(("archive".to_string(), ARCHIVE_COMMAND_DESC.to_string()));
@@ -2786,8 +2779,12 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
         VIDEO_MODELS_COMMAND_DESC.to_string(),
     ));
 
-    // Session clear is the least frequent action — keep it last.
+    // The role-switch entry (inline role picker, only for multi-role pools)
+    // is anchored at the very bottom of the menu.
     entries.push(("clear".to_string(), CLEAR_COMMAND_DESC.to_string()));
+    if pool.len() > 1 {
+        entries.push(("agents".to_string(), AGENTS_COMMAND_DESC.to_string()));
+    }
     entries
 }
 

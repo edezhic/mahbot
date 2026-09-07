@@ -2218,7 +2218,6 @@ async fn user_command_entries_reflect_admin_state() {
     // is present for the admin.
     let alice = user_command_entries("alice").await;
     let cmds: Vec<&str> = alice.iter().map(|(c, _)| c.as_str()).collect();
-    assert_eq!(cmds[0], "agents");
     assert!(cmds.contains(&"board"));
     assert!(cmds.contains(&"update"));
     // State-aware pairs reflect the workspace state: not paused →
@@ -2235,13 +2234,15 @@ async fn user_command_entries_reflect_admin_state() {
     // Model commands are unconditional (every user has the Assistant role).
     assert!(cmds.contains(&"image_models"));
     assert!(cmds.contains(&"video_models"));
-    // Menu order: role-switch entry first, then board/admin (+ /update),
-    // then workspace-state pairs, then model commands, with /clear last.
-    assert_eq!(cmds.last(), Some(&"clear"));
+    // Menu order: board/admin (+ /update), then workspace-state pairs,
+    // then model commands, with /clear second-to-last and the role-switch
+    // entry last.
+    assert_eq!(cmds.last(), Some(&"agents"));
     let pos = |cmd: &str| cmds.iter().position(|c| *c == cmd).unwrap();
     assert!(pos("board") < pos("update"));
     assert!(pos("update") < pos("image_models"));
     assert!(pos("image_models") < pos("clear"));
+    assert!(pos("clear") < pos("agents"));
 
     // Flipping the workspace state reverses the pairs (the ticket's
     // headline criterion): paused → /unpause, maintenance on →
