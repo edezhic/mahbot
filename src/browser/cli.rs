@@ -14,10 +14,12 @@
 //! default here.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::browser::actions;
 use crate::browser::contract::{BrowserResponse, OutEnvelope, OutKind, extract_snapshot_text};
 use crate::browser::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
 use crate::browser::{
@@ -66,40 +68,108 @@ fn classify_call_failure(code: Option<&str>, error: &str) -> OutKind {
     OutKind::Error
 }
 
-/// Recognized action words (for the usage-envelope action fallback).
-const KNOWN_ACTIONS: [&str; 8] = [
-    "status", "open", "count", "wait", "eval", "extract", "click", "session",
-];
+/// Top-level `mahbot browser -h` — rendered from the shared action registry.
+#[must_use]
+fn top_help() -> String {
+    let mut out = String::from("mahbot browser — headless browser automation CLI\n\n");
+    out.push_str("Usage:\n");
+    out.push_str("  mahbot browser <action> [options]\n\n");
+    out.push_str("Actions:\n");
+    for d in actions::ACTIONS.iter().filter(|a| a.cli.is_some()) {
+        let Some(cli) = d.cli.as_ref() else {
+            continue;
+        };
+        if cli.syntax.is_empty() {
+            let _ = writeln!(out, "  {}", d.name);
+        } else {
+            let _ = writeln!(out, "  {} {}", d.name, cli.syntax);
+        }
+        let _ = writeln!(out, "      {}", d.purpose);
+    }
+    out.push_str("\nGlobal flags:\n");
+    out.push_str(
+        "  --session <name>   use/name a session (not valid for status / session stop)\n\n",
+    );
+    out.push_str("Output (stdout, one JSON line):\n");
+    out.push_str(
+        "  {\"schema\":1,\"action\":\"...\",\"ok\":true|false,\"kind\":\"...\",...payload}\n\n",
+    );
+    out.push_str("Exit codes:\n");
+    out.push_str("  0  ok / empty (including a legitimately empty region)\n");
+    out.push_str("  1  site/data step failure (timeout, network, redesign, not-found, error)\n");
+    out.push_str("  2  environment failure (no chrome-use CLI/relay/Chrome/display)\n");
+    out.push_str("  3  usage error\n\n");
+    out.push_str("Help:\n");
+    out.push_str("  mahbot browser -h            this help\n");
+    out.push_str("  mahbot browser <action> -h   per-action help (flags, kinds, examples)\n");
+    out
+}
 
-/// Usage text shared by `--help` (stdout) and usage errors (stderr hint).
-const USAGE: &str = "\
-mahbot browser — headless browser automation CLI
+/// Per-action `mahbot browser <action> -h`.
+#[must_use]
+fn action_help(name: &str) -> String {
+    let Some(d) = actions::desc(name) else {
+        return String::new();
+    };
+    let Some(cli) = d.cli.as_ref() else {
+        return String::new();
+    };
 
-Usage:
-  mahbot browser <action> [options]
+    let mut out = String::new();
+    let _ = write!(out, "mahbot browser {} — {}\n\n", d.name, d.purpose);
+    out.push_str("Usage:\n");
+    if cli.syntax.is_empty() {
+        let _ = writeln!(out, "  mahbot browser {}", d.name);
+    } else {
+        let _ = writeln!(out, "  mahbot browser {} {}", d.name, cli.syntax);
+    }
 
-Actions:
-  status                        check chrome-use CLI, relay, Chrome, display
-  open <url> [--expect <sel>] [--structural] [--timeout <secs>]
-  count <selector> [--timeout <secs>]
-  wait <selector> [--timeout <secs>]
-  eval <js> [--timeout <secs>]
-  extract --schema-file <path> [--limit <n>] [--timeout <secs>]
-  click <selector> [--if-present] [--timeout <secs>]
-  session stop <name> [--force]
+    let mut flag_rows: Vec<(&str, &str)> = cli.flags.to_vec();
+    if cli.session {
+        flag_rows.push((
+            "--session <name>",
+            "use/name a session (not valid for status / session stop)",
+        ));
+    }
+    if !flag_rows.is_empty() {
+        let width = flag_rows.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
+        out.push_str("\nFlags:\n");
+        for (flag, desc) in flag_rows {
+            let _ = writeln!(out, "  {flag:<width$}  {desc}");
+        }
+    }
 
-Global flags:
-  --session <name>   use/name a session (not valid for status / session stop)
+    out.push_str("\nKinds (stdout \"kind\" → exit code):\n");
+    let kinds = cli
+        .kinds
+        .iter()
+        .map(|k| format!("{} ({})", k.as_str(), k.exit_code()))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let _ = writeln!(out, "  {kinds}");
 
-Output (stdout, one JSON line):
-  {\"schema\":1,\"action\":\"...\",\"ok\":true|false,\"kind\":\"...\",...payload}
+    if !cli.details.is_empty() {
+        let _ = write!(out, "\n{}\n", cli.details);
+    }
 
-Exit codes:
-  0  success (including a legitimately empty region)
-  1  site/data step failure (timeout, redesign, not-found, network, error)
-  2  environment failure (no chrome-use CLI/relay/Chrome/display)
-  3  usage error
-";
+    out.push_str("\nExamples:\n");
+    for ex in cli.examples {
+        let _ = writeln!(out, "  {ex}");
+    }
+    out
+}
+
+/// A per-action help request: the first positional token names a CLI action
+/// and any token after it is `-h`/`--help`. Flags/session values before the
+/// action word are skipped. Returns the action's registry name.
+fn action_help_request(args: &[String]) -> Option<&'static str> {
+    let (i, word) = first_positional(args)?;
+    let d = actions::desc(word)?;
+    d.cli
+        .as_ref()
+        .is_some_and(|_| args[i + 1..].iter().any(|t| t == "-h" || t == "--help"))
+        .then_some(d.name)
+}
 
 /// A session the CLI resolved for an action that runs in one.
 struct CliSession {
@@ -192,8 +262,20 @@ static CHROME_USE_SPAWNED: AtomicBool = AtomicBool::new(false);
 pub async fn run_cli(args: &[String]) -> i32 {
     // Re-enterable pub API: clear the previous call's spawn bookkeeping.
     CHROME_USE_SPAWNED.store(false, Ordering::Relaxed);
-    if args.first().is_some_and(|a| a == "--help" || a == "-h") {
-        print!("{USAGE}");
+    if let Some(a) = args.first()
+        && (a == "-h" || a == "--help")
+    {
+        print!("{}", top_help());
+        return 0;
+    }
+    // A `-h`/`--help` after the action word is per-action help — anywhere in
+    // the tail, not just immediately after it (so `open <url> --help` and
+    // `--session x open -h` work too). A `-h` before any action word falls
+    // through to top-level help / normal parsing: no valid invocation starts
+    // with a `-h`-looking token, parse_flags rejects those as usage errors, so
+    // per-action help only turns would-be usage errors into help.
+    if let Some(action) = action_help_request(args) {
+        print!("{}", action_help(action));
         return 0;
     }
 
@@ -220,21 +302,46 @@ pub async fn run_cli(args: &[String]) -> i32 {
 
 // ── Parsing ──────────────────────────────────────────────────────
 
+/// Flag sets for one action: `(value flags, boolean flags)`.
+type FlagSet = (&'static [&'static str], &'static [&'static str]);
+
+/// Per-action accepted flags — the single source for both the parser and the
+/// CliHelp lockstep test. `(action word, value flags, boolean flags)`.
+const ACTION_FLAGS: &[(&str, &[&str], &[&str])] = &[
+    ("status", &[], &[]),
+    ("open", &["expect", "timeout"], &["structural"]),
+    ("count", &["timeout"], &[]),
+    ("wait", &["timeout"], &[]),
+    ("eval", &["timeout"], &[]),
+    ("extract", &["schema-file", "limit", "timeout"], &[]),
+    ("click", &["timeout"], &["if-present"]),
+    ("session", &[], &["force"]),
+];
+
+/// Accepted flags for `word`: `(value flags, boolean flags)`.
+fn action_flags(word: &str) -> FlagSet {
+    ACTION_FLAGS
+        .iter()
+        .find(|(name, ..)| *name == word)
+        .map_or((&[], &[]), |(_, v, b)| (*v, *b))
+}
+
 fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
     let (session, remaining) = extract_global_session(args)?;
     let action_word = remaining
         .first()
         .ok_or_else(|| "no action given".to_string())?;
     let rest = &remaining[1..];
+    let allowed = action_flags(action_word);
     match action_word.as_str() {
         "status" => parse_status(session.as_deref(), rest),
-        "open" => parse_open(session.as_deref(), rest),
-        "count" => parse_count(session.as_deref(), rest),
-        "wait" => parse_wait(session.as_deref(), rest),
-        "eval" => parse_eval(session.as_deref(), rest),
-        "extract" => parse_extract(session.as_deref(), rest),
-        "click" => parse_click(session.as_deref(), rest),
-        "session" => parse_session_stop(session.as_deref(), rest),
+        "open" => parse_open(session.as_deref(), rest, allowed),
+        "count" => parse_count(session.as_deref(), rest, allowed),
+        "wait" => parse_wait(session.as_deref(), rest, allowed),
+        "eval" => parse_eval(session.as_deref(), rest, allowed),
+        "extract" => parse_extract(session.as_deref(), rest, allowed),
+        "click" => parse_click(session.as_deref(), rest, allowed),
+        "session" => parse_session_stop(session.as_deref(), rest, allowed),
         other => Err(format!("unknown action '{other}'")),
     }
 }
@@ -268,31 +375,30 @@ fn extract_global_session(args: &[String]) -> Result<(Option<String>, Vec<String
     Ok((session, remaining))
 }
 
-/// The action word to put on a usage envelope — the first non-flag token when
-/// it is a recognized action, else `"usage"`.
-fn recognized_action(args: &[String]) -> String {
+/// Index and token of the first positional argument: skips `--session <name>`
+/// (with its value), `--session=<name>`, and any other `-`-prefixed flag.
+fn first_positional(args: &[String]) -> Option<(usize, &str)> {
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
         if a == "--session" {
             i += 2;
-            continue;
-        }
-        if a.starts_with("--session=") {
+        } else if a.starts_with('-') {
             i += 1;
-            continue;
-        }
-        if a.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        return if KNOWN_ACTIONS.contains(&a.as_str()) {
-            a.clone()
         } else {
-            "usage".to_string()
-        };
+            return Some((i, a));
+        }
     }
-    "usage".to_string()
+    None
+}
+
+/// The action word to put on a usage envelope — the first non-flag token when
+/// it is a recognized action, else `"usage"`.
+fn recognized_action(args: &[String]) -> String {
+    match first_positional(args) {
+        Some((_, a)) if actions::is_cli_action(a) => a.to_string(),
+        _ => "usage".to_string(),
+    }
 }
 
 /// Split action args into positional tokens and a `--flag` map, handling both
@@ -378,8 +484,13 @@ fn parse_status(session: Option<&str>, rest: &[String]) -> Result<Invocation, St
     })
 }
 
-fn parse_open(session: Option<&str>, rest: &[String]) -> Result<Invocation, String> {
-    let (positionals, flags) = parse_flags(rest, &["expect", "timeout"], &["structural"])?;
+fn parse_open(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: FlagSet,
+) -> Result<Invocation, String> {
+    let (value_flags, bool_flags) = allowed;
+    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
     let url = take_positional(&positionals, 0, "url")?;
     reject_extra_positionals(&positionals, 1)?;
     Ok(Invocation {
@@ -393,8 +504,13 @@ fn parse_open(session: Option<&str>, rest: &[String]) -> Result<Invocation, Stri
     })
 }
 
-fn parse_count(session: Option<&str>, rest: &[String]) -> Result<Invocation, String> {
-    let (positionals, flags) = parse_flags(rest, &["timeout"], &[])?;
+fn parse_count(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: FlagSet,
+) -> Result<Invocation, String> {
+    let (value_flags, bool_flags) = allowed;
+    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
     let selector = take_positional(&positionals, 0, "selector")?;
     reject_extra_positionals(&positionals, 1)?;
     Ok(Invocation {
@@ -406,8 +522,13 @@ fn parse_count(session: Option<&str>, rest: &[String]) -> Result<Invocation, Str
     })
 }
 
-fn parse_wait(session: Option<&str>, rest: &[String]) -> Result<Invocation, String> {
-    let (positionals, flags) = parse_flags(rest, &["timeout"], &[])?;
+fn parse_wait(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: FlagSet,
+) -> Result<Invocation, String> {
+    let (value_flags, bool_flags) = allowed;
+    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
     let selector = take_positional(&positionals, 0, "selector")?;
     reject_extra_positionals(&positionals, 1)?;
     Ok(Invocation {
@@ -419,8 +540,13 @@ fn parse_wait(session: Option<&str>, rest: &[String]) -> Result<Invocation, Stri
     })
 }
 
-fn parse_eval(session: Option<&str>, rest: &[String]) -> Result<Invocation, String> {
-    let (positionals, flags) = parse_flags(rest, &["timeout"], &[])?;
+fn parse_eval(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: FlagSet,
+) -> Result<Invocation, String> {
+    let (value_flags, bool_flags) = allowed;
+    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
     let js = take_positional(&positionals, 0, "js")?;
     reject_extra_positionals(&positionals, 1)?;
     Ok(Invocation {
@@ -432,8 +558,13 @@ fn parse_eval(session: Option<&str>, rest: &[String]) -> Result<Invocation, Stri
     })
 }
 
-fn parse_extract(session: Option<&str>, rest: &[String]) -> Result<Invocation, String> {
-    let (positionals, flags) = parse_flags(rest, &["schema-file", "limit", "timeout"], &[])?;
+fn parse_extract(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: FlagSet,
+) -> Result<Invocation, String> {
+    let (value_flags, bool_flags) = allowed;
+    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
     if !positionals.is_empty() {
         return Err(format!("unexpected argument '{}'", positionals[0]));
     }
@@ -451,8 +582,13 @@ fn parse_extract(session: Option<&str>, rest: &[String]) -> Result<Invocation, S
     })
 }
 
-fn parse_click(session: Option<&str>, rest: &[String]) -> Result<Invocation, String> {
-    let (positionals, flags) = parse_flags(rest, &["timeout"], &["if-present"])?;
+fn parse_click(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: FlagSet,
+) -> Result<Invocation, String> {
+    let (value_flags, bool_flags) = allowed;
+    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
     let selector = take_positional(&positionals, 0, "selector")?;
     reject_extra_positionals(&positionals, 1)?;
     Ok(Invocation {
@@ -465,7 +601,11 @@ fn parse_click(session: Option<&str>, rest: &[String]) -> Result<Invocation, Str
     })
 }
 
-fn parse_session_stop(session: Option<&str>, rest: &[String]) -> Result<Invocation, String> {
+fn parse_session_stop(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: FlagSet,
+) -> Result<Invocation, String> {
     if session.is_some() {
         return Err("--session is not valid for session stop".to_string());
     }
@@ -478,7 +618,8 @@ fn parse_session_stop(session: Option<&str>, rest: &[String]) -> Result<Invocati
             "unknown session subcommand '{sub}' (expected 'stop')"
         ));
     }
-    let (positionals, flags) = parse_flags(&rest[1..], &[], &["force"])?;
+    let (value_flags, bool_flags) = allowed;
+    let (positionals, flags) = parse_flags(&rest[1..], value_flags, bool_flags)?;
     let name = take_positional(&positionals, 0, "name")?;
     reject_extra_positionals(&positionals, 1)?;
     Ok(Invocation {
@@ -719,9 +860,26 @@ fn fallback_step_message(status_code: Option<i32>, stderr: &str) -> String {
 
 // ── Actions ─────────────────────────────────────────────────────
 
+/// The `out_env` kind contract: a kind emitted for a registered CLI action
+/// must be declared in that action's shared-registry kind list, so the help
+/// text cannot drift from runtime emission. Unregistered pseudo-actions (the
+/// `"usage"` fallback) and non-CLI actions are exempt. Kept a pure predicate
+/// so the unit test exercises it in every build profile, not just debug.
+fn kind_contract_holds(action: &str, kind: OutKind) -> bool {
+    match actions::desc(action) {
+        None => true,
+        Some(d) => d.cli.as_ref().is_none_or(|c| c.kinds.contains(&kind)),
+    }
+}
+
 /// Construct an [`OutEnvelope`].
 #[must_use]
 fn out_env(action: &str, ok: bool, kind: OutKind, payload: Value) -> OutEnvelope {
+    debug_assert!(
+        kind_contract_holds(action, kind),
+        "kind {} not declared for action {action} — update the shared registry",
+        kind.as_str()
+    );
     OutEnvelope {
         action: action.to_string(),
         ok,
@@ -1550,5 +1708,128 @@ mod tests {
             recognized_action(&["--session=s".into(), "count".into(), ".x".into()]),
             "count"
         );
+    }
+
+    #[test]
+    fn top_help_lists_every_cli_action_with_purpose() {
+        let help = top_help();
+        for d in actions::ACTIONS.iter().filter(|a| a.cli.is_some()) {
+            assert!(help.contains(d.name), "top help missing action {}", d.name);
+            assert!(
+                help.contains(d.purpose),
+                "top help missing purpose for {}",
+                d.name
+            );
+        }
+    }
+
+    #[test]
+    fn action_help_covers_flags_kinds_and_examples() {
+        for d in actions::ACTIONS.iter().filter(|a| a.cli.is_some()) {
+            let cli = d.cli.as_ref().expect("filtered to cli actions");
+            let help = action_help(d.name);
+            assert!(help.contains("Usage:"), "{}: missing Usage", d.name);
+            assert!(help.contains("Kinds"), "{}: missing Kinds", d.name);
+            assert!(help.contains("Examples:"), "{}: missing Examples", d.name);
+            for k in cli.kinds {
+                assert!(
+                    help.contains(&format!("{} ({})", k.as_str(), k.exit_code())),
+                    "{}: missing kind {}",
+                    d.name,
+                    k.as_str()
+                );
+            }
+        }
+        assert!(action_help("open").contains("--expect"));
+        assert!(action_help("open").contains("redesign"));
+        assert!(!action_help("status").contains("Flags:"));
+    }
+
+    #[test]
+    fn action_flags_match_the_cli_help_flag_sets() {
+        // ACTION_FLAGS must cover exactly the 8 CLI action words.
+        let mut table: Vec<&str> = ACTION_FLAGS.iter().map(|(name, ..)| *name).collect();
+        table.sort_unstable();
+        let mut cli: Vec<&str> = actions::ACTIONS
+            .iter()
+            .filter(|a| a.cli.is_some())
+            .map(|a| a.name)
+            .collect();
+        cli.sort_unstable();
+        assert_eq!(table, cli, "ACTION_FLAGS must cover the CLI action words");
+
+        for &(word, value_flags, bool_flags) in ACTION_FLAGS {
+            let help = actions::desc(word)
+                .and_then(|d| d.cli.as_ref())
+                .expect("ACTION_FLAGS word should have a CliHelp");
+            // Machine name of each declared flag: `--expect <sel>` → `expect`,
+            // `--structural` → `structural`.
+            let mut expected: Vec<&str> = help
+                .flags
+                .iter()
+                .map(|(flag, _)| {
+                    flag.strip_prefix("--")
+                        .unwrap_or(flag)
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or(flag)
+                })
+                .collect();
+            let mut actual: Vec<&str> = value_flags
+                .iter()
+                .chain(bool_flags.iter())
+                .copied()
+                .collect();
+            if help.session {
+                // The global `--session` flag is rendered for and accepted by
+                // every session-enabled action, so it is on both sides.
+                expected.push("session");
+                actual.push("session");
+            }
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(
+                actual, expected,
+                "flag set mismatch for action {word}: ACTION_FLAGS vs CliHelp"
+            );
+        }
+    }
+
+    #[test]
+    fn action_help_request_intercepts_per_action_help() {
+        let arg = |s: &[&str]| s.iter().copied().map(String::from).collect::<Vec<_>>();
+        assert_eq!(action_help_request(&arg(&["open", "-h"])), Some("open"));
+        assert_eq!(
+            action_help_request(&arg(&["open", "https://x", "--help"])),
+            Some("open")
+        );
+        assert_eq!(
+            action_help_request(&arg(&["--session", "docs", "open", "-h"])),
+            Some("open")
+        );
+        assert_eq!(action_help_request(&arg(&["open"])), None);
+        assert_eq!(action_help_request(&arg(&["snapshot", "-h"])), None);
+        assert_eq!(action_help_request(&arg(&["frobnicate", "-h"])), None);
+        assert_eq!(action_help_request(&arg(&["--timeout", "5"])), None);
+    }
+
+    #[test]
+    fn out_env_kind_contract_is_enforced() {
+        // Every declared kind satisfies the contract.
+        for d in actions::ACTIONS.iter().filter(|a| a.cli.is_some()) {
+            let cli = d.cli.as_ref().expect("filtered above");
+            for k in cli.kinds {
+                assert!(
+                    kind_contract_holds(d.name, *k),
+                    "{}: declared kind {} fails the contract",
+                    d.name,
+                    k.as_str()
+                );
+            }
+        }
+        // An undeclared kind for a registered action violates it.
+        assert!(!kind_contract_holds("status", OutKind::Network));
+        // Unregistered pseudo-actions ("usage") are exempt.
+        assert!(kind_contract_holds("usage", OutKind::Usage));
     }
 }

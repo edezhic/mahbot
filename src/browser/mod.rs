@@ -4,12 +4,16 @@
 //! Frontends own everything user-facing: the interactive `browser` tool
 //! ([`crate::tools::browser`]) owns its LLM-facing framing and error texts,
 //! and the `mahbot browser` CLI ([`cli`]) owns its stdout/exit-code emission.
-//! This module stays free of any LLM-facing text — it holds the chrome-use CLI
-//! spawning ([`spawn`]), the tolerant `--json` response envelope parser
-//! ([`contract`]), and the session-name/URL rules the tool and CLI share.
+//! The per-action descriptor registry ([`actions`]) is the ONE shared source
+//! of LLM-facing action descriptions, rendered by both frontends (the tool's
+//! parameter schema and the CLI help); outside that registry this module still
+//! holds no other LLM-facing text. It also holds the chrome-use CLI spawning
+//! ([`spawn`]), the tolerant `--json` response envelope parser ([`contract`]),
+//! and the session-name/URL rules the tool and CLI share.
 
 use crate::util::is_http_url;
 
+pub(crate) mod actions;
 pub(crate) mod cli;
 pub(crate) mod contract;
 pub(crate) mod spawn;

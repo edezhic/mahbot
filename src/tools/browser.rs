@@ -619,102 +619,23 @@ impl Tool for BrowserTool {
         super::browser_daemon::is_advertised()
     }
 
-    #[expect(clippy::too_many_lines)]
     fn parameters_schema(&self) -> Value {
+        // oneOf entry order follows the shared registry (which is ordered for
+        // the CLI help), so it may differ from the pre-registry hand-built
+        // order; descriptions and structure are unchanged and the set is
+        // pinned by `parameters_schema_has_all_actions`.
+        let entries: Vec<Value> = crate::browser::actions::ACTIONS
+            .iter()
+            .filter_map(|a| {
+                a.tool.as_ref().map(|t| {
+                    super::action_entry_schema(a.name, a.purpose, t.required, &t.properties)
+                })
+            })
+            .collect();
         json!({
             "type": "object",
             "properties": {
-                "action": {
-                    "oneOf": [
-                        super::action_entry_schema("open", "Navigate to a URL (returns page content automatically)", &["url"], &json!({
-                            "url": {
-                                "type": "string",
-                                "description": "URL to navigate to"
-                            }
-                        })),
-                        super::action_entry_schema("snapshot", "Get accessibility snapshot with element refs (@e1, @e2, ...)", &[], &json!({
-                            "interactive_only": {
-                                "type": "boolean",
-                                "description": "Only show interactive elements (buttons, links, inputs)"
-                            },
-                            "compact": {
-                                "type": "boolean",
-                                "description": "Remove empty structural elements. Default: true"
-                            },
-                            "depth": {
-                                "type": "integer",
-                                "description": "Limit tree depth"
-                            }
-                        })),
-                        super::action_entry_schema("click", "Click an element by ref or CSS selector", &["selector"], &json!({
-                            "selector": {
-                                "type": "string",
-                                "description": "Element ref (@e1) or CSS selector to click. Refs come from the most recent snapshot on this tab — they become stale after any navigation or re-snapshot"
-                            }
-                        })),
-                        super::action_entry_schema("get_text", "Get text content of an element (uses DOM textContent — includes script/style content)", &["selector"], &json!({
-                            "selector": {
-                                "type": "string",
-                                "description": "Element ref (@e1) or CSS selector. Refs come from the most recent snapshot — always snapshot before calling get_text with a ref"
-                            }
-                        })),
-                        super::action_entry_schema("get_innertext", "Get visible rendered text of an element (uses innerText — no script/style content)", &["selector"], &json!({
-                            "selector": {
-                                "type": "string",
-                                "description": "Element ref (@e1) or CSS selector. Uses innerText() — returns only visible rendered text, no script/style content"
-                            }
-                        })),
-                        super::action_entry_schema("get_url", "Get current URL", &[], &json!({})),
-                        super::action_entry_schema("press", "Press a keyboard key at the current focus (e.g. Enter to submit forms)", &["key"], &json!({
-                            "key": {
-                                "type": "string",
-                                "description": "Key to press (e.g. Enter, Tab, Escape, Control+a, ArrowDown)"
-                            }
-                        })),
-                        super::action_entry_schema("eval", "Run JavaScript in the page context. Use to inspect element attributes, check state, or debug.", &["js"], &json!({
-                            "js": {
-                                "type": "string",
-                                "description": "JavaScript to run in the page context"
-                            }
-                        })),
-                        super::action_entry_schema("find", "Find an element by semantic locator and perform an action", &["by", "value", "action"], &json!({
-                            "by": {
-        "type": "string",
-                "description": "Locator type: text (case-sensitive visible text match, second most reliable for buttons/links/headings), role (accessibility tree role, use 'name' field to filter — but name filter can fail even when snapshot shows a match; fall back to 'text' or 'first' if it fails), label (matches <label for='...'> only), placeholder (EXACT match of HTML placeholder attribute — not accessible name shown in snapshot), alt, title (exact HTML title attribute), testid, first (CSS selector — MOST reliable for any element type), last (CSS selector), nth (CSS selector + index). For text inputs: prefer `by: \"first\"` with CSS selector (e.g. `\"input\"`, `\"textarea\"`) — role-based textbox locators are unreliable."
-                            },
-                            "value": {
-        "type": "string",
-                "description": "Locator match target. For 'text': substring to search for (case-sensitive); for 'placeholder': exact HTML placeholder attribute value (NOT what snapshot shows — check with eval); for 'role': role name ('button', 'link', 'textbox', 'heading'); for 'label': visible <label> text; for 'first'/'last'/'nth': CSS selector (e.g. 'input', 'button', 'form')"
-                            },
-                            "action": {
-        "type": "string",
-                "description": "Action to perform: click (click element), fill (clear field then type), type (append text without clearing, uses 'text' parameter), hover (hover over element), focus (focus element), check (check checkbox/radio button), uncheck (uncheck checkbox/radio button), text (get element text content — does NOT use the 'text' param; the 'text' param is only for fill/type). For filling text into inputs, use 'fill' with the 'text' parameter. For typing without clearing first, use 'type'. Press Enter after filling to submit forms."
-                            },
-                            "text": {
-                                "type": "string",
-                                                                                                "description": "Text to fill/type into the element (for action 'fill' or 'type')"
-                            },
-                            "name": {
-                                "type": "string",
-                                "description": "Accessible name filter (for role-based finding, e.g. 'Submit'). Note: this filter can fail even when the snapshot shows a matching element. When it fails, retry with `by: \"text\"` or `by: \"first\"` with a CSS selector."
-                            },
-                            "exact": {
-                                "type": "boolean",
-                                "description": "Require exact text match"
-                            },
-                            "index": {
-                                "type": "integer",
-                                "description": "Zero-based index for `by: \"nth\"`. Required when by is 'nth'."
-                            }
-                        })),
-                        super::action_entry_schema(
-                            "screenshot",
-                            "Capture a screenshot of the current page as a PNG and inject it into the conversation as a native image, so you can visually inspect the rendered page",
-                            &[],
-                            &json!({}),
-                        )
-                    ]
-                },
+                "action": { "oneOf": entries },
                 "tab": {
                     "type": "string",
                     "description": "Logical name for this browser session. \
