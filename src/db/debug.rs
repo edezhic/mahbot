@@ -821,22 +821,17 @@ async fn ipc_query_readonly(root: &Path, store: &str, sql: &str) -> Result<ipc::
 /// ("core" or "logs").
 async fn query_over_ipc(root: &Path, physical: &str, sql: &str) -> Result<()> {
     let resp = ipc_query_readonly(root, physical, sql).await?;
-    let mut out = String::new();
-    out.push_str(&resp.columns.join("|"));
-    out.push('\n');
-    for row in &resp.rows {
-        out.push_str(
-            &row.iter()
+    let rows = resp
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
                 .map(ipc::WireValue::format)
                 .collect::<Vec<_>>()
-                .join("|"),
-        );
-        out.push('\n');
-    }
-    if resp.truncated {
-        out.push_str(&format_truncation_row(resp.columns.len()));
-        out.push('\n');
-    }
+                .join("|")
+        })
+        .collect();
+    let out = render_pipe_table(&resp.columns, rows, resp.truncated);
     write_stdout(&out)
 }
 
@@ -1066,29 +1061,14 @@ fn execute_query_readonly(
         return Ok(String::new());
     }
 
-    let mut out = String::new();
-
-    // Column header row.
     let column_names: Vec<String> = (0..col_count)
         .map(|i| stmt.get_column_name(i).into_owned())
         .collect();
-    out.push_str(&column_names.join("|"));
-    out.push('\n');
-
     let (rows, has_more) = step_rows(io, db_path, &mut stmt, Some(ROW_LIMIT), |row| {
         format_core_row(row, col_count)
     })?;
-    for row in rows {
-        out.push_str(&row);
-        out.push('\n');
-    }
 
-    if has_more {
-        out.push_str(&format_truncation_row(col_count));
-        out.push('\n');
-    }
-
-    Ok(out)
+    Ok(render_pipe_table(&column_names, rows, has_more))
 }
 
 /// SQL selecting a store's user tables: `type='table'`, with real DDL, and not
@@ -1143,6 +1123,9 @@ fn dump_schema(
 
     let mut out = format!("== schema dump: {label} ==\n");
     for (name, sql) in tables {
+        if name.is_empty() {
+            continue;
+        }
         let count_sql = format!("SELECT COUNT(*) FROM {}", quote_ident(&name));
         let counts = collect_rows(io, &conn, &count_sql, db_path, |row| {
             format_core_value(row.get_value(0))
@@ -1470,12 +1453,35 @@ fn format_core_value(val: &turso::core::Value) -> String {
     }
 }
 
+/// Assemble the canonical `mahbot debug` pipe-table output: a column-header
+/// line, one line per pre-formatted row, and a truncation sentinel when the
+/// row limit was hit. Callers format their own row values (the value types
+/// differ per path) and delegate the assembly here. An empty column list
+/// renders as empty output.
+pub(crate) fn render_pipe_table(columns: &[String], rows: Vec<String>, truncated: bool) -> String {
+    if columns.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str(&columns.join("|"));
+    out.push('\n');
+    for row in rows {
+        out.push_str(&row);
+        out.push('\n');
+    }
+    if truncated {
+        out.push_str(&format_truncation_row(columns.len()));
+        out.push('\n');
+    }
+    out
+}
+
 /// Format a truncation sentinel row that matches the column count.
 ///
 /// For 1 column:  `truncated`
 /// For 2 columns: `truncated|truncated`
-/// For N≥3:       `...|truncated|truncated|...|...`
-///                 (ellipsis at first and last, `truncated` in between)
+/// For N≥3:       `...` + N−2 × `truncated` + `...`, pipe-joined
+///                 (N=3 → `...|truncated|...`, N=4 → `...|truncated|truncated|...`)
 pub(crate) fn format_truncation_row(column_count: usize) -> String {
     let parts: Vec<&str> = match column_count {
         1 => vec!["truncated"],
@@ -2305,32 +2311,6 @@ mod tests {
             run_debug_detect(&args, Some(dir.path().to_path_buf())).is_ok(),
             "detect --db all must succeed on healthy core + logs stores"
         );
-    }
-
-    /// The IPC `WireValue` round-trips through `from_turso`/`to_turso` and
-    /// renders NULL as empty, integers as decimals, and blobs as lowercase hex.
-    #[test]
-    fn wire_value_round_trips() {
-        use crate::db::Value;
-        use crate::db::ipc::WireValue;
-        for (value, wire) in [
-            (Value::Integer(42), WireValue::Integer(42)),
-            (Value::Real(1.5), WireValue::Real(1.5)),
-            (
-                Value::Text("hi".to_string()),
-                WireValue::Text("hi".to_string()),
-            ),
-            (Value::Null, WireValue::Null),
-        ] {
-            assert_eq!(WireValue::from_turso(&value), wire, "from_turso");
-            assert_eq!(wire.to_turso(), value, "to_turso");
-        }
-        // Blob round-trips through the base64 wire form.
-        let blob = vec![0x00u8, 0xDE, 0xAD];
-        let wire = WireValue::from_turso(&Value::Blob(blob.clone()));
-        assert_eq!(wire.to_turso(), Value::Blob(blob));
-        assert_eq!(wire.format(), "00dead");
-        assert_eq!(WireValue::Null.format(), "");
     }
 
     /// End-to-end daemon-down path: a row committed to the WAL (the store is

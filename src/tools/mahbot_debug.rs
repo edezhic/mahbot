@@ -88,26 +88,19 @@ async fn run_read_only_query(conn: &crate::db::Connection, sql: &str) -> anyhow:
     Ok(format_readonly_rows(&rows))
 }
 
-/// Render [`crate::db::ReadonlyRows`] as pipe-delimited text: a column-header
-/// line, one line per row, and a truncation sentinel line when the row limit was
-/// hit. Values follow the CLI display rules (NULL→empty, Blob→lowercase hex).
+/// Render [`crate::db::ReadonlyRows`] as pipe-delimited text (same format as
+/// `mahbot debug`): a column-header line, one line per row, and a truncation
+/// sentinel line when the row limit was hit. Values follow the CLI display
+/// rules (NULL→empty, Blob→lowercase hex).
 fn format_readonly_rows(rows: &crate::db::ReadonlyRows) -> String {
-    if rows.columns.is_empty() {
-        return String::new();
-    }
-    let mut out = String::new();
-    out.push_str(&rows.columns.join("|"));
-    out.push('\n');
-    for row in &rows.rows {
-        let parts: Vec<String> = row.iter().map(format_value).collect();
-        out.push_str(&parts.join("|"));
-        out.push('\n');
-    }
-    if rows.truncated {
-        out.push_str(&debug::format_truncation_row(rows.columns.len()));
-        out.push('\n');
-    }
-    out
+    debug::render_pipe_table(
+        &rows.columns,
+        rows.rows
+            .iter()
+            .map(|row| row.iter().map(format_value).collect::<Vec<_>>().join("|"))
+            .collect(),
+        rows.truncated,
+    )
 }
 
 /// Convert a [`turso::Value`] to its pipe-delimited display representation,

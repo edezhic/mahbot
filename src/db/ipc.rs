@@ -460,6 +460,31 @@ fn read_frame_sync(stream: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> 
 mod tests {
     use super::*;
 
+    /// The IPC `WireValue` round-trips through `from_turso`/`to_turso` and
+    /// renders NULL as empty, integers as decimals, and blobs as lowercase hex.
+    #[test]
+    fn wire_value_round_trips() {
+        use crate::db::Value;
+        for (value, wire) in [
+            (Value::Integer(42), WireValue::Integer(42)),
+            (Value::Real(1.5), WireValue::Real(1.5)),
+            (
+                Value::Text("hi".to_string()),
+                WireValue::Text("hi".to_string()),
+            ),
+            (Value::Null, WireValue::Null),
+        ] {
+            assert_eq!(WireValue::from_turso(&value), wire, "from_turso");
+            assert_eq!(wire.to_turso(), value, "to_turso");
+        }
+        // Blob round-trips through the base64 wire form.
+        let blob = vec![0x00u8, 0xDE, 0xAD];
+        let wire = WireValue::from_turso(&Value::Blob(blob.clone()));
+        assert_eq!(wire.to_turso(), Value::Blob(blob));
+        assert_eq!(wire.format(), "00dead");
+        assert_eq!(WireValue::Null.format(), "");
+    }
+
     /// serde_json emits `null` for non-finite floats; `de_real` must map it back
     /// to `NaN` so a REAL NaN cell round-trips instead of failing deserialization.
     #[test]
