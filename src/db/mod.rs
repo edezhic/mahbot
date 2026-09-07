@@ -1276,21 +1276,6 @@ impl TxGuard<'_> {
         Connection::query_impl(&self.conn, sql, params).await
     }
 
-    /// Execute a query that returns zero or one row, mapping it through a
-    /// closure. Returns `Ok(None)` when no row matches.
-    pub async fn query_optional<T, E>(
-        &self,
-        sql: &str,
-        params: impl IntoParams + Send + 'static,
-        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
-    ) -> anyhow::Result<Option<T>>
-    where
-        T: Send + 'static,
-        E: std::fmt::Display + Send + Sync + 'static,
-    {
-        optional_row(self.query_row(sql, params, map).await)
-    }
-
     /// Execute a query, mapping each row through a closure, failing on the
     /// first per-row error.
     pub async fn query_map_strict<T, E>(

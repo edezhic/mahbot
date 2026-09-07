@@ -741,12 +741,12 @@ impl SessionStore {
         // newest-first and pick the FIRST that structurally decodes as a
         // tool-call frame. A later assistant text row may merely contain the
         // substring — skip it. Tool results carry "tool_call_id", never
-        // "tool_calls" — the role filter already excludes them. The matching
-        // row's content is kept here so the frame's ordered calls can be
-        // decoded from it without a second SELECT.
-        let candidate_ids: Vec<i64> = tx
+        // "tool_calls" — the role filter already excludes them. Content is
+        // fetched in the same scan so the frame's ordered calls can be decoded
+        // without a second SELECT.
+        let candidates: Vec<(i64, String)> = tx
             .query(
-                "SELECT id FROM sessions \
+                "SELECT id, content FROM sessions \
                  WHERE agent_id = ?1 AND role = 'assistant' AND content LIKE '%\"tool_calls\"%' \
                  ORDER BY id DESC",
                 params![agent_id],
@@ -754,21 +754,12 @@ impl SessionStore {
             .await
             .context("find tool-call frame candidates")?
             .into_iter()
-            .map(|r| r.get::<i64>(0))
+            .map(|r| Result::<_, turso::Error>::Ok((r.get::<i64>(0)?, r.get::<String>(1)?)))
             .collect::<Result<Vec<_>, _>>()
-            .context("decode tool-call frame candidate ids")?;
+            .context("decode tool-call frame candidate rows")?;
 
         let mut frame: Option<(i64, String)> = None;
-        for id in candidate_ids {
-            let content = tx
-                .query_optional(
-                    "SELECT content FROM sessions WHERE id = ?1",
-                    params![id],
-                    |r| r.get::<String>(0),
-                )
-                .await
-                .context("load frame candidate content")?;
-            let Some(content) = content else { continue };
+        for (id, content) in candidates {
             let msg = ChatMessage {
                 role: ChatRole::Assistant,
                 content,
@@ -1325,19 +1316,14 @@ pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> anyhow
 /// Build a transient agent ID shared by the suffixed builder family
 /// (`analyze_`, `research_`, `discovery_`).
 ///
-/// Format: `{prefix}{ws_name}_{suffix}` when `label` is `None`, or
-/// `{prefix}{ws_name}_{suffix}_{label}` when `label` is `Some(_)`. The
-/// `prefix` must carry its trailing underscore (as stored in
-/// [`TRANSIENT_AGENT_ID_PREFIXES`]) so the result stays byte-identical to the
-/// historical literal builders — a bare prefix plus an inserted separator
-/// would emit a double underscore.
+/// Format: `{prefix}{ws_name}_{suffix}_{label}`. The `prefix` must carry its
+/// trailing underscore (as stored in [`TRANSIENT_AGENT_ID_PREFIXES`]) so the
+/// result stays byte-identical to the historical literal builders — a bare
+/// prefix plus an inserted separator would emit a double underscore.
 #[must_use]
-fn transient_agent_id(prefix: &str, ws_name: &str, label: Option<&str>) -> String {
+fn transient_agent_id(prefix: &str, ws_name: &str, label: &str) -> String {
     let suffix = crate::generate_suffix();
-    match label {
-        Some(label) => format!("{prefix}{ws_name}_{suffix}_{label}"),
-        None => format!("{prefix}{ws_name}_{suffix}"),
-    }
+    format!("{prefix}{ws_name}_{suffix}_{label}")
 }
 
 /// Construct the Maintainer agent ID for a workspace (deterministic, workspace-scoped).
@@ -1358,7 +1344,7 @@ pub(crate) fn maintainer_agent_id(ws_name: &str) -> String {
 /// Role is the LAST segment — see [`direct_agent_id`] for rationale.
 #[must_use]
 pub(crate) fn analyze_agent_id(ws_name: &str, role: &str) -> String {
-    transient_agent_id("analyze_", ws_name, Some(role))
+    transient_agent_id("analyze_", ws_name, role)
 }
 
 /// Construct an agent ID for a deep-research sub-agent (decomposers,
@@ -1367,7 +1353,7 @@ pub(crate) fn analyze_agent_id(ws_name: &str, role: &str) -> String {
 /// Format: `research_{ws_name}_{suffix}_{label}`
 #[must_use]
 pub(crate) fn research_agent_id(ws_name: &str, label: &str) -> String {
-    transient_agent_id("research_", ws_name, Some(label))
+    transient_agent_id("research_", ws_name, label)
 }
 
 /// Construct an agent ID for workspace role discovery.
@@ -1376,7 +1362,7 @@ pub(crate) fn research_agent_id(ws_name: &str, label: &str) -> String {
 /// Role is the LAST segment — see [`direct_agent_id`] for rationale.
 #[must_use]
 pub(crate) fn discovery_agent_id(ws_name: &str, role: &str) -> String {
-    transient_agent_id("discovery_", ws_name, Some(role))
+    transient_agent_id("discovery_", ws_name, role)
 }
 
 // ── Existing tests ──────────────────────────────────────────────
