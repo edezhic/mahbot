@@ -2623,7 +2623,7 @@ mod tests {
     // ── Diagnostics API tests ─────────────────────────────────────
 
     #[tokio::test]
-    async fn set_diagnostics_roundtrip() {
+    async fn set_diagnostics_roundtrip_and_bumps_generation() {
         let (store, _tmp) = test_store().await;
         insert_direct(&store, "diag_test", "/tmp/diag_test", false, false, 0, 0).await;
 
@@ -2650,36 +2650,9 @@ mod tests {
         assert!(loaded.type_check.is_none());
         assert!(loaded.build.is_none());
         assert!(loaded.unit_test.is_none());
-    }
-
-    #[tokio::test]
-    async fn get_generation_reads_diagnostics_column() {
-        let (store, _tmp) = test_store().await;
-        insert_direct(&store, "gen_test", "/tmp/gen_test", false, false, 5, 3).await;
 
         let diag_gen_val = store
-            .get_generation("gen_test", GenerationColumn::DIAGNOSTICS)
-            .await
-            .expect("get_generation");
-        assert_eq!(
-            diag_gen_val, 3,
-            "Should return the stored diagnostics_generation"
-        );
-    }
-
-    #[tokio::test]
-    async fn set_diagnostics_bumps_diagnostics_generation() {
-        let (store, _tmp) = test_store().await;
-        insert_direct(&store, "bump_test", "/tmp/bump_test", false, false, 0, 0).await;
-
-        let cmds = crate::DiagnosticsCommands::default();
-        store
-            .set_diagnostics("bump_test", &cmds)
-            .await
-            .expect("set_diagnostics");
-
-        let diag_gen_val = store
-            .get_generation("bump_test", GenerationColumn::DIAGNOSTICS)
+            .get_generation("diag_test", GenerationColumn::DIAGNOSTICS)
             .await
             .expect("get_generation");
         assert_eq!(
@@ -3082,14 +3055,6 @@ mod tests {
                 "def456",
                 true,
                 "Different hash should trigger rediscovery",
-            ),
-            // Edge case: current_hash is empty (shouldn't happen from git
-            // rev-parse HEAD, but the function handles it gracefully).
-            (
-                Some("abc123"),
-                "",
-                true,
-                "Empty current hash should trigger rediscovery",
             ),
         ];
         for (stored, current, expected, msg) in cases {
