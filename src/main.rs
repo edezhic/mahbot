@@ -779,11 +779,11 @@ async fn send_telegram_reply(msg: &ChannelMessage, content: String) {
     mahbot::channels::telegram::send_reply(&msg.reply_target, &content).await;
 }
 
-/// Serializes role-switch writes with their feedback (pinned text + picker
-/// checkmark) so two rapid taps commit and repaint in tap order. Held across
-/// the Telegram HTTP feedback: role switches are human-paced and the HTTP
-/// client timeout caps any stall — the accepted tradeoff for deterministic
-/// ordering.
+/// Serializes role-switch writes with their feedback (picker checkmark +
+/// command-menu refresh) so two rapid taps commit and repaint in tap order.
+/// Held across the Telegram HTTP feedback: role switches are human-paced and
+/// the HTTP client timeout caps any stall — the accepted tradeoff for
+/// deterministic ordering.
 static ROLE_SWITCH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 /// Handle a role switch request — pool-gated (revalidated at tap time),
@@ -801,19 +801,9 @@ async fn handle_role_switch(msg: &ChannelMessage, role: Role) {
         .await;
         return;
     }
-    // The pinned notification carries just the role name.
-    let text = role.display_label().to_string();
     let picker_refresh = msg
-        .chat_id
-        .clone()
-        .zip(msg.message_id)
-        .map(|(chat_id, message_id)| {
-            (
-                chat_id,
-                message_id,
-                build_role_picker_keyboard(&pool, Some(role)),
-            )
-        });
+        .message_id
+        .map(|message_id| (message_id, build_role_picker_keyboard(&pool, Some(role))));
     // Awaited inline (the callback handler is spawned per message, so this
     // never stalls the dispatch loop) under the lock that also covers the
     // write, making the persisted role and the last checkmark tap-ordered.
@@ -834,7 +824,7 @@ async fn handle_role_switch(msg: &ChannelMessage, role: Role) {
         .as_any()
         .downcast_ref::<mahbot::channels::telegram::TelegramChannel>()
         .expect("registered telegram channel");
-    tc.send_role_switch_feedback(&msg.reply_target, &text, picker_refresh)
+    tc.refresh_after_role_switch(&msg.reply_target, picker_refresh)
         .await;
 }
 

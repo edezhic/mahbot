@@ -666,10 +666,6 @@ fn bot_api_url(token: &str, method: &str) -> String {
 /// Telegram Bot API maximum file download size (20 MB).
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
-/// `config_kv` key prefix for the per-chat role-switch pin message id.
-/// Leftover entries for unbound chats are tiny and never re-read — harmless.
-pub(crate) const ROLE_PIN_KV_PREFIX: &str = "telegram_role_pin:";
-
 /// Change-detection state for a chat's per-user command menu refresh.
 enum ChatMenuState {
     /// Last successfully registered command payload (`None` = never registered).
@@ -698,13 +694,6 @@ pub struct TelegramChannel {
     /// (parallel agent responses) don't trip Telegram's rate limiting. Menu
     /// refreshes are fire-and-forget and fail-open.
     menu_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ChatMenuState>>>,
-
-    /// Mutual exclusion for role-switch pin flows: two rapid switches run in
-    /// detached tasks and must not interleave (both could read "no pin yet"
-    /// and pin two messages). Serialization is per instance — a bot-token
-    /// hot-reload replaces the channel, so an in-flight flow on the old
-    /// instance can interleave with one on the new (rare and self-healing).
-    pin_lock: tokio::sync::Mutex<()>,
 }
 
 /// Extract chat_id and reply_target from a Telegram message sub-object
@@ -951,8 +940,8 @@ fn strip_html_tags(s: &str) -> String {
     out
 }
 
-/// Classification of a Telegram edit failure (`editMessageText` or
-/// `editMessageReplyMarkup`) — matched on stable substrings independent of
+/// Classification of a Telegram edit failure (`editMessageReplyMarkup`) —
+/// matched on stable substrings independent of
 /// Telegram's wording; a reworded error hits `Other` (delivery unaffected,
 /// no recovery).
 #[derive(Debug)]
@@ -961,10 +950,9 @@ pub enum EditMessageFailure {
     NotFound,
     /// Past Telegram's 48-hour edit window.
     CannotEdit,
-    /// Text is identical ("message is not modified") — success/no-op.
+    /// Message is unchanged ("message is not modified") — success/no-op.
     NotModified,
-    /// Any other failure — deliver a plain notification, keep the stored id
-    /// (only 'not found'/'can't be edited' recover).
+    /// Any other failure (delivery unaffected, no recovery).
     Other,
 }
 
@@ -983,8 +971,7 @@ fn classify_edit_failure(description: &str) -> EditMessageFailure {
 
 /// Shared conversion for outbound text: decode HTML entities (e.g. &#39;
 /// that LLMs may emit) before markdown→HTML conversion so they don't get
-/// double-escaped. The role-pin flow reuses this so pinned content matches
-/// plain sends.
+/// double-escaped.
 fn to_telegram_html(text: &str) -> String {
     markdown_to_telegram_html(&decode_html_entities(text))
 }
@@ -1002,7 +989,6 @@ impl TelegramChannel {
             menu_cache: std::sync::Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),
             ),
-            pin_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1601,10 +1587,10 @@ impl TelegramChannel {
 
     /// Send one Telegram text message, with optional `parse_mode`. Returns
     /// the Telegram message id on success (`None` when the 2xx body omits it
-    /// — the message was still delivered; only the pin flow needs the id), or
-    /// the HTTP status and response body on failure. Parsing the body for the
-    /// id is an accepted coupling into the shared send path — the `None` case
-    /// preserves status-only semantics for callers that don't need the id.
+    /// — the message was still delivered), or the HTTP status and response
+    /// body on failure. Parsing the body for the id is an accepted coupling
+    /// into the shared send path — the `None` case preserves status-only
+    /// semantics for callers that don't need the id.
     async fn send_message_get_id(
         &self,
         chat_id: &str,
@@ -1715,29 +1701,6 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Edit a previously sent message's text. Returns the HTTP status and
-    /// error body on failure — the caller classifies the error.
-    async fn edit_message_text(
-        &self,
-        chat_id: &str,
-        message_id: i64,
-        text: &str,
-        parse_mode: Option<&str>,
-    ) -> Result<(), (reqwest::StatusCode, String)> {
-        let mut body = serde_json::json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": text,
-        });
-        if let Some(mode) = parse_mode {
-            body["parse_mode"] = serde_json::Value::String(mode.to_string());
-        }
-
-        self.post_telegram_json("editMessageText", body, "editMessageText error")
-            .await
-            .map(|_| ())
-    }
-
     /// Replace a previously sent message's inline keyboard in place
     /// (`editMessageReplyMarkup`). `reply_markup` must be a full
     /// `{"inline_keyboard": [...]}` value (or `Value::Null` to remove the
@@ -1763,214 +1726,27 @@ impl TelegramChannel {
         .map_err(|(_, desc)| classify_edit_failure(&desc))
     }
 
-    /// Pin a message in a chat. Pins are always silent in private chats;
-    /// `disable_notification` additionally suppresses any service notice.
-    async fn pin_chat_message(
-        &self,
-        chat_id: &str,
-        message_id: i64,
-    ) -> Result<(), (reqwest::StatusCode, String)> {
-        let body = serde_json::json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "disable_notification": true,
-        });
-
-        self.post_telegram_json("pinChatMessage", body, "pinChatMessage error")
-            .await
-            .map(|_| ())
-    }
-
-    /// Send the role-switch feedback: the pinned success notification plus,
-    /// when the tap carried the pressed picker's identity, an in-place ✓ move
-    /// on that picker's keyboard. Callers must serialize the preceding
+    /// Refresh the role-switch feedback: the per-role command menu and, when
+    /// the tap carried the pressed picker's identity, an in-place ✓ move on
+    /// that picker's keyboard (`picker_refresh` carries its
+    /// `(message_id, keyboard)`). Callers must serialize the preceding
     /// `switch_active_role` write with this call (the bin holds one lock over
-    /// both) so rapid taps can't leave the last-landed checkmark or pin text
-    /// disagreeing with the persisted role; the internal pin lock additionally
-    /// serializes concurrent callers. The lock is held across the HTTP calls
-    /// (role switches are human-paced; the HTTP client timeout caps any
-    /// stall) — the accepted tradeoff for deterministic ordering.
-    pub async fn send_role_switch_feedback(
+    /// both) so rapid taps can't leave the last-landed checkmark disagreeing
+    /// with the persisted role.
+    pub async fn refresh_after_role_switch(
         &self,
         reply_target: &str,
-        text: &str,
-        picker_refresh: Option<(String, i64, serde_json::Value)>,
+        picker_refresh: Option<(i64, serde_json::Value)>,
     ) {
-        // The lock is held across the HTTP calls — role switches are
-        // human-paced, so contention is negligible.
-        let _guard = self.pin_lock.lock().await;
-        self.send_role_switch_notification(reply_target, text).await;
-        if let Some((chat_id, message_id, keyboard)) = picker_refresh
-            && let Err(e) = self
-                .edit_reply_markup(&chat_id, message_id, &keyboard)
-                .await
+        let (chat_id, _thread_id) = parse_recipient(reply_target);
+        // Same command-menu refresh the normal send path triggers.
+        self.spawn_menu_refresh(chat_id);
+        if let Some((message_id, keyboard)) = picker_refresh
+            && let Err(e) = self.edit_reply_markup(chat_id, message_id, &keyboard).await
         {
             // Best-effort: a deleted/48h-expired message or an identical
             // keyboard (re-tap of the active role) is cosmetic — log and skip.
             tracing::debug!(?e, "role picker keyboard refresh skipped");
-        }
-    }
-
-    /// Send the role-switch success notification in a Telegram private chat,
-    /// pinned at the top: the first switch sends + pins + persists the message
-    /// id (per chat in `config_kv`); later switches edit it in place and
-    /// re-affirm the pin. Fail-open: the text is always delivered (barring
-    /// transport failure or a shutdown dropping the detached task) — a deleted
-    /// or past-48h pin is re-sent and re-pinned, other edit failures deliver a
-    /// plain message while the stored id is kept (only 'not found'/'can't be
-    /// edited' recover), and a failed re-pin after a successful edit is only
-    /// logged. Groups and threads get a plain notification (no pin).
-    async fn send_role_switch_notification(&self, reply_target: &str, text: &str) {
-        let (chat_id, thread_id) = parse_recipient(reply_target);
-        // Same command-menu refresh the normal send path triggers.
-        self.spawn_menu_refresh(chat_id);
-        let html = to_telegram_html(text);
-
-        // Pin only in private chats (positive chat_id) — groups require admin
-        // rights and pinChatMessage has no thread parameter.
-        if thread_id.is_some() || !chat_id.parse::<i64>().is_ok_and(|id| id > 0) {
-            self.send_plain_role_notification(chat_id, thread_id, &html)
-                .await;
-            return;
-        }
-
-        let kv_key = format!("{ROLE_PIN_KV_PREFIX}{chat_id}");
-        let stored_id = match crate::config_db::store().get_kv(&kv_key).await {
-            Ok(Some(id)) => id.parse::<i64>().ok(),
-            Ok(None) => None,
-            Err(e) => {
-                // DB unavailable — deliver plain, skip pinning; self-heals next switch.
-                tracing::warn!(chat_id, error = %e, "Failed to read Telegram role pin id");
-                self.send_plain_role_notification(chat_id, thread_id, &html)
-                    .await;
-                return;
-            }
-        };
-
-        let Some(message_id) = stored_id else {
-            self.send_and_pin_role_notification(chat_id, thread_id, &html, &kv_key)
-                .await;
-            return;
-        };
-
-        match self
-            .edit_message_text(chat_id, message_id, &html, Some("HTML"))
-            .await
-        {
-            Ok(()) => {}
-            Err((_, desc)) => match classify_edit_failure(&desc) {
-                EditMessageFailure::NotModified => {} // identical text — success/no-op
-                EditMessageFailure::NotFound => {
-                    tracing::warn!(
-                        chat_id,
-                        message_id,
-                        "Telegram role pin deleted — re-sending"
-                    );
-                    self.send_and_pin_role_notification(chat_id, thread_id, &html, &kv_key)
-                        .await;
-                    return;
-                }
-                EditMessageFailure::CannotEdit => {
-                    // Past the 48h edit window: re-send + re-pin a fresh id —
-                    // it auto-replaces the stale pin, and a failed fresh pin
-                    // self-heals on the next switch via the stored fresh id.
-                    tracing::warn!(
-                        chat_id,
-                        message_id,
-                        error = %desc,
-                        "Telegram role pin no longer editable (48h window) — re-sending"
-                    );
-                    self.send_and_pin_role_notification(chat_id, thread_id, &html, &kv_key)
-                        .await;
-                    return;
-                }
-                EditMessageFailure::Other => {
-                    // Unclassified failure — deliver the notification as a
-                    // plain message and keep the stored id (no re-send; only
-                    // 'not found'/'can't be edited' recover).
-                    tracing::warn!(chat_id, message_id, error = %desc, "Telegram role pin edit failed — delivering plain notification");
-                    self.send_plain_role_notification(chat_id, thread_id, &html)
-                        .await;
-                    return;
-                }
-            },
-        }
-        // Edited in place (or no-op) — re-affirm the pin (restores an
-        // unpin-without-delete).
-        if let Err((status, desc)) = self.pin_chat_message(chat_id, message_id).await {
-            tracing::warn!(chat_id, message_id, status = ?status, error = %desc, "Telegram role pin re-pin failed");
-        }
-    }
-
-    /// Low-level role notification send (HTML parse mode, no markup); returns
-    /// the message id (`None` when the 2xx body omits it — the message was
-    /// delivered, only the pin flow needs the id). The fixed plain-word text
-    /// can't produce HTML that Telegram rejects, so the strip-tags retry the
-    /// chunked send path uses is unnecessary here. The `_plain` and `_and_pin`
-    /// wrappers differ in what they do with the id.
-    async fn send_role_notification_html(
-        &self,
-        chat_id: &str,
-        thread_id: Option<&str>,
-        html: &str,
-    ) -> Result<Option<i64>, (reqwest::StatusCode, String)> {
-        self.send_message_get_id(chat_id, thread_id, html, Some("HTML"), None)
-            .await
-    }
-
-    /// Send the role notification as a plain (unpinned) message — the
-    /// non-pinnable-context and fail-open fallback. Logs send failures.
-    async fn send_plain_role_notification(
-        &self,
-        chat_id: &str,
-        thread_id: Option<&str>,
-        html: &str,
-    ) {
-        if let Err((status, desc)) = self
-            .send_role_notification_html(chat_id, thread_id, html)
-            .await
-        {
-            tracing::warn!(chat_id, status = ?status, error = %desc, "Telegram role notification send failed");
-        }
-    }
-
-    /// Send a fresh role notification and pin it. The id is persisted BEFORE
-    /// pinning — a crash between send and persist leaves only a harmless
-    /// unpinned duplicate; if persistence fails the pin is skipped so it can
-    /// never be orphaned (self-heals on the next switch).
-    async fn send_and_pin_role_notification(
-        &self,
-        chat_id: &str,
-        thread_id: Option<&str>,
-        html: &str,
-        kv_key: &str,
-    ) {
-        let message_id = match self
-            .send_role_notification_html(chat_id, thread_id, html)
-            .await
-        {
-            Ok(Some(id)) => id,
-            Ok(None) => {
-                tracing::warn!(
-                    chat_id,
-                    "Telegram role notification sent without a message id — cannot pin"
-                );
-                return;
-            }
-            Err((status, desc)) => {
-                tracing::warn!(chat_id, status = ?status, error = %desc, "Telegram role notification send failed");
-                return;
-            }
-        };
-        if let Err(e) = crate::config_db::store()
-            .set_kv(kv_key, &message_id.to_string())
-            .await
-        {
-            tracing::warn!(chat_id, message_id, error = %e, "Failed to persist Telegram role pin id — skipping pin");
-            return;
-        }
-        if let Err((status, desc)) = self.pin_chat_message(chat_id, message_id).await {
-            tracing::warn!(chat_id, message_id, status = ?status, error = %desc, "Telegram role notification pin failed");
         }
     }
 

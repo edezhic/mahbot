@@ -91,9 +91,9 @@
 //! Rows in `config_kv` without a corresponding [`ConfigData`] field are
 //! lazily purged on reload: [`reload_from_db`] logs each unknown key at
 //! `debug`, then best-effort deletes garbage rows (debug on success, warn
-//! on transient failure without failing boot) while the two intentional
-//! shared namespaces `crate::workspace::NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY`
-//! and `crate::channels::telegram::ROLE_PIN_KV_PREFIX` are left untouched.
+//! on transient failure without failing boot) while the intentional
+//! shared namespace `crate::workspace::NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY`
+//! is left untouched.
 //! Downgrade resurrection is therefore lost — under the previous ghost policy
 //! orphans were retained and would re-appear on downgrade, now they are deleted
 //! on first reboot. New orphans cannot be created via the settings path because
@@ -1140,17 +1140,15 @@ pub async fn reload_from_db() -> Result<()> {
 
 /// Delete `config_kv` rows whose keys are no longer recognized config fields
 /// (e.g. a setting removed in an upgrade), so stale values cannot resurface if
-/// the key is ever reintroduced. Preserved shared namespaces written by other
-/// subsystems — the nightly-discovery marker and Telegram role pins — are left
-/// untouched. Delete failures are logged and tolerated (transient, retried on
-/// the next reload).
+/// the key is ever reintroduced. The nightly-discovery marker shared
+/// namespace written by another subsystem is left untouched. Delete failures
+/// are logged and tolerated (transient, retried on the next reload).
 async fn purge_unknown_kv_orphans(store: &crate::config_db::ConfigStore, kvs: &[(String, String)]) {
     let orphans: Vec<String> = kvs
         .iter()
         .filter(|(key, _)| {
             !ConfigData::STRUCT_FIELDS_DEFAULT.has_string_field(key)
                 && key != crate::workspace::NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY
-                && !key.starts_with(crate::channels::telegram::ROLE_PIN_KV_PREFIX)
         })
         .map(|(key, _)| key.clone())
         .collect();

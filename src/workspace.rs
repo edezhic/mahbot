@@ -1559,8 +1559,7 @@ pub struct EditorTabRecord {
 /// rediscovery, so the timestamp must live in a table that outlives workspace
 /// churn (the append-only migration catalog supports column deltas, but a
 /// deleted row loses all of its columns). Unknown `config_kv` keys are purged
-/// on reload, except the preserved shared namespaces (this key and
-/// telegram_role_pin:*) which are left untouched.
+/// on reload, except the preserved shared namespace of this key.
 pub(crate) const NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY: &str = "nightly_discovery_last_pass_at";
 
 /// Returns `true` when the given local hour falls within the nightly
