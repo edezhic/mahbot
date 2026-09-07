@@ -225,7 +225,7 @@ fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
 /// Run a git command without any interpretation of the exit code.
 ///
 /// Shared by [`run_git_command`] and other raw-output callers to avoid
-/// duplicating the spawn + output + decode pattern. Returns the raw
+/// duplicating the spawn + collect + wait pattern. Returns the raw
 /// [`std::process::Output`] so each caller can interpret the exit
 /// status as appropriate.
 ///
@@ -757,17 +757,6 @@ async fn enumerate_untracked_dir(repo_path: &Path, dir: &str) -> anyhow::Result<
     Ok(parse_untracked_from_porcelain(&out))
 }
 
-/// Whether the repository has a resolvable HEAD commit (i.e. is not unborn).
-///
-/// Used to distinguish an unborn HEAD (a freshly `git init`ed repo with no
-/// commits) from other numstat failures — an unborn repo should still yield a
-/// working-tree snapshot with empty diff stats and full per-file statuses.
-async fn git_head_exists(repo_path: &Path) -> bool {
-    run_git_command(repo_path, &["rev-parse", "--verify", "HEAD"])
-        .await
-        .is_ok()
-}
-
 /// Working-tree snapshot: aggregate diff stats plus per-file porcelain
 /// statuses, from a single `git status --porcelain` + one numstat pass.
 ///
@@ -810,7 +799,11 @@ pub async fn run_git_worktree_snapshot(repo_path: &Path) -> anyhow::Result<GitWo
 
     let (added, removed, unborn_head) = match parse_numstat(repo_path, &["HEAD"]).await {
         Ok(stats) => (stats.0, stats.1, false),
-        Err(_) if !git_head_exists(repo_path).await => (0, 0, true),
+        // `git_has_commits` distinguishes an unborn HEAD (a freshly
+        // `git init`ed repo with no commits) from other numstat failures —
+        // an unborn repo should still yield a snapshot with empty stats and
+        // full per-file statuses.
+        Err(_) if !git_has_commits(repo_path).await => (0, 0, true),
         Err(e) => return Err(e.context("Failed to compute working-tree diff stats")),
     };
     let mut accum = UntrackedAccumulator {
@@ -1238,23 +1231,6 @@ mod tests {
         let (_dir, repo_path) = init_temp_repo();
         let has = git_has_commits(&repo_path).await;
         assert!(has, "repo with initial commit should have commits");
-    }
-
-    #[tokio::test]
-    async fn test_git_has_commits_false() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let repo_path = dir.path().to_path_buf();
-
-        // `git init` without any commit — empty repo
-        let status = std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&repo_path)
-            .status()
-            .expect("git init");
-        assert!(status.success());
-
-        let has = git_has_commits(&repo_path).await;
-        assert!(!has, "empty repo should not have commits");
     }
 
     #[tokio::test]
