@@ -451,7 +451,7 @@ pub(crate) fn cleanup_agent_id(job_id: &str) -> String {
 /// the row was created (the caller spawns the agent with that prompt), or
 /// `Ok(None)` when the row already exists (deduped — the boot-scan arm resumes
 /// the surviving row). Idempotent.
-pub(crate) async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Result<Option<String>> {
+async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Result<Option<String>> {
     let conn = &crate::session::store().conn;
     // The row itself is the dedup marker: a surviving row means the cleanup is
     // already in flight (crash between dispatch and completion) — no second
@@ -699,7 +699,7 @@ struct MediaCursor {
 /// Reset the in-memory media-sweep cursors (tests only — production never
 /// needs a reset: a restart clears the process-global anyway).
 #[cfg(test)]
-pub(crate) async fn reset_media_cursors() {
+async fn reset_media_cursors() {
     if let Some(map) = MEDIA_CURSORS.lock().await.as_mut() {
         map.clear();
     }

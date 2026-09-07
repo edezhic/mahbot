@@ -78,19 +78,19 @@ use crate::{ChatRequest, ChatResponse};
 // ── Hardcoded retry defaults (no config surface — fixed in code) ─────────
 
 pub(crate) const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 13;
-pub(crate) const DEFAULT_RETRY_BASE_BACKOFF_MS: u64 = 5_000;
-pub(crate) const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 60_000;
+const DEFAULT_RETRY_BASE_BACKOFF_MS: u64 = 5_000;
+const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 60_000;
 
 /// Dedicated joint-verdict synthesis retry schedule: total calls (1 full
 /// synthesis + up to N-1 repair rounds; default 3 = the lower edge of the
 /// approved 3–5 band), 30–45 s backoff band (base 30 s, cap 45 s, ±25%
 /// jitter on sleeps).
-pub(crate) const DEFAULT_SYNTHESIS_MAX_ATTEMPTS: u32 = 3;
-pub(crate) const DEFAULT_SYNTHESIS_BASE_BACKOFF_MS: u64 = 30_000;
-pub(crate) const DEFAULT_SYNTHESIS_MAX_BACKOFF_MS: u64 = 45_000;
+const DEFAULT_SYNTHESIS_MAX_ATTEMPTS: u32 = 3;
+const DEFAULT_SYNTHESIS_BASE_BACKOFF_MS: u64 = 30_000;
+const DEFAULT_SYNTHESIS_MAX_BACKOFF_MS: u64 = 45_000;
 
 /// Fail-open comment-extraction attempt budget — see [`RetryPolicy::comment`].
-pub(crate) const DEFAULT_COMMENT_MAX_ATTEMPTS: u32 = 3;
+const DEFAULT_COMMENT_MAX_ATTEMPTS: u32 = 3;
 
 /// Dedicated reasoning-only-stop continuation schedule: up to 3 appended-only
 /// continuation re-requests after the original in-class response, bounded by
@@ -99,7 +99,7 @@ pub(crate) const DEFAULT_COMMENT_MAX_ATTEMPTS: u32 = 3;
 /// single `chat_scoped` call (no inner transport retry — the appended tail
 /// makes every new reasoning state a fresh request; retryable transport errors
 /// re-send the identical bytes).
-pub(crate) const DEFAULT_CONTINUATION_MAX_ATTEMPTS: u32 = 3;
+const DEFAULT_CONTINUATION_MAX_ATTEMPTS: u32 = 3;
 
 /// The single timeout governing every LLM chat request — bounds the
 /// response-header wait (TTFB) and each body-read chunk wait, resetting while
@@ -134,7 +134,7 @@ pub(crate) struct RetryPolicy {
 impl RetryPolicy {
     /// Build the default policy from the hardcoded constants.
     #[must_use]
-    pub(crate) fn default() -> Self {
+    fn default() -> Self {
         Self {
             max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
             base_backoff_ms: DEFAULT_RETRY_BASE_BACKOFF_MS,
@@ -259,7 +259,7 @@ pub(crate) fn tiny_test_policy() -> RetryPolicy {
 /// hardcoded defaults (base 5000 / cap 60000) yield the binding agent-loop
 /// schedule 5/10/20/40/60/60… s — total sleep 555 s over 13 attempts.
 #[must_use]
-pub(crate) fn backoff_sequence(policy: &RetryPolicy) -> Vec<u64> {
+fn backoff_sequence(policy: &RetryPolicy) -> Vec<u64> {
     let sleeps = policy.max_attempts.saturating_sub(1) as usize;
     let mut seq = Vec::with_capacity(sleeps);
     for i in 0..sleeps {
@@ -274,7 +274,7 @@ pub(crate) fn backoff_sequence(policy: &RetryPolicy) -> Vec<u64> {
 /// Jitter touches the SLEEP ONLY, never the request bytes.
 /// The modulo guard keeps 0/1 ms schedules (test policies) division-safe.
 #[must_use]
-pub(crate) fn jittered_backoff_ms(base_ms: u64) -> u64 {
+fn jittered_backoff_ms(base_ms: u64) -> u64 {
     base_ms - base_ms / 4 + (rand::random::<u64>() % (base_ms / 2).max(1))
 }
 
@@ -284,7 +284,7 @@ pub(crate) fn jittered_backoff_ms(base_ms: u64) -> u64 {
 /// to [5000 ms, 60000 ms]. Otherwise ±25% jitter is applied to the schedule
 /// backoff — jitter touches the SLEEP ONLY, never the request bytes.
 #[must_use]
-pub(crate) fn compute_sleep_ms(schedule_ms: u64, retry_after_ms: Option<u64>) -> u64 {
+fn compute_sleep_ms(schedule_ms: u64, retry_after_ms: Option<u64>) -> u64 {
     if let Some(ra) = retry_after_ms {
         ra.clamp(RETRY_AFTER_MIN_MS, RETRY_AFTER_MAX_MS)
     } else {
@@ -476,7 +476,7 @@ impl RetryExhausted {
     }
 
     #[must_use]
-    pub(crate) fn shutdown(failures: Vec<RetryFailureRecord>) -> Self {
+    fn shutdown(failures: Vec<RetryFailureRecord>) -> Self {
         Self::new(failures, FailureClass::Shutdown)
     }
 }

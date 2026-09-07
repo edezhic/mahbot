@@ -737,7 +737,7 @@ const LOG_WRITER_PANIC_BACKOFF_MS: u64 = 500;
 pub struct LogWriterPanicState {
     /// Consecutive storage-panic restarts in progress (0 when the last flush
     /// succeeded).
-    pub consecutive_panics: u32,
+    consecutive_panics: u32,
     /// True once the writer stopped flushing permanently after exceeding
     /// [`LOG_WRITER_MAX_CONSECUTIVE_PANICS`] — the terminal banner state.
     pub writer_stopped: bool,
@@ -746,7 +746,7 @@ pub struct LogWriterPanicState {
 impl LogWriterPanicState {
     /// Record a storage panic; returns the updated consecutive-panic count.
     #[must_use]
-    pub fn record_panic(&mut self) -> u32 {
+    fn record_panic(&mut self) -> u32 {
         self.consecutive_panics += 1;
         if self.consecutive_panics >= LOG_WRITER_MAX_CONSECUTIVE_PANICS {
             self.writer_stopped = true;
@@ -757,14 +757,14 @@ impl LogWriterPanicState {
     /// Reset the consecutive-panic counter after a successful flush. The
     /// terminal stopped state is sticky — a stopped writer never flushes again
     /// (the broken connection cannot be healed without reopening the store).
-    pub fn reset(&mut self) {
+    fn reset(&mut self) {
         self.consecutive_panics = 0;
     }
 }
 
 /// Snapshot of the log-writer failure surface, for display and tests.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct LogWriteErrorInfo {
+pub(crate) struct LogWriteErrorInfo {
     /// Total failures recorded since startup — batch insert failures and writer panics.
     pub count: u64,
     /// RFC 3339 timestamp of the most recent failure.
@@ -801,7 +801,7 @@ static LOG_WRITE_LAST_STDERR_WARN_MS: AtomicU64 = AtomicU64::new(0);
 /// page renders a warning banner from it. It is safe to call from anywhere
 /// (no tracing involved), including from inside the writer task itself.
 #[must_use]
-pub fn log_write_error_info() -> LogWriteErrorInfo {
+pub(crate) fn log_write_error_info() -> LogWriteErrorInfo {
     LOG_WRITE_LAST_ERROR.lock().unwrap_poison().clone()
 }
 

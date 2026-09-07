@@ -453,7 +453,7 @@ macro_rules! string_config_fields {
             /// [`STRUCT_FIELDS_DEFAULT`] every value is `None`, so a value-based
             /// probe would always return `false`.
             #[must_use]
-            pub(crate) fn has_string_field(&self, key: &str) -> bool {
+            fn has_string_field(&self, key: &str) -> bool {
                 match key {
                     $(stringify!($field) => true,)*
                     _ => false,
@@ -851,7 +851,7 @@ impl ConfigReload {
     ///
     /// `None` on `provider_order` removes the row (mirroring the
     /// DELETE-if-empty persistence path).
-    pub(crate) fn set_model_routing_row(&self, model: &str, provider_order: Option<String>) {
+    fn set_model_routing_row(&self, model: &str, provider_order: Option<String>) {
         let mut guard = self.inner.write().unwrap_poison();
         if provider_order.is_none() {
             guard.model_routings.retain(|mr| mr.model != model);

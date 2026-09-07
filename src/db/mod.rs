@@ -1113,7 +1113,7 @@ impl Connection {
     /// it never resets the shared WAL frame index, so it is safe to run while
     /// other connections are live. The WAL file keeps growing until a
     /// TRUNCATE checkpoint runs; callers bound that growth with a size cap.
-    pub(crate) async fn checkpoint_passive(&self) -> anyhow::Result<CheckpointOutcome> {
+    async fn checkpoint_passive(&self) -> anyhow::Result<CheckpointOutcome> {
         self.run_checkpoint(CheckpointMode::Passive).await
     }
 
