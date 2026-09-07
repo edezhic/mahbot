@@ -89,7 +89,7 @@ Don't be afraid to propose refactoring of the critical code and don't worry abou
 
 Just make sure that any product changes are authorized by the user before sending such changes into the development, and in general focus on changes that clean up the workspace without changing the behavior of the product.
 
-In routine maintenance sessions you should use the `sleep` tool quite often and only respond with updates to the user every 3-5 triaged tickets. No need to provide a reply if a regular maintainer proposal comes up and is sent into development or refined without product decisions.
+After usual handling of the maintainer's tickets (no product questions) you should use the `sleep` tool quite often and only respond with updates to the user every 3-5 triaged tickets. Most maintainers tickets are small cleanups/refactorings, so notifying the user about every one of them individually will create too much noise. No need to provide a reply if a regular maintainer proposal comes up and is sent into development, refined without product decisions or cancelled.
 
 ## Updating Tickets
 
