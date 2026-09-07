@@ -9,7 +9,7 @@
 //! [`OutEnvelope`]) lives here too.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Response from chrome-use `--json` commands — the ONE structural envelope
 /// parser every browser frontend shares.
@@ -90,6 +90,103 @@ pub(crate) fn extract_snapshot_text(data: &serde_json::Value) -> Option<String> 
         ["text", "result", "content", "snapshot"]
             .iter()
             .find_map(|key| data.get(*key).and_then(Value::as_str).map(String::from))
+    })
+}
+
+/// Unwrap the actual JS result from an eval response. chrome-use wraps
+/// `eval` output as `data = {origin, result}` — an object carrying BOTH keys
+/// is treated as that wrapper; every other shape (a bare value, a plain
+/// string, a page result that merely has a `result` field) passes through.
+pub(crate) fn eval_result(resp: &BrowserResponse) -> Option<&Value> {
+    resp.data
+        .as_ref()
+        .map(|d| match (d.get("result"), d.get("origin")) {
+            (Some(result), Some(_)) => result,
+            _ => d,
+        })
+}
+
+/// Extract a non-negative element count from a count-eval response — the eval
+/// result arrives as a JSON number or its text form.
+pub(crate) fn eval_count(resp: &BrowserResponse) -> Option<u64> {
+    let data = eval_result(resp)?;
+    data.as_u64()
+        .or_else(|| data.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+}
+
+/// Trim `rows` to `limit` (mahbot-side) while reporting the honest `total`.
+/// Returns `(trimmed, total, returned)`.
+fn trim_extract_rows(rows: Vec<Value>, limit: Option<usize>) -> (Vec<Value>, usize, usize) {
+    let total = rows.len();
+    let returned = limit.map_or(total, |l| l.min(total));
+    let trimmed: Vec<Value> = rows.into_iter().take(returned).collect();
+    (trimmed, total, returned)
+}
+
+/// Rows from a chrome-use `extract --json` response `data` field.
+///
+/// chrome-use 1.5.101 answers rows-mode extract with
+/// `data = {extracted: [...], count, origin, meta}` (a `diagnostic` string is
+/// added on 0-match — unreachable through the count-gated frontends).
+/// Tolerance: a plain array passes through; a bare object is a single-object
+/// (schemaless) extract and becomes a one-element row list.
+fn extract_rows(data: &Value) -> Vec<Value> {
+    match data {
+        Value::Object(o) => match o.get("extracted") {
+            Some(Value::Array(a)) => a.clone(),
+            Some(other) => vec![other.clone()],
+            None => vec![Value::Object(o.clone())],
+        },
+        Value::Array(a) => a.clone(),
+        Value::Null => Vec::new(),
+        other => vec![other.clone()],
+    }
+}
+
+/// The ONE extract output contract for both frontends: read the rows from a
+/// chrome-use extract response `data` value and shape the payload — `data`
+/// carries the (possibly `limit`-trimmed) rows, `total` the honest full
+/// count, and `returned` appears only when a `limit` was applied.
+#[must_use]
+pub(crate) fn extract_output(data: &Value, limit: Option<usize>) -> Value {
+    let (trimmed, total, returned) = trim_extract_rows(extract_rows(data), limit);
+    let mut payload = json!({ "data": trimmed, "total": total });
+    if limit.is_some() {
+        payload["returned"] = json!(returned);
+    }
+    payload
+}
+
+/// A parsed `expect` verdict from a chrome-use `expect --json` response
+/// `data` object. `pass` is the authoritative tri-state anchor: `None` from
+/// [`expect_outcome`] means the payload was not an expect verdict at all.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExpectOutcome {
+    pub(crate) pass: bool,
+    /// The observed value chrome-use evaluated (element presence object,
+    /// count, text, URL string, …) — `None` when absent.
+    pub(crate) actual: Option<Value>,
+    /// chrome-use sets `timedOut: true` when the condition never held within
+    /// the deadline. mahbot never passes --no-wait, so a false verdict always
+    /// arrives folded into `timedOut` in practice; a bare `pass:false` is
+    /// defensive against a future chrome-use grammar change.
+    pub(crate) timed_out: bool,
+}
+
+/// Parse the `expect` verdict out of a chrome-use response `data` value.
+/// Returns `None` when the payload carries no boolean `pass` key (not an
+/// expect verdict — the caller classifies it as a generic error).
+#[must_use]
+pub(crate) fn expect_outcome(data: &Value) -> Option<ExpectOutcome> {
+    let obj = data.as_object()?;
+    let pass = obj.get("pass")?.as_bool()?;
+    Some(ExpectOutcome {
+        pass,
+        actual: obj.get("actual").cloned(),
+        timed_out: obj
+            .get("timedOut")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -336,5 +433,81 @@ mod tests {
             env.to_json(),
             r#"{"schema":1,"action":"status","ok":true,"kind":"ok","chrome_use":"present","relay_up":true}"#
         );
+    }
+
+    #[test]
+    fn extract_output_reads_the_chrome_use_15101_envelope() {
+        // The real 1.5.101 rows-mode shape: {extracted, count, origin, meta}.
+        let data = serde_json::json!({
+            "extracted": [{"a": 1}, {"a": 2}, {"a": 3}],
+            "count": 3,
+            "origin": "https://x",
+            "meta": {},
+        });
+        let out = extract_output(&data, Some(2));
+        assert_eq!(
+            out["data"],
+            serde_json::json!([{"a": 1}, {"a": 2}]),
+            "limit trims rows"
+        );
+        assert_eq!(out["total"], 3, "total stays honest");
+        assert_eq!(out["returned"], 2);
+
+        // Without a limit: no `returned` key.
+        let out = extract_output(&data, None);
+        assert_eq!(out["total"], 3);
+        assert!(out.get("returned").is_none());
+    }
+
+    #[test]
+    fn extract_output_tolerates_other_shapes() {
+        // Plain array passes through unchanged.
+        let arr = serde_json::json!([{"a": 1}]);
+        assert_eq!(
+            extract_output(&arr, None)["data"],
+            serde_json::json!([{"a": 1}])
+        );
+
+        // Bare object → single-element (schemaless) row list.
+        let obj = serde_json::json!({"a": 1});
+        assert_eq!(
+            extract_output(&obj, None)["data"],
+            serde_json::json!([{"a": 1}])
+        );
+
+        // Non-array `extracted` field → wrapped as a single row.
+        let weird = serde_json::json!({"extracted": "weird"});
+        assert_eq!(
+            extract_output(&weird, None)["data"],
+            serde_json::json!(["weird"])
+        );
+
+        // Null → empty rows, total 0.
+        let out = extract_output(&serde_json::Value::Null, None);
+        assert_eq!(out["data"], serde_json::json!([]));
+        assert_eq!(out["total"], 0);
+    }
+
+    #[test]
+    fn expect_outcome_parses_pass_fail_and_timeout() {
+        // pass true, no timeout, no actual.
+        let o = expect_outcome(&serde_json::json!({"pass": true})).expect("verdict present");
+        assert!(o.pass);
+        assert_eq!(o.actual, None);
+        assert!(!o.timed_out);
+
+        // pass false with actual + timedOut, unknown keys ignored.
+        let o = expect_outcome(&serde_json::json!({
+            "pass": false, "actual": 42, "timedOut": true, "condition": "x", "kind": "count",
+        }))
+        .expect("verdict present");
+        assert!(!o.pass);
+        assert_eq!(o.actual, Some(serde_json::json!(42)));
+        assert!(o.timed_out);
+
+        // Not an expect verdict.
+        assert_eq!(expect_outcome(&serde_json::json!({"success": true})), None);
+        assert_eq!(expect_outcome(&serde_json::json!({"actual": 1})), None);
+        assert_eq!(expect_outcome(&serde_json::json!("x")), None);
     }
 }

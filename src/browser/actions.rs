@@ -93,7 +93,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "The URL must be http(s). Reports the committed final URL. An uncommitted navigation (tab still on about:blank) or a Chrome error page is kind network. An invalid URL is kind usage (rc 3).",
+                details: "The URL must be http(s). Reports the committed final URL. An uncommitted navigation (tab still on about:blank) or a Chrome error page is kind network. An invalid URL is kind usage (rc 3). `--expect` is a wait-for-selector convenience after navigation, not a general assertion — use the expect action for condition checks.",
                 examples: &[
                     "mahbot browser open https://example.com",
                     "mahbot browser open https://example.com --expect \"#main\" --structural --timeout 15",
@@ -127,11 +127,34 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "wait",
-            purpose: "wait until a CSS selector matches something",
-            tool: None,
+            purpose: "wait until a CSS selector matches, the URL matches a pattern, or text appears",
+            tool: Some(ToolParams {
+                required: &[],
+                properties: json!({
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector to wait for (give exactly ONE of selector/url/text)"
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "URL pattern to wait for (give exactly ONE of selector/url/text)"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to wait for in the page (give exactly ONE of selector/url/text)"
+                    }
+                }),
+            }),
             cli: Some(CliHelp {
-                syntax: "<selector> [--timeout <secs>]",
-                flags: &[("--timeout <secs>", "step deadline in seconds (default 8)")],
+                syntax: "(<selector> | --url <pattern> | --text <text>) [--timeout <secs>]",
+                flags: &[
+                    ("--url <pattern>", "wait until the URL matches this pattern"),
+                    ("--text <text>", "wait until this text appears in the page"),
+                    (
+                        "--timeout <secs>",
+                        "condition deadline in seconds (default 8; forwarded to chrome-use and bounded mahbot-side)",
+                    ),
+                ],
                 session: true,
                 kinds: &[
                     OutKind::Ok,
@@ -142,8 +165,71 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "The deadline is enforced mahbot-side by bounding the spawned chrome-use step; --timeout is never forwarded to chrome-use.",
-                examples: &["mahbot browser wait \"#results\" --timeout 15"],
+                details: "Exactly one target: a selector positional, --url, or --text. A numeric first token (chrome-use's silent-sleep form) is rejected as usage. --timeout IS forwarded to chrome-use (its wait forms honor it) and the spawn is additionally bounded mahbot-side. --fn/--load are not exposed.",
+                examples: &[
+                    "mahbot browser wait \"#results\" --timeout 15",
+                    "mahbot browser wait --text \"Loaded\" --timeout 10",
+                ],
+            }),
+        },
+        ActionDesc {
+            name: "expect",
+            purpose: "assert a page condition (visible/hidden/present/count/text/value/attr/url) with a bounded wait",
+            tool: Some(ToolParams {
+                required: &["condition"],
+                properties: json!({
+                    "condition": {
+                        "type": "string",
+                        "description": "Condition to assert: visible | hidden | present | count | text | value | attr | url"
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector the condition applies to (required for all conditions except url)"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Expected element count (condition 'count')"
+                    },
+                    "op": {
+                        "type": "string",
+                        "description": "Comparison for condition 'count': == != > < >= <= (default ==)"
+                    },
+                    "predicate": {
+                        "type": "string",
+                        "description": "Comparison for text/value/attr/url: equals | contains | matches (default equals)"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Attribute name for condition 'attr'"
+                    },
+                    "expected": {
+                        "type": "string",
+                        "description": "Expected value for text/value/attr; the URL pattern for url"
+                    }
+                }),
+            }),
+            cli: Some(CliHelp {
+                syntax: "(<selector> <visible|hidden|present> | count <sel> <op> <n> | text|value <sel> <equals|contains|matches> <value> | attr <sel> <name> <pred> <value> | url <pred> <pattern>) [--timeout <secs>]",
+                flags: &[(
+                    "--timeout <secs>",
+                    "condition deadline in seconds (default 8; forwarded to chrome-use and bounded mahbot-side)",
+                )],
+                session: true,
+                kinds: &[
+                    OutKind::Ok,
+                    OutKind::Timeout,
+                    OutKind::Network,
+                    OutKind::NotFound,
+                    OutKind::Error,
+                    OutKind::Environment,
+                    OutKind::Usage,
+                ],
+                details: "rc 0 when the condition holds. rc 1 when it does not: kind timeout when the condition never held within the deadline (chrome-use reports every failed expect as a deadline expiration), kind error for other step failures. The allowlist is the safe subset of chrome-use's grammar — gone/request/no-errors and the --not/--regex/--no-wait flags are not exposed.",
+                examples: &[
+                    "mahbot browser expect \"#main\" visible",
+                    "mahbot browser expect count \".card\" \"==\" 0",
+                    "mahbot browser expect url contains \"dashboard\"",
+                ],
             }),
         },
         ActionDesc {
@@ -178,7 +264,19 @@ fn build_actions() -> Vec<ActionDesc> {
         ActionDesc {
             name: "extract",
             purpose: "extract rows from the page with a JSON schema file",
-            tool: None,
+            tool: Some(ToolParams {
+                required: &["schema"],
+                properties: json!({
+                    "schema": {
+                        "type": "object",
+                        "description": "Extraction schema: an optional \"rows\" CSS selector key for row-list extraction plus a required \"fields\" object mapping each field name to its CSS selector, e.g. {\"rows\": \".card\", \"fields\": {\"title\": \".title\", \"price\": \".price\"}}"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Trim rows mahbot-side; total still reports the honest count"
+                    }
+                }),
+            }),
             cli: Some(CliHelp {
                 syntax: "--schema-file <path> [--limit <n>] [--timeout <secs>]",
                 flags: &[
@@ -203,7 +301,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "When the schema's rows selector matches 0 elements, the empty region is reported honestly (kind empty, rc 0) without invoking chrome-use's phantom-row extract. An unreadable or invalid schema file is kind usage (rc 3).",
+                details: "The schema follows chrome-use's grammar: an optional \"rows\" selector plus a required \"fields\" object (field name → CSS selector or {sel, get, all}). When the schema's rows selector matches 0 elements, the empty region is reported honestly (kind empty, rc 0) without invoking chrome-use's phantom-row extract. An unreadable or invalid schema file is kind usage (rc 3). If the count eval fails (e.g. an invalid CSS rows selector), the action errors explicitly — chrome-use's dominant-container auto-detect fallback is deliberately NOT used, because the gate exists to avoid phantom rows.",
                 examples: &["mahbot browser extract --schema-file products.json --limit 20"],
             }),
         },
@@ -465,7 +563,7 @@ mod tests {
         assert_action_set(
             names,
             &[
-                "status", "open", "count", "wait", "eval", "extract", "click", "session",
+                "status", "open", "count", "wait", "expect", "eval", "extract", "click", "session",
             ],
         );
     }

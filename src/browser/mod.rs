@@ -20,6 +20,7 @@ use url::Host;
 pub(crate) mod actions;
 pub(crate) mod cli;
 pub(crate) mod contract;
+pub(crate) mod forms;
 pub(crate) mod spawn;
 
 /// Name prefix of every session the `mahbot browser` CLI creates (named and

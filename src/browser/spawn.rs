@@ -3,7 +3,7 @@
 //! A wedged daemon hangs inside the CLI's own ~152 s retry loop, so every
 //! health/watchdog/sweep call is deadline-bounded (the shutdown close path is
 //! instead bounded by its outer total-budget timeout); the interactive tool
-//! bounds its dispatch itself per-call (open 15s, networkidle wait 10s,
+//! bounds its dispatch itself per-call (open 15s, wait 10s, expect 20s,
 //! default 8s) via `CliTimeout::Bounded`, and on a timeout runs a bounded
 //! health evaluation — failing fast with daemon guidance when the daemon is
 //! down or wedged (a second consecutive hang on a session-daemon probe), since

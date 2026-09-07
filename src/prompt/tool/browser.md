@@ -24,6 +24,25 @@ Use `find` with locators to click, fill, hover, or check elements. Use `click` w
 ### 5. Visually inspect the rendered page: `screenshot`
 Capture a screenshot of the current tab and inject it into your conversation as a native image, so you can see exactly how the page is rendered. The screenshot is for your own analysis — you do not need to echo it or reference its path. Use it after `open`/`find`/`click` when visual layout, styling, or rendered state matters more than the accessibility tree.
 
+### 6. Wait for a condition: `wait`
+* `wait { selector: "#results" }` — wait until a CSS selector matches something.
+* `wait { url: "pattern" }` — wait until the URL matches a pattern.
+* `wait { text: "Loaded" }` — wait until this text appears in the page.
+Give exactly ONE target. Waits are bounded (~10 s) — a timeout is reported as an error, never an infinite block.
+
+### 7. Assert a condition: `expect`
+A bounded PASS/FAIL assertion — prefer it over open-and-eyeball when you need a definite answer:
+* `{ condition: "visible", selector: "#main" }` — also "hidden", "present".
+* `{ condition: "count", selector: ".card", op: "==", count: 5 }` — op: == != > < >= <=.
+* `{ condition: "text", selector: "h1", predicate: "contains", expected: "Hello" }` — predicate: equals | contains | matches.
+* `{ condition: "value", selector: "input", expected: "..." }` — input value.
+* `{ condition: "attr", selector: "a", name: "href", predicate: "contains", expected: "/docs" }`.
+* `{ condition: "url", predicate: "contains", expected: "dashboard" }`.
+PASS means the condition held within the deadline; FAIL reports the observed `actual` and whether it timed out. A FAIL is information, not a retry prompt.
+
+### 8. Structured extraction: `extract`
+`extract { schema: {...}, limit: N }` — schema-driven row extraction. The schema has an optional `"rows"` CSS selector key for row lists and a required `"fields"` object mapping each field name to its CSS selector, e.g. `{"rows": ".card", "fields": {"title": ".title", "price": ".price"}}`. An empty region is reported honestly (0 rows) instead of returning phantom rows; a failing rows-selector count (e.g. invalid CSS) is an error. `limit` trims the returned rows while `total` keeps the honest full count.
+
 ## JS eval notes
 * `const`/`let` declarations are scoped to individual `page.evaluate()` calls — they do NOT cause redeclaration errors across separate `eval` calls.
 * `var` declarations and `window.*` assignments DO persist across calls (standard JavaScript behavior).

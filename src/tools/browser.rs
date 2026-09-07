@@ -1,7 +1,13 @@
 //! Browser automation tool.
 
-use crate::browser::contract::{BrowserResponse, extract_snapshot_text};
+use crate::browser::contract::{
+    BrowserResponse, eval_count, expect_outcome, extract_output, extract_snapshot_text,
+};
 use crate::browser::escape_js_single_quoted;
+use crate::browser::forms::{
+    ExpectCond, ExtractGate, count_eval_js, expect_args, extract_gate, parse_count_op,
+    parse_predicate, parse_state, wait_args, wait_target,
+};
 use crate::browser::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
 use crate::util::{UnwrapPoison, is_http_url};
 use crate::{Tool, Workspace};
@@ -51,6 +57,55 @@ enum BrowserAction {
     /// Run JavaScript in the page context. Returns the result as a string.
     /// Useful for inspecting element attributes, checking state, or debugging.
     Eval { js: String },
+    /// Wait until a CSS selector matches, the URL matches a pattern, or text
+    /// appears — exactly one target. Bounded mahbot-side; the numeric sleep
+    /// form does not exist.
+    Wait {
+        /// CSS selector to wait for.
+        #[serde(default)]
+        selector: Option<String>,
+        /// URL pattern to wait for.
+        #[serde(default)]
+        url: Option<String>,
+        /// Text to wait for in the page.
+        #[serde(default)]
+        text: Option<String>,
+    },
+    /// Assert a page condition with a bounded wait — PASS/FAIL output.
+    /// Conditions: visible | hidden | present | count | text | value | attr | url.
+    Expect {
+        condition: String,
+        /// CSS selector (required for every condition except url).
+        #[serde(default)]
+        selector: Option<String>,
+        /// Comparison for condition "count": == != > < >= <= (default ==).
+        #[serde(default)]
+        op: Option<String>,
+        /// Expected count (condition "count").
+        #[serde(default)]
+        count: Option<u64>,
+        /// Comparison for text/value/attr/url: equals | contains | matches
+        /// (default equals).
+        #[serde(default)]
+        predicate: Option<String>,
+        /// Attribute name (condition "attr").
+        #[serde(default)]
+        name: Option<String>,
+        /// Expected value for text/value/attr; the URL pattern for url.
+        #[serde(default)]
+        expected: Option<String>,
+    },
+    /// Schema-driven row extraction. An empty region is reported honestly
+    /// (chrome-use's phantom-row auto-detect fallback is gated away), and
+    /// `limit` trims rows mahbot-side while `total` keeps the honest count.
+    Extract {
+        /// Extraction schema (JSON object). Include a "rows" CSS selector key
+        /// for row-list extraction, plus one field-per-selector.
+        schema: Value,
+        /// Trim rows to this many; the output's `total` keeps the honest count.
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// Find an element by semantic locator and perform an action.
     /// See `name()` doc block or the tool description for usage.
     Find {
@@ -285,15 +340,24 @@ impl BrowserTool {
         Ok(())
     }
 
+    /// Mahbot-side bounds for the condition-wait actions (see `call_timeout`).
+    const WAIT_BOUND: Duration = Duration::from_secs(10);
+    const EXPECT_BOUND: Duration = Duration::from_secs(20);
+    /// The chrome-side condition deadline rides below the mahbot bound so
+    /// chrome-use's own timeout error (with its retryable hint) surfaces instead
+    /// of a mahbot-side kill.
+    const CHROME_DEADLINE_SLACK: Duration = Duration::from_secs(2);
+
     /// Mahbot-side per-call bounds. chrome-use's own `--timeout` is ignored by
     /// `wait --load networkidle` (always its internal 25s default) and a wedged
     /// daemon hangs the CLI in its ~152s retry loop, so the tool bounds every
-    /// dispatch itself: open=15s (page load), wait=10s (networkidle stays
-    /// best-effort), everything else=8s (the daemon-side `run_cli_bounded` bound).
+    /// dispatch itself: open=15s (page load), wait=10s and expect=20s (condition
+    /// waits), everything else=8s (the daemon-side `run_cli_bounded` bound).
     fn call_timeout(args: &[&str]) -> Duration {
         match args.first() {
             Some(&"open") => Duration::from_secs(15),
-            Some(&"wait") => Duration::from_secs(10),
+            Some(&"wait") => Self::WAIT_BOUND,
+            Some(&"expect") => Self::EXPECT_BOUND,
             _ => Duration::from_secs(8),
         }
     }
@@ -351,51 +415,34 @@ impl BrowserTool {
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-
-        // chrome-use returns exit code 1 even when it outputs valid JSON
-        // with a structured error message. Try to parse the JSON first to
-        // get a meaningful error, fall back to stderr-only bail otherwise.
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let (error_msg, code, retryable) =
-                match serde_json::from_str::<BrowserResponse>(&stdout) {
-                    Ok(resp) => {
-                        let BrowserResponse {
-                            error,
-                            code,
-                            retryable,
-                            ..
-                        } = resp;
-                        (error.unwrap_or_default(), code, retryable)
-                    }
-                    Err(_) => (stderr.trim().to_string(), None, None),
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match parse_run_output(
+            args.first().copied(),
+            output.status.success(),
+            &stdout,
+            &stderr,
+        ) {
+            ParsedRun::Ok(resp) => Ok(resp),
+            ParsedRun::Unparseable => {
+                anyhow::bail!("Failed to parse chrome-use JSON response")
+            }
+            ParsedRun::Failed {
+                error,
+                code,
+                retryable,
+            } => {
+                let error_msg = if error.is_empty() {
+                    format!("chrome-use exited with code {}", output.status)
+                } else {
+                    enhance_browser_error(error)
                 };
-            let error_msg = if error_msg.is_empty() {
-                format!("chrome-use exited with code {}", output.status)
-            } else {
-                enhance_browser_error(error_msg)
-            };
-            Self::fail_fast_if_daemon_down(&error_msg, code.as_deref())?;
-            anyhow::bail!(
-                "chrome-use error: {}",
-                with_retry_hint(error_msg, retryable)
-            );
+                Self::fail_fast_if_daemon_down(&error_msg, code.as_deref())?;
+                anyhow::bail!(
+                    "chrome-use error: {}",
+                    with_retry_hint(error_msg, retryable)
+                )
+            }
         }
-
-        let response: BrowserResponse =
-            serde_json::from_str(&stdout).context("Failed to parse chrome-use JSON response")?;
-
-        if !response.is_success() {
-            let err = response.error.as_deref().unwrap_or("unknown error");
-            let enhanced = enhance_browser_error(err.to_string());
-            Self::fail_fast_if_daemon_down(&enhanced, response.code.as_deref())?;
-            anyhow::bail!(
-                "chrome-use error: {}",
-                with_retry_hint(enhanced, response.retryable)
-            );
-        }
-
-        Ok(response)
     }
 
     /// If an error carries the daemon-unavailable signature or envelope code,
@@ -449,6 +496,7 @@ impl BrowserTool {
 
     /// The chrome-use CLI takes a different argument shape per action — this
     /// builds the correct argument list for each action.
+    #[expect(clippy::too_many_lines, clippy::unchecked_time_subtraction)] // the per-action argv shapes are one cohesive dispatch; WAIT/EXPECT_BOUND exceed the slack by construction
     fn build_args(action: &BrowserAction) -> anyhow::Result<Vec<String>> {
         match action {
             BrowserAction::Open { url } => {
@@ -514,7 +562,139 @@ impl BrowserTool {
             BrowserAction::Screenshot { .. } => {
                 anyhow::bail!("Screenshot is handled in execute(), not build_args")
             }
+            BrowserAction::Wait {
+                selector,
+                url,
+                text,
+            } => {
+                let target = wait_target(selector.as_deref(), url.as_deref(), text.as_deref())
+                    .map_err(anyhow::Error::msg)?;
+                Ok(wait_args(
+                    &target,
+                    (Self::WAIT_BOUND - Self::CHROME_DEADLINE_SLACK).as_millis(),
+                ))
+            }
+            BrowserAction::Expect {
+                condition,
+                selector,
+                op,
+                count,
+                predicate,
+                name,
+                expected,
+            } => {
+                let cond = Self::build_expect_cond(
+                    condition,
+                    selector.as_ref(),
+                    op.as_ref(),
+                    count.as_ref(),
+                    predicate.as_ref(),
+                    name.as_ref(),
+                    expected.as_ref(),
+                )?;
+                Ok(expect_args(
+                    &cond,
+                    (Self::EXPECT_BOUND - Self::CHROME_DEADLINE_SLACK).as_millis(),
+                ))
+            }
+            BrowserAction::Extract { .. } => {
+                anyhow::bail!("Extract is handled in execute(), not build_args")
+            }
         }
+    }
+
+    /// Map the model-facing expect fields into a validated [`ExpectCond`].
+    /// Validation errors are corrective: they name the allowed values so the
+    /// model can self-correct in one round-trip.
+    fn build_expect_cond(
+        condition: &str,
+        selector: Option<&String>,
+        op: Option<&String>,
+        count: Option<&u64>,
+        predicate: Option<&String>,
+        name: Option<&String>,
+        expected: Option<&String>,
+    ) -> anyhow::Result<ExpectCond> {
+        let require_selector = |what: &str| {
+            selector.cloned().ok_or_else(|| {
+                anyhow::anyhow!("expect condition \"{condition}\" requires \"selector\" ({what})")
+            })
+        };
+        // Only the comparison conditions take a predicate — a stray one on a
+        // state/count condition is ignored, not an error.
+        let require_predicate = || {
+            parse_predicate(predicate.map_or("equals", String::as_str)).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid predicate '{predicate:?}' — use equals | contains | matches"
+                )
+            })
+        };
+        Ok(match condition {
+            "visible" | "hidden" | "present" => ExpectCond::State {
+                selector: require_selector("a CSS selector to check")?,
+                state: parse_state(condition).expect("condition matched the state allowlist"),
+            },
+            "count" => ExpectCond::Count {
+                selector: require_selector("the CSS selector to count")?,
+                op: parse_count_op(op.map_or("==", String::as_str)).ok_or_else(|| {
+                    anyhow::anyhow!("invalid count op '{op:?}' — use == != > < >= <=")
+                })?,
+                n: count.copied().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "expect condition \"count\" requires \"count\" (the expected number)"
+                    )
+                })?,
+            },
+            "text" | "value" => {
+                let predicate = require_predicate()?;
+                let selector = require_selector("the element to read")?;
+                let value = expected.cloned().ok_or_else(|| {
+                    anyhow::anyhow!("expect condition \"{condition}\" requires \"expected\"")
+                })?;
+                if condition == "text" {
+                    ExpectCond::Text {
+                        selector,
+                        predicate,
+                        value,
+                    }
+                } else {
+                    ExpectCond::Value {
+                        selector,
+                        predicate,
+                        value,
+                    }
+                }
+            }
+            "attr" => {
+                let predicate = require_predicate()?;
+                ExpectCond::Attr {
+                    selector: require_selector("the element holding the attribute")?,
+                    name: name.cloned().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "expect condition \"attr\" requires \"name\" (the attribute name)"
+                        )
+                    })?,
+                    predicate,
+                    value: expected.cloned().ok_or_else(|| {
+                        anyhow::anyhow!("expect condition \"attr\" requires \"expected\"")
+                    })?,
+                }
+            }
+            "url" => {
+                let predicate = require_predicate()?;
+                ExpectCond::Url {
+                    predicate,
+                    pattern: expected.cloned().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "expect condition \"url\" requires \"expected\" (the URL pattern)"
+                        )
+                    })?,
+                }
+            }
+            other => anyhow::bail!(
+                "invalid expect condition '{other}' — use visible | hidden | present | count | text | value | attr | url"
+            ),
+        })
     }
 }
 
@@ -731,6 +911,14 @@ impl Tool for BrowserTool {
         if let BrowserAction::Screenshot { .. } = &action {
             let output = self.capture_screenshot(&tab).await?;
             return Ok(super::with_normalization_notes(output, &normalized_notes));
+        }
+
+        if let BrowserAction::Extract { schema, limit } = &action {
+            let (schema, schema_note) = Self::normalize_extract_schema(schema)?;
+            let output = self.run_extract(&schema, *limit, &tab).await?;
+            let mut notes = normalized_notes;
+            notes.extend(schema_note);
+            return Ok(super::with_normalization_notes(output, &notes));
         }
 
         let (response, snapshot) = self.run_action(&action, &tab).await?;
@@ -1023,6 +1211,20 @@ impl BrowserTool {
                     || serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()),
                     |v| v.as_str().map_or_else(|| v.to_string(), str::to_string),
                 ),
+                BrowserAction::Wait { .. } => "wait complete".to_string(),
+                BrowserAction::Expect { .. } => match expect_outcome(&data) {
+                    Some(outcome) if outcome.pass => "expect: PASS (condition holds)".to_string(),
+                    Some(outcome) => {
+                        let actual = outcome.actual.map_or("n/a".to_string(), |v| v.to_string());
+                        format!(
+                            "expect: FAIL — condition did not hold (timed out: {}); actual: {actual}",
+                            outcome.timed_out
+                        )
+                    }
+                    None => {
+                        serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string())
+                    }
+                },
                 _ => serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()),
             },
             None => String::new(),
@@ -1035,6 +1237,116 @@ impl BrowserTool {
         };
 
         super::with_normalization_notes(output, notes)
+    }
+
+    /// Accept the model-facing extract schema: a JSON object, or a string
+    /// holding JSON text (models frequently double-encode). The object must
+    /// follow chrome-use's grammar — an optional `"rows"` selector string plus
+    /// a required `"fields"` object (field name → CSS selector or
+    /// `{sel, get, all}`). A flat schema with per-field keys at the top level
+    /// is normalized into `"fields"` and the correction is reported as a note.
+    /// Array-shaped objects (`{items: [...]}`) are rejected — wrapping them
+    /// into `fields` would hand chrome-use a malformed schema.
+    fn normalize_extract_schema(schema: &Value) -> anyhow::Result<(Value, Option<String>)> {
+        let parsed = match schema {
+            Value::Object(_) => schema.clone(),
+            Value::String(s) => serde_json::from_str::<Value>(s).map_err(|_| {
+                anyhow::anyhow!(
+                    "extract schema string is not valid JSON — pass the schema as a JSON object"
+                )
+            })?,
+            _ => anyhow::bail!(
+                "extract schema must be a JSON object with a \"fields\" object (field name → CSS selector)"
+            ),
+        };
+        let Some(map) = parsed.as_object() else {
+            anyhow::bail!(
+                "extract schema must be a JSON object with a \"fields\" object (field name → CSS selector)"
+            )
+        };
+        let field_shape = "field name → CSS selector string or {sel, get, all} object";
+        if let Some(rows) = map.get("rows") {
+            anyhow::ensure!(
+                rows.is_string(),
+                "extract schema \"rows\" must be a CSS selector string"
+            );
+        }
+        if let Some(fields) = map.get("fields") {
+            anyhow::ensure!(
+                fields.is_object(),
+                "extract schema \"fields\" must be an object ({field_shape})"
+            );
+            return Ok((parsed, None));
+        }
+        let mut fields = serde_json::Map::new();
+        for (k, v) in map.iter().filter(|(k, _)| k.as_str() != "rows") {
+            anyhow::ensure!(
+                v.is_string() || v.is_object(),
+                "extract schema field '{k}' must be a {field_shape} — \
+                 chrome-use requires a \"fields\" object"
+            );
+            fields.insert(k.clone(), v.clone());
+        }
+        let mut out = serde_json::Map::new();
+        if let Some(r) = map.get("rows") {
+            out.insert("rows".into(), r.clone());
+        }
+        out.insert("fields".into(), Value::Object(fields));
+        Ok((
+            Value::Object(out),
+            Some(
+                "flat extract schema normalized: field keys moved under \"fields\" \
+                 (chrome-use requires a fields object)"
+                    .to_string(),
+            ),
+        ))
+    }
+
+    /// Schema-driven extraction with the honest-empty gate: when the schema's
+    /// rows selector matches 0 elements, report the empty region WITHOUT
+    /// invoking chrome-use's phantom-row extract (its dominant-container
+    /// auto-detect returns garbage rows on a 0-match, and an invalid CSS
+    /// rows selector triggers the same fallback). A failing count eval is
+    /// an explicit error — the fallback is deliberately not used. `limit`
+    /// is mahbot-side post-filtering (chrome-use has no extract limit key);
+    /// `total` stays honest. `schema` is already normalized
+    /// ([`Self::normalize_extract_schema`]).
+    async fn run_extract(
+        &self,
+        schema: &Value,
+        limit: Option<usize>,
+        tab: &str,
+    ) -> anyhow::Result<String> {
+        let rows_sel = schema.get("rows").and_then(Value::as_str);
+        if let Some(sel) = rows_sel {
+            let js = count_eval_js(sel);
+            let resp = self.run_command(&["eval", &js], tab).await?;
+            let count = eval_count(&resp).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "count eval for the rows selector '{sel}' returned a non-numeric result"
+                )
+            });
+            match extract_gate(count) {
+                ExtractGate::Empty => {
+                    return serde_json::to_string_pretty(&extract_output(
+                        &Value::Array(vec![]),
+                        limit,
+                    ))
+                    .context("serialize extract output");
+                }
+                ExtractGate::Proceed => {}
+                ExtractGate::Fail(e) => return Err(e),
+            }
+        }
+        let schema_str = serde_json::to_string(schema)?;
+        let resp = self
+            .run_command(&["extract", "--schema", &schema_str], tab)
+            .await?;
+        let Some(data) = resp.data.as_ref() else {
+            anyhow::bail!("extract returned no data");
+        };
+        serde_json::to_string_pretty(&extract_output(data, limit))
+            .context("serialize extract output")
     }
 }
 
@@ -1100,6 +1412,58 @@ fn sanitize_filename_component(name: &str) -> String {
     out
 }
 
+/// Outcome of parsing one chrome-use CLI output in the tool (see
+/// [`parse_run_output`]).
+#[derive(Debug)]
+enum ParsedRun {
+    Ok(BrowserResponse),
+    /// Failure envelope (or unparseable stdout on a non-zero exit): the raw
+    /// error text (empty when the envelope carried none), envelope code, and
+    /// retryable flag.
+    Failed {
+        error: String,
+        code: Option<String>,
+        retryable: Option<bool>,
+    },
+    /// Zero exit but unparseable stdout.
+    Unparseable,
+}
+
+/// Parse one chrome-use CLI output. `expect` is the one chrome-use action
+/// whose `--json` envelope can succeed on a non-zero exit — a failed
+/// assertion arrives as `success:true` with exit 1, the verdict riding in
+/// `data.pass` — so envelope-success is trusted over the exit code there and
+/// nowhere else. Pure so tests pin the mapping.
+fn parse_run_output(
+    action: Option<&str>,
+    status_success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> ParsedRun {
+    let parsed: Option<BrowserResponse> = serde_json::from_str(stdout).ok();
+    let Some(resp) = parsed else {
+        return if status_success {
+            ParsedRun::Unparseable
+        } else {
+            ParsedRun::Failed {
+                error: stderr.trim().to_string(),
+                code: None,
+                retryable: None,
+            }
+        };
+    };
+    if resp.is_success() && (status_success || action == Some("expect")) {
+        return ParsedRun::Ok(resp);
+    }
+    // A failure envelope (or, for a non-expect action, the unusable
+    // success-on-non-zero-exit combination) — surface its error details.
+    ParsedRun::Failed {
+        error: resp.error.unwrap_or_default(),
+        code: resp.code,
+        retryable: resp.retryable,
+    }
+}
+
 /// Enhance chrome-use error messages with actionable hints for known
 /// failure patterns.
 fn enhance_browser_error(msg: String) -> String {
@@ -1143,6 +1507,9 @@ const KNOWN_ACTIONS: &[&str] = &[
     "eval",
     "find",
     "screenshot",
+    "wait",
+    "expect",
+    "extract",
 ];
 
 /// Expected action shape, echoed verbatim in corrective errors so the model
@@ -1154,7 +1521,10 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"open\":{\"url\":\"https://...\"}
     {\"press\":{\"key\":\"...\"}}, {\"eval\":{\"js\":\"...\"}}, \
     {\"find\":{\"by\":\"text|role|label|placeholder|alt|title|testid|first|last|nth\",\
     \"value\":\"...\",\"action\":\"click|fill|hover|check|text\"}}, \
-    {\"screenshot\":{}}";
+    {\"screenshot\":{}}, {\"wait\":{\"selector\":\"...\"}}, \
+    {\"expect\":{\"condition\":\"visible|hidden|present|count|text|value|attr|url\",\
+    \"selector\":\"...\",\"count\":int,\"op\":\"==\",\"predicate\":\"equals|contains|matches\",\"name\":\"...\",\"expected\":\"...\"}}, \
+    {\"extract\":{\"schema\":{...},\"limit\":int}}";
 
 /// Corrective error for an unrecoverable action shape, listing the exact
 /// expected form instead of raw serde text.
@@ -1745,6 +2115,10 @@ mod tests {
             BrowserTool::call_timeout(&["wait", "--load", "networkidle"]),
             Duration::from_secs(10)
         );
+        assert_eq!(
+            BrowserTool::call_timeout(&["expect", "visible", "#x"]),
+            Duration::from_secs(20)
+        );
         for args in [
             &["click", "@e1"][..],
             &["eval", "1+1"][..],
@@ -1786,11 +2160,11 @@ mod tests {
             .as_array()
             .expect("oneOf should be an array");
 
-        // There are exactly 10 browser actions.
+        // There are exactly 13 browser actions.
         assert_eq!(
             action_schemas.len(),
-            10,
-            "expected 10 actions, got {}",
+            13,
+            "expected 13 actions, got {}",
             action_schemas.len()
         );
 
@@ -1815,6 +2189,9 @@ mod tests {
             "eval",
             "find",
             "screenshot",
+            "wait",
+            "expect",
+            "extract",
         ] {
             assert!(
                 action_names.contains(expected),
@@ -1822,8 +2199,8 @@ mod tests {
             );
         }
 
-        // Structural invariants: snapshot, get_url and screenshot must lack inner
-        // "required"; all other actions must have it.
+        // Structural invariants: snapshot, get_url, screenshot and wait must lack
+        // inner "required"; all other actions must have it.
         for s in action_schemas {
             let inner = s
                 .get("properties")
@@ -1837,7 +2214,7 @@ mod tests {
                 .map_or("?", String::as_str);
 
             let has_inner_required = inner.is_some_and(|obj| obj.contains_key("required"));
-            if name == "snapshot" || name == "get_url" || name == "screenshot" {
+            if name == "snapshot" || name == "get_url" || name == "screenshot" || name == "wait" {
                 assert!(
                     !has_inner_required,
                     "{name} should NOT have inner 'required'"
@@ -2183,6 +2560,9 @@ mod tests {
                 "press" => json!({"key": "Enter"}),
                 "eval" => json!({"js": "1 + 1"}),
                 "find" => json!({"by": "text", "value": "x", "action": "click"}),
+                "wait" => json!({"selector": "#x"}),
+                "expect" => json!({"condition": "visible", "selector": "#x"}),
+                "extract" => json!({"schema": {"rows": ".r"}}),
                 other => panic!("KNOWN_ACTIONS entry {other} has no lockstep payload"),
             }
         };
@@ -2208,6 +2588,9 @@ mod tests {
             "eval",
             "find",
             "screenshot",
+            "wait",
+            "expect",
+            "extract",
         ] {
             assert!(
                 KNOWN_ACTIONS.contains(&name),
@@ -2223,6 +2606,308 @@ mod tests {
             BrowserTool::build_args(&action).is_err(),
             "Screenshot must be handled in execute(), not build_args"
         );
+    }
+
+    #[test]
+    fn build_args_for_wait_and_expect() {
+        fn argv(args: &[String]) -> Vec<&str> {
+            args.iter().map(String::as_str).collect()
+        }
+
+        // Wait: exactly one target, deadline-bound below the mahbot bound.
+        let wait_selector = BrowserAction::Wait {
+            selector: Some("#r".into()),
+            url: None,
+            text: None,
+        };
+        let got = BrowserTool::build_args(&wait_selector).unwrap();
+        assert_eq!(argv(&got), vec!["wait", "#r", "--timeout", "8000"]);
+
+        let wait_url = BrowserAction::Wait {
+            selector: None,
+            url: Some("dashboard".into()),
+            text: None,
+        };
+        let got = BrowserTool::build_args(&wait_url).unwrap();
+        assert_eq!(
+            argv(&got),
+            vec!["wait", "--url", "dashboard", "--timeout", "8000"]
+        );
+
+        let wait_text = BrowserAction::Wait {
+            selector: None,
+            url: None,
+            text: Some("Loaded".into()),
+        };
+        let got = BrowserTool::build_args(&wait_text).unwrap();
+        assert_eq!(
+            argv(&got),
+            vec!["wait", "--text", "Loaded", "--timeout", "8000"]
+        );
+
+        // Wait requires exactly one target.
+        let both = BrowserAction::Wait {
+            selector: Some("#r".into()),
+            url: Some("dashboard".into()),
+            text: None,
+        };
+        assert!(
+            BrowserTool::build_args(&both).is_err(),
+            "two targets must err"
+        );
+        let none = BrowserAction::Wait {
+            selector: None,
+            url: None,
+            text: None,
+        };
+        assert!(
+            BrowserTool::build_args(&none).is_err(),
+            "no target must err"
+        );
+        // A numeric selector would be chrome-use's silent-sleep form — rejected.
+        let numeric = BrowserAction::Wait {
+            selector: Some("5000".into()),
+            url: None,
+            text: None,
+        };
+        let err = BrowserTool::build_args(&numeric).unwrap_err().to_string();
+        assert!(err.contains("silent sleep"), "err: {err}");
+
+        // Expect visible.
+        let expect_visible = BrowserAction::Expect {
+            condition: "visible".into(),
+            selector: Some("#main".into()),
+            op: None,
+            count: None,
+            predicate: None,
+            name: None,
+            expected: None,
+        };
+        let got = BrowserTool::build_args(&expect_visible).unwrap();
+        assert_eq!(
+            argv(&got),
+            vec!["expect", "#main", "visible", "--timeout", "18000"]
+        );
+
+        // Expect count defaults op to ==.
+        let expect_count_default = BrowserAction::Expect {
+            condition: "count".into(),
+            selector: Some(".card".into()),
+            op: None,
+            count: Some(5),
+            predicate: None,
+            name: None,
+            expected: None,
+        };
+        let got = BrowserTool::build_args(&expect_count_default).unwrap();
+        assert_eq!(
+            argv(&got),
+            vec!["expect", "count", ".card", "==", "5", "--timeout", "18000"]
+        );
+
+        // Expect count forwards an explicit op.
+        let expect_count_op = BrowserAction::Expect {
+            condition: "count".into(),
+            selector: Some(".card".into()),
+            op: Some(">=".into()),
+            count: Some(5),
+            predicate: None,
+            name: None,
+            expected: None,
+        };
+        let got = BrowserTool::build_args(&expect_count_op).unwrap();
+        assert_eq!(
+            argv(&got),
+            vec!["expect", "count", ".card", ">=", "5", "--timeout", "18000"]
+        );
+
+        // Expect url with a predicate.
+        let expect_url = BrowserAction::Expect {
+            condition: "url".into(),
+            selector: None,
+            op: None,
+            count: None,
+            predicate: Some("contains".into()),
+            name: None,
+            expected: Some("dashboard".into()),
+        };
+        let got = BrowserTool::build_args(&expect_url).unwrap();
+        assert_eq!(
+            argv(&got),
+            vec![
+                "expect",
+                "url",
+                "contains",
+                "dashboard",
+                "--timeout",
+                "18000"
+            ]
+        );
+
+        // Expect corrective errors.
+        let bad_condition = BrowserAction::Expect {
+            condition: "banana".into(),
+            selector: None,
+            op: None,
+            count: None,
+            predicate: None,
+            name: None,
+            expected: None,
+        };
+        assert!(BrowserTool::build_args(&bad_condition).is_err());
+
+        let count_no_count = BrowserAction::Expect {
+            condition: "count".into(),
+            selector: Some(".card".into()),
+            op: None,
+            count: None,
+            predicate: None,
+            name: None,
+            expected: None,
+        };
+        assert!(BrowserTool::build_args(&count_no_count).is_err());
+
+        let visible_no_selector = BrowserAction::Expect {
+            condition: "visible".into(),
+            selector: None,
+            op: None,
+            count: None,
+            predicate: None,
+            name: None,
+            expected: None,
+        };
+        assert!(BrowserTool::build_args(&visible_no_selector).is_err());
+
+        let bad_op = BrowserAction::Expect {
+            condition: "count".into(),
+            selector: Some(".card".into()),
+            op: Some("!%".into()),
+            count: Some(5),
+            predicate: None,
+            name: None,
+            expected: None,
+        };
+        let err = BrowserTool::build_args(&bad_op).unwrap_err().to_string();
+        assert!(err.contains("invalid count op"), "err: {err}");
+
+        let bad_predicate = BrowserAction::Expect {
+            condition: "text".into(),
+            selector: Some("h1".into()),
+            op: None,
+            count: None,
+            predicate: Some("bogus".into()),
+            name: None,
+            expected: Some("x".into()),
+        };
+        let err = BrowserTool::build_args(&bad_predicate)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid predicate"), "err: {err}");
+    }
+
+    /// Direct pin of the run-level classification, including the crux of the
+    /// expect contract: a failed assertion arrives as `success:true` with
+    /// exit 1 and the verdict in `data`.
+    #[test]
+    fn parse_run_output_pins_envelope_over_exit_code() {
+        // expect pass=false: success:true + exit 1 → the verdict is returned.
+        let body = json!({"success": true, "data": {"pass": false, "actual": 3, "timedOut": true}});
+        let resp = match parse_run_output(Some("expect"), false, &body.to_string(), "") {
+            ParsedRun::Ok(resp) => resp,
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        let outcome = expect_outcome(resp.data.as_ref().expect("data present")).expect("verdict");
+        assert!(!outcome.pass && outcome.timed_out);
+        assert_eq!(outcome.actual, Some(json!(3)));
+
+        // …but only for expect: the same payload on another action is a failure.
+        assert!(matches!(
+            parse_run_output(Some("open"), false, &body.to_string(), ""),
+            ParsedRun::Failed { .. }
+        ));
+
+        // A failure envelope on any exit → Failed with its details.
+        let err_body = json!({"success": false, "error": "Browser not launched", "code": "browser_not_launched"});
+        match parse_run_output(Some("expect"), false, &err_body.to_string(), "") {
+            ParsedRun::Failed { error, code, .. } => {
+                assert_eq!(error, "Browser not launched");
+                assert_eq!(code.as_deref(), Some("browser_not_launched"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // Unparseable stdout: zero exit → Unparseable; non-zero → stderr fallback.
+        assert!(matches!(
+            parse_run_output(None, true, "garbage", ""),
+            ParsedRun::Unparseable
+        ));
+        match parse_run_output(None, false, "garbage", "relay is down\n") {
+            ParsedRun::Failed {
+                error,
+                code,
+                retryable,
+            } => {
+                assert_eq!(error, "relay is down");
+                assert!(code.is_none() && retryable.is_none());
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // Happy path.
+        assert!(matches!(
+            parse_run_output(
+                Some("open"),
+                true,
+                &json!({"success": true}).to_string(),
+                ""
+            ),
+            ParsedRun::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn normalize_extract_schema_shapes() {
+        // A chrome-use-grammar object (rows + fields) passes through, no note.
+        let obj = json!({"rows": ".card", "fields": {"title": ".title"}});
+        let (out, note) = BrowserTool::normalize_extract_schema(&obj).unwrap();
+        assert_eq!(out, obj);
+        assert!(note.is_none());
+
+        // A flat schema (per-field keys at the top level) is normalized into
+        // the required "fields" object, with a correction note.
+        let (out, note) =
+            BrowserTool::normalize_extract_schema(&json!({"rows": ".card", "title": ".title"}))
+                .unwrap();
+        assert_eq!(out, json!({"rows": ".card", "fields": {"title": ".title"}}));
+        assert!(note.is_some_and(|n| n.contains("fields")));
+
+        // A string holding valid JSON text parses to the object.
+        let stringified = json!("{\"rows\": \".card\", \"fields\": {}}");
+        let (out, note) = BrowserTool::normalize_extract_schema(&stringified).unwrap();
+        assert_eq!(out, json!({"rows": ".card", "fields": {}}));
+        assert!(note.is_none());
+
+        // A non-JSON string errs with the corrective message.
+        let err = BrowserTool::normalize_extract_schema(&json!("not json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not valid JSON"), "err: {err}");
+
+        // A non-object shape errs.
+        assert!(BrowserTool::normalize_extract_schema(&json!(42)).is_err());
+
+        // An array-shaped object (no fields key, array values) errs instead of
+        // being mangled into a fields object.
+        let err = BrowserTool::normalize_extract_schema(&json!({"items": [1, 2]}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be a"), "err: {err}");
+
+        // A "fields" key that is not an object errs.
+        let err = BrowserTool::normalize_extract_schema(&json!({"fields": ".title"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"fields\" must be an object"), "err: {err}");
     }
 
     #[test]

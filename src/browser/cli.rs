@@ -20,12 +20,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::browser::actions;
-use crate::browser::contract::{BrowserResponse, OutEnvelope, OutKind, extract_snapshot_text};
-use crate::browser::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
-use crate::browser::{
-    CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX, escape_js_single_quoted, is_blank_page_url,
-    validate_url,
+use crate::browser::contract::{
+    BrowserResponse, ExpectOutcome, OutEnvelope, OutKind, eval_count, eval_result, expect_outcome,
+    extract_output, extract_snapshot_text,
 };
+use crate::browser::forms::{
+    ExpectCond, ExtractGate, WaitTarget, count_eval_js, describe, expect_args, extract_gate,
+    parse_count_op, parse_predicate, parse_state, wait_args, wait_target,
+};
+use crate::browser::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
+use crate::browser::{CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX, is_blank_page_url, validate_url};
 use crate::tools::browser_daemon::{
     CliStatus, chrome_running, cli_path, cli_probe, cli_version, display_available,
     is_daemon_unavailable_code, is_daemon_unavailable_error, is_relay_unavailable_error, relay_up,
@@ -34,6 +38,12 @@ use serde_json::{Value, json};
 
 /// Default step timeout (8 s) — every step uses it unless `--timeout` is given.
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Extra slack over the requested `--timeout` for the wait/expect bounds:
+/// the requested timeout is forwarded to chrome-use (its wait/expect forms
+/// honor it), so its own honest timeout error usually surfaces before the
+/// mahbot-side kill fires.
+const STEP_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
 
 /// Classify a chrome-use step failure into an [`OutKind`]. Environment
 /// signatures win because rc 2 must not be masked by a page-level wrapper
@@ -197,7 +207,11 @@ enum Action {
         timeout: Duration,
     },
     Wait {
-        selector: String,
+        target: WaitTarget,
+        timeout: Duration,
+    },
+    Expect {
+        cond: ExpectCond,
         timeout: Duration,
     },
     Eval {
@@ -222,6 +236,7 @@ enum Action {
 
 /// A failed chrome-use step: the classified [`OutKind`] plus the error text
 /// (empty for a mahbot-side deadline kill).
+#[derive(Debug)]
 struct StepFailure {
     kind: OutKind,
     message: String,
@@ -311,7 +326,8 @@ const ACTION_FLAGS: &[(&str, &[&str], &[&str])] = &[
     ("status", &[], &[]),
     ("open", &["expect", "timeout"], &["structural"]),
     ("count", &["timeout"], &[]),
-    ("wait", &["timeout"], &[]),
+    ("wait", &["timeout", "url", "text"], &[]),
+    ("expect", &["timeout"], &[]),
     ("eval", &["timeout"], &[]),
     ("extract", &["schema-file", "limit", "timeout"], &[]),
     ("click", &["timeout"], &["if-present"]),
@@ -338,6 +354,7 @@ fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
         "open" => parse_open(session.as_deref(), rest, allowed),
         "count" => parse_count(session.as_deref(), rest, allowed),
         "wait" => parse_wait(session.as_deref(), rest, allowed),
+        "expect" => parse_expect(session.as_deref(), rest, allowed),
         "eval" => parse_eval(session.as_deref(), rest, allowed),
         "extract" => parse_extract(session.as_deref(), rest, allowed),
         "click" => parse_click(session.as_deref(), rest, allowed),
@@ -529,15 +546,149 @@ fn parse_wait(
 ) -> Result<Invocation, String> {
     let (value_flags, bool_flags) = allowed;
     let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
-    let selector = take_positional(&positionals, 0, "selector")?;
+    let target = wait_target(
+        positionals.first().map(String::as_str),
+        flags.value("url"),
+        flags.value("text"),
+    )?;
     reject_extra_positionals(&positionals, 1)?;
     Ok(Invocation {
         action: Action::Wait {
-            selector,
+            target,
             timeout: parse_timeout_flag(&flags)?,
         },
         session: session.map(String::from),
     })
+}
+
+fn parse_expect(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: FlagSet,
+) -> Result<Invocation, String> {
+    let (value_flags, bool_flags) = allowed;
+    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let cond = parse_expect_cond(&positionals)?;
+    Ok(Invocation {
+        action: Action::Expect {
+            cond,
+            timeout: parse_timeout_flag(&flags)?,
+        },
+        session: session.map(String::from),
+    })
+}
+
+/// chrome-use 1.5.101 selector-first expect grammar, validated against the
+/// safe allowlist: `<sel> <visible|hidden|present>`, `count <sel> <op> <n>`,
+/// `text|value <sel> <pred> <value>`, `attr <sel> <name> <pred> <value>`,
+/// `url <pred> <pattern>`. Trailing words of a text/value/attr/url payload
+/// are joined with spaces (shell quoting is the normal path).
+#[expect(clippy::too_many_lines)]
+fn parse_expect_cond(ps: &[String]) -> Result<ExpectCond, String> {
+    let usage = "expect <selector> <visible|hidden|present> | count <sel> <op> <n> | text|value <sel> <equals|contains|matches> <value> | attr <sel> <name> <pred> <value> | url <pred> <pattern>";
+    let first = ps
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing condition — {usage}"))?;
+    match first {
+        "count" => {
+            if ps.len() != 4 {
+                return Err("expect count takes exactly: count <selector> <op> <n>".to_string());
+            }
+            let op = parse_count_op(&ps[2]).ok_or_else(|| {
+                format!(
+                    "invalid count op '{}' — use == != > < >= <= (or eq ne gt lt ge le)",
+                    ps[2]
+                )
+            })?;
+            let n: u64 = ps[3]
+                .parse()
+                .map_err(|_| format!("count comparison needs a number, got '{}'", ps[3]))?;
+            Ok(ExpectCond::Count {
+                selector: ps[1].clone(),
+                op,
+                n,
+            })
+        }
+        "text" | "value" => {
+            if ps.len() < 4 {
+                return Err(format!(
+                    "expect {first} takes: {first} <selector> <equals|contains|matches> <value>"
+                ));
+            }
+            let predicate = parse_predicate(&ps[2]).ok_or_else(|| {
+                format!(
+                    "invalid predicate '{}' — use equals|contains|matches",
+                    ps[2]
+                )
+            })?;
+            let value = ps[3..].join(" ");
+            let selector = ps[1].clone();
+            Ok(if first == "text" {
+                ExpectCond::Text {
+                    selector,
+                    predicate,
+                    value,
+                }
+            } else {
+                ExpectCond::Value {
+                    selector,
+                    predicate,
+                    value,
+                }
+            })
+        }
+        "attr" => {
+            if ps.len() < 5 {
+                return Err(
+                    "expect attr takes: attr <selector> <name> <equals|contains|matches> <value>"
+                        .to_string(),
+                );
+            }
+            let predicate = parse_predicate(&ps[3]).ok_or_else(|| {
+                format!(
+                    "invalid predicate '{}' — use equals|contains|matches",
+                    ps[3]
+                )
+            })?;
+            Ok(ExpectCond::Attr {
+                selector: ps[1].clone(),
+                name: ps[2].clone(),
+                predicate,
+                value: ps[4..].join(" "),
+            })
+        }
+        "url" => {
+            if ps.len() < 3 {
+                return Err("expect url takes: url <equals|contains|matches> <pattern>".to_string());
+            }
+            let predicate = parse_predicate(&ps[1]).ok_or_else(|| {
+                format!(
+                    "invalid predicate '{}' — use equals|contains|matches",
+                    ps[1]
+                )
+            })?;
+            Ok(ExpectCond::Url {
+                predicate,
+                pattern: ps[2..].join(" "),
+            })
+        }
+        sel => {
+            if ps.len() != 2 {
+                return Err(format!("expect takes a selector and one state — {usage}"));
+            }
+            let state = parse_state(&ps[1]).ok_or_else(|| {
+                format!(
+                    "unsupported condition '{}' — allowed states: visible|hidden|present (count/text/value/attr/url have their own forms)",
+                    ps[1]
+                )
+            })?;
+            Ok(ExpectCond::State {
+                selector: sel.to_string(),
+                state,
+            })
+        }
+    }
 }
 
 fn parse_eval(
@@ -736,7 +887,8 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
                     timeout,
                 } => open(url, expect.as_deref(), *structural, *timeout, &name).await,
                 Action::Count { selector, timeout } => count(selector, *timeout, &name).await,
-                Action::Wait { selector, timeout } => wait(selector, *timeout, &name).await,
+                Action::Wait { target, timeout } => wait(target, *timeout, &name).await,
+                Action::Expect { cond, timeout } => expect(cond, *timeout, &name).await,
                 Action::Eval { js, timeout } => eval(js, *timeout, &name).await,
                 Action::Extract {
                     schema_file,
@@ -758,23 +910,6 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
 }
 
 // ── Step runner ──────────────────────────────────────────────────
-
-/// SAFE wait form only: `wait <selector>`, selector first. There is
-/// deliberately NO timeout parameter — chrome-use has no documented
-/// `--timeout` flag for waits (only `--download` mode), so the deadline is
-/// enforced by bounding the spawned process. The trap form
-/// `wait --timeout N <sel>` is unconstructible through this kernel.
-fn wait_selector_args(selector: &str) -> Vec<String> {
-    vec!["wait".into(), selector.into()]
-}
-
-/// Build eval JS that returns the count of elements matching `selector`.
-fn count_eval_js(selector: &str) -> String {
-    format!(
-        "document.querySelectorAll('{}').length",
-        escape_js_single_quoted(selector)
-    )
-}
 
 /// Run one chrome-use step, bounded by `timeout`. `session` scopes the call
 /// via `--session`; `None` leaves the call session-unscoped (`session stop`
@@ -811,38 +946,61 @@ async fn spawn_step(
             kind: OutKind::Timeout,
             message: String::new(),
         }),
-        CliRun::Output(out) => {
-            let code = out.status.code();
-            let stderr_owned = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            // Fallback message for a non-success exit / unparseable stdout.
-            let fallback = || fallback_step_message(code, &stderr_owned);
-            let classified = |resp: BrowserResponse| {
-                let code = resp.code.clone();
-                let msg = resp
-                    .error
-                    .filter(|e| !e.trim().is_empty())
-                    .unwrap_or_else(fallback);
-                failed(classify_call_failure(code.as_deref(), &msg), msg)
-            };
-            if !out.status.success() {
-                return match serde_json::from_slice::<BrowserResponse>(&out.stdout) {
-                    Ok(resp) => classified(resp),
-                    Err(_) => failed(classify_call_failure(None, &fallback()), fallback()),
-                };
-            }
-            match serde_json::from_slice::<BrowserResponse>(&out.stdout) {
-                Ok(resp) if resp.is_success() => Ok(resp),
-                Ok(resp) => classified(resp),
-                Err(_) => failed(
-                    OutKind::Error,
-                    if stderr_owned.is_empty() {
-                        "chrome-use returned non-JSON output".to_string()
-                    } else {
-                        stderr_owned
-                    },
-                ),
-            }
+        CliRun::Output(out) => classify_step_output(
+            args.first() == Some(&"expect"),
+            out.status.code(),
+            out.status.success(),
+            &out.stdout,
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ),
+    }
+}
+
+/// Classify one chrome-use output (the `CliRun::Output` payload) into a step
+/// outcome. Pure so tests pin the mapping. `expect` is the one chrome-use
+/// action whose `--json` envelope can succeed on a non-zero exit — a failed
+/// assertion arrives as `success:true` with exit 1, the verdict riding in
+/// `data` — so envelope-success is trusted over the exit code there and
+/// nowhere else.
+fn classify_step_output(
+    expect_style: bool,
+    exit_code: Option<i32>,
+    status_success: bool,
+    stdout: &[u8],
+    stderr: &str,
+) -> StepOutcome {
+    let failed = |kind: OutKind, message: String| Err(StepFailure { kind, message });
+    // Fallback message for a non-success exit / unparseable stdout.
+    let fallback = || fallback_step_message(exit_code, stderr);
+    let classified = |resp: BrowserResponse| {
+        let code = resp.code.clone();
+        let msg = resp
+            .error
+            .filter(|e| !e.trim().is_empty())
+            .unwrap_or_else(fallback);
+        failed(classify_call_failure(code.as_deref(), &msg), msg)
+    };
+    let parsed: Option<BrowserResponse> = serde_json::from_slice(stdout).ok();
+    if !status_success {
+        if expect_style && parsed.as_ref().is_some_and(BrowserResponse::is_success) {
+            return Ok(parsed.expect("success checked"));
         }
+        return match parsed {
+            Some(resp) => classified(resp),
+            None => failed(classify_call_failure(None, &fallback()), fallback()),
+        };
+    }
+    match parsed {
+        Some(resp) if resp.is_success() => Ok(resp),
+        Some(resp) => classified(resp),
+        None => failed(
+            OutKind::Error,
+            if stderr.is_empty() {
+                "chrome-use returned non-JSON output".to_string()
+            } else {
+                stderr.to_string()
+            },
+        ),
     }
 }
 
@@ -984,6 +1142,23 @@ async fn open(
             json!({ "url": url, "error": e.to_string() }),
         );
     }
+    // The `--expect` selector goes through the shared wait-target policy (so
+    // the numeric silent-sleep form is rejected here too) — validated before
+    // navigating, never after.
+    let wait_for = match expect
+        .map(|sel| wait_target(Some(sel), None, None))
+        .transpose()
+    {
+        Ok(t) => t,
+        Err(e) => {
+            return out_env(
+                "open",
+                false,
+                OutKind::Usage,
+                json!({ "url": url, "error": e }),
+            );
+        }
+    };
     let path = match require_cli("open", json!({ "url": url })) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1040,15 +1215,18 @@ async fn open(
             );
         }
     }
-    if let Some(sel) = expect {
-        let wargs = wait_selector_args(sel);
+    if let Some(target) = wait_for {
+        let wargs = wait_args(&target, timeout.as_millis());
         let refs: Vec<&str> = wargs.iter().map(String::as_str).collect();
-        return match spawn_step(&path, &refs, Some(session), timeout).await {
+        let target = target.describe();
+        // Same bound as the standalone wait: requested + margin, so the
+        // forwarded chrome-side deadline fires its honest error first.
+        return match spawn_step(&path, &refs, Some(session), timeout + STEP_TIMEOUT_MARGIN).await {
             Ok(_) => out_env(
                 "open",
                 true,
                 OutKind::Ok,
-                json!({ "url": final_url, "selector": sel }),
+                json!({ "url": final_url, "target": target }),
             ),
             Err(f) if f.kind == OutKind::Timeout => {
                 let (kind, hint) = if structural {
@@ -1068,7 +1246,7 @@ async fn open(
                     kind,
                     json!({
                         "url": final_url,
-                        "selector": sel,
+                        "target": target,
                         "timeout_ms": timeout.as_millis(),
                         "hint": hint
                     }),
@@ -1076,33 +1254,12 @@ async fn open(
             }
             Err(f) => f.envelope(
                 "open",
-                json!({ "url": final_url, "selector": sel }),
+                json!({ "url": final_url, "target": target }),
                 timeout,
             ),
         };
     }
     out_env("open", true, OutKind::Ok, json!({ "url": final_url }))
-}
-
-/// Unwrap the actual JS result from an eval response. chrome-use wraps
-/// `eval` output as `data = {origin, result}` — an object carrying BOTH keys
-/// is treated as that wrapper; every other shape (a bare value, a plain
-/// string, a page result that merely has a `result` field) passes through.
-fn eval_result(resp: &BrowserResponse) -> Option<&Value> {
-    resp.data
-        .as_ref()
-        .map(|d| match (d.get("result"), d.get("origin")) {
-            (Some(result), Some(_)) => result,
-            _ => d,
-        })
-}
-
-/// Extract a non-negative element count from a count-eval response — the eval
-/// result arrives as a JSON number or its text form.
-fn eval_count(resp: &BrowserResponse) -> Option<u64> {
-    let data = eval_result(resp)?;
-    data.as_u64()
-        .or_else(|| data.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
 }
 
 /// Run the count-eval shim for `selector` — shared by the `count` action and
@@ -1143,18 +1300,79 @@ async fn count(selector: &str, timeout: Duration, session: &str) -> OutEnvelope 
     }
 }
 
-/// `wait` — `wait <selector>` bounded by the step deadline (never a forwarded
-/// `--timeout`; the trap form is unconstructible).
-async fn wait(selector: &str, timeout: Duration, session: &str) -> OutEnvelope {
-    let path = match require_cli("wait", json!({ "selector": selector })) {
+/// `wait` — bounded wait for a safe [`WaitTarget`] (the numeric sleep form is
+/// rejected at parse time). The requested `--timeout` is forwarded to
+/// chrome-use (its wait forms honor it) and the spawn is bounded at the
+/// requested timeout plus a margin, so chrome-use's own honest timeout error
+/// surfaces instead of a kill.
+async fn wait(target: &WaitTarget, timeout: Duration, session: &str) -> OutEnvelope {
+    let base = json!({ "target": target.describe() });
+    let path = match require_cli("wait", base.clone()) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let wargs = wait_selector_args(selector);
-    let refs: Vec<&str> = wargs.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), timeout).await {
-        Ok(_) => out_env("wait", true, OutKind::Ok, json!({ "selector": selector })),
-        Err(f) => f.envelope("wait", json!({ "selector": selector }), timeout),
+    let args = wait_args(target, timeout.as_millis());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match spawn_step(&path, &refs, Some(session), timeout + STEP_TIMEOUT_MARGIN).await {
+        Ok(_) => out_env(
+            "wait",
+            true,
+            OutKind::Ok,
+            json!({ "target": target.describe() }),
+        ),
+        Err(f) => f.envelope("wait", base, timeout),
+    }
+}
+
+/// Map a parsed expect verdict to the envelope: pass → rc 0; deadline
+/// expiration → kind timeout; a plain false (only reachable if a future
+/// chrome-use stops folding it into timedOut) → kind error. Pure so tests
+/// pin the mapping.
+fn expect_envelope(condition: &str, outcome: ExpectOutcome) -> OutEnvelope {
+    let mut payload = json!({ "condition": condition });
+    if let Some(actual) = outcome.actual {
+        payload["actual"] = actual;
+    }
+    if outcome.pass {
+        payload["pass"] = json!(true);
+        return out_env("expect", true, OutKind::Ok, payload);
+    }
+    payload["pass"] = json!(false);
+    let kind = if outcome.timed_out {
+        payload["timed_out"] = json!(true);
+        payload["error"] = json!("condition was not met within the deadline");
+        OutKind::Timeout
+    } else {
+        payload["error"] = json!("condition is false");
+        OutKind::Error
+    };
+    out_env("expect", false, kind, payload)
+}
+
+/// `expect` — assert a condition with a bounded wait. The envelope (not the
+/// exit code) is authoritative: a failed assertion arrives as
+/// `success:true` with the verdict in `data`, which [`expect_outcome`]
+/// parses (see [`spawn_step`]).
+async fn expect(cond: &ExpectCond, timeout: Duration, session: &str) -> OutEnvelope {
+    let condition = describe(cond);
+    let base = json!({ "condition": condition });
+    let path = match require_cli("expect", base.clone()) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let args = expect_args(cond, timeout.as_millis());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match spawn_step(&path, &refs, Some(session), timeout + STEP_TIMEOUT_MARGIN).await {
+        Ok(resp) => match resp.data.as_ref().and_then(expect_outcome) {
+            Some(outcome) => expect_envelope(&condition, outcome),
+            None => out_env(
+                "expect",
+                false,
+                OutKind::Error,
+                json!({ "condition": condition, "error": "expect returned an unrecognized payload" }),
+            ),
+        },
+        Err(f) => f.envelope("expect", base, timeout),
     }
 }
 
@@ -1172,15 +1390,6 @@ async fn eval(js: &str, timeout: Duration, session: &str) -> OutEnvelope {
         }
         Err(f) => f.envelope("eval", json!({ "js": js }), timeout),
     }
-}
-
-/// Trim `rows` to `limit` (mahbot-side) while reporting the honest `total`.
-/// Returns `(trimmed, total, returned)`.
-fn trim_extract_rows(rows: Vec<Value>, limit: Option<usize>) -> (Vec<Value>, usize, usize) {
-    let total = rows.len();
-    let returned = limit.map_or(total, |l| l.min(total));
-    let trimmed: Vec<Value> = rows.into_iter().take(returned).collect();
-    (trimmed, total, returned)
 }
 
 /// `extract` — schema-driven rows extraction, gated by a count so an empty
@@ -1222,24 +1431,25 @@ async fn extract(
     // Honest-empty gate: when the rows selector matches 0, report empty without
     // invoking chrome-use's phantom-row `extract`.
     if let Some(rows_sel) = schema.get("rows").and_then(Value::as_str) {
-        match count_via_eval(&path, rows_sel, session, timeout).await {
-            Ok(0) => {
+        let count = count_via_eval(&path, rows_sel, session, timeout).await;
+        match extract_gate(count) {
+            ExtractGate::Empty => {
                 return out_env(
                     "extract",
                     true,
                     OutKind::Empty,
-                    json!({ "data": [], "total": 0 }),
+                    extract_output(&json!([]), limit),
                 );
             }
-            Ok(_) => {}
-            Err(f) => return f.envelope("extract", json!({}), timeout),
+            ExtractGate::Proceed => {}
+            ExtractGate::Fail(f) => return f.envelope("extract", json!({}), timeout),
         }
     }
 
     // `--schema-file` is the installed chrome-use 1.5.101's own documented
-    // form (`extract --help`); chrome-use 1.5.101 answers rows-mode
-    // `extract --json` with `data = {rows: [...], meta: {...}}` and
-    // single-object mode with the bare object; tolerate a plain array too.
+    // form (`extract --help`); rows-mode extract answers
+    // `data = {extracted: [...], count, origin, meta}` and single-object mode
+    // with the bare object; extract_output tolerates a plain array too.
     let args = [
         "extract".to_string(),
         "--schema-file".to_string(),
@@ -1247,22 +1457,12 @@ async fn extract(
     ];
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     match spawn_step(&path, &refs, Some(session), timeout).await {
-        Ok(resp) => {
-            let rows: Vec<Value> = match resp.data.as_ref() {
-                Some(v) if v.get("rows").is_some_and(Value::is_array) => {
-                    v["rows"].as_array().expect("rows checked").clone()
-                }
-                Some(Value::Array(a)) => a.clone(),
-                Some(other) => vec![other.clone()],
-                None => Vec::new(),
-            };
-            let (trimmed, total, returned) = trim_extract_rows(rows, limit);
-            let mut payload = json!({ "data": trimmed, "total": total });
-            if limit.is_some() {
-                payload["returned"] = json!(returned);
-            }
-            out_env("extract", true, OutKind::Ok, payload)
-        }
+        Ok(resp) => out_env(
+            "extract",
+            true,
+            OutKind::Ok,
+            extract_output(resp.data.as_ref().unwrap_or(&Value::Null), limit),
+        ),
         Err(f) => f.envelope("extract", json!({}), timeout),
     }
 }
@@ -1362,18 +1562,6 @@ async fn close_ephemeral(name: &str) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn wait_selector_args_never_builds_trap_form() {
-        assert_eq!(
-            wait_selector_args(".btn"),
-            vec!["wait".to_string(), ".btn".to_string()]
-        );
-        // A selector that looks like a timeout flag stays a single positional.
-        assert_eq!(
-            wait_selector_args("--timeout 5 .btn"),
-            vec!["wait".to_string(), "--timeout 5 .btn".to_string()]
-        );
-    }
     #[test]
     fn eval_count_unwraps_chrome_use_result_envelope() {
         let resp = |data: Value| BrowserResponse {
@@ -1525,19 +1713,160 @@ mod tests {
         assert!(env.payload.get("timeout_ms").is_none());
     }
 
+    /// Direct pin of the spawn-level classification, including the crux of the
+    /// expect contract: a failed assertion arrives as `success:true` with
+    /// exit 1 and the verdict in `data`.
     #[test]
-    fn extract_limit_trim_is_honest() {
-        let rows: Vec<Value> = (0..5).map(|i| json!({ "i": i })).collect();
-        let (trimmed, total, returned) = trim_extract_rows(rows.clone(), Some(2));
-        assert_eq!(total, 5);
-        assert_eq!(returned, 2);
-        assert_eq!(trimmed.len(), 2);
-        assert_eq!(trimmed[0], json!({ "i": 0 }));
+    fn classify_step_output_pins_envelope_over_exit_code() {
+        let envelope = |body: Value| serde_json::to_vec(&body).expect("serialize envelope");
+        let outcome = |r: &StepOutcome| match r {
+            Ok(resp) => Ok(resp.data.clone()),
+            Err(f) => Err((f.kind, f.message.clone())),
+        };
 
-        let (trimmed, total, returned) = trim_extract_rows(rows, None);
-        assert_eq!(total, 5);
-        assert_eq!(returned, 5);
-        assert_eq!(trimmed.len(), 5);
+        // expect pass=false: success:true + exit 1 → the verdict is returned.
+        let resp = classify_step_output(
+            true,
+            Some(1),
+            false,
+            &envelope(
+                json!({"success": true, "data": {"pass": false, "actual": 3, "timedOut": true}}),
+            ),
+            "",
+        )
+        .expect("expect verdict must survive the non-zero exit");
+        assert_eq!(
+            resp.data
+                .as_ref()
+                .and_then(expect_outcome)
+                .map(|o| (o.pass, o.timed_out, o.actual)),
+            Some((false, true, Some(json!(3))))
+        );
+
+        // …but only for expect: the same payload on another action is a
+        // generic failure (fallback message, no envelope error).
+        let r = classify_step_output(
+            false,
+            Some(1),
+            false,
+            &envelope(json!({"success": true, "data": {"pass": false}})),
+            "",
+        );
+        assert_eq!(
+            outcome(&r),
+            Err((OutKind::Error, "chrome-use exited with code 1".into()))
+        );
+
+        // expect un-evaluable (no browser): success:false + exit 2 → environment.
+        let r = classify_step_output(
+            true,
+            Some(2),
+            false,
+            &envelope(
+                json!({"success": false, "error": "Browser not launched", "code": "browser_not_launched"}),
+            ),
+            "",
+        );
+        assert_eq!(
+            outcome(&r),
+            Err((OutKind::Environment, "Browser not launched".into()))
+        );
+
+        // Honest timeout classification on a failed wait.
+        let r = classify_step_output(
+            false,
+            Some(1),
+            false,
+            &envelope(json!({"success": false, "error": "Wait timed out after 15000ms"})),
+            "",
+        );
+        assert_eq!(
+            outcome(&r),
+            Err((OutKind::Timeout, "Wait timed out after 15000ms".into()))
+        );
+
+        // Happy path: exit 0 + success envelope.
+        assert!(
+            outcome(&classify_step_output(
+                false,
+                Some(0),
+                true,
+                &envelope(json!({"success": true, "data": {}})),
+                ""
+            ))
+            .is_ok()
+        );
+
+        // Unparseable stdout: zero exit → non-JSON error; non-zero → stderr fallback.
+        let r = classify_step_output(false, Some(0), true, b"garbage", "");
+        assert_eq!(
+            outcome(&r),
+            Err((OutKind::Error, "chrome-use returned non-JSON output".into()))
+        );
+        let r = classify_step_output(false, Some(1), false, b"garbage", "relay is not connected");
+        assert_eq!(
+            outcome(&r),
+            Err((OutKind::Environment, "relay is not connected".into()))
+        );
+    }
+
+    #[test]
+    fn expect_envelope_maps_pass_timeout_and_false() {
+        // pass → rc 0 / ok.
+        let env = expect_envelope(
+            "'#main' is visible",
+            ExpectOutcome {
+                pass: true,
+                actual: Some(json!({"tag": "h1"})),
+                timed_out: false,
+            },
+        );
+        assert!(env.ok);
+        assert_eq!(env.kind, OutKind::Ok);
+        assert_eq!(env.payload["pass"], json!(true));
+        assert_eq!(env.payload["actual"], json!({"tag": "h1"}));
+
+        // deadline expiration → timeout.
+        let env = expect_envelope(
+            "count('.card') == 3",
+            ExpectOutcome {
+                pass: false,
+                actual: Some(json!(0)),
+                timed_out: true,
+            },
+        );
+        assert!(!env.ok);
+        assert_eq!(env.kind, OutKind::Timeout);
+        assert_eq!(env.payload["pass"], json!(false));
+        assert_eq!(env.payload["timed_out"], json!(true));
+
+        // plain false → error (no timed_out key).
+        let env = expect_envelope(
+            "url contains \"dashboard\"",
+            ExpectOutcome {
+                pass: false,
+                actual: Some(json!("about:blank")),
+                timed_out: false,
+            },
+        );
+        assert!(!env.ok);
+        assert_eq!(env.kind, OutKind::Error);
+        assert_eq!(env.payload["pass"], json!(false));
+        assert!(env.payload.get("timed_out").is_none());
+
+        // `actual: None` omits the actual key.
+        let env = expect_envelope(
+            "'#main' is present",
+            ExpectOutcome {
+                pass: true,
+                actual: None,
+                timed_out: false,
+            },
+        );
+        assert!(env.ok);
+        assert_eq!(env.kind, OutKind::Ok);
+        assert_eq!(env.payload["pass"], json!(true));
+        assert!(env.payload.get("actual").is_none());
     }
 
     #[expect(clippy::too_many_lines)]
@@ -1605,6 +1934,102 @@ mod tests {
                 | Action::Eval { timeout, .. } => assert_eq!(timeout, Duration::from_secs(7)),
                 _ => panic!("expected a timed action"),
             }
+        }
+
+        // wait with --url / --text targets.
+        let inv = parse_invocation(&[
+            "wait".into(),
+            "--url".into(),
+            "dashboard".into(),
+            "--timeout=9".into(),
+        ])
+        .expect("wait url parses");
+        match inv.action {
+            Action::Wait { target, timeout } => {
+                assert!(matches!(target, WaitTarget::Url(u) if u == "dashboard"));
+                assert_eq!(timeout, Duration::from_secs(9));
+            }
+            _ => panic!("expected Wait"),
+        }
+        let inv = parse_invocation(&["wait".into(), "--text".into(), "Loaded".into()])
+            .expect("wait text parses");
+        match inv.action {
+            Action::Wait { target, timeout } => {
+                assert!(matches!(target, WaitTarget::Text(t) if t == "Loaded"));
+                assert_eq!(timeout, DEFAULT_STEP_TIMEOUT);
+            }
+            _ => panic!("expected Wait"),
+        }
+
+        // expect conditions via the forms grammar.
+        let inv = parse_invocation(&["expect".into(), "#main".into(), "visible".into()])
+            .expect("expect state parses");
+        match inv.action {
+            Action::Expect { cond, timeout } => {
+                assert!(matches!(
+                    cond,
+                    ExpectCond::State { selector, state } if selector == "#main" && state == "visible"
+                ));
+                assert_eq!(timeout, DEFAULT_STEP_TIMEOUT);
+            }
+            _ => panic!("expected Expect"),
+        }
+        let inv = parse_invocation(&[
+            "expect".into(),
+            "count".into(),
+            ".card".into(),
+            ">=".into(),
+            "3".into(),
+            "--timeout=5".into(),
+        ])
+        .expect("expect count parses");
+        match inv.action {
+            Action::Expect { cond, timeout } => {
+                assert!(matches!(
+                    cond,
+                    ExpectCond::Count { selector, op, n } if selector == ".card" && op == ">=" && n == 3
+                ));
+                assert_eq!(timeout, Duration::from_secs(5));
+            }
+            _ => panic!("expected Expect"),
+        }
+        let inv = parse_invocation(&[
+            "expect".into(),
+            "text".into(),
+            "h1".into(),
+            "contains".into(),
+            "Hello".into(),
+            "World".into(),
+        ])
+        .expect("expect text parses");
+        match inv.action {
+            Action::Expect { cond, timeout } => {
+                assert!(matches!(
+                    cond,
+                    ExpectCond::Text { selector, predicate, value }
+                        if selector == "h1" && predicate == "contains" && value == "Hello World"
+                ));
+                assert_eq!(timeout, DEFAULT_STEP_TIMEOUT);
+            }
+            _ => panic!("expected Expect"),
+        }
+        let inv = parse_invocation(&[
+            "expect".into(),
+            "url".into(),
+            "contains".into(),
+            "dashboard".into(),
+        ])
+        .expect("expect url parses");
+        match inv.action {
+            Action::Expect { cond, timeout } => {
+                assert!(matches!(
+                    cond,
+                    ExpectCond::Url { predicate, pattern }
+                        if predicate == "contains" && pattern == "dashboard"
+                ));
+                assert_eq!(timeout, DEFAULT_STEP_TIMEOUT);
+            }
+            _ => panic!("expected Expect"),
         }
 
         // extract requires --schema-file.
@@ -1692,6 +2117,59 @@ mod tests {
             parse_invocation(&["open".into(), "https://x".into(), "--timeout=0".into()]).is_err()
         );
         assert!(parse_invocation(&["session".into(), "destroy".into(), "x".into()]).is_err());
+        // wait must reject the numeric silent-sleep form and mixed targets.
+        assert!(parse_invocation(&["wait".into(), "5000".into()]).is_err());
+        assert!(
+            parse_invocation(&[
+                "wait".into(),
+                "--url".into(),
+                "a".into(),
+                "--text".into(),
+                "b".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_invocation(&["wait".into(), "--url".into(), "a".into(), ".x".into()]).is_err()
+        );
+        // wait rejects extra positionals (previously silently ignored).
+        assert!(parse_invocation(&["wait".into(), "#main".into(), "extra".into()]).is_err());
+        // expect rejects missing / off-allowlist conditions.
+        assert!(parse_invocation(&["expect".into()]).is_err());
+        assert!(parse_invocation(&["expect".into(), "#a".into(), "gone".into()]).is_err());
+        assert!(
+            parse_invocation(&[
+                "expect".into(),
+                "count".into(),
+                ".c".into(),
+                "~=".into(),
+                "2".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_invocation(&[
+                "expect".into(),
+                "count".into(),
+                ".c".into(),
+                "==".into(),
+                "x".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_invocation(&[
+                "expect".into(),
+                "text".into(),
+                "h1".into(),
+                "starts".into(),
+                "x".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_invocation(&["expect".into(), "count".into(), ".c".into(), "==".into()]).is_err()
+        );
     }
 
     #[test]
@@ -1748,7 +2226,7 @@ mod tests {
 
     #[test]
     fn action_flags_match_the_cli_help_flag_sets() {
-        // ACTION_FLAGS must cover exactly the 8 CLI action words.
+        // ACTION_FLAGS must cover exactly the CLI action words.
         let mut table: Vec<&str> = ACTION_FLAGS.iter().map(|(name, ..)| *name).collect();
         table.sort_unstable();
         let mut cli: Vec<&str> = actions::ACTIONS
