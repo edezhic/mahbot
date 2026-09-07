@@ -695,8 +695,8 @@ pub struct TelegramChannel {
 
     /// Per-chat command menu state — change detection + in-flight coalescing
     /// for the per-user `setMyCommands` refresh, so outbound message floods
-    /// (manager broadcasts, parallel agent responses) don't trip Telegram's
-    /// rate limiting. Menu refreshes are fire-and-forget and fail-open.
+    /// (parallel agent responses) don't trip Telegram's rate limiting. Menu
+    /// refreshes are fire-and-forget and fail-open.
     menu_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ChatMenuState>>>,
 
     /// Mutual exclusion for role-switch pin flows: two rapid switches run in

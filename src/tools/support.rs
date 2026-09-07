@@ -375,7 +375,7 @@ impl Tool for InstallChromeUseTool {
     }
 }
 
-/// Mark onboarding complete and switch the admin to their chosen agent.
+/// Mark onboarding complete and switch the admin to the Assistant.
 pub(crate) struct FinalizeTool;
 
 #[async_trait]
@@ -389,7 +389,7 @@ impl Tool for FinalizeTool {
             &json!({
                 "agent": {
                     "type": "string",
-                    "description": "The agent to switch to after onboarding: 'assistant' or 'manager'."
+                    "description": "The agent to switch to after onboarding: 'assistant'."
                 }
             }),
             &["agent"],
@@ -403,15 +403,15 @@ impl Tool for FinalizeTool {
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         let user = acting_user(ws).to_string();
         let agent = super::get_str(&args, "agent")?.parse::<Role>()?;
-        if !matches!(agent, Role::Assistant | Role::Manager) {
-            return Err(err("agent must be 'assistant', 'manager'"));
+        if agent != Role::Assistant {
+            return Err(err("agent must be 'assistant'"));
         }
 
         // Switch the active role BEFORE persisting `Finished` (mirrors
         // `kickoff_support`: the role action runs first, then the durable state
         // is recorded). If the role switch fails the state stays `Welcomed`, so
         // the Support agent can retry `finalize`; if the persist fails the user
-        // is already on the chosen agent (idempotent) and a retry re-records it.
+        // is already on the Assistant (idempotent) and a retry re-records it.
         crate::users::switch_active_role(&user, agent).await?;
         crate::config::persist_settled_string_field(
             crate::config::CONFIG_KEY_ONBOARDING_STATE,

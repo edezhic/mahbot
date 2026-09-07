@@ -1175,17 +1175,9 @@ impl HomeState {
                 .size(theme::TEXT_14)
                 .color(theme::TEXT_MUTED),
         };
-        // Personal-workspace picker hides the Manager role — routing maps
-        // Manager→Assistant there, so offering it in the menu is misleading.
-        // Use the filtered pool both for the button gate and the menu items.
-        let filtered_pool: Vec<Role> = role_pool
-            .iter()
-            .filter(|role| **role != Role::Manager || !self.at_personal_picker())
-            .copied()
-            .collect();
         let role_btn = button(role_icon)
             .on_press_maybe(
-                (self.selected_user.is_some() && !filtered_pool.is_empty())
+                (self.selected_user.is_some() && !role_pool.is_empty())
                     .then_some(HomeMessage::RoleMenuToggled),
             )
             .style(theme::icon_button_style(false))
@@ -1200,9 +1192,9 @@ impl HomeState {
         // publishes SwitchRole, which the Dashboard intercepts and persists
         // (it also sends RoleMenuClosed). Outside-click / Escape dismissal
         // is handled by the popup itself via RoleMenuClosed.
-        let role_btn: Element<'_, HomeMessage> = if !filtered_pool.is_empty() {
+        let role_btn: Element<'_, HomeMessage> = if !role_pool.is_empty() {
             let user = self.selected_user.clone().unwrap_or_default();
-            let items: Vec<RoleMenuItem<HomeMessage>> = filtered_pool
+            let items: Vec<RoleMenuItem<HomeMessage>> = role_pool
                 .iter()
                 .map(|role| {
                     let is_current = active_role.as_ref() == Some(role);
@@ -1535,10 +1527,11 @@ impl HomeState {
                         // same (role, workspace) resolution as routing and
                         // Telegram /clear (see
                         // [`crate::users::resolve_session_target`]): the
-                        // starting workspace is the user's DB workspace, never
-                        // the GUI picker position, so the Personal picker
-                        // clears the project Manager conversation instead of
-                        // a phantom Analyst session in the personal workspace.
+                        // starting role/workspace resolve from the user's DB
+                        // record, never the GUI picker position, and the
+                        // resolvable roles (Assistant/Support) are pinned —
+                        // so the cleared session is always the user's
+                        // personal-workspace session.
                         let (effective_role, ws) =
                             crate::users::resolve_session_target(&sender).await;
                         // Fail-closed: a failed abandon aborts the clear — the
@@ -2652,7 +2645,7 @@ mod tests {
             .get()
             .expect("users store initialized");
         store
-            .add_user(user, Some("full"), Role::Manager)
+            .add_user(user, Some("full"), Role::Assistant)
             .await
             .expect("add user");
 
@@ -2745,11 +2738,11 @@ mod tests {
     fn test_call_site_wiring_symmetric_at_any_picker() {
         // (picker, message workspace, agent role, content) — both directions:
         // at the project picker personal Assistant/Support messages append and
-        // clear sending/typing; at the personal picker the same holds for
-        // Manager replies in the user's DB project workspace.
+        // clear sending/typing; at the personal picker Assistant messages
+        // still append into the user's DB project workspace (the merge partner).
         let cases = [
             ("ws1", "personal:alice", "assistant", "Assistant reply"),
-            ("", "ws1", "manager", "Manager reply"),
+            ("", "ws1", "assistant", "Assistant reply in project"),
         ];
         for (picker, msg_ws, role, content) in cases {
             let mut state = make_home_state("alice", picker);

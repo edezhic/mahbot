@@ -20,9 +20,11 @@
 //!
 //! # Response delivery
 //!
-//! - [`Role::Manager`] broadcasts to all workspace users.
-//! - Other roles broadcast to all of the triggering user's channel bindings
-//!   (Manager model generalized).
+//! - [`Role::Manager`] responses relay to every admin user's Assistant via
+//!   the durable `<manager-message>` envelope ([`route_manager_notify`]) —
+//!   there is no direct user delivery.
+//! - Other roles deliver to the triggering user's channel bindings (with an
+//!   unregistered-user fallback).
 
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
@@ -562,16 +564,11 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         let role = job.role;
 
         // ── Resolve users for response delivery ───────────────────────
-        // Manager: broadcast to all workspace users.
-        // Other roles: deliver to the specific user.
+        // Non-Manager roles deliver to the specific triggering user. The
+        // Manager has no direct user delivery: its responses relay to the
+        // admin Assistants via the ManagerNotify envelope below.
         let users: Vec<UserRecord> = if role == Role::Manager {
-            match crate::users::USER_STORE.get() {
-                Some(store) => store
-                    .find_by_workspace(&job.workspace_name)
-                    .await
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            }
+            Vec::new()
         } else {
             match resolve_single_user(&job.user_name).await {
                 Some(user) => vec![user],
@@ -617,7 +614,9 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
 
         // ── Run the agent ─────────────────────────────────────────────
         // Full-access (admin) users get the Assistant's full-permission toolset
-        // and role prompt; everyone else runs the base Assistant.
+        // and role prompt; everyone else runs the base Assistant. Manager jobs
+        // resolve no users, so `full_access` is always false there — inert for
+        // this role (nothing in the Manager toolset or prompt gates on it).
         let full_access = users.first().is_some_and(UserRecord::is_admin);
         let (agent, response) = crate::agent::run_agent(
             agent_id.clone(),
@@ -676,12 +675,12 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         }
 
         // ── Response delivery ─────────────────────────────────────────
-        // Manager: broadcast + persist to all workspace users.
+        // Manager: the sole delivery path is the durable <manager-message>
+        // envelope into each admin's personal Assistant.
         // Other roles: broadcast to all of the triggering user's channel
         // bindings (or use fallback for unregistered users).
         match role {
             Role::Manager => {
-                deliver_manager_response(&response, &users, &job).await;
                 route_manager_notify(&response, &job.workspace_name).await;
             }
             _ => {
@@ -878,17 +877,6 @@ async fn route_manager_notify(response: &str, source_workspace: &str) {
     }
 }
 
-/// Deliver a response to all workspace users (Manager role).
-async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &AgentJob) {
-    if users.is_empty() {
-        warn!(
-            workspace = %job.workspace_name,
-            "Message router [manager]: no users with workspace — response delivered to nobody",
-        );
-    }
-    deliver_agent_response_to_workspace(response, users, Role::Manager, &job.workspace_name).await;
-}
-
 /// Broadcast + persist one shared-broadcast_id copy per unique workspace user,
 /// then transport-deliver to every channel binding. The shared broadcast id
 /// lets the workspace chat stream dedupe the per-user copies exactly. Skips
@@ -991,7 +979,7 @@ async fn deliver_response_over_channels(
 }
 
 /// Deliver a response to a single registered user, broadcasting it to ALL of
-/// the user's channel bindings (the Manager model generalized to every role).
+/// the user's channel bindings.
 ///
 /// `user` is the resolved [`UserRecord`] for the job's sender — guaranteed
 /// non-empty by the consumer loop before calling this function.
@@ -1005,8 +993,7 @@ async fn deliver_response_over_channels(
 /// channel the request came in on.
 ///
 /// `job.reply_target` is not used to scope transport delivery for registered
-/// users — each binding supplies its own reply_target on its own channel, the
-/// broadcast model the Manager generalizes.
+/// users — each binding supplies its own reply_target on its own channel.
 async fn deliver_single_user_response(
     response: &str,
     user: &UserRecord,
@@ -1453,8 +1440,7 @@ mod tests {
     }
 
     /// `deliver_single_user_response` completes without error and broadcasts
-    /// to all of the user's channel bindings (the Manager model generalized to
-    /// a single role). Here admin is bound to "gui" and the job originates on
+    /// to all of the user's channel bindings. Here admin is bound to "gui" and the job originates on
     /// "gui" — broadcast+persist runs and transport delivery reaches the
     /// matching "gui" binding. No-panic is the assertion.
     #[tokio::test]
@@ -1565,98 +1551,6 @@ mod tests {
         assert!(
             !captured.is_empty(),
             "spy channel should have captured at least one broadcast send",
-        );
-    }
-
-    /// `deliver_manager_response` broadcasts to all workspace users without
-    /// panic when users have channel bindings.
-    #[tokio::test]
-    #[serial_test::serial(provider)]
-    async fn test_deliver_manager_response_with_users() {
-        setup_response_test_infra().await;
-
-        let store = crate::users::USER_STORE.get().unwrap();
-        store
-            .bind_channel("admin", "gui", "admin")
-            .await
-            .expect("bind admin to gui channel");
-
-        let user = resolve_single_user("admin").await.unwrap();
-
-        let job = AgentJob {
-            content: "manager broadcast".to_string(),
-            workspace_name: "default".to_string(),
-            user_name: "admin".to_string(),
-            channel: "gui".to_string(),
-            kind: MessageKind::TicketNotify,
-            role: Role::Manager,
-            reply_target: None,
-            pending_job_id: None,
-        };
-
-        deliver_manager_response("manager response", &[user], &job).await;
-    }
-
-    /// Regression: the Manager transport loop must skip bindings whose channel
-    /// differs from the delivering transport (same filter the single-user path
-    /// applies). The user is bound only to `SPY_MATCH`; a second registered spy
-    /// channel must capture nothing — without the channel filter, the loop
-    /// would replay the matching binding's delivery on every registered
-    /// channel. Uses a dedicated user because the users store and channel
-    /// registry are process-global and other tests deliver for `admin`
-    /// concurrently.
-    #[tokio::test]
-    #[serial_test::serial(provider)]
-    async fn test_deliver_manager_response_skips_foreign_channel_bindings() {
-        const SPY_MATCH: &str = "__test_mgr_spy_match";
-        const SPY_OTHER: &str = "__test_mgr_spy_other";
-        const USER: &str = "__test_mgr_skip_user";
-        setup_response_test_infra().await;
-
-        let store = crate::users::USER_STORE.get().unwrap();
-        store
-            .add_user(USER, None, Role::Assistant)
-            .await
-            .expect("create dedicated test user");
-        store
-            .bind_channel(USER, SPY_MATCH, "mgr-spy-target")
-            .await
-            .expect("bind user to matching spy channel");
-        store
-            .update_channel_contact(SPY_MATCH, "mgr-spy-target", "mgr-spy-target")
-            .await
-            .expect("set reply_target on the spy binding");
-
-        let (match_spy, match_sent) = crate::util::test::SpyChannel::new(SPY_MATCH);
-        let (other_spy, other_sent) = crate::util::test::SpyChannel::new(SPY_OTHER);
-        crate::channel_registry().register(Arc::new(match_spy) as Arc<dyn crate::Channel>);
-        crate::channel_registry().register(Arc::new(other_spy) as Arc<dyn crate::Channel>);
-
-        let user = resolve_single_user(USER).await.unwrap();
-        let job = AgentJob {
-            content: "manager broadcast".to_string(),
-            workspace_name: "default".to_string(),
-            user_name: USER.to_string(),
-            channel: "gui".to_string(),
-            kind: MessageKind::TicketNotify,
-            role: Role::Manager,
-            reply_target: None,
-            pending_job_id: None,
-        };
-
-        deliver_manager_response("manager response", &[user], &job).await;
-
-        let captured = match_sent.lock().unwrap_poison();
-        assert!(
-            captured.len() == 1
-                && captured[0].recipient == "mgr-spy-target"
-                && captured[0].content == "manager response",
-            "matching spy channel should deliver exactly once to the binding's \
-             reply_target, got: {captured:?}",
-        );
-        assert!(
-            other_sent.lock().unwrap_poison().is_empty(),
-            "spy channel without a matching binding must not receive the manager response",
         );
     }
 

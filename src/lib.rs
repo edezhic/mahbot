@@ -600,7 +600,7 @@ pub static GUI_MESSAGE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<ChannelMe
 ///
 /// Replaces the old single-channel `OnceCell` with a multi-channel
 /// `RwLock<HashMap>`. Channels register themselves during startup;
-/// lookups are used to route outbound replies, Manager responses,
+/// lookups are used to route outbound replies, agent responses,
 /// and typing indicators.
 #[derive(Default)]
 pub struct ChannelRegistry {

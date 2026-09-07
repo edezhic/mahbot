@@ -18,7 +18,8 @@
 //! 5. **Command recording** — record speech until silence or 10 min cap
 //! 6. **Transcription** — via the shared Qwen3-ASR local transcriber
 //! 7. **Routing** — transcribed text is routed to the user's active role via
-//!    [`route_to_agent`] (falls back to the Manager if no active user is determined).
+//!    [`route_to_agent`] (falls back to the seeded admin's default pool role
+//!    if no active user is determined).
 //!
 //! The pipeline runs unconditionally as a boot background task. It does NOT
 //! use an LLM agent loop.
@@ -1593,7 +1594,8 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
 /// Resolves the active user's role and workspace from the user's DB record,
 /// then routes through the agent-ID message router.
 ///
-/// Falls back to the Manager router if no active user can be determined.
+/// Falls back to the admin user's pool role if no active user can be
+/// determined.
 async fn route_to_agent(text: String) {
     // Try active user first (set by GUI on user switch)
     let user_name = active_user_name();
@@ -1607,7 +1609,7 @@ async fn route_to_agent(text: String) {
             return;
         };
         let ws = crate::users::resolve_workspace_for_user_name(&user_name).await;
-        route_voice_to_role(text, &user_name, role, &pool, ws).await;
+        route_voice_to_role(text, &user_name, role, ws).await;
         return;
     }
 
@@ -1616,25 +1618,20 @@ async fn route_to_agent(text: String) {
     // like the active-user path: an emptied admin pool drops the command.
     let ws = crate::users::resolve_workspace_for_user_name("admin").await;
     let admin_pool = crate::users::role_pool("admin").await;
-    if admin_pool.is_empty() {
+    let Some(&role) = admin_pool.first() else {
         info!("Voice command dropped (no active role) (user: admin): {text}");
         return;
-    }
-    let role = if admin_pool.contains(&crate::Role::Manager) {
-        crate::Role::Manager
-    } else {
-        admin_pool[0]
     };
-    route_voice_to_role(text, "admin", role, &admin_pool, ws).await;
+    route_voice_to_role(text, "admin", role, ws).await;
 }
 
-/// Shared tail of [`route_to_agent`]: clamp/pin the pool-selected role to
-/// its effective workspace, log, broadcast the transcript, and hand off to
+/// Shared tail of [`route_to_agent`]: pin the pool-selected role to its
+/// effective workspace, log, broadcast the transcript, and hand off to
 /// the message router.
 ///
 /// Pool-gating applies to both callers: the routed role stays inside the
-/// pool — including the same personal-workspace Manager→Assistant clamp and
-/// Assistant/Support pinning to the personal workspace, atomically.
+/// pool — with Assistant/Support pinning to the personal workspace,
+/// atomically.
 ///
 /// The routed user_name is the active user, or "admin" (the seeded admin
 /// identity) for the no-active-user fallback — an empty name would produce
@@ -1643,10 +1640,9 @@ async fn route_voice_to_role(
     text: String,
     user_name: &str,
     role: crate::Role,
-    pool: &[crate::Role],
     ws: crate::Workspace,
 ) {
-    let (role, ws) = crate::users::effective_role_and_workspace(role, ws, user_name, pool);
+    let ws = crate::users::effective_workspace_for_role(role, ws, user_name);
 
     info!(
         "Voice command -> {role} (user: {user_name}, workspace: {})",

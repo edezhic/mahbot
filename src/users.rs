@@ -83,9 +83,10 @@ impl UserStore {
     /// on the shared consolidated connection) and each isolated user store open.
     pub(crate) async fn ensure_admin_user(&self) -> Result<()> {
         if !self.user_exists("admin").await? {
-            // Fresh admin: full permissions + selected_role=Support (the first
-            // onboarding-pool role).
-            self.add_user("admin", Some("full"), Role::Support).await?;
+            // Fresh admin: full permissions + selected_role=Assistant (the first
+            // pool role).
+            self.add_user("admin", Some("full"), Role::Assistant)
+                .await?;
         }
         Ok(())
     }
@@ -341,8 +342,8 @@ impl UserStore {
 
     /// Find the users attached to the given shared workspace — admin-filtered.
     ///
-    /// Workspace membership is admin-only: the Manager broadcast and the
-    /// Assistant→Manager mirror deliver only to admin (full-permissions)
+    /// Workspace membership is admin-only: the Assistant→Manager mirror
+    /// (send_message_to_manager) delivers only to admin (full-permissions)
     /// members, so a rogue non-admin re-attachment can never receive
     /// shared-workspace traffic (defense in depth on top of the runtime
     /// resolution clamp).
@@ -491,12 +492,13 @@ fn is_admin_permissions(permissions: Option<&str>) -> bool {
 }
 
 /// The role pool for a permissions value, derived at read time (no `user_roles`
-/// table). Full-permissions (admin) users get the onboarding pool; all other
-/// users are limited to the personal assistant role.
+/// table). Full-permissions (admin) users get `[Assistant, Support]` with the
+/// Assistant first (default + fallback); all other users are limited to the
+/// personal assistant role.
 #[must_use]
 fn role_pool_for_permissions(permissions: Option<&str>) -> Vec<Role> {
     if is_admin_permissions(permissions) {
-        vec![Role::Support, Role::Assistant, Role::Manager]
+        vec![Role::Assistant, Role::Support]
     } else {
         vec![Role::Assistant]
     }
@@ -831,8 +833,8 @@ pub async fn switch_active_role(user_name: &str, role: Role) -> Result<()> {
 ///
 /// A stored selection is honoured when it is still in the pool; a selection
 /// outside the pool falls back to the first pool role. Without a stored
-/// selection, the first pool role is used (Support for a full-permissions
-/// admin, Assistant otherwise).
+/// selection, the first pool role is used (Assistant for every user — admins
+/// and non-admins alike).
 pub async fn resolve_active_role(user_name: &str) -> Option<Role> {
     let pool = role_pool(user_name).await;
     resolve_active_role_from_pool(user_name, &pool).await
@@ -860,24 +862,6 @@ pub async fn resolve_active_role_from_pool(user_name: &str, pool: &[Role]) -> Op
             .filter(|r| pool.contains(r))
             .or_else(|| pool.first().copied()),
         None => pool.first().copied(),
-    }
-}
-
-/// The role that answers for a user in a workspace: personal workspaces do
-/// not support the Manager agent (no board pipeline), so Manager falls back
-/// to Assistant. The fallback stays inside the user's pool — a Manager-only
-/// pool (not possible under the permission-derived pools) would keep the
-/// Manager selection. Canonical home for the chat and voice routing paths.
-#[must_use]
-fn resolve_effective_role(role: Role, ws_name: &str, pool: &[Role]) -> Role {
-    if role == Role::Manager && is_personal_workspace(ws_name) {
-        if pool.contains(&Role::Assistant) {
-            Role::Assistant
-        } else {
-            role
-        }
-    } else {
-        role
     }
 }
 
@@ -925,7 +909,7 @@ pub(crate) fn enforce_personal_pinning(
 /// and Support always work in the user's personal workspace regardless of
 /// the selected workspace, giving path-dependent callers (enrichment
 /// uploads, generated-media writes) the personal workspace's filesystem
-/// path.
+/// path. Other roles pass through unchanged.
 /// An empty `user_name` disables pinning (no personal identity to pin to),
 /// so callers must pass a resolvable user (the voice admin fallback passes
 /// "admin").
@@ -933,11 +917,7 @@ pub(crate) fn enforce_personal_pinning(
 /// project workspace's `uploads/`/`generated/` stays there and is no longer
 /// reachable by Assistant tools (e.g. video_edit path confinement).
 #[must_use]
-pub(crate) fn effective_workspace_for_role(
-    role: Role,
-    ws: Workspace,
-    user_name: &str,
-) -> Workspace {
+pub fn effective_workspace_for_role(role: Role, ws: Workspace, user_name: &str) -> Workspace {
     if pins_to_personal(role, &ws.name, user_name) {
         personal_workspace_struct(user_name)
     } else {
@@ -952,30 +932,11 @@ pub(crate) fn effective_workspace_for_role(
     }
 }
 
-/// Resolve the effective (role, workspace) pair atomically: apply
-/// `resolve_effective_role` (Manager→Assistant in personal workspaces) then
-/// pin Assistant/Support to the user's personal workspace via
-/// `effective_workspace_for_role`. The transformations act on disjoint role
-/// sets, but a single call keeps session identity and the pinned workspace
-/// consistent at every routing entry point.
-#[must_use]
-pub fn effective_role_and_workspace(
-    role: Role,
-    ws: Workspace,
-    user_name: &str,
-    pool: &[Role],
-) -> (Role, Workspace) {
-    let role = resolve_effective_role(role, &ws.name, pool);
-    let ws = effective_workspace_for_role(role, ws, user_name);
-    (role, ws)
-}
-
 /// Resolve the (role, workspace) a user's messages route to and their
 /// session lives in — the same resolution as routing, so ClearChat and
 /// Telegram /clear always clear the actual recipient: the DB-selected
 /// workspace, the pool-clamped active role (Assistant fallback for an
-/// empty pool), the personal-workspace Manager→Assistant remap, and
-/// Assistant/Support pinning.
+/// empty pool), and Assistant/Support pinning.
 pub async fn resolve_session_target(user_name: &str) -> (Role, Workspace) {
     let (ws, pool) = tokio::join!(
         resolve_workspace_for_user_name(user_name),
@@ -984,7 +945,8 @@ pub async fn resolve_session_target(user_name: &str) -> (Role, Workspace) {
     let role = resolve_active_role_from_pool(user_name, &pool)
         .await
         .unwrap_or(Role::Assistant);
-    effective_role_and_workspace(role, ws, user_name, &pool)
+    let ws = effective_workspace_for_role(role, ws, user_name);
+    (role, ws)
 }
 
 /// Resolve a channel+identifier pair to the canonical user name.
@@ -1113,11 +1075,12 @@ mod tests {
 
     #[test]
     fn role_pool_for_permissions_is_permission_derived() {
-        // Full-permissions (admin) → the onboarding pool; everyone else → the
-        // personal assistant role. The default (first) role drives routing.
+        // Full-permissions (admin) → [Assistant, Support] with the Assistant
+        // first (default + fallback); everyone else → the personal assistant
+        // role. The default (first) role drives routing.
         assert_eq!(
             role_pool_for_permissions(Some("full")),
-            vec![Role::Support, Role::Assistant, Role::Manager]
+            vec![Role::Assistant, Role::Support]
         );
         assert_eq!(role_pool_for_permissions(None), vec![Role::Assistant]);
     }
@@ -1154,6 +1117,30 @@ mod tests {
             .unwrap();
         assert_eq!(
             resolve_active_role("pool_user").await,
+            Some(Role::Assistant)
+        );
+
+        // Admin: pool defaults to Assistant (the first pool role); a stored
+        // 'manager' (out-of-pool, e.g. from before this change) clamps back.
+        store
+            .add_user("admin_pool_user", Some("full"), Role::Assistant)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_active_role("admin_pool_user").await,
+            Some(Role::Assistant)
+        );
+        store
+            .update_user(
+                "admin_pool_user",
+                FieldUpdate::Set("manager"),
+                FieldUpdate::Unchanged,
+                FieldUpdate::Unchanged,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_active_role("admin_pool_user").await,
             Some(Role::Assistant)
         );
     }
@@ -1257,7 +1244,6 @@ mod tests {
             "personal:alice",
             "alice"
         ));
-        assert!(!pins_to_personal(Role::Manager, "ws1", "alice"));
         assert!(!pins_to_personal(Role::Assistant, "ws1", ""));
 
         let project = Workspace {
@@ -1271,37 +1257,11 @@ mod tests {
             "the personal workspace must use the userspaces path, got: {}",
             personal.path
         );
-        // Manager keeps the project workspace; already-personal passes through.
-        let kept = effective_workspace_for_role(Role::Manager, project.clone(), "alice");
+        // Non-pinned roles keep the project workspace; already-personal passes through.
+        let kept = effective_workspace_for_role(Role::Engineer, project.clone(), "alice");
         assert_eq!(kept.name, "ws1");
         let already = effective_workspace_for_role(Role::Support, personal.clone(), "alice");
         assert_eq!(already.name, "personal:alice");
-
-        // Atomic composition: Manager→Assistant remap in personal workspaces and
-        // Assistant/Support pinning resolve in one call. A pool that
-        // contains Assistant remaps Manager; without Assistant the Manager
-        // selection is kept (the active-role invariant).
-        let (role, ws) = effective_role_and_workspace(
-            Role::Manager,
-            Workspace {
-                name: "personal:alice".to_string(),
-                ..Default::default()
-            },
-            "alice",
-            &[Role::Assistant],
-        );
-        assert_eq!(role, Role::Assistant);
-        assert_eq!(ws.name, "personal:alice");
-        let (role, _ws) = effective_role_and_workspace(
-            Role::Manager,
-            Workspace {
-                name: "personal:alice".to_string(),
-                ..Default::default()
-            },
-            "alice",
-            &[Role::Analyst],
-        );
-        assert_eq!(role, Role::Manager);
     }
 
     #[test]
@@ -1326,10 +1286,6 @@ mod tests {
         );
         // Non-pinned roles pass through unchanged even with an empty user.
         assert_eq!(
-            enforce_personal_pinning(Role::Manager, "proj-ws", ""),
-            Some("proj-ws".to_string())
-        );
-        assert_eq!(
             enforce_personal_pinning(Role::Engineer, "proj-ws", ""),
             Some("proj-ws".to_string())
         );
@@ -1347,7 +1303,7 @@ mod tests {
         let user = "home_clear_target";
         let store = store();
         store
-            .add_user(user, Some("full"), Role::Manager)
+            .add_user(user, Some("full"), Role::Assistant)
             .await
             .unwrap();
         crate::util::test::create_test_workspace(
@@ -1356,9 +1312,9 @@ mod tests {
         )
         .await;
 
-        // Manager active in a project DB workspace → Manager@project
-        // (the routed recipient), even when the GUI picker is on the personal
-        // workspace.
+        // Stored 'manager' (out-of-pool, e.g. a pre-existing admin) clamps to
+        // the pool default (Assistant), which is then pinned to the personal
+        // workspace — even when the DB workspace is set to a project.
         store
             .update_user(
                 user,
@@ -1369,8 +1325,8 @@ mod tests {
             .await
             .unwrap();
         let (role, ws) = resolve_session_target(user).await;
-        assert_eq!(role, Role::Manager);
-        assert_eq!(ws.name, "ws_home_clear_target");
+        assert_eq!(role, Role::Assistant);
+        assert_eq!(ws.name, "personal:home_clear_target");
 
         // Assistant active → pinned to the personal workspace regardless of
         // the DB workspace.
@@ -1379,22 +1335,6 @@ mod tests {
                 user,
                 FieldUpdate::Set("assistant"),
                 FieldUpdate::Unchanged,
-                FieldUpdate::Unchanged,
-            )
-            .await
-            .unwrap();
-        let (role, ws) = resolve_session_target(user).await;
-        assert_eq!(role, Role::Assistant);
-        assert_eq!(ws.name, "personal:home_clear_target");
-
-        // Manager active with no DB workspace → Manager remaps to
-        // Assistant@personal (the personal-workspace invariant; the pool
-        // contains Assistant).
-        store
-            .update_user(
-                user,
-                FieldUpdate::Set("manager"),
-                FieldUpdate::Clear,
                 FieldUpdate::Unchanged,
             )
             .await
@@ -1430,14 +1370,14 @@ mod tests {
         let store = store();
 
         // Admin (full) + shared selection → keeps the shared workspace.
-        seed_user(&store, "adm_shared", Some("full"), Some("ws_shared")).await;
+        seed_user(store, "adm_shared", Some("full"), Some("ws_shared")).await;
         assert_eq!(
             resolve_selected_workspace_name("adm_shared").await,
             Some("ws_shared".to_string())
         );
         // Admin + stored personal value → normalized to the canonical personal name.
         seed_user(
-            &store,
+            store,
             "adm_personal",
             Some("full"),
             Some("personal:adm_personal"),
@@ -1448,19 +1388,19 @@ mod tests {
             Some("personal:adm_personal".to_string())
         );
         // Admin + NULL selection → personal.
-        seed_user(&store, "adm_null", Some("full"), None).await;
+        seed_user(store, "adm_null", Some("full"), None).await;
         assert_eq!(
             resolve_selected_workspace_name("adm_null").await,
             Some("personal:adm_null".to_string())
         );
         // Non-admin (NULL permissions) + shared selection → clamped to personal.
-        seed_user(&store, "u_shared", None, Some("ws_shared")).await;
+        seed_user(store, "u_shared", None, Some("ws_shared")).await;
         assert_eq!(
             resolve_selected_workspace_name("u_shared").await,
             Some("personal:u_shared".to_string())
         );
         // Non-admin + NULL selection → personal.
-        seed_user(&store, "u_null", None, None).await;
+        seed_user(store, "u_null", None, None).await;
         assert_eq!(
             resolve_selected_workspace_name("u_null").await,
             Some("personal:u_null".to_string())
@@ -1478,12 +1418,12 @@ mod tests {
 
         // Non-admin with a shared selection that exists in the table is still
         // clamped to the personal workspace (never a shared one).
-        seed_user(&store, "u_shared", None, Some("ws_admin_aware")).await;
+        seed_user(store, "u_shared", None, Some("ws_admin_aware")).await;
         let ws = resolve_workspace_for_user_name("u_shared").await;
         assert_eq!(ws.name, "personal:u_shared");
 
         // Admin with a shared selection that exists keeps the shared workspace.
-        seed_user(&store, "adm_shared", Some("full"), Some("ws_admin_aware")).await;
+        seed_user(store, "adm_shared", Some("full"), Some("ws_admin_aware")).await;
         let ws = resolve_workspace_for_user_name("adm_shared").await;
         assert_eq!(ws.name, "ws_admin_aware");
     }
@@ -1494,8 +1434,8 @@ mod tests {
         let store = store();
 
         // The same shared workspace attached by an admin and a non-admin.
-        seed_user(&store, "adm_member", Some("full"), Some("ws_shared_x")).await;
-        seed_user(&store, "non_admin_member", None, Some("ws_shared_x")).await;
+        seed_user(store, "adm_member", Some("full"), Some("ws_shared_x")).await;
+        seed_user(store, "non_admin_member", None, Some("ws_shared_x")).await;
 
         let members = store.find_by_workspace("ws_shared_x").await.unwrap();
         assert_eq!(members.len(), 1, "only the admin member must be returned");

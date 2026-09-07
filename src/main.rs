@@ -910,8 +910,7 @@ async fn handle_start_command(msg: &ChannelMessage) {
 async fn handle_clear_session(msg: &ChannelMessage) {
     // Clear the session the user actually talks to: the same (role, workspace)
     // resolution as routing — DB-selected workspace, pool-clamped active role
-    // with Assistant fallback, personal-workspace Manager→Assistant remap, and
-    // Assistant/Support pinning.
+    // with Assistant fallback, and Assistant/Support pinning.
     let (effective_role, ws) = mahbot::users::resolve_session_target(&msg.user_name).await;
     let reply = match clear_session(&msg.user_name, effective_role.as_str(), &ws.name).await {
         Ok(reply) => reply,
@@ -925,8 +924,8 @@ async fn handle_clear_session(msg: &ChannelMessage) {
 
 /// Deliver a session-clear confirmation via the router's raw `reply_target`
 /// path (broadcast + persist + transport). The caller passes the already
-/// effective role (pool-clamped, personal-workspace Manager→Assistant remap
-/// applied) so the confirmation bubble matches agent responses.
+/// effective role (pool-clamped, Assistant/Support pinning applied) so the
+/// confirmation bubble matches agent responses.
 async fn deliver_clear_reply(
     reply: &str,
     msg: &ChannelMessage,
@@ -1339,16 +1338,14 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     );
     let role = mahbot::users::resolve_active_role_from_pool(&msg.user_name, &pool).await;
 
-    // Personal workspaces map Manager→Assistant (pool-clamped), and
     // Assistant/Support always work in the user's personal workspace
-    // regardless of the selected workspace — both resolve atomically, before
-    // enrichment and before `msg.workspace` is set so uploads, broadcast,
-    // persist and chat_history stay consistent with the routed workspace.
+    // regardless of the selected workspace — resolved before enrichment and
+    // before `msg.workspace` is set so uploads, broadcast, persist and
+    // chat_history stay consistent with the routed workspace.
     let (effective_role, ws) = match role {
         Some(role) => {
-            let (effective_role, ws) =
-                mahbot::users::effective_role_and_workspace(role, ws, &msg.user_name, &pool);
-            (Some(effective_role), ws)
+            let ws = mahbot::users::effective_workspace_for_role(role, ws, &msg.user_name);
+            (Some(role), ws)
         }
         None => (None, ws),
     };

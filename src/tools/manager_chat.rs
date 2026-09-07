@@ -4,8 +4,8 @@
 //! The Assistant addresses the Manager on the user's behalf via an internal
 //! agent message (wrapped in an `<assistant-message>` envelope). The send tool
 //! mirrors the message into each workspace user's chat AND their channel
-//! bindings, symmetric with the Manager broadcast. The tool is gated to the
-//! full-access Assistant (see `Role::Assistant` toolset).
+//! bindings so the send stays visible in the workspace chat. The tool is gated
+//! to the full-access Assistant (see `Role::Assistant` toolset).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -54,11 +54,11 @@ impl Tool for SendMessageToManagerTool {
             );
         }
 
-        // Persist the RAW message to each workspace user's chat for visibility
-        // (symmetric with the Manager broadcast), attributed as the Assistant,
-        // then transport-deliver it (shared broadcast id — the workspace chat
-        // stream dedupes the per-user copies). If no workspace users exist,
-        // skip silently — the Manager job still routes.
+        // Persist the RAW message to each workspace user's chat for visibility,
+        // attributed as the Assistant, then transport-deliver it (shared
+        // broadcast id — the workspace chat stream dedupes the per-user
+        // copies). If no workspace users exist, skip silently — the Manager
+        // job still routes.
         let users = match crate::users::USER_STORE.get() {
             Some(store) => store.find_by_workspace(workspace).await.unwrap_or_default(),
             None => Vec::new(),
