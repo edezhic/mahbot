@@ -315,10 +315,8 @@ mod tests {
     /// "CODER_RESPONSE", settles it as the tool result contiguous after the
     /// frame, and terminalizes the job.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
-    #[expect(clippy::too_many_lines)] // deliberate: the drain-cut + resume lifecycle is one cohesive assertion bed
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn sync_implement_draincut_and_completion_resumes_durable_job() {
-        let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let ws = test_ws("/tmp/test_ws_sync_implement");
         let pin = "sync_implement_pin";

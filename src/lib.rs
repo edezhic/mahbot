@@ -15,6 +15,7 @@ pub mod alarms;
 pub mod audio;
 pub mod bench_openrouter;
 pub(crate) mod boot;
+pub(crate) mod browser;
 pub mod channels;
 pub mod config;
 pub mod config_db;
@@ -51,6 +52,10 @@ pub mod workspace;
 /// served invocations to this subcommand of the current binary).
 #[cfg(unix)]
 pub use tools::shell::grep_engine::run_engine as run_grep_engine;
+
+/// `mahbot browser` subcommand entry (dispatched from `main()` before the
+/// instance lock — headless browser automation that runs alongside the daemon).
+pub use browser::cli::run_cli as run_browser_cli;
 
 /// Test/subprocess-harness rewrite entry with an explicit home (fixture `~`
 /// operands); production single-file gate. Only compiled for the e2e harness.

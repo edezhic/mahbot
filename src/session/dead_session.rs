@@ -555,10 +555,11 @@ mod tests {
 
     // ── End-to-end recovery tests ───────────────────────────────────────
     //
-    // These three tests share the process-global test DB, the retry tracker,
-    // the agent registry, and the drain flag, so each holds
-    // `retry_tests_lock()` for its full duration (the e2e test acquires it via
-    // its `install_retry_seam_dyn` guard).
+    // Four tests share the process-global test DB, the retry tracker, and
+    // the agent registry, and all but `sleep_ended_session_is_not_recovered`
+    // also depend on the drain flag, so each carries the serial_test keys
+    // guarding the globals it touches (`provider` for the fake provider,
+    // `drain` for the shutdown drain flag).
 
     /// Seed a direct session whose tail is a dangling emission-time analyze
     /// tool-call frame plus the caller-owned launched durable job, checkpointed
@@ -693,10 +694,10 @@ mod tests {
     /// then does the recovery round call the model once — asserted to exactly
     /// one fingerprint.
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    // Joins the `provider` group (order: provider → retry_tests_lock, as in the
-    // pipeline/retry tests) so two per-test runtimes never drive the shared
-    // global stores concurrently.
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
+    // Joins the `provider` group (serial key guards the global fake provider,
+    // `drain` the shutdown drain flag) so two per-test runtimes never drive
+    // the shared global stores concurrently.
     async fn recovery_resumes_dangling_durable_job_end_to_end() {
         let fake = std::sync::Arc::new(
             crate::util::test::FakeProvider::new()
@@ -798,10 +799,8 @@ mod tests {
     /// dangling durable job is NOT resumed and no attempt is recorded — the
     /// session is still eligible on a later cycle.
     #[tokio::test]
-    #[serial_test::serial(provider)] // see recovery_resumes_dangling_durable_job_end_to_end
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global drain flag across the whole test
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn live_running_session_is_not_recovered() {
-        let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let ws = crate::util::test::create_test_workspace(
             "/tmp/dead_session_live_ws",
@@ -844,8 +843,8 @@ mod tests {
         AGENT_REGISTRY.deregister(&agent_id, generation);
 
         // Clean up the seeded dangling session + launched job so a LATER
-        // `recover_dead_sessions` (e.g. the paused test, serialized after us by
-        // `retry_tests_lock`) does not route a recovery for this leftover
+        // `recover_dead_sessions` (e.g. the paused test, serialized after us
+        // by the serial key) does not route a recovery for this leftover
         // candidate and consume the shared fake provider mid-flight.
         conn.execute(
             "DELETE FROM sessions WHERE agent_id = ?1",
@@ -886,10 +885,8 @@ mod tests {
     /// A paused workspace freezes dangling-frame resumption: the pause guard
     /// skips the session before routing (no budget consumed, no job resumed).
     #[tokio::test]
-    #[serial_test::serial(provider)] // see recovery_resumes_dangling_durable_job_end_to_end
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global drain flag across the whole test
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn paused_workspace_dangling_frame_is_not_recovered() {
-        let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let ws = crate::util::test::create_test_workspace(
             "/tmp/dead_session_paused_ws",
@@ -932,9 +929,7 @@ mod tests {
     /// tails (real crash/drain cuts) keep recovering as before.
     #[tokio::test]
     #[serial_test::serial(provider)] // see recovery_resumes_dangling_durable_job_end_to_end
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the shared store's recover_dead_sessions runs across tests
     async fn sleep_ended_session_is_not_recovered() {
-        let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let ws = crate::util::test::create_test_workspace(
             "/tmp/dead_session_sleep_ws",
@@ -984,7 +979,7 @@ mod tests {
         );
 
         // Clean up the seeded candidate so a LATER recover_dead_sessions
-        // (serialized after us by retry_tests_lock) does not route a recovery
+        // (serialized after us by the serial key) does not route a recovery
         // for this leftover session.
         conn.execute(
             "DELETE FROM sessions WHERE agent_id = ?1",

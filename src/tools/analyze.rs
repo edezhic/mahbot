@@ -1530,7 +1530,7 @@ fn render_extraction_failures(outcomes: &[AnalystOutcome]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::test::{FakeProvider, install_fake_provider, retry_tests_lock};
+    use crate::util::test::{FakeProvider, install_fake_provider};
     use crate::workspace::test_ws;
     use serde_json::json;
     use std::sync::Arc;
@@ -1941,9 +1941,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn test_consolidation_fail_open_delivers_raw_reports() {
-        let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // Synthesis retries (transport failures) exhaust → fail open.
@@ -1979,9 +1978,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn test_consolidation_non_retryable_fails_open() {
-        let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // Even an immediate non-retryable error fails open.
@@ -2015,9 +2013,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn test_consolidation_success_synthesizes() {
-        let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // The grouping pass parses a strict id-based GroupingOutput; a
@@ -2036,10 +2033,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn test_consolidation_single_parseable_source_skips_grouping() {
-        let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // ≥2 valid responses but only one produced parseable claims: a
@@ -2079,9 +2074,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn test_consolidation_fail_open_mixed_failure_classes() {
-        let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // Mixed transport + empty-response failures exercise both failure
@@ -2108,10 +2102,8 @@ mod tests {
     /// delivered with the extraction-failure marker (fail-open at the
     /// extraction step, not the synthesis step).
     #[tokio::test]
-    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn test_extraction_fail_open_delivers_raw_reports() {
-        let _lock = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = FakeProvider::new()
@@ -2167,14 +2159,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn test_consolidation_async_envelope_carries_marker() {
         // The async dispatch path (tokio::spawn in AnalyzeTool::execute) builds
         // its envelope via SyncDurableCore::Analyze.build_async_message — this
         // test drives the REAL fail-open consolidation result through that
         // production builder (not a manual re-wrap), asserting the exact
         // envelope + marker shape that reaches the caller's agent channel.
-        let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = FakeProvider::new()
@@ -2218,9 +2209,8 @@ mod tests {
     /// overrides `preserve_full_output` so the consolidated analysis (and any
     /// appended verification section) is never sandwich-truncated.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn analyze_output_preserved_full_no_sandwich_truncation() {
-        let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = FakeProvider::new()
@@ -2292,9 +2282,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn test_consolidation_partial_success_with_remainder() {
-        let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // Round 1 freezes one group and leaves one item ungrouped; round 2's
@@ -2348,12 +2337,10 @@ mod tests {
     /// (raw passthrough — no provider needed).
     ///
     /// Serialized with the drain-flag writers: `resume_analyze_round` consults the
-    /// process-global drain flag and aborts early while it is set (project
-    /// convention: retry_tests_lock).
+    /// process-global drain flag and aborts early while it is set.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn resume_analyze_round_reuses_existing_job() {
-        let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let ws = test_ws("/tmp/test_ws_resume_analyze");
         let job_id = "analyze_job_resume_1";
@@ -2464,9 +2451,7 @@ mod tests {
     /// launched analyze/implement jobs — a research-kind and a ticket-phase-kind
     /// job owned by the same pin are ignored — newest first.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn find_owned_launched_jobs_ignores_other_kinds() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let ws = test_ws("/tmp/test_ws_find_owned");
         let pin = "sync_analyze_find_pin";
@@ -2704,9 +2689,8 @@ mod tests {
     /// [`CallSuspended`] carrier and leaves the caller-owned job `launched` —
     /// never terminalized.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn sync_analyze_draincut_returns_call_suspended_error() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let ws = test_ws("/tmp/test_ws_sync_analyze_draincut");
         let pin = "sync_analyze_draincut_pin";
@@ -2752,7 +2736,7 @@ mod tests {
     // provider, so the test must not interleave with the other provider-group
     // tests (same exclusion the pipeline/retry tests rely on).
     #[tokio::test]
-    #[serial_test::serial(provider)]
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn resume_hook_completion_resumes_durable_analyze() {
         let fake = std::sync::Arc::new(FakeProvider::new());
         let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());

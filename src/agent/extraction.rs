@@ -176,7 +176,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
 mod tests {
     use super::*;
     use crate::retry::tiny_test_policy;
-    use crate::util::test::{FakeProvider, install_fake_provider, retry_tests_lock};
+    use crate::util::test::{FakeProvider, install_fake_provider};
     use crate::{ChatMessage, ChatRequest};
     use std::sync::Arc;
 
@@ -228,9 +228,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn recovers_after_consecutive_transport_errors() {
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
         let fake = Arc::new(
             FakeProvider::new()
@@ -245,9 +243,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn recovers_after_truncated_envelope_parse_errors() {
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
         // Truncated-envelope class (EOF-while-parsing defect class) retried
         // byte-identical, then a full body parses.
@@ -265,9 +261,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn recovers_after_llm_parse_failure_via_reprompt() {
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
         let fake = Arc::new(
             FakeProvider::new()
@@ -280,9 +274,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn exhausts_attempts_with_bounded_call_count() {
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy()); // 3 attempts
         let fake = Arc::new(
             FakeProvider::new()
@@ -299,9 +291,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn non_retryable_error_propagates_immediately() {
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
         let fake = Arc::new(FakeProvider::new().err(
             crate::retry::FailureClass::NonRetryable,
@@ -318,13 +308,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn transport_final_failure_clears_earlier_text_from_last_raw() {
         // Mixed sequence: an early attempt produces text (parse failure), then
         // later attempts die on transport. The ticket comment must NOT label the
         // earlier text as 'last attempt' — last_raw must be None because the
         // final attempt died before producing text.
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy()); // 3 attempts
         let fake = Arc::new(
             FakeProvider::new()
@@ -354,11 +342,9 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn tool_call_final_attempt_keeps_empty_last_raw() {
         // A tool-call final attempt (empty text) survives as Some("") so the
         // comment can state "final attempt was a tool call".
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy()); // 3 attempts
         let fake = Arc::new(
             FakeProvider::new().ok("not json").ok("not json").ok(""), // tool-call-style final attempt: no text
@@ -374,9 +360,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn attempts_byte_identical_except_reprompt() {
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
         let fake = Arc::new(
             FakeProvider::new()
@@ -403,9 +387,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn json_reply_reprompts_with_non_empty_assistant_turn() {
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
         // JSON-shaped but unparseable for the score → parse failure → re-prompt.
         let fake = Arc::new(
@@ -431,9 +413,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn empty_last_raw_reprompts_with_marker_not_empty_turn() {
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
         // Tool-call-style response with no text → Some("") last_raw → parse failure.
         let fake = Arc::new(FakeProvider::new().ok("").ok(r#"{"score": 7}"#));
@@ -456,9 +436,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn score_out_of_range_never_passes_and_reprompts() {
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
         let fake = Arc::new(
             FakeProvider::new()
@@ -472,9 +450,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn score_out_of_range_all_attempts_classifies_as_out_of_range() {
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy()); // 3 attempts
         let fake = Arc::new(
             FakeProvider::new()
@@ -505,9 +481,7 @@ mod tests {
     /// Catches the extraction path drifting from the recorded request.
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn extraction_rows_record_base_params_and_retry_context() {
-        let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
         let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
         let _store_guard = crate::util::test::install_test_log_store(store.clone());

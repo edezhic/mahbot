@@ -562,9 +562,8 @@ mod tests {
     /// The repair runs but the post-repair checkpoint still fails: the failure
     /// report is written to error.log and the graceful drain begins.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn repair_ran_but_checkpoint_still_fails_shuts_down() {
-        let _lock = crate::util::test::retry_tests_lock();
         crate::shutdown::drain_clear();
         let tmp = tempfile::TempDir::new().unwrap();
         let conn = crate::db::open_consolidated_store(tmp.path())
@@ -611,9 +610,8 @@ mod tests {
     /// A store with no ticket-title FTS index (repair is NotApplicable) skips
     /// the retry entirely yet still writes error.log and begins the drain.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn checkpoint_failure_without_fts_store_writes_error_log_and_drains() {
-        let _lock = crate::util::test::retry_tests_lock();
         crate::shutdown::drain_clear();
         let tmp = tempfile::TempDir::new().unwrap();
         let conn = crate::db::open_with_schema(

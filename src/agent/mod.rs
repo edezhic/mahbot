@@ -2617,9 +2617,7 @@ fn failure_classification(agent: &Agent, error: Option<&anyhow::Error>) -> &'sta
 mod tests {
     use super::*;
     use crate::Tool;
-    use crate::util::test::{
-        FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-    };
+    use crate::util::test::{FakeProvider, install_fake_provider, install_test_retry_policy};
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
 
@@ -2716,11 +2714,10 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
     fn failure_classification_recovers_retry_exhaustion() {
         // failure_classification consults the process-global drain flag before
-        // everything else — serialize against the drain-flag writers
-        // (project convention: retry_tests_lock).
-        let _guard = crate::util::test::retry_tests_lock();
+        // everything else — serialize against the drain-flag writers.
         // Mirror llm_call's error construction: the RetryExhausted must
         // survive as a source (via .context, not string flattening) so the
         // granular FailureClass is recoverable from the chain.
@@ -2767,10 +2764,10 @@ mod tests {
     /// dispatch tails skip the exit-time ticket rollback for drained agents.
     /// Serialized against other tests: the drain flag is process-global, so a
     /// concurrent test consulting is_draining() could be misclassified during
-    /// the assertion window (project convention: retry_tests_lock).
+    /// the assertion window.
     #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn failure_classification_recognizes_drain() {
-        let _guard = crate::util::test::retry_tests_lock();
         let agent = make_agent(vec![]);
         // Drain flag unset: normal classification.
         assert_eq!(failure_classification(&agent, None), "runtime");
@@ -3638,10 +3635,8 @@ mod tests {
     // provider, so the test must not interleave with the other provider-group
     // tests (same exclusion the pipeline/retry tests rely on).
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)]
     async fn leader_first_call_failure_still_fires_signal() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
         let ws = crate::workspace::test_ws_named("/tmp/ws_leader_fail", "leader_fail");
@@ -3687,10 +3682,8 @@ mod tests {
     /// next turn on the session (any wake-up: user message, async result,
     /// alarm) clears the flag and runs normally.
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)]
     async fn sleep_call_ends_the_run_gracefully_and_flag_resets_on_reengage() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         // Script exactly ONE sleep tool call; a follow-up LLM call would pop
         // the second scripted item and the first turn would end with a text
@@ -3840,10 +3833,8 @@ mod tests {
     /// (assistant reasoning payload + the resume nudge), and the nudge never
     /// appears in the original request.
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)]
     async fn llm_call_recovers_reasoning_only_stop_via_continuation() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = std::sync::Arc::new(
@@ -3878,10 +3869,8 @@ mod tests {
     /// appends its own (assistant reasoning + nudge) pair, so the request
     /// prefix stays byte-stable and only the tail grows.
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)]
     async fn llm_call_continuation_accumulates_tail_until_answer() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = std::sync::Arc::new(
@@ -3935,10 +3924,8 @@ mod tests {
     /// error, no provider-retry-exhaustion marker, no transcript trace, and
     /// granular "no_response" classification.
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)]
     async fn llm_call_continuation_exhaustion_fails_safely_without_leaking() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = std::sync::Arc::new(
@@ -3998,10 +3985,8 @@ mod tests {
     /// retried request is byte-identical, and exhaustion derives the final
     /// class from the last recorded failure (Transport, not NoResponse).
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)]
     async fn llm_call_continuation_transport_error_does_not_duplicate_tail() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = std::sync::Arc::new(
@@ -4050,10 +4035,8 @@ mod tests {
     /// A non-retryable provider error mid-recovery breaks immediately instead
     /// of burning the remaining attempts, and keeps the granular class.
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)]
     async fn llm_call_continuation_non_retryable_error_breaks_immediately() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = std::sync::Arc::new(
@@ -4087,9 +4070,8 @@ mod tests {
     /// masked, even when the break happens before the first attempt (no
     /// request was ever sent, so there is also nothing to record in telemetry).
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn recover_reasoning_only_stop_abort_classifies_as_shutdown() {
-        let _guard = crate::util::test::retry_tests_lock();
         let agent = make_agent(vec![]);
         let first = crate::ChatResponse {
             text: None,
@@ -4123,10 +4105,8 @@ mod tests {
     /// "a FAILED call never updates the value" invariant), even though the
     /// invisible in-class response carried real usage.
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)]
     async fn llm_call_continuation_exhaustion_does_not_update_session_length() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = std::sync::Arc::new(
@@ -4161,10 +4141,8 @@ mod tests {
     /// RESOLVING response only — the in-class response the continuation
     /// consumed is never recorded (no inflated value, no wasted double write).
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)]
     async fn llm_call_continuation_success_records_only_resolving_usage() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = std::sync::Arc::new(
@@ -4187,10 +4165,8 @@ mod tests {
 
     /// A normal answer or a tool-call turn never enters the continuation path.
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)]
     async fn llm_call_skips_continuation_for_normal_and_tool_call_turns() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
 
@@ -4226,10 +4202,8 @@ mod tests {
     /// Summarize recovers a reasoning-only stop via the same bounded
     /// continuation; the continuation answer becomes the summary.
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)]
     async fn summarize_recovers_reasoning_only_stop_via_continuation() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = std::sync::Arc::new(
@@ -4257,10 +4231,8 @@ mod tests {
     /// empty-response error fires (warn + full history in `maybe_summarize`),
     /// and the thinking never leaks into the error.
     #[tokio::test]
-    #[serial_test::serial(provider)]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)]
     async fn summarize_continuation_exhaustion_fails_open_without_leaking() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = std::sync::Arc::new(
@@ -4440,10 +4412,8 @@ mod tests {
     /// phrase) and the run continues through its normal loop — the retried
     /// call carries the corrected message and the agent answers.
     #[tokio::test]
-    #[serial_test::serial(active_models)] // seeds the process-global catalog caches
-    #[expect(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
+    #[serial_test::serial(active_models, provider, drain)] // seeds the process-global catalog caches + process-global fake provider + shutdown drain flag
     async fn rejected_input_image_is_stripped_and_run_continues() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         seed_empty_catalogs();
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -4527,10 +4497,8 @@ mod tests {
     /// without "image") does not trigger the strip — the run takes the normal
     /// failure path and the image stays in the session.
     #[tokio::test]
-    #[serial_test::serial(active_models)] // seeds the process-global catalog caches
-    #[expect(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
+    #[serial_test::serial(active_models, provider, drain)] // seeds the process-global catalog caches + process-global fake provider + shutdown drain flag
     async fn text_content_rejection_follows_normal_failure_path() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         seed_empty_catalogs();
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -4568,10 +4536,8 @@ mod tests {
     /// so the normal failure path applies (no repeated stripping, no infinite
     /// retry loop).
     #[tokio::test]
-    #[serial_test::serial(active_models)] // seeds the process-global catalog caches
-    #[expect(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
+    #[serial_test::serial(active_models, provider, drain)] // seeds the process-global catalog caches + process-global fake provider + shutdown drain flag
     async fn subsequent_failure_after_strip_takes_normal_failure_path() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         seed_empty_catalogs();
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -5112,7 +5078,7 @@ mod tests {
     /// contiguously after the frame, and only then is the resumed job
     /// terminalized.
     #[tokio::test]
-    #[serial_test::serial(provider)]
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn drain_mid_sync_analyze_leaves_call_dangling_then_completion_resumes() {
         let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new());
         let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
@@ -5280,7 +5246,7 @@ mod tests {
     /// id. A THIRD launched job for the pin that binds no call stays launched
     /// (unfinished jobs are never deleted except by explicit abandon).
     #[tokio::test]
-    #[serial_test::serial(provider)]
+    #[serial_test::serial(provider, drain)]
     async fn complete_pending_tool_calls_binds_same_kind_calls_to_distinct_jobs() {
         let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new());
         let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());

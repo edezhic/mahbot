@@ -282,11 +282,10 @@ async fn delete_results_archive(job_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::test::{JobRowBuilder, retry_tests_lock};
+    use crate::util::test::JobRowBuilder;
 
     #[tokio::test]
     async fn cancel_fires_signal_and_guard_removes_entry_on_drop() {
-        let _lock = retry_tests_lock();
         // Unregistered run: cancel is a no-op, is_cancelled false.
         cancel("nope");
         assert!(!is_cancelled("nope"));
@@ -308,9 +307,7 @@ mod tests {
     /// research_jobs rows + pending row + folder + archive all removed;
     /// nothing is resumable or deliverable.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn sweep_removes_rows_folder_and_archive_for_no_dump_run() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let job_id = "research_cancel_midrun_1";
         let conn = &crate::session::store().conn;
@@ -378,9 +375,7 @@ mod tests {
     /// removed (boot replay must have nothing to deliver, and the cleanup must
     /// not resume), and the dump-less folder + archive are released.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn sweep_removes_pending_and_cleanup_rows_for_terminalized_run() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let job_id = "research_cancel_terminal_1";
         let conn = &crate::session::store().conn;
@@ -438,9 +433,7 @@ mod tests {
     /// dump survive (the cleanup tail / OS sweep owns their release). The warn
     /// log is not asserted.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn sweep_never_releases_folder_with_command_dump() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let job_id = "research_cancel_dump_guard_1";
         let conn = &crate::session::store().conn;
@@ -508,10 +501,8 @@ mod tests {
     /// the pending envelope is dropped, and the archive removed — while the
     /// run folder AND its dump survive for the cleanup tail.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     #[expect(clippy::too_many_lines)] // the transition asserts every row/fs side effect
     async fn cancel_handoff_transitions_rows_and_holds_folder() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let job_id = "research_handoff_transition_1";
         let conn = &crate::session::store().conn;
@@ -622,9 +613,7 @@ mod tests {
     /// handoff delegates to the sweep and returns `None`; the research row and
     /// the dump-less folder are gone.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn cancel_handoff_without_dump_sweeps() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let job_id = "research_handoff_no_dump_1";
         let conn = &crate::session::store().conn;
@@ -666,9 +655,7 @@ mod tests {
     /// The GUI/abandon path for a run with NO live orchestrator: firing the
     /// cancel signal sweeps the durable rows and the dump-less folder directly.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn cancel_research_run_sweeps_unregistered_run() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let job_id = "research_cancel_unregistered_1";
         let conn = &crate::session::store().conn;
@@ -711,9 +698,7 @@ mod tests {
 
     /// The sweep is idempotent; a double release (racing cleanup tail) is safe.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn sweep_is_idempotent_and_double_release_safe() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let job_id = "research_cancel_double_1";
         sweep_cancelled_run(job_id).await.unwrap();
@@ -724,9 +709,7 @@ mod tests {
     /// The in-tx cancel gate: a completion racing a cancel must roll back —
     /// no pending row may survive, and the jobs row stays for the sweep.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn complete_durable_job_rolls_back_when_run_cancelled() {
-        let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let job_id = "research_cancel_complete_1";
         let ws = crate::workspace::test_ws("/tmp/test_ws_research_cancel_complete");

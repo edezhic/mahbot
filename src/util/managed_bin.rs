@@ -302,11 +302,14 @@ pub(crate) fn bun_bin_dir() -> Option<PathBuf> {
 /// chrome-use binary is placed here and probed FIRST by its resolver on every
 /// OS — on Windows it is the only probe that reliably finds mahbot's own
 /// install — so the first-install location and the auto-update swap location
-/// are always the same path.
+/// are always the same path. Falls back to the HOME-derived default storage
+/// root when config is not initialized (e.g. the `mahbot browser` CLI, which
+/// dispatches before config init) so a standard managed install is still found.
 #[must_use]
 pub(crate) fn storage_bin_dir() -> Option<PathBuf> {
     crate::config::CONFIG
         .try_storage_root()
+        .or_else(|| crate::config::default_config_dir().ok())
         .map(|r| r.join("bin"))
 }
 

@@ -843,7 +843,7 @@ async fn probe_then_claim_queued(store: &BoardStore, ws: &Workspace) -> (bool, O
 /// diagnostics (skipped) → review (skip-reviewed) → QA → sanitation (dirty
 /// commit).
 
-#[serial_test::serial(provider)]
+#[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_commit() {
     let _guard = TEST_LOCK.lock().await;
@@ -1060,7 +1060,7 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
 /// substance (kind/severity/impact/reasoning), the ticket still advances to
 /// Planning, and the joint comment records the enrichment.
 
-#[serial_test::serial(provider)]
+#[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn analysis_escalation_and_blocker_verification() {
     let _guard = TEST_LOCK.lock().await;
@@ -1139,7 +1139,7 @@ async fn analysis_escalation_and_blocker_verification() {
 /// behavior) would re-run every slot with a new suffix and grow the roster with
 /// duplicate-idx rows; here the Done slot is provably NOT re-run (its stored
 /// verdict is reconstructed without an LLM call).
-#[serial_test::serial(provider)]
+#[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
     let _guard = TEST_LOCK.lock().await;
@@ -1252,7 +1252,7 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
 /// appended its blocker-verification slots is resumed by reconstructing the
 /// done escalation slot and re-running only the not-Done one, without
 /// re-appending (so no duplicate-idx escalation rows accumulate).
-#[serial_test::serial(provider)]
+#[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
     let _guard = TEST_LOCK.lock().await;
@@ -1435,7 +1435,7 @@ fn blocker_verification_merge_reduces_two_verifiers_to_one_outcome() {
 /// verifier count is a single tester. These are asserted deterministically
 /// without an agent round (real churn is measured for at least one band).
 
-#[serial_test::serial(provider)]
+#[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn review_qa_dynamic_count_calibration() {
     use crate::pipeline::verdict::{
@@ -1527,7 +1527,7 @@ async fn review_qa_dynamic_count_calibration() {
 /// (terminal), the phase job is deleted, Queued siblings are drained to Planning,
 /// and the workspace is NOT paused (a bounce is not a technical failure).
 
-#[serial_test::serial(provider)]
+#[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
     let _guard = TEST_LOCK.lock().await;
@@ -1606,7 +1606,7 @@ async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
 /// puller re-creates a fresh job. The engineer session pin survives the round
 /// job's deletion so the accumulated session is preserved across resets.
 
-#[serial_test::serial(provider)]
+#[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() {
     let _guard = TEST_LOCK.lock().await;
@@ -1799,7 +1799,7 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
 /// attempt without pausing the workspace or consuming the bounce budget; the
 /// ticket stays in Analysis for a fresh round.
 
-#[serial_test::serial(provider)]
+#[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
     let _guard = TEST_LOCK.lock().await;
@@ -1878,7 +1878,7 @@ async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
 /// workspace. This holds even while an engineer round is in flight — the
 /// agent-side failure tail no longer drives a user cancel.
 
-#[serial_test::serial(provider)]
+#[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn cancel_requested_engineer_goes_to_cancelled() {
     let _guard = TEST_LOCK.lock().await;
@@ -1955,7 +1955,7 @@ async fn cancel_requested_engineer_goes_to_cancelled() {
 /// boundary: the phase job is retained, the workspace is paused, and the
 /// unpause re-drives the round to completion without re-pausing.
 
-#[serial_test::serial(provider)]
+#[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
     let _guard = TEST_LOCK.lock().await;
@@ -2047,7 +2047,7 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
 /// owned analyze job (Done roster) is terminalized, its consolidated result
 /// settles contiguously after the frame, and only then does the engineer LLM
 /// round proceed (the Done-slot replay adds zero LLM calls).
-#[serial_test::serial(provider)]
+#[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn stage_re_drive_completes_dangling_calls_before_model_round() {
     let _guard = TEST_LOCK.lock().await;

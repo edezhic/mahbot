@@ -1887,9 +1887,7 @@ mod tests {
     /// (retry_count bumped, status re-armed to launched). The mode discriminator
     /// replaces the NULL-sentinel overload of `caller_agent_id`.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn boot_recovery_skips_caller_owned_jobs() {
-        let _guard = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
         let ws_name = "boot_recovery_ws";
@@ -1999,9 +1997,7 @@ mod tests {
     /// resumed: it stays `launched` with `retry_count` 0 (no checkpoint bump),
     /// and it is absent from the resumable list.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn boot_scan_leaves_unresolvable_workspace_cleanup_row_in_place() {
-        let _guard = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
         let job_id = "cleanup_missing_ws_1";
@@ -2042,9 +2038,7 @@ mod tests {
     /// async and ticket-phase jobs for the same workspace survive, and the sync
     /// job's roster cascades away with it.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn clear_abandons_session_sync_jobs() {
-        let _guard = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
         let ws_name = "clear_abandon_ws";
@@ -2119,9 +2113,7 @@ mod tests {
     /// phase, research, and research_cleanup rows all go, research run folders
     /// are released via the run cancel, and the rosters cascade away.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn workspace_delete_abandons_all_jobs() {
-        let _guard = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
         let ws_name = "ws_abandon_test";

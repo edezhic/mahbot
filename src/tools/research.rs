@@ -3626,7 +3626,7 @@ mod tests {
     /// durable envelope, and delivers to the ORIGINAL caller
     /// (role/user/channel persisted on the job row, not hardcoded to Manager).
     #[tokio::test]
-    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn resume_research_run_continues_at_synthesis_stage() {
         crate::util::test::init_management_test_stores().await;
         // One synthesis call (the only LLM work left at stage=Synthesis).
@@ -3744,9 +3744,7 @@ mod tests {
     /// completion INSERT succeeds even with no jobs row (a 0-row DELETE is
     /// not an error, so the tx commits and the pending row persists).
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn terminalization_spawn_failure_delivers_error_envelope_without_artifacts() {
-        let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let ws = crate::workspace::test_ws("/tmp/test_ws_research_spawn_fail");
         let envelope = terminalize_research(
@@ -3789,9 +3787,7 @@ mod tests {
     /// row/fs lifecycle (sweep, dump-guarded folder release, cleanup-row
     /// transition) is covered by research_cancel.rs tests.
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn cancelled_run_exits_cancelled_at_stage_boundary() {
-        let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let ws = crate::workspace::test_ws("/tmp/test_ws_research_cancel_boundary");
         let job_id = "research_job_cancel_boundary_1";
@@ -3805,10 +3801,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn test_synthesis_truncated_output_is_marked_and_transport_fails_open() {
-        let _lock = crate::util::test::retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let ws = crate::workspace::test_ws_named("/tmp/test_ws", "research_synth_truncated");
@@ -4235,14 +4229,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn test_annotate_round_confirm_failure_fail_open() {
         // End-to-end fail-open: the annotation pass succeeds, the confirm pass
         // fails entirely (transport) — every mutating verdict becomes weak
         // with the CONFIRM_FAILED marker; claims are never dropped, never
         // all-novel fallback.
-        let _lock = crate::util::test::retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let ws = crate::workspace::test_ws_named("/tmp/test_ws", "research_annotate_fail_open");
@@ -4436,10 +4428,8 @@ mod tests {
     /// `capture_round` would OVERWRITE the pre-crash capture (whose early
     /// sessions are already TTL'd).
     #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn load_seeds_commands_from_dump_after_crash() {
         crate::util::test::init_management_test_stores().await;
-        let _lock = crate::util::test::retry_tests_lock();
         let job_id = "research_dump_reload";
         let conn = &crate::session::store().conn;
         let now = crate::db::now();

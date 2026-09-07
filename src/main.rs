@@ -585,11 +585,24 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // `mahbot browser` subcommand: headless browser automation CLI over the
+    // shared browser core. Dispatched before lock acquisition + temp-root init
+    // so it can run alongside the daemon (it uses its own session namespace);
+    // chrome-use binary resolution falls back to PATH/home locations.
+    if std::env::args().nth(1).as_deref() == Some("browser") {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let args = std::env::args().skip(2).collect::<Vec<_>>();
+        let code = rt.block_on(mahbot::run_browser_cli(&args));
+        std::process::exit(code);
+    }
+
     // Consolidate ALL daemon temp files under one private root
     // (`/tmp/mahbot`, mode 0700) and pin TMPDIR to it — BEFORE any
     // temp use (config, logs, stores, shell children). The debug,
-    // __grep-engine and bench-openrouter subcommands above must NOT create
-    // the root (they exit before this point).
+    // __grep-engine, bench-openrouter and browser subcommands above must NOT
+    // create the root (they exit before this point).
     mahbot::temp::init_temp_root()?;
 
     // Resolve storage root before config init, so we can acquire the lock.

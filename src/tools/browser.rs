@@ -1,6 +1,8 @@
 //! Browser automation tool.
 
-use super::browser_daemon::{envelope_success, envelope_verdict};
+use crate::browser::contract::{BrowserResponse, envelope_verdict, extract_snapshot_text};
+use crate::browser::escape_js_single_quoted;
+use crate::browser::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
 use crate::util::{UnwrapPoison, is_http_url};
 use crate::{Tool, Workspace};
 use anyhow::Context;
@@ -11,37 +13,9 @@ use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::process::Command;
 use tracing::debug;
-
-/// Response from chrome-use `--json` commands.
-#[derive(Debug, Deserialize)]
-struct BrowserResponse {
-    /// Classic `success` envelope key — absent on newer `ok`-keyed envelopes.
-    #[serde(default)]
-    success: Option<bool>,
-    /// Latest chrome-use envelopes replace `success` with `ok` on some commands
-    /// (e.g. `session list --json`).
-    #[serde(default)]
-    ok: Option<bool>,
-    data: Option<Value>,
-    error: Option<String>,
-    /// Stable error-envelope code (v1.5.78+) — present on structured errors.
-    code: Option<String>,
-}
-
-impl BrowserResponse {
-    /// Success gate accepting both the classic `success: true` envelope and
-    /// the latest `ok: true` one — delegates to the shared
-    /// [`super::browser_daemon::envelope_success`] predicate (failure
-    /// precedence) so the typed and Value-based paths cannot drift.
-    fn is_success(&self) -> bool {
-        envelope_success(self.success, self.ok)
-    }
-}
 
 /// Actions for navigating and extracting content from web pages.
 #[derive(Debug, Clone, Deserialize)]
@@ -194,7 +168,7 @@ impl BrowserTool {
     /// extract) so concurrent callers targeting the same tab are serialized
     /// consistently.
     pub async fn fetch_page_text(&self, url: &str, tab: &str) -> anyhow::Result<String> {
-        Self::validate_url(url)?;
+        crate::browser::validate_url(url)?;
 
         Self::ensure_available().await?;
 
@@ -246,7 +220,7 @@ impl BrowserTool {
             .as_ref()
             .and_then(|d| d.get("url"))
             .and_then(Value::as_str)
-            .is_some_and(is_blank_page_url)
+            .is_some_and(crate::browser::is_blank_page_url)
         {
             self.close_session(tab).await;
             anyhow::bail!(
@@ -298,51 +272,40 @@ impl BrowserTool {
         Ok(())
     }
 
-    /// Validate a URL is structurally safe to navigate to.
-    fn validate_url(url: &str) -> anyhow::Result<()> {
-        let url = url.trim();
-
-        if url.is_empty() {
-            anyhow::bail!("URL cannot be empty");
-        }
-
-        // Block file:// — bypasses SSRF controls.
-        if url.starts_with("file://") {
-            anyhow::bail!("file:// URLs are not allowed in browser automation");
-        }
-
-        if !is_http_url(url) {
-            anyhow::bail!("Only http:// and https:// URLs are allowed");
-        }
-
-        Ok(())
-    }
-
     /// Run an chrome-use command and parse the JSON response.
     async fn run_command(&self, args: &[&str], tab: &str) -> anyhow::Result<BrowserResponse> {
-        let mut cmd = Command::new(super::browser_daemon::cli_path().with_context(|| {
+        let cli = super::browser_daemon::cli_path().with_context(|| {
             format!(
                 "chrome-use CLI is not available. {}",
                 super::browser_daemon::CHROME_USE_INSTALL_HINT
             )
-        })?);
-        super::browser_daemon::ensure_browser_env(&mut cmd);
-        cmd.args(args);
-        cmd.arg("--json");
-        cmd.args(["--session", tab]);
+        })?;
         // Record the session name after the CLI path resolved, so a missing
         // CLI never registers a pointless close — the run-end close only needs
         // sessions that were actually dispatched.
         self.browser_sessions.track(tab);
 
-        debug!("chrome-use args: {:?}", cmd.as_std().get_args());
+        let mut logged_args: Vec<&str> = args.to_vec();
+        logged_args.extend(["--json", "--session", tab]);
+        debug!("chrome-use args: {:?}", logged_args);
 
-        let output = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .context("Failed to execute chrome-use CLI")?;
+        let run = spawn_cli(CliSpawn {
+            path: &cli,
+            args,
+            session: Some(tab),
+            json: true,
+            capture_stderr: true,
+            timeout: CliTimeout::Unbounded,
+            cancel_kills: false,
+        })
+        .await;
+        let output = match run {
+            CliRun::Output(output) => output,
+            CliRun::SpawnFailure => anyhow::bail!("Failed to execute chrome-use CLI"),
+            // Unreachable for the Unbounded policy — kept as an honest bail
+            // so the match stays total without a panic path.
+            CliRun::TimedOut => anyhow::bail!("chrome-use CLI call timed out"),
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -434,7 +397,7 @@ impl BrowserTool {
     fn build_args(action: &BrowserAction) -> anyhow::Result<Vec<String>> {
         match action {
             BrowserAction::Open { url } => {
-                Self::validate_url(url)?;
+                crate::browser::validate_url(url)?;
                 Ok(vec!["open".into(), url.clone()])
             }
             BrowserAction::Snapshot {
@@ -552,13 +515,24 @@ async fn close_all_browser_sessions_inner() {
     };
 
     // List active sessions
-    let mut list_cmd = Command::new(&cmd);
-    super::browser_daemon::ensure_browser_env(&mut list_cmd);
-    list_cmd.kill_on_drop(true);
-    let list_output = match list_cmd.args(["session", "list", "--json"]).output().await {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::debug!("chrome-use not available, skipping browser cleanup: {e}");
+    let list_output = match spawn_cli(CliSpawn {
+        path: &cmd,
+        args: &["session", "list"],
+        session: None,
+        json: true,
+        capture_stderr: true,
+        timeout: CliTimeout::Unbounded,
+        cancel_kills: true,
+    })
+    .await
+    {
+        CliRun::Output(o) => o,
+        CliRun::SpawnFailure => {
+            tracing::debug!("chrome-use not available, skipping browser cleanup: spawn failed");
+            return;
+        }
+        CliRun::TimedOut => {
+            tracing::debug!("chrome-use session list timed out, skipping browser cleanup");
             return;
         }
     };
@@ -597,26 +571,35 @@ async fn close_all_browser_sessions_inner() {
             // (join_all) inside this function's scope.
             let cmd = &cmd;
             async move {
-                let mut close_cmd = Command::new(cmd);
-                super::browser_daemon::ensure_browser_env(&mut close_cmd);
-                close_cmd.kill_on_drop(true);
-                match close_cmd
-                    .args(["--session", session_id, "close"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await
+                match spawn_cli(CliSpawn {
+                    path: cmd.as_path(),
+                    args: &["--session", session_id, "close"],
+                    session: None,
+                    json: false,
+                    capture_stderr: false,
+                    cancel_kills: true,
+                    timeout: CliTimeout::Unbounded,
+                })
+                .await
                 {
-                    Ok(status) if status.success() => {
+                    CliRun::Output(out) if out.status.success() => {
                         tracing::debug!("Closed chrome-use session: {session_id}");
                     }
-                    Ok(status) => {
+                    CliRun::Output(out) => {
                         tracing::warn!(
-                            "chrome-use close session '{session_id}' exited with status: {status}"
+                            "chrome-use close session '{session_id}' exited with status: {}",
+                            out.status
                         );
                     }
-                    Err(e) => {
-                        tracing::warn!("failed to close chrome-use session '{session_id}': {e}");
+                    CliRun::SpawnFailure => {
+                        tracing::warn!(
+                            "failed to close chrome-use session '{session_id}': spawn failed"
+                        );
+                    }
+                    CliRun::TimedOut => {
+                        tracing::warn!(
+                            "failed to close chrome-use session '{session_id}': timed out"
+                        );
                     }
                 }
             }
@@ -746,86 +729,14 @@ impl Tool for BrowserTool {
         })
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn execute(&self, _ws: &Workspace, args: Value) -> anyhow::Result<String> {
-        let mut normalized_notes: Vec<String> = Vec::new();
-        let (tab, tab_note) = self.normalize_tab(&args);
-        if let Some(note) = tab_note {
-            normalized_notes.push(note);
-        }
-
-        let action_value = args
-            .get("action")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!(corrective_action_error(&args)))?;
-        let (action_value, normalized_note) =
-            normalize_action(action_value, &args).map_err(|e| anyhow::anyhow!(e))?;
-        if let Some(note) = normalized_note {
-            normalized_notes.push(format!("action normalized: {action_value} ({note})"));
-        }
-
-        let action: BrowserAction = serde_json::from_value(action_value.clone()).map_err(|e| {
-            // Give a more helpful message when the LLM uses wrong field names,
-            // always including the exact expected shape so the model can
-            // self-correct in one round-trip.
-            let hint = match &action_value {
-                Value::Object(map) if map.contains_key("find") => {
-                    " 'find' requires 'by', 'value', and 'action' fields (use 'value' not 'name' for the locator text). Valid 'action' values: click, fill, type, hover, focus, check, uncheck, text (use 'text' param only for fill/type, not for the 'text' action)".to_string()
-                }
-                _ => String::new(),
-            };
-            anyhow::anyhow!(
-                "Invalid browser action arguments{hint}. Expected action to be {EXPECTED_ACTION_SHAPE}, \
-                 plus a \"tab\" string. Serde error: {e}"
-            )
-        })?;
+        let (tab, action, normalized_notes) = self.normalize_call(&args)?;
 
         debug!(tab, action = ?action, "browser action");
 
         Self::ensure_available().await?;
 
-        // Validate find locator type early for better diagnostics.
-        if let BrowserAction::Find {
-            by,
-            action: find_action,
-            index,
-            ..
-        } = &action
-        {
-            let valid = [
-                "role",
-                "text",
-                "label",
-                "placeholder",
-                "alt",
-                "title",
-                "testid",
-                "first",
-                "last",
-                "nth",
-            ];
-            if !valid.contains(&by.as_str()) {
-                anyhow::bail!(
-                    "Invalid 'find' locator type '{by}'. Must be one of: {}",
-                    valid.join(", ")
-                );
-            }
-            let valid_actions = [
-                "click", "hover", "focus", "fill", "type", "check", "uncheck", "text",
-            ];
-            if !valid_actions.contains(&find_action.as_str()) {
-                anyhow::bail!(
-                    "Invalid 'find' action '{find_action}'. Must be one of: {}",
-                    valid_actions.join(", ")
-                );
-            }
-            if by == "nth" && index.is_none() {
-                anyhow::bail!(
-                    "'index' is required when 'by' is \"nth\". \
-                     Provide the zero-based index of the element to select."
-                );
-            }
-        }
+        Self::validate_find(&action)?;
 
         // Get or create a per-tab lock — only serializes operations on the
         // same tab. Different tabs run fully concurrently.
@@ -846,71 +757,14 @@ impl Tool for BrowserTool {
             return Ok(super::with_normalization_notes(output, &normalized_notes));
         }
 
-        let cli_args = Self::build_args(&action)?;
-        let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
-        let response = self.run_command(&str_args, &tab).await?;
-
-        // A real navigation attempt that ends on the scratch `about:blank`
-        // never committed — fail loudly (and close the tab best-effort)
-        // instead of reporting success with no content.
-        if let BrowserAction::Open { url } = &action {
-            self.bail_on_blank_navigation(&tab, url, &response).await?;
-        }
-
-        // After open, wait for network idle, then auto-snapshot
-        // so the LLM sees page content immediately.
-        let snapshot_output = if matches!(action, BrowserAction::Open { .. }) {
-            let wait_args = ["wait", "--load", "networkidle"];
-            let _ = self.run_command(&wait_args, &tab).await;
-
-            // Run a compact snapshot to return page content.
-            match self.run_command(&["snapshot", "-c"], &tab).await {
-                Ok(snap_resp) => snap_resp
-                    .data
-                    .as_ref()
-                    .and_then(extract_snapshot_text)
-                    .unwrap_or_default(),
-                Err(_) => String::new(),
-            }
-        } else {
-            String::new()
-        };
-
-        let output = match response.data {
-            Some(data) => match &action {
-                BrowserAction::Snapshot { .. } | BrowserAction::GetText { .. } => {
-                    extract_snapshot_text(&data)
-                        .or_else(|| serde_json::to_string_pretty(&data).ok())
-                        .unwrap_or_default()
-                }
-                BrowserAction::Open { .. } => {
-                    let mut s = format!(
-                        "Opened {}",
-                        data.get("url").and_then(|v| v.as_str()).unwrap_or("?")
-                    );
-                    if !snapshot_output.is_empty() {
-                        use std::fmt::Write;
-                        let _ = write!(s, "\n\n--- Page content ---\n{snapshot_output}");
-                    }
-                    s
-                }
-                BrowserAction::GetUrl { .. } => data
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                _ => serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()),
-            },
-            None => String::new(),
-        };
-
-        let output = if output.is_empty() {
-            format!("[Tab: {tab}] (no output)")
-        } else {
-            format!("[Tab: {tab}] {output}")
-        };
-
-        Ok(super::with_normalization_notes(output, &normalized_notes))
+        let (response, snapshot) = self.run_action(&action, &tab).await?;
+        Ok(Self::format_action_output(
+            &action,
+            &tab,
+            response,
+            &snapshot,
+            &normalized_notes,
+        ))
     }
 
     async fn image_payload(
@@ -1001,18 +855,184 @@ impl BrowserTool {
         let nonce = rand::random::<u64>();
         Ok(dir.join(format!("{slug}_{nonce:016x}.png")))
     }
+
+    /// Normalize the raw tool arguments into the parsed action plus the tab
+    /// and any normalization notes. LLM-facing corrective texts (action shape,
+    /// find-hint) live with the tool, not the shared browser core.
+    fn normalize_call(&self, args: &Value) -> anyhow::Result<(String, BrowserAction, Vec<String>)> {
+        let mut normalized_notes: Vec<String> = Vec::new();
+        let (tab, tab_note) = self.normalize_tab(args);
+        if let Some(note) = tab_note {
+            normalized_notes.push(note);
+        }
+
+        let action_value = args
+            .get("action")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!(corrective_action_error(args)))?;
+        let (action_value, normalized_note) =
+            normalize_action(action_value, args).map_err(|e| anyhow::anyhow!(e))?;
+        if let Some(note) = normalized_note {
+            normalized_notes.push(format!("action normalized: {action_value} ({note})"));
+        }
+
+        let action: BrowserAction = serde_json::from_value(action_value.clone()).map_err(|e| {
+            // Give a more helpful message when the LLM uses wrong field names,
+            // always including the exact expected shape so the model can
+            // self-correct in one round-trip.
+            let hint = match &action_value {
+                Value::Object(map) if map.contains_key("find") => {
+                    " 'find' requires 'by', 'value', and 'action' fields (use 'value' not 'name' for the locator text). Valid 'action' values: click, fill, type, hover, focus, check, uncheck, text (use 'text' param only for fill/type, not for the 'text' action)".to_string()
+                }
+                _ => String::new(),
+            };
+            anyhow::anyhow!(
+                "Invalid browser action arguments{hint}. Expected action to be {EXPECTED_ACTION_SHAPE}, \
+                 plus a \"tab\" string. Serde error: {e}"
+            )
+        })?;
+
+        Ok((tab, action, normalized_notes))
+    }
+
+    /// Validate a `Find` action's locator type/action payload early for better
+    /// diagnostics — before any CLI dispatch.
+    fn validate_find(action: &BrowserAction) -> anyhow::Result<()> {
+        if let BrowserAction::Find {
+            by,
+            action: find_action,
+            index,
+            ..
+        } = action
+        {
+            let valid = [
+                "role",
+                "text",
+                "label",
+                "placeholder",
+                "alt",
+                "title",
+                "testid",
+                "first",
+                "last",
+                "nth",
+            ];
+            if !valid.contains(&by.as_str()) {
+                anyhow::bail!(
+                    "Invalid 'find' locator type '{by}'. Must be one of: {}",
+                    valid.join(", ")
+                );
+            }
+            let valid_actions = [
+                "click", "hover", "focus", "fill", "type", "check", "uncheck", "text",
+            ];
+            if !valid_actions.contains(&find_action.as_str()) {
+                anyhow::bail!(
+                    "Invalid 'find' action '{find_action}'. Must be one of: {}",
+                    valid_actions.join(", ")
+                );
+            }
+            if by == "nth" && index.is_none() {
+                anyhow::bail!(
+                    "'index' is required when 'by' is \"nth\". \
+                     Provide the zero-based index of the element to select."
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Orchestrate a single browser action: build the args, dispatch, and (for
+    /// `Open`) the blank-navigation guard, the best-effort network-idle wait,
+    /// and the compact auto-snapshot. Returns the RAW response and the snapshot
+    /// text — no LLM-facing framing (that lives in [`Self::format_action_output`]).
+    async fn run_action(
+        &self,
+        action: &BrowserAction,
+        tab: &str,
+    ) -> anyhow::Result<(BrowserResponse, String)> {
+        let cli_args = Self::build_args(action)?;
+        let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
+        let response = self.run_command(&str_args, tab).await?;
+
+        // A real navigation attempt that ends on the scratch `about:blank`
+        // never committed — fail loudly (and close the tab best-effort)
+        // instead of reporting success with no content.
+        if let BrowserAction::Open { url } = action {
+            self.bail_on_blank_navigation(tab, url, &response).await?;
+        }
+
+        // After open, wait for network idle, then auto-snapshot
+        // so the LLM sees page content immediately.
+        let snapshot = if matches!(action, BrowserAction::Open { .. }) {
+            let wait_args = ["wait", "--load", "networkidle"];
+            let _ = self.run_command(&wait_args, tab).await;
+
+            // Run a compact snapshot to return page content.
+            match self.run_command(&["snapshot", "-c"], tab).await {
+                Ok(snap_resp) => snap_resp
+                    .data
+                    .as_ref()
+                    .and_then(extract_snapshot_text)
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
+        Ok((response, snapshot))
+    }
+
+    /// Shape the raw [`BrowserResponse`] into the LLM-facing text: the
+    /// per-action data extraction, the `[Tab: {tab}]` framing, and the
+    /// normalization notes.
+    fn format_action_output(
+        action: &BrowserAction,
+        tab: &str,
+        response: BrowserResponse,
+        snapshot: &str,
+        notes: &[String],
+    ) -> String {
+        let output = match response.data {
+            Some(data) => match action {
+                BrowserAction::Snapshot { .. } | BrowserAction::GetText { .. } => {
+                    extract_snapshot_text(&data)
+                        .or_else(|| serde_json::to_string_pretty(&data).ok())
+                        .unwrap_or_default()
+                }
+                BrowserAction::Open { .. } => {
+                    let mut s = format!(
+                        "Opened {}",
+                        data.get("url").and_then(|v| v.as_str()).unwrap_or("?")
+                    );
+                    if !snapshot.is_empty() {
+                        use std::fmt::Write;
+                        let _ = write!(s, "\n\n--- Page content ---\n{snapshot}");
+                    }
+                    s
+                }
+                BrowserAction::GetUrl { .. } => data
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                _ => serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()),
+            },
+            None => String::new(),
+        };
+
+        let output = if output.is_empty() {
+            format!("[Tab: {tab}] (no output)")
+        } else {
+            format!("[Tab: {tab}] {output}")
+        };
+
+        super::with_normalization_notes(output, notes)
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
-/// A navigation that ends here never committed — the tab stayed on the scratch
-/// `about:blank` page (relay broken, navigation blocked, etc.). Keyed on the
-/// final URL only, so legitimately content-free pages (image URLs, PDFs, canvas
-/// shells) are not false-flagged by having zero extracted text.
-fn is_blank_page_url(url: &str) -> bool {
-    let url = url.trim();
-    url.is_empty() || url.starts_with("about:blank")
-}
 
 /// Reduce a name to a single safe filename component (ASCII alphanumerics,
 /// `-`, `_`), so a model-supplied value (e.g. a browser `tab`) can never
@@ -1361,11 +1381,6 @@ fn extract_xml_field(inner: &str, tag: &str) -> Option<String> {
     }
 }
 
-/// Escape a string for embedding in a single-quoted JavaScript literal.
-fn escape_js_single_quoted(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
 /// Build eval JS that returns `innerText` for the given CSS selector or ref.
 fn inner_text_eval_js(selector: &str) -> String {
     let escaped = escape_js_single_quoted(selector);
@@ -1374,43 +1389,12 @@ fn inner_text_eval_js(selector: &str) -> String {
     )
 }
 
-/// Extract textual content from an chrome-use snapshot response `data` field.
-///
-/// chrome-use can return the snapshot as:
-/// - A plain string (via `snapshot -c`)
-/// - An object with a `content` field (via `get_text`)
-/// - An object with `origin`, `refs`, and `snapshot` fields (via `open` auto-snapshot)
-///
-/// Returns `None` if none of these shapes match.
-fn extract_snapshot_text(data: &serde_json::Value) -> Option<String> {
-    data.as_str()
-        .map(String::from)
-        .or_else(|| {
-            data.get("content")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .or_else(|| {
-            data.get("snapshot")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-}
-
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::browser_daemon::{browser_bin, ensure_browser_env};
-    use crate::util::test::set_env_var;
-
-    #[test]
-    fn url_validation_accepts_all_domains() {
-        assert!(BrowserTool::validate_url("https://example.com").is_ok());
-        assert!(BrowserTool::validate_url("https://docs.example.com").is_ok());
-        assert!(BrowserTool::validate_url("https://other.com").is_ok());
-    }
+    use crate::tools::browser_daemon::browser_bin;
 
     // ── build_args: simple actions ───────────────────────────────────────
 
@@ -1737,67 +1721,6 @@ mod tests {
         }
     }
 
-    /// Read an env var explicitly set on the command by `ensure_browser_env`.
-    fn cmd_env(cmd: &Command, key: &str) -> Option<String> {
-        cmd.as_std()
-            .get_envs()
-            .find(|(k, _)| *k == std::ffi::OsStr::new(key))
-            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
-    }
-
-    #[test]
-    fn ensure_browser_env_defaults_home_only_when_missing() {
-        {
-            let _guard = set_env_var("HOME", None);
-            let mut cmd = Command::new("true");
-            ensure_browser_env(&mut cmd);
-            assert_eq!(cmd_env(&cmd, "HOME").as_deref(), Some("/tmp"));
-        }
-        {
-            let _guard = set_env_var("HOME", Some("/home/user"));
-            let mut cmd = Command::new("true");
-            ensure_browser_env(&mut cmd);
-            assert_eq!(cmd_env(&cmd, "HOME"), None);
-        }
-    }
-
-    #[test]
-    fn ensure_browser_env_defaults_chromium_flags_only_when_missing() {
-        {
-            let _guard = set_env_var("CHROMIUM_FLAGS", None);
-            let mut cmd = Command::new("true");
-            ensure_browser_env(&mut cmd);
-            assert_eq!(
-                cmd_env(&cmd, "CHROMIUM_FLAGS").as_deref(),
-                Some("--no-first-run --no-default-browser-check --disable-gpu")
-            );
-        }
-        {
-            let _guard = set_env_var("CHROMIUM_FLAGS", Some("--headless"));
-            let mut cmd = Command::new("true");
-            ensure_browser_env(&mut cmd);
-            assert_eq!(cmd_env(&cmd, "CHROMIUM_FLAGS"), None);
-        }
-    }
-
-    #[test]
-    fn ensure_browser_env_sets_fixed_env_vars() {
-        let mut cmd = Command::new("true");
-        ensure_browser_env(&mut cmd);
-        assert_eq!(
-            cmd_env(&cmd, "AGENT_BROWSER_DEFAULT_TIMEOUT").as_deref(),
-            Some("15000")
-        );
-        assert_eq!(
-            cmd_env(&cmd, "AGENT_BROWSER_IDLE_TIMEOUT_MS").as_deref(),
-            Some("300000")
-        );
-        assert_eq!(
-            cmd_env(&cmd, "AGENT_BROWSER_NO_AUTO_RECONNECT").as_deref(),
-            Some("1")
-        );
-    }
-
     #[test]
     fn browser_bin_name_is_correct() {
         let name = browser_bin();
@@ -1985,19 +1908,6 @@ mod tests {
     }
 
     #[test]
-    fn blank_page_url_predicate() {
-        // Scratch/about pages that never committed are blank-page failures.
-        assert!(is_blank_page_url("about:blank"));
-        assert!(is_blank_page_url("about:blank#blocked"));
-        assert!(is_blank_page_url(""));
-        // Real pages — even ones that render no text — are NOT blank failures
-        // (image URLs, PDFs, canvas shells).
-        assert!(!is_blank_page_url("https://example.com/image.png"));
-        assert!(!is_blank_page_url("https://example.com/file.pdf"));
-        assert!(!is_blank_page_url("about:srcdoc"));
-    }
-
-    #[test]
     fn missing_or_empty_tab_defaults_to_per_run_session() {
         // Missing tab → the per-run default session, echoed in tool output.
         let tool = BrowserTool::default();
@@ -2061,6 +1971,8 @@ mod tests {
     #[tokio::test]
     async fn fail_fast_returns_guidance_without_retrying() {
         let _guard = crate::tools::browser_daemon::with_health_test_lock().await;
+        // Pristine start (a sibling health test may have left a Down fixture).
+        crate::tools::browser_daemon::reset_health();
         // An orphaned-tab error (even envelope-wrapped with the auto-connect
         // and daemon-wrapper text) fails fast with hand-close guidance but
         // does NOT mark the daemon unhealthy — the relay and daemon are up, so
@@ -2311,26 +2223,5 @@ mod tests {
         );
         assert!(parse_session_list(&serde_json::json!(null)).is_empty());
         assert!(parse_session_list(&serde_json::json!({"ok": true, "data": {}})).is_empty());
-    }
-
-    #[test]
-    fn browser_response_accepts_tolerant_envelopes() {
-        let ok: BrowserResponse =
-            serde_json::from_str(r#"{"ok":true,"data":{}}"#).expect("tolerant deserialize");
-        assert!(ok.is_success());
-
-        let success: BrowserResponse =
-            serde_json::from_str(r#"{"success":true}"#).expect("tolerant deserialize");
-        assert!(success.is_success());
-
-        let failed: BrowserResponse =
-            serde_json::from_str(r#"{"success":false}"#).expect("tolerant deserialize");
-        assert!(!failed.is_success());
-
-        // Failure precedence — mirrors envelope_verdict: an explicit false on
-        // either key loses over a contradicting success key.
-        let mixed: BrowserResponse =
-            serde_json::from_str(r#"{"success":false,"ok":true}"#).expect("tolerant deserialize");
-        assert!(!mixed.is_success());
     }
 }

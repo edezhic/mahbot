@@ -199,8 +199,7 @@ impl RetryPolicy {
     /// Test seam: in tests, the override installed via
     /// [`swap_test_retry_policy`] takes precedence over the hardcoded
     /// schedule so retry-loop tests don't sleep for minutes; otherwise
-    /// `self` applies unchanged. Poison-tolerant like the other test seams
-    /// ([`crate::util::test::retry_tests_lock`]): a failing test must not
+    /// `self` applies unchanged. Poison-tolerant: a failing test must not
     /// cascade into later ones. A no-op outside tests.
     #[must_use]
     fn apply_test_override(self) -> Self {
@@ -213,7 +212,7 @@ impl RetryPolicy {
 }
 
 /// Test seam: install a tiny retry policy so scoped-retry tests run fast.
-/// Guarded by `util::test::retry_tests_lock()` in tests that use it.
+/// Callers must be annotated `#[serial_test::serial(provider)]`.
 #[cfg(test)]
 static TEST_POLICY_OVERRIDE: std::sync::RwLock<Option<RetryPolicy>> = std::sync::RwLock::new(None);
 
@@ -723,8 +722,8 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(provider)] // synthesis() applies the process-global test-policy override
     fn defaults_are_hardcoded() {
-        let _guard = crate::util::test::retry_tests_lock();
         // No config surface exists — the policy must always be the
         // hardcoded defaults regardless of any stray config_kv rows.
         let policy = RetryPolicy::default();
@@ -739,9 +738,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn agent_chat_rides_out_sustained_outage_and_recovers() {
-        let _guard = crate::util::test::retry_tests_lock();
         // The binding agent-loop budget (13 attempts): the first 12 attempts
         // hit a sustained 503-style outage, the 13th recovers.
         let policy = RetryPolicy {

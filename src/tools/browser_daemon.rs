@@ -10,9 +10,9 @@
 //! marks the daemon unhealthy and wakes the watchdog, which recovers from that
 //! stored classification — the daemon-free status cannot see a wedged daemon,
 //! so the watchdog never re-evaluates over a fail-fast classification. It also
-//! owns the chrome-use CLI invocation primitives (binary name, env setup,
-//! `--version` check) so the browser tool depends on this module and not vice
-//! versa.
+//! owns the chrome-use CLI invocation primitives (binary name, `--version`
+//! check) so the browser tool depends on this module and not vice versa; the
+//! shared command env/setup lives in [`crate::browser::spawn`].
 //!
 //! mahbot drives the user's real, logged-in Chrome through the chrome-use
 //! extension relay — no chrome-use `--launch` mode, no profile copies, no CDP
@@ -40,6 +40,8 @@
 //!   open a window unasked; on display-less hosts it is paused rather than spend
 //!   the launch budget (launching can never help there).
 
+use crate::browser::contract::{envelope_verdict, extract_error};
+use crate::browser::spawn::{CliRun, CliSpawn, CliTimeout, ensure_browser_env, spawn_cli};
 use crate::util::UnwrapPoison;
 use futures_util::future::join_all;
 use serde_json::Value;
@@ -388,7 +390,7 @@ pub(crate) fn is_daemon_unavailable_error(msg: &str) -> bool {
 /// Relay-side failure signature — the daemon is alive but cannot drive Chrome
 /// through the extension relay. Distinct from a daemon wedge (restart clears a
 /// wedge; a relay drop needs the extension to republish, then self-heals).
-fn is_relay_unavailable_error(msg: &str) -> bool {
+pub(crate) fn is_relay_unavailable_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("relay isn't connected")
         || lower.contains("relay is not")
@@ -670,7 +672,7 @@ fn release_asset_name() -> Result<String, String> {
 /// or its output is not a parseable semver — callers distinguish "not
 /// installed" (via [`cli_path`]) from "unparseable version" (proceed assuming
 /// outdated).
-async fn cli_version() -> Option<semver::Version> {
+pub(crate) async fn cli_version() -> Option<semver::Version> {
     let path = cli_path()?;
     let mut cmd = Command::new(&path);
     ensure_browser_env(&mut cmd);
@@ -688,60 +690,26 @@ async fn cli_version() -> Option<semver::Version> {
     parse_cli_version(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Set HOME, `CHROMIUM_FLAGS`, and default timeout env vars on the command
-/// so that the Chromium spawned by chrome-use works in service/docker
-/// environments.
-pub(crate) fn ensure_browser_env(cmd: &mut Command) {
-    if std::env::var_os("HOME").is_none() {
-        cmd.env("HOME", "/tmp");
-    }
-    // Suppress Chromium's "--enable-crashes-dialog" and GPU-related flags
-    // that cause issues in headless/service environments.
-    if std::env::var_os("CHROMIUM_FLAGS").is_none() {
-        cmd.env(
-            "CHROMIUM_FLAGS",
-            "--no-first-run --no-default-browser-check --disable-gpu",
-        );
-    }
-    // Default 15-second timeout for all chrome-use actions (including
-    // `wait --text` which would otherwise block much longer).
-    cmd.env("AGENT_BROWSER_DEFAULT_TIMEOUT", "15000");
-    // 5-minute idle timeout — the chrome-use daemon still stops after 5 idle
-    // minutes, but chrome-use ≥1.5.101 PRESERVES external Chrome tabs on idle
-    // (only an explicit close/session stop cleans them up), so mahbot closes
-    // agent-opened sessions explicitly at run end.
-    cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", "300000");
-    // Enable human-like interaction speed for bot-detection avoidance.
-    // chrome-use supports the same env vars as agent-browser for backward
-    // compatibility.
-    cmd.env("AGENT_BROWSER_HUMANIZE", "human");
-    // Keep the upgrade-available banner out of every command's stderr.
-    cmd.env("CHROME_USE_NO_UPDATE_CHECK", "1");
-    cmd.env("AGENT_BROWSER_NO_UPDATE_CHECK", "1");
-    // The watchdog owns recovery. Without these, a browser command issued while
-    // the relay is down makes the CLI kill session daemons / the native host
-    // and wait up to 45s for a relay revive — racing the watchdog's own
-    // cause-aware recovery and turning a health check into a 45s stall.
-    cmd.env("AGENT_BROWSER_NO_AUTO_RECONNECT", "1");
-    cmd.env("AGENT_BROWSER_RELAY_REVIVE_SECS", "0");
-}
-
-/// Spawn a chrome-use CLI call with the browser env, `--json`, and an optional
-/// `--session`, bounded by [`CLI_TIMEOUT`] — a wedged daemon hangs inside the
-/// CLI's own ~152 s retry loop, so every call must be bounded.
+/// Spawn a chrome-use CLI call through [`crate::browser::spawn::spawn_cli`] with
+/// the shared env, `--json`, and an optional `--session`, bounded by
+/// [`CLI_TIMEOUT`] — a wedged daemon hangs inside the CLI's own ~152 s retry
+/// loop, so every call must be bounded.
 async fn run_cli_bounded(args: &[&str], session: Option<&str>) -> Option<std::process::Output> {
-    let mut cmd = Command::new(cli_path()?);
-    ensure_browser_env(&mut cmd);
-    cmd.args(args).arg("--json");
-    if let Some(session) = session {
-        cmd.args(["--session", session]);
+    let path = cli_path()?;
+    match spawn_cli(CliSpawn {
+        path: &path,
+        args,
+        session,
+        json: true,
+        capture_stderr: false,
+        timeout: CliTimeout::Bounded(CLI_TIMEOUT),
+        cancel_kills: true,
+    })
+    .await
+    {
+        CliRun::Output(out) => Some(out),
+        CliRun::SpawnFailure | CliRun::TimedOut => None,
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-    cmd.kill_on_drop(true);
-    tokio::time::timeout(CLI_TIMEOUT, cmd.output())
-        .await
-        .ok()?
-        .ok()
 }
 
 /// Run a chrome-use CLI command with `--json` (and optional `--session`),
@@ -897,7 +865,7 @@ const WINDOWS_CHROME_PROCESS_NAMES: [&str; 3] = ["chrome.exe", "chromium.exe", "
 /// spawn error, other exit code, or timeout → `None` (inconclusive → the
 /// classifier degrades to RelayDown). A closed browser is recovered by
 /// launching, not by restarting the daemon.
-async fn chrome_running() -> Option<bool> {
+pub(crate) async fn chrome_running() -> Option<bool> {
     #[cfg(not(target_os = "windows"))]
     {
         pgrep_running(&CHROME_PROCESS_NAMES.join("|")).await
@@ -920,7 +888,9 @@ async fn chrome_running() -> Option<bool> {
 async fn pgrep_running(pattern: &str) -> Option<bool> {
     let mut cmd = Command::new("pgrep");
     cmd.args(["-x", pattern])
-        .stdout(Stdio::piped())
+        // Only the exit code matters — a piped-but-undrained stdout kills a
+        // matching pgrep with SIGPIPE before it can report its status.
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
     let status = tokio::time::timeout(CLI_TIMEOUT, cmd.status())
@@ -1163,10 +1133,12 @@ async fn close_run_session(name: &str) {
     }
 }
 
-/// Only mahbot-owned session names may be swept — user, default, and other
-/// agents' sessions must never be touched (strict-scope rule).
+/// Only mahbot-owned session names may be swept — link-enricher-* and ephemeral
+/// `mahbot-browser-ephemeral-*` CLI sessions (orphan protection). Named
+/// `mahbot-browser-<name>` sessions and user/default/agent-tab sessions are
+/// never touched (strict-scope rule).
 fn is_mahbot_session_name(name: &str) -> bool {
-    name.starts_with("link-enricher-")
+    name.starts_with("link-enricher-") || name.starts_with(crate::browser::CLI_EPHEMERAL_PREFIX)
 }
 
 /// Causes the sweep warns about — warn once per cause transition so a
@@ -1377,38 +1349,6 @@ async fn stop_session_daemon(name: &str, deadline: Instant) -> Option<()> {
 /// signature detection.
 async fn run_session_cli_json(args: &[&str], session: &str) -> Result<Value, Option<String>> {
     run_cli_json_opt(args, Some(session)).await
-}
-
-/// Extract the `error` message from a CLI error response, if any.
-fn extract_error(stdout: &[u8]) -> Option<String> {
-    let v: Value = serde_json::from_slice(stdout).unwrap_or_default();
-    v.get("error")
-        .and_then(Value::as_str)
-        .map(String::from)
-        .filter(|s| !s.is_empty())
-}
-
-/// Core envelope-success predicate with failure precedence: an explicit
-/// `false` on either key loses over a contradicting success key (conservative
-/// — the error text surfaces), and a payload with neither key is not a
-/// success. Shared by [`envelope_verdict`] (Value-based) and
-/// `BrowserResponse::is_success` (typed) so the two cannot drift.
-pub(crate) fn envelope_success(success: Option<bool>, ok: Option<bool>) -> bool {
-    !(success == Some(false) || ok == Some(false)) && (success == Some(true) || ok == Some(true))
-}
-
-/// Tri-state verdict of a chrome-use JSON envelope: `Some(true)` when either
-/// `success` or `ok` reports success, `Some(false)` when either reports
-/// failure, `None` when the payload carries no verdict key (callers decide
-/// their own default). Newer chrome-use commands replaced `success` with `ok`
-/// (e.g. `session list`).
-pub(crate) fn envelope_verdict(v: &Value) -> Option<bool> {
-    let success = v.get("success").and_then(Value::as_bool);
-    let ok = v.get("ok").and_then(Value::as_bool);
-    if success.is_none() && ok.is_none() {
-        return None;
-    }
-    Some(envelope_success(success, ok))
 }
 
 fn set_health(outcome: ProbeOutcome) {
@@ -2018,7 +1958,7 @@ async fn cleanup_stale_sessions() {
         return;
     };
     for name in sessions {
-        if name.starts_with("link-enricher-") {
+        if is_mahbot_session_name(&name) {
             sweep_session(&name).await;
         }
     }
@@ -2051,7 +1991,7 @@ async fn wait_for_relay(budget: Duration) {
     }
 }
 
-async fn relay_up() -> Option<bool> {
+pub(crate) async fn relay_up() -> Option<bool> {
     let status = run_cli_json(&["status"]).await?;
     status
         .get("data")?
@@ -2120,7 +2060,7 @@ async fn attempt_chrome_launch() {
 /// Whether a Chrome window can actually appear: Linux needs a display session;
 /// macOS/Windows launch is attempted and degrades via the failure path (SSH/
 /// service sessions surface there).
-fn display_available() -> bool {
+pub(crate) fn display_available() -> bool {
     #[cfg(target_os = "linux")]
     {
         std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
@@ -2544,6 +2484,8 @@ mod tests {
         let msg = daemon_down_message();
         assert!(msg.contains("down or unresponsive"));
         assert!(msg.contains("restart it automatically"));
+        // Leave the singleton pristine for sibling health tests.
+        reset_health();
     }
 
     #[test]
@@ -2955,27 +2897,6 @@ mod tests {
             Some(semver::Version::new(1, 5, 99))
         );
         assert_eq!(parse_cli_version("chrome-use\nno version here"), None);
-    }
-
-    #[test]
-    fn envelope_verdict_covers_both_envelopes() {
-        let v = |json: serde_json::Value| envelope_verdict(&json);
-        assert_eq!(v(serde_json::json!({"success": true})), Some(true));
-        assert_eq!(v(serde_json::json!({"ok": true})), Some(true));
-        assert_eq!(
-            v(serde_json::json!({"success": false, "error": "x"})),
-            Some(false)
-        );
-        assert_eq!(
-            v(serde_json::json!({"ok": false, "error": "x"})),
-            Some(false)
-        );
-        // Failure beats an unrelated success key; no verdict key → None.
-        assert_eq!(
-            v(serde_json::json!({"success": false, "ok": true})),
-            Some(false)
-        );
-        assert_eq!(v(serde_json::json!({"data": {}})), None);
     }
 
     #[test]

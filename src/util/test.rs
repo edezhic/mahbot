@@ -64,27 +64,19 @@ pub fn env_lock() -> &'static std::sync::Mutex<()> {
     ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
-/// Shared lock serializing tests that install the retry-policy override and /
-/// or the fake provider (scoped-retry tests).
-///
-/// Both [`crate::retry::swap_test_retry_policy`] (via
-/// [`install_test_retry_policy`]) and
-/// [`crate::providers::swap_provider_for_test`] mutate process-global state;
-/// tests using either must hold this lock for their duration.
-///
-/// # Panic safety
-///
-/// The lock is poison-tolerant: a test that panics while holding it poisons
-/// the mutex, and the next caller recovers the guard via
-/// [`UnwrapPoison::unwrap_poison`] instead of panicking — a single test
-/// failure cannot cascade into every subsequent retry test.
-pub fn retry_tests_lock() -> std::sync::MutexGuard<'static, ()> {
-    static RETRY_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    RETRY_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_poison()
-}
+// ── Test-global exclusion via serial_test keys ─────────────
+
+// Test-global exclusion is via [`serial_test`] keys: `provider` guards the
+// process-global fake-provider + retry-policy globals, `drain` guards the
+// shutdown drain flag. A test needs a key whenever it MUTATES the guarded
+// global or its assertions depend on the global's value — a drain-flag reader
+// asserting non-drain behavior needs `drain` just as much as a mutator does.
+// Multi-key attributes may list keys in any order: serial_test's derive macro
+// sorts them alphabetically at expansion ("avoids dining philosopher issues"),
+// so the library itself guarantees a consistent global acquisition order.
+// Tests that touch no guarded global carry no key and must not share
+// process-global state of their own (unique workspace/job ids against the
+// shared test store), e.g. the jobs boot-recovery and research-cancel tests.
 
 // ── Retry-policy guard for scoped-retry tests ──────────────
 
@@ -108,7 +100,8 @@ impl Drop for RetryPolicyGuard {
 /// Install a test retry-policy override for the duration of the returned
 /// guard.
 ///
-/// Callers must hold [`retry_tests_lock()`] for the duration and keep the
+/// The caller must be annotated `#[serial_test::serial(provider)]` (the
+/// serial key guards the process-global retry-policy override) and keep the
 /// returned guard alive — dropping it restores the previous override.
 pub(crate) fn install_test_retry_policy(policy: crate::retry::RetryPolicy) -> RetryPolicyGuard {
     let previous = crate::retry::swap_test_retry_policy(policy);
@@ -343,9 +336,10 @@ impl Drop for FakeProviderGuard {
 
 /// Install a [`FakeProvider`] as the global provider for tests.
 ///
-/// Callers must hold [`retry_tests_lock()`] for the duration and keep the
-/// returned guard alive — dropping it (on test end or panic) restores the
-/// previous provider without clobbering a newer fake installed concurrently.
+/// The caller must be annotated `#[serial_test::serial(provider)]` (the
+/// serial key guards the process-global fake provider) and keep the returned
+/// guard alive — dropping it (on test end or panic) restores the previous
+/// provider without clobbering a newer fake installed concurrently.
 pub(crate) fn install_fake_provider(provider: Arc<dyn crate::Provider>) -> FakeProviderGuard {
     let previous = crate::providers::swap_provider_for_test(provider.clone());
     FakeProviderGuard {
@@ -356,38 +350,36 @@ pub(crate) fn install_fake_provider(provider: Arc<dyn crate::Provider>) -> FakeP
 
 // ── Combined retry+provider test seam ────────────────────
 
-/// RAII guard for [`install_retry_seam`]: holds [`retry_tests_lock`], the
-/// tiny retry-policy override, and the fake provider until dropped, so all
-/// three restore at scope exit (including on panic). Fields are ordered so
-/// the drop restores provider → policy → lock (reverse of install).
+/// RAII guard for [`install_retry_seam`]: holds the tiny retry-policy
+/// override and the fake provider until dropped, so both restore at scope
+/// exit (including on panic). Fields are ordered so the drop restores
+/// provider → policy (reverse of install).
 ///
-/// Holding the guard across `.await` is intentional — the lock serializes
-/// the process-global test seams — and wrapping it in this struct
-/// deliberately keeps `clippy::await_holding_lock` from firing.
+/// The caller must be annotated `#[serial_test::serial(provider)]` (the
+/// serial key guards the process-global fake provider + retry-policy
+/// override).
 #[must_use]
 pub(crate) struct RetrySeam {
     _fake: FakeProviderGuard,
     _retry: RetryPolicyGuard,
-    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
-/// Scoped install of the full retry-provider test seam: acquires
-/// [`retry_tests_lock`], installs [`crate::retry::tiny_test_policy`], and
-/// installs `provider` as the global provider. Everything restores when the
-/// returned [`RetrySeam`] drops.
+/// Scoped install of the full retry-provider test seam: installs
+/// [`crate::retry::tiny_test_policy`] and `provider` as the global provider.
+/// Everything restores when the returned [`RetrySeam`] drops.
+///
+/// The caller must be annotated `#[serial_test::serial(provider)]`.
 pub(crate) fn install_retry_seam(provider: impl crate::Provider + 'static) -> RetrySeam {
     install_retry_seam_dyn(Arc::new(provider))
 }
 
 /// [`install_retry_seam`] for an already-arc'd provider.
 pub(crate) fn install_retry_seam_dyn(provider: Arc<dyn crate::Provider>) -> RetrySeam {
-    let lock = retry_tests_lock();
     let retry = install_test_retry_policy(crate::retry::tiny_test_policy());
     let fake = install_fake_provider(provider);
     RetrySeam {
         _fake: fake,
         _retry: retry,
-        _lock: lock,
     }
 }
 
@@ -452,9 +444,11 @@ impl crate::Channel for SpyChannel {
 ///
 /// While the guard is alive the redirect is PROCESS-GLOBAL: every
 /// `record_llm_*` write in any concurrently-running test lands in this store.
-/// Callers must hold [`retry_tests_lock()`] for the duration (same convention
-/// as [`install_fake_provider`]) and filter queries by a test-unique
-/// `agent_id` — otherwise writes leak across tests.
+/// Callers must hold the serial_test keys covering every global their test
+/// touches for the guard's lifetime — the redirect is PROCESS-GLOBAL, so any
+/// concurrently-running LLM-writing test's rows land in this store (the
+/// current sole caller holds `provider`) — and filter queries by a
+/// test-unique `agent_id`.
 pub(crate) fn install_test_log_store(store: crate::logs::LogStore) -> TestLogStoreGuard {
     let previous = crate::stats::swap_test_log_store(Some(store));
     TestLogStoreGuard { previous }
@@ -1270,8 +1264,8 @@ mod retry_policy_guard_tests {
     const TINY_MAX_ATTEMPTS: u32 = 3;
 
     #[test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     fn installs_and_restores_on_drop() {
-        let _lock = retry_tests_lock();
         assert_eq!(
             crate::retry::RetryPolicy::current().max_attempts,
             crate::retry::DEFAULT_RETRY_MAX_ATTEMPTS
@@ -1290,8 +1284,8 @@ mod retry_policy_guard_tests {
     }
 
     #[test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     fn restores_on_panic() {
-        let _lock = retry_tests_lock();
         let result = std::panic::catch_unwind(|| {
             let _guard = install_test_retry_policy(crate::retry::tiny_test_policy());
             assert_eq!(
@@ -1306,19 +1300,6 @@ mod retry_policy_guard_tests {
             crate::retry::DEFAULT_RETRY_MAX_ATTEMPTS,
             "a panicking test must not leak the tiny policy into later tests"
         );
-    }
-
-    #[test]
-    fn lock_recovers_after_poison() {
-        // A test that panics while holding retry_tests_lock poisons the std
-        // Mutex; the next acquire must recover the guard (PoisonError
-        // into_inner) instead of panicking — one failure cannot cascade.
-        let result = std::panic::catch_unwind(|| {
-            let _lock = retry_tests_lock();
-            panic!("intentional panic while holding the retry lock");
-        });
-        assert!(result.is_err());
-        let _lock = retry_tests_lock(); // must not panic despite poisoning
     }
 }
 
