@@ -1,9 +1,9 @@
-//! `mahbot browser` — headless browser automation CLI over the shared core.
+//! `mahbot chrome` — browser automation CLI over the shared core.
 //!
 //! Dispatched from `main()` before temp-root/lock init (runs alongside the
 //! daemon), so it must not rely on the `/tmp/mahbot` temp root or initialized
 //! config; chrome-use binary resolution falls back to PATH/home locations.
-//! Sessions are namespaced `mahbot-browser-*` so they can never collide with
+//! Sessions are namespaced `mahbot-chrome-*` so they can never collide with
 //! the interactive tool's `agent-tab-*`.
 //!
 //! stdout is exactly ONE line of JSON (the [`OutEnvelope`]); stderr carries
@@ -19,18 +19,18 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::browser::actions;
-use crate::browser::contract::{
-    BrowserResponse, ExpectOutcome, OutEnvelope, OutKind, eval_count, eval_result, expect_outcome,
+use crate::chrome::actions;
+use crate::chrome::contract::{
+    ChromeResponse, ExpectOutcome, OutEnvelope, OutKind, eval_count, eval_result, expect_outcome,
     extract_output, extract_snapshot_text,
 };
-use crate::browser::forms::{
+use crate::chrome::forms::{
     ExpectCond, ExtractGate, WaitTarget, count_eval_js, describe, expect_args, extract_gate,
     parse_count_op, parse_predicate, parse_state, wait_args, wait_target,
 };
-use crate::browser::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
-use crate::browser::{CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX, is_blank_page_url, validate_url};
-use crate::tools::browser_daemon::{
+use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
+use crate::chrome::{CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX, is_blank_page_url, validate_url};
+use crate::tools::chrome_daemon::{
     CliStatus, chrome_running, cli_path, cli_probe, cli_version, display_available,
     is_daemon_unavailable_code, is_daemon_unavailable_error, is_relay_unavailable_error, relay_up,
 };
@@ -78,12 +78,12 @@ fn classify_call_failure(code: Option<&str>, error: &str) -> OutKind {
     OutKind::Error
 }
 
-/// Top-level `mahbot browser -h` — rendered from the shared action registry.
+/// Top-level `mahbot chrome -h` — rendered from the shared action registry.
 #[must_use]
 fn top_help() -> String {
-    let mut out = String::from("mahbot browser — headless browser automation CLI\n\n");
+    let mut out = String::from("mahbot chrome — browser automation CLI\n\n");
     out.push_str("Usage:\n");
-    out.push_str("  mahbot browser <action> [options]\n\n");
+    out.push_str("  mahbot chrome <action> [options]\n\n");
     out.push_str("Actions:\n");
     for d in actions::ACTIONS.iter().filter(|a| a.cli.is_some()) {
         let Some(cli) = d.cli.as_ref() else {
@@ -110,12 +110,12 @@ fn top_help() -> String {
     out.push_str("  2  environment failure (no chrome-use CLI/relay/Chrome/display)\n");
     out.push_str("  3  usage error\n\n");
     out.push_str("Help:\n");
-    out.push_str("  mahbot browser -h            this help\n");
-    out.push_str("  mahbot browser <action> -h   per-action help (flags, kinds, examples)\n");
+    out.push_str("  mahbot chrome -h            this help\n");
+    out.push_str("  mahbot chrome <action> -h   per-action help (flags, kinds, examples)\n");
     out
 }
 
-/// Per-action `mahbot browser <action> -h`.
+/// Per-action `mahbot chrome <action> -h`.
 #[must_use]
 fn action_help(name: &str) -> String {
     let Some(d) = actions::desc(name) else {
@@ -126,12 +126,12 @@ fn action_help(name: &str) -> String {
     };
 
     let mut out = String::new();
-    let _ = write!(out, "mahbot browser {} — {}\n\n", d.name, d.purpose);
+    let _ = write!(out, "mahbot chrome {} — {}\n\n", d.name, d.purpose);
     out.push_str("Usage:\n");
     if cli.syntax.is_empty() {
-        let _ = writeln!(out, "  mahbot browser {}", d.name);
+        let _ = writeln!(out, "  mahbot chrome {}", d.name);
     } else {
-        let _ = writeln!(out, "  mahbot browser {} {}", d.name, cli.syntax);
+        let _ = writeln!(out, "  mahbot chrome {} {}", d.name, cli.syntax);
     }
 
     let mut flag_rows: Vec<(&str, &str)> = cli.flags.to_vec();
@@ -193,7 +193,7 @@ struct Invocation {
     session: Option<String>,
 }
 
-/// One parsed `mahbot browser` action.
+/// One parsed `mahbot chrome` action.
 enum Action {
     Status,
     Open {
@@ -265,7 +265,7 @@ impl StepFailure {
 }
 
 /// Outcome of one spawned chrome-use step.
-type StepOutcome = Result<BrowserResponse, StepFailure>;
+type StepOutcome = Result<ChromeResponse, StepFailure>;
 
 /// Whether any session-scoped chrome-use spawn has been attempted this
 /// process — an ephemeral session can only exist after such a spawn, so
@@ -273,7 +273,7 @@ type StepOutcome = Result<BrowserResponse, StepFailure>;
 /// any spawn attempt. Never read before `run_cli` resets it.
 static CHROME_USE_SPAWNED: AtomicBool = AtomicBool::new(false);
 
-/// `mahbot browser` CLI entry — returns the process exit code.
+/// `mahbot chrome` CLI entry — returns the process exit code.
 pub async fn run_cli(args: &[String]) -> i32 {
     // Re-enterable pub API: clear the previous call's spawn bookkeeping.
     CHROME_USE_SPAWNED.store(false, Ordering::Relaxed);
@@ -298,8 +298,8 @@ pub async fn run_cli(args: &[String]) -> i32 {
         Ok(inv) => inv,
         Err(msg) => {
             let action = recognized_action(args);
-            eprintln!("mahbot browser: {msg}");
-            eprintln!("run 'mahbot browser --help' for usage.");
+            eprintln!("mahbot chrome: {msg}");
+            eprintln!("run 'mahbot chrome --help' for usage.");
             out_env(&action, false, OutKind::Usage, json!({ "error": msg })).emit();
             return 3;
         }
@@ -826,8 +826,8 @@ fn parse_limit_flag(flags: &Flags) -> Result<Option<usize>, String> {
 // ── Session resolution ───────────────────────────────────────────
 
 /// Resolve the session name and whether it is ephemeral: a named `--session`
-/// becomes `mahbot-browser-<name>` (idempotent for an already-prefixed name);
-/// no flag yields an ephemeral `mahbot-browser-ephemeral-<suffix>` session.
+/// becomes `mahbot-chrome-<name>` (idempotent for an already-prefixed name);
+/// no flag yields an ephemeral `mahbot-chrome-ephemeral-<suffix>` session.
 fn resolve_session(flag: Option<&str>) -> (String, bool) {
     match flag {
         Some(name) => {
@@ -865,7 +865,7 @@ fn resolve_stop_target(name: &str, force: bool) -> Result<String, String> {
             return Ok(name.to_string());
         }
         return Err(format!(
-            "{name} is not a mahbot-browser session; pass --force to stop it anyway"
+            "{name} is not a mahbot-chrome session; pass --force to stop it anyway"
         ));
     }
     Ok(format!("{CLI_SESSION_PREFIX}{name}"))
@@ -972,7 +972,7 @@ fn classify_step_output(
     let failed = |kind: OutKind, message: String| Err(StepFailure { kind, message });
     // Fallback message for a non-success exit / unparseable stdout.
     let fallback = || fallback_step_message(exit_code, stderr);
-    let classified = |resp: BrowserResponse| {
+    let classified = |resp: ChromeResponse| {
         let code = resp.code.clone();
         let msg = resp
             .error
@@ -980,9 +980,9 @@ fn classify_step_output(
             .unwrap_or_else(fallback);
         failed(classify_call_failure(code.as_deref(), &msg), msg)
     };
-    let parsed: Option<BrowserResponse> = serde_json::from_slice(stdout).ok();
+    let parsed: Option<ChromeResponse> = serde_json::from_slice(stdout).ok();
     if !status_success {
-        if expect_style && parsed.as_ref().is_some_and(BrowserResponse::is_success) {
+        if expect_style && parsed.as_ref().is_some_and(ChromeResponse::is_success) {
             return Ok(parsed.expect("success checked"));
         }
         return match parsed {
@@ -1114,7 +1114,7 @@ async fn status() -> OutEnvelope {
         return out_env("status", true, OutKind::Ok, Value::Object(payload));
     }
     let error = failures.join("; ");
-    eprintln!("mahbot browser: {error}");
+    eprintln!("mahbot chrome: {error}");
     payload.insert("error".into(), json!(error));
     out_env(
         "status",
@@ -1491,7 +1491,7 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
     let target = match resolve_stop_target(name, force) {
         Ok(t) => t,
         Err(error) => {
-            eprintln!("mahbot browser: {error}");
+            eprintln!("mahbot chrome: {error}");
             return out_env(
                 "session",
                 false,
@@ -1526,7 +1526,7 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
 async fn close_ephemeral(name: &str) {
     let Some(path) = cli_path() else {
         eprintln!(
-            "mahbot browser: could not close ephemeral session '{name}' (chrome-use CLI not found)"
+            "mahbot chrome: could not close ephemeral session '{name}' (chrome-use CLI not found)"
         );
         return;
     };
@@ -1543,15 +1543,15 @@ async fn close_ephemeral(name: &str) {
     {
         CliRun::Output(out) if out.status.success() => {}
         CliRun::Output(_) => {
-            eprintln!("mahbot browser: failed to close ephemeral session '{name}'");
+            eprintln!("mahbot chrome: failed to close ephemeral session '{name}'");
         }
         CliRun::SpawnFailure => {
             eprintln!(
-                "mahbot browser: could not spawn chrome-use to close ephemeral session '{name}'"
+                "mahbot chrome: could not spawn chrome-use to close ephemeral session '{name}'"
             );
         }
         CliRun::TimedOut => {
-            eprintln!("mahbot browser: timed out closing ephemeral session '{name}'");
+            eprintln!("mahbot chrome: timed out closing ephemeral session '{name}'");
         }
     }
 }
@@ -1564,7 +1564,7 @@ mod tests {
 
     #[test]
     fn eval_count_unwraps_chrome_use_result_envelope() {
-        let resp = |data: Value| BrowserResponse {
+        let resp = |data: Value| ChromeResponse {
             success: Some(true),
             ok: None,
             data: Some(data),
@@ -1604,11 +1604,11 @@ mod tests {
     #[test]
     fn resolve_session_named_prefixing_is_idempotent() {
         let (name, ephemeral) = resolve_session(Some("foo"));
-        assert_eq!(name, "mahbot-browser-foo");
+        assert_eq!(name, "mahbot-chrome-foo");
         assert!(!ephemeral);
 
-        let (name, ephemeral) = resolve_session(Some("mahbot-browser-foo"));
-        assert_eq!(name, "mahbot-browser-foo");
+        let (name, ephemeral) = resolve_session(Some("mahbot-chrome-foo"));
+        assert_eq!(name, "mahbot-chrome-foo");
         assert!(!ephemeral);
     }
 
@@ -1623,12 +1623,12 @@ mod tests {
     fn session_stop_gating_resolves_and_protects() {
         // CLI-namespace names pass through; bare names are prefixed.
         assert_eq!(
-            resolve_stop_target("mahbot-browser-foo", false).unwrap(),
-            "mahbot-browser-foo"
+            resolve_stop_target("mahbot-chrome-foo", false).unwrap(),
+            "mahbot-chrome-foo"
         );
         assert_eq!(
             resolve_stop_target("foo", false).unwrap(),
-            "mahbot-browser-foo"
+            "mahbot-chrome-foo"
         );
         // Protected namespaces are refused without --force, stopped as-is with it.
         assert!(resolve_stop_target("agent-tab-1", false).is_err());

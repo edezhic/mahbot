@@ -25,7 +25,7 @@
 //! videos — every role), while image compression is role-dependent.
 
 use crate::ChannelMessage;
-use crate::tools::browser::BrowserTool;
+use crate::tools::chrome::ChromeTool;
 use crate::util::media_target::{self, MediaTarget};
 use crate::util::{MEDIA_MARKER_RE, file_name_or_path, is_http_url, parse_media_marker};
 use regex::Regex;
@@ -43,7 +43,7 @@ static URL_RE: LazyLock<Regex> =
 /// Process-global sequence for link-enricher session names. The
 /// `link-enricher-` prefix is load-bearing: `is_mahbot_session_name` sweeps
 /// only sessions starting with it. Unique suffixes keep concurrent
-/// `enrich_links` runs from sharing a browser session.
+/// `enrich_links` runs from sharing a chrome session.
 static LINK_ENRICHER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The audio-transcription icon combo (sound written into text). Used both as
@@ -598,7 +598,7 @@ fn extract_urls(text: &str) -> Vec<String> {
 /// Enrich a message by prepending link summaries for any URLs found in the text.
 ///
 /// If no URLs are found, the original message is returned unchanged.
-/// Links are fetched concurrently using the shared `BrowserTool` — each URL
+/// Links are fetched concurrently using the shared `ChromeTool` — each URL
 /// gets its own isolated session tab that is closed after text extraction.
 pub async fn enrich_links(content: &str) -> Cow<'_, str> {
     // Truncate very long snippets to keep messages manageable.
@@ -613,10 +613,10 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
     // daemon is confirmed down. A stale/unknown state passes optimistically
     // and the concurrent fetch tasks re-discover liveness (bounded by the
     // probe timeout) without failing the message.
-    if !(crate::tools::browser_daemon::is_advertised()
+    if !(crate::tools::chrome_daemon::is_advertised()
         && matches!(
-            crate::tools::browser_daemon::cli_probe().await,
-            crate::tools::browser_daemon::CliStatus::Available
+            crate::tools::chrome_daemon::cli_probe().await,
+            crate::tools::chrome_daemon::CliStatus::Available
         ))
     {
         tracing::debug!("chrome-use not available, skipping link enrichment");
@@ -624,7 +624,7 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
     }
 
     // Fetch all URLs concurrently.
-    let browser = std::sync::Arc::new(BrowserTool::default());
+    let chrome = std::sync::Arc::new(ChromeTool::default());
     let mut tasks = Vec::with_capacity(urls.len());
     for url in &urls {
         let url = url.clone();
@@ -632,11 +632,11 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
             "link-enricher-{}",
             LINK_ENRICHER_SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        let browser = std::sync::Arc::clone(&browser);
+        let chrome = std::sync::Arc::clone(&chrome);
         tasks.push(tokio::spawn(async move {
-            let result = browser.fetch_page_text(&url, &tab).await;
+            let result = chrome.fetch_page_text(&url, &tab).await;
             // Close the tab (best-effort) regardless of fetch outcome.
-            browser.close_session(&tab).await;
+            chrome.close_session(&tab).await;
             (url, result)
         }));
     }

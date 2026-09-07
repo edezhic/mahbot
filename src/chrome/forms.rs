@@ -1,10 +1,10 @@
-//! Safe chrome-use argv forms shared by the interactive `browser` tool and
-//! the `mahbot browser` CLI. The unsafe shapes are kept out at this shared
+//! Safe chrome-use argv forms shared by the interactive `chrome` tool and
+//! the `mahbot chrome` CLI. The unsafe shapes are kept out at this shared
 //! layer: the numeric `wait <ms>` sleep form has no [`WaitTarget`] variant and
 //! [`wait_target`] rejects a numeric selector, and expect conditions are a
 //! validated allowlist ([`ExpectCond`] → [`expect_args`]).
 
-use crate::browser::escape_js_single_quoted;
+use crate::chrome::escape_js_single_quoted;
 
 /// What a `wait` waits for. The numeric sleep form (`wait 5000`) has no
 /// variant — [`wait_target`] rejects it before one can be built.

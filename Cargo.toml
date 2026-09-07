@@ -112,7 +112,7 @@ semver = "1"
 tempfile = "3"
 unicode-normalization = "0.1"
 
-# URL parsing + IP netmask matching for browser URL validation (SSRF guard)
+# URL parsing + IP netmask matching for chrome URL validation (SSRF guard)
 url = "2"
 ipnet = "2"
 

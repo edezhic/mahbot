@@ -1,12 +1,12 @@
-//! Single shared source of browser action descriptions: one table rendered
-//! into BOTH the interactive `browser` tool's LLM-facing parameter schema and
-//! the `mahbot browser` CLI help, so the two consumers cannot drift.
+//! Single shared source of chrome action descriptions: one table rendered
+//! into BOTH the interactive `chrome` tool's LLM-facing parameter schema and
+//! the `mahbot chrome` CLI help, so the two consumers cannot drift.
 
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};
 
-use crate::browser::contract::OutKind;
+use crate::chrome::contract::OutKind;
 
 /// Tool-schema parameter block for one action.
 pub(crate) struct ToolParams {
@@ -57,7 +57,7 @@ fn build_actions() -> Vec<ActionDesc> {
                 session: false,
                 kinds: &[OutKind::Ok, OutKind::Environment, OutKind::Usage],
                 details: "Pure preflight — probes chrome-use, the extension relay, a running Chrome, and a usable display. Never launches Chrome and never mutates the environment. Rejects --session.",
-                examples: &["mahbot browser status"],
+                examples: &["mahbot chrome status"],
             }),
         },
         ActionDesc {
@@ -95,8 +95,8 @@ fn build_actions() -> Vec<ActionDesc> {
                 ],
                 details: "The URL must be http(s). Reports the committed final URL. An uncommitted navigation (tab still on about:blank) or a Chrome error page is kind network. An invalid URL is kind usage (rc 3). `--expect` is a wait-for-selector convenience after navigation, not a general assertion — use the expect action for condition checks.",
                 examples: &[
-                    "mahbot browser open https://example.com",
-                    "mahbot browser open https://example.com --expect \"#main\" --structural --timeout 15",
+                    "mahbot chrome open https://example.com",
+                    "mahbot chrome open https://example.com --expect \"#main\" --structural --timeout 15",
                 ],
             }),
         },
@@ -120,8 +120,8 @@ fn build_actions() -> Vec<ActionDesc> {
                 ],
                 details: "A count of 0 reports kind empty (rc 0) — a legitimately empty region, not a failure.",
                 examples: &[
-                    "mahbot browser count \".card\"",
-                    "mahbot browser count \"a[href]\" --session docs",
+                    "mahbot chrome count \".card\"",
+                    "mahbot chrome count \"a[href]\" --session docs",
                 ],
             }),
         },
@@ -167,8 +167,8 @@ fn build_actions() -> Vec<ActionDesc> {
                 ],
                 details: "Exactly one target: a selector positional, --url, or --text. A numeric first token (chrome-use's silent-sleep form) is rejected as usage. --timeout IS forwarded to chrome-use (its wait forms honor it) and the spawn is additionally bounded mahbot-side. --fn/--load are not exposed.",
                 examples: &[
-                    "mahbot browser wait \"#results\" --timeout 15",
-                    "mahbot browser wait --text \"Loaded\" --timeout 10",
+                    "mahbot chrome wait \"#results\" --timeout 15",
+                    "mahbot chrome wait --text \"Loaded\" --timeout 10",
                 ],
             }),
         },
@@ -226,9 +226,9 @@ fn build_actions() -> Vec<ActionDesc> {
                 ],
                 details: "rc 0 when the condition holds. rc 1 when it does not: kind timeout when the condition never held within the deadline (chrome-use reports every failed expect as a deadline expiration), kind error for other step failures. The allowlist is the safe subset of chrome-use's grammar — gone/request/no-errors and the --not/--regex/--no-wait flags are not exposed.",
                 examples: &[
-                    "mahbot browser expect \"#main\" visible",
-                    "mahbot browser expect count \".card\" \"==\" 0",
-                    "mahbot browser expect url contains \"dashboard\"",
+                    "mahbot chrome expect \"#main\" visible",
+                    "mahbot chrome expect count \".card\" \"==\" 0",
+                    "mahbot chrome expect url contains \"dashboard\"",
                 ],
             }),
         },
@@ -258,7 +258,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Usage,
                 ],
                 details: "The result is emitted as a JSON value under the result key.",
-                examples: &["mahbot browser eval 'document.title'"],
+                examples: &["mahbot chrome eval 'document.title'"],
             }),
         },
         ActionDesc {
@@ -302,7 +302,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Usage,
                 ],
                 details: "The schema follows chrome-use's grammar: an optional \"rows\" selector plus a required \"fields\" object (field name → CSS selector or {sel, get, all}). When the schema's rows selector matches 0 elements, the empty region is reported honestly (kind empty, rc 0) without invoking chrome-use's phantom-row extract. An unreadable or invalid schema file is kind usage (rc 3). If the count eval fails (e.g. an invalid CSS rows selector), the action errors explicitly — chrome-use's dominant-container auto-detect fallback is deliberately NOT used, because the gate exists to avoid phantom rows.",
-                examples: &["mahbot browser extract --schema-file products.json --limit 20"],
+                examples: &["mahbot chrome extract --schema-file products.json --limit 20"],
             }),
         },
         ActionDesc {
@@ -338,8 +338,8 @@ fn build_actions() -> Vec<ActionDesc> {
                 ],
                 details: "The CLI has no snapshot refs — the selector is always CSS.",
                 examples: &[
-                    "mahbot browser click \"#submit\"",
-                    "mahbot browser click \".next\" --if-present",
+                    "mahbot chrome click \"#submit\"",
+                    "mahbot chrome click \".next\" --if-present",
                 ],
             }),
         },
@@ -363,8 +363,8 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "Refuses to stop protected sessions (the interactive tool's agent-tab-* and the link enricher's link-enricher-*) unless --force is passed. Session names are prefixed with mahbot-browser- unless already prefixed.",
-                examples: &["mahbot browser session stop docs"],
+                details: "Refuses to stop protected sessions (the interactive tool's agent-tab-* and the link enricher's link-enricher-*) unless --force is passed. Session names are prefixed with mahbot-chrome- unless already prefixed.",
+                examples: &["mahbot chrome session stop docs"],
             }),
         },
         ActionDesc {

@@ -139,7 +139,7 @@ fn corrective_action_error(received: &Value) -> String {
     )
 }
 
-/// Tolerant action normalization, mirroring the browser tool: a canonical tagged
+/// Tolerant action normalization, mirroring the chrome tool: a canonical tagged
 /// object `{"click":{...}}`, a plain action name with flattened sibling fields
 /// `{"action":"click","x":0,"y":0}`, or a stringified JSON object.
 fn normalize_action(action: Value, args: &Value) -> Result<(Value, Option<String>), String> {

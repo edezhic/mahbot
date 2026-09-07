@@ -1,5 +1,5 @@
 //! Generic managed-binary release mechanics shared by the rust-installed tool
-//! managers (chrome-use via `browser_daemon`, the managed bun runtime).
+//! managers (chrome-use via `chrome_daemon`, the managed bun runtime).
 //!
 //! These binaries are all installed into a location mahbot manages — the
 //! tool-standard user dir where one applies (bun: `~/.bun/bin`), never
@@ -303,7 +303,7 @@ pub(crate) fn bun_bin_dir() -> Option<PathBuf> {
 /// OS — on Windows it is the only probe that reliably finds mahbot's own
 /// install — so the first-install location and the auto-update swap location
 /// are always the same path. Falls back to the HOME-derived default storage
-/// root when config is not initialized (e.g. the `mahbot browser` CLI, which
+/// root when config is not initialized (e.g. the `mahbot chrome` CLI, which
 /// dispatches before config init) so a standard managed install is still found.
 #[must_use]
 pub(crate) fn storage_bin_dir() -> Option<PathBuf> {

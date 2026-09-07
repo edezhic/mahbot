@@ -1,14 +1,14 @@
-//! Browser automation tool.
+//! Chrome automation tool.
 
-use crate::browser::contract::{
-    BrowserResponse, eval_count, expect_outcome, extract_output, extract_snapshot_text,
+use crate::chrome::contract::{
+    ChromeResponse, eval_count, expect_outcome, extract_output, extract_snapshot_text,
 };
-use crate::browser::escape_js_single_quoted;
-use crate::browser::forms::{
+use crate::chrome::escape_js_single_quoted;
+use crate::chrome::forms::{
     ExpectCond, ExtractGate, count_eval_js, expect_args, extract_gate, parse_count_op,
     parse_predicate, parse_state, wait_args, wait_target,
 };
-use crate::browser::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
+use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
 use crate::util::{UnwrapPoison, is_http_url};
 use crate::{Tool, Workspace};
 use anyhow::Context;
@@ -26,7 +26,7 @@ use tracing::debug;
 /// Actions for navigating and extracting content from web pages.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum BrowserAction {
+enum ChromeAction {
     /// Navigate to a URL (returns page content automatically).
     Open { url: String },
     /// Get accessibility snapshot with element refs (`@e1`, `@e2`, …).
@@ -145,15 +145,15 @@ const fn true_val() -> bool {
     true
 }
 
-/// Browser sessions one agent run's browser tooling opened. chrome-use
+/// Chrome sessions one agent run's chrome tooling opened. chrome-use
 /// ≥1.5.101 no longer closes external Chrome tabs when the daemon idles out,
 /// so every session name the run used is recorded here and closed at run end —
 /// the created-only close path, never an enumeration sweep (a sweep could
 /// close the user's own tabs).
 #[derive(Default)]
-pub(crate) struct BrowserRunSessions(std::sync::Mutex<BTreeSet<String>>);
+pub(crate) struct ChromeRunSessions(std::sync::Mutex<BTreeSet<String>>);
 
-impl BrowserRunSessions {
+impl ChromeRunSessions {
     fn track(&self, name: &str) {
         self.0.lock().unwrap_poison().insert(name.to_string());
     }
@@ -162,15 +162,15 @@ impl BrowserRunSessions {
     }
 }
 
-/// Browser tool for fetching content from web pages.
+/// Chrome tool for fetching content from web pages.
 ///
-/// Each operation requires a `tab` name — separate browser sessions
+/// Each operation requires a `tab` name — separate chrome sessions
 /// (isolated via `--session`). The default session is unique per tool
 /// instance (one agent run), not the shared `"default"` — concurrent runs
 /// never collide on a shared session. Every session used is closed at run end.
 /// Operations on the same tab are serialized via a per-tab lock.
 #[derive(Default)]
-pub struct BrowserTool {
+pub struct ChromeTool {
     /// Per-tab locks — only serializes operations on the same tab.
     /// Different tabs can run concurrently without blocking each other.
     tab_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -183,16 +183,16 @@ pub struct BrowserTool {
     /// instance (one agent run) so concurrent runs never collide on a shared
     /// session, and closing it at run end can't clobber another run's tabs.
     default_session: std::sync::OnceLock<String>,
-    /// Browser sessions this run's browser tooling used — closed at run end.
-    browser_sessions: std::sync::Arc<BrowserRunSessions>,
+    /// Chrome sessions this run's chrome tooling used — closed at run end.
+    chrome_sessions: std::sync::Arc<ChromeRunSessions>,
 }
 
-impl BrowserTool {
-    /// Construct a browser tool for one agent run, sharing the run's session
+impl ChromeTool {
+    /// Construct a chrome tool for one agent run, sharing the run's session
     /// tracker so every session the run opens is closed at run end.
-    pub(crate) fn new(browser_sessions: std::sync::Arc<BrowserRunSessions>) -> Self {
+    pub(crate) fn new(chrome_sessions: std::sync::Arc<ChromeRunSessions>) -> Self {
         Self {
-            browser_sessions,
+            chrome_sessions,
             ..Default::default()
         }
     }
@@ -212,7 +212,7 @@ impl BrowserTool {
 
     /// Open a URL, wait for network idle, and extract clean visible text via
     /// `document.body.innerText` (JavaScript eval). Unlike the accessibility
-    /// tree returned by the `Open` browser action (which contains element refs,
+    /// tree returned by the `Open` chrome action (which contains element refs,
     /// ARIA roles, and indentation), this returns plain rendered text — no
     /// markup, no hidden content, no `<script>`/`<style>` noise.
     ///
@@ -223,7 +223,7 @@ impl BrowserTool {
     /// extract) so concurrent callers targeting the same tab are serialized
     /// consistently.
     pub async fn fetch_page_text(&self, url: &str, tab: &str) -> anyhow::Result<String> {
-        crate::browser::validate_url(url)?;
+        crate::chrome::validate_url(url)?;
 
         Self::ensure_available().await?;
 
@@ -249,7 +249,7 @@ impl BrowserTool {
         Ok(text)
     }
 
-    /// Close a browser session tab by name — verified: the session's tab group
+    /// Close a chrome session tab by name — verified: the session's tab group
     /// is swept (enumerate → close → re-enumerate convergence) so a leftover
     /// cannot be orphaned silently by a kill-based close. Only the target
     /// session's own tabs are touched. Non-mahbot session names (e.g. the
@@ -257,7 +257,7 @@ impl BrowserTool {
     /// strict-scope rule — agent-facing sessions are instead closed at run end
     /// (chrome-use ≥1.5.101 idle no longer closes them).
     pub async fn close_session(&self, tab: &str) {
-        super::browser_daemon::sweep_session(tab).await;
+        super::chrome_daemon::sweep_session(tab).await;
     }
 
     /// If the response shows a failed navigation — the tab never left the
@@ -272,7 +272,7 @@ impl BrowserTool {
         &self,
         tab: &str,
         url: &str,
-        response: &BrowserResponse,
+        response: &ChromeResponse,
     ) -> anyhow::Result<()> {
         let Some(committed_url) = response
             .data
@@ -282,14 +282,14 @@ impl BrowserTool {
         else {
             return Ok(());
         };
-        if crate::browser::is_chrome_error_page(committed_url) {
+        if crate::chrome::is_chrome_error_page(committed_url) {
             anyhow::bail!(
                 "Navigation to {url} failed — Chrome landed on its error page \
                  (chrome-error://chromewebdata/), meaning the site is unreachable (DNS failure, \
                  refused connection, or a blocked/unsafe port). Verify the URL and network."
             );
         }
-        if crate::browser::is_blank_page_url(committed_url) {
+        if crate::chrome::is_blank_page_url(committed_url) {
             self.close_session(tab).await;
             anyhow::bail!(
                 "Navigation failed: the tab is still on a blank page after opening {url} — the \
@@ -305,27 +305,27 @@ impl BrowserTool {
     /// transient probe failure (spawn EAGAIN/EMFILE, timeout) as "not
     /// installed". One CLI probe; the daemon-health evaluation is cached.
     async fn ensure_available() -> anyhow::Result<()> {
-        match super::browser_daemon::cli_probe().await {
-            super::browser_daemon::CliStatus::Available => {}
-            super::browser_daemon::CliStatus::Missing => {
+        match super::chrome_daemon::cli_probe().await {
+            super::chrome_daemon::CliStatus::Available => {}
+            super::chrome_daemon::CliStatus::Missing => {
                 anyhow::bail!(
                     "chrome-use CLI is not available. {}",
-                    super::browser_daemon::CHROME_USE_INSTALL_HINT
+                    super::chrome_daemon::CHROME_USE_INSTALL_HINT
                 );
             }
-            super::browser_daemon::CliStatus::Transient(failure) => {
+            super::chrome_daemon::CliStatus::Transient(failure) => {
                 let msg = match failure {
-                    super::browser_daemon::CliProbeFailure::Spawn(reason) => format!(
+                    super::chrome_daemon::CliProbeFailure::Spawn(reason) => format!(
                         "chrome-use CLI check could not spawn the binary ({reason}) — a \
                          temporary failure (e.g. system resource exhaustion), not a missing \
                          install. Retry shortly."
                     ),
-                    super::browser_daemon::CliProbeFailure::BadVersion(status) => format!(
+                    super::chrome_daemon::CliProbeFailure::BadVersion(status) => format!(
                         "chrome-use CLI is installed but its `--version` check failed \
                          ({status}) — the install looks broken. Reinstall it by having the \
                          Support agent re-run the user-consented `install_chrome_use` tool."
                     ),
-                    super::browser_daemon::CliProbeFailure::Timeout => {
+                    super::chrome_daemon::CliProbeFailure::Timeout => {
                         "chrome-use CLI probe timed out — the binary is present but \
                          unresponsive. Retry shortly; if this persists the CLI may be wedged."
                             .to_string()
@@ -334,8 +334,8 @@ impl BrowserTool {
                 anyhow::bail!(msg);
             }
         }
-        if !super::browser_daemon::is_available().await {
-            anyhow::bail!("{}", super::browser_daemon::daemon_down_message());
+        if !super::chrome_daemon::is_available().await {
+            anyhow::bail!("{}", super::chrome_daemon::daemon_down_message());
         }
         Ok(())
     }
@@ -363,17 +363,17 @@ impl BrowserTool {
     }
 
     /// Run an chrome-use command and parse the JSON response.
-    async fn run_command(&self, args: &[&str], tab: &str) -> anyhow::Result<BrowserResponse> {
-        let cli = super::browser_daemon::cli_path().with_context(|| {
+    async fn run_command(&self, args: &[&str], tab: &str) -> anyhow::Result<ChromeResponse> {
+        let cli = super::chrome_daemon::cli_path().with_context(|| {
             format!(
                 "chrome-use CLI is not available. {}",
-                super::browser_daemon::CHROME_USE_INSTALL_HINT
+                super::chrome_daemon::CHROME_USE_INSTALL_HINT
             )
         })?;
         // Record the session name after the CLI path resolved, so a missing
         // CLI never registers a pointless close — the run-end close only needs
         // sessions that were actually dispatched.
-        self.browser_sessions.track(tab);
+        self.chrome_sessions.track(tab);
 
         let mut logged_args: Vec<&str> = args.to_vec();
         logged_args.extend(["--json", "--session", tab]);
@@ -400,7 +400,7 @@ impl BrowserTool {
                 // call was just slow". The probe covers the wedge case a
                 // status check cannot see — see health_after_call_timeout.
                 if let Some(down_message) =
-                    super::browser_daemon::health_after_call_timeout(tab).await
+                    super::chrome_daemon::health_after_call_timeout(tab).await
                 {
                     anyhow::bail!("{down_message}");
                 }
@@ -434,7 +434,7 @@ impl BrowserTool {
                 let error_msg = if error.is_empty() {
                     format!("chrome-use exited with code {}", output.status)
                 } else {
-                    enhance_browser_error(error)
+                    enhance_chrome_error(error)
                 };
                 Self::fail_fast_if_daemon_down(&error_msg, code.as_deref())?;
                 anyhow::bail!(
@@ -454,14 +454,14 @@ impl BrowserTool {
     /// and leave health untouched (recovery cannot fix a Chrome-side orphan,
     /// and hiding the daemon would block other sessions for UNHEALTHY_TTL).
     fn fail_fast_if_daemon_down(error: &str, code: Option<&str>) -> anyhow::Result<()> {
-        if super::browser_daemon::is_unreachable_tab_error(error) {
-            anyhow::bail!("{}", super::browser_daemon::unreachable_tab_message(error));
+        if super::chrome_daemon::is_unreachable_tab_error(error) {
+            anyhow::bail!("{}", super::chrome_daemon::unreachable_tab_message(error));
         }
-        if super::browser_daemon::is_daemon_unavailable_error(error)
-            || super::browser_daemon::is_daemon_unavailable_code(code)
+        if super::chrome_daemon::is_daemon_unavailable_error(error)
+            || super::chrome_daemon::is_daemon_unavailable_code(code)
         {
-            super::browser_daemon::note_unhealthy(error);
-            anyhow::bail!("{}", super::browser_daemon::daemon_down_message());
+            super::chrome_daemon::note_unhealthy(error);
+            anyhow::bail!("{}", super::chrome_daemon::daemon_down_message());
         }
         Ok(())
     }
@@ -497,13 +497,13 @@ impl BrowserTool {
     /// The chrome-use CLI takes a different argument shape per action — this
     /// builds the correct argument list for each action.
     #[expect(clippy::too_many_lines, clippy::unchecked_time_subtraction)] // the per-action argv shapes are one cohesive dispatch; WAIT/EXPECT_BOUND exceed the slack by construction
-    fn build_args(action: &BrowserAction) -> anyhow::Result<Vec<String>> {
+    fn build_args(action: &ChromeAction) -> anyhow::Result<Vec<String>> {
         match action {
-            BrowserAction::Open { url } => {
-                crate::browser::validate_url(url)?;
+            ChromeAction::Open { url } => {
+                crate::chrome::validate_url(url)?;
                 Ok(vec!["open".into(), url.clone()])
             }
-            BrowserAction::Snapshot {
+            ChromeAction::Snapshot {
                 interactive_only,
                 compact,
                 depth,
@@ -521,17 +521,17 @@ impl BrowserTool {
                 }
                 Ok(args)
             }
-            BrowserAction::Click { selector } => Ok(vec!["click".into(), selector.clone()]),
-            BrowserAction::GetText { selector } => {
+            ChromeAction::Click { selector } => Ok(vec!["click".into(), selector.clone()]),
+            ChromeAction::GetText { selector } => {
                 Ok(vec!["get".into(), "text".into(), selector.clone()])
             }
-            BrowserAction::GetInnerText { .. } => {
+            ChromeAction::GetInnerText { .. } => {
                 anyhow::bail!("GetInnerText is handled in execute(), not build_args")
             }
-            BrowserAction::GetUrl { .. } => Ok(vec!["get".into(), "url".into()]),
-            BrowserAction::Press { key } => Ok(vec!["press".into(), key.clone()]),
-            BrowserAction::Eval { js } => Ok(vec!["eval".into(), js.clone()]),
-            BrowserAction::Find {
+            ChromeAction::GetUrl { .. } => Ok(vec!["get".into(), "url".into()]),
+            ChromeAction::Press { key } => Ok(vec!["press".into(), key.clone()]),
+            ChromeAction::Eval { js } => Ok(vec!["eval".into(), js.clone()]),
+            ChromeAction::Find {
                 by,
                 value,
                 action,
@@ -559,10 +559,10 @@ impl BrowserTool {
                 }
                 Ok(args)
             }
-            BrowserAction::Screenshot { .. } => {
+            ChromeAction::Screenshot { .. } => {
                 anyhow::bail!("Screenshot is handled in execute(), not build_args")
             }
-            BrowserAction::Wait {
+            ChromeAction::Wait {
                 selector,
                 url,
                 text,
@@ -574,7 +574,7 @@ impl BrowserTool {
                     (Self::WAIT_BOUND - Self::CHROME_DEADLINE_SLACK).as_millis(),
                 ))
             }
-            BrowserAction::Expect {
+            ChromeAction::Expect {
                 condition,
                 selector,
                 op,
@@ -597,7 +597,7 @@ impl BrowserTool {
                     (Self::EXPECT_BOUND - Self::CHROME_DEADLINE_SLACK).as_millis(),
                 ))
             }
-            BrowserAction::Extract { .. } => {
+            ChromeAction::Extract { .. } => {
                 anyhow::bail!("Extract is handled in execute(), not build_args")
             }
         }
@@ -698,12 +698,12 @@ impl BrowserTool {
     }
 }
 
-/// Close all running browser sessions at shutdown. The chrome-use
+/// Close all running chrome sessions at shutdown. The chrome-use
 /// child process does not always get reaped on process exit — its
 /// sessions hold open ports and lingering instances that can
 /// interfere with the next daemon startup.
-pub async fn close_all_browser_sessions() {
-    if tokio::time::timeout(SHUTDOWN_CLEANUP_TIMEOUT, close_all_browser_sessions_inner())
+pub async fn close_all_chrome_sessions() {
+    if tokio::time::timeout(SHUTDOWN_CLEANUP_TIMEOUT, close_all_chrome_sessions_inner())
         .await
         .is_err()
     {
@@ -721,7 +721,7 @@ const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// chrome-use envelopes: latest returns `{"ok":true,"sessions":[{"name":..}]}`;
 /// older builds return `{"success":true,"data":{"sessions":["name",..]}}`.
 /// Entries may be objects (keyed by `name`) or plain strings. Callers gate on
-/// `BrowserResponse::verdict` first — this only extracts the names and returns
+/// `ChromeResponse::verdict` first — this only extracts the names and returns
 /// an empty list when no session array is present.
 fn parse_session_list(v: &Value) -> Vec<String> {
     let array = v
@@ -743,9 +743,9 @@ fn parse_session_list(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-async fn close_all_browser_sessions_inner() {
-    let Some(cmd) = super::browser_daemon::cli_path() else {
-        tracing::debug!("chrome-use not available, skipping browser cleanup");
+async fn close_all_chrome_sessions_inner() {
+    let Some(cmd) = super::chrome_daemon::cli_path() else {
+        tracing::debug!("chrome-use not available, skipping chrome cleanup");
         return;
     };
 
@@ -763,11 +763,11 @@ async fn close_all_browser_sessions_inner() {
     {
         CliRun::Output(o) => o,
         CliRun::SpawnFailure => {
-            tracing::debug!("chrome-use not available, skipping browser cleanup: spawn failed");
+            tracing::debug!("chrome-use not available, skipping chrome cleanup: spawn failed");
             return;
         }
         CliRun::TimedOut => {
-            tracing::debug!("chrome-use session list timed out, skipping browser cleanup");
+            tracing::debug!("chrome-use session list timed out, skipping chrome cleanup");
             return;
         }
     };
@@ -777,7 +777,7 @@ async fn close_all_browser_sessions_inner() {
             // Gate only on an explicit failure verdict; a payload with neither
             // verdict key proceeds (tolerance-first — unknown future envelopes
             // still get their sessions closed if they carry a sessions array).
-            if BrowserResponse::from_value(&v).verdict() == Some(false) {
+            if ChromeResponse::from_value(&v).verdict() == Some(false) {
                 tracing::warn!(
                     "chrome-use session list failed: {}",
                     v.get("error")
@@ -845,13 +845,13 @@ async fn close_all_browser_sessions_inner() {
 }
 
 #[async_trait]
-impl Tool for BrowserTool {
+impl Tool for ChromeTool {
     fn name(&self) -> &'static str {
-        "browser"
+        "chrome"
     }
 
     fn is_advertised(&self) -> bool {
-        super::browser_daemon::is_advertised()
+        super::chrome_daemon::is_advertised()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -859,7 +859,7 @@ impl Tool for BrowserTool {
         // the CLI help), so it may differ from the pre-registry hand-built
         // order; descriptions and structure are unchanged and the set is
         // pinned by `parameters_schema_has_all_actions`.
-        let entries: Vec<Value> = crate::browser::actions::ACTIONS
+        let entries: Vec<Value> = crate::chrome::actions::ACTIONS
             .iter()
             .filter_map(|a| {
                 a.tool.as_ref().map(|t| {
@@ -873,7 +873,7 @@ impl Tool for BrowserTool {
                 "action": { "oneOf": entries },
                 "tab": {
                     "type": "string",
-                    "description": "Logical name for this browser session. \
+                    "description": "Logical name for this chrome session. \
                      Missing or empty defaults to a unique per-run session \
                      (closed automatically when your run ends). Only use an \
                      explicit name (e.g. \"docs\", \"github\") if you need to \
@@ -888,7 +888,7 @@ impl Tool for BrowserTool {
     async fn execute(&self, _ws: &Workspace, args: Value) -> anyhow::Result<String> {
         let (tab, action, normalized_notes) = self.normalize_call(&args)?;
 
-        debug!(tab, action = ?action, "browser action");
+        debug!(tab, action = ?action, "chrome action");
 
         Self::ensure_available().await?;
 
@@ -898,7 +898,7 @@ impl Tool for BrowserTool {
         // same tab. Different tabs run fully concurrently.
         let _guard = self.acquire_tab_lock(&tab).await;
 
-        if let BrowserAction::GetInnerText { selector } = &action {
+        if let ChromeAction::GetInnerText { selector } = &action {
             let output = self.get_inner_text(selector, &tab).await?;
             let body = if output.is_empty() {
                 format!("[Tab: {tab}] (no output)")
@@ -908,12 +908,12 @@ impl Tool for BrowserTool {
             return Ok(super::with_normalization_notes(body, &normalized_notes));
         }
 
-        if let BrowserAction::Screenshot { .. } = &action {
+        if let ChromeAction::Screenshot { .. } = &action {
             let output = self.capture_screenshot(&tab).await?;
             return Ok(super::with_normalization_notes(output, &normalized_notes));
         }
 
-        if let BrowserAction::Extract { schema, limit } = &action {
+        if let ChromeAction::Extract { schema, limit } = &action {
             let (schema, schema_note) = Self::normalize_extract_schema(schema)?;
             let output = self.run_extract(&schema, *limit, &tab).await?;
             let mut notes = normalized_notes;
@@ -941,8 +941,8 @@ impl Tool for BrowserTool {
         // is never re-attached to a non-screenshot call.
         let action_value = args.get("action")?.clone();
         let (action_value, _) = normalize_action(action_value, args).ok()?;
-        let action: BrowserAction = serde_json::from_value(action_value).ok()?;
-        if !matches!(action, BrowserAction::Screenshot { .. }) {
+        let action: ChromeAction = serde_json::from_value(action_value).ok()?;
+        if !matches!(action, ChromeAction::Screenshot { .. }) {
             return None;
         }
         let path = self.last_screenshot.lock().unwrap_poison().clone()?;
@@ -961,15 +961,15 @@ impl Tool for BrowserTool {
             &p,
             meta,
             None,
-            crate::tools::ImagePayloadSource::Browser,
+            crate::tools::ImagePayloadSource::Chrome,
         ))
     }
 }
 
-impl BrowserTool {
+impl ChromeTool {
     /// Resolve the tab for a call. An explicit non-empty tab passes through
     /// unchanged; missing/empty falls back to the per-run default session — unique
-    /// per `BrowserTool` instance (one agent run) so concurrent runs never collide
+    /// per `ChromeTool` instance (one agent run) so concurrent runs never collide
     /// on a shared session, and closing it at run end can't clobber another run's
     /// tabs. Defaulting is echoed in tool output.
     fn normalize_tab(&self, args: &Value) -> (String, Option<String>) {
@@ -998,7 +998,7 @@ impl BrowserTool {
         // phantom image.
         if !path.is_file() {
             anyhow::bail!(
-                "Browser screenshot reported success but no PNG was written at {}",
+                "Chrome screenshot reported success but no PNG was written at {}",
                 path.display()
             );
         }
@@ -1007,7 +1007,7 @@ impl BrowserTool {
         let (width, height) = validate_png(&path)?;
         *self.last_screenshot.lock().unwrap_poison() = Some(path_str.clone());
         Ok(format!(
-            "[Tab: {tab}] Captured a browser screenshot: {path_str} ({width}x{height}). \
+            "[Tab: {tab}] Captured a chrome screenshot: {path_str} ({width}x{height}). \
              [IMAGE:{path_str}]"
         ))
     }
@@ -1017,10 +1017,10 @@ impl BrowserTool {
     /// a sanitized tab name plus a random nonce so a model-supplied `tab`
     /// (which is user-controlled) can never traverse out of the temp root.
     fn screenshot_output_path(tab: &str) -> anyhow::Result<PathBuf> {
-        let dir = std::env::temp_dir().join("browser-screenshots");
+        let dir = std::env::temp_dir().join("chrome-screenshots");
         std::fs::create_dir_all(&dir).with_context(|| {
             format!(
-                "Failed to create browser screenshot directory {}",
+                "Failed to create chrome screenshot directory {}",
                 dir.display()
             )
         })?;
@@ -1031,8 +1031,8 @@ impl BrowserTool {
 
     /// Normalize the raw tool arguments into the parsed action plus the tab
     /// and any normalization notes. LLM-facing corrective texts (action shape,
-    /// find-hint) live with the tool, not the shared browser core.
-    fn normalize_call(&self, args: &Value) -> anyhow::Result<(String, BrowserAction, Vec<String>)> {
+    /// find-hint) live with the tool, not the shared chrome core.
+    fn normalize_call(&self, args: &Value) -> anyhow::Result<(String, ChromeAction, Vec<String>)> {
         let mut normalized_notes: Vec<String> = Vec::new();
         let (tab, tab_note) = self.normalize_tab(args);
         if let Some(note) = tab_note {
@@ -1049,7 +1049,7 @@ impl BrowserTool {
             normalized_notes.push(format!("action normalized: {action_value} ({note})"));
         }
 
-        let action: BrowserAction = serde_json::from_value(action_value.clone()).map_err(|e| {
+        let action: ChromeAction = serde_json::from_value(action_value.clone()).map_err(|e| {
             // Give a more helpful message when the LLM uses wrong field names,
             // always including the exact expected shape so the model can
             // self-correct in one round-trip.
@@ -1060,7 +1060,7 @@ impl BrowserTool {
                 _ => String::new(),
             };
             anyhow::anyhow!(
-                "Invalid browser action arguments{hint}. Expected action to be {EXPECTED_ACTION_SHAPE}, \
+                "Invalid chrome action arguments{hint}. Expected action to be {EXPECTED_ACTION_SHAPE}, \
                  plus a \"tab\" string. Serde error: {e}"
             )
         })?;
@@ -1070,8 +1070,8 @@ impl BrowserTool {
 
     /// Validate a `Find` action's locator type/action payload early for better
     /// diagnostics — before any CLI dispatch.
-    fn validate_find(action: &BrowserAction) -> anyhow::Result<()> {
-        if let BrowserAction::Find {
+    fn validate_find(action: &ChromeAction) -> anyhow::Result<()> {
+        if let ChromeAction::Find {
             by,
             action: find_action,
             name,
@@ -1132,15 +1132,15 @@ impl BrowserTool {
         Ok(())
     }
 
-    /// Orchestrate a single browser action: build the args, dispatch, and (for
+    /// Orchestrate a single chrome action: build the args, dispatch, and (for
     /// `Open`) the blank-navigation guard, the best-effort network-idle wait,
     /// and the compact auto-snapshot. Returns the RAW response and the snapshot
     /// text — no LLM-facing framing (that lives in [`Self::format_action_output`]).
     async fn run_action(
         &self,
-        action: &BrowserAction,
+        action: &ChromeAction,
         tab: &str,
-    ) -> anyhow::Result<(BrowserResponse, String)> {
+    ) -> anyhow::Result<(ChromeResponse, String)> {
         let cli_args = Self::build_args(action)?;
         let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
         let response = self.run_command(&str_args, tab).await?;
@@ -1148,13 +1148,13 @@ impl BrowserTool {
         // A real navigation that ends on the scratch `about:blank` or Chrome's
         // error page never loaded — fail loudly (closing the blank-page tab
         // best-effort) instead of reporting success with no content.
-        if let BrowserAction::Open { url } = action {
+        if let ChromeAction::Open { url } = action {
             self.bail_on_failed_navigation(tab, url, &response).await?;
         }
 
         // After open, wait for network idle, then auto-snapshot
         // so the LLM sees page content immediately.
-        let snapshot = if matches!(action, BrowserAction::Open { .. }) {
+        let snapshot = if matches!(action, ChromeAction::Open { .. }) {
             let wait_args = ["wait", "--load", "networkidle"];
             let _ = self.run_command(&wait_args, tab).await;
 
@@ -1174,24 +1174,24 @@ impl BrowserTool {
         Ok((response, snapshot))
     }
 
-    /// Shape the raw [`BrowserResponse`] into the LLM-facing text: the
+    /// Shape the raw [`ChromeResponse`] into the LLM-facing text: the
     /// per-action data extraction, the `[Tab: {tab}]` framing, and the
     /// normalization notes.
     fn format_action_output(
-        action: &BrowserAction,
+        action: &ChromeAction,
         tab: &str,
-        response: BrowserResponse,
+        response: ChromeResponse,
         snapshot: &str,
         notes: &[String],
     ) -> String {
         let output = match response.data {
             Some(data) => match action {
-                BrowserAction::Snapshot { .. } | BrowserAction::GetText { .. } => {
+                ChromeAction::Snapshot { .. } | ChromeAction::GetText { .. } => {
                     extract_snapshot_text(&data)
                         .or_else(|| serde_json::to_string_pretty(&data).ok())
                         .unwrap_or_default()
                 }
-                BrowserAction::Open { .. } => {
+                ChromeAction::Open { .. } => {
                     let mut s = format!(
                         "Opened {}",
                         data.get("url").and_then(|v| v.as_str()).unwrap_or("?")
@@ -1202,17 +1202,17 @@ impl BrowserTool {
                     }
                     s
                 }
-                BrowserAction::GetUrl { .. } => data
+                ChromeAction::GetUrl { .. } => data
                     .get("url")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
-                BrowserAction::Eval { .. } => data.get("result").map_or_else(
+                ChromeAction::Eval { .. } => data.get("result").map_or_else(
                     || serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()),
                     |v| v.as_str().map_or_else(|| v.to_string(), str::to_string),
                 ),
-                BrowserAction::Wait { .. } => "wait complete".to_string(),
-                BrowserAction::Expect { .. } => match expect_outcome(&data) {
+                ChromeAction::Wait { .. } => "wait complete".to_string(),
+                ChromeAction::Expect { .. } => match expect_outcome(&data) {
                     Some(outcome) if outcome.pass => "expect: PASS (condition holds)".to_string(),
                     Some(outcome) => {
                         let actual = outcome.actual.map_or("n/a".to_string(), |v| v.to_string());
@@ -1390,7 +1390,7 @@ fn validate_png(path: &Path) -> anyhow::Result<(u32, u32)> {
 }
 
 /// Reduce a name to a single safe filename component (ASCII alphanumerics,
-/// `-`, `_`), so a model-supplied value (e.g. a browser `tab`) can never
+/// `-`, `_`), so a model-supplied value (e.g. a chrome `tab`) can never
 /// inject path separators or `..` traversal into a tool-chosen output path.
 fn sanitize_filename_component(name: &str) -> String {
     let mut out: String = name
@@ -1416,7 +1416,7 @@ fn sanitize_filename_component(name: &str) -> String {
 /// [`parse_run_output`]).
 #[derive(Debug)]
 enum ParsedRun {
-    Ok(BrowserResponse),
+    Ok(ChromeResponse),
     /// Failure envelope (or unparseable stdout on a non-zero exit): the raw
     /// error text (empty when the envelope carried none), envelope code, and
     /// retryable flag.
@@ -1440,7 +1440,7 @@ fn parse_run_output(
     stdout: &str,
     stderr: &str,
 ) -> ParsedRun {
-    let parsed: Option<BrowserResponse> = serde_json::from_str(stdout).ok();
+    let parsed: Option<ChromeResponse> = serde_json::from_str(stdout).ok();
     let Some(resp) = parsed else {
         return if status_success {
             ParsedRun::Unparseable
@@ -1466,7 +1466,7 @@ fn parse_run_output(
 
 /// Enhance chrome-use error messages with actionable hints for known
 /// failure patterns.
-fn enhance_browser_error(msg: String) -> String {
+fn enhance_chrome_error(msg: String) -> String {
     let lower = msg.to_ascii_lowercase();
     if lower.contains("unknown ref")
         || lower.contains("node with given id does not belong to the document")
@@ -1493,7 +1493,7 @@ fn with_retry_hint(error: String, retryable: Option<bool>) -> String {
 
 // ── Tolerant action normalization ─────────────────────────────────────────
 
-/// Known browser action variant names (must match `BrowserAction` serde names).
+/// Known chrome action variant names (must match `ChromeAction` serde names).
 const KNOWN_ACTIONS: &[&str] = &[
     "open",
     "snapshot",
@@ -1530,13 +1530,13 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"open\":{\"url\":\"https://...\"}
 /// expected form instead of raw serde text.
 fn corrective_action_error(received: &Value) -> String {
     format!(
-        "Invalid browser action arguments. Expected action to be {EXPECTED_ACTION_SHAPE}, \
+        "Invalid chrome action arguments. Expected action to be {EXPECTED_ACTION_SHAPE}, \
          plus a \"tab\" string. Received: {received}"
     )
 }
 
-/// Normalize a model-supplied browser `action` value into the canonical
-/// `{"variant": {...}}` tagged form that `BrowserAction` deserializes from.
+/// Normalize a model-supplied chrome `action` value into the canonical
+/// `{"variant": {...}}` tagged form that `ChromeAction` deserializes from.
 ///
 /// Recoverable shapes are mapped to their canonical equivalent and a note
 /// describing the correction is returned (so silent acceptance stays visible
@@ -1818,7 +1818,7 @@ fn inner_text_eval_js(selector: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::browser_daemon::browser_bin;
+    use crate::tools::chrome_daemon::chrome_bin;
 
     // ── build_args: simple actions ───────────────────────────────────────
 
@@ -1826,21 +1826,21 @@ mod tests {
     fn build_args_for_simple_actions() {
         struct Case {
             name: &'static str,
-            action: BrowserAction,
+            action: ChromeAction,
             expected: &'static [&'static str],
         }
 
         let cases = [
             Case {
                 name: "open",
-                action: BrowserAction::Open {
+                action: ChromeAction::Open {
                     url: "https://example.com".into(),
                 },
                 expected: &["open", "https://example.com"],
             },
             Case {
                 name: "snapshot",
-                action: BrowserAction::Snapshot {
+                action: ChromeAction::Snapshot {
                     interactive_only: true,
                     compact: true,
                     depth: Some(5),
@@ -1849,27 +1849,27 @@ mod tests {
             },
             Case {
                 name: "click",
-                action: BrowserAction::Click {
+                action: ChromeAction::Click {
                     selector: "@e1".into(),
                 },
                 expected: &["click", "@e1"],
             },
             Case {
                 name: "get_text",
-                action: BrowserAction::GetText {
+                action: ChromeAction::GetText {
                     selector: "@e3".into(),
                 },
                 expected: &["get", "text", "@e3"],
             },
             Case {
                 name: "get_url",
-                action: BrowserAction::GetUrl {},
+                action: ChromeAction::GetUrl {},
                 expected: &["get", "url"],
             },
         ];
 
         for case in &cases {
-            let args = BrowserTool::build_args(&case.action).unwrap_or_else(|e| {
+            let args = ChromeTool::build_args(&case.action).unwrap_or_else(|e| {
                 panic!("{}: build_args failed: {}", case.name, e);
             });
             assert_eq!(args, case.expected, "{}", case.name);
@@ -1880,11 +1880,11 @@ mod tests {
 
     #[test]
     fn build_args_rejects_get_innertext() {
-        let action = BrowserAction::GetInnerText {
+        let action = ChromeAction::GetInnerText {
             selector: "body".into(),
         };
         assert!(
-            BrowserTool::build_args(&action).is_err(),
+            ChromeTool::build_args(&action).is_err(),
             "GetInnerText must be handled in execute(), not build_args"
         );
     }
@@ -2028,7 +2028,7 @@ mod tests {
         ];
 
         for case in &cases {
-            let action = BrowserAction::Find {
+            let action = ChromeAction::Find {
                 by: case.by.into(),
                 value: case.value.into(),
                 action: case.action.into(),
@@ -2037,7 +2037,7 @@ mod tests {
                 exact: case.exact,
                 index: case.index,
             };
-            let args = BrowserTool::build_args(&action).unwrap_or_else(|e| {
+            let args = ChromeTool::build_args(&action).unwrap_or_else(|e| {
                 panic!("{}: build_args failed: {}", case.name, e);
             });
             assert_eq!(args, case.expected, "{}", case.name);
@@ -2052,7 +2052,7 @@ mod tests {
     #[test]
     fn validate_find_rejects_runtime_unsupported_actions() {
         for bad_action in ["focus", "type", "uncheck"] {
-            let action = BrowserAction::Find {
+            let action = ChromeAction::Find {
                 by: "text".into(),
                 value: "anything".into(),
                 action: bad_action.into(),
@@ -2061,7 +2061,7 @@ mod tests {
                 exact: None,
                 index: None,
             };
-            let err = BrowserTool::validate_find(&action)
+            let err = ChromeTool::validate_find(&action)
                 .expect_err("focus/type/uncheck must be rejected")
                 .to_string();
             assert!(
@@ -2073,7 +2073,7 @@ mod tests {
 
     #[test]
     fn validate_find_rejects_name_exact_on_css_locators() {
-        let find = |by: &str, name: Option<&str>, exact: Option<bool>| BrowserAction::Find {
+        let find = |by: &str, name: Option<&str>, exact: Option<bool>| ChromeAction::Find {
             by: by.into(),
             value: ".card".into(),
             action: "click".into(),
@@ -2083,14 +2083,14 @@ mod tests {
             index: if by == "nth" { Some(0) } else { None },
         };
         for by in ["nth", "first", "last", "testid"] {
-            let err = BrowserTool::validate_find(&find(by, Some("Submit"), None))
+            let err = ChromeTool::validate_find(&find(by, Some("Submit"), None))
                 .expect_err("name with CSS-selector locator must be rejected")
                 .to_string();
             assert!(
                 err.contains("`name`/`exact`") && err.contains(by),
                 "by {by}: {err}"
             );
-            let err = BrowserTool::validate_find(&find(by, None, Some(true)))
+            let err = ChromeTool::validate_find(&find(by, None, Some(true)))
                 .expect_err("exact with CSS-selector locator must be rejected")
                 .to_string();
             assert!(
@@ -2099,7 +2099,7 @@ mod tests {
             );
         }
         // role-style locators still honor name/exact.
-        BrowserTool::validate_find(&find("role", Some("Submit"), Some(false)))
+        ChromeTool::validate_find(&find("role", Some("Submit"), Some(false)))
             .expect("role + name/exact must still validate");
     }
 
@@ -2108,15 +2108,15 @@ mod tests {
     #[test]
     fn call_timeout_policy() {
         assert_eq!(
-            BrowserTool::call_timeout(&["open", "https://example.com"]),
+            ChromeTool::call_timeout(&["open", "https://example.com"]),
             Duration::from_secs(15)
         );
         assert_eq!(
-            BrowserTool::call_timeout(&["wait", "--load", "networkidle"]),
+            ChromeTool::call_timeout(&["wait", "--load", "networkidle"]),
             Duration::from_secs(10)
         );
         assert_eq!(
-            BrowserTool::call_timeout(&["expect", "visible", "#x"]),
+            ChromeTool::call_timeout(&["expect", "visible", "#x"]),
             Duration::from_secs(20)
         );
         for args in [
@@ -2125,7 +2125,7 @@ mod tests {
             &["snapshot", "-c"][..],
         ] {
             assert_eq!(
-                BrowserTool::call_timeout(args),
+                ChromeTool::call_timeout(args),
                 Duration::from_secs(8),
                 "args: {args:?}"
             );
@@ -2134,14 +2134,14 @@ mod tests {
 
     #[test]
     fn tool_name_and_description_are_set() {
-        let tool = BrowserTool::default();
-        assert_eq!(tool.name(), "browser");
+        let tool = ChromeTool::default();
+        assert_eq!(tool.name(), "chrome");
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn parameters_schema_is_valid_json() {
-        let tool = BrowserTool::default();
+        let tool = ChromeTool::default();
         let schema = tool.parameters_schema();
         assert!(schema.is_object());
         assert!(
@@ -2154,13 +2154,13 @@ mod tests {
 
     #[test]
     fn parameters_schema_has_all_actions() {
-        let tool = BrowserTool::default();
+        let tool = ChromeTool::default();
         let schema = tool.parameters_schema();
         let action_schemas = schema["properties"]["action"]["oneOf"]
             .as_array()
             .expect("oneOf should be an array");
 
-        // There are exactly 13 browser actions.
+        // There are exactly 13 chrome actions.
         assert_eq!(
             action_schemas.len(),
             13,
@@ -2226,8 +2226,8 @@ mod tests {
     }
 
     #[test]
-    fn browser_bin_name_is_correct() {
-        let name = browser_bin();
+    fn chrome_bin_name_is_correct() {
+        let name = chrome_bin();
         if cfg!(target_os = "windows") {
             assert_eq!(name, "chrome-use.exe");
         } else {
@@ -2242,7 +2242,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_page_text_propagates_url_validation_errors() {
-        let tool = BrowserTool::default();
+        let tool = ChromeTool::default();
 
         let err = tool.fetch_page_text("", "test-tab").await.unwrap_err();
         assert!(
@@ -2414,7 +2414,7 @@ mod tests {
     #[test]
     fn missing_or_empty_tab_defaults_to_per_run_session() {
         // Missing tab → the per-run default session, echoed in tool output.
-        let tool = BrowserTool::default();
+        let tool = ChromeTool::default();
         let (tab, note) =
             tool.normalize_tab(&json!({"action":{"open":{"url":"https://example.com"}}}));
         assert!(
@@ -2432,9 +2432,9 @@ mod tests {
             tab, tab2,
             "default session must be stable per tool instance"
         );
-        // A DIFFERENT BrowserTool instance yields a DIFFERENT name (no
+        // A DIFFERENT ChromeTool instance yields a DIFFERENT name (no
         // cross-run collision).
-        let other = BrowserTool::default();
+        let other = ChromeTool::default();
         let (other_tab, _note) =
             other.normalize_tab(&json!({"tab":"","action":{"open":{"url":"x"}}}));
         assert_ne!(tab, other_tab, "each tool instance needs its own session");
@@ -2474,14 +2474,14 @@ mod tests {
 
     #[tokio::test]
     async fn fail_fast_returns_guidance_without_retrying() {
-        let _guard = crate::tools::browser_daemon::with_health_test_lock().await;
+        let _guard = crate::tools::chrome_daemon::with_health_test_lock().await;
         // Pristine start (a sibling health test may have left a Down fixture).
-        crate::tools::browser_daemon::reset_health();
+        crate::tools::chrome_daemon::reset_health();
         // An orphaned-tab error (even envelope-wrapped with the auto-connect
         // and daemon-wrapper text) fails fast with hand-close guidance but
         // does NOT mark the daemon unhealthy — the relay and daemon are up, so
         // recovery must not wake for it.
-        let err = BrowserTool::fail_fast_if_daemon_down(
+        let err = ChromeTool::fail_fast_if_daemon_down(
             "Auto-launch failed: Could not drive your Chrome through the ab-connect extension. \
              The tab this session was driving can no longer be resolved (it was closed, or a \
              flaky relay dropped it)",
@@ -2492,60 +2492,60 @@ mod tests {
             err.to_string().contains("close the leftover tab in Chrome"),
             "expected hand-close guidance, got: {err}"
         );
-        assert!(crate::tools::browser_daemon::is_advertised());
+        assert!(crate::tools::chrome_daemon::is_advertised());
         // Daemon-unavailable signature → actionable guidance, daemon marked
         // unhealthy (wakes the auto-recovery watchdog).
-        let err = BrowserTool::fail_fast_if_daemon_down(
+        let err = ChromeTool::fail_fast_if_daemon_down(
             "Failed to read: Resource temporarily unavailable (os error 35) (after 5 retries - daemon may be busy or unresponsive)",
             None,
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("browser daemon is down"),
+            err.to_string().contains("chrome daemon is down"),
             "expected guidance message, got: {err}"
         );
-        assert!(!crate::tools::browser_daemon::is_advertised());
+        assert!(!crate::tools::chrome_daemon::is_advertised());
         // The unambiguous daemon-side envelope code fails fast too (no message
         // matching).
-        let err = BrowserTool::fail_fast_if_daemon_down(
+        let err = ChromeTool::fail_fast_if_daemon_down(
             "chrome-use error: browser not launched",
             Some("browser_not_launched"),
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("browser daemon is down"),
+            err.to_string().contains("chrome daemon is down"),
             "expected guidance message, got: {err}"
         );
         // Site-level failures — even ones carrying the coarse `connection_failed`
         // code (the CLI assigns it to any "connection" text) — pass through as
         // truthful navigation failures and leave the daemon healthy.
         assert!(
-            BrowserTool::fail_fast_if_daemon_down(
+            ChromeTool::fail_fast_if_daemon_down(
                 "chrome-use error: Navigation failed: net::ERR_CONNECTION_REFUSED",
                 Some("connection_failed"),
             )
             .is_ok()
         );
         assert!(
-            BrowserTool::fail_fast_if_daemon_down("chrome-use error: Element not found", None)
+            ChromeTool::fail_fast_if_daemon_down("chrome-use error: Element not found", None)
                 .is_ok()
         );
         assert!(
-            BrowserTool::fail_fast_if_daemon_down("chrome-use error: timed out", Some("timeout"))
+            ChromeTool::fail_fast_if_daemon_down("chrome-use error: timed out", Some("timeout"))
                 .is_ok()
         );
         // Restore the global health singleton so later agent-constructing
-        // tests don't inherit a hidden browser tool.
-        crate::tools::browser_daemon::reset_health();
+        // tests don't inherit a hidden chrome tool.
+        crate::tools::chrome_daemon::reset_health();
     }
 
     // -----------------------------------------------------------------------
-    // KNOWN_ACTIONS lockstep — adding a BrowserAction variant must be mirrored
+    // KNOWN_ACTIONS lockstep — adding a ChromeAction variant must be mirrored
     // in the normalization allowlist.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn known_actions_lockstep_with_browser_action_variants() {
+    fn known_actions_lockstep_with_chrome_action_variants() {
         // Minimal payload per variant/alias name (KNOWN_ACTIONS also carries the
         // serde aliases on GetInnerText).
         let payload = |name: &str| -> Value {
@@ -2571,12 +2571,12 @@ mod tests {
         for name in KNOWN_ACTIONS {
             let tagged = json!({*name: payload(name)});
             assert!(
-                serde_json::from_value::<BrowserAction>(tagged.clone()).is_ok(),
+                serde_json::from_value::<ChromeAction>(tagged.clone()).is_ok(),
                 "KNOWN_ACTIONS entry does not deserialize: {tagged}"
             );
         }
         // Every variant's canonical name must be in the allowlist — a new
-        // BrowserAction variant fails here.
+        // ChromeAction variant fails here.
         for name in [
             "open",
             "snapshot",
@@ -2601,9 +2601,9 @@ mod tests {
 
     #[test]
     fn build_args_rejects_screenshot() {
-        let action = BrowserAction::Screenshot {};
+        let action = ChromeAction::Screenshot {};
         assert!(
-            BrowserTool::build_args(&action).is_err(),
+            ChromeTool::build_args(&action).is_err(),
             "Screenshot must be handled in execute(), not build_args"
         );
     }
@@ -2615,66 +2615,63 @@ mod tests {
         }
 
         // Wait: exactly one target, deadline-bound below the mahbot bound.
-        let wait_selector = BrowserAction::Wait {
+        let wait_selector = ChromeAction::Wait {
             selector: Some("#r".into()),
             url: None,
             text: None,
         };
-        let got = BrowserTool::build_args(&wait_selector).unwrap();
+        let got = ChromeTool::build_args(&wait_selector).unwrap();
         assert_eq!(argv(&got), vec!["wait", "#r", "--timeout", "8000"]);
 
-        let wait_url = BrowserAction::Wait {
+        let wait_url = ChromeAction::Wait {
             selector: None,
             url: Some("dashboard".into()),
             text: None,
         };
-        let got = BrowserTool::build_args(&wait_url).unwrap();
+        let got = ChromeTool::build_args(&wait_url).unwrap();
         assert_eq!(
             argv(&got),
             vec!["wait", "--url", "dashboard", "--timeout", "8000"]
         );
 
-        let wait_text = BrowserAction::Wait {
+        let wait_text = ChromeAction::Wait {
             selector: None,
             url: None,
             text: Some("Loaded".into()),
         };
-        let got = BrowserTool::build_args(&wait_text).unwrap();
+        let got = ChromeTool::build_args(&wait_text).unwrap();
         assert_eq!(
             argv(&got),
             vec!["wait", "--text", "Loaded", "--timeout", "8000"]
         );
 
         // Wait requires exactly one target.
-        let both = BrowserAction::Wait {
+        let both = ChromeAction::Wait {
             selector: Some("#r".into()),
             url: Some("dashboard".into()),
             text: None,
         };
         assert!(
-            BrowserTool::build_args(&both).is_err(),
+            ChromeTool::build_args(&both).is_err(),
             "two targets must err"
         );
-        let none = BrowserAction::Wait {
+        let none = ChromeAction::Wait {
             selector: None,
             url: None,
             text: None,
         };
-        assert!(
-            BrowserTool::build_args(&none).is_err(),
-            "no target must err"
-        );
+        assert!(ChromeTool::build_args(&none).is_err(), "no target must err");
         // A numeric selector would be chrome-use's silent-sleep form — rejected.
-        let numeric = BrowserAction::Wait {
+        let numeric = ChromeAction::Wait {
             selector: Some("5000".into()),
             url: None,
             text: None,
         };
-        let err = BrowserTool::build_args(&numeric).unwrap_err().to_string();
+        let err = ChromeTool::build_args(&numeric).unwrap_err().to_string();
         assert!(err.contains("silent sleep"), "err: {err}");
 
         // Expect visible.
-        let expect_visible = BrowserAction::Expect {
+        let expect_visible = ChromeAction::Expect {
             condition: "visible".into(),
             selector: Some("#main".into()),
             op: None,
@@ -2683,14 +2680,14 @@ mod tests {
             name: None,
             expected: None,
         };
-        let got = BrowserTool::build_args(&expect_visible).unwrap();
+        let got = ChromeTool::build_args(&expect_visible).unwrap();
         assert_eq!(
             argv(&got),
             vec!["expect", "#main", "visible", "--timeout", "18000"]
         );
 
         // Expect count defaults op to ==.
-        let expect_count_default = BrowserAction::Expect {
+        let expect_count_default = ChromeAction::Expect {
             condition: "count".into(),
             selector: Some(".card".into()),
             op: None,
@@ -2699,14 +2696,14 @@ mod tests {
             name: None,
             expected: None,
         };
-        let got = BrowserTool::build_args(&expect_count_default).unwrap();
+        let got = ChromeTool::build_args(&expect_count_default).unwrap();
         assert_eq!(
             argv(&got),
             vec!["expect", "count", ".card", "==", "5", "--timeout", "18000"]
         );
 
         // Expect count forwards an explicit op.
-        let expect_count_op = BrowserAction::Expect {
+        let expect_count_op = ChromeAction::Expect {
             condition: "count".into(),
             selector: Some(".card".into()),
             op: Some(">=".into()),
@@ -2715,14 +2712,14 @@ mod tests {
             name: None,
             expected: None,
         };
-        let got = BrowserTool::build_args(&expect_count_op).unwrap();
+        let got = ChromeTool::build_args(&expect_count_op).unwrap();
         assert_eq!(
             argv(&got),
             vec!["expect", "count", ".card", ">=", "5", "--timeout", "18000"]
         );
 
         // Expect url with a predicate.
-        let expect_url = BrowserAction::Expect {
+        let expect_url = ChromeAction::Expect {
             condition: "url".into(),
             selector: None,
             op: None,
@@ -2731,7 +2728,7 @@ mod tests {
             name: None,
             expected: Some("dashboard".into()),
         };
-        let got = BrowserTool::build_args(&expect_url).unwrap();
+        let got = ChromeTool::build_args(&expect_url).unwrap();
         assert_eq!(
             argv(&got),
             vec![
@@ -2745,7 +2742,7 @@ mod tests {
         );
 
         // Expect corrective errors.
-        let bad_condition = BrowserAction::Expect {
+        let bad_condition = ChromeAction::Expect {
             condition: "banana".into(),
             selector: None,
             op: None,
@@ -2754,9 +2751,9 @@ mod tests {
             name: None,
             expected: None,
         };
-        assert!(BrowserTool::build_args(&bad_condition).is_err());
+        assert!(ChromeTool::build_args(&bad_condition).is_err());
 
-        let count_no_count = BrowserAction::Expect {
+        let count_no_count = ChromeAction::Expect {
             condition: "count".into(),
             selector: Some(".card".into()),
             op: None,
@@ -2765,9 +2762,9 @@ mod tests {
             name: None,
             expected: None,
         };
-        assert!(BrowserTool::build_args(&count_no_count).is_err());
+        assert!(ChromeTool::build_args(&count_no_count).is_err());
 
-        let visible_no_selector = BrowserAction::Expect {
+        let visible_no_selector = ChromeAction::Expect {
             condition: "visible".into(),
             selector: None,
             op: None,
@@ -2776,9 +2773,9 @@ mod tests {
             name: None,
             expected: None,
         };
-        assert!(BrowserTool::build_args(&visible_no_selector).is_err());
+        assert!(ChromeTool::build_args(&visible_no_selector).is_err());
 
-        let bad_op = BrowserAction::Expect {
+        let bad_op = ChromeAction::Expect {
             condition: "count".into(),
             selector: Some(".card".into()),
             op: Some("!%".into()),
@@ -2787,10 +2784,10 @@ mod tests {
             name: None,
             expected: None,
         };
-        let err = BrowserTool::build_args(&bad_op).unwrap_err().to_string();
+        let err = ChromeTool::build_args(&bad_op).unwrap_err().to_string();
         assert!(err.contains("invalid count op"), "err: {err}");
 
-        let bad_predicate = BrowserAction::Expect {
+        let bad_predicate = ChromeAction::Expect {
             condition: "text".into(),
             selector: Some("h1".into()),
             op: None,
@@ -2799,7 +2796,7 @@ mod tests {
             name: None,
             expected: Some("x".into()),
         };
-        let err = BrowserTool::build_args(&bad_predicate)
+        let err = ChromeTool::build_args(&bad_predicate)
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid predicate"), "err: {err}");
@@ -2869,42 +2866,42 @@ mod tests {
     fn normalize_extract_schema_shapes() {
         // A chrome-use-grammar object (rows + fields) passes through, no note.
         let obj = json!({"rows": ".card", "fields": {"title": ".title"}});
-        let (out, note) = BrowserTool::normalize_extract_schema(&obj).unwrap();
+        let (out, note) = ChromeTool::normalize_extract_schema(&obj).unwrap();
         assert_eq!(out, obj);
         assert!(note.is_none());
 
         // A flat schema (per-field keys at the top level) is normalized into
         // the required "fields" object, with a correction note.
         let (out, note) =
-            BrowserTool::normalize_extract_schema(&json!({"rows": ".card", "title": ".title"}))
+            ChromeTool::normalize_extract_schema(&json!({"rows": ".card", "title": ".title"}))
                 .unwrap();
         assert_eq!(out, json!({"rows": ".card", "fields": {"title": ".title"}}));
         assert!(note.is_some_and(|n| n.contains("fields")));
 
         // A string holding valid JSON text parses to the object.
         let stringified = json!("{\"rows\": \".card\", \"fields\": {}}");
-        let (out, note) = BrowserTool::normalize_extract_schema(&stringified).unwrap();
+        let (out, note) = ChromeTool::normalize_extract_schema(&stringified).unwrap();
         assert_eq!(out, json!({"rows": ".card", "fields": {}}));
         assert!(note.is_none());
 
         // A non-JSON string errs with the corrective message.
-        let err = BrowserTool::normalize_extract_schema(&json!("not json"))
+        let err = ChromeTool::normalize_extract_schema(&json!("not json"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("not valid JSON"), "err: {err}");
 
         // A non-object shape errs.
-        assert!(BrowserTool::normalize_extract_schema(&json!(42)).is_err());
+        assert!(ChromeTool::normalize_extract_schema(&json!(42)).is_err());
 
         // An array-shaped object (no fields key, array values) errs instead of
         // being mangled into a fields object.
-        let err = BrowserTool::normalize_extract_schema(&json!({"items": [1, 2]}))
+        let err = ChromeTool::normalize_extract_schema(&json!({"items": [1, 2]}))
             .unwrap_err()
             .to_string();
         assert!(err.contains("must be a"), "err: {err}");
 
         // A "fields" key that is not an object errs.
-        let err = BrowserTool::normalize_extract_schema(&json!({"fields": ".title"}))
+        let err = ChromeTool::normalize_extract_schema(&json!({"fields": ".title"}))
             .unwrap_err()
             .to_string();
         assert!(err.contains("\"fields\" must be an object"), "err: {err}");
@@ -2914,8 +2911,8 @@ mod tests {
     fn screenshot_action_normalizes_and_parses() {
         // Canonical tagged object.
         let action = serde_json::json!({"screenshot": {}});
-        let parsed: BrowserAction = serde_json::from_value(action.clone()).unwrap();
-        assert!(matches!(parsed, BrowserAction::Screenshot {}));
+        let parsed: ChromeAction = serde_json::from_value(action.clone()).unwrap();
+        assert!(matches!(parsed, ChromeAction::Screenshot {}));
 
         // Plain action name with a tab sibling.
         let args = serde_json::json!({"action": "screenshot", "tab": "docs"});
@@ -2925,20 +2922,20 @@ mod tests {
             note.is_some(),
             "screenshot should record a normalization note"
         );
-        let parsed: BrowserAction = serde_json::from_value(normalized).unwrap();
-        assert!(matches!(parsed, BrowserAction::Screenshot {}));
+        let parsed: ChromeAction = serde_json::from_value(normalized).unwrap();
+        assert!(matches!(parsed, ChromeAction::Screenshot {}));
     }
 
     #[test]
     #[expect(clippy::case_sensitive_file_extension_comparisons)] // the tool itself always emits a lowercase .png name
     fn screenshot_output_path_is_safe_and_unique() {
         // A hostile tab name must not escape the temp dir.
-        let p = BrowserTool::screenshot_output_path("../../etc/cron.d").unwrap();
+        let p = ChromeTool::screenshot_output_path("../../etc/cron.d").unwrap();
         let file_name = p.file_name().unwrap().to_string_lossy().into_owned();
         assert!(!file_name.contains('/') && !file_name.contains('\\'));
         assert!(file_name.ends_with(".png"));
         // Two calls yield different files (random nonce).
-        let p2 = BrowserTool::screenshot_output_path("default").unwrap();
+        let p2 = ChromeTool::screenshot_output_path("default").unwrap();
         assert_ne!(p, p2);
     }
 
@@ -2947,7 +2944,7 @@ mod tests {
     #[test]
     fn validate_png_accepts_real_png() {
         let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
-        let dir = std::env::temp_dir().join("mahbot-browser-test-valid");
+        let dir = std::env::temp_dir().join("mahbot-chrome-test-valid");
         std::fs::create_dir_all(&dir).unwrap();
         let png_path = dir.join("valid.png");
         let mut buf = Vec::new();
@@ -2963,7 +2960,7 @@ mod tests {
 
     #[test]
     fn validate_png_rejects_corrupt_file() {
-        let dir = std::env::temp_dir().join("mahbot-browser-test-corrupt");
+        let dir = std::env::temp_dir().join("mahbot-chrome-test-corrupt");
         std::fs::create_dir_all(&dir).unwrap();
         let png_path = dir.join("corrupt.png");
         std::fs::write(&png_path, b"not a png").unwrap();
@@ -2978,12 +2975,12 @@ mod tests {
 
     #[test]
     fn format_action_output_eval_prefers_result() {
-        let response = BrowserResponse {
+        let response = ChromeResponse {
             data: Some(json!({"origin": "https://x", "result": "hello"})),
-            ..BrowserResponse::default()
+            ..ChromeResponse::default()
         };
-        let out = BrowserTool::format_action_output(
-            &BrowserAction::Eval { js: "42".into() },
+        let out = ChromeTool::format_action_output(
+            &ChromeAction::Eval { js: "42".into() },
             "default",
             response,
             "",
@@ -2998,12 +2995,12 @@ mod tests {
 
     #[test]
     fn format_action_output_eval_falls_back_without_result() {
-        let response = BrowserResponse {
+        let response = ChromeResponse {
             data: Some(json!({"note": "no result key"})),
-            ..BrowserResponse::default()
+            ..ChromeResponse::default()
         };
-        let out = BrowserTool::format_action_output(
-            &BrowserAction::Eval { js: "42".into() },
+        let out = ChromeTool::format_action_output(
+            &ChromeAction::Eval { js: "42".into() },
             "default",
             response,
             "",
@@ -3013,10 +3010,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_payload_attaches_browser_screenshot() {
+    async fn image_payload_attaches_chrome_screenshot() {
         // Build a tiny PNG on disk.
         let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
-        let dir = std::env::temp_dir().join("mahbot-browser-test");
+        let dir = std::env::temp_dir().join("mahbot-chrome-test");
         std::fs::create_dir_all(&dir).unwrap();
         let png_path = dir.join("shot.png");
         let mut buf = Vec::new();
@@ -3024,7 +3021,7 @@ mod tests {
             .unwrap();
         std::fs::write(&png_path, &buf).unwrap();
 
-        let tool = BrowserTool::default();
+        let tool = ChromeTool::default();
         *tool.last_screenshot.lock().unwrap_poison() =
             Some(png_path.to_string_lossy().into_owned());
 
@@ -3035,14 +3032,14 @@ mod tests {
             )
             .await
             .expect("screenshot must produce an image payload");
-        assert_eq!(payload.source, crate::tools::ImagePayloadSource::Browser);
+        assert_eq!(payload.source, crate::tools::ImagePayloadSource::Chrome);
         assert_eq!(payload.format, "PNG");
         assert!(payload.data_uri.starts_with("data:image/jpeg;base64,"));
         assert!(
             payload
                 .attached_annotation()
-                .starts_with("Browser screenshot"),
-            "annotation must describe it as a browser screenshot: {}",
+                .starts_with("Chrome screenshot"),
+            "annotation must describe it as a chrome screenshot: {}",
             payload.attached_annotation()
         );
 
@@ -3051,7 +3048,7 @@ mod tests {
 
     #[tokio::test]
     async fn image_payload_ignores_non_screenshot_actions() {
-        let tool = BrowserTool::default();
+        let tool = ChromeTool::default();
         // A stale path must not be attached to a non-screenshot action.
         *tool.last_screenshot.lock().unwrap_poison() = Some("/tmp/stale.png".to_string());
         let payload = tool
@@ -3091,7 +3088,7 @@ mod tests {
         });
         assert_eq!(parse_session_list(&mixed), vec!["docs", "default"]);
 
-        // Envelope-verdict gating lives in the caller (close_all_browser_sessions_inner);
+        // Envelope-verdict gating lives in the caller (close_all_chrome_sessions_inner);
         // this helper only extracts names.
         let failed = serde_json::json!({"ok": false, "error": "boom"});
         assert!(parse_session_list(&failed).is_empty());

@@ -284,15 +284,15 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::self_update::run_update_availability_refresh(),
     );
 
-    // Browser daemon health watchdog: classifies chrome-use health from the
+    // Chrome daemon health watchdog: classifies chrome-use health from the
     // daemon-free status and auto-restarts with bounded backoff when it is
-    // down; wedges surface on real browser calls (fail-fast) and wake this
-    // watchdog (browser relay daemon only — never the mahbot service itself).
+    // down; wedges surface on real chrome calls (fail-fast) and wake this
+    // watchdog (chrome relay daemon only — never the mahbot service itself).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
-        "browser-daemon",
-        mahbot::tools::browser_daemon::run_watchdog(),
+        "chrome-daemon",
+        mahbot::tools::chrome_daemon::run_watchdog(),
     );
 
     // chrome-use auto-update: best-effort once-per-boot check that swaps an
@@ -303,7 +303,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &mut tasks,
         &shutdown_token,
         "chrome-use-updater",
-        mahbot::tools::browser_daemon::run_auto_update(),
+        mahbot::tools::chrome_daemon::run_auto_update(),
     );
 
     // Managed bun runtime: silent first install at startup (no consent flow —
@@ -517,7 +517,7 @@ async fn shutdown_after_dashboard() {
     // after the update's finalizing drain fired it. A future exit path that
     // drops the runtime without firing the token would break this invariant.
     mahbot::agent::registry::AGENT_REGISTRY.shutdown_all();
-    mahbot::tools::browser::close_all_browser_sessions().await;
+    mahbot::tools::chrome::close_all_chrome_sessions().await;
 
     // Take the JoinSet out of the lock before awaiting (drop guard).
     let maybe_tasks = {
@@ -585,23 +585,23 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
-    // `mahbot browser` subcommand: headless browser automation CLI over the
-    // shared browser core. Dispatched before lock acquisition + temp-root init
+    // `mahbot chrome` subcommand: browser automation CLI over the
+    // shared chrome core. Dispatched before lock acquisition + temp-root init
     // so it can run alongside the daemon (it uses its own session namespace);
     // chrome-use binary resolution falls back to PATH/home locations.
-    if std::env::args().nth(1).as_deref() == Some("browser") {
+    if std::env::args().nth(1).as_deref() == Some("chrome") {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let args = std::env::args().skip(2).collect::<Vec<_>>();
-        let code = rt.block_on(mahbot::run_browser_cli(&args));
+        let code = rt.block_on(mahbot::run_chrome_cli(&args));
         std::process::exit(code);
     }
 
     // Consolidate ALL daemon temp files under one private root
     // (`/tmp/mahbot`, mode 0700) and pin TMPDIR to it — BEFORE any
     // temp use (config, logs, stores, shell children). The debug,
-    // __grep-engine, bench-openrouter and browser subcommands above must NOT
+    // __grep-engine, bench-openrouter and chrome subcommands above must NOT
     // create the root (they exit before this point).
     mahbot::temp::init_temp_root()?;
 

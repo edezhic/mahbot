@@ -1,25 +1,25 @@
 //! One place for the chrome-use response envelope parsing, shared by the
-//! interactive `browser` tool and the `mahbot browser` CLI.
+//! interactive `chrome` tool and the `mahbot chrome` CLI.
 //!
 //! chrome-use answers `--json` commands with either the classic `success` key
-//! or the newer `ok` key. [`BrowserResponse`] is the single structural parser
-//! every frontend shares — [`BrowserResponse::verdict`] applies the shared
+//! or the newer `ok` key. [`ChromeResponse`] is the single structural parser
+//! every frontend shares — [`ChromeResponse::verdict`] applies the shared
 //! failure-precedence logic so the two paths cannot drift. The `mahbot
-//! browser` stdout output contract ([`SCHEMA_VERSION`], [`OutKind`],
+//! chrome` stdout output contract ([`SCHEMA_VERSION`], [`OutKind`],
 //! [`OutEnvelope`]) lives here too.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Response from chrome-use `--json` commands — the ONE structural envelope
-/// parser every browser frontend shares.
+/// parser every chrome frontend shares.
 ///
 /// There is no schema-version marker in chrome-use, and the envelope even
 /// varies within one binary (`session list` answers `ok:true`, everything
 /// else `success:true`), so tolerance is structural: every field is
 /// [`Option`], unknown keys are ignored.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct BrowserResponse {
+pub(crate) struct ChromeResponse {
     /// Classic `success` envelope key — absent on newer `ok`-keyed envelopes.
     #[serde(default)]
     pub(crate) success: Option<bool>,
@@ -38,7 +38,7 @@ pub(crate) struct BrowserResponse {
     pub(crate) retryable: Option<bool>,
 }
 
-impl BrowserResponse {
+impl ChromeResponse {
     /// Success gate accepting both the classic `success: true` envelope and
     /// the latest `ok: true` one — delegates to the shared [`envelope_success`]
     /// predicate (failure precedence).
@@ -69,8 +69,8 @@ impl BrowserResponse {
 /// Core envelope-success predicate with failure precedence: an explicit
 /// `false` on either key loses over a contradicting success key (conservative
 /// — the error text surfaces), and a payload with neither key is not a
-/// success. Backs [`BrowserResponse::is_success`] and
-/// [`BrowserResponse::verdict`].
+/// success. Backs [`ChromeResponse::is_success`] and
+/// [`ChromeResponse::verdict`].
 fn envelope_success(success: Option<bool>, ok: Option<bool>) -> bool {
     !(success == Some(false) || ok == Some(false)) && (success == Some(true) || ok == Some(true))
 }
@@ -97,7 +97,7 @@ pub(crate) fn extract_snapshot_text(data: &serde_json::Value) -> Option<String> 
 /// `eval` output as `data = {origin, result}` — an object carrying BOTH keys
 /// is treated as that wrapper; every other shape (a bare value, a plain
 /// string, a page result that merely has a `result` field) passes through.
-pub(crate) fn eval_result(resp: &BrowserResponse) -> Option<&Value> {
+pub(crate) fn eval_result(resp: &ChromeResponse) -> Option<&Value> {
     resp.data
         .as_ref()
         .map(|d| match (d.get("result"), d.get("origin")) {
@@ -108,7 +108,7 @@ pub(crate) fn eval_result(resp: &BrowserResponse) -> Option<&Value> {
 
 /// Extract a non-negative element count from a count-eval response — the eval
 /// result arrives as a JSON number or its text form.
-pub(crate) fn eval_count(resp: &BrowserResponse) -> Option<u64> {
+pub(crate) fn eval_count(resp: &ChromeResponse) -> Option<u64> {
     let data = eval_result(resp)?;
     data.as_u64()
         .or_else(|| data.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
@@ -190,7 +190,7 @@ pub(crate) fn expect_outcome(data: &Value) -> Option<ExpectOutcome> {
     })
 }
 
-/// `mahbot browser` stdout envelope schema version.
+/// `mahbot chrome` stdout envelope schema version.
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 /// Failure/success classification of one CLI step — drives the emitted
@@ -283,29 +283,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn browser_response_accepts_tolerant_envelopes() {
-        let ok: BrowserResponse =
+    fn chrome_response_accepts_tolerant_envelopes() {
+        let ok: ChromeResponse =
             serde_json::from_str(r#"{"ok":true,"data":{}}"#).expect("tolerant deserialize");
         assert!(ok.is_success());
 
-        let success: BrowserResponse =
+        let success: ChromeResponse =
             serde_json::from_str(r#"{"success":true}"#).expect("tolerant deserialize");
         assert!(success.is_success());
 
-        let failed: BrowserResponse =
+        let failed: ChromeResponse =
             serde_json::from_str(r#"{"success":false}"#).expect("tolerant deserialize");
         assert!(!failed.is_success());
 
         // Failure precedence — an explicit false on either key loses over a
         // contradicting success key.
-        let mixed: BrowserResponse =
+        let mixed: ChromeResponse =
             serde_json::from_str(r#"{"success":false,"ok":true}"#).expect("tolerant deserialize");
         assert!(!mixed.is_success());
     }
 
     #[test]
     fn verdict_covers_both_envelopes() {
-        let v = |json: serde_json::Value| BrowserResponse::from_value(&json).verdict();
+        let v = |json: serde_json::Value| ChromeResponse::from_value(&json).verdict();
         assert_eq!(v(serde_json::json!({"success": true})), Some(true));
         assert_eq!(v(serde_json::json!({"ok": true})), Some(true));
         assert_eq!(
@@ -325,11 +325,11 @@ mod tests {
     }
 
     #[test]
-    fn browser_response_parses_structured_error_retryable() {
+    fn chrome_response_parses_structured_error_retryable() {
         let v = serde_json::json!({
             "success": false, "error": "boom", "code": "connection_failed", "retryable": true,
         });
-        let resp = BrowserResponse::from_value(&v);
+        let resp = ChromeResponse::from_value(&v);
         assert_eq!(resp.success, Some(false));
         assert_eq!(resp.error.as_deref(), Some("boom"));
         assert_eq!(resp.code.as_deref(), Some("connection_failed"));
@@ -339,7 +339,7 @@ mod tests {
         let v = serde_json::json!({
             "ok": false, "code": "connection_failed", "retryable": false,
         });
-        let resp = BrowserResponse::from_value(&v);
+        let resp = ChromeResponse::from_value(&v);
         assert_eq!(resp.ok, Some(false));
         assert_eq!(resp.retryable, Some(false));
         assert!(!resp.is_success());
@@ -347,20 +347,20 @@ mod tests {
 
     #[test]
     fn from_value_tolerates_unknown_keys_and_non_objects() {
-        let resp = BrowserResponse::from_value(&serde_json::json!({
+        let resp = ChromeResponse::from_value(&serde_json::json!({
             "success": true, "version": 99, "unknown": [1, 2, 3],
         }));
         assert_eq!(resp.success, Some(true));
         assert!(resp.is_success());
         // Tolerates a payload with neither verdict key plus unknown keys.
-        let resp = BrowserResponse::from_value(&serde_json::json!({
+        let resp = ChromeResponse::from_value(&serde_json::json!({
             "data": {"x": 1}, "future_key": true,
         }));
         assert_eq!(resp.verdict(), None);
         assert_eq!(resp.data, Some(serde_json::json!({"x": 1})));
         // A non-object / unparseable payload yields a default response.
         assert_eq!(
-            BrowserResponse::from_value(&serde_json::json!("plain string")).verdict(),
+            ChromeResponse::from_value(&serde_json::json!("plain string")).verdict(),
             None
         );
     }

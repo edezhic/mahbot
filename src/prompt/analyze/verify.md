@@ -1,4 +1,4 @@
-Verify the following claim independently, using your research tools (web search, browser, etc.). Do not trust the listed sources at face value — look for primary evidence.
+Verify the following claim independently, using your research tools (web search, chrome, etc.). Do not trust the listed sources at face value — look for primary evidence.
 
 # Claim
 

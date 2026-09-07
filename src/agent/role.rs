@@ -260,7 +260,7 @@ use crate::Workspace;
 use crate::config::CONFIG;
 use crate::tools::{
     AddAlarmTool, AddCommentTool, AddUserTool, AddWorkspaceTool, AnalyzeTool, BindTelegramTool,
-    BrowserTool, ComputerTool, CreateTicketTool, DispatchMode, EditTool, FinalizeTool,
+    ChromeTool, ComputerTool, CreateTicketTool, DispatchMode, EditTool, FinalizeTool,
     GetTicketTool, ImageGenTool, ImplementTool, InstallChromeUseTool, ListAlarmsTool,
     ListTicketsTool, MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool,
     SearchArchivedTicketsTool, SearchTool, SendMessageToManagerTool, SetupTelegramBotTool,
@@ -301,15 +301,15 @@ impl Role {
     /// tools); every other role's toolset is byte-identical regardless of its
     /// value.
     ///
-    /// `browser_sessions` is the run-scoped browser session tracker shared with
-    /// the agent's `BrowserTool` so every session the run opens is closed at
+    /// `chrome_sessions` is the run-scoped chrome session tracker shared with
+    /// the agent's `ChromeTool` so every session the run opens is closed at
     /// run end.
     #[must_use]
     pub(crate) fn tools(
         self,
         ws: &Workspace,
         full_access: bool,
-        browser_sessions: std::sync::Arc<crate::tools::browser::BrowserRunSessions>,
+        chrome_sessions: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
     ) -> Vec<Box<dyn Tool>> {
         let mut tools: Vec<Box<dyn Tool>> = match self {
             Role::Engineer => {
@@ -342,7 +342,7 @@ impl Role {
             }
             Role::Analyst => {
                 let mut t = Self::readonly_core_tools();
-                t.push(Box::new(BrowserTool::new(browser_sessions)));
+                t.push(Box::new(ChromeTool::new(chrome_sessions)));
                 t
             }
             Role::Coder => Self::full_core_tools(),
@@ -475,10 +475,10 @@ impl Role {
 mod tests {
     use super::*;
 
-    /// Run-scoped browser session tracker for toolset tests — the caller-visible
+    /// Run-scoped chrome session tracker for toolset tests — the caller-visible
     /// per-run tracker is never used here (these tests never open a browser).
-    fn test_sessions() -> std::sync::Arc<crate::tools::browser::BrowserRunSessions> {
-        std::sync::Arc::new(crate::tools::browser::BrowserRunSessions::default())
+    fn test_sessions() -> std::sync::Arc<crate::tools::chrome::ChromeRunSessions> {
+        std::sync::Arc::new(crate::tools::chrome::ChromeRunSessions::default())
     }
 
     #[test]
@@ -676,7 +676,7 @@ mod tests {
     fn computer_tool_only_in_full_access_assistant() {
         // Acceptance pin: `computer` is granted ONLY to the full-access
         // Assistant. Every other role (base or full) and the base Assistant
-        // rely on delegation (browser/analyze/shell) rather than direct local
+        // rely on delegation (chrome/analyze/shell) rather than direct local
         // GUI access, so the tool must never leak into their toolset.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {

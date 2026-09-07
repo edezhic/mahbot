@@ -1,4 +1,4 @@
-Headless browser for navigating web pages, interacting with elements, extracting content, and capturing screenshots for visual inspection. Returns an accessibility-tree snapshot for AI consumption.
+Chrome browser automation: navigate web pages, interact with elements, extract content, and capture screenshots for visual inspection. Returns an accessibility-tree snapshot for AI consumption.
 
 ## Required parameter
 `tab` — a logical session name. Missing or empty uses a unique per-run session that is closed automatically when your run ends. Use an explicit different name (e.g. "docs") only to keep multiple pages open simultaneously. Same tab = serialized operations on that page.
@@ -50,7 +50,7 @@ PASS means the condition held within the deadline; FAIL reports the observed `ac
 
 ## Large content handling
 * For files over ~10KB, prefer the `read` tool (local files) or `shell` with `curl` (remote files) — they have no truncation.
-* If using browser for large content, use `eval` with chunked extraction: `document.body.innerText.slice(0, 10000)`.
+* If using chrome for large content, use `eval` with chunked extraction: `document.body.innerText.slice(0, 10000)`.
 * `get_text` on raw.githubusercontent.com or CDN URLs returns full content but wrapped in page HTML — prefer `read` or `curl` for raw file content.
 
 ## `value` vs `text` (critical distinction)

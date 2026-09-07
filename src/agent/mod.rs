@@ -342,9 +342,9 @@ async fn tool_result_content(
 /// One-pass derivation of a role's advertised tools and their specs — the
 /// single source for both [`Agent::new`] and the research wrap-up snapshot
 /// (`.1`), so the frozen post-deadline replay can never drift from the live
-/// agent's tools (KV-cache byte identity). The returned `browser_sessions` is
-/// the run-scoped tracker (`BrowserTool` records every session it opens into
-/// it; [`crate::tools::browser_daemon::close_run_sessions`] closes them at
+/// agent's tools (KV-cache byte identity). The returned `chrome_sessions` is
+/// the run-scoped tracker (`ChromeTool` records every session it opens into
+/// it; [`crate::tools::chrome_daemon::close_run_sessions`] closes them at
 /// run end).
 #[must_use]
 pub(crate) fn role_tools_and_specs(
@@ -354,17 +354,16 @@ pub(crate) fn role_tools_and_specs(
 ) -> (
     Vec<Box<dyn Tool>>,
     Vec<crate::ToolSpec>,
-    std::sync::Arc<crate::tools::browser::BrowserRunSessions>,
+    std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
 ) {
-    let browser_sessions =
-        std::sync::Arc::new(crate::tools::browser::BrowserRunSessions::default());
+    let chrome_sessions = std::sync::Arc::new(crate::tools::chrome::ChromeRunSessions::default());
     let tools: Vec<Box<dyn Tool>> = role
-        .tools(ws, full_access, browser_sessions.clone())
+        .tools(ws, full_access, chrome_sessions.clone())
         .into_iter()
         .filter(|t| t.is_advertised())
         .collect();
     let tool_specs = tools.iter().map(|t| t.spec()).collect();
-    (tools, tool_specs, browser_sessions)
+    (tools, tool_specs, chrome_sessions)
 }
 
 /// A role's derived chat-request triplet (model slot → per-model provider
@@ -460,7 +459,7 @@ impl Agent {
         parent_key: Option<crate::agent::registry::ParentKey>,
         parent_label: Option<String>,
     ) -> Self {
-        let (tools, tool_specs, browser_sessions) = role_tools_and_specs(role, ws, full_access);
+        let (tools, tool_specs, chrome_sessions) = role_tools_and_specs(role, ws, full_access);
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let pause_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -539,7 +538,7 @@ impl Agent {
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
-            browser_sessions,
+            chrome_sessions,
         }
     }
 }
@@ -2494,9 +2493,9 @@ pub(crate) async fn run_agent(
     }
     let result = agent.work(message, resume).await;
 
-    // Capture the run-scoped browser-session tracker before the match moves
+    // Capture the run-scoped chrome-session tracker before the match moves
     // `agent` into the outcome — the run-end close needs it after cleanup.
-    let browser_sessions = std::sync::Arc::clone(&agent.browser_sessions);
+    let chrome_sessions = std::sync::Arc::clone(&agent.chrome_sessions);
 
     // A completed Ok result is kept regardless of cancel cause — the token may
     // have fired just as work() finished; downstream finalizers are the
@@ -2553,9 +2552,9 @@ pub(crate) async fn run_agent(
     // Drop the per-agent computer registry entries (observation/target/capture)
     // so they never leak into a later run.
     crate::tools::computer::cleanup_agent_state(&agent_id_for_cleanup);
-    // Close the browser sessions this run opened — chrome-use ≥1.5.101 keeps
+    // Close the chrome sessions this run opened — chrome-use ≥1.5.101 keeps
     // external Chrome tabs alive on daemon idle, so the close must be explicit.
-    crate::tools::browser_daemon::close_run_sessions(&browser_sessions).await;
+    crate::tools::chrome_daemon::close_run_sessions(&chrome_sessions).await;
     outcome
 }
 
@@ -2728,9 +2727,7 @@ mod tests {
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
-            browser_sessions: std::sync::Arc::new(
-                crate::tools::browser::BrowserRunSessions::default(),
-            ),
+            chrome_sessions: std::sync::Arc::new(crate::tools::chrome::ChromeRunSessions::default()),
         }
     }
 

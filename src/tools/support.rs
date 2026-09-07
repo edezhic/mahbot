@@ -338,7 +338,7 @@ impl Tool for InstallChromeUseTool {
     }
 
     async fn execute(&self, _ws: &Workspace, _args: serde_json::Value) -> anyhow::Result<String> {
-        crate::tools::browser_daemon::install_chrome_use()
+        crate::tools::chrome_daemon::install_chrome_use()
             .await
             .map_err(err)?;
 
@@ -363,7 +363,7 @@ impl Tool for InstallChromeUseTool {
              Pinning it to the toolbar is an optional UX tip only — it is NOT required for \
              connectivity (Chrome native messaging, no debug port).\n\
              Only after that will agents be able to drive the user's normal browser via \
-             `browser`.\n\
+             `chrome`.\n\
              Note: this setup is intentionally invasive — chrome-use gets full control \
              over the user's real browser. It must only be run after you (the Support \
              agent) have explained what it does and obtained the user's explicit consent.\n\

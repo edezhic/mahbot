@@ -4,9 +4,9 @@ use anyhow::Context;
 pub(crate) mod active_models;
 pub(crate) mod alarms;
 pub(crate) mod analyze;
-pub mod browser;
-pub mod browser_daemon;
 pub mod bun;
+pub mod chrome;
+pub mod chrome_daemon;
 pub mod computer;
 pub(crate) mod edit;
 pub(crate) mod image_gen;
@@ -159,7 +159,7 @@ pub(crate) fn fit_request_body_budget(
 
 pub(crate) use alarms::{AddAlarmTool, ListAlarmsTool, RemoveAlarmTool};
 pub(crate) use analyze::{AnalyzeTool, DispatchMode};
-pub(crate) use browser::BrowserTool;
+pub(crate) use chrome::ChromeTool;
 pub(crate) use computer::ComputerTool;
 pub(crate) use edit::EditTool;
 pub(crate) use image_gen::ImageGenTool;
@@ -214,7 +214,7 @@ pub(crate) fn with_normalization_notes(output: String, notes: &[String]) -> Stri
 /// Tools with non-standard top-level keys in their top-level schema
 /// (e.g., `oneOf` in WebSearchTool) should not use this directly;
 /// they may still use it internally as a building block (e.g.,
-/// BrowserTool's [`action_entry_schema`] calls it for each inner entry).
+/// ChromeTool's [`action_entry_schema`] calls it for each inner entry).
 #[must_use]
 pub(crate) fn tool_params_schema(
     properties: &serde_json::Value,
@@ -234,7 +234,7 @@ pub(crate) fn tool_params_schema(
 ///
 /// Wraps a `"{"name": inner}"` object in the standard `{"type":"object",
 /// "properties":{name: inner}, "required":[name], "additionalProperties":false,
-/// "description":description}` envelope used by the browser and computer tools'
+/// "description":description}` envelope used by the chrome and computer tools'
 /// nested action schemas. `inner` is built by [`tool_params_schema`], which adds
 /// `"required"` only when non-empty, and then hard-closes the action object.
 #[must_use]
@@ -849,7 +849,7 @@ pub(crate) struct ToolExecutionOutcome {
 
 /// Discriminates the tool that produced an [`ImagePayload`] so the agent loop can
 /// label the injected image with the actual opening phrase ("Read image file",
-/// "Generated image file", "Browser screenshot") without knowing which tool
+/// "Generated image file", "Chrome screenshot") without knowing which tool
 /// produced it — the loop selects the annotation purely by dedup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImagePayloadSource {
@@ -858,9 +858,9 @@ pub(crate) enum ImagePayloadSource {
     /// Tool-produced image (e.g. image_gen), or one derived by the agent loop
     /// from a tool's `[IMAGE:path]` marker.
     Generated,
-    /// Screenshot captured by the browser tool (injected as a native image for
+    /// Screenshot captured by the chrome tool (injected as a native image for
     /// the agent's own visual analysis).
-    Browser,
+    Chrome,
     /// Screen capture from the computer tool (injected as a native image for
     /// the agent's own visual analysis).
     Computer,
@@ -869,13 +869,13 @@ pub(crate) enum ImagePayloadSource {
 impl ImagePayloadSource {
     /// Opening phrase of the injected-image annotation, e.g. "Read image file"
     /// for the read tool's on-disk raster, "Generated image file" for a
-    /// tool-produced image, "Browser screenshot" for the browser's capture.
+    /// tool-produced image, "Chrome screenshot" for the chrome's capture.
     #[must_use]
     pub(crate) fn opener(self) -> &'static str {
         match self {
             Self::Read => "Read image file",
             Self::Generated => "Generated image file",
-            Self::Browser => "Browser screenshot",
+            Self::Chrome => "Chrome screenshot",
             Self::Computer => "Computer screenshot",
         }
     }
@@ -911,7 +911,7 @@ pub(crate) struct ImagePayload {
     /// context (mirrors the `[Recovered path: ...]` note shown for text reads).
     pub recovery_note: Option<String>,
     /// Tool that produced the image, selecting the annotation opener
-    /// ("Read image file", "Generated image file", "Browser screenshot").
+    /// ("Read image file", "Generated image file", "Chrome screenshot").
     pub source: ImagePayloadSource,
 }
 
@@ -1021,6 +1021,8 @@ pub(crate) fn normalize_tool_name(name: &str) -> &str {
         "grep" | "rg" | "grep_search" | "glob" => "search",
         "read_file" => "read",
         "str_replace" => "edit",
+        // pre-rename persisted tool calls (mahbot <0.6) still rebind across restarts
+        "browser" => "chrome",
         _ => name,
     }
 }

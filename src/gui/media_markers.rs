@@ -163,7 +163,7 @@ fn replace_saved_annotations(s: &str) -> String {
 /// Maximum longest side (px) of the rendered image the GUI keeps per image — a
 /// `MAX_IMAGE_LONGEST_SIDE_PX² · 4` = 16 MiB RGBA tile. A larger — but still
 /// valid — raster is decoded under the shared generous raster budget and
-/// DOWNSCALED to this cap so a tall browser screenshot renders (not a
+/// DOWNSCALED to this cap so a tall chrome screenshot renders (not a
 /// placeholder); only a genuinely corrupt / missing / non-image / header-bomb
 /// target degrades to the "🖼️ …" placeholder.
 const MAX_IMAGE_LONGEST_SIDE_PX: u32 = 2048;

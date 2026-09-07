@@ -50,6 +50,6 @@ Then run `mahbot` to start the service, and you'll be asked to provide one of:
 - OpenRouter API key, or
 - a custom OpenAI-compatible endpoint
 
-The rest of the setup will be explained and done through the Support agent. It will help you with configuring the workspace, adding other users, connecting the Telegram bot to comfortably direct mahbot agents from your phone using text, voice msgs & built-in commands, and setting up the search providers & browser use tooling for your agents.
+The rest of the setup will be explained and done through the Support agent. It will help you with configuring the workspace, adding other users, connecting the Telegram bot to comfortably direct mahbot agents from your phone using text, voice msgs & built-in commands, and setting up the search providers & chrome-use tooling for your agents.
 
 Beware that as of now mahbot is only regularly tested on macos & linux, so it might still have unexpected bugs on other platforms.

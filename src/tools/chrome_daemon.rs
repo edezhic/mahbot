@@ -6,13 +6,13 @@
 //! This module classifies health from a daemon-free `status` snapshot
 //! (extension disabled, relay down, host missing, …) and auto-restarts the
 //! daemon with bounded backoff and thrash protection. Real wedge detection is
-//! per-call: a browser command that fails with the daemon-unavailable signature
+//! per-call: a chrome command that fails with the daemon-unavailable signature
 //! marks the daemon unhealthy and wakes the watchdog, which recovers from that
 //! stored classification — the daemon-free status cannot see a wedged daemon,
 //! so the watchdog never re-evaluates over a fail-fast classification. It also
 //! owns the chrome-use CLI invocation primitives (binary name, `--version`
-//! check) so the browser tool depends on this module and not vice versa; the
-//! shared command env/setup lives in [`crate::browser::spawn`].
+//! check) so the chrome tool depends on this module and not vice versa; the
+//! shared command env/setup lives in [`crate::chrome::spawn`].
 //!
 //! mahbot drives the user's real, logged-in Chrome through the chrome-use
 //! extension relay — no chrome-use `--launch` mode, no profile copies, no CDP
@@ -31,17 +31,17 @@
 //! orphaned forever (no other mechanism ever reclaims it).
 //!
 //! Trade-offs:
-//! - A genuine daemon wedge surfaces on the first real browser call, which pays
+//! - A genuine daemon wedge surfaces on the first real chrome call, which pays
 //!   the CLI's ~152 s internal retry before fail-fast marks it unhealthy (worst
 //!   case, rare, and self-healing — the restart clears the wedge).
 //! - `daemon restart` destroys all session state; recovery guidance notes that
-//!   existing browser sessions are reset.
+//!   existing chrome sessions are reset.
 //! - The Chrome auto-launch shares the user's profile and environment, so it may
 //!   open a window unasked; on display-less hosts it is paused rather than spend
 //!   the launch budget (launching can never help there).
 
-use crate::browser::contract::BrowserResponse;
-use crate::browser::spawn::{CliRun, CliSpawn, CliTimeout, ensure_browser_env, spawn_cli};
+use crate::chrome::contract::ChromeResponse;
+use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, ensure_chrome_env, spawn_cli};
 use crate::util::UnwrapPoison;
 use futures_util::future::join_all;
 use serde_json::Value;
@@ -60,7 +60,7 @@ use tracing::{debug, error, info, warn};
 const CLI_TIMEOUT: Duration = Duration::from_secs(8);
 /// Cache TTL for a healthy evaluation (fresh enough for per-call checks).
 const HEALTH_TTL: Duration = Duration::from_secs(10);
-/// Longer TTL for a confirmed-down result, so repeated browser calls fail fast
+/// Longer TTL for a confirmed-down result, so repeated chrome calls fail fast
 /// instead of re-evaluating on every invocation.
 const UNHEALTHY_TTL: Duration = Duration::from_mins(1);
 /// Watchdog cadence between automatic health evaluations.
@@ -428,7 +428,7 @@ pub(crate) fn is_daemon_unavailable_code(code: Option<&str>) -> bool {
 }
 
 /// Get the platform-appropriate chrome-use binary name.
-pub(crate) const fn browser_bin() -> &'static str {
+pub(crate) const fn chrome_bin() -> &'static str {
     if cfg!(target_os = "windows") {
         "chrome-use.exe"
     } else {
@@ -545,7 +545,7 @@ fn invalidate_cli_path() {
 /// `extra_shell_path_prefixes`). Candidates must be executable (`execvp` would
 /// skip a non-executable PATH entry, so we do too).
 fn find_cli_binary() -> Option<PathBuf> {
-    let name = browser_bin();
+    let name = chrome_bin();
     if let Some(dir) = crate::util::managed_bin::storage_bin_dir() {
         let candidate = dir.join(name);
         if crate::util::is_executable(&candidate) {
@@ -606,7 +606,7 @@ pub(crate) async fn cli_probe() -> CliStatus {
         return CliStatus::Missing;
     };
     let mut cmd = Command::new(&path);
-    ensure_browser_env(&mut cmd);
+    ensure_chrome_env(&mut cmd);
     cmd.arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -675,7 +675,7 @@ fn release_asset_name() -> Result<String, String> {
 pub(crate) async fn cli_version() -> Option<semver::Version> {
     let path = cli_path()?;
     let mut cmd = Command::new(&path);
-    ensure_browser_env(&mut cmd);
+    ensure_chrome_env(&mut cmd);
     cmd.arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -690,7 +690,7 @@ pub(crate) async fn cli_version() -> Option<semver::Version> {
     parse_cli_version(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Spawn a chrome-use CLI call through [`crate::browser::spawn::spawn_cli`] with
+/// Spawn a chrome-use CLI call through [`crate::chrome::spawn::spawn_cli`] with
 /// the shared env, `--json`, and an optional `--session`, bounded by
 /// [`CLI_TIMEOUT`] — a wedged daemon hangs inside the CLI's own ~152 s retry
 /// loop, so every call must be bounded.
@@ -721,7 +721,7 @@ async fn run_cli_bounded(args: &[&str], session: Option<&str>) -> Option<std::pr
 async fn run_cli_json_opt(args: &[&str], session: Option<&str>) -> Result<Value, Option<String>> {
     let out = run_cli_bounded(args, session).await.ok_or(None)?;
     let v: Value = serde_json::from_slice(&out.stdout).map_err(|_| None)?;
-    let env = BrowserResponse::from_value(&v);
+    let env = ChromeResponse::from_value(&v);
     if !out.status.success() || env.verdict() != Some(true) {
         return Err(env.error.filter(|e| !e.is_empty()));
     }
@@ -922,7 +922,7 @@ async fn tasklist_has(name: &str) -> Option<bool> {
 }
 
 /// Classify daemon health from the daemon-free `status` snapshot. Wedges are
-/// invisible to this check by design — a real browser call that fails with the
+/// invisible to this check by design — a real chrome call that fails with the
 /// daemon-unavailable signature marks the daemon unhealthy via [`note_unhealthy`]
 /// (fail-fast) and wakes the watchdog, which recovers from that stored cause.
 /// A healthy snapshot also drives the extension-skew advisory (single `status`
@@ -1011,7 +1011,7 @@ pub(crate) async fn sweep_session(name: &str) {
         debug!(
             session = name,
             ?failure,
-            "tab sweep skipped — browser service unavailable"
+            "tab sweep skipped — chrome service unavailable"
         );
         return;
     }
@@ -1083,14 +1083,14 @@ pub(crate) async fn sweep_session(name: &str) {
     sweep_warn_transition(SweepWarn::Deferred);
 }
 
-/// Close the browser sessions one agent run's browser tooling used, via the
+/// Close the chrome sessions one agent run's chrome tooling used, via the
 /// created-only close (`--session <name> close` — chrome-use drops the
 /// session's own tabs without enumerating anything, so the user's own tabs
 /// are never touched). Best-effort and strictly warn-only: a failed close
 /// (daemon down, wedged CLI) leaks the session's tabs — an accepted edge, the
 /// same class as the other cleanup paths. Called from the agent run end
 /// (`run_agent`).
-pub(crate) async fn close_run_sessions(sessions: &super::browser::BrowserRunSessions) {
+pub(crate) async fn close_run_sessions(sessions: &super::chrome::ChromeRunSessions) {
     let names = sessions.snapshot();
     if names.is_empty() {
         return;
@@ -1102,7 +1102,7 @@ pub(crate) async fn close_run_sessions(sessions: &super::browser::BrowserRunSess
             warn!(
                 session = name,
                 ?failure,
-                "agent-run browser session close skipped — browser service unavailable"
+                "agent-run chrome session close skipped — chrome service unavailable"
             );
         }
         return;
@@ -1115,30 +1115,34 @@ async fn close_run_session(name: &str) {
     match run_cli_bounded(&["close"], Some(name)).await {
         None => warn!(
             session = name,
-            "agent-run browser session close timed out or daemon unavailable — tabs may leak until closed by hand"
+            "agent-run chrome session close timed out or daemon unavailable — tabs may leak until closed by hand"
         ),
         Some(out) if !out.status.success() => warn!(
             session = name,
-            "agent-run browser session close failed: {}",
+            "agent-run chrome session close failed: {}",
             // run_cli_bounded nulls stderr — the envelope error on stdout is
             // the only failure detail available.
-            BrowserResponse::from_value(&serde_json::from_slice(&out.stdout).unwrap_or_default())
+            ChromeResponse::from_value(&serde_json::from_slice(&out.stdout).unwrap_or_default())
                 .error
                 .unwrap_or_else(|| {
                     let status = out.status;
                     format!("exit status {status}")
                 })
         ),
-        Some(_) => debug!(session = name, "agent-run browser session closed"),
+        Some(_) => debug!(session = name, "agent-run chrome session closed"),
     }
 }
 
 /// Only mahbot-owned session names may be swept — link-enricher-* and ephemeral
-/// `mahbot-browser-ephemeral-*` CLI sessions (orphan protection). Named
-/// `mahbot-browser-<name>` sessions and user/default/agent-tab sessions are
-/// never touched (strict-scope rule).
+/// `mahbot-chrome-ephemeral-*` CLI sessions (orphan protection). Named
+/// `mahbot-chrome-<name>` sessions and user/default/agent-tab sessions are
+/// never touched (strict-scope rule). The legacy pre-rename
+/// `mahbot-browser-ephemeral-*` prefix still matches so orphans left by older
+/// builds don't leak.
 fn is_mahbot_session_name(name: &str) -> bool {
-    name.starts_with("link-enricher-") || name.starts_with(crate::browser::CLI_EPHEMERAL_PREFIX)
+    name.starts_with("link-enricher-")
+        || name.starts_with(crate::chrome::CLI_EPHEMERAL_PREFIX)
+        || name.starts_with("mahbot-browser-ephemeral-")
 }
 
 /// Causes the sweep warns about — warn once per cause transition so a
@@ -1258,7 +1262,7 @@ async fn session_tab_list(name: &str, deadline: Instant) -> Option<Vec<SweepTab>
 /// the tab by hand unblocks the session — the sweep logs this signal and keeps
 /// retrying. An orphan the extension fully dropped (service-worker restart)
 /// never produces these; it is invisible to every CLI path (see the sweep's
-/// pinned-behaviors note). Real browser calls hitting this state fail fast
+/// pinned-behaviors note). Real chrome calls hitting this state fail fast
 /// with the same guidance without marking the daemon unhealthy — see
 /// [`unreachable_tab_message`]. The "or the relay lost it" variant is a
 /// permanent orphan (the relay dropped the attach); "navigated across
@@ -1283,7 +1287,7 @@ pub(crate) fn unreachable_tab_message(error: &str) -> String {
     format!(
         "{error}. The chrome-use extension lost its debugger attach to this tab and never \
          re-attaches about:blank tabs — close the leftover tab in Chrome to unblock this \
-         session (the browser daemon itself is healthy)."
+         session (the chrome daemon itself is healthy)."
     )
 }
 
@@ -1403,7 +1407,7 @@ pub(crate) fn is_advertised() -> bool {
 /// Mark the daemon unhealthy immediately (fail-fast path) with the cause the
 /// error text points to, and wake the watchdog so recovery starts without
 /// waiting for the next interval. Unreachable-tab errors never reach this path
-/// — the browser tool's fail-fast guard bails with hand-close guidance first
+/// — the chrome tool's fail-fast guard bails with hand-close guidance first
 /// (recovery cannot fix a Chrome-side orphan, so none is attempted).
 pub(crate) fn note_unhealthy(error: &str) {
     // Same classification as the watchdog's health evaluation — the two
@@ -1421,7 +1425,7 @@ pub(crate) fn daemon_down_message() -> String {
     let h = health().lock().unwrap_poison();
     let cause = match h.last_failure {
         Some(ProbeFailure::NotInstalled) => {
-            "The chrome-use extension or native host is not installed — the browser daemon \
+            "The chrome-use extension or native host is not installed — the chrome daemon \
              cannot run. Enable the chrome-use extension at chrome://extensions (or reinstall \
              the chrome-use CLI); health recovers automatically once it is installed."
         }
@@ -1466,9 +1470,7 @@ pub(crate) fn daemon_down_message() -> String {
              debugger attach; about:blank tabs are never re-attached) — close the leftover \
              tab in Chrome to unblock the session."
         }
-        Some(ProbeFailure::DaemonWedge) | None => {
-            "The chrome-use browser daemon is down or unresponsive."
-        }
+        Some(ProbeFailure::DaemonWedge) | None => "The chrome daemon is down or unresponsive.",
     };
     let recovery = if matches!(h.last_failure, Some(ProbeFailure::ChromeNotRunning)) {
         // ChromeNotRunning has its own launch budget, so a halted RESTART state
@@ -1499,15 +1501,15 @@ pub(crate) fn daemon_down_message() -> String {
          automatically once the underlying issue is resolved."
     } else {
         " Auto-recovery was triggered and will restart it automatically — no manual action is \
-         needed (note: the restart resets browser sessions)."
+         needed (note: the restart resets chrome sessions)."
     };
     format!(
         "{cause}{recovery} While it's down, use web_search, or shell `curl` for page fetches, \
-         instead of the browser tool."
+         instead of the chrome tool."
     )
 }
 
-/// Bounded post-timeout health evaluation, deciding what a timed-out browser
+/// Bounded post-timeout health evaluation, deciding what a timed-out chrome
 /// call means. `status` is daemon-free and by design cannot see a wedged
 /// session daemon (wedges are invisible to it), and the mahbot-side per-call
 /// bound cuts the CLI off before its own ~152 s retry loop can surface the
@@ -1602,7 +1604,7 @@ pub async fn run_watchdog() {
                         if cli_present != Some(false) {
                             cli_present = Some(false);
                             warn!(
-                                "chrome-use CLI not found — browser daemon watchdog standing down"
+                                "chrome-use CLI not found — chrome daemon watchdog standing down"
                             );
                         }
                         // Re-check rarely on CLI-less hosts so the watchdog
@@ -1761,7 +1763,7 @@ async fn download_chrome_use_binary(tag: &str) -> Result<(tempfile::TempDir, Pat
     let out_path = crate::util::managed_bin::extract_single_file_tar_gz(
         &archive_path,
         dir.path(),
-        browser_bin(),
+        chrome_bin(),
     )?;
     Ok((dir, out_path))
 }
@@ -1783,7 +1785,7 @@ pub(crate) async fn install_chrome_use() -> Result<(), String> {
 
     let dest = crate::util::managed_bin::storage_bin_dir()
         .ok_or_else(|| "managed chrome-use bin dir unavailable (storage root not set)".to_string())?
-        .join(browser_bin());
+        .join(chrome_bin());
     let parent = dest
         .parent()
         .ok_or_else(|| format!("invalid chrome-use install path {}", dest.display()))?;
@@ -1967,7 +1969,7 @@ pub async fn run_auto_update() {
     info!("chrome-use auto-updated to {latest} (binary in place)");
 }
 
-/// One-time cleanup of stale mahbot-owned browser-session artifacts at watchdog
+/// One-time cleanup of stale mahbot-owned chrome-session artifacts at watchdog
 /// start: leftover link-enricher sessions get swept so their tab groups don't
 /// accumulate. Each sweep is verified (round-over-round convergence) and only
 /// ever closes the target session's own tabs — sessions owned by other agents
@@ -2036,12 +2038,12 @@ const CHROME_LAUNCH_FLAGS: [&str; 3] = [
 /// Launch the user's real Chrome when [`ProbeFailure::ChromeNotRunning`], within
 /// a bounded launch budget separate from daemon restarts. Display-less hosts
 /// are unfixable here: paused, no budget consumed. The launch inherits mahbot's
-/// real environment (NOT `ensure_browser_env` — its HOME override and daemon
+/// real environment (NOT `ensure_chrome_env` — its HOME override and daemon
 /// flags must never reach the user's browser) and waits for the relay.
 async fn attempt_chrome_launch() {
     if !display_available() {
         record_launch_outcome(ChromeLaunchOutcome::NoDisplay);
-        debug!("browser daemon: headless host — Chrome launch skipped; start Chrome manually");
+        debug!("chrome daemon: headless host — Chrome launch skipped; start Chrome manually");
         return;
     }
     let gate = { health().lock().unwrap_poison().gate_launch(Instant::now()) };
@@ -2070,7 +2072,7 @@ async fn attempt_chrome_launch() {
     // the restart path) — the launch budget resets only on sustained health.
     set_health_after_recovery(outcome);
     if outcome.is_healthy() {
-        info!("browser daemon: relay recovered after Chrome launch");
+        info!("chrome daemon: relay recovered after Chrome launch");
     } else {
         record_launch_outcome(ChromeLaunchOutcome::Launched);
         warn!(
@@ -2256,7 +2258,7 @@ fn warn_transition(failure: ProbeFailure) {
              tab in Chrome to unblock the session"
         ),
         ProbeFailure::DaemonWedge => {
-            warn!("browser daemon is unresponsive — restarting it (bounded backoff).");
+            warn!("chrome daemon is unresponsive — restarting it (bounded backoff).");
         }
     }
 }
@@ -2267,14 +2269,14 @@ fn log_gate_denied(gate: RecoveryGate, noun: &str, max: u32) {
     match gate {
         RecoveryGate::Halted => error!(
             attempts = max,
-            "browser daemon: {max} consecutive failed {noun} attempts; \
+            "chrome daemon: {max} consecutive failed {noun} attempts; \
              auto-recovery halted for 30 min (thrash protection)"
         ),
         RecoveryGate::Backoff => {
-            debug!("browser daemon: still down; waiting out {noun} backoff");
+            debug!("chrome daemon: still down; waiting out {noun} backoff");
         }
         RecoveryGate::Cooldown => {
-            debug!("browser daemon: still down; {noun} cooldown in progress (thrash protection)");
+            debug!("chrome daemon: still down; {noun} cooldown in progress (thrash protection)");
         }
         RecoveryGate::Allowed(_) => unreachable!(),
     }
@@ -2322,7 +2324,7 @@ async fn attempt_recovery(mut failure: ProbeFailure) {
         set_health(outcome);
         match outcome {
             ProbeOutcome::Healthy => {
-                info!("browser daemon: relay recovered without a restart");
+                info!("chrome daemon: relay recovered without a restart");
                 return;
             }
             ProbeOutcome::Down(f) => {
@@ -2356,7 +2358,7 @@ async fn attempt_recovery(mut failure: ProbeFailure) {
     info!(
         attempt,
         max = MAX_RESTART_ATTEMPTS,
-        "browser daemon: attempting auto-recovery"
+        "chrome daemon: attempting auto-recovery"
     );
     // Restart session daemons (session-less; closes their tabs, relay survives).
     // No `reconnect` — it can cold-restart the user's Chrome or open the Web
@@ -2372,11 +2374,11 @@ async fn attempt_recovery(mut failure: ProbeFailure) {
     // genuine health, so a run that keeps failing cannot reopen a fresh cycle.
     set_health_after_recovery(outcome);
     if outcome.is_healthy() {
-        info!("browser daemon: recovered after restart");
+        info!("chrome daemon: recovered after restart");
     } else {
         warn!(
             attempt,
-            "browser daemon: restart attempt did not restore health"
+            "chrome daemon: restart attempt did not restore health"
         );
     }
 }
@@ -2386,7 +2388,7 @@ async fn run_cli(args: &[&str]) -> bool {
         return false;
     };
     let mut cmd = Command::new(path);
-    ensure_browser_env(&mut cmd);
+    ensure_chrome_env(&mut cmd);
     cmd.args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

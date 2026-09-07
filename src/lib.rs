@@ -15,8 +15,8 @@ pub mod alarms;
 pub mod audio;
 pub mod bench_openrouter;
 pub(crate) mod boot;
-pub(crate) mod browser;
 pub mod channels;
+pub(crate) mod chrome;
 pub mod config;
 pub mod config_db;
 pub(crate) mod consensus;
@@ -53,9 +53,9 @@ pub mod workspace;
 #[cfg(unix)]
 pub use tools::shell::grep_engine::run_engine as run_grep_engine;
 
-/// `mahbot browser` subcommand entry (dispatched from `main()` before the
-/// instance lock — headless browser automation that runs alongside the daemon).
-pub use browser::cli::run_cli as run_browser_cli;
+/// `mahbot chrome` subcommand entry (dispatched from `main()` before the
+/// instance lock — browser automation that runs alongside the daemon).
+pub use chrome::cli::run_cli as run_chrome_cli;
 
 /// Test/subprocess-harness rewrite entry with an explicit home (fixture `~`
 /// operands); production single-file gate. Only compiled for the e2e harness.
@@ -737,9 +737,9 @@ pub struct Agent {
     workspace: Arc<crate::Workspace>,
     /// Agent-owned tool set.
     tools: Vec<Box<dyn crate::Tool>>,
-    /// Browser sessions this run's browser tooling used — closed at run end
+    /// Chrome sessions this run's chrome tooling used — closed at run end
     /// (chrome-use ≥1.5.101 no longer closes external Chrome tabs on daemon idle).
-    browser_sessions: std::sync::Arc<crate::tools::browser::BrowserRunSessions>,
+    chrome_sessions: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
     /// Cached tool specs — computed once from `tools` at construction time.
     pub(crate) tool_specs: Vec<ToolSpec>,
     /// Cancellation token for cooperative mid-loop cancellation (a deliberate
@@ -1132,7 +1132,7 @@ pub(crate) trait Tool: Send + Sync {
     ///
     /// There are three distinct policy patterns across the codebase:
     ///
-    /// 1. **Scrub-all** (trait default: `true`) — web_search, browser, edit,
+    /// 1. **Scrub-all** (trait default: `true`) — web_search, chrome, edit,
     ///    analyze, ticket, media-gen tools, and most others. The raw output may
     ///    contain credentials, so it is always scrubbed before the LLM sees it.
     ///
@@ -1176,7 +1176,7 @@ pub(crate) trait Tool: Send + Sync {
     ///
     /// Returns `true` by default. Tools backed by an external daemon/service
     /// override this to hide themselves while that service is down, so the
-    /// model doesn't burn calls against a dead backend (e.g. browser when the
+    /// model doesn't burn calls against a dead backend (e.g. chrome when the
     /// chrome-use daemon is unreachable).
     ///
     /// The result is read once when an agent is constructed and kept for the

@@ -1,9 +1,9 @@
-//! Shared browser automation core: the chrome-use CLI spawn mechanics and the
-//! tolerant envelope contract that every browser frontend needs.
+//! Shared chrome automation core: the chrome-use CLI spawn mechanics and the
+//! tolerant envelope contract that every chrome frontend needs.
 //!
-//! Frontends own everything user-facing: the interactive `browser` tool
-//! ([`crate::tools::browser`]) owns its LLM-facing framing and error texts,
-//! and the `mahbot browser` CLI ([`cli`]) owns its stdout/exit-code emission.
+//! Frontends own everything user-facing: the interactive `chrome` tool
+//! ([`crate::tools::chrome`]) owns its LLM-facing framing and error texts,
+//! and the `mahbot chrome` CLI ([`cli`]) owns its stdout/exit-code emission.
 //! The per-action descriptor registry ([`actions`]) is the ONE shared source
 //! of LLM-facing action descriptions, rendered by both frontends (the tool's
 //! parameter schema and the CLI help); outside that registry this module still
@@ -23,16 +23,16 @@ pub(crate) mod contract;
 pub(crate) mod forms;
 pub(crate) mod spawn;
 
-/// Name prefix of every session the `mahbot browser` CLI creates (named and
+/// Name prefix of every session the `mahbot chrome` CLI creates (named and
 /// ephemeral). The interactive tool keeps `agent-tab-*`; link enrichment keeps
 /// `link-enricher-*`.
-pub(crate) const CLI_SESSION_PREFIX: &str = "mahbot-browser-";
+pub(crate) const CLI_SESSION_PREFIX: &str = "mahbot-chrome-";
 
 /// Prefix of per-invocation ephemeral CLI sessions — the ONLY CLI prefix the
 /// daemon-side sweep may close (orphan protection after crashes); named
-/// `mahbot-browser-<name>` sessions are never swept (cookie persistence is a
+/// `mahbot-chrome-<name>` sessions are never swept (cookie persistence is a
 /// feature).
-pub(crate) const CLI_EPHEMERAL_PREFIX: &str = "mahbot-browser-ephemeral-";
+pub(crate) const CLI_EPHEMERAL_PREFIX: &str = "mahbot-chrome-ephemeral-";
 
 /// IP networks [`validate_url`] refuses to navigate to — the unambiguous
 /// metadata/link-local targets only: link-local (incl. the 169.254.169.254
@@ -67,7 +67,7 @@ pub(crate) fn validate_url(url: &str) -> anyhow::Result<()> {
 
     // Block file:// case-insensitively — it bypasses SSRF controls.
     if url.to_ascii_lowercase().starts_with("file://") {
-        anyhow::bail!("file:// URLs are not allowed in browser automation");
+        anyhow::bail!("file:// URLs are not allowed in chrome automation");
     }
 
     // url::Url lowercases scheme+host, so "HTTP://EXAMPLE.COM" passes and

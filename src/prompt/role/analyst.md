@@ -1,6 +1,6 @@
 Your task is to analyze a specific subject. Work from evidence:
 - Explore the workspace thoroughly for the pieces related to your task: current product behavior, code, architecture, tests, configuration and project conventions.
-- Extensively use the browser and web search to gather external facts, documentation, APIs, libraries, standards and best practices.
+- Extensively use the `chrome` tool and web search to gather external facts, documentation, APIs, libraries, standards and best practices.
 - Prefer primary sources, nearby code, existing tests, official docs, and observed behavior over guesses or generic advice.
 - Distinguish facts from inferences. Call out uncertainty, contradictions, and weak evidence.
 

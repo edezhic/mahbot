@@ -52,7 +52,7 @@ pub(crate) struct CliSpawn<'a> {
 pub(crate) enum CliRun {
     Output(std::process::Output),
     /// chrome-use binary not found (caller resolved `path` from
-    /// `browser_daemon::cli_path()`, so this is a vanished-binary race).
+    /// `chrome_daemon::cli_path()`, so this is a vanished-binary race).
     SpawnFailure,
     /// Bounded call exceeded its deadline (child killed).
     TimedOut,
@@ -61,7 +61,7 @@ pub(crate) enum CliRun {
 /// Set HOME, `CHROMIUM_FLAGS`, and default timeout env vars on the command
 /// so that the Chromium spawned by chrome-use works in service/docker
 /// environments.
-pub(crate) fn ensure_browser_env(cmd: &mut Command) {
+pub(crate) fn ensure_chrome_env(cmd: &mut Command) {
     if std::env::var_os("HOME").is_none() {
         cmd.env("HOME", "/tmp");
     }
@@ -88,7 +88,7 @@ pub(crate) fn ensure_browser_env(cmd: &mut Command) {
     // Keep the upgrade-available banner out of every command's stderr.
     cmd.env("CHROME_USE_NO_UPDATE_CHECK", "1");
     cmd.env("AGENT_BROWSER_NO_UPDATE_CHECK", "1");
-    // The watchdog owns recovery. Without these, a browser command issued while
+    // The watchdog owns recovery. Without these, a chrome command issued while
     // the relay is down makes the CLI kill session daemons / the native host
     // and wait up to 45s for a relay revive — racing the watchdog's own
     // cause-aware recovery and turning a health check into a 45s stall.
@@ -97,14 +97,14 @@ pub(crate) fn ensure_browser_env(cmd: &mut Command) {
 }
 
 /// Spawn a chrome-use CLI invocation per [`CliSpawn`]: apply
-/// [`ensure_browser_env`], the caller's args, the optional `--json` / `--session
+/// [`ensure_chrome_env`], the caller's args, the optional `--json` / `--session
 /// <s>` suffixes, pipe stdout and stderr per the `json` / `capture_stderr`
 /// flags, and kill-on-drop. A bounded call that hits its deadline reports
 /// [`CliRun::TimedOut`]; any spawn IO error is folded into
 /// [`CliRun::SpawnFailure`].
 pub(crate) async fn spawn_cli(spec: CliSpawn<'_>) -> CliRun {
     let mut cmd = Command::new(spec.path);
-    ensure_browser_env(&mut cmd);
+    ensure_chrome_env(&mut cmd);
     cmd.args(spec.args);
     if spec.json {
         cmd.arg("--json").stdout(std::process::Stdio::piped());
@@ -140,7 +140,7 @@ mod tests {
     use crate::util::test::set_env_var;
     use tokio::process::Command;
 
-    /// Read an env var explicitly set on the command by `ensure_browser_env`.
+    /// Read an env var explicitly set on the command by `ensure_chrome_env`.
     fn cmd_env(cmd: &Command, key: &str) -> Option<String> {
         cmd.as_std()
             .get_envs()
@@ -149,27 +149,27 @@ mod tests {
     }
 
     #[test]
-    fn ensure_browser_env_defaults_home_only_when_missing() {
+    fn ensure_chrome_env_defaults_home_only_when_missing() {
         {
             let _guard = set_env_var("HOME", None);
             let mut cmd = Command::new("true");
-            ensure_browser_env(&mut cmd);
+            ensure_chrome_env(&mut cmd);
             assert_eq!(cmd_env(&cmd, "HOME").as_deref(), Some("/tmp"));
         }
         {
             let _guard = set_env_var("HOME", Some("/home/user"));
             let mut cmd = Command::new("true");
-            ensure_browser_env(&mut cmd);
+            ensure_chrome_env(&mut cmd);
             assert_eq!(cmd_env(&cmd, "HOME"), None);
         }
     }
 
     #[test]
-    fn ensure_browser_env_defaults_chromium_flags_only_when_missing() {
+    fn ensure_chrome_env_defaults_chromium_flags_only_when_missing() {
         {
             let _guard = set_env_var("CHROMIUM_FLAGS", None);
             let mut cmd = Command::new("true");
-            ensure_browser_env(&mut cmd);
+            ensure_chrome_env(&mut cmd);
             assert_eq!(
                 cmd_env(&cmd, "CHROMIUM_FLAGS").as_deref(),
                 Some("--no-first-run --no-default-browser-check --disable-gpu")
@@ -178,15 +178,15 @@ mod tests {
         {
             let _guard = set_env_var("CHROMIUM_FLAGS", Some("--headless"));
             let mut cmd = Command::new("true");
-            ensure_browser_env(&mut cmd);
+            ensure_chrome_env(&mut cmd);
             assert_eq!(cmd_env(&cmd, "CHROMIUM_FLAGS"), None);
         }
     }
 
     #[test]
-    fn ensure_browser_env_sets_fixed_env_vars() {
+    fn ensure_chrome_env_sets_fixed_env_vars() {
         let mut cmd = Command::new("true");
-        ensure_browser_env(&mut cmd);
+        ensure_chrome_env(&mut cmd);
         assert_eq!(
             cmd_env(&cmd, "AGENT_BROWSER_DEFAULT_TIMEOUT").as_deref(),
             Some("15000")

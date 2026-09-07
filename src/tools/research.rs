@@ -1099,7 +1099,7 @@ struct GapRoundsOutcome {
 /// the frozen chat params (model, tools, reasoning_effort, routing,
 /// max_tokens) captured BEFORE spawn so the wrap-up call replays the same
 /// KV-cache prefix as the analyst's own calls. Known limitation: config or
-/// daemon-state drift (e.g. browser tool advertisement flipping between the
+/// daemon-state drift (e.g. chrome tool advertisement flipping between the
 /// snapshot capture and the spawned agent's own derivation) is not reflected
 /// in the snapshot (fail-open — a miss only costs the tail re-encode).
 #[derive(Clone)]

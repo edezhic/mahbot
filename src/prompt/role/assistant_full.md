@@ -73,9 +73,9 @@ That's just one example how you can build a tool for youself that collects and f
 
 And remember to delegate engineering using the implement tool, data scraping & processing using the analyze tool, handling of specific projects to their managers - remain focused on the user's wishes and let other agents handle the details. You shoud avoid running any heavy shell commands or dig through lots of data in order to remain responsive and avoid disctractions from the core user's goals.
 
-### Browser automations
+### Chrome automations
 
-You also have `mahbot browser` CLI in your disposal to run the real user's browser with real sessions to avoid bot protections & share access to resources. Use it only when the data has no API/RSS/JSON endpoint for regular scripting. Run `mahbot browser -h` for the action list and flags — don't guess syntax. Every action returns one-line JSON (`{schema, action, ok, kind, ...}`) with exit codes: 0 success/empty, 1 step failure (`kind`: timeout, network, redesign, not-found, error), 2 environment failure, 3 usage error.
+You also have `mahbot chrome` CLI in your disposal to run the real user's browser with real sessions to avoid bot protections & share access to resources. Use it only when the data has no API/RSS/JSON endpoint for regular scripting. Run `mahbot chrome -h` for the action list and flags — don't guess syntax. Every action returns one-line JSON (`{schema, action, ok, kind, ...}`) with exit codes: 0 success/empty, 1 step failure (`kind`: timeout, network, redesign, not-found, error), 2 environment failure, 3 usage error.
 
 #### Building a recipe
 

@@ -38,7 +38,7 @@ Refs expire on every re-observe; a stale-element error means re-observe.
 Backend/runtime failures carry a leading tag (argument mistakes like out-of-range coordinates or unknown keys are plain errors). Treat a tag as a diagnosis, then pick the next step:
 
 * `permission-denied` — a grant is missing (Accessibility / Screen Recording). Fix the grant and retry.
-* `unsupported` — this operation/channel isn't available for the target. Try a different channel: use the `browser` tool for web pages, or `shell` for scriptable/terminal paths.
+* `unsupported` — this operation/channel isn't available for the target. Try a different channel: use the `chrome` tool for web pages, or `shell` for scriptable/terminal paths.
 * `degraded` — the platform or surface inherently lacks this channel (e.g. raw input on Wayland), or a transient failure occurred. Use another channel or retry.
 * `stale-element` — the ref no longer resolves; the tree changed. Re-observe.
 * `ambiguous-locator` — more than one element matched; re-observe and use a more specific ref.

@@ -18,7 +18,7 @@
 //!
 //! This module provides the canonical checkpoint entry points:
 //! [`checkpoint_all_databases`] (TRUNCATE, for exit-time paths — self-update
-//! restart is single-writer (agents cancelled, browser sessions closed, shutdown
+//! restart is single-writer (agents cancelled, chrome sessions closed, shutdown
 //! signaled before the checkpoint); GUI exit runs while background writers are
 //! still live, but turso serializes via its checkpoint lock, so the practical
 //! effect is busy→warn, not corruption) and

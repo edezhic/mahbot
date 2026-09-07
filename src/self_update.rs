@@ -213,7 +213,7 @@ async fn release_instance_lock() {
 /// alive and must re-claim the lock.
 ///
 /// This is a recoverable path: it runs during self-update after all agents
-/// have been cancelled, browser sessions closed, and shutdown signaled.
+/// have been cancelled, chrome sessions closed, and shutdown signaled.
 async fn reacquire_instance_lock() -> Result<()> {
     let mutex = INSTANCE_LOCK
         .get()
@@ -953,7 +953,7 @@ async fn finalize_install(
 ///    be aborted by a window close or SIGINT racing the checkpoint. No failure
 ///    transitions with 'service shutting down' comments fire — agents that
 ///    cannot finish stay status='launched' and boot-resume. The drain semantics
-///    are unchanged; then `close_all_browser_sessions()` releases the browser
+///    are unchanged; then `close_all_chrome_sessions()` releases the browser
 ///    tabs the update path still owns.
 /// 2. Checkpoint all databases BEFORE releasing the instance lock and spawning
 ///    the replacement. `exit(0)` below bypasses Rust destructors, so Turso
@@ -990,7 +990,7 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
     crate::shutdown::drain_begin();
     let token = crate::shutdown::shutdown_token();
     token.cancelled().await;
-    crate::tools::browser::close_all_browser_sessions().await;
+    crate::tools::chrome::close_all_chrome_sessions().await;
 
     // 2. Checkpoint all databases BEFORE releasing the instance lock and
     //    spawning the replacement (see doc comment above).
