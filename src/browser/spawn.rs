@@ -3,10 +3,12 @@
 //! A wedged daemon hangs inside the CLI's own ~152 s retry loop, so every
 //! health/watchdog/sweep call is deadline-bounded (the shutdown close path is
 //! instead bounded by its outer total-budget timeout); the interactive tool
-//! deliberately does NOT bound its dispatch — the CLI's internal retries must
-//! finish so daemon-unavailable signatures reach the tool's fail-fast guard.
-//! One helper, [`spawn_cli`], plus the per-call timeout and cancellation
-//! policies.
+//! bounds its dispatch itself per-call (open 15s, networkidle wait 10s,
+//! default 8s) via `CliTimeout::Bounded`, and on a timeout runs a bounded
+//! health evaluation — failing fast with daemon guidance when the daemon is
+//! down or wedged (a second consecutive hang on a session-daemon probe), since
+//! the mahbot-side bound cuts off the CLI's own wedge signature. One helper,
+//! [`spawn_cli`], plus the per-call timeout and cancellation policies.
 
 use std::path::Path;
 use std::time::Duration;
@@ -15,7 +17,8 @@ use tokio::process::Command;
 /// Per-call timeout policy for a chrome-use CLI call.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CliTimeout {
-    /// No per-call bound — the interactive tool path (see module doc).
+    /// No per-call bound — only the shutdown close path uses it (its own outer
+    /// total-budget timeout bounds the whole cleanup sequence; see module doc).
     Unbounded,
     /// Kill the child after the deadline (`kill_on_drop` makes dropping the
     /// read future fatal).
@@ -37,11 +40,11 @@ pub(crate) struct CliSpawn<'a> {
     /// Pipe stderr (needed when the caller reads failure details from it);
     /// otherwise null it.
     pub(crate) capture_stderr: bool,
-    /// Kill the child when the awaiting future is dropped (task cancellation)
-    /// instead of letting it run to completion. The interactive tool leaves
-    /// this off — its calls always run to completion, and a cancelled agent
-    /// run must not kill a chrome-use retry mid-flight; daemon-side and CLI
-    /// callers kill.
+    /// Kill the child when the awaiting future is dropped (task cancellation
+    /// or a `Bounded` timeout) instead of letting it run to completion. Every
+    /// caller kills — once the interactive tool's dispatch became bounded,
+    /// letting a timed-out call's chrome-use child keep retrying in the
+    /// background has no upside.
     pub(crate) cancel_kills: bool,
     pub(crate) timeout: CliTimeout,
 }

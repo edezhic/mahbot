@@ -1382,6 +1382,7 @@ mod tests {
             data: Some(data),
             error: None,
             code: None,
+            retryable: None,
         };
         // chrome-use 1.5.101 wraps eval output as {origin, result}.
         assert_eq!(

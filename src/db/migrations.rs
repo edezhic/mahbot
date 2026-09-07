@@ -2301,6 +2301,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// asserted explicitly. This also proves
     /// Turso honors `IF NOT EXISTS` on the FTS index when the baseline re-runs it.
     #[tokio::test]
+    #[expect(clippy::too_many_lines)]
     async fn old_catalog_current_db_reopens_as_noop() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();

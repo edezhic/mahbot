@@ -1226,12 +1226,24 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
             job_id.clone(),
         )
         .await;
-        // 2 re-run slots × (turn + verdict extraction) = 4 LLM calls; a fresh
-        // rebuild would have re-run all 3 slots (6 calls).
-        assert_eq!(
-            fake.request_fingerprints.lock().unwrap().len(),
-            4,
-            "the Done slot must be reconstructed from its stored outcome, not re-run",
+        // The two not-Done slots are re-run from their STORED tasks (the only
+        // prompts that may appear), while the Done slot's stored task is never
+        // dispatched. An exact call count would be racy here: the slots run in
+        // parallel and pop the shared scripted responses in arbitrary order,
+        // so one slot's verdict extraction can pop the other's prose turn
+        // response and retry — retries still carry only the stored tasks.
+        let fps = fake.request_fingerprints.lock().unwrap();
+        for task in ["resume task 1", "resume task 2"] {
+            assert!(
+                fps.iter().any(|f| f.contains(task)),
+                "the not-Done slot must be re-run with its stored task: {task}"
+            );
+        }
+        assert!(
+            fps.iter()
+                .all(|f| f.contains("resume task 1") || f.contains("resume task 2")),
+            "only the not-Done slots' stored tasks may be dispatched — a fresh rebuild \
+             (derived tasks) or a re-run of the Done slot is a resume regression"
         );
     }
 

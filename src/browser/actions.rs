@@ -358,11 +358,11 @@ fn build_actions() -> Vec<ActionDesc> {
                     },
                     "action": {
                         "type": "string",
-                        "description": "Action to perform: click (click element), fill (clear field then type), type (append text without clearing, uses 'text' parameter), hover (hover over element), focus (focus element), check (check checkbox/radio button), uncheck (uncheck checkbox/radio button), text (get element text content — does NOT use the 'text' param; the 'text' param is only for fill/type). For filling text into inputs, use 'fill' with the 'text' parameter. For typing without clearing first, use 'type'. Press Enter after filling to submit forms."
+                        "description": "Action to perform: click (click element), fill (clear field then type), hover (hover over element), check (check checkbox/radio button), text (get element text content — does NOT use the 'text' param; the 'text' param is only for 'fill'). Press Enter after filling to submit forms."
                     },
                     "text": {
                         "type": "string",
-                        "description": "Text to fill/type into the element (for action 'fill' or 'type')"
+                        "description": "Text to fill into the element (for action 'fill')"
                     },
                     "name": {
                         "type": "string",

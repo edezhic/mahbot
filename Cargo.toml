@@ -112,6 +112,10 @@ semver = "1"
 tempfile = "3"
 unicode-normalization = "0.1"
 
+# URL parsing + IP netmask matching for browser URL validation (SSRF guard)
+url = "2"
+ipnet = "2"
+
 # chrome-use release archive download/extract (tar.gz sidecar-verified)
 flate2 = "1"
 tar = "0.4"

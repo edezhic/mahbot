@@ -11,7 +11,7 @@ Opens a page and automatically returns a compact accessibility snapshot. Read th
 Re-scan the page to get fresh element refs. Pass `compact: false` to include empty structural elements, `interactive_only: true` to see only buttons/links/inputs, or `depth: N` to limit tree depth (useful for deeply nested pages).
 
 ### 3. Interact: `find` or `click`
-Use `find` with locators to click, fill, hover, or focus elements. Use `click` with a CSS selector or ref (`@e1`) for simple clicks. Always take a fresh `snapshot` after navigation before using refs — they become stale on any DOM change.
+Use `find` with locators to click, fill, hover, or check elements. Use `click` with a CSS selector or ref (`@e1`) for simple clicks. Always take a fresh `snapshot` after navigation before using refs — they become stale on any DOM change.
 
 ### 4. Extract content: `get_text`, `get_innertext`, `eval`, or `snapshot`
 * `get_text { selector: "body" }` — uses DOM `textContent`, so returns ALL descendant text including content inside `<script>` and `<style>` elements. For visible text only (no script/style), use `get_innertext` or `eval` with `document.querySelector('body').innerText`.
@@ -36,7 +36,7 @@ Capture a screenshot of the current tab and inject it into your conversation as 
 
 ## `value` vs `text` (critical distinction)
 * `value` = the locator search target (CSS selector, button label text, role name). This is what the tool searches for to *find* the element.
-* `text` = text to *fill* or *type* into the element. Only used with `action: "fill"` or `"type"`.
+* `text` = text to *fill* into the element. Only used with `action: "fill"`.
 * **Do NOT swap them** — they serve different purposes.
 
 ## Locator types for `find` (ranked by reliability)
@@ -68,7 +68,7 @@ The snapshot shows the *accessible name* (from `aria-label`), not the `placehold
 * `title` — matches HTML `title` attribute (exact match).
 
 ## Valid `find` actions
-`click` (click element), `fill` (clears then types, uses `text` param), `type` (appends without clearing, uses `text` param), `hover` (hover over element), `focus` (focus element), `check` (check checkbox/radio button), `uncheck` (uncheck checkbox/radio button), `text` (get element text content — does NOT use the `text` param).
+`click` (click element), `fill` (clears then types, uses `text` param), `hover` (hover over element), `check` (check checkbox/radio button), `text` (get element text content — does NOT use the `text` param). (`focus`, `type`, and `uncheck` are not supported by the runtime.)
 
 ## Keyboard shortcuts
 * `press { key: "Enter" }` — submit forms after filling inputs.

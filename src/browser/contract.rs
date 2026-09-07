@@ -2,17 +2,23 @@
 //! interactive `browser` tool and the `mahbot browser` CLI.
 //!
 //! chrome-use answers `--json` commands with either the classic `success` key
-//! or the newer `ok` key. Every consumer needs the same conservative verdict
-//! logic (failure-precedence), so the typed [`BrowserResponse`] and the
-//! `Value`-based [`envelope_verdict`] both delegate to [`envelope_success`] and
-//! cannot drift. The `mahbot browser` stdout output contract ([`SCHEMA_VERSION`],
-//! [`OutKind`], [`OutEnvelope`]) lives here too.
+//! or the newer `ok` key. [`BrowserResponse`] is the single structural parser
+//! every frontend shares — [`BrowserResponse::verdict`] applies the shared
+//! failure-precedence logic so the two paths cannot drift. The `mahbot
+//! browser` stdout output contract ([`SCHEMA_VERSION`], [`OutKind`],
+//! [`OutEnvelope`]) lives here too.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Response from chrome-use `--json` commands.
-#[derive(Debug, Deserialize)]
+/// Response from chrome-use `--json` commands — the ONE structural envelope
+/// parser every browser frontend shares.
+///
+/// There is no schema-version marker in chrome-use, and the envelope even
+/// varies within one binary (`session list` answers `ok:true`, everything
+/// else `success:true`), so tolerance is structural: every field is
+/// [`Option`], unknown keys are ignored.
+#[derive(Debug, Default, Deserialize)]
 pub(crate) struct BrowserResponse {
     /// Classic `success` envelope key — absent on newer `ok`-keyed envelopes.
     #[serde(default)]
@@ -25,71 +31,66 @@ pub(crate) struct BrowserResponse {
     pub(crate) error: Option<String>,
     /// Stable error-envelope code (v1.5.78+) — present on structured errors.
     pub(crate) code: Option<String>,
+    /// `retryable` flag on structured error envelopes (v1.5.101 emits it on
+    /// every `{success:false,…}`) — the interactive tool surfaces it to the
+    /// agent as a retry hint.
+    #[serde(default)]
+    pub(crate) retryable: Option<bool>,
 }
 
 impl BrowserResponse {
     /// Success gate accepting both the classic `success: true` envelope and
     /// the latest `ok: true` one — delegates to the shared [`envelope_success`]
-    /// predicate (failure precedence) so the typed and Value-based paths
-    /// cannot drift.
+    /// predicate (failure precedence).
     pub(crate) fn is_success(&self) -> bool {
         envelope_success(self.success, self.ok)
     }
-}
 
-/// Extract the `error` message from a CLI error response, if any.
-pub(crate) fn extract_error(stdout: &[u8]) -> Option<String> {
-    let v: Value = serde_json::from_slice(stdout).unwrap_or_default();
-    v.get("error")
-        .and_then(Value::as_str)
-        .map(String::from)
-        .filter(|s| !s.is_empty())
+    /// Tri-state verdict of a chrome-use JSON envelope: `Some(true)` when
+    /// either `success` or `ok` reports success, `Some(false)` when either
+    /// reports failure, `None` when the payload carries no verdict key
+    /// (callers own their default: strict / tolerance-first / error-first).
+    pub(crate) fn verdict(&self) -> Option<bool> {
+        if self.success.is_none() && self.ok.is_none() {
+            return None;
+        }
+        Some(self.is_success())
+    }
+
+    /// The single `Value`-path parse entry: unknown keys are dropped and any
+    /// non-object / unparseable payload yields a default response (all fields
+    /// [`None`]).
+    #[must_use]
+    pub(crate) fn from_value(v: &Value) -> Self {
+        serde_json::from_value(v.clone()).unwrap_or_default()
+    }
 }
 
 /// Core envelope-success predicate with failure precedence: an explicit
 /// `false` on either key loses over a contradicting success key (conservative
 /// — the error text surfaces), and a payload with neither key is not a
-/// success. Shared by [`envelope_verdict`] (Value-based) and
-/// `BrowserResponse::is_success` (typed) so the two cannot drift.
+/// success. Backs [`BrowserResponse::is_success`] and
+/// [`BrowserResponse::verdict`].
 fn envelope_success(success: Option<bool>, ok: Option<bool>) -> bool {
     !(success == Some(false) || ok == Some(false)) && (success == Some(true) || ok == Some(true))
 }
 
-/// Tri-state verdict of a chrome-use JSON envelope: `Some(true)` when either
-/// `success` or `ok` reports success, `Some(false)` when either reports
-/// failure, `None` when the payload carries no verdict key (callers decide
-/// their own default). Newer chrome-use commands replaced `success` with `ok`
-/// (e.g. `session list`).
-pub(crate) fn envelope_verdict(v: &Value) -> Option<bool> {
-    let success = v.get("success").and_then(Value::as_bool);
-    let ok = v.get("ok").and_then(Value::as_bool);
-    if success.is_none() && ok.is_none() {
-        return None;
-    }
-    Some(envelope_success(success, ok))
-}
-
-/// Extract textual content from an chrome-use snapshot response `data` field.
+/// Extract textual content from a chrome-use snapshot response `data` field.
 ///
 /// chrome-use can return the snapshot as:
 /// - A plain string (via `snapshot -c`)
+/// - An object with a `text` field (via `get_text`)
+/// - An object with a `result` field (via `eval`)
 /// - An object with a `content` field (via `get_text`)
 /// - An object with `origin`, `refs`, and `snapshot` fields (via `open` auto-snapshot)
 ///
-/// Returns `None` if none of these shapes match.
+/// Returns `None` if none of these shapes match (the caller falls back).
 pub(crate) fn extract_snapshot_text(data: &serde_json::Value) -> Option<String> {
-    data.as_str()
-        .map(String::from)
-        .or_else(|| {
-            data.get("content")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .or_else(|| {
-            data.get("snapshot")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
+    data.as_str().map(String::from).or_else(|| {
+        ["text", "result", "content", "snapshot"]
+            .iter()
+            .find_map(|key| data.get(*key).and_then(Value::as_str).map(String::from))
+    })
 }
 
 /// `mahbot browser` stdout envelope schema version.
@@ -198,16 +199,16 @@ mod tests {
             serde_json::from_str(r#"{"success":false}"#).expect("tolerant deserialize");
         assert!(!failed.is_success());
 
-        // Failure precedence — mirrors envelope_verdict: an explicit false on
-        // either key loses over a contradicting success key.
+        // Failure precedence — an explicit false on either key loses over a
+        // contradicting success key.
         let mixed: BrowserResponse =
             serde_json::from_str(r#"{"success":false,"ok":true}"#).expect("tolerant deserialize");
         assert!(!mixed.is_success());
     }
 
     #[test]
-    fn envelope_verdict_covers_both_envelopes() {
-        let v = |json: serde_json::Value| envelope_verdict(&json);
+    fn verdict_covers_both_envelopes() {
+        let v = |json: serde_json::Value| BrowserResponse::from_value(&json).verdict();
         assert_eq!(v(serde_json::json!({"success": true})), Some(true));
         assert_eq!(v(serde_json::json!({"ok": true})), Some(true));
         assert_eq!(
@@ -224,6 +225,72 @@ mod tests {
             Some(false)
         );
         assert_eq!(v(serde_json::json!({"data": {}})), None);
+    }
+
+    #[test]
+    fn browser_response_parses_structured_error_retryable() {
+        let v = serde_json::json!({
+            "success": false, "error": "boom", "code": "connection_failed", "retryable": true,
+        });
+        let resp = BrowserResponse::from_value(&v);
+        assert_eq!(resp.success, Some(false));
+        assert_eq!(resp.error.as_deref(), Some("boom"));
+        assert_eq!(resp.code.as_deref(), Some("connection_failed"));
+        assert_eq!(resp.retryable, Some(true));
+        assert!(!resp.is_success());
+
+        let v = serde_json::json!({
+            "ok": false, "code": "connection_failed", "retryable": false,
+        });
+        let resp = BrowserResponse::from_value(&v);
+        assert_eq!(resp.ok, Some(false));
+        assert_eq!(resp.retryable, Some(false));
+        assert!(!resp.is_success());
+    }
+
+    #[test]
+    fn from_value_tolerates_unknown_keys_and_non_objects() {
+        let resp = BrowserResponse::from_value(&serde_json::json!({
+            "success": true, "version": 99, "unknown": [1, 2, 3],
+        }));
+        assert_eq!(resp.success, Some(true));
+        assert!(resp.is_success());
+        // Tolerates a payload with neither verdict key plus unknown keys.
+        let resp = BrowserResponse::from_value(&serde_json::json!({
+            "data": {"x": 1}, "future_key": true,
+        }));
+        assert_eq!(resp.verdict(), None);
+        assert_eq!(resp.data, Some(serde_json::json!({"x": 1})));
+        // A non-object / unparseable payload yields a default response.
+        assert_eq!(
+            BrowserResponse::from_value(&serde_json::json!("plain string")).verdict(),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_snapshot_text_handles_verified_shapes() {
+        let text = |v: serde_json::Value| extract_snapshot_text(&v);
+        assert_eq!(
+            text(serde_json::json!("plain text")),
+            Some("plain text".into())
+        );
+        assert_eq!(
+            text(serde_json::json!({"text": "hello"})),
+            Some("hello".into())
+        );
+        assert_eq!(text(serde_json::json!({"result": "42"})), Some("42".into()));
+        assert_eq!(
+            text(serde_json::json!({"content": "page"})),
+            Some("page".into())
+        );
+        assert_eq!(
+            text(serde_json::json!({"snapshot": "snap"})),
+            Some("snap".into())
+        );
+        // Non-string fields (and absent keys) fall back in the caller.
+        assert_eq!(text(serde_json::json!({"result": 42})), None);
+        assert_eq!(text(serde_json::json!({})), None);
     }
 
     #[test]

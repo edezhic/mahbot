@@ -1,6 +1,6 @@
 //! Browser automation tool.
 
-use crate::browser::contract::{BrowserResponse, envelope_verdict, extract_snapshot_text};
+use crate::browser::contract::{BrowserResponse, extract_snapshot_text};
 use crate::browser::escape_js_single_quoted;
 use crate::browser::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
 use crate::util::{UnwrapPoison, is_http_url};
@@ -11,7 +11,7 @@ use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,10 +64,10 @@ enum BrowserAction {
         /// Locator value. For 'text': substring to search for; for 'role':
         /// role name ('button', 'link', 'textbox', etc.); for 'first'/'last'/'nth': CSS selector.
         value: String,
-        /// Action to perform: click, fill, type, hover, focus, check, uncheck, text.
-        /// "fill" clears the field then types; "type" appends without clearing.
+        /// Action to perform: click, fill, hover, check, text.
+        /// "fill" clears the field then types.
         action: String,
-        /// Text to fill/type into the element (only for action "fill" or "type").
+        /// Text to fill into the element (only for action "fill").
         text: Option<String>,
         /// Accessible name filter for role-based finding, e.g. "Submit".
         /// Note: this filter can fail even when the snapshot shows a matching element.
@@ -178,9 +178,10 @@ impl BrowserTool {
         let _guard = self.acquire_tab_lock(tab).await;
         let opened = self.run_command(&["open", url], tab).await?;
 
-        // A real navigation attempt that ends on the scratch `about:blank`
-        // never committed — fail loudly instead of returning empty content.
-        self.bail_on_blank_navigation(tab, url, &opened).await?;
+        // A real navigation that ends on the scratch `about:blank` or Chrome's
+        // error page never loaded — fail loudly instead of returning empty
+        // content.
+        self.bail_on_failed_navigation(tab, url, &opened).await?;
 
         // Wait for network idle (best-effort — no hard error on timeout).
         let _ = self
@@ -204,24 +205,36 @@ impl BrowserTool {
         super::browser_daemon::sweep_session(tab).await;
     }
 
-    /// If the response shows the tab still on the scratch `about:blank` page,
-    /// the navigation never committed — close the session (verified sweep) and
-    /// fail with the cause. The close is refused for non-mahbot session names
-    /// (strict-scope rule), leaving the tab to the run-end session close. No-op
-    /// when the navigation committed.
-    async fn bail_on_blank_navigation(
+    /// If the response shows a failed navigation — the tab never left the
+    /// scratch `about:blank` page, or Chrome committed to its error page — fail
+    /// with a cause. The blank-page case means the navigation never committed,
+    /// so the session is closed (verified sweep) to avoid an orphaned tab; a
+    /// committed Chrome error page keeps the tab open — the navigation
+    /// committed, so the tab stays reusable for a retry. The close is refused
+    /// for non-mahbot session names (strict-scope rule), leaving the tab to the
+    /// run-end session close. No-op when the navigation committed.
+    async fn bail_on_failed_navigation(
         &self,
         tab: &str,
         url: &str,
         response: &BrowserResponse,
     ) -> anyhow::Result<()> {
-        if response
+        let Some(committed_url) = response
             .data
             .as_ref()
             .and_then(|d| d.get("url"))
             .and_then(Value::as_str)
-            .is_some_and(crate::browser::is_blank_page_url)
-        {
+        else {
+            return Ok(());
+        };
+        if crate::browser::is_chrome_error_page(committed_url) {
+            anyhow::bail!(
+                "Navigation to {url} failed — Chrome landed on its error page \
+                 (chrome-error://chromewebdata/), meaning the site is unreachable (DNS failure, \
+                 refused connection, or a blocked/unsafe port). Verify the URL and network."
+            );
+        }
+        if crate::browser::is_blank_page_url(committed_url) {
             self.close_session(tab).await;
             anyhow::bail!(
                 "Navigation failed: the tab is still on a blank page after opening {url} — the \
@@ -272,6 +285,19 @@ impl BrowserTool {
         Ok(())
     }
 
+    /// Mahbot-side per-call bounds. chrome-use's own `--timeout` is ignored by
+    /// `wait --load networkidle` (always its internal 25s default) and a wedged
+    /// daemon hangs the CLI in its ~152s retry loop, so the tool bounds every
+    /// dispatch itself: open=15s (page load), wait=10s (networkidle stays
+    /// best-effort), everything else=8s (the daemon-side `run_cli_bounded` bound).
+    fn call_timeout(args: &[&str]) -> Duration {
+        match args.first() {
+            Some(&"open") => Duration::from_secs(15),
+            Some(&"wait") => Duration::from_secs(10),
+            _ => Duration::from_secs(8),
+        }
+    }
+
     /// Run an chrome-use command and parse the JSON response.
     async fn run_command(&self, args: &[&str], tab: &str) -> anyhow::Result<BrowserResponse> {
         let cli = super::browser_daemon::cli_path().with_context(|| {
@@ -295,16 +321,33 @@ impl BrowserTool {
             session: Some(tab),
             json: true,
             capture_stderr: true,
-            timeout: CliTimeout::Unbounded,
-            cancel_kills: false,
+            timeout: CliTimeout::Bounded(Self::call_timeout(args)),
+            // A timed-out/cancelled call must not leave the chrome-use child
+            // running its retry loop in the background.
+            cancel_kills: true,
         })
         .await;
         let output = match run {
             CliRun::Output(output) => output,
             CliRun::SpawnFailure => anyhow::bail!("Failed to execute chrome-use CLI"),
-            // Unreachable for the Unbounded policy — kept as an honest bail
-            // so the match stays total without a panic path.
-            CliRun::TimedOut => anyhow::bail!("chrome-use CLI call timed out"),
+            CliRun::TimedOut => {
+                // Distinguish "daemon down/wedged" (fail fast with daemon
+                // guidance; wakes the watchdog) from "daemon healthy, that
+                // call was just slow". The probe covers the wedge case a
+                // status check cannot see — see health_after_call_timeout.
+                if let Some(down_message) =
+                    super::browser_daemon::health_after_call_timeout(tab).await
+                {
+                    anyhow::bail!("{down_message}");
+                }
+                let secs = Self::call_timeout(args).as_secs();
+                anyhow::bail!(
+                    "chrome-use did not answer within {secs}s for `{}` — the call was aborted. \
+                     The daemon looked healthy, so this is usually a slow page or a wedged CLI; \
+                     retry once before trying another approach.",
+                    args.join(" ")
+                );
+            }
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -314,20 +357,29 @@ impl BrowserTool {
         // get a meaningful error, fall back to stderr-only bail otherwise.
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let (error_msg, code) = match serde_json::from_str::<BrowserResponse>(&stdout) {
-                Ok(resp) => {
-                    let BrowserResponse { error, code, .. } = resp;
-                    (error.unwrap_or_default(), code)
-                }
-                Err(_) => (stderr.trim().to_string(), None),
-            };
+            let (error_msg, code, retryable) =
+                match serde_json::from_str::<BrowserResponse>(&stdout) {
+                    Ok(resp) => {
+                        let BrowserResponse {
+                            error,
+                            code,
+                            retryable,
+                            ..
+                        } = resp;
+                        (error.unwrap_or_default(), code, retryable)
+                    }
+                    Err(_) => (stderr.trim().to_string(), None, None),
+                };
             let error_msg = if error_msg.is_empty() {
                 format!("chrome-use exited with code {}", output.status)
             } else {
                 enhance_browser_error(error_msg)
             };
             Self::fail_fast_if_daemon_down(&error_msg, code.as_deref())?;
-            anyhow::bail!("chrome-use error: {error_msg}");
+            anyhow::bail!(
+                "chrome-use error: {}",
+                with_retry_hint(error_msg, retryable)
+            );
         }
 
         let response: BrowserResponse =
@@ -337,7 +389,10 @@ impl BrowserTool {
             let err = response.error.as_deref().unwrap_or("unknown error");
             let enhanced = enhance_browser_error(err.to_string());
             Self::fail_fast_if_daemon_down(&enhanced, response.code.as_deref())?;
-            anyhow::bail!("chrome-use error: {enhanced}");
+            anyhow::bail!(
+                "chrome-use error: {}",
+                with_retry_hint(enhanced, response.retryable)
+            );
         }
 
         Ok(response)
@@ -486,8 +541,8 @@ const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// chrome-use envelopes: latest returns `{"ok":true,"sessions":[{"name":..}]}`;
 /// older builds return `{"success":true,"data":{"sessions":["name",..]}}`.
 /// Entries may be objects (keyed by `name`) or plain strings. Callers gate on
-/// [`envelope_verdict`] first — this only extracts the names and returns an
-/// empty list when no session array is present.
+/// `BrowserResponse::verdict` first — this only extracts the names and returns
+/// an empty list when no session array is present.
 fn parse_session_list(v: &Value) -> Vec<String> {
     let array = v
         .get("sessions")
@@ -542,7 +597,7 @@ async fn close_all_browser_sessions_inner() {
             // Gate only on an explicit failure verdict; a payload with neither
             // verdict key proceeds (tolerance-first — unknown future envelopes
             // still get their sessions closed if they carry a sessions array).
-            if envelope_verdict(&v) == Some(false) {
+            if BrowserResponse::from_value(&v).verdict() == Some(false) {
                 tracing::warn!(
                     "chrome-use session list failed: {}",
                     v.get("error")
@@ -706,6 +761,11 @@ impl Tool for BrowserTool {
         let p = PathBuf::from(&path);
         // Only a real PNG/JPEG/WebP raster opens the decode (fails open on a
         // non-raster/over-cap file, mirroring the read tool's payload path).
+        // Residual edge, accepted by design: a PNG corrupt beyond its IHDR
+        // passes capture_screenshot's header validation and reaches here, the
+        // decode fails, and only the textual marker is delivered (no image
+        // part) — the header gate keeps the common corrupt-capture case an
+        // explicit error instead.
         let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&p)
             .await
             .ok()?;
@@ -754,9 +814,13 @@ impl BrowserTool {
                 path.display()
             );
         }
+        // A corrupt/truncated PNG would otherwise emit a phantom `[IMAGE:…]`
+        // marker that the payload path fails open on — gate the emission here.
+        let (width, height) = validate_png(&path)?;
         *self.last_screenshot.lock().unwrap_poison() = Some(path_str.clone());
         Ok(format!(
-            "[Tab: {tab}] Captured a browser screenshot: {path_str}. [IMAGE:{path_str}]"
+            "[Tab: {tab}] Captured a browser screenshot: {path_str} ({width}x{height}). \
+             [IMAGE:{path_str}]"
         ))
     }
 
@@ -803,7 +867,7 @@ impl BrowserTool {
             // self-correct in one round-trip.
             let hint = match &action_value {
                 Value::Object(map) if map.contains_key("find") => {
-                    " 'find' requires 'by', 'value', and 'action' fields (use 'value' not 'name' for the locator text). Valid 'action' values: click, fill, type, hover, focus, check, uncheck, text (use 'text' param only for fill/type, not for the 'text' action)".to_string()
+                    " 'find' requires 'by', 'value', and 'action' fields (use 'value' not 'name' for the locator text). Valid 'action' values: click, fill, hover, check, text (use 'text' param only for fill)".to_string()
                 }
                 _ => String::new(),
             };
@@ -822,6 +886,8 @@ impl BrowserTool {
         if let BrowserAction::Find {
             by,
             action: find_action,
+            name,
+            exact,
             index,
             ..
         } = action
@@ -844,9 +910,10 @@ impl BrowserTool {
                     valid.join(", ")
                 );
             }
-            let valid_actions = [
-                "click", "hover", "focus", "fill", "type", "check", "uncheck", "text",
-            ];
+            // chrome-use 1.5.101 rejects focus/type/uncheck with 'Unknown
+            // subaction' despite --help listing them — only advertise/resolve
+            // the subset that actually dispatches.
+            let valid_actions = ["click", "hover", "fill", "check", "text"];
             if !valid_actions.contains(&find_action.as_str()) {
                 anyhow::bail!(
                     "Invalid 'find' action '{find_action}'. Must be one of: {}",
@@ -857,6 +924,20 @@ impl BrowserTool {
                 anyhow::bail!(
                     "'index' is required when 'by' is \"nth\". \
                      Provide the zero-based index of the element to select."
+                );
+            }
+            // For these CSS-selector locators chrome-use's parser consumes
+            // everything after the action as the fill value, so `--name` /
+            // `--exact` would be eaten as fill text — reject instead of
+            // silently stripping them.
+            if (name.is_some() || *exact == Some(true))
+                && matches!(by.as_str(), "nth" | "first" | "last" | "testid")
+            {
+                anyhow::bail!(
+                    "`name`/`exact` are not honored for the '{by}' locator — chrome-use's parser \
+                     treats everything after the action as fill text, so they would be consumed \
+                     as the fill value. Drop `name`/`exact` when using '{by}' (they only apply \
+                     to role/text-style locators) and match by `value` instead."
                 );
             }
         }
@@ -876,11 +957,11 @@ impl BrowserTool {
         let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
         let response = self.run_command(&str_args, tab).await?;
 
-        // A real navigation attempt that ends on the scratch `about:blank`
-        // never committed — fail loudly (and close the tab best-effort)
-        // instead of reporting success with no content.
+        // A real navigation that ends on the scratch `about:blank` or Chrome's
+        // error page never loaded — fail loudly (closing the blank-page tab
+        // best-effort) instead of reporting success with no content.
         if let BrowserAction::Open { url } = action {
-            self.bail_on_blank_navigation(tab, url, &response).await?;
+            self.bail_on_failed_navigation(tab, url, &response).await?;
         }
 
         // After open, wait for network idle, then auto-snapshot
@@ -938,6 +1019,10 @@ impl BrowserTool {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
+                BrowserAction::Eval { .. } => data.get("result").map_or_else(
+                    || serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()),
+                    |v| v.as_str().map_or_else(|| v.to_string(), str::to_string),
+                ),
                 _ => serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()),
             },
             None => String::new(),
@@ -954,6 +1039,43 @@ impl BrowserTool {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/// Validate a screenshot file is a real PNG: magic bytes + IHDR dimensions
+/// (bytes 16..24, big-endian). chrome-use can report success yet write a
+/// corrupt/truncated file, and `image_payload` fails open on undecodable
+/// rasters — so the validation gates the `[IMAGE:…]` marker emission here,
+/// where a corrupt capture becomes an explicit error instead of a phantom
+/// image part.
+fn validate_png(path: &Path) -> anyhow::Result<(u32, u32)> {
+    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    // Only the header is needed — magic bytes + IHDR dimensions (bytes 16..24).
+    let mut header = [0u8; 24];
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to read screenshot {}", path.display()))?;
+    std::io::Read::read_exact(&mut file, &mut header).map_err(|_| {
+        anyhow::anyhow!(
+            "Screenshot at {} is not a valid PNG (truncated or wrong format)",
+            path.display()
+        )
+    })?;
+    if header[..8] != PNG_MAGIC {
+        anyhow::bail!(
+            "Screenshot at {} is not a valid PNG (wrong format)",
+            path.display()
+        );
+    }
+    let width = u32::from_be_bytes(header[16..20].try_into().expect("slice is 4 bytes"));
+    let height = u32::from_be_bytes(header[20..24].try_into().expect("slice is 4 bytes"));
+    if width == 0 || height == 0 {
+        anyhow::bail!(
+            "Screenshot at {} has an empty IHDR ({}x{})",
+            path.display(),
+            width,
+            height
+        );
+    }
+    Ok((width, height))
+}
 
 /// Reduce a name to a single safe filename component (ASCII alphanumerics,
 /// `-`, `_`), so a model-supplied value (e.g. a browser `tab`) can never
@@ -994,6 +1116,17 @@ fn enhance_browser_error(msg: String) -> String {
     }
 }
 
+/// Append the envelope's retry hint when chrome-use itself marked the error
+/// `retryable` — otherwise the model cannot tell a worth-retrying transient
+/// (e.g. element not yet present) from a dead end.
+fn with_retry_hint(error: String, retryable: Option<bool>) -> String {
+    if retryable == Some(true) {
+        format!("{error} (chrome-use marked this error retryable — a retry may succeed)")
+    } else {
+        error
+    }
+}
+
 // ── Tolerant action normalization ─────────────────────────────────────────
 
 /// Known browser action variant names (must match `BrowserAction` serde names).
@@ -1020,7 +1153,7 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"open\":{\"url\":\"https://...\"}
     {\"get_innertext\":{\"selector\":\"...\"}}, {\"get_url\":{}}, \
     {\"press\":{\"key\":\"...\"}}, {\"eval\":{\"js\":\"...\"}}, \
     {\"find\":{\"by\":\"text|role|label|placeholder|alt|title|testid|first|last|nth\",\
-    \"value\":\"...\",\"action\":\"click|fill|type|hover|focus|check|uncheck|text\"}}, \
+    \"value\":\"...\",\"action\":\"click|fill|hover|check|text\"}}, \
     {\"screenshot\":{}}";
 
 /// Corrective error for an unrecoverable action shape, listing the exact
@@ -1512,17 +1645,6 @@ mod tests {
                 expected: &["find", "text", "Accept", "check"],
             },
             Case {
-                name: "find_uncheck",
-                by: "text",
-                value: "Subscribe",
-                action: "uncheck",
-                text: None,
-                find_name: None,
-                exact: None,
-                index: None,
-                expected: &["find", "text", "Subscribe", "uncheck"],
-            },
-            Case {
                 name: "find_text_action",
                 by: "first",
                 value: ".result",
@@ -1549,6 +1671,90 @@ mod tests {
                 panic!("{}: build_args failed: {}", case.name, e);
             });
             assert_eq!(args, case.expected, "{}", case.name);
+        }
+    }
+
+    // ── validate_find: runtime-rejected actions ───────────────────────────
+
+    /// focus/type/uncheck are listed by `chrome-use --help` but 1.5.101
+    /// rejects them at runtime with 'Unknown subaction' — validate_find must
+    /// reject them up front.
+    #[test]
+    fn validate_find_rejects_runtime_unsupported_actions() {
+        for bad_action in ["focus", "type", "uncheck"] {
+            let action = BrowserAction::Find {
+                by: "text".into(),
+                value: "anything".into(),
+                action: bad_action.into(),
+                text: None,
+                name: None,
+                exact: None,
+                index: None,
+            };
+            let err = BrowserTool::validate_find(&action)
+                .expect_err("focus/type/uncheck must be rejected")
+                .to_string();
+            assert!(
+                err.contains("Invalid 'find' action"),
+                "action {bad_action}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_find_rejects_name_exact_on_css_locators() {
+        let find = |by: &str, name: Option<&str>, exact: Option<bool>| BrowserAction::Find {
+            by: by.into(),
+            value: ".card".into(),
+            action: "click".into(),
+            text: None,
+            name: name.map(String::from),
+            exact,
+            index: if by == "nth" { Some(0) } else { None },
+        };
+        for by in ["nth", "first", "last", "testid"] {
+            let err = BrowserTool::validate_find(&find(by, Some("Submit"), None))
+                .expect_err("name with CSS-selector locator must be rejected")
+                .to_string();
+            assert!(
+                err.contains("`name`/`exact`") && err.contains(by),
+                "by {by}: {err}"
+            );
+            let err = BrowserTool::validate_find(&find(by, None, Some(true)))
+                .expect_err("exact with CSS-selector locator must be rejected")
+                .to_string();
+            assert!(
+                err.contains("`name`/`exact`") && err.contains(by),
+                "by {by}: {err}"
+            );
+        }
+        // role-style locators still honor name/exact.
+        BrowserTool::validate_find(&find("role", Some("Submit"), Some(false)))
+            .expect("role + name/exact must still validate");
+    }
+
+    // ── call_timeout policy ──────────────────────────────────────────────
+
+    #[test]
+    fn call_timeout_policy() {
+        assert_eq!(
+            BrowserTool::call_timeout(&["open", "https://example.com"]),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            BrowserTool::call_timeout(&["wait", "--load", "networkidle"]),
+            Duration::from_secs(10)
+        );
+        for args in [
+            &["click", "@e1"][..],
+            &["eval", "1+1"][..],
+            &["snapshot", "-c"][..],
+        ] {
+            assert_eq!(
+                BrowserTool::call_timeout(args),
+                Duration::from_secs(8),
+                "args: {args:?}"
+            );
         }
     }
 
@@ -2049,6 +2255,76 @@ mod tests {
         // Two calls yield different files (random nonce).
         let p2 = BrowserTool::screenshot_output_path("default").unwrap();
         assert_ne!(p, p2);
+    }
+
+    // ── validate_png ─────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_png_accepts_real_png() {
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        let dir = std::env::temp_dir().join("mahbot-browser-test-valid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png_path = dir.join("valid.png");
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&png_path, &buf).unwrap();
+
+        let (width, height) = validate_png(&png_path).unwrap();
+        assert_eq!((width, height), (2, 2));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_png_rejects_corrupt_file() {
+        let dir = std::env::temp_dir().join("mahbot-browser-test-corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png_path = dir.join("corrupt.png");
+        std::fs::write(&png_path, b"not a png").unwrap();
+
+        let err = validate_png(&png_path).unwrap_err().to_string();
+        assert!(err.contains("not a valid PNG"), "err: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── format_action_output: eval ───────────────────────────────────────
+
+    #[test]
+    fn format_action_output_eval_prefers_result() {
+        let response = BrowserResponse {
+            data: Some(json!({"origin": "https://x", "result": "hello"})),
+            ..BrowserResponse::default()
+        };
+        let out = BrowserTool::format_action_output(
+            &BrowserAction::Eval { js: "42".into() },
+            "default",
+            response,
+            "",
+            &[],
+        );
+        assert!(out.contains("hello"), "output: {out}");
+        assert!(
+            !out.contains('{'),
+            "should not pretty-print JSON braces: {out}"
+        );
+    }
+
+    #[test]
+    fn format_action_output_eval_falls_back_without_result() {
+        let response = BrowserResponse {
+            data: Some(json!({"note": "no result key"})),
+            ..BrowserResponse::default()
+        };
+        let out = BrowserTool::format_action_output(
+            &BrowserAction::Eval { js: "42".into() },
+            "default",
+            response,
+            "",
+            &[],
+        );
+        assert!(out.contains('{'), "should fall back to pretty-print: {out}");
     }
 
     #[tokio::test]

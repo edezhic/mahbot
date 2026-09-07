@@ -1886,6 +1886,11 @@ mod tests {
     /// with `retry_count` untouched; the async job is check-pointed
     /// (retry_count bumped, status re-armed to launched). The mode discriminator
     /// replaces the NULL-sentinel overload of `caller_agent_id`.
+    ///
+    /// Serial with the other `recover_from_restart` test: a concurrent boot
+    /// scan rescans the shared `jobs` table and check-points this test's async
+    /// analyze a second time (retry_count 2), breaking the exact-count assert.
+    #[serial_test::serial(recover_from_restart)]
     #[tokio::test]
     async fn boot_recovery_skips_caller_owned_jobs() {
         crate::util::test::init_management_test_stores().await;
@@ -1996,6 +2001,7 @@ mod tests {
     /// `resolve_workspace` returns `Ok(None)`) is SKIPPED in place, not
     /// resumed: it stays `launched` with `retry_count` 0 (no checkpoint bump),
     /// and it is absent from the resumable list.
+    #[serial_test::serial(recover_from_restart)] // a concurrent boot scan would rescan the shared jobs table — see the sibling test above
     #[tokio::test]
     async fn boot_scan_leaves_unresolvable_workspace_cleanup_row_in_place() {
         crate::util::test::init_management_test_stores().await;

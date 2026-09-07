@@ -40,7 +40,7 @@
 //!   open a window unasked; on display-less hosts it is paused rather than spend
 //!   the launch budget (launching can never help there).
 
-use crate::browser::contract::{envelope_verdict, extract_error};
+use crate::browser::contract::BrowserResponse;
 use crate::browser::spawn::{CliRun, CliSpawn, CliTimeout, ensure_browser_env, spawn_cli};
 use crate::util::UnwrapPoison;
 use futures_util::future::join_all;
@@ -720,12 +720,10 @@ async fn run_cli_bounded(args: &[&str], session: Option<&str>) -> Option<std::pr
 /// timeout/spawn/parse failure.
 async fn run_cli_json_opt(args: &[&str], session: Option<&str>) -> Result<Value, Option<String>> {
     let out = run_cli_bounded(args, session).await.ok_or(None)?;
-    if !out.status.success() {
-        return Err(extract_error(&out.stdout));
-    }
     let v: Value = serde_json::from_slice(&out.stdout).map_err(|_| None)?;
-    if envelope_verdict(&v) != Some(true) {
-        return Err(extract_error(&out.stdout));
+    let env = BrowserResponse::from_value(&v);
+    if !out.status.success() || env.verdict() != Some(true) {
+        return Err(env.error.filter(|e| !e.is_empty()));
     }
     Ok(v)
 }
@@ -1124,10 +1122,12 @@ async fn close_run_session(name: &str) {
             "agent-run browser session close failed: {}",
             // run_cli_bounded nulls stderr — the envelope error on stdout is
             // the only failure detail available.
-            extract_error(&out.stdout).unwrap_or_else(|| {
-                let status = out.status;
-                format!("exit status {status}")
-            })
+            BrowserResponse::from_value(&serde_json::from_slice(&out.stdout).unwrap_or_default())
+                .error
+                .unwrap_or_else(|| {
+                    let status = out.status;
+                    format!("exit status {status}")
+                })
         ),
         Some(_) => debug!(session = name, "agent-run browser session closed"),
     }
@@ -1505,6 +1505,30 @@ pub(crate) fn daemon_down_message() -> String {
         "{cause}{recovery} While it's down, use web_search, or shell `curl` for page fetches, \
          instead of the browser tool."
     )
+}
+
+/// Bounded post-timeout health evaluation, deciding what a timed-out browser
+/// call means. `status` is daemon-free and by design cannot see a wedged
+/// session daemon (wedges are invisible to it), and the mahbot-side per-call
+/// bound cuts the CLI off before its own ~152 s retry loop can surface the
+/// daemon-unavailable signature — so after a healthy `status`, the session's
+/// daemon itself is probed with a trivial bounded command. A second
+/// consecutive hang is the wedge signature: mark the daemon unhealthy (wakes
+/// the watchdog, whose recovery restarts the session daemon) and return the
+/// down message. `None` = healthy — the timeout was a slow call, not the
+/// daemon.
+pub(crate) async fn health_after_call_timeout(session: &str) -> Option<String> {
+    if !is_available().await {
+        return Some(daemon_down_message());
+    }
+    if run_cli_bounded(&["get", "url"], Some(session))
+        .await
+        .is_none()
+    {
+        note_unhealthy("chrome-use CLI call timed out twice — daemon unresponsive");
+        return Some(daemon_down_message());
+    }
+    None
 }
 
 /// Background watchdog: evaluate daemon health from the daemon-free status,
