@@ -298,8 +298,10 @@ fn skipped_grep_outcome(reason: String, seg: &str, piped: bool) -> GrepOutcome {
 
 /// Canonical telemetry flag order, used by `lightweight_scan` to render a
 /// skipped member's flag string. `flags_surface` (served-member rendering)
-/// independently orders the `GrepFlags` fields in the same relative order;
-/// the two stay in sync by convention.
+/// independently follows the same relative order over the `GrepFlags`
+/// fields; this sync is by convention only, with one deliberate
+/// divergence: `flags_surface` folds before/after into `C` when both are
+/// set, while `lightweight_scan` emits them as separate `A`/`B` letters.
 const FLAG_ORDER: &[char] = &[
     'n', 'i', 'v', 'w', 'x', 'a', 'h', 'H', 's', 'r', 'o', 'z', 'c', 'l', 'm', 'C', 'A', 'B',
 ];
@@ -1066,8 +1068,10 @@ impl GrepFlags {
     }
 }
 
-/// Normalized single-string flag surface for a served grep (telemetry), laid
-/// out in the `GrepFlags` field order (e.g. "nivro...").
+/// Normalized single-string flag surface for a served grep (telemetry),
+/// emitted in `GrepFlags` field order with one exception: when both
+/// before/after are set they fold into a single `C` (e.g. `-B2 -A3` →
+/// "C", not "BA").
 fn flags_surface(flags: &GrepFlags) -> String {
     let mut s = String::new();
     if flags.n {
