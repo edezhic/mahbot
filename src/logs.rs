@@ -367,7 +367,7 @@ fn quarantine_logs_artifacts(root: &Path) {
 }
 
 /// Parameters for filtering log queries.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct LogQuery {
     pub level: Option<String>,
     pub target: Option<String>,
@@ -863,8 +863,9 @@ fn record_log_write_failure_impl(message: &str, kind: LogFailureKind) -> u32 {
     consecutive
 }
 
-/// Reset the consecutive-panic counter (and the terminal stopped flag) after a
-/// successful flush.
+/// Reset the consecutive-panic counter after a successful flush. The terminal
+/// stopped state is sticky — only [`LogWriterPanicState::reset`]'s counter is
+/// cleared here, a stopped writer never flushes again.
 fn reset_log_writer_panic_state() {
     let mut guard = LOG_WRITE_LAST_ERROR.lock().unwrap_poison();
     guard.panic_state.reset();

@@ -1,16 +1,20 @@
-//! Per-agent tool call statistics, consolidated into the logs database.
+//! Tool-call and LLM request statistics, consolidated into the logs database.
 //!
-//! Each tool invocation is recorded as an individual row with its full
-//! serialized arguments, execution duration, and success/failure outcome.
-//! Stats accumulate in-memory in each [`crate::Agent`] via a
-//! `std::sync::Mutex<Vec<ToolCallRecord>>` and are flushed to the logs
-//! store on session finalization via [`crate::logs::LogStore::flush_batch`].
+//! Two persistence families live here, both fail-open (write failures are
+//! logged, never fatal) and both targeting the logs store's tables:
 //!
-//! The `tool_calls` table (and its indexes) is created
-//! by the logs store's baseline schema catalog entry (in the append-only
-//! catalog), so a logs-store quarantine recreate also recreates it. Consumers
-//! access the table through [`crate::logs::LOG_STORE`] with fail-open
-//! accessors.
+//! * **Tool calls** — each [`crate::Agent`] accumulates
+//!   `ToolCallRecord`s in a `std::sync::Mutex<Vec<ToolCallRecord>>` and
+//!   flushes them on session finalization via [`LogStore::flush_batch`]
+//!   (defined in this module) into `tool_calls`.
+//! * **LLM requests / failures** — per-operation `llm_requests` rows via
+//!   [`record_llm_operation`] / [`record_llm_operation_meta`] and grouped
+//!   `llm_failures` rows via [`LlmOperationCtx`], fed by the retry pipeline.
+//!
+//! All tables (and their indexes) are created by the logs store's baseline
+//! schema catalog entry (in the append-only catalog), so a logs-store
+//! quarantine recreate also recreates them. Consumers access the store
+//! through [`crate::logs::LOG_STORE`].
 
 use crate::db::{self};
 use anyhow::Result;
@@ -304,20 +308,29 @@ pub(crate) struct LlmOperationCtx {
     pub call: LlmCallMeta,
 }
 
-impl LlmOperationCtx {
-    /// Derive the context from a `ChatRequest`. `None` when the request
-    /// carries no metadata — the same gating as the `llm_requests` rows
-    /// (context-free calls are never logged).
-    #[must_use]
+impl LlmCallMeta {
+    /// Extract the request fields the durable rows read from a `ChatRequest`.
+    /// `None` when the request carries no metadata — the same gating as the
+    /// `llm_requests` rows (context-free calls are never logged).
     pub(crate) fn from_request(request: &crate::ChatRequest) -> Option<Self> {
         let meta = request.meta.as_ref()?;
         Some(Self {
+            meta: meta.clone(),
+            model: request.model.clone(),
+            provider_order: request.provider_order.clone(),
+        })
+    }
+}
+
+impl LlmOperationCtx {
+    /// Derive the context from a `ChatRequest`; see
+    /// [`LlmCallMeta::from_request`] for the metadata gating.
+    #[must_use]
+    pub(crate) fn from_request(request: &crate::ChatRequest) -> Option<Self> {
+        let call = LlmCallMeta::from_request(request)?;
+        Some(Self {
             operation_id: crate::generate_id(),
-            call: LlmCallMeta {
-                meta: meta.clone(),
-                model: request.model.clone(),
-                provider_order: request.provider_order.clone(),
-            },
+            call,
         })
     }
 }
@@ -412,15 +425,11 @@ async fn record_llm_operation(
     finish_reason: Option<&str>,
     failure_class: Option<&'static str>,
 ) {
-    let Some(meta) = request.meta.as_ref() else {
+    let Some(call) = LlmCallMeta::from_request(request) else {
         return;
     };
     record_llm_operation_meta(
-        &LlmCallMeta {
-            meta: meta.clone(),
-            model: request.model.clone(),
-            provider_order: request.provider_order.clone(),
-        },
+        &call,
         duration_ms,
         attempts,
         response,
