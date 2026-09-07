@@ -38,10 +38,7 @@
 //! `qwen_asr::audio::mel_spectrogram` normalizes each call by its global max.
 //! Both enrollment and streaming therefore always feed exactly the same
 //! window shape — the trailing [`WINDOW_SAMPLES`] samples of VAD-gated speech
-//! — so the per-call normalization is identical by construction.  The
-//! voice-pipeline benchmark validates this explicitly (mel-normalization
-//! consistency probe: the same clip encoded whole-utterance vs
-//! streaming-accumulated must yield near-identical embeddings).
+//! — so the per-call normalization is identical by construction.
 
 use anyhow::{Result, anyhow};
 use qwen_asr::context::QwenModel;
@@ -63,7 +60,7 @@ pub(crate) const WAKE_WORD_EMBEDDING_DIM: usize = 1024;
 /// embedding and collapsing confusable discrimination (measured: 40-clip
 /// pair probe finds 25% of pairs at cosine >0.85 with a 1 s window vs 12%
 /// with 76 frames).  76 frames still yields ~10 tokens per window.
-pub(crate) const WINDOW_MEL_FRAMES: usize = 76;
+const WINDOW_MEL_FRAMES: usize = 76;
 
 /// Detection window in samples: [`WINDOW_MEL_FRAMES`] × mel hop ([`qwen_asr::config::HOP_LENGTH`]).
 pub(crate) const WINDOW_SAMPLES: usize = WINDOW_MEL_FRAMES * qwen_asr::config::HOP_LENGTH;
@@ -253,7 +250,11 @@ pub(crate) const ENROLLMENT_SCHEMA_VERSION: u32 = 2;
 
 /// Negative-sample calibration stats: cosine distribution of negative
 /// material against the prototype, measured at enrollment time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The default (`Calibration::default()`) represents an enrollment with no
+/// usable negatives: `soft_floor()` = [`DEFAULT_SOFT_FLOOR`] and `fire_soft()`
+/// = [`MATCH_THRESHOLD_FACTOR`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Calibration {
     /// Mean cosine of negative samples vs the prototype.
     pub(crate) neg_mean: f32,
@@ -317,23 +318,9 @@ impl Calibration {
     /// Map a raw cosine ([-1,1]) into the soft-score space [0,1] used by the
     /// rolling/adaptive machinery: linear from `soft_floor()` → 0 to 1.0 → 1.
     #[must_use]
-    pub(crate) fn soft_score(&self, cosine: f32) -> f32 {
+    fn soft_score(&self, cosine: f32) -> f32 {
         let floor = self.soft_floor();
         ((cosine - floor) / (1.0 - floor)).clamp(0.0, 1.0)
-    }
-}
-
-/// Default calibration represents an enrollment with no usable negatives:
-/// `soft_floor()` = [`DEFAULT_SOFT_FLOOR`] and `fire_soft()` =
-/// [`MATCH_THRESHOLD_FACTOR`].
-impl Default for Calibration {
-    fn default() -> Self {
-        Self {
-            neg_mean: 0.0,
-            neg_std: 0.0,
-            neg_p99: 0.0, // raw unknown — see [`Calibration::soft_floor`]
-            n_negatives: 0,
-        }
     }
 }
 
@@ -419,14 +406,14 @@ impl WakeWordEnrollment {
     /// Cosine similarity of a window embedding (L2-normalized) against the
     /// prototype.
     #[must_use]
-    pub(crate) fn cosine(&self, embedding: &[f32]) -> f32 {
+    fn cosine(&self, embedding: &[f32]) -> f32 {
         cosine_similarity(embedding, &self.prototype)
     }
 
     /// Maximum cosine of a window embedding against the anti-prototypes
     /// (0.0 when no negatives were collected).
     #[must_use]
-    pub(crate) fn max_negative_cosine(&self, embedding: &[f32]) -> f32 {
+    fn max_negative_cosine(&self, embedding: &[f32]) -> f32 {
         self.negative_prototypes
             .iter()
             .map(|a| cosine_similarity(embedding, a))
@@ -461,7 +448,7 @@ impl WakeWordEnrollment {
 
 /// Maximum number of anti-prototype centroids distilled from the negative
 /// pool at enrollment (farthest-point sampling keeps the set spread).
-pub(crate) const MAX_NEGATIVE_PROTOTYPES: usize = 8;
+const MAX_NEGATIVE_PROTOTYPES: usize = 8;
 
 /// Distill the negative-sample pool into up to [`MAX_NEGATIVE_PROTOTYPES`]
 /// L2-normalized anti-prototypes via farthest-point sampling.
@@ -473,12 +460,9 @@ pub(crate) const MAX_NEGATIVE_PROTOTYPES: usize = 8;
 /// that single prototype; with none, returns an empty set (scoring falls back
 /// to the plain positive cosine).
 #[must_use]
-pub(crate) fn distill_negative_prototypes(negatives: &[Vec<f32>]) -> Vec<Vec<f32>> {
+fn distill_negative_prototypes(negatives: &[Vec<f32>]) -> Vec<Vec<f32>> {
     if negatives.is_empty() {
         return Vec::new();
-    }
-    if negatives.len() == 1 {
-        return vec![negatives[0].clone()];
     }
     let k = negatives.len().min(MAX_NEGATIVE_PROTOTYPES);
     let mut chosen: Vec<usize> = Vec::with_capacity(k);
