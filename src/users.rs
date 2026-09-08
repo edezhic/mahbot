@@ -340,21 +340,6 @@ impl UserStore {
         Ok(users)
     }
 
-    /// Find the users attached to the given shared workspace — admin-filtered.
-    ///
-    /// Workspace membership is admin-only: the Assistant→Manager mirror
-    /// (send_message_to_manager) delivers only to admin (full-permissions)
-    /// members, so a rogue non-admin re-attachment can never receive
-    /// shared-workspace traffic (defense in depth on top of the runtime
-    /// resolution clamp).
-    pub async fn find_by_workspace(&self, workspace_name: &str) -> Result<Vec<UserRecord>> {
-        self.list_users_where(
-            "WHERE selected_workspace = ?1 AND permissions = ?2",
-            db::params![workspace_name, "full"],
-        )
-        .await
-    }
-
     /// Find a single user by exact name, returning their full record with channel bindings.
     /// Returns `None` if no such user exists.
     pub async fn find_by_name(&self, user_name: &str) -> Result<Option<UserRecord>> {
@@ -662,7 +647,7 @@ async fn resolve_user_model_column(user_name: &str, column: &str) -> Option<Stri
 /// A NULL `selected_workspace` also yields `personal:{user}`; `None` means
 /// no user row or a read failure (warned) — the caller applies its own
 /// personal default. The admin predicate is exactly `permissions = "full"`,
-/// the same one the data migration and `find_by_workspace` use.
+/// the same one the data migration uses.
 pub(crate) async fn resolve_selected_workspace_name(user_name: &str) -> Option<String> {
     match store()
         .get_selected_workspace_and_permissions(user_name)
@@ -1426,19 +1411,5 @@ mod tests {
         seed_user(store, "adm_shared", Some("full"), Some("ws_admin_aware")).await;
         let ws = resolve_workspace_for_user_name("adm_shared").await;
         assert_eq!(ws.name, "ws_admin_aware");
-    }
-
-    #[tokio::test]
-    async fn find_by_workspace_filters_to_admin_members() {
-        crate::util::test::init_test_stores().await;
-        let store = store();
-
-        // The same shared workspace attached by an admin and a non-admin.
-        seed_user(store, "adm_member", Some("full"), Some("ws_shared_x")).await;
-        seed_user(store, "non_admin_member", None, Some("ws_shared_x")).await;
-
-        let members = store.find_by_workspace("ws_shared_x").await.unwrap();
-        assert_eq!(members.len(), 1, "only the admin member must be returned");
-        assert_eq!(members[0].name, "adm_member");
     }
 }

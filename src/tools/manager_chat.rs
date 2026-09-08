@@ -2,10 +2,10 @@
 //! Manager.
 //!
 //! The Assistant addresses the Manager on the user's behalf via an internal
-//! agent message (wrapped in an `<assistant-message>` envelope). The send tool
-//! mirrors the message into each workspace user's chat AND their channel
-//! bindings so the send stays visible in the workspace chat. The tool is gated
-//! to the full-access Assistant (see `Role::Assistant` toolset).
+//! agent message (wrapped in an `<assistant-message>` envelope). The send is
+//! fully internal: nothing reaches the workspace users' chat history or
+//! channel bindings. The tool is gated to the full-access Assistant (see
+//! `Role::Assistant` toolset).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -14,8 +14,8 @@ use serde_json::json;
 use crate::Workspace;
 use crate::tools::Tool;
 
-/// The `send_message_to_manager` tool: deliver a message to the Manager agent
-/// of a project workspace, and mirror it into the workspace users' chat.
+/// The `send_message_to_manager` tool: deliver an internal message to the
+/// Manager agent of a project workspace.
 pub struct SendMessageToManagerTool;
 
 #[async_trait]
@@ -54,23 +54,6 @@ impl Tool for SendMessageToManagerTool {
             );
         }
 
-        // Persist the RAW message to each workspace user's chat for visibility,
-        // attributed as the Assistant, then transport-deliver it (shared
-        // broadcast id — the workspace chat stream dedupes the per-user
-        // copies). If no workspace users exist, skip silently — the Manager
-        // job still routes.
-        let users = match crate::users::USER_STORE.get() {
-            Some(store) => store.find_by_workspace(workspace).await.unwrap_or_default(),
-            None => Vec::new(),
-        };
-        crate::agent::message_router::deliver_agent_response_to_workspace(
-            message,
-            &users,
-            crate::Role::Assistant,
-            workspace,
-        )
-        .await;
-
         // Envelope wrapping happens only on the routed Manager-bound job.
         let envelope = crate::prompt::substitute(
             &crate::prompt::load_prompt("assistant_message.md"),
@@ -90,5 +73,115 @@ impl Tool for SendMessageToManagerTool {
         Ok(format!(
             "Message delivered to the manager of workspace '{workspace}'."
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::UnwrapPoison;
+    use std::sync::Arc;
+
+    async fn chat_history_rows(workspace: &str) -> i64 {
+        crate::session::store()
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_history WHERE workspace = ?1",
+                crate::db::params![workspace],
+                |row| row.get::<i64>(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Regression: the send must stay fully internal — the
+    /// `<assistant-message>` envelope still routes to the workspace Manager
+    /// (live route + durable pending_jobs copy), while NOTHING is mirrored
+    /// into the workspace users' chat_history or their channel bindings.
+    /// The admin user is attached to the workspace with a live spy-channel
+    /// binding — exactly the setup the removed mirroring delivered to.
+    #[tokio::test]
+    #[serial_test::serial(channel_registry)]
+    async fn manager_send_stays_internal() {
+        crate::util::test::init_management_test_stores().await;
+
+        let ws =
+            crate::util::test::create_test_workspace("/tmp/mahbot/ws_mirror", "ws_mirror").await;
+
+        // An admin workspace member bound to a spy channel — the removed
+        // mirroring would have persisted + transport-delivered for exactly
+        // this user.
+        let store = crate::users::store();
+        store
+            .add_user("mirror_user", Some("full"), crate::Role::Assistant)
+            .await
+            .unwrap();
+        store
+            .update_user(
+                "mirror_user",
+                crate::users::FieldUpdate::Unchanged,
+                crate::users::FieldUpdate::Set(&ws.name),
+                crate::users::FieldUpdate::Unchanged,
+            )
+            .await
+            .unwrap();
+        store
+            .bind_channel("mirror_user", "spy", "mirror_user")
+            .await
+            .unwrap();
+
+        let (spy, sent) = crate::util::test::SpyChannel::new("spy");
+        let registry = crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+        registry.register(Arc::new(spy) as Arc<dyn crate::Channel>);
+
+        // Register the Manager consumer so the routed envelope lands here
+        // instead of spawning a live consumer loop.
+        let target = crate::session::manager_agent_id(&ws.name);
+        let mut rx = crate::agent::message_router::register_agent(&target);
+
+        let before = chat_history_rows(&ws.name).await;
+
+        let res = crate::agent::CURRENT_TOOL_USER_NAME
+            .scope("mirror_user".to_string(), async {
+                crate::agent::CURRENT_TOOL_AGENT_ID
+                    .scope(Some("agent_mirror".to_string()), async {
+                        SendMessageToManagerTool
+                            .execute(
+                                &ws,
+                                serde_json::json!({"workspace": &ws.name, "message": "delegated work"}),
+                            )
+                            .await
+                    })
+                    .await
+            })
+            .await;
+        assert!(res.is_ok(), "tool must succeed: {:#}", res.unwrap_err());
+
+        // The envelope reached the Manager consumer.
+        let job = rx.recv().await.expect("envelope must reach the manager");
+        assert_eq!(
+            job.kind,
+            crate::agent::message_router::MessageKind::AgentMessage
+        );
+        assert_eq!(job.workspace_name, ws.name);
+        assert!(job.content.contains("delegated work"));
+
+        // A durable pending_jobs copy exists for boot resume.
+        let pending = crate::jobs::list_pending_jobs(&crate::session::store().conn)
+            .await
+            .unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|p| p.target_agent_id == target && p.envelope.contains("delegated work")),
+            "durable envelope copy expected in pending_jobs"
+        );
+
+        // Nothing mirrored into chat history or channel bindings.
+        assert_eq!(chat_history_rows(&ws.name).await, before);
+        assert!(
+            sent.lock().unwrap_poison().is_empty(),
+            "no channel delivery expected"
+        );
     }
 }

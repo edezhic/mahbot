@@ -877,46 +877,6 @@ async fn route_manager_notify(response: &str, source_workspace: &str) {
     }
 }
 
-/// Broadcast + persist one shared-broadcast_id copy per unique workspace user,
-/// then transport-deliver to every channel binding. The shared broadcast id
-/// lets the workspace chat stream dedupe the per-user copies exactly. Skips
-/// silently when `users` is empty.
-pub(crate) async fn deliver_agent_response_to_workspace(
-    response: &str,
-    users: &[UserRecord],
-    role: Role,
-    workspace: &str,
-) {
-    // One broadcast id shared by every per-user copy of this dispatch, so the
-    // workspace stream can dedupe them exactly (distinct copies share it).
-    let broadcast_id = Some(crate::generate_id());
-    let agent_role = Some(role.as_str().to_string());
-
-    // ── Broadcast + persist once per user ───────────────────────
-    {
-        let mut seen_names = HashSet::new();
-        for user in users {
-            if !seen_names.insert(&user.name) {
-                continue;
-            }
-            let channel = user.channels.first().map_or("gui", |b| b.channel.as_str());
-            broadcast_and_persist_agent_response(
-                &user.name,
-                channel,
-                response,
-                agent_role.clone(),
-                workspace,
-                broadcast_id.clone(),
-            )
-            .await;
-        }
-    }
-
-    if !users.is_empty() {
-        deliver_response_over_channels(response, users, role, workspace).await;
-    }
-}
-
 /// Transport-deliver `response` to every channel binding of `users`
 /// (broadcast + chat_history persistence happen at the call sites). Telegram
 /// deliveries get the per-role attribution prefix when the recipient can
