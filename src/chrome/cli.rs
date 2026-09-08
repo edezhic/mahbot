@@ -34,6 +34,7 @@ use crate::tools::chrome_daemon::{
     CliStatus, chrome_running, cli_path, cli_probe, cli_version, display_available,
     is_daemon_unavailable_code, is_daemon_unavailable_error, is_relay_unavailable_error, relay_up,
 };
+use crate::util::{TOOL_OUTPUT_BUDGET_BYTES, truncate_sandwich};
 use serde_json::{Value, json};
 
 /// Default step timeout (8 s) — every step uses it unless `--timeout` is given.
@@ -1125,7 +1126,8 @@ async fn status() -> OutEnvelope {
 }
 
 /// `open` — navigate to `url`, optionally wait for `--expect` (redesign-aware
-/// via `--structural`) and report the committed final URL.
+/// via `--structural`), report the committed final URL and best-effort attach
+/// the page content (compact accessibility snapshot).
 #[expect(clippy::too_many_lines)]
 async fn open(
     url: &str,
@@ -1221,13 +1223,23 @@ async fn open(
         let target = target.describe();
         // Same bound as the standalone wait: requested + margin, so the
         // forwarded chrome-side deadline fires its honest error first.
-        return match spawn_step(&path, &refs, Some(session), timeout + STEP_TIMEOUT_MARGIN).await {
-            Ok(_) => out_env(
-                "open",
-                true,
-                OutKind::Ok,
-                json!({ "url": final_url, "target": target }),
-            ),
+        let waited = spawn_step(&path, &refs, Some(session), timeout + STEP_TIMEOUT_MARGIN).await;
+        // The page is open regardless of the wait outcome, so the content
+        // rides on failure envelopes too: it is exactly what diagnoses a
+        // redesign. Same remaining-budget rule as the plain path — slow
+        // waits simply exhaust it and the content is omitted.
+        let content = capture_open_content(
+            &path,
+            session,
+            timeout.saturating_sub(navigation_started.elapsed()),
+        )
+        .await;
+        let mut payload = json!({ "url": final_url, "target": target });
+        if let Some(content) = content {
+            payload["content"] = json!(content);
+        }
+        return match waited {
+            Ok(_) => out_env("open", true, OutKind::Ok, payload),
             Err(f) if f.kind == OutKind::Timeout => {
                 let (kind, hint) = if structural {
                     (
@@ -1240,26 +1252,48 @@ async fn open(
                         "selector not found — may be structural change, empty region, or content-dependent",
                     )
                 };
-                out_env(
-                    "open",
-                    false,
-                    kind,
-                    json!({
-                        "url": final_url,
-                        "target": target,
-                        "timeout_ms": timeout.as_millis(),
-                        "hint": hint
-                    }),
-                )
+                payload["timeout_ms"] = json!(timeout.as_millis());
+                payload["hint"] = json!(hint);
+                out_env("open", false, kind, payload)
             }
-            Err(f) => f.envelope(
-                "open",
-                json!({ "url": final_url, "target": target }),
-                timeout,
-            ),
+            Err(f) => f.envelope("open", payload, timeout),
         };
     }
-    out_env("open", true, OutKind::Ok, json!({ "url": final_url }))
+    // Content capture is best-effort and bounded: it runs on the budget the
+    // navigation (+ error probe) left over, and a failure, exhaustion, or
+    // content-free page simply omits `content` — a successful navigation is
+    // never downgraded.
+    let mut payload = json!({ "url": final_url });
+    let budget = timeout.saturating_sub(navigation_started.elapsed());
+    if let Some(content) = capture_open_content(&path, session, budget).await {
+        payload["content"] = json!(content);
+    }
+    out_env("open", true, OutKind::Ok, payload)
+}
+
+/// Best-effort compact page snapshot for the `open` envelope — the same
+/// content form the interactive chrome tool surfaces after an open. Skipped
+/// under 500 ms of budget (mirroring the error-page probe); a failed step,
+/// an unrecognized response shape, or a content-free page yields no content.
+/// Non-empty content is byte-capped so the single-line JSON envelope stays
+/// valid and within the tool-output budget.
+async fn capture_open_content(path: &Path, session: &str, budget: Duration) -> Option<String> {
+    if budget < Duration::from_millis(500) {
+        return None;
+    }
+    let resp = spawn_step(path, &["snapshot", "-c"], Some(session), budget)
+        .await
+        .ok()?;
+    let text = resp.data.as_ref().and_then(extract_snapshot_text)?;
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(truncate_sandwich(
+        text,
+        TOOL_OUTPUT_BUDGET_BYTES,
+        "page content",
+    ))
 }
 
 /// Run the count-eval shim for `selector` — shared by the `count` action and

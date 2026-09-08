@@ -82,7 +82,7 @@ fn envelope_success(success: Option<bool>, ok: Option<bool>) -> bool {
 /// - An object with a `text` field (via `get_text`)
 /// - An object with a `result` field (via `eval`)
 /// - An object with a `content` field (via `get_text`)
-/// - An object with `origin`, `refs`, and `snapshot` fields (via `open` auto-snapshot)
+/// - An object with `origin`, `refs`, and `snapshot` fields (via `snapshot --json`)
 ///
 /// Returns `None` if none of these shapes match (the caller falls back).
 pub(crate) fn extract_snapshot_text(data: &serde_json::Value) -> Option<String> {

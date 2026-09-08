@@ -3035,6 +3035,34 @@ mod tests {
         check_shell_output(cases);
     }
 
+    #[test]
+    fn mahbot_chrome_envelope_line_bypasses_the_line_cap() {
+        // The chrome CLI emits ONE line of JSON; its profile must not apply
+        // GEN_FALLBACK's 500-byte line cap, which would truncate the envelope
+        // mid-JSON and drop the page content.
+        let envelope = format!(
+            r#"{{"schema":1,"action":"open","ok":true,"kind":"ok","content":"{}","url":"https://example.com/"}}"#,
+            "x".repeat(600)
+        );
+        let result = process_shell_output(
+            "mahbot chrome open https://example.com",
+            &envelope,
+            "",
+            0,
+            Duration::from_secs_f64(1.0),
+        );
+        assert_contains_not_contains(
+            "mahbot chrome envelope",
+            &result,
+            &[r#""content":""#],
+            &["more chars on this line"],
+        );
+        assert!(
+            result.contains(&envelope),
+            "envelope line must survive intact"
+        );
+    }
+
     #[expect(clippy::too_many_lines)]
     #[test]
     fn tool_profile_cases() {

@@ -225,6 +225,11 @@ pub(super) static GEN_FALLBACK: LazyLock<Profile> = LazyLock::new(|| {
 pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
     vec![
         // ── General shell ────────────────────────────────────────────────
+        // The `mahbot chrome` CLI emits exactly ONE line of JSON (the
+        // OutEnvelope); a per-line cap would truncate it mid-envelope into
+        // invalid JSON and drop the page content. No line cap — the envelope
+        // is byte-bounded by the chrome module's own content cap.
+        Profile::new(r"^mahbot\s+chrome\b"),
         Profile::new(r"^df\b").max_line_len(80).max(20),
         // Simple utilities: strip blanks, truncate long lines, cap at 50
         small_util(r"^(?:du|shellcheck|stat|ps|rustc)\b", 50),

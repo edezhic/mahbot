@@ -1158,14 +1158,19 @@ impl ChromeTool {
             let wait_args = ["wait", "--load", "networkidle"];
             let _ = self.run_command(&wait_args, tab).await;
 
-            // Run a compact snapshot to return page content.
-            match self.run_command(&["snapshot", "-c"], tab).await {
-                Ok(snap_resp) => snap_resp
-                    .data
-                    .as_ref()
-                    .and_then(extract_snapshot_text)
-                    .unwrap_or_default(),
-                Err(_) => String::new(),
+            // Compact snapshot to return page content; when it comes back
+            // empty (canvas/PDF/SPA shells, capture failure) fall back to
+            // visible text so open still yields something readable.
+            let snap = self
+                .run_command(&["snapshot", "-c"], tab)
+                .await
+                .ok()
+                .and_then(|r| r.data.as_ref().and_then(extract_snapshot_text))
+                .unwrap_or_default();
+            if snap.trim().is_empty() {
+                self.get_inner_text("body", tab).await.unwrap_or_default()
+            } else {
+                snap
             }
         } else {
             String::new()
@@ -1196,7 +1201,9 @@ impl ChromeTool {
                         "Opened {}",
                         data.get("url").and_then(|v| v.as_str()).unwrap_or("?")
                     );
-                    if !snapshot.is_empty() {
+                    if snapshot.trim().is_empty() {
+                        s.push_str("\n\n(no page content captured)");
+                    } else {
                         use std::fmt::Write;
                         let _ = write!(s, "\n\n--- Page content ---\n{snapshot}");
                     }
