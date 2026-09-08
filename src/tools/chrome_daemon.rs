@@ -1103,7 +1103,7 @@ async fn close_run_session(name: &str) {
 /// never touched (strict-scope rule). The legacy pre-rename
 /// `mahbot-browser-ephemeral-*` prefix still matches so orphans left by older
 /// builds don't leak.
-fn is_mahbot_session_name(name: &str) -> bool {
+pub(crate) fn is_mahbot_session_name(name: &str) -> bool {
     name.starts_with("link-enricher-")
         || name.starts_with(crate::chrome::CLI_EPHEMERAL_PREFIX)
         || name.starts_with("mahbot-browser-ephemeral-")
