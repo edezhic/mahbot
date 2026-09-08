@@ -21,9 +21,10 @@ use std::time::{Duration, Instant};
 
 use crate::chrome::actions;
 use crate::chrome::contract::{
-    ChromeResponse, EXPECT_TIMEOUT_NOTE, ExpectOutcome, OutEnvelope, OutKind,
-    classify_call_failure, eval_count, eval_result, expect_outcome, extract_output,
-    extract_snapshot_text, sanitize_timeout_message, with_condition_timeout_note,
+    ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, ErrorPageProbe, ExpectOutcome,
+    OutEnvelope, OutKind, classify_call_failure, eval_count, eval_result, expect_outcome,
+    extract_net_error_code, extract_output, extract_snapshot_text, net_error_phrase,
+    parse_error_page_probe, sanitize_timeout_message, with_condition_timeout_note,
 };
 use crate::chrome::forms::{
     ExpectCond, ExtractGate, WaitTarget, count_eval_js, describe, expect_args, extract_gate,
@@ -250,8 +251,10 @@ struct StepFailure {
 
 impl StepFailure {
     /// The failure envelope for `action`, layering the failure detail onto
-    /// `base` params: a deadline kill reports `timeout_ms`, any other failure
-    /// reports the chrome-use `error` text.
+    /// `base` params: a deadline kill reports `timeout_ms` plus a factual
+    /// `error`; any other failure reports the chrome-use `error` text, and
+    /// Network failures carry the extracted net error token as `error_code`
+    /// when the message contains one.
     fn envelope(self, action: &str, base: Value, timeout: Duration) -> OutEnvelope {
         let mut obj = match base {
             Value::Object(m) => m,
@@ -263,8 +266,17 @@ impl StepFailure {
         };
         if self.kind == OutKind::Timeout && self.message.is_empty() {
             obj.insert("timeout_ms".into(), json!(timeout.as_millis()));
+            obj.insert(
+                "error".into(),
+                json!(deadline_error(timeout, "the step did not complete")),
+            );
         } else {
             obj.insert("error".into(), json!(self.message));
+        }
+        if self.kind == OutKind::Network
+            && let Some(code) = extract_net_error_code(&self.message)
+        {
+            obj.insert("error_code".into(), json!(code));
         }
         out_env(action, false, self.kind, Value::Object(obj))
     }
@@ -1278,6 +1290,27 @@ async fn status() -> OutEnvelope {
     )
 }
 
+/// The honest `error` text for a committed-Chrome-error-page network failure:
+/// the specific cause when the net error code was extracted, the generic
+/// fallback otherwise (never lose the honest generic reason).
+fn network_failure_error(code: Option<&str>) -> String {
+    match code {
+        Some(c) => {
+            format!(
+                "Chrome rendered an error page — {c} ({})",
+                net_error_phrase(c)
+            )
+        }
+        None => "Chrome rendered an error page (site unreachable or refused)".to_string(),
+    }
+}
+
+/// The factual `error` text for a mahbot-side deadline kill; `what` names the
+/// step that did not complete.
+fn deadline_error(timeout: Duration, what: &str) -> String {
+    format!("deadline reached after {}ms — {what}", timeout.as_millis())
+}
+
 /// `open` — navigate to `url`, optionally wait for `--expect` (redesign-aware
 /// via `--structural`), report the committed final URL and best-effort attach
 /// the page content (compact accessibility snapshot). `timeout` bounds the
@@ -1353,7 +1386,7 @@ async fn open(
             false,
             OutKind::Network,
             json!({
-                "url": final_url,
+                "url": url,
                 "error": "navigation never committed — tab still on about:blank"
             }),
         );
@@ -1361,38 +1394,33 @@ async fn open(
     // The error-page probe is reserved up to the 2 s slack so it runs even
     // when the navigation consumed the whole declared deadline; total wall
     // time stays within declared + slack. Best-effort (inconclusive = pass);
-    // skipped when nothing is left.
+    // skipped when nothing is left. One eval yields both the error-page
+    // verdict and the net error token Chrome renders in `div.error-code`
+    // (empty until the neterror script runs — the generic message covers it).
     let probe_budget = total.saturating_sub(started.elapsed()).min(DEADLINE_SLACK);
-    let probe_js = "location.protocol === 'chrome-error:'";
     if probe_budget >= Duration::from_millis(500)
         && let Ok(probe) = spawn_step(
             &path,
-            &["eval", probe_js],
+            &["eval", ERROR_PAGE_PROBE_JS],
             Some(session),
             probe_budget,
             None,
             None,
         )
         .await
+        && let Some(ErrorPageProbe {
+            is_error_page: true,
+            code,
+        }) = parse_error_page_probe(&probe)
     {
-        // The probe result is a JS boolean; chrome-use may deliver it as JSON
-        // `true` or the text "true".
-        let result = eval_result(&probe);
-        let err_page = result.and_then(Value::as_bool) == Some(true)
-            || result
-                .and_then(extract_snapshot_text)
-                .is_some_and(|t| t.trim().eq_ignore_ascii_case("true"));
-        if err_page {
-            return out_env(
-                "open",
-                false,
-                OutKind::Network,
-                json!({
-                    "url": final_url,
-                    "error": "Chrome rendered an error page (site unreachable or refused)"
-                }),
-            );
+        let mut payload = json!({
+            "url": url,
+            "error": network_failure_error(code.as_deref()),
+        });
+        if let Some(code) = code {
+            payload["error_code"] = json!(code);
         }
+        return out_env("open", false, OutKind::Network, payload);
     }
     if let Some(target) = wait_for {
         let target_desc = target.describe();
@@ -1415,6 +1443,7 @@ async fn open(
         // envelope the wait-timeout arm produces, without content.
         if wait_budget < Duration::from_millis(250) {
             payload["timeout_ms"] = json!(timeout.as_millis());
+            payload["error"] = json!(deadline_error(timeout, "the target wait never started"));
             payload["hint"] = json!(hint);
             return out_env("open", false, timeout_kind, payload);
         }
@@ -1437,6 +1466,13 @@ async fn open(
             Ok(_) => out_env("open", true, OutKind::Ok, payload),
             Err(f) if f.kind == OutKind::Timeout => {
                 payload["timeout_ms"] = json!(timeout.as_millis());
+                // The chrome-side timeout message when chrome-use phrased the
+                // timeout itself, a factual deadline text on a mahbot kill.
+                if f.message.is_empty() {
+                    payload["error"] = json!(deadline_error(timeout, "the target never appeared"));
+                } else {
+                    payload["error"] = json!(f.message);
+                }
                 payload["hint"] = json!(hint);
                 out_env("open", false, timeout_kind, payload)
             }
@@ -2202,23 +2238,50 @@ mod tests {
     }
 
     #[test]
+    fn network_failure_error_names_code_or_falls_back() {
+        assert_eq!(
+            network_failure_error(Some("ERR_NAME_NOT_RESOLVED")),
+            "Chrome rendered an error page — ERR_NAME_NOT_RESOLVED (DNS resolution failure)"
+        );
+        assert_eq!(
+            network_failure_error(None),
+            "Chrome rendered an error page (site unreachable or refused)"
+        );
+    }
+
+    #[test]
     fn step_failure_envelope_reports_timeout_vs_error() {
         let timeout = Duration::from_secs(8);
+        // A deadline kill now reports timeout_ms AND a factual error.
         let env = StepFailure {
             kind: OutKind::Timeout,
             message: String::new(),
         }
         .envelope("wait", json!({ "selector": ".x" }), timeout);
-        assert!(env.payload.get("timeout_ms").is_some());
-        assert!(env.payload.get("error").is_none());
+        assert_eq!(env.payload["timeout_ms"], 8000);
+        assert_eq!(
+            env.payload["error"],
+            "deadline reached after 8000ms — the step did not complete"
+        );
 
+        // Any other failure reports the chrome-use error text, no timeout_ms.
         let env = StepFailure {
             kind: OutKind::Network,
             message: "net::ERR_NAME_NOT_RESOLVED".into(),
         }
         .envelope("open", json!({ "url": "https://x" }), timeout);
         assert_eq!(env.payload["error"], "net::ERR_NAME_NOT_RESOLVED");
+        assert_eq!(env.payload["error_code"], "ERR_NAME_NOT_RESOLVED");
         assert!(env.payload.get("timeout_ms").is_none());
+
+        // A Network failure with no recognizable net error token gets no
+        // error_code.
+        let env = StepFailure {
+            kind: OutKind::Network,
+            message: "connection refused by peer".into(),
+        }
+        .envelope("open", json!({ "url": "https://x" }), timeout);
+        assert!(env.payload.get("error_code").is_none());
     }
 
     #[test]

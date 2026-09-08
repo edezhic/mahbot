@@ -1,8 +1,9 @@
 //! Chrome automation tool.
 
 use crate::chrome::contract::{
-    ChromeResponse, EXPECT_TIMEOUT_NOTE, classify_call_failure, eval_count, expect_outcome,
-    extract_output, extract_snapshot_text, is_daemon_unavailable_code, is_daemon_unavailable_error,
+    ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, classify_call_failure, eval_count,
+    expect_outcome, extract_output, extract_snapshot_text, is_daemon_unavailable_code,
+    is_daemon_unavailable_error, net_error_phrase, parse_error_page_probe,
     sanitize_timeout_message, with_condition_timeout_note,
 };
 use crate::chrome::escape_js_single_quoted;
@@ -302,11 +303,28 @@ impl ChromeTool {
             return Ok(());
         };
         if crate::chrome::is_chrome_error_page(committed_url) {
-            anyhow::bail!(
-                "Navigation to {url} failed — Chrome landed on its error page \
-                 (chrome-error://chromewebdata/), meaning the site is unreachable (DNS failure, \
-                 refused connection, or a blocked/unsafe port). Verify the URL and network."
-            );
+            // Best-effort: ask the error page which net error code Chrome
+            // rendered (the same probe the CLI `open` uses); the generic
+            // message is the fallback when nothing recognizable renders.
+            let code = self
+                .run_command(&["eval", ERROR_PAGE_PROBE_JS], tab)
+                .await
+                .ok()
+                .and_then(|r| parse_error_page_probe(&r))
+                .filter(|p| p.is_error_page)
+                .and_then(|p| p.code);
+            match code {
+                Some(code) => anyhow::bail!(
+                    "Navigation to {url} failed — Chrome rendered its error page: {code} ({}). \
+                     Verify the URL and network.",
+                    net_error_phrase(&code)
+                ),
+                None => anyhow::bail!(
+                    "Navigation to {url} failed — Chrome landed on its error page \
+                     (chrome-error://chromewebdata/), meaning the site is unreachable (DNS failure, \
+                     refused connection, or a blocked/unsafe port). Verify the URL and network."
+                ),
+            }
         }
         if crate::chrome::is_blank_page_url(committed_url) {
             self.close_session(tab).await;

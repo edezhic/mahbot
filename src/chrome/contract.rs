@@ -8,8 +8,10 @@
 //! chrome` stdout output contract ([`SCHEMA_VERSION`], [`OutKind`],
 //! [`OutEnvelope`]) lives here too.
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::LazyLock;
 
 /// Response from chrome-use `--json` commands — the ONE structural envelope
 /// parser every chrome frontend shares.
@@ -129,6 +131,55 @@ pub(crate) fn eval_result(resp: &ChromeResponse) -> Option<&Value> {
             (Some(result), Some(_)) => result,
             _ => d,
         })
+}
+
+/// The ONE error-page probe eval, shared by the CLI `open` action and the
+/// interactive tool: always a JSON verdict string (robust against textified
+/// delivery) reporting whether the tab committed to a Chrome error page and,
+/// best-effort, the net error token Chrome renders in the error page's
+/// `div.error-code` (empty until the neterror script renders it, and on
+/// template/locale drift — callers must keep the generic fallback).
+pub(crate) const ERROR_PAGE_PROBE_JS: &str = "JSON.stringify({err: location.protocol === 'chrome-error:', code: (document.querySelector('.error-code') || {}).textContent || ''})";
+
+/// Parsed [`ERROR_PAGE_PROBE_JS`] verdict.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ErrorPageProbe {
+    /// The tab conclusively sits on a Chrome error page.
+    pub(crate) is_error_page: bool,
+    /// The net error token (`ERR_*` / `DNS_*`) read from `div.error-code`,
+    /// when one rendered and is recognizable.
+    pub(crate) code: Option<String>,
+}
+
+/// Parse an error-page probe response. `None` = inconclusive (callers treat
+/// the probe as passed, never as a network failure). The verdict arrives as
+/// the eval's JSON string — possibly textified — or an already-parsed object.
+pub(crate) fn parse_error_page_probe(resp: &ChromeResponse) -> Option<ErrorPageProbe> {
+    let data = eval_result(resp)?;
+    let verdict = if let Some(text) = extract_snapshot_text(data) {
+        let t = text.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("undefined") {
+            return None;
+        }
+        serde_json::from_str::<Value>(t)
+            .ok()
+            .or_else(|| extract_net_error_code(t).map(|c| json!({ "err": true, "code": c })))
+    } else if let v @ Value::Object(_) = data {
+        Some(v.clone())
+    } else {
+        None
+    }?;
+    let is_error_page = verdict.get("err").and_then(Value::as_bool) == Some(true);
+    let code = is_error_page.then(|| {
+        verdict
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    });
+    Some(ErrorPageProbe {
+        is_error_page,
+        code: code.and_then(extract_net_error_code),
+    })
 }
 
 /// Extract a non-negative element count from a count-eval response — the eval
@@ -346,6 +397,37 @@ pub(crate) fn classify_call_failure(code: Option<&str>, error: &str) -> OutKind 
     OutKind::Error
 }
 
+/// Canonical net error token extracted from chrome-side text. Both forms
+/// chrome-use surfaces — the `net::ERR_*` prefix form on CDP `errorText` and
+/// the bare `ERR_*`/`DNS_*` form Chrome renders in the error page's
+/// `div.error-code` — canonicalize to the bare token (e.g.
+/// `ERR_NAME_NOT_RESOLVED`, `DNS_PROBE_FINISHED_NXDOMAIN`).
+pub(crate) fn extract_net_error_code(text: &str) -> Option<String> {
+    static NET_ERROR_CODE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:net::)?\b(ERR_[A-Z0-9_]+|DNS_[A-Z0-9_]+)").expect("valid net error regex")
+    });
+    NET_ERROR_CODE
+        .captures(text)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+/// Coarse cause phrase for a net error token: DNS failures, refused
+/// connections, everything else (timed out/reset/unsafe port/disconnected…)
+/// shares one honest "unreachable or failed" bucket — the raw token is the
+/// precise signal for the caller. `ERR_NAME_NOT_RESOLVED` counts as DNS: it
+/// is the canonical DNS-failure code chrome-use surfaces via CDP errorText
+/// (the error page itself renders the `DNS_*`-prefixed token).
+pub(crate) fn net_error_phrase(code: &str) -> &'static str {
+    if code.starts_with("DNS_") || code == "ERR_NAME_NOT_RESOLVED" {
+        "DNS resolution failure"
+    } else if code == "ERR_CONNECTION_REFUSED" {
+        "connection refused"
+    } else {
+        "site unreachable or connection failed"
+    }
+}
+
 /// Start of the canned remediation hint chrome-use (external binary) appends
 /// to some timeout failures. Everything from the first occurrence of this
 /// marker to the end of the message is stripped by
@@ -389,8 +471,9 @@ pub(crate) const EXPECT_TIMEOUT_NOTE: &str =
 
 /// Append the action's condition-timeout remediation note to `message` when
 /// `kind` is Timeout and `message` is chrome-use's own phrased text — an empty
-/// message is the mahbot-side deadline kill, whose timeout_ms-only envelope
-/// shape is pinned and stays untouched. No-op for every other action.
+/// message is the mahbot-side deadline kill, which carries its own factual
+/// error text and never gets the remediation note. No-op for every other
+/// action.
 pub(crate) fn with_condition_timeout_note(action: &str, kind: OutKind, message: &mut String) {
     let note = match (kind, action) {
         (OutKind::Timeout, "wait") => Some(WAIT_TIMEOUT_NOTE),
@@ -731,6 +814,123 @@ mod tests {
     }
 
     #[test]
+    fn net_error_code_extraction_canonicalizes_both_forms() {
+        // The net::ERR_ prefix form (chrome-use errorText) and the bare
+        // ERR_*/DNS_* form (div.error-code) canonicalize to the bare token.
+        assert_eq!(
+            extract_net_error_code("Navigation failed: net::ERR_NAME_NOT_RESOLVED"),
+            Some("ERR_NAME_NOT_RESOLVED".into())
+        );
+        assert_eq!(
+            extract_net_error_code("ERR_CONNECTION_REFUSED"),
+            Some("ERR_CONNECTION_REFUSED".into())
+        );
+        assert_eq!(
+            extract_net_error_code("DNS_PROBE_FINISHED_NXDOMAIN"),
+            Some("DNS_PROBE_FINISHED_NXDOMAIN".into())
+        );
+        assert_eq!(
+            extract_net_error_code("error: net::ERR_CONNECTION_TIMED_OUT — retry"),
+            Some("ERR_CONNECTION_TIMED_OUT".into())
+        );
+        assert_eq!(extract_net_error_code("connection refused by peer"), None);
+        assert_eq!(extract_net_error_code(""), None);
+    }
+
+    #[test]
+    fn net_error_phrases_bucket_dns_refused_other() {
+        assert_eq!(
+            net_error_phrase("DNS_PROBE_FINISHED_NXDOMAIN"),
+            "DNS resolution failure"
+        );
+        // ERR_NAME_NOT_RESOLVED is the DNS-failure code surfaced via CDP
+        // errorText despite the ERR_ prefix.
+        assert_eq!(
+            net_error_phrase("ERR_NAME_NOT_RESOLVED"),
+            "DNS resolution failure"
+        );
+        assert_eq!(
+            net_error_phrase("ERR_CONNECTION_REFUSED"),
+            "connection refused"
+        );
+        assert_eq!(
+            net_error_phrase("ERR_CONNECTION_RESET"),
+            "site unreachable or connection failed"
+        );
+    }
+
+    #[test]
+    fn error_page_probe_parses_verdict_shapes() {
+        let resp = |data: Value| ChromeResponse {
+            data: Some(data),
+            ..Default::default()
+        };
+        // The usual shape: the JSON verdict string inside the eval wrapper.
+        let clean = resp(json!({ "origin": "x", "result": r#"{"err": false, "code": ""}"# }));
+        assert_eq!(
+            parse_error_page_probe(&clean),
+            Some(ErrorPageProbe {
+                is_error_page: false,
+                code: None
+            })
+        );
+        let failed = resp(
+            json!({ "origin": "x", "result": r#"{"err": true, "code": "ERR_CONNECTION_REFUSED"}"# }),
+        );
+        assert_eq!(
+            parse_error_page_probe(&failed),
+            Some(ErrorPageProbe {
+                is_error_page: true,
+                code: Some("ERR_CONNECTION_REFUSED".into())
+            })
+        );
+        // An error page whose code did not render in time → generic fallback.
+        let no_code = resp(json!({ "origin": "x", "result": r#"{"err": true, "code": ""}"# }));
+        assert_eq!(
+            parse_error_page_probe(&no_code),
+            Some(ErrorPageProbe {
+                is_error_page: true,
+                code: None
+            })
+        );
+        // A bare (wrapper-less) string verdict.
+        let bare = resp(json!(
+            r#"{"err": true, "code": "DNS_PROBE_FINISHED_NXDOMAIN"}"#
+        ));
+        assert_eq!(
+            parse_error_page_probe(&bare),
+            Some(ErrorPageProbe {
+                is_error_page: true,
+                code: Some("DNS_PROBE_FINISHED_NXDOMAIN".into())
+            })
+        );
+        // An already-parsed verdict object.
+        let object = resp(json!({ "err": true, "code": "ERR_UNSAFE_PORT" }));
+        assert_eq!(
+            parse_error_page_probe(&object),
+            Some(ErrorPageProbe {
+                is_error_page: true,
+                code: Some("ERR_UNSAFE_PORT".into())
+            })
+        );
+        // Lenient fallback: an unparseable text carrying a net error token
+        // still identifies an error page.
+        let token_text = resp(json!("net::ERR_INTERNET_DISCONNECTED"));
+        assert_eq!(
+            parse_error_page_probe(&token_text),
+            Some(ErrorPageProbe {
+                is_error_page: true,
+                code: Some("ERR_INTERNET_DISCONNECTED".into())
+            })
+        );
+        // Inconclusive shapes → None (the probe passes, never a failure).
+        assert_eq!(parse_error_page_probe(&resp(json!(null))), None);
+        assert_eq!(parse_error_page_probe(&resp(json!(""))), None);
+        assert_eq!(parse_error_page_probe(&resp(json!("garbage text"))), None);
+        assert_eq!(parse_error_page_probe(&resp(json!(true))), None);
+    }
+
+    #[test]
     fn sanitize_timeout_message_strips_stale_relay_hint() {
         // Timeout-classified message with the canned hint → hint stripped
         // (including the separator period before the hint sentence), honest
@@ -782,7 +982,7 @@ mod tests {
             format!("waitFor timed out: .submit{EXPECT_TIMEOUT_NOTE}")
         );
         // Empty message (mahbot-side deadline kill) → untouched, so the
-        // timeout_ms-only envelope shape stays pinned.
+        // deadline kill keeps its own factual error text.
         let mut m = String::new();
         with_condition_timeout_note("wait", OutKind::Timeout, &mut m);
         assert!(m.is_empty());

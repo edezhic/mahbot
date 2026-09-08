@@ -128,12 +128,13 @@ pub(crate) fn is_blank_page_url(url: &str) -> bool {
     url.is_empty() || url.starts_with("about:blank")
 }
 
-/// chrome-use's scratch error-page URL (v1.5.101, live-verified): DNS/refused/
-/// unsafe-port navigations return rc=0 with success:true and commit to
-/// `chrome-error://chromewebdata/` (prefix match — the trailing slash exists;
-/// no false positives on 404/5xx or real captive-portal pages). The only
-/// false positive is a TLS-intercepting portal with a fake certificate —
-/// accepted trade-off.
+/// chrome-use's scratch error-page URL (live-verified on 1.5.101 and
+/// reconfirmed on the installed 1.5.106; the binary auto-updates): DNS/refused/
+/// unsafe-port navigations return
+/// rc=0 with success:true and commit to `chrome-error://chromewebdata/`
+/// (prefix match — the trailing slash exists; no false positives on 404/5xx
+/// or real captive-portal pages). The only false positive is a
+/// TLS-intercepting portal with a fake certificate — accepted trade-off.
 pub(crate) fn is_chrome_error_page(url: &str) -> bool {
     url.trim().starts_with("chrome-error://")
 }
