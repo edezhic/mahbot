@@ -145,7 +145,7 @@ fn model_picker_list<'a>(
             &add_input.buffer,
             add_placeholder,
             false, // Enter adds nothing here; the Add button drives the mutation.
-            Length::Fixed(450.0),
+            Length::Fill,
             Some(Id::from(format!("model_picker:{}", target.idx()))),
             on_add_input,
         ),
@@ -1590,14 +1590,15 @@ impl SettingsState {
         active_user: Option<&str>,
         active_is_admin: bool,
     ) -> Element<'_, SettingsMessage> {
-        // Workspace management section (top). The workspace list & add form are
-        // gated on the active user's admin status (shared membership is admin-only).
+        // Workspace management section (right column). The workspace list &
+        // add form are gated on the active user's admin status (shared
+        // membership is admin-only).
         let ws_section = self.workspaces_section(active_is_admin);
 
-        // User management section (second)
+        // User management section (right column, below workspaces)
         let us_section = self.users_section(active_user);
 
-        // Existing config sections
+        // Existing config sections (left column)
         let config_sections = Column::new()
             .push(self.provider_section())
             .push(Space::new().height(16))
@@ -1619,19 +1620,31 @@ impl SettingsState {
             .push(Space::new().height(16))
             .push(Self::about_section());
 
-        let mut content = column![
-            ws_section,
-            Space::new().height(16),
-            us_section,
-            Space::new().height(16),
-            config_sections,
-        ];
+        // Two strict 50/50 columns sharing ONE outer vertical scroll (`vscroll`
+        // below). Both columns are `FillPortion(1)` inside a single row, so the
+        // taller column naturally defines the page length; column separation
+        // comes only from the right column's internal left padding (no spacer
+        // element).
+        let left_col = config_sections;
+        let right_col = column![ws_section, Space::new().height(16), us_section,];
 
+        let mut content = column![];
+
+        // Page-level error banner — a full-width band above both columns.
         if let Some(ref err) = self.error {
+            content = content.push(widgets::error_banner_fill(err));
             content = content.push(Space::new().height(8));
-            content = content
-                .push(container(text(err).color(theme::STATUS_ERROR)).padding([theme::PAD_8, 0.0]));
         }
+
+        content = content.push(row![
+            container(left_col).width(Length::FillPortion(1)),
+            container(right_col)
+                .width(Length::FillPortion(1))
+                .padding(iced::Padding {
+                    left: theme::PAD_16,
+                    ..iced::Padding::ZERO
+                }),
+        ]);
 
         let scroll = widgets::vscroll(content);
 
@@ -1682,33 +1695,42 @@ impl SettingsState {
         } else {
             for ws_item in &ws.workspaces {
                 let ws_row = container(
-                    row![
-                        // Name column (FillPortion: 22) — workspace name with
-                        // the status pill inlined right after it (the Status
-                        // column was removed; maintainer/pause toggles live
-                        // in the footer only).
-                        container(
-                            row![
-                                text(&ws_item.name)
-                                    .size(theme::TEXT_14)
-                                    .color(theme::TEXT_PRIMARY),
-                                widgets::tooltip_hint(
-                                    widgets::badge_pill(
-                                        ws_item.status.to_string(),
-                                        theme::workspace_status_color(ws_item.status),
-                                        widgets::PILL_MODAL,
-                                    ),
-                                    "Status",
+                    column![
+                        // Line 1 — name, status pill, and truncated path on one
+                        // row. Maintainer/pause toggles live in the footer only.
+                        row![
+                            text(&ws_item.name)
+                                .size(theme::TEXT_14)
+                                .color(theme::TEXT_PRIMARY),
+                            widgets::tooltip_hint(
+                                widgets::badge_pill(
+                                    ws_item.status.to_string(),
+                                    theme::workspace_status_color(ws_item.status),
+                                    widgets::PILL_MODAL,
                                 ),
-                            ]
-                            .spacing(theme::SPACE_10)
-                            .align_y(Alignment::Center),
-                        )
-                        .width(Length::FillPortion(22))
-                        .align_x(Alignment::Start)
+                                "Status",
+                            ),
+                            // Path fills the remaining width and clips —
+                            // `Wrapping::None` keeps it on one line at any
+                            // column width (iced text has no ellipsis), and
+                            // the tooltip always reveals the full path.
+                            widgets::tooltip_hint(
+                                container(
+                                    text(&ws_item.path)
+                                        .size(theme::TEXT_12)
+                                        .color(theme::TEXT_SECONDARY)
+                                        .wrapping(text::Wrapping::None),
+                                )
+                                .width(Length::Fill)
+                                .clip(true)
+                                .align_y(Alignment::Center),
+                                ws_item.path.clone(),
+                            ),
+                        ]
+                        .spacing(theme::SPACE_10)
                         .align_y(Alignment::Center),
-                        // Contexts column (FillPortion: 42, the widest) — per-role
-                        // context icons, general context, Diag, Notes.
+                        // Line 2 — per-role context icons, general context,
+                        // Diag, Notes.
                         {
                             let mut left = Row::new()
                                 .spacing(theme::SPACE_4)
@@ -1777,22 +1799,10 @@ impl SettingsState {
                                 theme::button_text,
                                 tooltip::Position::Top,
                             ));
-                            container(left)
-                                .width(Length::FillPortion(42))
-                                .align_x(Alignment::Start)
-                                .align_y(Alignment::Center)
+                            left
                         },
-                        // Path column (FillPortion: 36)
-                        container(
-                            text(&ws_item.path)
-                                .size(theme::TEXT_12)
-                                .color(theme::TEXT_SECONDARY)
-                        )
-                        .width(Length::FillPortion(36))
-                        .align_x(Alignment::Start)
-                        .align_y(Alignment::Center),
                     ]
-                    .align_y(Alignment::Center),
+                    .spacing(theme::SPACE_6),
                 )
                 .padding(theme::PAD_8)
                 .style(theme::surface_card_style);
@@ -2072,9 +2082,9 @@ impl SettingsState {
                                 &us.bind_input.buffer,
                                 "@username",
                                 false,
-                                // Fills the left segment so the editor fits
-                                // inside the half-width row; the fixed-size
-                                // label and Bind/Cancel buttons floor it.
+                                // Fills the left segment so the editor spans
+                                // the row; the fixed-size label and
+                                // Bind/Cancel buttons floor it.
                                 Length::Fill,
                                 Some(Id::from(format!("bind_input:{}", user.name))),
                                 |action| {
@@ -2201,10 +2211,7 @@ impl SettingsState {
                     ]
                     .align_y(Alignment::Center),
                 )
-                // Users rows are rendered at half the container width — the
-                // content is compact and stretching it full width would just
-                // add empty space. Workspaces rows stay full width.
-                .width(Length::FillPortion(1))
+                .width(Length::Fill)
                 .padding(theme::PAD_8)
                 .style(theme::surface_card_style);
 
@@ -2228,9 +2235,7 @@ impl SettingsState {
                     )
                     .into()
                 };
-                // The row's FillPortion(1) pairs with this spacer's
-                // FillPortion(1) to occupy half the container width.
-                rows = rows.push(row![user_row, Space::new().width(Length::FillPortion(1))]);
+                rows = rows.push(user_row);
             }
         }
 
@@ -2476,7 +2481,6 @@ impl SettingsState {
         label: &'static str,
         placeholder: &'static str,
         key: &'static str,
-        hint: Option<&'static str>,
     ) -> Element<'a, SettingsMessage> {
         let field = format!("config:{key}");
         let error = self.field_errors.get(&field).map(String::as_str);
@@ -2486,13 +2490,31 @@ impl SettingsState {
                 &self.field_editor(&field).buffer,
                 placeholder,
                 true,
-                Length::Fixed(375.0),
+                Length::Fill,
                 Some(Id::from(field.clone())),
                 move |action| SettingsMessage::ConfigFieldAction { key, action },
             ),
-            hint,
+            None,
             error,
         )
+    }
+
+    /// A model-slot config field: the field-name label stays left of the input,
+    /// while the group's role list is rendered as a small hint label ABOVE the
+    /// input (aligned with the input column via [`FIELD_ROW_INLINE_PAD`]).
+    fn config_model_slot_field<'a>(
+        &'a self,
+        label: &'static str,
+        placeholder: &'static str,
+        key: &'static str,
+        role_hint: &'static str,
+    ) -> Element<'a, SettingsMessage> {
+        column![
+            inline_label(role_hint, FIELD_ROW_INLINE_PAD, theme::TEXT_SECONDARY),
+            self.config_text_field(label, placeholder, key),
+        ]
+        .spacing(theme::SPACE_2)
+        .into()
     }
 
     /// A single maskable password config field row (with password highlighting).
@@ -2513,7 +2535,7 @@ impl SettingsState {
                 &self.field_editor(&field).buffer,
                 placeholder,
                 self.password_visible.contains(&target),
-                Length::Fixed(375.0),
+                Length::Fill,
                 highlight,
                 Some(Id::from(field.clone())),
                 move |action| SettingsMessage::PasswordFieldAction { key, action },
@@ -2574,10 +2596,9 @@ impl SettingsState {
                 "Endpoint URL",
                 "https://openrouter.ai/api/v1",
                 CONFIG_KEY_PROVIDER_ENDPOINT,
-                None,
             );
             if let Some(w) = self.endpoint_warning.as_ref() {
-                endpoint_row = column![endpoint_row, inline_warning(w, 188.0)]
+                endpoint_row = column![endpoint_row, inline_warning(w, FIELD_ROW_INLINE_PAD)]
                     .spacing(theme::SPACE_2)
                     .into();
             }
@@ -2601,17 +2622,17 @@ impl SettingsState {
     }
 
     fn models_section(&self) -> Element<'_, SettingsMessage> {
-        let manager_row = self.config_text_field(
+        let manager_row = self.config_model_slot_field(
             "Manager",
             crate::config::DEFAULT_MANAGER_MODEL,
             CONFIG_KEY_MANAGER_MODEL,
-            Some("Manager, Assistant, Discovery, Engineer, Support, Maintainer"),
+            "Manager, Assistant, Discovery, Engineer, Support, Maintainer",
         );
-        let worker_row = self.config_text_field(
+        let worker_row = self.config_model_slot_field(
             "Worker",
             crate::config::DEFAULT_WORKER_MODEL,
             CONFIG_KEY_WORKER_MODEL,
-            Some("Analyst, Coder, QA, Reviewer, Sanitation"),
+            "Analyst, Coder, QA, Reviewer, Sanitation",
         );
         section(
             "Models",
@@ -2796,7 +2817,7 @@ impl SettingsState {
                 &self.wake_word_phrase_input.buffer,
                 "mahbot",
                 false,
-                Length::Fixed(250.0),
+                Length::Fill,
                 Some(Id::new("wake_word_phrase")),
                 SettingsMessage::WakeWordPhraseInput,
             );
@@ -2955,7 +2976,7 @@ impl SettingsState {
         .text_size(theme::TEXT_13)
         .style(theme::pick_list_style)
         .menu_style(theme::pick_list_menu_style)
-        .width(Length::Fixed(180.0));
+        .width(Length::Fill);
 
         let provider_row = field_row_with_error(
             "Web Search Provider",
@@ -3048,7 +3069,7 @@ impl SettingsState {
                 &self.field_editor(&order_field).buffer,
                 placeholder,
                 true,
-                Length::Fixed(375.0),
+                Length::Fill,
                 Some(Id::from(order_field.clone())),
                 move |action| {
                     if matches!(action, EditorAction::Submit) {
@@ -3129,6 +3150,10 @@ fn section_impl<'a>(
     .into()
 }
 
+/// Left pad aligning inline messages/hints with a field row's input column:
+/// the fixed 180px label width plus the 8px row gap.
+const FIELD_ROW_INLINE_PAD: f32 = 188.0;
+
 /// Label on the left, input on the right, optional hint below.
 fn field_row<'a>(
     label: &'static str,
@@ -3139,8 +3164,8 @@ fn field_row<'a>(
 }
 
 /// Small inline status label in the given color, indented `left_pad` px to
-/// align with the input column — shared body of [`inline_error`] and
-/// [`inline_warning`].
+/// align with the input column — shared body of [`inline_error`],
+/// [`inline_warning`], and the model-slot role-list hint above the input.
 fn inline_label(msg: &str, left_pad: f32, color: iced::Color) -> Element<'_, SettingsMessage> {
     container(text(msg).size(theme::TEXT_10).color(color))
         .padding(iced::Padding::default().left(left_pad))
@@ -3266,7 +3291,7 @@ fn field_row_with_error<'a>(
 
     let row_elem: Element<'a, SettingsMessage> = row_widget.into();
     if let Some(err) = error {
-        column![row_elem, inline_error(err, 188.0),]
+        column![row_elem, inline_error(err, FIELD_ROW_INLINE_PAD),]
             .spacing(theme::SPACE_2)
             .into()
     } else {

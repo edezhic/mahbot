@@ -217,13 +217,24 @@ pub fn password_field_editor<'a, M: Clone + 'a>(
         .into()
 }
 
-/// Render a styled error banner for dashboard panels.
-#[must_use]
-pub fn error_banner<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> {
+/// Shared body of [`error_banner`] / [`error_banner_fill`]: the pill-styled
+/// error text.
+fn error_banner_body<'a, Message: 'a>(err: &'a str) -> container::Container<'a, Message> {
     container(text(err).size(theme::TEXT_13).color(theme::STATUS_ERROR))
         .padding(theme::PAD_8)
         .style(theme::pill_style(theme::STATUS_ERROR.scale_alpha(0.08)))
-        .into()
+}
+
+/// Render a styled error banner for dashboard panels.
+#[must_use]
+pub fn error_banner<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> {
+    error_banner_body(err).into()
+}
+
+/// [`error_banner`] stretched to the full container width.
+#[must_use]
+pub fn error_banner_fill<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> {
+    error_banner_body(err).width(Length::Fill).into()
 }
 
 /// Standardized "Loading…" placeholder label for load-state scaffolding.

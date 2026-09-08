@@ -214,7 +214,7 @@ pub struct Workspace {
     /// `maintenance_enabled` is `true`, and vice versa.
     ///
     /// Persisted in the `workspaces` table with a `DEFAULT 0` schema default.
-    /// Toggled via the settings panel in the GUI.
+    /// Toggled from the dashboard footer chrome.
     pub maintenance_enabled: bool,
     /// Whether automatic claim dispatch is paused for this workspace (a strict
     /// freeze): ALL in-flight pipeline work stops (in-flight agents are
