@@ -342,30 +342,6 @@ pub fn badge_pill<'a, Message: 'a>(
         .into()
 }
 
-/// Maintainer icon + ON/OFF badge shared by the Settings workspace-row
-/// Maintainer toggle; the wrapping toggle button stays with the caller.
-#[must_use]
-pub fn maint_badge<'a, Message: 'a>(enabled: bool) -> Column<'a, Message> {
-    column![
-        theme::role_icon(&crate::Role::Maintainer)
-            .size(theme::TEXT_14)
-            .color(if enabled {
-                theme::ACCENT
-            } else {
-                theme::TEXT_MUTED
-            }),
-        text(if enabled { "ON" } else { "OFF" })
-            .size(theme::TEXT_10)
-            .color(if enabled {
-                theme::ACCENT
-            } else {
-                theme::TEXT_MUTED
-            }),
-    ]
-    .spacing(0)
-    .align_x(Alignment::Center)
-}
-
 /// Page/panel section heading: JetBrains Mono, 16px, secondary text color.
 #[must_use]
 pub fn section_heading<'a>(

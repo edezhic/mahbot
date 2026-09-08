@@ -20,10 +20,6 @@ pub enum WorkspacesMessage {
     DeleteResult(Result<(), String>),
     Reanalyze(String),
     ReanalyzeResult(Result<(), String>),
-    ToggleMaintainer(String, bool),
-    ToggleResult(Result<(), String>),
-    TogglePaused(String, bool),
-    PauseResult(String, bool, Result<(), String>), // name, now_paused, result
 
     /// User clicked a role icon to view per-agent context (read-only markdown).
     ViewContext(String, String), // workspace_name, role
@@ -186,42 +182,6 @@ impl WorkspacesState {
             ),
             WorkspacesMessage::ReanalyzeResult(Ok(())) => Task::none(),
             WorkspacesMessage::ReanalyzeResult(Err(e)) => {
-                self.load_state.fail(e.clone());
-                Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
-            }
-            WorkspacesMessage::ToggleMaintainer(name, enabled) => Task::perform(
-                async move {
-                    crate::workspace::store()
-                        .set_maintenance_enabled(&name, enabled)
-                        .await
-                        .map_err(|e| e.to_string())
-                },
-                WorkspacesMessage::ToggleResult,
-            ),
-            WorkspacesMessage::ToggleResult(Ok(())) => Task::none(),
-            WorkspacesMessage::ToggleResult(Err(e)) => {
-                self.load_state.fail(e.clone());
-                Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
-            }
-            WorkspacesMessage::TogglePaused(name, paused) => {
-                let name2 = name.clone();
-                Task::perform(
-                    async move {
-                        crate::workspace::store()
-                            .set_paused(&name, paused)
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    move |result| WorkspacesMessage::PauseResult(name2, paused, result),
-                )
-            }
-            WorkspacesMessage::PauseResult(name, paused, Ok(())) => Task::done(
-                WorkspacesMessage::Toast(super::ToastMessage::SuccessMsg(format!(
-                    "Pipeline {} for {name}",
-                    if paused { "paused" } else { "resumed" }
-                ))),
-            ),
-            WorkspacesMessage::PauseResult(_, _, Err(e)) => {
                 self.load_state.fail(e.clone());
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
             }

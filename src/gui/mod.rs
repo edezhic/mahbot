@@ -1028,7 +1028,7 @@ impl Dashboard {
         }
 
         // Any successful Settings-side workspace mutation (add, delete,
-        // reanalyze, toggles, diagnostics/notes edits) refreshes the shared
+        // reanalyze, diagnostics/notes edits) refreshes the shared
         // workspace map from one full DB read — the map is the single source
         // of truth, and syncing the Settings workspace list from it (see
         // [`Self::sync_settings_lists_from_map`]) gives the page its immediate
@@ -1039,8 +1039,6 @@ impl Dashboard {
             settings::SettingsMessage::WorkspaceMsg(
                 workspaces::WorkspacesMessage::DeleteResult(Ok(()))
                     | workspaces::WorkspacesMessage::ReanalyzeResult(Ok(()))
-                    | workspaces::WorkspacesMessage::ToggleResult(Ok(()))
-                    | workspaces::WorkspacesMessage::PauseResult(_, _, Ok(()))
                     | workspaces::WorkspacesMessage::DiagnosticsSaved(_, Ok(()))
                     | workspaces::WorkspacesMessage::RediscoverDiagnosticsResult(_, Ok(()))
                     | workspaces::WorkspacesMessage::NotesSaved(_, Ok(()))
@@ -2681,7 +2679,10 @@ impl Dashboard {
     }
 
     /// Footer workspace picker: shared workspaces only, admin-gated, persists
-    /// via [`Self::select_workspace`]. Returns `None` for the no-user,
+    /// via [`Self::select_workspace`]. With a single shared workspace the
+    /// dropdown degrades to a static label (that workspace's display name,
+    /// or the "Select workspace" placeholder when nothing is selected —
+    /// including a Personal/unset selection). Returns `None` for the no-user,
     /// non-admin, and zero-shared-workspaces states — the admin flag is
     /// fail-closed `false` until loaded, so the picker is hidden at boot
     /// (intended).
@@ -2694,6 +2695,24 @@ impl Dashboard {
         // suggest a choice that isn't there; hide the picker instead.
         if options.is_empty() {
             return None;
+        }
+        if options.len() == 1 {
+            // A one-option dropdown offers no choice; render the sole
+            // workspace as a static label (140px, matching the dropdown's
+            // footprint so the footer chrome doesn't shift).
+            let sole = &options[0];
+            let label = if self.active_workspace_name().as_deref() == Some(sole.value.as_str()) {
+                sole.label.clone()
+            } else {
+                "Select workspace".to_string()
+            };
+            return Some(widgets::tooltip_hint(
+                container(text(label).size(theme::TEXT_14).color(theme::TEXT_PRIMARY))
+                    .width(Length::Fixed(140.0))
+                    .padding([theme::PAD_4, theme::PAD_8])
+                    .style(theme::pill_style(theme::BG_ELEVATED)),
+                "Active workspace",
+            ));
         }
         // Guard the displayed selection: a dangling persisted value (the
         // workspace vanished from the map) renders no highlight; a personal

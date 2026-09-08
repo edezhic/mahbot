@@ -1681,39 +1681,17 @@ impl SettingsState {
             );
         } else {
             for ws_item in &ws.workspaces {
-                let maintainer_on = ws_item.maintenance_enabled;
-                let paused = ws_item.paused;
-                let (pause_icon, pause_tooltip) = if paused {
-                    (
-                        lucide::play::<iced::Theme, iced::Renderer>()
-                            .size(theme::TEXT_11)
-                            .color(theme::ACCENT),
-                        "Resume pipeline",
-                    )
-                } else {
-                    (
-                        lucide::pause::<iced::Theme, iced::Renderer>()
-                            .size(theme::TEXT_11)
-                            .color(theme::TEXT_MUTED),
-                        "Pause pipeline",
-                    )
-                };
-
                 let ws_row = container(
                     row![
-                        // Name column (FillPortion: 15)
-                        container(
-                            text(&ws_item.name)
-                                .size(theme::TEXT_14)
-                                .color(theme::TEXT_PRIMARY)
-                        )
-                        .width(Length::FillPortion(15))
-                        .align_x(Alignment::Start)
-                        .align_y(Alignment::Center),
-                        // Status column (FillPortion: 18) — status pill,
-                        // maintainer toggle, pause/unpause toggle.
+                        // Name column (FillPortion: 22) — workspace name with
+                        // the status pill inlined right after it (the Status
+                        // column was removed; maintainer/pause toggles live
+                        // in the footer only).
                         container(
                             row![
+                                text(&ws_item.name)
+                                    .size(theme::TEXT_14)
+                                    .color(theme::TEXT_PRIMARY),
                                 widgets::tooltip_hint(
                                     widgets::badge_pill(
                                         ws_item.status.to_string(),
@@ -1722,44 +1700,14 @@ impl SettingsState {
                                     ),
                                     "Status",
                                 ),
-                                widgets::icon_tooltip_button(
-                                    widgets::maint_badge(maintainer_on),
-                                    if maintainer_on {
-                                        "stop maintenance"
-                                    } else {
-                                        "start maintenance"
-                                    },
-                                    Some(SettingsMessage::WorkspaceMsg(
-                                        workspaces::WorkspacesMessage::ToggleMaintainer(
-                                            ws_item.name.clone(),
-                                            !maintainer_on,
-                                        ),
-                                    )),
-                                    button::DEFAULT_PADDING,
-                                    theme::button_text,
-                                    tooltip::Position::Top,
-                                ),
-                                widgets::icon_tooltip_button(
-                                    pause_icon,
-                                    pause_tooltip,
-                                    Some(SettingsMessage::WorkspaceMsg(
-                                        workspaces::WorkspacesMessage::TogglePaused(
-                                            ws_item.name.clone(),
-                                            !paused,
-                                        ),
-                                    )),
-                                    button::DEFAULT_PADDING,
-                                    theme::button_text,
-                                    tooltip::Position::Top,
-                                ),
                             ]
-                            .spacing(theme::SPACE_4)
+                            .spacing(theme::SPACE_10)
                             .align_y(Alignment::Center),
                         )
-                        .width(Length::FillPortion(18))
+                        .width(Length::FillPortion(22))
                         .align_x(Alignment::Start)
                         .align_y(Alignment::Center),
-                        // Contexts column (FillPortion: 28) — per-role
+                        // Contexts column (FillPortion: 42, the widest) — per-role
                         // context icons, general context, Diag, Notes.
                         {
                             let mut left = Row::new()
@@ -1830,17 +1778,17 @@ impl SettingsState {
                                 tooltip::Position::Top,
                             ));
                             container(left)
-                                .width(Length::FillPortion(28))
+                                .width(Length::FillPortion(42))
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center)
                         },
-                        // Path column (FillPortion: 39)
+                        // Path column (FillPortion: 36)
                         container(
                             text(&ws_item.path)
                                 .size(theme::TEXT_12)
                                 .color(theme::TEXT_SECONDARY)
                         )
-                        .width(Length::FillPortion(39))
+                        .width(Length::FillPortion(36))
                         .align_x(Alignment::Start)
                         .align_y(Alignment::Center),
                     ]
@@ -2124,7 +2072,10 @@ impl SettingsState {
                                 &us.bind_input.buffer,
                                 "@username",
                                 false,
-                                Length::Fixed(270.0),
+                                // Fills the left segment so the editor fits
+                                // inside the half-width row; the fixed-size
+                                // label and Bind/Cancel buttons floor it.
+                                Length::Fill,
                                 Some(Id::from(format!("bind_input:{}", user.name))),
                                 |action| {
                                     SettingsMessage::UserMsg(users::UsersMessage::BindInputChanged(
@@ -2250,6 +2201,10 @@ impl SettingsState {
                     ]
                     .align_y(Alignment::Center),
                 )
+                // Users rows are rendered at half the container width — the
+                // content is compact and stretching it full width would just
+                // add empty space. Workspaces rows stay full width.
+                .width(Length::FillPortion(1))
                 .padding(theme::PAD_8)
                 .style(theme::surface_card_style);
 
@@ -2273,7 +2228,9 @@ impl SettingsState {
                     )
                     .into()
                 };
-                rows = rows.push(user_row);
+                // The row's FillPortion(1) pairs with this spacer's
+                // FillPortion(1) to occupy half the container width.
+                rows = rows.push(row![user_row, Space::new().width(Length::FillPortion(1))]);
             }
         }
 
