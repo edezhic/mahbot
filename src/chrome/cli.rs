@@ -29,7 +29,10 @@ use crate::chrome::forms::{
     parse_count_op, parse_predicate, parse_state, text_value_argv, wait_args, wait_target,
 };
 use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
-use crate::chrome::{CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX, is_blank_page_url, validate_url};
+use crate::chrome::{
+    CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX, DEADLINE_SLACK, DEFAULT_OPEN_TIMEOUT,
+    is_blank_page_url, validate_url,
+};
 use crate::tools::chrome_daemon::{
     CliStatus, chrome_running, cli_path, cli_probe, cli_version, display_available,
     is_daemon_unavailable_code, is_daemon_unavailable_error, is_relay_unavailable_error, relay_up,
@@ -38,13 +41,8 @@ use crate::util::{TOOL_OUTPUT_BUDGET_BYTES, truncate_sandwich};
 use serde_json::{Value, json};
 
 /// Default step timeout (8 s) — every step uses it unless `--timeout` is given.
+/// `open` defaults higher: [`DEFAULT_OPEN_TIMEOUT`] (whole-operation budget).
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// Extra slack over the requested `--timeout` for the wait/expect bounds:
-/// the requested timeout is forwarded to chrome-use (its wait/expect forms
-/// honor it), so its own honest timeout error usually surfaces before the
-/// mahbot-side kill fires.
-const STEP_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
 
 /// Classify a chrome-use step failure into an [`OutKind`]. Environment
 /// signatures win because rc 2 must not be masked by a page-level wrapper
@@ -60,12 +58,15 @@ fn classify_call_failure(code: Option<&str>, error: &str) -> OutKind {
     if error.contains("net::ERR_") || code == Some("connection_failed") {
         return OutKind::Network;
     }
-    // chrome-use's internal action timeout (AGENT_BROWSER_DEFAULT_TIMEOUT
-    // fires before the mahbot-side bound when the user passes --timeout
-    // above 15 s). Matched by its specific phrasings ("Wait timed out after
-    // Nms", "waitFor timed out: …") rather than a bare "timed out" substring,
-    // so an unrecognized connect-timeout message still classifies as Error —
-    // same exit code (1), honest kind label.
+    // chrome-use's internal action timeout (AGENT_BROWSER_DEFAULT_TIMEOUT).
+    // Chrome-side deadlines equal the declared budget, and the mahbot-side
+    // kill rides DEADLINE_SLACK above them, so chrome-use's honest phrased
+    // timeouts normally surface first; the classifier still catches them for
+    // every verb. Matched
+    // by its specific phrasings ("Wait timed out after Nms", "waitFor timed
+    // out: …") rather than a bare "timed out" substring, so an unrecognized
+    // connect-timeout message still classifies as Error — same exit code (1),
+    // honest kind label.
     let lower = error.to_ascii_lowercase();
     if code == Some("timeout")
         || lower.contains("timed out after")
@@ -574,7 +575,7 @@ fn parse_open(
             url,
             expect: flags.value("expect").map(String::from),
             structural: flags.has("structural"),
-            timeout: parse_timeout_flag(&flags)?,
+            timeout: parse_timeout_flag(&flags, DEFAULT_OPEN_TIMEOUT)?,
         },
         session: session.map(String::from),
     })
@@ -592,7 +593,7 @@ fn parse_count(
     Ok(Invocation {
         action: Action::Count {
             selector,
-            timeout: parse_timeout_flag(&flags)?,
+            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
         },
         session: session.map(String::from),
     })
@@ -614,7 +615,7 @@ fn parse_wait(
     Ok(Invocation {
         action: Action::Wait {
             target,
-            timeout: parse_timeout_flag(&flags)?,
+            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
         },
         session: session.map(String::from),
     })
@@ -631,7 +632,7 @@ fn parse_expect(
     Ok(Invocation {
         action: Action::Expect {
             cond,
-            timeout: parse_timeout_flag(&flags)?,
+            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
         },
         session: session.map(String::from),
     })
@@ -762,7 +763,7 @@ fn parse_eval(
     Ok(Invocation {
         action: Action::Eval {
             js,
-            timeout: parse_timeout_flag(&flags)?,
+            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
         },
         session: session.map(String::from),
     })
@@ -786,7 +787,7 @@ fn parse_extract(
         action: Action::Extract {
             schema_file,
             limit: parse_limit_flag(&flags)?,
-            timeout: parse_timeout_flag(&flags)?,
+            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
         },
         session: session.map(String::from),
     })
@@ -805,7 +806,7 @@ fn parse_click(
         action: Action::Click {
             selector,
             if_present: flags.has("if-present"),
-            timeout: parse_timeout_flag(&flags)?,
+            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
         },
         session: session.map(String::from),
     })
@@ -836,7 +837,7 @@ fn parse_fill(
         action: Action::Fill {
             selector,
             source,
-            timeout: parse_timeout_flag(&flags)?,
+            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
         },
         session: session.map(String::from),
     })
@@ -863,7 +864,7 @@ fn parse_type(
             selector,
             text,
             key_events: flags.has("key-events"),
-            timeout: parse_timeout_flag(&flags)?,
+            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
         },
         session: session.map(String::from),
     })
@@ -894,7 +895,7 @@ fn parse_press(
             key,
             selector: flags.value("selector").map(String::from),
             hold,
-            timeout: parse_timeout_flag(&flags)?,
+            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
         },
         session: session.map(String::from),
     })
@@ -944,7 +945,7 @@ fn reject_extra_positionals(positionals: &[String], expected: usize) -> Result<(
     Ok(())
 }
 
-fn parse_timeout_flag(flags: &Flags) -> Result<Duration, String> {
+fn parse_timeout_flag(flags: &Flags, default: Duration) -> Result<Duration, String> {
     match flags.value("timeout") {
         Some(v) => {
             let secs: u64 = v
@@ -955,7 +956,7 @@ fn parse_timeout_flag(flags: &Flags) -> Result<Duration, String> {
             }
             Ok(Duration::from_secs(secs))
         }
-        None => Ok(DEFAULT_STEP_TIMEOUT),
+        None => Ok(default),
     }
 }
 
@@ -1027,7 +1028,8 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
         Action::SessionStop { name, force } => (session_stop(name, *force).await, None),
         action => {
             let (name, ephemeral) = resolve_session(invocation.session.as_deref());
-            let env = match action {
+            let started = Instant::now();
+            let mut env = match action {
                 Action::Open {
                     url,
                     expect,
@@ -1069,6 +1071,14 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
                     unreachable!("handled by the outer match")
                 }
             };
+            // Deadline-expiration kinds carry the observed wall time alongside
+            // the declared `timeout_ms` (redesign is open's `--structural`
+            // deadline-expiration label).
+            if matches!(env.kind, OutKind::Timeout | OutKind::Redesign)
+                && let Some(obj) = env.payload.as_object_mut()
+            {
+                obj.insert("elapsed_ms".into(), json!(started.elapsed().as_millis()));
+            }
             (env, Some(CliSession { name, ephemeral }))
         }
     }
@@ -1078,23 +1088,17 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
 
 /// Run one chrome-use step, bounded by `timeout`. `session` scopes the call
 /// via `--session`; `None` leaves the call session-unscoped (`session stop`
-/// names its session via the positional instead). Stdin is nulled.
+/// names its session via the positional instead). `input` pipes a stdin
+/// payload (only `fill --stdin` uses one). `chrome_deadline` sets the
+/// chrome-use-side deadline for verbs without a `--timeout` flag (i.e.
+/// `open`); verbs that forward `--timeout` pass `None`.
 async fn spawn_step(
     path: &Path,
     args: &[&str],
     session: Option<&str>,
     timeout: Duration,
-) -> StepOutcome {
-    spawn_step_input(path, args, session, timeout, None).await
-}
-
-/// [`spawn_step`] with a stdin payload (only `fill --stdin` pipes one).
-async fn spawn_step_input(
-    path: &Path,
-    args: &[&str],
-    session: Option<&str>,
-    timeout: Duration,
     input: Option<&[u8]>,
+    chrome_deadline: Option<Duration>,
 ) -> StepOutcome {
     // A session-scoped spawn attempt may materialize the ephemeral session
     // (a vanished-binary race still sets this; the close attempt is then a
@@ -1112,6 +1116,7 @@ async fn spawn_step_input(
         timeout: CliTimeout::Bounded(timeout),
         cancel_kills: true,
         input: input.map(<[u8]>::to_vec),
+        chrome_deadline,
     })
     .await
     {
@@ -1303,7 +1308,9 @@ async fn status() -> OutEnvelope {
 
 /// `open` — navigate to `url`, optionally wait for `--expect` (redesign-aware
 /// via `--structural`), report the committed final URL and best-effort attach
-/// the page content (compact accessibility snapshot).
+/// the page content (compact accessibility snapshot). `timeout` bounds the
+/// whole operation (navigation + error-page probe + `--expect` wait + content
+/// capture); total wall time stays within `timeout + DEADLINE_SLACK`.
 #[expect(clippy::too_many_lines)]
 async fn open(
     url: &str,
@@ -1342,8 +1349,22 @@ async fn open(
         Err(e) => return e,
     };
 
-    let navigation_started = Instant::now();
-    let resp = match spawn_step(&path, &["open", url], Some(session), timeout).await {
+    let started = Instant::now();
+    let total = timeout + DEADLINE_SLACK;
+    // chrome-use's open verb has no `--timeout` flag and uses the
+    // AGENT_BROWSER_DEFAULT_TIMEOUT env default (15 s today), so the override
+    // gives heavy SPAs the full declared budget as the chrome-side deadline;
+    // the mahbot-side kill rides DEADLINE_SLACK above it.
+    let resp = match spawn_step(
+        &path,
+        &["open", url],
+        Some(session),
+        total,
+        None,
+        Some(timeout),
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err(f) => return f.envelope("open", json!({ "url": url }), timeout),
     };
@@ -1365,14 +1386,22 @@ async fn open(
             }),
         );
     }
-    // The navigation step consumed part of the user's `--timeout`; the
-    // chrome-error probe is best-effort (inconclusive = pass) so it runs on
-    // the REMAINING budget instead of a second full step — total wall time
-    // stays bounded by `timeout`. Skipped when nothing is left.
-    let probe_budget = timeout.saturating_sub(navigation_started.elapsed());
+    // The error-page probe is reserved up to the 2 s slack so it runs even
+    // when the navigation consumed the whole declared deadline; total wall
+    // time stays within declared + slack. Best-effort (inconclusive = pass);
+    // skipped when nothing is left.
+    let probe_budget = total.saturating_sub(started.elapsed()).min(DEADLINE_SLACK);
     let probe_js = "location.protocol === 'chrome-error:'";
     if probe_budget >= Duration::from_millis(500)
-        && let Ok(probe) = spawn_step(&path, &["eval", probe_js], Some(session), probe_budget).await
+        && let Ok(probe) = spawn_step(
+            &path,
+            &["eval", probe_js],
+            Some(session),
+            probe_budget,
+            None,
+            None,
+        )
+        .await
     {
         // The probe result is a JS boolean; chrome-use may deliver it as JSON
         // `true` or the text "true".
@@ -1394,43 +1423,50 @@ async fn open(
         }
     }
     if let Some(target) = wait_for {
-        let wargs = wait_args(&target, timeout.as_millis());
+        let target_desc = target.describe();
+        let mut payload = json!({ "url": final_url, "target": target_desc });
+        // A missed `--expect` after a committed navigation is a suspected
+        // redesign when `--structural` was declared, a plain timeout otherwise.
+        let (timeout_kind, hint) = if structural {
+            (
+                OutKind::Redesign,
+                "possible DOM redesign or structural change",
+            )
+        } else {
+            (
+                OutKind::Timeout,
+                "selector not found — may be structural change, empty region, or content-dependent",
+            )
+        };
+        let wait_budget = total.saturating_sub(started.elapsed());
+        // No budget left for the wait (or its capture) — emit the same timeout
+        // envelope the wait-timeout arm produces, without content.
+        if wait_budget < Duration::from_millis(250) {
+            payload["timeout_ms"] = json!(timeout.as_millis());
+            payload["hint"] = json!(hint);
+            return out_env("open", false, timeout_kind, payload);
+        }
+        // The wait's chrome-side deadline equals its remaining budget (the
+        // whole-operation ceiling), forwarded via --timeout; the mahbot bound
+        // matches it — whichever fires, the envelope below is identical.
+        let wargs = wait_args(&target, wait_budget.as_millis());
         let refs: Vec<&str> = wargs.iter().map(String::as_str).collect();
-        let target = target.describe();
-        // Same bound as the standalone wait: requested + margin, so the
-        // forwarded chrome-side deadline fires its honest error first.
-        let waited = spawn_step(&path, &refs, Some(session), timeout + STEP_TIMEOUT_MARGIN).await;
+        let waited = spawn_step(&path, &refs, Some(session), wait_budget, None, None).await;
         // The page is open regardless of the wait outcome, so the content
         // rides on failure envelopes too: it is exactly what diagnoses a
         // redesign. Same remaining-budget rule as the plain path — slow
         // waits simply exhaust it and the content is omitted.
-        let content = capture_open_content(
-            &path,
-            session,
-            timeout.saturating_sub(navigation_started.elapsed()),
-        )
-        .await;
-        let mut payload = json!({ "url": final_url, "target": target });
+        let content =
+            capture_open_content(&path, session, total.saturating_sub(started.elapsed())).await;
         if let Some(content) = content {
             payload["content"] = json!(content);
         }
         return match waited {
             Ok(_) => out_env("open", true, OutKind::Ok, payload),
             Err(f) if f.kind == OutKind::Timeout => {
-                let (kind, hint) = if structural {
-                    (
-                        OutKind::Redesign,
-                        "possible DOM redesign or structural change",
-                    )
-                } else {
-                    (
-                        OutKind::Timeout,
-                        "selector not found — may be structural change, empty region, or content-dependent",
-                    )
-                };
                 payload["timeout_ms"] = json!(timeout.as_millis());
                 payload["hint"] = json!(hint);
-                out_env("open", false, kind, payload)
+                out_env("open", false, timeout_kind, payload)
             }
             Err(f) => f.envelope("open", payload, timeout),
         };
@@ -1440,7 +1476,7 @@ async fn open(
     // content-free page simply omits `content` — a successful navigation is
     // never downgraded.
     let mut payload = json!({ "url": final_url });
-    let budget = timeout.saturating_sub(navigation_started.elapsed());
+    let budget = total.saturating_sub(started.elapsed());
     if let Some(content) = capture_open_content(&path, session, budget).await {
         payload["content"] = json!(content);
     }
@@ -1457,7 +1493,7 @@ async fn capture_open_content(path: &Path, session: &str, budget: Duration) -> O
     if budget < Duration::from_millis(500) {
         return None;
     }
-    let resp = spawn_step(path, &["snapshot", "-c"], Some(session), budget)
+    let resp = spawn_step(path, &["snapshot", "-c"], Some(session), budget, None, None)
         .await
         .ok()?;
     let text = resp.data.as_ref().and_then(extract_snapshot_text)?;
@@ -1483,7 +1519,7 @@ async fn count_via_eval(
     let js = count_eval_js(selector);
     let args = ["eval".to_string(), js];
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let resp = spawn_step(path, &refs, Some(session), timeout).await?;
+    let resp = spawn_step(path, &refs, Some(session), timeout, None, None).await?;
     eval_count(&resp).ok_or(StepFailure {
         kind: OutKind::Error,
         message: "count eval returned a non-numeric result".to_string(),
@@ -1511,10 +1547,10 @@ async fn count(selector: &str, timeout: Duration, session: &str) -> OutEnvelope 
 }
 
 /// `wait` — bounded wait for a safe [`WaitTarget`] (the numeric sleep form is
-/// rejected at parse time). The requested `--timeout` is forwarded to
-/// chrome-use (its wait forms honor it) and the spawn is bounded at the
-/// requested timeout plus a margin, so chrome-use's own honest timeout error
-/// surfaces instead of a kill.
+/// rejected at parse time). The requested `--timeout` IS chrome-use's deadline
+/// (its wait forms honor it), so its honest timeout error surfaces at the
+/// declared deadline; mahbot kills only once the deadline is actually
+/// exceeded (see [`DEADLINE_SLACK`]).
 async fn wait(target: &WaitTarget, timeout: Duration, session: &str) -> OutEnvelope {
     let base = json!({ "target": target.describe() });
     let path = match require_cli("wait", base.clone()) {
@@ -1523,7 +1559,16 @@ async fn wait(target: &WaitTarget, timeout: Duration, session: &str) -> OutEnvel
     };
     let args = wait_args(target, timeout.as_millis());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), timeout + STEP_TIMEOUT_MARGIN).await {
+    match spawn_step(
+        &path,
+        &refs,
+        Some(session),
+        timeout + DEADLINE_SLACK,
+        None,
+        None,
+    )
+    .await
+    {
         Ok(_) => out_env(
             "wait",
             true,
@@ -1570,9 +1615,20 @@ async fn expect(cond: &ExpectCond, timeout: Duration, session: &str) -> OutEnvel
         Ok(p) => p,
         Err(e) => return e,
     };
+    // Same rule as wait: the forwarded `--timeout` is chrome-use's own
+    // deadline; the mahbot-side kill rides DEADLINE_SLACK above it.
     let args = expect_args(cond, timeout.as_millis());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), timeout + STEP_TIMEOUT_MARGIN).await {
+    match spawn_step(
+        &path,
+        &refs,
+        Some(session),
+        timeout + DEADLINE_SLACK,
+        None,
+        None,
+    )
+    .await
+    {
         Ok(resp) => match resp.data.as_ref().and_then(expect_outcome) {
             Some(outcome) => expect_envelope(&condition, outcome),
             None => out_env(
@@ -1593,7 +1649,7 @@ async fn eval(js: &str, timeout: Duration, session: &str) -> OutEnvelope {
         Ok(p) => p,
         Err(e) => return e,
     };
-    match spawn_step(&path, &["eval", js], Some(session), timeout).await {
+    match spawn_step(&path, &["eval", js], Some(session), timeout, None, None).await {
         Ok(resp) => {
             let result = eval_result(&resp).cloned().unwrap_or(Value::Null);
             out_env("eval", true, OutKind::Ok, json!({ "result": result }))
@@ -1666,7 +1722,7 @@ async fn extract(
         schema_file.to_string(),
     ];
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), timeout).await {
+    match spawn_step(&path, &refs, Some(session), timeout, None, None).await {
         Ok(resp) => out_env(
             "extract",
             true,
@@ -1689,7 +1745,7 @@ async fn click(selector: &str, if_present: bool, timeout: Duration, session: &st
         args.push("--if-present".to_string());
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), timeout).await {
+    match spawn_step(&path, &refs, Some(session), timeout, None, None).await {
         Ok(_) => out_env("click", true, OutKind::Ok, json!({ "selector": selector })),
         Err(f) => f.envelope("click", json!({ "selector": selector }), timeout),
     }
@@ -1776,7 +1832,7 @@ async fn fill(selector: &str, source: &TextInput, timeout: Duration, session: &s
         TextInput::Inline(_) => None,
     };
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    match spawn_step_input(&path, &refs, Some(session), timeout, input.as_deref()).await {
+    match spawn_step(&path, &refs, Some(session), timeout, input.as_deref(), None).await {
         Ok(resp) => text_input_ok_envelope(action, &base, resp),
         Err(f) => f.envelope(action, base, timeout),
     }
@@ -1804,7 +1860,7 @@ async fn r#type(
     // BEFORE it (everything after is a verbatim value).
     argv.extend(text_value_argv(text));
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), timeout).await {
+    match spawn_step(&path, &refs, Some(session), timeout, None, None).await {
         Ok(resp) => text_input_ok_envelope(action, &base, resp),
         Err(f) => f.envelope(action, base, timeout),
     }
@@ -1841,7 +1897,7 @@ async fn press(
         argv.extend(["--hold".to_string(), h.to_string()]);
     }
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), timeout).await {
+    match spawn_step(&path, &refs, Some(session), timeout, None, None).await {
         Ok(resp) => text_input_ok_envelope(action, &base, resp),
         Err(f) => f.envelope(action, base, timeout),
     }
@@ -1871,6 +1927,8 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
         &["session", "stop", &target],
         None,
         DEFAULT_STEP_TIMEOUT,
+        None,
+        None,
     )
     .await
     {
@@ -1901,6 +1959,7 @@ async fn close_ephemeral(name: &str) {
         cancel_kills: true,
         timeout: CliTimeout::Bounded(DEFAULT_STEP_TIMEOUT),
         input: None,
+        chrome_deadline: None,
     })
     .await
     {
@@ -2027,8 +2086,10 @@ mod tests {
             classify_call_failure(Some("connection_failed"), "connection refused"),
             OutKind::Network
         );
-        // chrome-use's internal action timeout (reachable when --timeout
-        // exceeds its 15 s AGENT_BROWSER_DEFAULT_TIMEOUT) — kind timeout, rc 1.
+        // chrome-use's internal action timeout (AGENT_BROWSER_DEFAULT_TIMEOUT)
+        // — kind timeout, rc 1. Chrome-side deadlines equal the declared
+        // budget (the mahbot kill rides DEADLINE_SLACK above), but the
+        // classifier still catches it for every verb.
         assert_eq!(
             classify_call_failure(None, "Wait timed out after 15000ms"),
             OutKind::Timeout
@@ -2285,6 +2346,15 @@ mod tests {
                 assert_eq!(expect.as_deref(), Some(".btn"));
                 assert_eq!(timeout, Duration::from_secs(3));
             }
+            _ => panic!("expected Open"),
+        }
+
+        // open without --timeout defaults to the whole-operation budget (20 s),
+        // NOT the per-step 8 s.
+        let inv =
+            parse_invocation(&["open".into(), "https://example.com".into()]).expect("open parses");
+        match inv.action {
+            Action::Open { timeout, .. } => assert_eq!(timeout, DEFAULT_OPEN_TIMEOUT),
             _ => panic!("expected Open"),
         }
 

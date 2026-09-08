@@ -357,24 +357,25 @@ impl ChromeTool {
         Ok(())
     }
 
-    /// Mahbot-side bounds for the condition-wait actions (see `call_timeout`).
-    const WAIT_BOUND: Duration = Duration::from_secs(10);
-    const EXPECT_BOUND: Duration = Duration::from_secs(20);
-    /// The chrome-side condition deadline rides below the mahbot bound so
-    /// chrome-use's own timeout error (with its retryable hint) surfaces instead
-    /// of a mahbot-side kill.
-    const CHROME_DEADLINE_SLACK: Duration = Duration::from_secs(2);
+    /// Declared chrome-side condition-wait deadlines, forwarded to chrome-use
+    /// via `--timeout` (see `build_args`); the mahbot-side kill rides
+    /// [`crate::chrome::DEADLINE_SLACK`] above them (see `call_timeout`).
+    const WAIT_DEADLINE: Duration = Duration::from_secs(10);
+    const EXPECT_DEADLINE: Duration = Duration::from_secs(20);
 
-    /// Mahbot-side per-call bounds. chrome-use's own `--timeout` is ignored by
-    /// `wait --load networkidle` (always its internal 25s default) and a wedged
-    /// daemon hangs the CLI in its ~152s retry loop, so the tool bounds every
-    /// dispatch itself: open=15s (page load), wait=10s and expect=20s (condition
-    /// waits), everything else=8s (the daemon-side `run_cli_bounded` bound).
+    /// Mahbot-side per-call kill bounds. chrome-use's own `--timeout` is
+    /// ignored by `wait --load networkidle` (always its internal 25s default)
+    /// and a wedged daemon hangs the CLI in its ~152s retry loop, so the tool
+    /// bounds every dispatch itself: open = [`crate::chrome::DEFAULT_OPEN_TIMEOUT`]
+    /// plus slack (whole-operation budget), wait/expect = their declared
+    /// deadlines plus slack (condition waits), everything else=8s (the
+    /// daemon-side `run_cli_bounded` bound).
     fn call_timeout(args: &[&str]) -> Duration {
+        use crate::chrome::{DEADLINE_SLACK, DEFAULT_OPEN_TIMEOUT};
         match args.first() {
-            Some(&"open") => Duration::from_secs(15),
-            Some(&"wait") => Self::WAIT_BOUND,
-            Some(&"expect") => Self::EXPECT_BOUND,
+            Some(&"open") => DEFAULT_OPEN_TIMEOUT + DEADLINE_SLACK,
+            Some(&"wait") => Self::WAIT_DEADLINE + DEADLINE_SLACK,
+            Some(&"expect") => Self::EXPECT_DEADLINE + DEADLINE_SLACK,
             _ => Duration::from_secs(8),
         }
     }
@@ -396,17 +397,26 @@ impl ChromeTool {
         logged_args.extend(["--json", "--session", tab]);
         debug!("chrome-use args: {:?}", logged_args);
 
+        // `open` takes no --timeout flag (chrome-use uses its env default), so
+        // its chrome-side deadline is set to the declared budget via the env
+        // override; the mahbot kill rides DEADLINE_SLACK above and only fires
+        // when the deadline is actually exceeded.
+        let bound = Self::call_timeout(args);
+        let chrome_deadline =
+            (args.first() == Some(&"open")).then_some(crate::chrome::DEFAULT_OPEN_TIMEOUT);
+
         let run = spawn_cli(CliSpawn {
             path: &cli,
             args,
             session: Some(tab),
             json: true,
             capture_stderr: true,
-            timeout: CliTimeout::Bounded(Self::call_timeout(args)),
+            timeout: CliTimeout::Bounded(bound),
             // A timed-out/cancelled call must not leave the chrome-use child
             // running its retry loop in the background.
             cancel_kills: true,
             input: None,
+            chrome_deadline,
         })
         .await;
         let output = match run {
@@ -514,7 +524,7 @@ impl ChromeTool {
 
     /// The chrome-use CLI takes a different argument shape per action — this
     /// builds the correct argument list for each action.
-    #[expect(clippy::too_many_lines, clippy::unchecked_time_subtraction)] // the per-action argv shapes are one cohesive dispatch; WAIT/EXPECT_BOUND exceed the slack by construction
+    #[expect(clippy::too_many_lines)] // the per-action argv shapes are one cohesive dispatch
     fn build_args(action: &ChromeAction) -> anyhow::Result<Vec<String>> {
         match action {
             ChromeAction::Open { url } => {
@@ -612,10 +622,7 @@ impl ChromeTool {
             } => {
                 let target = wait_target(selector.as_deref(), url.as_deref(), text.as_deref())
                     .map_err(anyhow::Error::msg)?;
-                Ok(wait_args(
-                    &target,
-                    (Self::WAIT_BOUND - Self::CHROME_DEADLINE_SLACK).as_millis(),
-                ))
+                Ok(wait_args(&target, Self::WAIT_DEADLINE.as_millis()))
             }
             ChromeAction::Expect {
                 condition,
@@ -635,10 +642,7 @@ impl ChromeTool {
                     name.as_ref(),
                     expected.as_ref(),
                 )?;
-                Ok(expect_args(
-                    &cond,
-                    (Self::EXPECT_BOUND - Self::CHROME_DEADLINE_SLACK).as_millis(),
-                ))
+                Ok(expect_args(&cond, Self::EXPECT_DEADLINE.as_millis()))
             }
             ChromeAction::Extract { .. } => {
                 anyhow::bail!("Extract is handled in execute(), not build_args")
@@ -802,6 +806,7 @@ async fn close_all_chrome_sessions_inner() {
         timeout: CliTimeout::Unbounded,
         cancel_kills: true,
         input: None,
+        chrome_deadline: None,
     })
     .await
     {
@@ -859,6 +864,7 @@ async fn close_all_chrome_sessions_inner() {
                     cancel_kills: true,
                     timeout: CliTimeout::Unbounded,
                     input: None,
+                    chrome_deadline: None,
                 })
                 .await
                 {
@@ -2241,15 +2247,15 @@ mod tests {
     fn call_timeout_policy() {
         assert_eq!(
             ChromeTool::call_timeout(&["open", "https://example.com"]),
-            Duration::from_secs(15)
+            Duration::from_secs(22)
         );
         assert_eq!(
             ChromeTool::call_timeout(&["wait", "--load", "networkidle"]),
-            Duration::from_secs(10)
+            Duration::from_secs(12)
         );
         assert_eq!(
             ChromeTool::call_timeout(&["expect", "visible", "#x"]),
-            Duration::from_secs(20)
+            Duration::from_secs(22)
         );
         for args in [
             &["click", "@e1"][..],
@@ -2753,14 +2759,15 @@ mod tests {
             args.iter().map(String::as_str).collect()
         }
 
-        // Wait: exactly one target, deadline-bound below the mahbot bound.
+        // Wait: exactly one target; the forwarded --timeout is the declared
+        // chrome-side deadline (the mahbot kill rides DEADLINE_SLACK above it).
         let wait_selector = ChromeAction::Wait {
             selector: Some("#r".into()),
             url: None,
             text: None,
         };
         let got = ChromeTool::build_args(&wait_selector).unwrap();
-        assert_eq!(argv(&got), vec!["wait", "#r", "--timeout", "8000"]);
+        assert_eq!(argv(&got), vec!["wait", "#r", "--timeout", "10000"]);
 
         let wait_url = ChromeAction::Wait {
             selector: None,
@@ -2770,7 +2777,7 @@ mod tests {
         let got = ChromeTool::build_args(&wait_url).unwrap();
         assert_eq!(
             argv(&got),
-            vec!["wait", "--url", "dashboard", "--timeout", "8000"]
+            vec!["wait", "--url", "dashboard", "--timeout", "10000"]
         );
 
         let wait_text = ChromeAction::Wait {
@@ -2781,7 +2788,7 @@ mod tests {
         let got = ChromeTool::build_args(&wait_text).unwrap();
         assert_eq!(
             argv(&got),
-            vec!["wait", "--text", "Loaded", "--timeout", "8000"]
+            vec!["wait", "--text", "Loaded", "--timeout", "10000"]
         );
 
         // Wait requires exactly one target.
@@ -2822,7 +2829,7 @@ mod tests {
         let got = ChromeTool::build_args(&expect_visible).unwrap();
         assert_eq!(
             argv(&got),
-            vec!["expect", "#main", "visible", "--timeout", "18000"]
+            vec!["expect", "#main", "visible", "--timeout", "20000"]
         );
 
         // Expect count defaults op to ==.
@@ -2838,7 +2845,7 @@ mod tests {
         let got = ChromeTool::build_args(&expect_count_default).unwrap();
         assert_eq!(
             argv(&got),
-            vec!["expect", "count", ".card", "==", "5", "--timeout", "18000"]
+            vec!["expect", "count", ".card", "==", "5", "--timeout", "20000"]
         );
 
         // Expect count forwards an explicit op.
@@ -2854,7 +2861,7 @@ mod tests {
         let got = ChromeTool::build_args(&expect_count_op).unwrap();
         assert_eq!(
             argv(&got),
-            vec!["expect", "count", ".card", ">=", "5", "--timeout", "18000"]
+            vec!["expect", "count", ".card", ">=", "5", "--timeout", "20000"]
         );
 
         // Expect url with a predicate.
@@ -2876,7 +2883,7 @@ mod tests {
                 "contains",
                 "dashboard",
                 "--timeout",
-                "18000"
+                "20000"
             ]
         );
 

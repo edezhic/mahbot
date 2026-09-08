@@ -3,8 +3,8 @@
 //! A wedged daemon hangs inside the CLI's own ~152 s retry loop, so every
 //! health/watchdog/sweep call is deadline-bounded (the shutdown close path is
 //! instead bounded by its outer total-budget timeout); the interactive tool
-//! bounds its dispatch itself per-call (open 15s, wait 10s, expect 20s,
-//! default 8s) via `CliTimeout::Bounded`, and on a timeout runs a bounded
+//! bounds its dispatch itself per-call (open = 20s declared + 2s slack,
+//! wait 10+2s, expect 20+2s, default 8s) via `CliTimeout::Bounded`, and on a timeout runs a bounded
 //! health evaluation — failing fast with daemon guidance when the daemon is
 //! down or wedged (a second consecutive hang on a session-daemon probe), since
 //! the mahbot-side bound cuts off the CLI's own wedge signature. One helper,
@@ -50,6 +50,10 @@ pub(crate) struct CliSpawn<'a> {
     /// and the payload is written concurrently with output collection.
     pub(crate) input: Option<Vec<u8>>,
     pub(crate) timeout: CliTimeout,
+    /// Overrides the `AGENT_BROWSER_DEFAULT_TIMEOUT` env default for this one
+    /// invocation — used where the chrome-use verb has no `--timeout` flag,
+    /// i.e. `open`.
+    pub(crate) chrome_deadline: Option<Duration>,
 }
 
 pub(crate) enum CliRun {
@@ -99,6 +103,15 @@ pub(crate) fn ensure_chrome_env(cmd: &mut Command) {
     cmd.env("AGENT_BROWSER_RELAY_REVIVE_SECS", "0");
 }
 
+/// Override the chrome-use-side deadline ([`CliSpawn::chrome_deadline`]) on
+/// `cmd`, which [`ensure_chrome_env`] already seeded with the
+/// `AGENT_BROWSER_DEFAULT_TIMEOUT` default. Only `Some` overrides.
+pub(crate) fn apply_chrome_deadline(cmd: &mut Command, deadline: Option<Duration>) {
+    if let Some(d) = deadline {
+        cmd.env("AGENT_BROWSER_DEFAULT_TIMEOUT", d.as_millis().to_string());
+    }
+}
+
 /// Spawn a chrome-use CLI invocation per [`CliSpawn`]: apply
 /// [`ensure_chrome_env`], the caller's args, the optional `--json` / `--session
 /// <s>` suffixes, pipe stdout and stderr per the `json` / `capture_stderr`
@@ -108,6 +121,7 @@ pub(crate) fn ensure_chrome_env(cmd: &mut Command) {
 pub(crate) async fn spawn_cli(spec: CliSpawn<'_>) -> CliRun {
     let mut cmd = Command::new(spec.path);
     ensure_chrome_env(&mut cmd);
+    apply_chrome_deadline(&mut cmd, spec.chrome_deadline);
     cmd.args(spec.args);
     if spec.json {
         cmd.arg("--json").stdout(std::process::Stdio::piped());
@@ -224,6 +238,27 @@ mod tests {
         assert_eq!(
             cmd_env(&cmd, "AGENT_BROWSER_NO_AUTO_RECONNECT").as_deref(),
             Some("1")
+        );
+    }
+
+    #[test]
+    fn chrome_deadline_override_replaces_env_default() {
+        // The override replaces the seeded 15000 ms default for this one call.
+        let mut cmd = Command::new("true");
+        ensure_chrome_env(&mut cmd);
+        apply_chrome_deadline(&mut cmd, Some(Duration::from_secs(18)));
+        assert_eq!(
+            cmd_env(&cmd, "AGENT_BROWSER_DEFAULT_TIMEOUT").as_deref(),
+            Some("18000")
+        );
+
+        // None keeps the seeded default untouched.
+        let mut cmd = Command::new("true");
+        ensure_chrome_env(&mut cmd);
+        apply_chrome_deadline(&mut cmd, None);
+        assert_eq!(
+            cmd_env(&cmd, "AGENT_BROWSER_DEFAULT_TIMEOUT").as_deref(),
+            Some("15000")
         );
     }
 }

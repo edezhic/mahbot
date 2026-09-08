@@ -80,7 +80,10 @@ fn build_actions() -> Vec<ActionDesc> {
                         "--structural",
                         "with --expect: a wait timeout is classified as redesign (suspected DOM redesign) instead of timeout",
                     ),
-                    ("--timeout <secs>", "step deadline in seconds (default 8)"),
+                    (
+                        "--timeout <secs>",
+                        "whole-operation deadline in seconds (default 20)",
+                    ),
                 ],
                 session: true,
                 kinds: &[
@@ -93,7 +96,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "The URL must be http(s). Reports the committed final URL plus the page content — a best-effort compact accessibility snapshot, truncated at ~5 KB and absent when the capture fails, the step budget is exhausted, or the page is content-free. An uncommitted navigation (tab still on about:blank) or a Chrome error page is kind network. An invalid URL is kind usage (rc 3). `--expect` is a wait-for-selector convenience after navigation, not a general assertion — use the expect action for condition checks.",
+                details: "The URL must be http(s). Reports the committed final URL plus the page content — a best-effort compact accessibility snapshot, truncated at ~5 KB and absent when the capture fails, the step budget is exhausted, or the page is content-free. An uncommitted navigation (tab still on about:blank) or a Chrome error page is kind network. An invalid URL is kind usage (rc 3). `--expect` is a wait-for-selector convenience after navigation, not a general assertion — use the expect action for condition checks. The `--timeout` deadline covers the whole operation — navigation, the error-page probe, the `--expect` wait, and content capture — with total wall clock ≤ declared + 2s.",
                 examples: &[
                     "mahbot chrome open https://example.com",
                     "mahbot chrome open https://example.com --expect \"#main\" --structural --timeout 15",
@@ -152,7 +155,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     ("--text <text>", "wait until this text appears in the page"),
                     (
                         "--timeout <secs>",
-                        "condition deadline in seconds (default 8; forwarded to chrome-use and bounded mahbot-side)",
+                        "condition deadline in seconds (default 8; chrome-use's own deadline — mahbot kills 2s past it)",
                     ),
                 ],
                 session: true,
@@ -165,7 +168,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "Exactly one target: a selector positional, --url, or --text. A numeric first token (chrome-use's silent-sleep form) is rejected as usage. --timeout IS forwarded to chrome-use (its wait forms honor it) and the spawn is additionally bounded mahbot-side. --fn/--load are not exposed.",
+                details: "Exactly one target: a selector positional, --url, or --text. A numeric first token (chrome-use's silent-sleep form) is rejected as usage. --timeout IS chrome-use's deadline, honored in full; mahbot kills only 2s past it (chrome-use's honest timeout error surfaces at the deadline). --fn/--load are not exposed.",
                 examples: &[
                     "mahbot chrome wait \"#results\" --timeout 15",
                     "mahbot chrome wait --text \"Loaded\" --timeout 10",
@@ -212,7 +215,7 @@ fn build_actions() -> Vec<ActionDesc> {
                 syntax: "(<selector> <visible|hidden|present> | count <sel> <op> <n> | text|value <sel> <equals|contains|matches> <value> | attr <sel> <name> <pred> <value> | url <pred> <pattern>) [--timeout <secs>]",
                 flags: &[(
                     "--timeout <secs>",
-                    "condition deadline in seconds (default 8; forwarded to chrome-use and bounded mahbot-side)",
+                    "condition deadline in seconds (default 8; chrome-use's own deadline — mahbot kills 2s past it)",
                 )],
                 session: true,
                 kinds: &[

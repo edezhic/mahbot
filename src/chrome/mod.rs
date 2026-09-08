@@ -13,6 +13,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use ipnet::IpNet;
 use url::Host;
@@ -27,6 +28,19 @@ pub(crate) mod spawn;
 /// ephemeral). The interactive tool keeps `agent-tab-*`; link enrichment keeps
 /// `link-enricher-*`.
 pub(crate) const CLI_SESSION_PREFIX: &str = "mahbot-chrome-";
+
+/// The mahbot-side kill rides this far above the declared chrome-use deadline:
+/// chrome-use's own honest timeout (with its structured verdict / retryable
+/// hint) surfaces at the declared deadline, and mahbot kills only when the
+/// deadline is actually exceeded. Also the wall-clock margin the CLI `open`
+/// path may spend past the declared deadline (reserved for the chrome-error
+/// probe).
+pub(crate) const DEADLINE_SLACK: Duration = Duration::from_secs(2);
+
+/// Default `open` timeout (20 s) shared by both frontends: open is a
+/// whole-operation budget (nav + probe + expect wait + capture), so it
+/// defaults above the per-step 8 s.
+pub(crate) const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Prefix of per-invocation ephemeral CLI sessions — the ONLY CLI prefix the
 /// daemon-side sweep may close (orphan protection after crashes); named

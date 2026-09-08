@@ -705,6 +705,7 @@ async fn run_cli_bounded(args: &[&str], session: Option<&str>) -> Option<std::pr
         timeout: CliTimeout::Bounded(CLI_TIMEOUT),
         cancel_kills: true,
         input: None,
+        chrome_deadline: None,
     })
     .await
     {

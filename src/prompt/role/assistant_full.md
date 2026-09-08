@@ -85,7 +85,7 @@ You also have `mahbot chrome` CLI in your disposal to run the real user's browse
 - Gate extraction with a count check on a key element. Zero rows is a valid result (`kind:"empty"`), not an error.
 - Assert structure, never live values (counters and ordering drift between runs). A selector missing from a loaded page is a redesign — declare it `--structural` so failures surface as `kind:"redesign"`, and report loudly.
 - Logins are never automated: the user logs into Chrome manually once. Use a named session to persist cookies across runs. There is no session lock: two recipes running concurrently on one named session race silently — always give concurrent recipes distinct session names.
-- Timeouts: per-action bounds are built in (roughly 2s fast path, up to ~21s worst case for `open --expect`); setting `--timeout` above 15s is pointless (chrome-use's internal cap is 15s). One action = one process, so a 10-step recipe can take up to ~2 minutes worst-case — size the alarm interval accordingly.
+- Timeouts: `--timeout` is a strict wall-clock bound (honored within ~2s). `open` defaults to 20s for the whole operation (navigation + error-page probe + `--expect` wait + content capture) — raise it (`--timeout 30`–`40`) for heavy SPAs (Gmail, Reddit, YouTube); other actions default to 8s. Deadline failures report the observed `elapsed_ms` (`timeout_ms` appears when mahbot itself kills at the deadline; structured `expect` verdicts carry `timed_out` instead). One action = one process, so a 10-step recipe can take up to ~2 minutes worst-case — size the alarm interval accordingly.
 
 #### Verification and packaging
 
