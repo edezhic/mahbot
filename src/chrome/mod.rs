@@ -6,8 +6,9 @@
 //! and the `mahbot chrome` CLI ([`cli`]) owns its stdout/exit-code emission.
 //! The per-action descriptor registry ([`actions`]) is the ONE shared source
 //! of LLM-facing action descriptions, rendered by both frontends (the tool's
-//! parameter schema and the CLI help); outside that registry this module still
-//! holds no other LLM-facing text. It also holds the chrome-use CLI spawning
+//! parameter schema and the CLI help); the shared chrome-failure remediation
+//! notes ([`contract`]) are the one other agent-facing text owned here. It
+//! also holds the chrome-use CLI spawning
 //! ([`spawn`]), the tolerant `--json` response envelope parser ([`contract`]),
 //! and the session-name/URL rules the tool and CLI share.
 

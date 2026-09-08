@@ -21,12 +21,14 @@ use std::time::{Duration, Instant};
 
 use crate::chrome::actions;
 use crate::chrome::contract::{
-    ChromeResponse, ExpectOutcome, OutEnvelope, OutKind, eval_count, eval_result, expect_outcome,
-    extract_output, extract_snapshot_text,
+    ChromeResponse, EXPECT_TIMEOUT_NOTE, ExpectOutcome, OutEnvelope, OutKind,
+    classify_call_failure, eval_count, eval_result, expect_outcome, extract_output,
+    extract_snapshot_text, sanitize_timeout_message, with_condition_timeout_note,
 };
 use crate::chrome::forms::{
     ExpectCond, ExtractGate, WaitTarget, count_eval_js, describe, expect_args, extract_gate,
-    parse_count_op, parse_predicate, parse_state, text_value_argv, wait_args, wait_target,
+    parse_count_op, parse_predicate, parse_state, text_value_argv, validate_extract_getters,
+    wait_args, wait_target,
 };
 use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
 use crate::chrome::{
@@ -34,8 +36,7 @@ use crate::chrome::{
     is_blank_page_url, validate_url,
 };
 use crate::tools::chrome_daemon::{
-    CliStatus, chrome_running, cli_path, cli_probe, cli_version, display_available,
-    is_daemon_unavailable_code, is_daemon_unavailable_error, is_relay_unavailable_error, relay_up,
+    CliStatus, chrome_running, cli_path, cli_probe, cli_version, display_available, relay_up,
 };
 use crate::util::{TOOL_OUTPUT_BUDGET_BYTES, truncate_sandwich};
 use serde_json::{Value, json};
@@ -43,42 +44,6 @@ use serde_json::{Value, json};
 /// Default step timeout (8 s) — every step uses it unless `--timeout` is given.
 /// `open` defaults higher: [`DEFAULT_OPEN_TIMEOUT`] (whole-operation budget).
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// Classify a chrome-use step failure into an [`OutKind`]. Environment
-/// signatures win because rc 2 must not be masked by a page-level wrapper
-/// text: a relay/daemon/Chrome-launch problem is a CLI environment failure
-/// even when the CLI wraps the message in a "page failed" envelope.
-fn classify_call_failure(code: Option<&str>, error: &str) -> OutKind {
-    if is_daemon_unavailable_error(error)
-        || is_daemon_unavailable_code(code)
-        || is_relay_unavailable_error(error)
-    {
-        return OutKind::Environment;
-    }
-    if error.contains("net::ERR_") || code == Some("connection_failed") {
-        return OutKind::Network;
-    }
-    // chrome-use's internal action timeout (AGENT_BROWSER_DEFAULT_TIMEOUT).
-    // Chrome-side deadlines equal the declared budget, and the mahbot-side
-    // kill rides DEADLINE_SLACK above them, so chrome-use's honest phrased
-    // timeouts normally surface first; the classifier still catches them for
-    // every verb. Matched
-    // by its specific phrasings ("Wait timed out after Nms", "waitFor timed
-    // out: …") rather than a bare "timed out" substring, so an unrecognized
-    // connect-timeout message still classifies as Error — same exit code (1),
-    // honest kind label.
-    let lower = error.to_ascii_lowercase();
-    if code == Some("timeout")
-        || lower.contains("timed out after")
-        || lower.contains("waitfor timed out")
-    {
-        return OutKind::Timeout;
-    }
-    if code == Some("element_not_found") || lower.contains("element not found") {
-        return OutKind::NotFound;
-    }
-    OutKind::Error
-}
 
 /// Top-level `mahbot chrome -h` — rendered from the shared action registry.
 #[must_use]
@@ -1160,16 +1125,23 @@ fn classify_step_output(
             .error
             .filter(|e| !e.trim().is_empty())
             .unwrap_or_else(fallback);
-        failed(classify_call_failure(code.as_deref(), &msg), msg)
+        let kind = classify_call_failure(code.as_deref(), &msg);
+        failed(kind, sanitize_timeout_message(kind, &msg))
     };
     let parsed: Option<ChromeResponse> = serde_json::from_slice(stdout).ok();
     if !status_success {
         if expect_style && parsed.as_ref().is_some_and(ChromeResponse::is_success) {
             return Ok(parsed.expect("success checked"));
         }
-        return match parsed {
-            Some(resp) => classified(resp),
-            None => failed(classify_call_failure(None, &fallback()), fallback()),
+        return if let Some(resp) = parsed {
+            classified(resp)
+        } else {
+            // The stderr fallback can also carry a timeout phrasing plus the
+            // canned hint (chrome-use prints diagnostics there when stdout is
+            // non-JSON), so it is classified and sanitized too.
+            let msg = fallback();
+            let kind = classify_call_failure(None, &msg);
+            failed(kind, sanitize_timeout_message(kind, &msg))
         };
     }
     match parsed {
@@ -1575,7 +1547,10 @@ async fn wait(target: &WaitTarget, timeout: Duration, session: &str) -> OutEnvel
             OutKind::Ok,
             json!({ "target": target.describe() }),
         ),
-        Err(f) => f.envelope("wait", base, timeout),
+        Err(mut f) => {
+            with_condition_timeout_note("wait", f.kind, &mut f.message);
+            f.envelope("wait", base, timeout)
+        }
     }
 }
 
@@ -1595,7 +1570,9 @@ fn expect_envelope(condition: &str, outcome: ExpectOutcome) -> OutEnvelope {
     payload["pass"] = json!(false);
     let kind = if outcome.timed_out {
         payload["timed_out"] = json!(true);
-        payload["error"] = json!("condition was not met within the deadline");
+        payload["error"] = json!(format!(
+            "condition was not met within the deadline{EXPECT_TIMEOUT_NOTE}"
+        ));
         OutKind::Timeout
     } else {
         payload["error"] = json!("condition is false");
@@ -1638,7 +1615,10 @@ async fn expect(cond: &ExpectCond, timeout: Duration, session: &str) -> OutEnvel
                 json!({ "condition": condition, "error": "expect returned an unrecognized payload" }),
             ),
         },
-        Err(f) => f.envelope("expect", base, timeout),
+        Err(mut f) => {
+            with_condition_timeout_note("expect", f.kind, &mut f.message);
+            f.envelope("expect", base, timeout)
+        }
     }
 }
 
@@ -1688,6 +1668,10 @@ async fn extract(
             );
         }
     };
+
+    if let Err(err) = validate_extract_getters(&schema) {
+        return out_env("extract", false, OutKind::Usage, json!({ "error": err }));
+    }
 
     let path = match require_cli("extract", json!({})) {
         Ok(p) => p,
@@ -2062,82 +2046,6 @@ mod tests {
         assert!(resolve_stop_target("link-enricher-7", false).is_err());
     }
 
-    #[test]
-    fn classify_call_failure_mapping() {
-        // Environment signatures win (rc 2 must not be masked by page text).
-        assert_eq!(
-            classify_call_failure(None, "daemon may be busy or unresponsive"),
-            OutKind::Environment
-        );
-        assert_eq!(
-            classify_call_failure(Some("browser_not_launched"), "whatever"),
-            OutKind::Environment
-        );
-        assert_eq!(
-            classify_call_failure(None, "relay isn't connected"),
-            OutKind::Environment
-        );
-        // Site-level network failures.
-        assert_eq!(
-            classify_call_failure(None, "net::ERR_NAME_NOT_RESOLVED"),
-            OutKind::Network
-        );
-        assert_eq!(
-            classify_call_failure(Some("connection_failed"), "connection refused"),
-            OutKind::Network
-        );
-        // chrome-use's internal action timeout (AGENT_BROWSER_DEFAULT_TIMEOUT)
-        // — kind timeout, rc 1. Chrome-side deadlines equal the declared
-        // budget (the mahbot kill rides DEADLINE_SLACK above), but the
-        // classifier still catches it for every verb.
-        assert_eq!(
-            classify_call_failure(None, "Wait timed out after 15000ms"),
-            OutKind::Timeout
-        );
-        assert_eq!(
-            classify_call_failure(None, "waitFor timed out: .submit"),
-            OutKind::Timeout
-        );
-        // Not-found selectors.
-        assert_eq!(
-            classify_call_failure(Some("element_not_found"), "whatever"),
-            OutKind::NotFound
-        );
-        assert_eq!(
-            classify_call_failure(None, "Element not found"),
-            OutKind::NotFound
-        );
-        // Everything else is a generic step failure.
-        assert_eq!(
-            classify_call_failure(None, "some random issue"),
-            OutKind::Error
-        );
-        assert_eq!(
-            classify_call_failure(Some("other_code"), "some issue"),
-            OutKind::Error
-        );
-    }
-
-    #[test]
-    fn step_failure_envelope_reports_timeout_vs_error() {
-        let timeout = Duration::from_secs(8);
-        let env = StepFailure {
-            kind: OutKind::Timeout,
-            message: String::new(),
-        }
-        .envelope("wait", json!({ "selector": ".x" }), timeout);
-        assert!(env.payload.get("timeout_ms").is_some());
-        assert!(env.payload.get("error").is_none());
-
-        let env = StepFailure {
-            kind: OutKind::Network,
-            message: "net::ERR_NAME_NOT_RESOLVED".into(),
-        }
-        .envelope("open", json!({ "url": "https://x" }), timeout);
-        assert_eq!(env.payload["error"], "net::ERR_NAME_NOT_RESOLVED");
-        assert!(env.payload.get("timeout_ms").is_none());
-    }
-
     /// Direct pin of the spawn-level classification, including the crux of the
     /// expect contract: a failed assertion arrives as `success:true` with
     /// exit 1 and the verdict in `data`.
@@ -2235,6 +2143,84 @@ mod tests {
         );
     }
 
+    /// The canned stale-relay hint is stripped from Timeout-classified
+    /// failures only — envelope `error` text and the stderr fallback alike —
+    /// while non-Timeout messages keep it verbatim.
+    #[test]
+    fn classify_step_output_strips_canned_relay_hint() {
+        let envelope = |body: Value| serde_json::to_vec(&body).expect("serialize envelope");
+        let outcome = |r: &StepOutcome| match r {
+            Ok(resp) => Ok(resp.data.clone()),
+            Err(f) => Err((f.kind, f.message.clone())),
+        };
+        let hint = "Hint: the session's browser connection is unresponsive (likely a stale \
+                    relay/service-worker mid-session). Reconnect with `connect`, or close the \
+                    session and reopen it.";
+
+        // Timeout envelope: hint stripped, honest prefix kept.
+        let r = classify_step_output(
+            false,
+            Some(1),
+            false,
+            &envelope(
+                json!({"success": false, "error": format!("Wait timed out after 15000ms. {hint}")}),
+            ),
+            "",
+        );
+        assert_eq!(
+            outcome(&r),
+            Err((OutKind::Timeout, "Wait timed out after 15000ms".into()))
+        );
+
+        // A non-timeout envelope carrying the hint keeps it verbatim (kind Error,
+        // not stripped — only Timeout-classified messages are rewritten).
+        let r = classify_step_output(
+            false,
+            Some(1),
+            false,
+            &envelope(json!({"success": false, "error": format!("some other failure. {hint}")})),
+            "",
+        );
+        assert_eq!(
+            outcome(&r),
+            Err((OutKind::Error, format!("some other failure. {hint}")))
+        );
+
+        // The stderr fallback is classified and sanitized too: a timeout
+        // phrasing with the canned hint in stderr → hint stripped.
+        let r = classify_step_output(
+            false,
+            Some(1),
+            false,
+            b"garbage",
+            &format!("Wait timed out after 15000ms. {hint}"),
+        );
+        assert_eq!(
+            outcome(&r),
+            Err((OutKind::Timeout, "Wait timed out after 15000ms".into()))
+        );
+    }
+
+    #[test]
+    fn step_failure_envelope_reports_timeout_vs_error() {
+        let timeout = Duration::from_secs(8);
+        let env = StepFailure {
+            kind: OutKind::Timeout,
+            message: String::new(),
+        }
+        .envelope("wait", json!({ "selector": ".x" }), timeout);
+        assert!(env.payload.get("timeout_ms").is_some());
+        assert!(env.payload.get("error").is_none());
+
+        let env = StepFailure {
+            kind: OutKind::Network,
+            message: "net::ERR_NAME_NOT_RESOLVED".into(),
+        }
+        .envelope("open", json!({ "url": "https://x" }), timeout);
+        assert_eq!(env.payload["error"], "net::ERR_NAME_NOT_RESOLVED");
+        assert!(env.payload.get("timeout_ms").is_none());
+    }
+
     #[test]
     fn expect_envelope_maps_pass_timeout_and_false() {
         // pass → rc 0 / ok.
@@ -2264,6 +2250,12 @@ mod tests {
         assert_eq!(env.kind, OutKind::Timeout);
         assert_eq!(env.payload["pass"], json!(false));
         assert_eq!(env.payload["timed_out"], json!(true));
+        assert_eq!(
+            env.payload["error"],
+            json!(
+                "condition was not met within the deadline — consider verifying the condition or allowing more time"
+            )
+        );
 
         // plain false → error (no timed_out key).
         let env = expect_envelope(

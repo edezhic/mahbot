@@ -40,7 +40,9 @@
 //!   open a window unasked; on display-less hosts it is paused rather than spend
 //!   the launch budget (launching can never help there).
 
-use crate::chrome::contract::ChromeResponse;
+use crate::chrome::contract::{
+    ChromeResponse, is_daemon_unavailable_error, is_relay_unavailable_error,
+};
 use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, ensure_chrome_env, spawn_cli};
 use crate::util::UnwrapPoison;
 use futures_util::future::join_all;
@@ -367,38 +369,6 @@ fn record_launch_outcome(outcome: ChromeLaunchOutcome) {
     health().lock().unwrap_poison().launch_outcome = Some(outcome);
 }
 
-/// Detect the daemon-unavailable signature chrome-use produces when its
-/// background daemon is dead or wedged: the CLI hangs in its own 5-retry loop
-/// (EAGAIN / "Resource temporarily unavailable") and eventually reports
-/// "daemon may be busy or unresponsive". Also covers the 1.5.8x-era texts
-/// (stuck-daemon auto-stop, disappeared daemon endpoint, failed auto-launch).
-pub(crate) fn is_daemon_unavailable_error(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    lower.contains("resource temporarily unavailable")
-        || lower.contains("os error 35")
-        || lower.contains("os error 11")
-        || lower.contains("daemon may be busy or unresponsive")
-        || lower.contains("session unresponsive")
-        || lower.contains("cdp session is unresponsive after attaching")
-        || lower.contains("daemon failed to start")
-        || lower.contains("auto-launch failed")
-        // Colon form only — "failed to connect to <host>" is a page-level
-        // navigation failure, not a daemon socket problem.
-        || lower.contains("failed to connect:")
-}
-
-/// Relay-side failure signature — the daemon is alive but cannot drive Chrome
-/// through the extension relay. Distinct from a daemon wedge (restart clears a
-/// wedge; a relay drop needs the extension to republish, then self-heals).
-pub(crate) fn is_relay_unavailable_error(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    lower.contains("relay isn't connected")
-        || lower.contains("relay is not")
-        || lower.contains("relay dropped")
-        || lower.contains("relay down")
-        || lower.contains("could not drive your chrome")
-}
-
 /// Classify a fast CLI failure text into a health cause. Unreachable-tab
 /// errors are their own state — the daemon and relay are up, only the
 /// session's tab is orphaned, so recovery must NOT run for them. The signature
@@ -417,14 +387,6 @@ fn classify_failure_text(msg: &str) -> Option<ProbeFailure> {
     } else {
         None
     }
-}
-
-/// Stable error-envelope `code` values (v1.5.78+) that are unambiguously
-/// daemon-side. The coarse `connection_failed` code is shared with page-level
-/// navigation failures (the CLI classifies any "connection" text as such), so
-/// the message-text matcher stays the source of truth for those.
-pub(crate) fn is_daemon_unavailable_code(code: Option<&str>) -> bool {
-    matches!(code, Some("browser_not_launched"))
 }
 
 /// Get the platform-appropriate chrome-use binary name.
@@ -2421,6 +2383,7 @@ pub(crate) fn reset_health() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::contract::is_daemon_unavailable_code;
 
     #[tokio::test]
     async fn advertisement_and_availability_reflect_daemon_state() {

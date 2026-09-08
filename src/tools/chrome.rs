@@ -1,12 +1,14 @@
 //! Chrome automation tool.
 
 use crate::chrome::contract::{
-    ChromeResponse, eval_count, expect_outcome, extract_output, extract_snapshot_text,
+    ChromeResponse, EXPECT_TIMEOUT_NOTE, classify_call_failure, eval_count, expect_outcome,
+    extract_output, extract_snapshot_text, is_daemon_unavailable_code, is_daemon_unavailable_error,
+    sanitize_timeout_message, with_condition_timeout_note,
 };
 use crate::chrome::escape_js_single_quoted;
 use crate::chrome::forms::{
     ExpectCond, ExtractGate, count_eval_js, expect_args, extract_gate, parse_count_op,
-    parse_predicate, parse_state, wait_args, wait_target,
+    parse_predicate, parse_state, validate_extract_getters, wait_args, wait_target,
 };
 use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
 use crate::util::{UnwrapPoison, is_http_url};
@@ -464,11 +466,20 @@ impl ChromeTool {
                 } else {
                     enhance_chrome_error(error)
                 };
+                // Classify once: strip chrome-use's stale-relay hint from
+                // Timeout messages (mahbot's surface has no `connect` verb;
+                // Environment diagnostics pass through untouched), then
+                // append the action's remediation note from the same kind.
+                let kind = classify_call_failure(code.as_deref(), &error_msg);
+                let error_msg = sanitize_timeout_message(kind, &error_msg);
                 Self::fail_fast_if_daemon_down(&error_msg, code.as_deref())?;
-                anyhow::bail!(
-                    "chrome-use error: {}",
-                    with_retry_hint(error_msg, retryable)
-                )
+                let mut error_msg = with_retry_hint(error_msg, retryable);
+                with_condition_timeout_note(
+                    args.first().copied().unwrap_or(""),
+                    kind,
+                    &mut error_msg,
+                );
+                anyhow::bail!("chrome-use error: {error_msg}");
             }
         }
     }
@@ -485,9 +496,7 @@ impl ChromeTool {
         if super::chrome_daemon::is_unreachable_tab_error(error) {
             anyhow::bail!("{}", super::chrome_daemon::unreachable_tab_message(error));
         }
-        if super::chrome_daemon::is_daemon_unavailable_error(error)
-            || super::chrome_daemon::is_daemon_unavailable_code(code)
-        {
+        if is_daemon_unavailable_error(error) || is_daemon_unavailable_code(code) {
             super::chrome_daemon::note_unhealthy(error);
             anyhow::bail!("{}", super::chrome_daemon::daemon_down_message());
         }
@@ -1285,10 +1294,15 @@ impl ChromeTool {
                     Some(outcome) if outcome.pass => "expect: PASS (condition holds)".to_string(),
                     Some(outcome) => {
                         let actual = outcome.actual.map_or("n/a".to_string(), |v| v.to_string());
-                        format!(
+                        let mut s = format!(
                             "expect: FAIL — condition did not hold (timed out: {}); actual: {actual}",
                             outcome.timed_out
-                        )
+                        );
+                        // Same remediation the CLI expect envelope carries.
+                        if outcome.timed_out {
+                            s.push_str(EXPECT_TIMEOUT_NOTE);
+                        }
+                        s
                     }
                     None => {
                         serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string())
@@ -1352,35 +1366,41 @@ impl ChromeTool {
                 "extract schema \"rows\" must be a CSS selector string"
             );
         }
-        if let Some(fields) = map.get("fields") {
+        let (out, note) = if let Some(fields) = map.get("fields") {
             anyhow::ensure!(
                 fields.is_object(),
                 "extract schema \"fields\" must be an object ({field_shape})"
             );
-            return Ok((parsed, None));
-        }
-        let mut fields = serde_json::Map::new();
-        for (k, v) in map.iter().filter(|(k, _)| k.as_str() != "rows") {
-            anyhow::ensure!(
-                v.is_string() || v.is_object(),
-                "extract schema field '{k}' must be a {field_shape} — \
-                 chrome-use requires a \"fields\" object"
-            );
-            fields.insert(k.clone(), v.clone());
-        }
-        let mut out = serde_json::Map::new();
-        if let Some(r) = map.get("rows") {
-            out.insert("rows".into(), r.clone());
-        }
-        out.insert("fields".into(), Value::Object(fields));
-        Ok((
-            Value::Object(out),
-            Some(
-                "flat extract schema normalized: field keys moved under \"fields\" \
-                 (chrome-use requires a fields object)"
-                    .to_string(),
-            ),
-        ))
+            (parsed, None)
+        } else {
+            let mut fields = serde_json::Map::new();
+            for (k, v) in map.iter().filter(|(k, _)| k.as_str() != "rows") {
+                anyhow::ensure!(
+                    v.is_string() || v.is_object(),
+                    "extract schema field '{k}' must be a {field_shape} — \
+                     chrome-use requires a \"fields\" object"
+                );
+                fields.insert(k.clone(), v.clone());
+            }
+            let mut out = serde_json::Map::new();
+            if let Some(r) = map.get("rows") {
+                out.insert("rows".into(), r.clone());
+            }
+            out.insert("fields".into(), Value::Object(fields));
+            (
+                Value::Object(out),
+                Some(
+                    "flat extract schema normalized: field keys moved under \"fields\" \
+                     (chrome-use requires a fields object)"
+                        .to_string(),
+                ),
+            )
+        };
+        // The getter vocabulary is independent of the shape (object vs flat);
+        // validate the final normalized schema exactly once so a bad getter is
+        // rejected loudly instead of chrome-use's silent textContent fallback.
+        validate_extract_getters(&out).map_err(anyhow::Error::msg)?;
+        Ok((out, note))
     }
 
     /// Schema-driven extraction with the honest-empty gate: when the schema's
@@ -3051,6 +3071,25 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("\"fields\" must be an object"), "err: {err}");
+
+        // Getters are validated post-normalization: a bare attribute name (no
+        // "@") is rejected loudly instead of chrome-use's silent textContent
+        // fallback.
+        let err = ChromeTool::normalize_extract_schema(&json!({
+            "fields": {"link": {"sel": "a", "get": "href"}}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains('@'), "err: {err}");
+        assert!(err.contains("getter"), "err: {err}");
+
+        // An "@"-prefixed attribute getter is accepted.
+        assert!(
+            ChromeTool::normalize_extract_schema(&json!({
+                "fields": {"u": {"sel": "a", "get": "@href"}}
+            }))
+            .is_ok()
+        );
     }
 
     #[test]

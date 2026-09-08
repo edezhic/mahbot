@@ -265,6 +265,145 @@ impl OutKind {
     }
 }
 
+// ── Failure signatures & classification ────────────────────────────────
+// These live here (not in chrome_daemon) so the failure-interpretation layer
+// stays dependency-free: chrome_daemon imports them back, and both frontends
+// classify through this module without any frontend-to-frontend coupling.
+
+/// Detect the daemon-unavailable signature chrome-use produces when its
+/// background daemon is dead or wedged: the CLI hangs in its own 5-retry loop
+/// (EAGAIN / "Resource temporarily unavailable") and eventually reports
+/// "daemon may be busy or unresponsive". Also covers the 1.5.8x-era texts
+/// (stuck-daemon auto-stop, disappeared daemon endpoint, failed auto-launch).
+pub(crate) fn is_daemon_unavailable_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("resource temporarily unavailable")
+        || lower.contains("os error 35")
+        || lower.contains("os error 11")
+        || lower.contains("daemon may be busy or unresponsive")
+        || lower.contains("session unresponsive")
+        || lower.contains("cdp session is unresponsive after attaching")
+        || lower.contains("daemon failed to start")
+        || lower.contains("auto-launch failed")
+        // Colon form only — "failed to connect to <host>" is a page-level
+        // navigation failure, not a daemon socket problem.
+        || lower.contains("failed to connect:")
+}
+
+/// Relay-side failure signature — the daemon is alive but cannot drive Chrome
+/// through the extension relay. Distinct from a daemon wedge (restart clears a
+/// wedge; a relay drop needs the extension to republish, then self-heals).
+pub(crate) fn is_relay_unavailable_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("relay isn't connected")
+        || lower.contains("relay is not")
+        || lower.contains("relay dropped")
+        || lower.contains("relay down")
+        || lower.contains("could not drive your chrome")
+}
+
+/// Stable error-envelope `code` values (v1.5.78+) that are unambiguously
+/// daemon-side. The coarse `connection_failed` code is shared with page-level
+/// navigation failures (the CLI classifies any "connection" text as such), so
+/// the message-text matcher stays the source of truth for those.
+pub(crate) fn is_daemon_unavailable_code(code: Option<&str>) -> bool {
+    matches!(code, Some("browser_not_launched"))
+}
+
+/// Classify a chrome-use step failure into an [`OutKind`]. Environment
+/// signatures win because rc 2 must not be masked by a page-level wrapper
+/// text: a relay/daemon/Chrome-launch problem is a CLI environment failure
+/// even when the CLI wraps the message in a "page failed" envelope.
+pub(crate) fn classify_call_failure(code: Option<&str>, error: &str) -> OutKind {
+    if is_daemon_unavailable_error(error)
+        || is_daemon_unavailable_code(code)
+        || is_relay_unavailable_error(error)
+    {
+        return OutKind::Environment;
+    }
+    if error.contains("net::ERR_") || code == Some("connection_failed") {
+        return OutKind::Network;
+    }
+    // chrome-use's internal action timeout (AGENT_BROWSER_DEFAULT_TIMEOUT).
+    // Chrome-side deadlines equal the declared budget, and the mahbot-side
+    // kill rides DEADLINE_SLACK above them, so chrome-use's honest phrased
+    // timeouts normally surface first; the classifier still catches them for
+    // every verb. Matched
+    // by its specific phrasings ("Wait timed out after Nms", "waitFor timed
+    // out: …") rather than a bare "timed out" substring, so an unrecognized
+    // connect-timeout message still classifies as Error — same exit code (1),
+    // honest kind label.
+    let lower = error.to_ascii_lowercase();
+    if code == Some("timeout")
+        || lower.contains("timed out after")
+        || lower.contains("waitfor timed out")
+    {
+        return OutKind::Timeout;
+    }
+    if code == Some("element_not_found") || lower.contains("element not found") {
+        return OutKind::NotFound;
+    }
+    OutKind::Error
+}
+
+/// Start of the canned remediation hint chrome-use (external binary) appends
+/// to some timeout failures. Everything from the first occurrence of this
+/// marker to the end of the message is stripped by
+/// [`sanitize_timeout_message`].
+const STALE_RELAY_HINT_MARKER: &str = "Hint: the session's browser connection is unresponsive";
+
+/// chrome-use (external binary) appends a canned remediation hint to some
+/// timeout failures: "Hint: the session's browser connection is unresponsive
+/// (likely a stale relay/service-worker mid-session). Reconnect with
+/// `connect`, or close the session and reopen it." That hint is wrong in
+/// mahbot's surface — there is no `connect` verb here and the connection is
+/// usually healthy (the condition simply never appeared) — so both frontends
+/// strip it from Timeout-classified messages. Environment-classified relay/
+/// daemon diagnostics are never rewritten: genuine connection-failure
+/// guidance must pass through untouched. The wording is chrome-use's; if a
+/// release rephrases it, the strip degrades to a no-op (acceptable). The
+/// separator period before the hint sentence is dropped too, so appended
+/// remediation reads "…15000ms — …" rather than "…15000ms. — …".
+pub(crate) fn sanitize_timeout_message(kind: OutKind, message: &str) -> String {
+    if kind != OutKind::Timeout {
+        return message.to_string();
+    }
+    match message.find(STALE_RELAY_HINT_MARKER) {
+        Some(idx) => {
+            let head = message[..idx].trim_end();
+            head.strip_suffix('.').unwrap_or(head).to_string()
+        }
+        None => message.to_string(),
+    }
+}
+
+/// Remediation appended to `wait` condition timeouts in BOTH frontends (after
+/// the honest chrome-use text) — one source so the CLI and the interactive
+/// tool never drift.
+pub(crate) const WAIT_TIMEOUT_NOTE: &str = " — the target never appeared within the deadline; consider verifying the \
+     selector/text/URL or allowing more time";
+
+/// Same for `expect` (whose cause text already names the deadline).
+pub(crate) const EXPECT_TIMEOUT_NOTE: &str =
+    " — consider verifying the condition or allowing more time";
+
+/// Append the action's condition-timeout remediation note to `message` when
+/// `kind` is Timeout and `message` is chrome-use's own phrased text — an empty
+/// message is the mahbot-side deadline kill, whose timeout_ms-only envelope
+/// shape is pinned and stays untouched. No-op for every other action.
+pub(crate) fn with_condition_timeout_note(action: &str, kind: OutKind, message: &mut String) {
+    let note = match (kind, action) {
+        (OutKind::Timeout, "wait") => Some(WAIT_TIMEOUT_NOTE),
+        (OutKind::Timeout, "expect") => Some(EXPECT_TIMEOUT_NOTE),
+        _ => None,
+    };
+    if let Some(note) = note
+        && !message.is_empty()
+    {
+        message.push_str(note);
+    }
+}
+
 /// The one-line stdout envelope. `payload` must be a JSON object; it is
 /// flattened after `kind`.
 pub(crate) struct OutEnvelope {
@@ -534,5 +673,123 @@ mod tests {
         assert_eq!(expect_outcome(&serde_json::json!({"success": true})), None);
         assert_eq!(expect_outcome(&serde_json::json!({"actual": 1})), None);
         assert_eq!(expect_outcome(&serde_json::json!("x")), None);
+    }
+    #[test]
+    fn classify_call_failure_mapping() {
+        // Environment signatures win (rc 2 must not be masked by page text).
+        assert_eq!(
+            classify_call_failure(None, "daemon may be busy or unresponsive"),
+            OutKind::Environment
+        );
+        assert_eq!(
+            classify_call_failure(Some("browser_not_launched"), "whatever"),
+            OutKind::Environment
+        );
+        assert_eq!(
+            classify_call_failure(None, "relay isn't connected"),
+            OutKind::Environment
+        );
+        // Site-level network failures.
+        assert_eq!(
+            classify_call_failure(None, "net::ERR_NAME_NOT_RESOLVED"),
+            OutKind::Network
+        );
+        assert_eq!(
+            classify_call_failure(Some("connection_failed"), "connection refused"),
+            OutKind::Network
+        );
+        // chrome-use's internal action timeout (AGENT_BROWSER_DEFAULT_TIMEOUT)
+        // — kind timeout, rc 1. Chrome-side deadlines equal the declared
+        // budget (the mahbot kill rides DEADLINE_SLACK above), but the
+        // classifier still catches it for every verb.
+        assert_eq!(
+            classify_call_failure(None, "Wait timed out after 15000ms"),
+            OutKind::Timeout
+        );
+        assert_eq!(
+            classify_call_failure(None, "waitFor timed out: .submit"),
+            OutKind::Timeout
+        );
+        // Not-found selectors.
+        assert_eq!(
+            classify_call_failure(Some("element_not_found"), "whatever"),
+            OutKind::NotFound
+        );
+        assert_eq!(
+            classify_call_failure(None, "Element not found"),
+            OutKind::NotFound
+        );
+        // Everything else is a generic step failure.
+        assert_eq!(
+            classify_call_failure(None, "some random issue"),
+            OutKind::Error
+        );
+        assert_eq!(
+            classify_call_failure(Some("other_code"), "some issue"),
+            OutKind::Error
+        );
+    }
+
+    #[test]
+    fn sanitize_timeout_message_strips_stale_relay_hint() {
+        // Timeout-classified message with the canned hint → hint stripped
+        // (including the separator period before the hint sentence), honest
+        // prefix ("Wait timed out after 15000ms") kept.
+        assert_eq!(
+            sanitize_timeout_message(
+                OutKind::Timeout,
+                "Wait timed out after 15000ms. Hint: the session's browser connection \
+                 is unresponsive (likely a stale relay/service-worker mid-session). Reconnect \
+                 with `connect`, or close the session and reopen it."
+            ),
+            "Wait timed out after 15000ms"
+        );
+        // A Timeout message without the marker is unchanged.
+        assert_eq!(
+            sanitize_timeout_message(OutKind::Timeout, "Wait timed out after 19000ms"),
+            "Wait timed out after 19000ms"
+        );
+    }
+
+    #[test]
+    fn sanitize_timeout_message_leaves_non_timeout_alone() {
+        // The hint with NO timeout phrasing → not Timeout, so untouched.
+        let hint = "Hint: the session's browser connection is unresponsive (likely a stale \
+             relay/service-worker mid-session). Reconnect with `connect`, or close the session \
+             and reopen it.";
+        assert_eq!(sanitize_timeout_message(OutKind::Error, hint), hint);
+        // An Environment-classified relay message passes through untouched.
+        let relay = "relay isn't connected";
+        assert_eq!(sanitize_timeout_message(OutKind::Environment, relay), relay);
+        // An Error-classified message with the hint keeps it verbatim.
+        let other = format!("some other failure\n{hint}");
+        assert_eq!(sanitize_timeout_message(OutKind::Error, &other), other);
+    }
+
+    #[test]
+    fn with_condition_timeout_note_appends_by_action() {
+        // Phrased wait timeout → wait note; expect → expect note.
+        let mut m = String::from("Wait timed out after 15000ms");
+        with_condition_timeout_note("wait", OutKind::Timeout, &mut m);
+        assert_eq!(
+            m,
+            format!("Wait timed out after 15000ms{WAIT_TIMEOUT_NOTE}")
+        );
+        let mut m = String::from("waitFor timed out: .submit");
+        with_condition_timeout_note("expect", OutKind::Timeout, &mut m);
+        assert_eq!(
+            m,
+            format!("waitFor timed out: .submit{EXPECT_TIMEOUT_NOTE}")
+        );
+        // Empty message (mahbot-side deadline kill) → untouched, so the
+        // timeout_ms-only envelope shape stays pinned.
+        let mut m = String::new();
+        with_condition_timeout_note("wait", OutKind::Timeout, &mut m);
+        assert!(m.is_empty());
+        // Non-Timeout kinds and other actions are never touched.
+        let mut m = String::from("some failure");
+        with_condition_timeout_note("wait", OutKind::Error, &mut m);
+        with_condition_timeout_note("eval", OutKind::Timeout, &mut m);
+        assert_eq!(m, "some failure");
     }
 }

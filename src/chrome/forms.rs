@@ -5,6 +5,7 @@
 //! validated allowlist ([`ExpectCond`] → [`expect_args`]).
 
 use crate::chrome::escape_js_single_quoted;
+use serde_json::Value;
 
 /// The inline-text argv element for a `fill`/`type` value: a leading-dash
 /// text is shielded with the standard `--` end-of-options marker, which
@@ -263,6 +264,54 @@ pub(crate) fn extract_gate<E>(count: Result<u64, E>) -> ExtractGate<E> {
     }
 }
 
+/// The corrective suffix shared by every getter-validation error.
+const GETTER_GRAMMAR: &str = "valid getters are \"text\" (default), \"html\", \"value\", or \
+     \"@<attribute>\" (e.g. \"@href\"); attributes require the \"@\" prefix — a bare \
+     attribute name is not a getter";
+
+/// Validate the extract-schema getter vocabulary against chrome-use's
+/// documented grammar: `get` = "text" (default) | "@<attribute>" | "html" |
+/// "value". chrome-use silently falls back to textContent for unknown
+/// getters, which produced plausible-but-wrong `ok:true` extractions (rc 0,
+/// no signal) — mahbot rejects them loudly instead. Attributes require the
+/// "@" prefix (get "@href", not "href"); "@" alone is invalid. The allowlist
+/// is pinned to the documented chrome-use grammar (stable across 1.5.10x) —
+/// extend it if a future chrome-use release documents new getters.
+pub(crate) fn validate_extract_getters(schema: &Value) -> Result<(), String> {
+    let Some(fields) = schema.get("fields").and_then(Value::as_object) else {
+        // Missing or non-object "fields" is shape-checked elsewhere; getter
+        // validation only applies to the object form.
+        return Ok(());
+    };
+    for (name, field) in fields {
+        let Some(obj) = field.as_object() else {
+            continue; // plain CSS-selector string fields need no getter check.
+        };
+        let Some(get) = obj.get("get") else {
+            continue;
+        };
+        let Some(getter) = get.as_str() else {
+            return Err(format!(
+                "extract field '{name}' has a non-string getter {get} — {GETTER_GRAMMAR}"
+            ));
+        };
+        if let Some(attr) = getter.strip_prefix('@') {
+            if attr.is_empty() {
+                return Err(format!(
+                    "extract field '{name}' has an empty getter \"@\" — {GETTER_GRAMMAR}"
+                ));
+            }
+            continue;
+        }
+        if !matches!(getter, "text" | "html" | "value") {
+            return Err(format!(
+                "extract field '{name}' has an invalid getter \"{getter}\" — {GETTER_GRAMMAR}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +474,65 @@ mod tests {
             count_eval_js("div.c"),
             "document.querySelectorAll('div.c').length"
         );
+    }
+
+    #[test]
+    fn validate_extract_getters_accepts_documented_grammar() {
+        // text/html/value and "@<attribute>" all pass; missing get passes.
+        let schema = serde_json::json!({
+            "rows": ".card",
+            "fields": {
+                "t": {"sel": ".a", "get": "text"},
+                "h": {"sel": ".b", "get": "html"},
+                "v": {"sel": ".c", "get": "value"},
+                "u": {"sel": "a", "get": "@href"},
+                "plain": ".title",
+            },
+        });
+        assert!(
+            validate_extract_getters(&schema).is_ok(),
+            "doc grammar passes"
+        );
+
+        // A field object with no "get" key is fine (defaults to text).
+        let no_get = serde_json::json!({"fields": {"title": {"sel": ".title"}}});
+        assert!(validate_extract_getters(&no_get).is_ok());
+    }
+
+    #[test]
+    fn validate_extract_getters_rejects_bad_getters() {
+        // Bare attribute name (no "@") is rejected with the convention taught.
+        let err = validate_extract_getters(&serde_json::json!({
+            "fields": {"link": {"sel": "a", "get": "href"}}
+        }))
+        .unwrap_err();
+        assert!(err.contains('@'), "err: {err}");
+        assert!(err.contains("getter"), "err: {err}");
+        assert!(err.contains("href"), "err: {err}");
+
+        // Empty "@" is rejected.
+        let err = validate_extract_getters(&serde_json::json!({
+            "fields": {"u": {"sel": "a", "get": "@"}}
+        }))
+        .unwrap_err();
+        assert!(err.contains("empty getter"), "err: {err}");
+
+        // Non-string get is rejected.
+        let err = validate_extract_getters(&serde_json::json!({
+            "fields": {"u": {"sel": "a", "get": 42}}
+        }))
+        .unwrap_err();
+        assert!(err.contains("non-string getter"), "err: {err}");
+    }
+
+    #[test]
+    fn validate_extract_getters_ignores_non_object_fields_and_shapes() {
+        // Plain string fields (CSS selectors) are fine.
+        let schema = serde_json::json!({"fields": {"title": ".title", "url": "a"}});
+        assert!(validate_extract_getters(&schema).is_ok());
+
+        // Missing or non-object "fields" is shape-checked elsewhere — Ok here.
+        assert!(validate_extract_getters(&serde_json::json!({"rows": ".card"})).is_ok());
+        assert!(validate_extract_getters(&serde_json::json!({"fields": ".title"})).is_ok());
     }
 }

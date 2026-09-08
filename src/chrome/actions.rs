@@ -272,7 +272,7 @@ fn build_actions() -> Vec<ActionDesc> {
                 properties: json!({
                     "schema": {
                         "type": "object",
-                        "description": "Extraction schema: an optional \"rows\" CSS selector key for row-list extraction plus a required \"fields\" object mapping each field name to its CSS selector, e.g. {\"rows\": \".card\", \"fields\": {\"title\": \".title\", \"price\": \".price\"}}"
+                        "description": "Extraction schema: an optional \"rows\" CSS selector key for row-list extraction plus a required \"fields\" object. Each field maps to a CSS selector string or {\"sel\": \"<css>\", \"get\": \"<getter>\", \"all\": true}; getter is \"text\" (default), \"html\", \"value\", or \"@<attribute>\" — attributes REQUIRE the \"@\" prefix (e.g. \"@href\"; a bare attribute name is rejected mahbot-side). Example: {\"rows\": \".card\", \"fields\": {\"title\": \".title\", \"url\": {\"sel\": \"a\", \"get\": \"@href\"}}}"
                     },
                     "limit": {
                         "type": "integer",
@@ -304,7 +304,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "The schema follows chrome-use's grammar: an optional \"rows\" selector plus a required \"fields\" object (field name → CSS selector or {sel, get, all}). When the schema's rows selector matches 0 elements, the empty region is reported honestly (kind empty, rc 0) without invoking chrome-use's phantom-row extract. An unreadable or invalid schema file is kind usage (rc 3). If the count eval fails (e.g. an invalid CSS rows selector), the action errors explicitly — chrome-use's dominant-container auto-detect fallback is deliberately NOT used, because the gate exists to avoid phantom rows.",
+                details: "The schema follows chrome-use's grammar: an optional \"rows\" selector plus a required \"fields\" object (field name → CSS selector or {sel, get, all}). Field getters: \"text\" (default), \"html\", \"value\", or \"@<attribute>\" (e.g. \"@href\"); attributes require the \"@\" prefix, and unknown getters are rejected kind usage (rc 3) instead of chrome-use's silent textContent fallback. When the schema's rows selector matches 0 elements, the empty region is reported honestly (kind empty, rc 0) without invoking chrome-use's phantom-row extract. An unreadable or invalid schema file is kind usage (rc 3). If the count eval fails (e.g. an invalid CSS rows selector), the action errors explicitly — chrome-use's dominant-container auto-detect fallback is deliberately NOT used, because the gate exists to avoid phantom rows.",
                 examples: &["mahbot chrome extract --schema-file products.json --limit 20"],
             }),
         },
