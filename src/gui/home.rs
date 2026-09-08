@@ -1,7 +1,7 @@
 //! Home page — native GUI chat interface with user impersonation.
 //!
 //! Users pick an identity from the user picker, select a workspace via the
-//! Dashboard workspace picker, and chat with MahBot agents in real time
+//! footer workspace picker, and chat with MahBot agents in real time
 //! with full markdown rendering and typing indicators.
 
 use crate::ChatDirection;
@@ -228,7 +228,7 @@ fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
 pub enum HomeMessage {
     /// User selected (from picker, Users page icon, or auto-selected at boot).
     UserSelected(String),
-    /// Workspace changed (from Dashboard workspace picker — propagated via Dashboard).
+    /// Workspace changed (from the footer workspace picker — propagated via Dashboard).
     WorkspaceChanged(Option<String>),
     /// Text editor content changed.
     InputChanged(super::editor_widget::EditorAction),
@@ -336,7 +336,7 @@ pub enum HomeMessage {
 pub struct HomeState {
     /// Currently selected user (sender identifier).
     pub(crate) selected_user: Option<String>,
-    /// Currently selected workspace name (synced from Dashboard workspace
+    /// Currently selected workspace name (synced from the footer workspace
     /// picker). `Some("personal:{user}")` = the user's "Personal" workspace;
     /// `Some("ws")` = a shared workspace. Resolved to `personal:<user_name>`
     /// before querying chat_history or sessions.

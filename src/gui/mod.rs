@@ -42,7 +42,9 @@ use crate::logs::LogStore;
 use crate::pipeline::board::Ticket;
 
 use iced::keyboard;
-use iced::widget::{Column, Row, Space, button, column, container, row, rule, text, tooltip};
+use iced::widget::{
+    Column, Row, Space, button, column, container, pick_list, row, rule, text, tooltip,
+};
 use iced::window;
 use iced::{Alignment, Color, Element, Length, Task};
 
@@ -139,17 +141,13 @@ pub enum Page {
 }
 
 impl Page {
-    /// Pages shown in the sidebar (Home, Editor, Shell). Running Agents is
-    /// NOT in the sidebar — it is reachable only via the footer activity
-    /// indicators (role icons / zap counter). Because the Cmd+number
-    /// shortcuts index this same list, Cmd+4 no longer navigates to it
-    /// (user-approved).
+    /// Pages in the sidebar top nav (Home, Editor, Shell) — the Cmd+number keyboard map.
     const fn sidebar_pages() -> &'static [Page] {
         &[Page::Home, Page::Editor, Page::Shell]
     }
 
-    /// Pages shown in the footer nav (Sessions, Logs, Settings).
-    const fn footer_pages() -> &'static [Page] {
+    /// Pages in the sidebar bottom nav (Sessions, Logs, Settings) — click-only, no keyboard shortcut.
+    const fn sidebar_bottom_pages() -> &'static [Page] {
         &[Page::Sessions, Page::Logs, Page::Settings]
     }
 
@@ -317,6 +315,9 @@ pub enum Message {
     UpdateResult(Result<String, String>),
     /// Toggle the selected workspace's pipeline pause or maintainer state.
     Toggle(ToggleKind),
+    /// Footer workspace picker: switch the active user's workspace (shared
+    /// workspaces only; admin-gated at render).
+    WorkspacePick(String),
     /// Result of a per-workspace toggle DB write. Carries (kind, result, workspace_name, intended_state).
     /// On success, the workspace map is reloaded from the store; on error an error toast is shown.
     ToggleResult(ToggleKind, Result<(), String>, String, bool),
@@ -750,8 +751,8 @@ impl Dashboard {
         restored_name: &str,
     ) -> Task<Message> {
         self.workspaces = workspaces;
-        // Sync the Settings workspace list + users picker options from the
-        // freshly-loaded map (no separate DB read).
+        // Sync the Settings workspace list from the freshly-loaded map (no
+        // separate DB read).
         self.sync_settings_lists_from_map();
         // Pre-set Home's selected_user from persisted window state
         // so UsersLoaded doesn't auto-select the first user when
@@ -810,8 +811,8 @@ impl Dashboard {
                 .map(Message::Sessions),
             Page::Settings => {
                 self.settings_state.refresh();
-                // Workspace list + users picker options come from the shared
-                // map; only the users list needs a DB refresh on navigation.
+                // Workspace list comes from the shared map; only the users
+                // list needs a DB refresh on navigation.
                 self.sync_settings_lists_from_map();
                 self.refresh_settings_users()
             }
@@ -829,16 +830,14 @@ impl Dashboard {
             .map(|msg| Message::Settings(settings::SettingsMessage::UserMsg(msg)))
     }
 
-    /// Sync the Settings lists from the shared workspace map: the workspace
-    /// section list (sorted by name, matching the store's `ORDER BY name`) and
-    /// the users-page workspace picker options. No DB read — the map is the
-    /// single source of truth.
+    /// Sync the Settings workspaces section list from the shared workspace map
+    /// (sorted by name, matching the store's `ORDER BY name`). No DB read — the
+    /// map is the single source of truth.
     ///
     /// Shared-workspace membership is admin-only: when the active user is not
     /// an admin, the Workspaces settings list is emptied (every `workspaces`
     /// table row is a shared workspace; personal workspaces never live in the
-    /// map). The users-page picker options are still assigned — they only carry
-    /// shared names, and non-admin rows substitute a muted "Personal" label.
+    /// map).
     fn sync_settings_lists_from_map(&mut self) {
         let mut list: Vec<Workspace> = self.workspaces.values().cloned().collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
@@ -847,11 +846,6 @@ impl Dashboard {
             list.clear();
         }
         self.settings_state.workspaces_state.workspaces = list;
-        // The Personal option value is now the empty string (`""`); the
-        // settings page replaces it with each row's own personal name when
-        // rendering per-user pickers.
-        self.settings_state.users_state.workspace_options =
-            workspace_pick_options(&self.workspaces);
     }
 
     /// Toggle the selected workspace's pause or maintainer state.
@@ -1001,9 +995,9 @@ impl Dashboard {
     }
 
     /// Process a Settings message, intercepting user-related messages for
-    /// cross-page side effects (user switching, workspace switching,
-    /// deletion recovery) and optionally reloading workspace options when
-    /// workspaces are added or deleted.
+    /// cross-page side effects (user switching, deletion recovery) and
+    /// optionally reloading the workspace map when workspaces are added or
+    /// deleted.
     fn process_settings_message(&mut self, msg: settings::SettingsMessage) -> Task<Message> {
         // Capture cross-page side effects for intercepted UserMsg
         // variants. These batch alongside the delegation call below.
@@ -1019,31 +1013,15 @@ impl Dashboard {
                             .map(Message::Home),
                     );
                 }
-                users::UsersMessage::DeleteResult(Ok(()), deleted_user) => {
-                    if self.selected_user_name.as_deref() == Some(deleted_user.as_str()) {
-                        self.selected_user_name = Some("admin".to_string());
-                        self.persist_window_state();
-                        intercept_task = Some(
-                            Task::done(home::HomeMessage::UserSelected("admin".to_string()))
-                                .map(Message::Home),
-                        );
-                    }
-                }
-                users::UsersMessage::UpdateWorkspace(sender, ws)
-                    if self.selected_user_name.as_deref() == Some(sender.as_str()) =>
+                users::UsersMessage::DeleteResult(Ok(()), deleted_user)
+                    if self.selected_user_name.as_deref() == Some(deleted_user.as_str()) =>
                 {
-                    // The picker's own DB write (below, via settings_state.update)
-                    // already persisted the active user's selection — only move
-                    // the sidebar.
-                    intercept_task = Some(self.apply_workspace_selection(ws));
-                }
-                // An active-role change in Settings leaves the
-                // Dashboard's cached role/pool stale (composer role dropdown
-                // guard and 'current' marker) — refresh them for the selected
-                // user. Workspace changes are handled by the UpdateWorkspace
-                // arm above and need no role/pool refresh.
-                users::UsersMessage::RoleUpdateResult(Ok(())) => {
-                    intercept_task = Some(self.refresh_selected_user_role_cache());
+                    self.selected_user_name = Some("admin".to_string());
+                    self.persist_window_state();
+                    intercept_task = Some(
+                        Task::done(home::HomeMessage::UserSelected("admin".to_string()))
+                            .map(Message::Home),
+                    );
                 }
                 _ => {}
             }
@@ -1230,6 +1208,7 @@ impl Dashboard {
             _ if !self.ready => Task::none(),
 
             // ── Post-ready handlers (no per-arm guards needed) ──
+            Message::WorkspacePick(name) => self.select_workspace(&name),
             Message::ToastExpired(id) => {
                 // Dismissing an already-expired/unknown id is a safe no-op.
                 self.toasts.retain(|t| t.id != id);
@@ -1647,7 +1626,7 @@ impl Dashboard {
 
     /// Apply a workspace selection in memory and broadcast it to all pages,
     /// without writing the DB. Used where the DB write happened (or happens)
-    /// elsewhere — e.g. the Settings→Users picker for the active user.
+    /// elsewhere — e.g. the footer workspace picker's [`Self::select_workspace`].
     fn apply_workspace_selection(&mut self, name: &str) -> Task<Message> {
         // Git state is cleared and eagerly refreshed below via
         // propagate_workspace_selection → set_workspace_path.
@@ -1674,8 +1653,8 @@ impl Dashboard {
     ///
     /// No admin clamp is applied here: every producer of a selection is
     /// already admin-aware (the Home reverse-sync resolves through
-    /// [`crate::users::resolve_selected_workspace_name`], the Settings
-    /// per-row picker is gated by the row user's permissions), so a
+    /// [`crate::users::resolve_selected_workspace_name`], the footer
+    /// workspace picker is admin-gated), so a
     /// non-admin can never request a shared workspace — and clamping against
     /// the async-loaded `selected_user_is_admin` cache would race a user
     /// switch and wrongly detach an admin from their shared workspace.
@@ -1698,7 +1677,7 @@ impl Dashboard {
                 let ws = name.to_string();
                 Task::perform(
                     async move {
-                        if let Err(e) = users::update_user_field(user.clone(), ws, false).await {
+                        if let Err(e) = users::update_user_field(user.clone(), ws).await {
                             tracing::warn!(error = %e, user = %user, "Failed to persist workspace selection");
                         }
                     },
@@ -2550,8 +2529,7 @@ fn page_icon(page: Page, size: u32, color: Color) -> Element<'static, Message> {
 /// Shared sidebar toggle wrapper — wraps an icon inside a centered,
 /// full-width button with a tooltip at the given `position`.
 ///
-/// Used by [`Dashboard::render_maintainer_toggle`],
-/// [`Dashboard::render_pause_toggle`] and [`Dashboard::render_sidebar_nav`].
+/// Used by [`Dashboard::sidebar_nav_column`] (the sidebar nav icons).
 fn render_sidebar_toggle<'a>(
     icon: Element<'a, Message>,
     tooltip_text: impl text::IntoFragment<'a>,
@@ -2578,13 +2556,11 @@ fn render_sidebar_toggle<'a>(
 
 impl Dashboard {
     fn sidebar_view(&self) -> Element<'_, Message> {
-        let mut col = column![self.render_sidebar_nav(), Space::new().height(Length::Fill),];
-        // Pipeline toggles only apply to a real (non-Personal) workspace;
-        // hidden entirely for Personal mode / boot state.
-        if self.has_active_workspace() {
-            col = col.push(self.render_maintainer_toggle());
-            col = col.push(self.render_pause_toggle());
-        }
+        let col = column![
+            self.render_sidebar_nav(),
+            Space::new().height(Length::Fill),
+            self.render_sidebar_bottom_nav(),
+        ];
         container(col.spacing(theme::SPACE_2))
             .width(Length::Fixed(56.0))
             .height(Length::Fill)
@@ -2593,15 +2569,16 @@ impl Dashboard {
             .into()
     }
 
-    /// Sidebar navigation icons: Home, Editor, Shell (28px). Running Agents
-    /// is not in the sidebar — it is reachable only via the footer activity
-    /// indicators.
+    /// Shared nav-icon column for the sidebar top and bottom navs. Each page
+    /// is rendered as a 28px icon button; the active page is accent-colored,
+    /// and Editor/Shell are disabled (TEXT_FAINT, no press) when no workspace
+    /// is selectable.
     ///
     /// Uses Position::Right — iced snaps Top tooltips into the viewport,
     /// overlapping the topmost sidebar button.
-    fn render_sidebar_nav(&self) -> Element<'_, Message> {
+    fn sidebar_nav_column(&self, pages: &[Page]) -> Column<'_, Message> {
         let mut col = Column::new().spacing(theme::SPACE_2);
-        for page in Page::sidebar_pages() {
+        for page in pages {
             let is_active = self.page == *page;
             // Editor, Shell require any workspace (shared or personal with a user selected).
             let has_any_workspace =
@@ -2633,46 +2610,106 @@ impl Dashboard {
             );
             col = col.push(nav_btn);
         }
-        col.into()
+        col
     }
 
-    /// Per-workspace Maintainer toggle button.
+    /// Sidebar top nav icons: Home, Editor, Shell (28px). Running Agents
+    /// is not in the sidebar — it is reachable only via the footer activity
+    /// indicators.
+    fn render_sidebar_nav(&self) -> Element<'_, Message> {
+        self.sidebar_nav_column(Page::sidebar_pages()).into()
+    }
+
+    /// Sidebar bottom nav icons: Sessions, Logs, Settings (28px) — click-only,
+    /// no keyboard shortcut.
+    fn render_sidebar_bottom_nav(&self) -> Element<'_, Message> {
+        self.sidebar_nav_column(Page::sidebar_bottom_pages()).into()
+    }
+
+    /// Footer per-workspace Maintainer toggle icon button.
     fn render_maintainer_toggle(&self) -> Element<'_, Message> {
-        let tooltip_text = if self.maintenance_enabled() {
-            "stop maintenance"
-        } else {
-            "start maintenance"
-        };
-        render_sidebar_toggle(
-            widgets::maint_badge(self.maintenance_enabled()).into(),
-            tooltip_text,
+        let enabled = self.maintenance_enabled();
+        let icon: Element<'_, Message> = theme::role_icon(&Role::Maintainer)
+            .size(theme::TEXT_24)
+            .color(if enabled {
+                theme::ACCENT
+            } else {
+                theme::TEXT_MUTED
+            })
+            .into();
+        widgets::icon_tooltip_button(
+            icon,
+            if enabled {
+                "stop maintenance"
+            } else {
+                "start maintenance"
+            },
             Some(Message::Toggle(ToggleKind::Maintenance)),
+            theme::PAD_3,
+            theme::button_text,
             tooltip::Position::Top,
         )
     }
 
-    /// Per-workspace pipeline pause/unpause toggle button.
+    /// Footer per-workspace pipeline pause/unpause toggle icon button.
     fn render_pause_toggle(&self) -> Element<'_, Message> {
-        let pause_icon = if self.paused() {
+        let paused = self.paused();
+        let icon: Element<'_, Message> = if paused {
             lucide::play::<iced::Theme, iced::Renderer>()
-                .size(28)
+                .size(24)
                 .color(theme::ACCENT)
+                .into()
         } else {
             lucide::pause::<iced::Theme, iced::Renderer>()
-                .size(28)
+                .size(24)
                 .color(theme::TEXT_MUTED)
+                .into()
         };
-        let tooltip_text = if self.paused() {
+        let tooltip_text = if paused {
             "Resume pipeline"
         } else {
             "Pause pipeline"
         };
-        render_sidebar_toggle(
-            pause_icon.into(),
+        widgets::icon_tooltip_button(
+            icon,
             tooltip_text,
             Some(Message::Toggle(ToggleKind::Pause)),
+            theme::PAD_3,
+            theme::button_text,
             tooltip::Position::Top,
         )
+    }
+
+    /// Footer workspace picker: shared workspaces only, admin-gated, persists
+    /// via [`Self::select_workspace`]. Returns `None` for the no-user,
+    /// non-admin, and zero-shared-workspaces states — the admin flag is
+    /// fail-closed `false` until loaded, so the picker is hidden at boot
+    /// (intended).
+    fn render_workspace_picker(&self) -> Option<Element<'_, Message>> {
+        if self.selected_user_name.is_none() || !self.selected_user_is_admin {
+            return None;
+        }
+        let options = shared_workspace_options(&self.workspaces);
+        // No shared workspaces exist — an inert placeholder dropdown would
+        // suggest a choice that isn't there; hide the picker instead.
+        if options.is_empty() {
+            return None;
+        }
+        // Guard the displayed selection: a dangling persisted value (the
+        // workspace vanished from the map) renders no highlight; a personal
+        // selection (`active_workspace_name()` → None) renders the placeholder.
+        let selected = self
+            .active_workspace_name()
+            .and_then(|name| options.iter().find(|o| o.value == name).cloned());
+        Some(widgets::tooltip_hint(
+            pick_list(options, selected, |opt| Message::WorkspacePick(opt.value))
+                .placeholder("Select workspace")
+                .style(theme::pick_list_style)
+                .menu_style(theme::pick_list_menu_style)
+                .padding([theme::PAD_4, theme::PAD_8])
+                .width(Length::Fixed(140.0)),
+            "Active workspace",
+        ))
     }
 
     /// Render the self-update confirmation modal (opened by
@@ -2764,33 +2801,7 @@ impl Dashboard {
         ))
     }
 
-    /// Render the footer navigation icons (Sessions, Logs, Settings).
-    fn render_nav_icons(&self) -> Element<'_, Message> {
-        let mut icons: Vec<Element<'_, Message>> = Vec::with_capacity(3);
-        for page in Page::footer_pages() {
-            let is_active = self.page == *page;
-            let color = if is_active {
-                theme::ACCENT
-            } else {
-                theme::TEXT_MUTED
-            };
-            let icon: Element<'_, Message> = page_icon(*page, 24, color);
-            icons.push(widgets::icon_tooltip_button(
-                icon,
-                page.label(),
-                Some(Message::Navigation(*page)),
-                theme::PAD_3,
-                theme::button_text,
-                tooltip::Position::Top,
-            ));
-        }
-        Row::with_children(icons)
-            .spacing(theme::SPACE_6)
-            .align_y(Alignment::Center)
-            .into()
-    }
-
-    /// Vertical divider between nav icons and git blocks.
+    /// Vertical divider between the footer activity chrome and git blocks.
     fn render_git_divider() -> Element<'static, Message> {
         rule::vertical(1)
             .style(|_: &iced::Theme| rule::Style {
@@ -3084,16 +3095,21 @@ impl Dashboard {
         footer_status_label(label)
     }
 
-    /// 42px footer bar — nav items (left) and active agents (right).
+    /// 42px footer bar — update/picker/toggle chrome (left) and active
+    /// agents (right).
     fn footer_view(&self) -> Element<'_, Message> {
-        let mut left_elements: Vec<Element<'_, Message>> = Vec::with_capacity(3);
+        let mut left_elements: Vec<Element<'_, Message>> = Vec::with_capacity(5);
 
         if let Some(el) = Self::render_update_button() {
             left_elements.push(el);
         }
-
-        left_elements.push(self.render_nav_icons());
-
+        if let Some(el) = self.render_workspace_picker() {
+            left_elements.push(el);
+        }
+        if self.has_active_workspace() {
+            left_elements.push(self.render_maintainer_toggle());
+            left_elements.push(self.render_pause_toggle());
+        }
         if let Some(el) = self.render_git_block() {
             left_elements.push(el);
         }
@@ -3290,27 +3306,20 @@ async fn load_workspace_options(user: Option<String>) -> Message {
     Message::BootWorkspaces(workspaces, restored)
 }
 
-/// Build the Settings users-page workspace picker options from the shared
-/// workspace map: "Personal" prepended (value = `""` — "selecting" it persists
-/// a NULL because `update_user_field` maps empty→Clear, which decouples the
-/// option list from the impersonated user), then map values sorted by name,
-/// labeled by each workspace's display name.
+/// Build the footer workspace picker options from the shared workspace map:
+/// values sorted by name, labeled by each workspace's display name. Personal
+/// workspaces never live in the map, so the list is shared-only by construction.
 #[must_use]
-fn workspace_pick_options(map: &HashMap<String, Workspace>) -> Vec<widgets::PickOption> {
-    let mut options = Vec::with_capacity(map.len() + 1);
-    options.push(widgets::PickOption {
-        value: String::new(),
-        label: "Personal".to_string(),
-    });
+fn shared_workspace_options(map: &HashMap<String, Workspace>) -> Vec<widgets::PickOption> {
     let mut values: Vec<&Workspace> = map.values().collect();
     values.sort_by(|a, b| a.name.cmp(&b.name));
-    for ws in values {
-        options.push(widgets::PickOption {
+    values
+        .into_iter()
+        .map(|ws| widgets::PickOption {
             value: ws.name.clone(),
             label: ws.display_name(),
-        });
-    }
-    options
+        })
+        .collect()
 }
 
 /// Open a URL in the system browser (fire-and-forget).
@@ -3475,31 +3484,10 @@ mod tests {
             .collect();
         assert_eq!(ws_names, vec!["alpha", "beta"]);
 
-        // Users picker options = Personal prepended (value ""), then
-        // display_name labels sorted by name.
-        let options = &dash.settings_state.users_state.workspace_options;
-        assert_eq!(options.len(), 3);
-        assert_eq!(
-            (options[0].value.as_str(), options[0].label.as_str()),
-            ("", "Personal")
-        );
-        assert_eq!(
-            (options[1].value.as_str(), options[1].label.as_str()),
-            ("alpha", "alpha")
-        );
-        assert_eq!(
-            (options[2].value.as_str(), options[2].label.as_str()),
-            ("beta", "beta")
-        );
-
-        // Non-admin active (fail-closed): the shared workspace list is emptied;
-        // the picker options still carry the shared names (non-admin rows
-        // substitute a muted "Personal" label at render time).
+        // Non-admin active (fail-closed): the shared workspace list is emptied.
         dash.selected_user_is_admin = false;
         let _ = dash.update(Message::WorkspacesReloaded(map));
         assert!(dash.settings_state.workspaces_state.workspaces.is_empty());
-        let options = &dash.settings_state.users_state.workspace_options;
-        assert_eq!(options.len(), 3);
     }
 
     /// The DB-sourced boot resolution: an admin (permissions='full') with a

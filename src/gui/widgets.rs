@@ -342,9 +342,8 @@ pub fn badge_pill<'a, Message: 'a>(
         .into()
 }
 
-/// Maintainer icon + ON/OFF badge shared by the sidebar Maintainer toggle and
-/// the Settings workspace-row Maintainer toggle; the wrapping toggle button
-/// stays with each caller.
+/// Maintainer icon + ON/OFF badge shared by the Settings workspace-row
+/// Maintainer toggle; the wrapping toggle button stays with the caller.
 #[must_use]
 pub fn maint_badge<'a, Message: 'a>(enabled: bool) -> Column<'a, Message> {
     column![

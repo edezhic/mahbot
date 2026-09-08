@@ -1,11 +1,6 @@
 //! Users dashboard page — manage user preferences.
 
-use crate::Role;
 use crate::users::{FieldUpdate, UserRecord, UserStore};
-
-use std::collections::HashMap;
-
-use strum::IntoEnumIterator;
 
 use iced::Task;
 
@@ -21,27 +16,18 @@ pub(crate) fn user_store() -> Result<&'static UserStore, String> {
 
 /// Run a single-field `update_user`, mapping an empty value (or a `personal:{user}`
 /// workspace name) to [`FieldUpdate::Clear`] — the personal workspace is stored
-/// as NULL and computed on the fly. `is_role` selects which column is updated.
-pub(crate) async fn update_user_field(
-    sender: String,
-    value: String,
-    is_role: bool,
-) -> Result<(), String> {
+/// as NULL and computed on the fly. Updates the workspace column.
+pub(crate) async fn update_user_field(sender: String, workspace: String) -> Result<(), String> {
     let store = user_store()?;
     // Empty and personal-workspace values both mean "no shared workspace
-    // selected" → NULL. Role columns never accept a personal mapping.
-    let val = if value.is_empty() || (!is_role && crate::users::is_personal_workspace(&value)) {
+    // selected" → NULL.
+    let val = if workspace.is_empty() || crate::users::is_personal_workspace(&workspace) {
         FieldUpdate::Clear
     } else {
-        FieldUpdate::Set(&value)
-    };
-    let (role, ws) = if is_role {
-        (val, FieldUpdate::Unchanged)
-    } else {
-        (FieldUpdate::Unchanged, val)
+        FieldUpdate::Set(&workspace)
     };
     store
-        .update_user(&sender, role, ws, FieldUpdate::Unchanged)
+        .update_user(&sender, FieldUpdate::Unchanged, val, FieldUpdate::Unchanged)
         .await
         .map_err(|e| e.to_string())
 }
@@ -50,11 +36,6 @@ pub(crate) async fn update_user_field(
 pub enum UsersMessage {
     Refreshed(Vec<UserRecord>),
     RefreshError(String),
-    UpdateRole(String, String),
-    UpdateWorkspace(String, String),
-    UpdateResult(Result<(), String>),
-    /// Result of an active-role change via the users-table picker.
-    RoleUpdateResult(Result<(), String>),
     DeleteUser(String),
     ConfirmDelete(String),
     CancelDelete,
@@ -87,12 +68,6 @@ pub struct UsersState {
     pub(crate) users: Vec<UserRecord>,
     pub(crate) load_state: super::common::AsyncLoadState,
 
-    // Dropdown options (populated on refresh)
-    pub(crate) workspace_options: Vec<super::widgets::PickOption>,
-    pub(crate) role_options: Vec<super::widgets::PickOption>,
-    /// Per-user active-role picker options, restricted to each user's pool.
-    pub(crate) active_role_options: HashMap<String, Vec<super::widgets::PickOption>>,
-
     // Delete confirmation
     pub(crate) delete_target: Option<String>,
     pub(crate) deleting: bool,
@@ -110,9 +85,6 @@ impl UsersState {
         Self {
             users: Vec::new(),
             load_state: super::common::AsyncLoadState::new(),
-            workspace_options: Vec::new(),
-            role_options: Vec::new(),
-            active_role_options: HashMap::new(),
             delete_target: None,
             deleting: false,
             bind_target: None,
@@ -143,56 +115,11 @@ impl UsersState {
             UsersMessage::Refreshed(users) => {
                 self.users = users;
 
-                // workspace_options is synchronized from the dashboard's shared
-                // workspace map (see gui/mod.rs) rather than read here.
-
-                // Build role options from Role::iter()
-                self.role_options = Role::iter()
-                    .map(|r| {
-                        let name = r.to_string();
-                        super::widgets::PickOption {
-                            value: name.clone(),
-                            label: name,
-                        }
-                    })
-                    .collect();
-
-                // Per-user active-role options, restricted to each user's pool.
-                self.active_role_options = self
-                    .users
-                    .iter()
-                    .map(|u| {
-                        let options = u
-                            .roles
-                            .iter()
-                            .filter_map(|name| {
-                                self.role_options.iter().find(|o| o.value == *name).cloned()
-                            })
-                            .collect();
-                        (u.name.clone(), options)
-                    })
-                    .collect();
-
                 Task::none()
             }
             UsersMessage::RefreshError(e) => {
                 self.load_state.fail(e);
                 Task::none()
-            }
-            UsersMessage::UpdateRole(sender, role) => Task::perform(
-                async move { update_user_field(sender, role, true).await },
-                UsersMessage::RoleUpdateResult,
-            ),
-            UsersMessage::UpdateWorkspace(sender, ws) => Task::perform(
-                async move { update_user_field(sender, ws, false).await },
-                UsersMessage::UpdateResult,
-            ),
-            UsersMessage::UpdateResult(Ok(())) | UsersMessage::RoleUpdateResult(Ok(())) => {
-                self.refresh()
-            }
-            UsersMessage::UpdateResult(Err(e)) | UsersMessage::RoleUpdateResult(Err(e)) => {
-                self.load_state.fail(e.clone());
-                Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))
             }
             UsersMessage::DeleteUser(sender) => {
                 self.delete_target = Some(sender);
