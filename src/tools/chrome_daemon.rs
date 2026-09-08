@@ -704,6 +704,7 @@ async fn run_cli_bounded(args: &[&str], session: Option<&str>) -> Option<std::pr
         capture_stderr: false,
         timeout: CliTimeout::Bounded(CLI_TIMEOUT),
         cancel_kills: true,
+        input: None,
     })
     .await
     {

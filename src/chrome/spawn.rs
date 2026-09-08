@@ -46,6 +46,9 @@ pub(crate) struct CliSpawn<'a> {
     /// letting a timed-out call's chrome-use child keep retrying in the
     /// background has no upside.
     pub(crate) cancel_kills: bool,
+    /// Optional stdin payload (e.g. `fill --stdin`). When set, stdin is piped
+    /// and the payload is written concurrently with output collection.
+    pub(crate) input: Option<Vec<u8>>,
     pub(crate) timeout: CliTimeout,
 }
 
@@ -121,12 +124,35 @@ pub(crate) async fn spawn_cli(spec: CliSpawn<'_>) -> CliRun {
     }
     cmd.kill_on_drop(spec.cancel_kills);
 
+    // When a stdin payload is set, pipe stdin and write the payload
+    // concurrently with output collection — a full stdin write must not
+    // deadlock against a full stdout pipe. Without a payload, `output()`
+    // (stdin nulled) is the simple path.
+    if spec.input.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    }
+    let run = async {
+        let Some(data) = spec.input else {
+            return cmd.output().await;
+        };
+        let mut child = cmd.spawn()?;
+        let mut stdin = child.stdin.take().expect("stdin piped when input is set");
+        let writer = tokio::task::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(&data).await;
+            let _ = stdin.shutdown().await;
+        });
+        let out = child.wait_with_output().await;
+        let _ = writer.await; // normally already done; EPIPE if the child never read
+        out
+    };
+
     match spec.timeout {
-        CliTimeout::Unbounded => match cmd.output().await {
+        CliTimeout::Unbounded => match run.await {
             Ok(out) => CliRun::Output(out),
             Err(_) => CliRun::SpawnFailure,
         },
-        CliTimeout::Bounded(d) => match tokio::time::timeout(d, cmd.output()).await {
+        CliTimeout::Bounded(d) => match tokio::time::timeout(d, run).await {
             Err(_) => CliRun::TimedOut,
             Ok(Err(_)) => CliRun::SpawnFailure,
             Ok(Ok(out)) => CliRun::Output(out),

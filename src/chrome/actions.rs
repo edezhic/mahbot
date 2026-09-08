@@ -344,6 +344,138 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
         },
         ActionDesc {
+            name: "fill",
+            purpose: "clear an input/textarea/contenteditable and fill it with text (read-back verified)",
+            tool: Some(ToolParams {
+                required: &["selector", "text"],
+                properties: json!({
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector or ref (@e1) of the input/textarea/contenteditable to fill. Refs come from the most recent snapshot on this tab — they become stale after navigation or re-snapshot"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to write — replaces the existing content. Use this for multiline/large text"
+                    }
+                }),
+            }),
+            cli: Some(CliHelp {
+                syntax: "<selector> <text> [--file <path>] [--stdin] [--timeout <secs>]",
+                flags: &[
+                    (
+                        "--file <path>",
+                        "read the fill value from a UTF-8 file (large/multiline text — chrome-use reads the file)",
+                    ),
+                    ("--stdin", "read the fill value from this process's stdin"),
+                    ("--timeout <secs>", "step deadline in seconds (default 8)"),
+                ],
+                session: true,
+                kinds: &[
+                    OutKind::Ok,
+                    OutKind::Timeout,
+                    OutKind::Network,
+                    OutKind::NotFound,
+                    OutKind::Error,
+                    OutKind::Environment,
+                    OutKind::Usage,
+                ],
+                details: "Clears the field and fills it, replacing existing content; the written value is read back and verified before success — rich editors (CodeMirror, Monaco, ProseMirror, contenteditable) and framework inputs (React/Vue/Angular) are handled natively. Exactly one text source: the inline text (multi-word text is joined with spaces), --file <path>, or --stdin. A missing --file is kind usage; a target that does not exist is kind not-found; a read-back verification failure is kind error. A text beginning with '-' must be passed after `--` (or use --file/--stdin).",
+                examples: &[
+                    "mahbot chrome fill \"#email\" \"user@example.com\"",
+                    "mahbot chrome fill \".editor\" --file ./post.md",
+                ],
+            }),
+        },
+        ActionDesc {
+            name: "type",
+            purpose: "type text character-by-character into an element (appends, does not clear)",
+            tool: Some(ToolParams {
+                required: &["selector", "text"],
+                properties: json!({
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector or ref (@e1) of the input/textarea/contenteditable to type into. Refs come from the most recent snapshot on this tab — they become stale after navigation or re-snapshot"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to type character-by-character, appending to existing content. Embedded newlines press Enter (which can submit a form) — use fill for multiline text"
+                    },
+                    "key_events": {
+                        "type": "boolean",
+                        "description": "Send real per-character keyDown/keyUp instead of insertText — for autocomplete/combobox fields that only react to key events"
+                    }
+                }),
+            }),
+            cli: Some(CliHelp {
+                syntax: "<selector> <text> [--key-events] [--timeout <secs>]",
+                flags: &[
+                    (
+                        "--key-events",
+                        "send real per-character keyDown/keyUp — for autocomplete/combobox fields",
+                    ),
+                    ("--timeout <secs>", "step deadline in seconds (default 8)"),
+                ],
+                session: true,
+                kinds: &[
+                    OutKind::Ok,
+                    OutKind::Timeout,
+                    OutKind::Network,
+                    OutKind::NotFound,
+                    OutKind::Error,
+                    OutKind::Environment,
+                    OutKind::Usage,
+                ],
+                details: "Types character-by-character without clearing (appends to existing content). --key-events sends real per-character keyDown/keyUp for autocomplete/combobox fields. Embedded newlines press Enter — they can submit a form; use fill for multiline text. When the page rewrites or filters the typed text, chrome-use's warning makes the action kind error (rc 1) — never a silent success. A text beginning with '-' must be passed after `--`.",
+                examples: &[
+                    "mahbot chrome type \"#search\" \"hello\"",
+                    "mahbot chrome type \"#zip\" \"201-0001\" --key-events",
+                ],
+            }),
+        },
+        ActionDesc {
+            name: "press",
+            purpose: "Press a keyboard key at the current focus (e.g. Enter to submit forms)",
+            tool: Some(ToolParams {
+                required: &["key"],
+                properties: json!({
+                    "key": {
+                        "type": "string",
+                        "description": "Key to press (e.g. Enter, Tab, Escape, Control+a, ArrowDown)"
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "Focus this element (CSS selector or ref @e1) before pressing — use when focus may not be where you left it"
+                    }
+                }),
+            }),
+            cli: Some(CliHelp {
+                syntax: "<key> [--selector <sel>] [--hold <ms>] [--timeout <secs>]",
+                flags: &[
+                    ("--selector <sel>", "focus this element before pressing"),
+                    (
+                        "--hold <ms>",
+                        "hold the key down for this long before releasing",
+                    ),
+                    ("--timeout <secs>", "step deadline in seconds (default 8)"),
+                ],
+                session: true,
+                kinds: &[
+                    OutKind::Ok,
+                    OutKind::Timeout,
+                    OutKind::Network,
+                    OutKind::NotFound,
+                    OutKind::Error,
+                    OutKind::Environment,
+                    OutKind::Usage,
+                ],
+                details: "Sends the key to the focused element; --selector focuses a target first (which makes kind not-found reachable). For JS-dependent keys chrome-use probes for key listeners; with none found, chrome-use's warning makes the action kind error (rc 1) — never a silent success.",
+                examples: &[
+                    "mahbot chrome press Enter --selector \"textarea[name=q]\"",
+                    "mahbot chrome press Escape",
+                ],
+            }),
+        },
+        ActionDesc {
             name: "session",
             purpose: "stop a named CLI session (session stop)",
             tool: None,
@@ -423,20 +555,6 @@ fn build_actions() -> Vec<ActionDesc> {
             tool: Some(ToolParams {
                 required: &[],
                 properties: json!({}),
-            }),
-            cli: None,
-        },
-        ActionDesc {
-            name: "press",
-            purpose: "Press a keyboard key at the current focus (e.g. Enter to submit forms)",
-            tool: Some(ToolParams {
-                required: &["key"],
-                properties: json!({
-                    "key": {
-                        "type": "string",
-                        "description": "Key to press (e.g. Enter, Tab, Escape, Control+a, ArrowDown)"
-                    }
-                }),
             }),
             cli: None,
         },
@@ -563,7 +681,8 @@ mod tests {
         assert_action_set(
             names,
             &[
-                "status", "open", "count", "wait", "expect", "eval", "extract", "click", "session",
+                "status", "open", "count", "wait", "expect", "eval", "extract", "click", "fill",
+                "type", "press", "session",
             ],
         );
     }

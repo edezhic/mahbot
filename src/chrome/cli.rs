@@ -26,7 +26,7 @@ use crate::chrome::contract::{
 };
 use crate::chrome::forms::{
     ExpectCond, ExtractGate, WaitTarget, count_eval_js, describe, expect_args, extract_gate,
-    parse_count_op, parse_predicate, parse_state, wait_args, wait_target,
+    parse_count_op, parse_predicate, parse_state, text_value_argv, wait_args, wait_target,
 };
 use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
 use crate::chrome::{CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX, is_blank_page_url, validate_url};
@@ -229,10 +229,49 @@ enum Action {
         if_present: bool,
         timeout: Duration,
     },
+    Fill {
+        selector: String,
+        source: TextInput,
+        timeout: Duration,
+    },
+    Type {
+        selector: String,
+        text: String,
+        key_events: bool,
+        timeout: Duration,
+    },
+    Press {
+        key: String,
+        selector: Option<String>,
+        hold: Option<u64>,
+        timeout: Duration,
+    },
     SessionStop {
         name: String,
         force: bool,
     },
+}
+
+/// Where `fill` gets its text.
+enum TextInput {
+    /// Inline positional text (multi-word joined with spaces).
+    Inline(String),
+    /// `--file <path>` passthrough — chrome-use reads the file.
+    File(String),
+    /// `--stdin` — mahbot reads its own stdin and pipes the bytes.
+    Stdin,
+}
+
+impl TextInput {
+    /// The chrome-use argv suffix carrying the value (leading-dash inline
+    /// text shielded with `--`; see [`forms::text_value_argv`]).
+    fn argv(&self) -> Vec<String> {
+        match self {
+            Self::Inline(t) => text_value_argv(t),
+            Self::File(p) => vec!["--file".into(), p.clone()],
+            Self::Stdin => vec!["--stdin".into()],
+        }
+    }
 }
 
 /// A failed chrome-use step: the classified [`OutKind`] plus the error text
@@ -332,6 +371,9 @@ const ACTION_FLAGS: &[(&str, &[&str], &[&str])] = &[
     ("eval", &["timeout"], &[]),
     ("extract", &["schema-file", "limit", "timeout"], &[]),
     ("click", &["timeout"], &["if-present"]),
+    ("fill", &["file", "timeout"], &["stdin"]),
+    ("type", &["timeout"], &["key-events"]),
+    ("press", &["selector", "hold", "timeout"], &[]),
     ("session", &[], &["force"]),
 ];
 
@@ -359,19 +401,29 @@ fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
         "eval" => parse_eval(session.as_deref(), rest, allowed),
         "extract" => parse_extract(session.as_deref(), rest, allowed),
         "click" => parse_click(session.as_deref(), rest, allowed),
+        "fill" => parse_fill(session.as_deref(), rest, allowed),
+        "type" => parse_type(session.as_deref(), rest, allowed),
+        "press" => parse_press(session.as_deref(), rest, allowed),
         "session" => parse_session_stop(session.as_deref(), rest, allowed),
         other => Err(format!("unknown action '{other}'")),
     }
 }
 
-/// Pull the global `--session` flag out of anywhere in the args, returning the
-/// session value (last occurrence wins) and the remaining tokens.
+/// Pull the global `--session` flag out of anywhere before the `--`
+/// end-of-options marker, returning the session value (last occurrence wins)
+/// and the remaining tokens (everything from `--` on kept verbatim).
 fn extract_global_session(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
     let mut session: Option<String> = None;
     let mut remaining = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        // `--` ends option parsing (the fill/type text escape hatch): the
+        // rest is verbatim text, never scanned for --session.
+        if a == "--" {
+            remaining.extend_from_slice(&args[i..]);
+            break;
+        }
         if a == "--session" {
             i += 1;
             let val = args
@@ -432,6 +484,12 @@ fn parse_flags(
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        // `--` ends option parsing: the rest are positionals verbatim (the
+        // escape hatch for a leading-dash fill/type text).
+        if a == "--" {
+            positionals.extend(args[i + 1..].iter().cloned());
+            break;
+        }
         if let Some(body) = a.strip_prefix("--") {
             let (name, eq_value) = match body.split_once('=') {
                 Some((n, v)) => (n, Some(v)),
@@ -753,6 +811,95 @@ fn parse_click(
     })
 }
 
+fn parse_fill(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: FlagSet,
+) -> Result<Invocation, String> {
+    let (value_flags, bool_flags) = allowed;
+    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let usage = "fill <selector> <text | --file <path> | --stdin>";
+    let selector = match positionals.first() {
+        Some(s) => s.clone(),
+        None => return Err(format!("missing selector — {usage}")),
+    };
+    let inline = positionals.get(1..).unwrap_or_default();
+    let file = flags.value("file");
+    let stdin = flags.has("stdin");
+    let source = match (file, stdin, inline.is_empty()) {
+        (Some(f), false, true) => TextInput::File(f.to_string()),
+        (None, true, true) => TextInput::Stdin,
+        (None, false, false) => TextInput::Inline(inline.join(" ")),
+        _ => return Err(format!("exactly one text source required — {usage}")),
+    };
+    Ok(Invocation {
+        action: Action::Fill {
+            selector,
+            source,
+            timeout: parse_timeout_flag(&flags)?,
+        },
+        session: session.map(String::from),
+    })
+}
+
+fn parse_type(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: FlagSet,
+) -> Result<Invocation, String> {
+    let (value_flags, bool_flags) = allowed;
+    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let usage = "type <selector> <text> [--key-events]";
+    let selector = match positionals.first() {
+        Some(s) => s.clone(),
+        None => return Err(format!("missing selector — {usage}")),
+    };
+    let text = positionals.get(1..).unwrap_or_default().join(" ");
+    if text.is_empty() {
+        return Err(format!("missing text — {usage}"));
+    }
+    Ok(Invocation {
+        action: Action::Type {
+            selector,
+            text,
+            key_events: flags.has("key-events"),
+            timeout: parse_timeout_flag(&flags)?,
+        },
+        session: session.map(String::from),
+    })
+}
+
+fn parse_press(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: FlagSet,
+) -> Result<Invocation, String> {
+    let (value_flags, bool_flags) = allowed;
+    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let usage = "press <key> [--selector <sel>] [--hold <ms>]";
+    let key = match positionals.first() {
+        Some(s) => s.clone(),
+        None => return Err(format!("missing key — {usage}")),
+    };
+    reject_extra_positionals(&positionals, 1)?;
+    let hold = match flags.value("hold") {
+        Some(v) => Some(
+            v.parse::<u64>()
+                .map_err(|_| format!("--hold must be an integer (ms): {v}"))?,
+        ),
+        None => None,
+    };
+    Ok(Invocation {
+        action: Action::Press {
+            key,
+            selector: flags.value("selector").map(String::from),
+            hold,
+            timeout: parse_timeout_flag(&flags)?,
+        },
+        session: session.map(String::from),
+    })
+}
+
 fn parse_session_stop(
     session: Option<&str>,
     rest: &[String],
@@ -901,6 +1048,23 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
                     if_present,
                     timeout,
                 } => click(selector, *if_present, *timeout, &name).await,
+                Action::Fill {
+                    selector,
+                    source,
+                    timeout,
+                } => fill(selector, source, *timeout, &name).await,
+                Action::Type {
+                    selector,
+                    text,
+                    key_events,
+                    timeout,
+                } => r#type(selector, text, *key_events, *timeout, &name).await,
+                Action::Press {
+                    key,
+                    selector,
+                    hold,
+                    timeout,
+                } => press(key, selector.as_deref(), *hold, *timeout, &name).await,
                 Action::Status | Action::SessionStop { .. } => {
                     unreachable!("handled by the outer match")
                 }
@@ -914,12 +1078,23 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
 
 /// Run one chrome-use step, bounded by `timeout`. `session` scopes the call
 /// via `--session`; `None` leaves the call session-unscoped (`session stop`
-/// names its session via the positional instead).
+/// names its session via the positional instead). Stdin is nulled.
 async fn spawn_step(
     path: &Path,
     args: &[&str],
     session: Option<&str>,
     timeout: Duration,
+) -> StepOutcome {
+    spawn_step_input(path, args, session, timeout, None).await
+}
+
+/// [`spawn_step`] with a stdin payload (only `fill --stdin` pipes one).
+async fn spawn_step_input(
+    path: &Path,
+    args: &[&str],
+    session: Option<&str>,
+    timeout: Duration,
+    input: Option<&[u8]>,
 ) -> StepOutcome {
     // A session-scoped spawn attempt may materialize the ephemeral session
     // (a vanished-binary race still sets this; the close attempt is then a
@@ -936,6 +1111,7 @@ async fn spawn_step(
         capture_stderr: true,
         timeout: CliTimeout::Bounded(timeout),
         cancel_kills: true,
+        input: input.map(<[u8]>::to_vec),
     })
     .await
     {
@@ -1519,6 +1695,158 @@ async fn click(selector: &str, if_present: bool, timeout: Duration, session: &st
     }
 }
 
+/// Read this process's stdin to EOF for `fill --stdin`, capped so an
+/// oversized/accidental stream is a usage error, not a memory event.
+const STDIN_TEXT_CAP: usize = 10 * 1024 * 1024;
+async fn read_stdin_capped() -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut stdin = tokio::io::stdin().take((STDIN_TEXT_CAP + 1) as u64);
+    stdin
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| format!("cannot read stdin: {e}"))?;
+    if buf.len() > STDIN_TEXT_CAP {
+        return Err(format!(
+            "stdin text exceeds the {STDIN_TEXT_CAP} byte cap — write it to a file and use --file"
+        ));
+    }
+    if buf.is_empty() {
+        return Err(
+            "no text on stdin — pipe it, e.g. `cat post.md | mahbot chrome fill \".editor\" --stdin`"
+                .to_string(),
+        );
+    }
+    Ok(buf)
+}
+
+/// The fill/type/press success handling, pure for tests: a success envelope
+/// carrying chrome-use's degraded-success `warning`
+/// ([`crate::chrome::contract::chrome_use_warning`]) is classified as kind
+/// error (rc 1) with the warning surfaced — the action may not have taken
+/// effect, so it must never exit 0. A clean success emits kind ok with the
+/// action params plus chrome-use's `data`.
+fn text_input_ok_envelope(action: &str, base: &Value, resp: ChromeResponse) -> OutEnvelope {
+    let warning = crate::chrome::contract::chrome_use_warning(&resp);
+    let mut payload = base.as_object().cloned().unwrap_or_default();
+    if let Some(d) = resp.data {
+        payload.insert("data".into(), d);
+    }
+    if let Some(warning) = warning {
+        payload.insert("warning".into(), warning);
+        return out_env(action, false, OutKind::Error, Value::Object(payload));
+    }
+    out_env(action, true, OutKind::Ok, Value::Object(payload))
+}
+
+/// `fill` — clear + verified fill. Exactly one text source (inline text,
+/// --file passthrough, or mahbot-piped --stdin).
+async fn fill(selector: &str, source: &TextInput, timeout: Duration, session: &str) -> OutEnvelope {
+    let action = "fill";
+    let base = json!({ "selector": selector });
+    let path = match require_cli(action, base.clone()) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let mut argv = vec!["fill".to_string(), selector.to_string()];
+    argv.extend(source.argv());
+    let input = match source {
+        TextInput::Stdin => match read_stdin_capped().await {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                return out_env(
+                    action,
+                    false,
+                    OutKind::Usage,
+                    json!({ "selector": selector, "error": e }),
+                );
+            }
+        },
+        TextInput::File(f) => {
+            if !std::path::Path::new(f).is_file() {
+                return out_env(
+                    action,
+                    false,
+                    OutKind::Usage,
+                    json!({ "selector": selector, "error": format!("--file does not exist: {f}") }),
+                );
+            }
+            None
+        }
+        TextInput::Inline(_) => None,
+    };
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    match spawn_step_input(&path, &refs, Some(session), timeout, input.as_deref()).await {
+        Ok(resp) => text_input_ok_envelope(action, &base, resp),
+        Err(f) => f.envelope(action, base, timeout),
+    }
+}
+
+/// `type` — character-by-character typing (appends, does not clear).
+async fn r#type(
+    selector: &str,
+    text: &str,
+    key_events: bool,
+    timeout: Duration,
+    session: &str,
+) -> OutEnvelope {
+    let action = "type";
+    let base = json!({ "selector": selector, "text": text });
+    let path = match require_cli(action, base.clone()) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let mut argv = vec!["type".to_string(), selector.to_string()];
+    if key_events {
+        argv.push("--key-events".to_string());
+    }
+    // Leading-dash text rides after the `--` shield; action flags must come
+    // BEFORE it (everything after is a verbatim value).
+    argv.extend(text_value_argv(text));
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    match spawn_step(&path, &refs, Some(session), timeout).await {
+        Ok(resp) => text_input_ok_envelope(action, &base, resp),
+        Err(f) => f.envelope(action, base, timeout),
+    }
+}
+
+/// `press` — press a key at the focused element, optionally focusing a
+/// `--selector` first and holding `--hold` ms before release.
+async fn press(
+    key: &str,
+    selector: Option<&str>,
+    hold: Option<u64>,
+    timeout: Duration,
+    session: &str,
+) -> OutEnvelope {
+    let action = "press";
+    let mut base_obj = serde_json::Map::new();
+    base_obj.insert("key".into(), json!(key));
+    if let Some(sel) = selector {
+        base_obj.insert("selector".into(), json!(sel));
+    }
+    if let Some(h) = hold {
+        base_obj.insert("hold_ms".into(), json!(h));
+    }
+    let base = Value::Object(base_obj);
+    let path = match require_cli(action, base.clone()) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let mut argv = vec!["press".to_string(), key.to_string()];
+    if let Some(sel) = selector {
+        argv.extend(["--selector".to_string(), sel.to_string()]);
+    }
+    if let Some(h) = hold {
+        argv.extend(["--hold".to_string(), h.to_string()]);
+    }
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    match spawn_step(&path, &refs, Some(session), timeout).await {
+        Ok(resp) => text_input_ok_envelope(action, &base, resp),
+        Err(f) => f.envelope(action, base, timeout),
+    }
+}
+
 /// `session stop` — name-gated stop of a CLI session (protects the interactive
 /// tool's `agent-tab-*` sessions unless `--force`).
 async fn session_stop(name: &str, force: bool) -> OutEnvelope {
@@ -1572,6 +1900,7 @@ async fn close_ephemeral(name: &str) {
         capture_stderr: false,
         cancel_kills: true,
         timeout: CliTimeout::Bounded(DEFAULT_STEP_TIMEOUT),
+        input: None,
     })
     .await
     {
@@ -1605,6 +1934,7 @@ mod tests {
             error: None,
             code: None,
             retryable: None,
+            extra: serde_json::Map::default(),
         };
         // chrome-use 1.5.101 wraps eval output as {origin, result}.
         assert_eq!(
@@ -2130,6 +2460,153 @@ mod tests {
     }
 
     #[test]
+    fn parse_text_input_happy_paths() {
+        // fill inline multi-word text.
+        let inv = parse_invocation(&["fill".into(), "#q".into(), "hello".into(), "world".into()])
+            .expect("fill inline parses");
+        match inv.action {
+            Action::Fill {
+                selector, source, ..
+            } => {
+                assert_eq!(selector, "#q");
+                assert!(matches!(source, TextInput::Inline(t) if t == "hello world"));
+            }
+            _ => panic!("expected Fill"),
+        }
+
+        // fill with `--file=<path>`.
+        let inv = parse_invocation(&["fill".into(), "#q".into(), "--file=post.md".into()])
+            .expect("fill --file parses");
+        match inv.action {
+            Action::Fill { source, .. } => {
+                assert!(matches!(source, TextInput::File(p) if p == "post.md"));
+            }
+            _ => panic!("expected Fill"),
+        }
+
+        // fill with a separate `--file <path>` value.
+        let inv = parse_invocation(&[
+            "fill".into(),
+            "#q".into(),
+            "--file".into(),
+            "post.md".into(),
+        ])
+        .expect("fill --file value parses");
+        match inv.action {
+            Action::Fill { source, .. } => {
+                assert!(matches!(source, TextInput::File(p) if p == "post.md"));
+            }
+            _ => panic!("expected Fill"),
+        }
+
+        // fill --stdin.
+        let inv = parse_invocation(&["fill".into(), "#q".into(), "--stdin".into()])
+            .expect("fill --stdin parses");
+        match inv.action {
+            Action::Fill { source, .. } => {
+                assert!(matches!(source, TextInput::Stdin));
+            }
+            _ => panic!("expected Fill"),
+        }
+
+        // type with and without --key-events.
+        let inv =
+            parse_invocation(&["type".into(), "#q".into(), "hi".into()]).expect("type parses");
+        match inv.action {
+            Action::Type {
+                selector,
+                text,
+                key_events,
+                ..
+            } => {
+                assert_eq!(selector, "#q");
+                assert_eq!(text, "hi");
+                assert!(!key_events);
+            }
+            _ => panic!("expected Type"),
+        }
+        let inv = parse_invocation(&[
+            "type".into(),
+            "#q".into(),
+            "hi".into(),
+            "--key-events".into(),
+        ])
+        .expect("type --key-events parses");
+        match inv.action {
+            Action::Type { key_events, .. } => assert!(key_events),
+            _ => panic!("expected Type"),
+        }
+
+        // press with selector, hold and timeout.
+        let inv = parse_invocation(&[
+            "press".into(),
+            "Enter".into(),
+            "--selector".into(),
+            "#t".into(),
+            "--hold".into(),
+            "50".into(),
+            "--timeout".into(),
+            "9".into(),
+        ])
+        .expect("press parses");
+        match inv.action {
+            Action::Press {
+                key,
+                selector,
+                hold,
+                timeout,
+            } => {
+                assert_eq!(key, "Enter");
+                assert_eq!(selector.as_deref(), Some("#t"));
+                assert_eq!(hold, Some(50));
+                assert_eq!(timeout, Duration::from_secs(9));
+            }
+            _ => panic!("expected Press"),
+        }
+    }
+
+    /// The `--` end-of-options marker: a leading-dash text (even one that
+    /// looks like `--session`) is taken verbatim, never parsed as a flag.
+    #[test]
+    fn parse_dash_separator_takes_text_verbatim() {
+        let inv = parse_invocation(&["fill".into(), "#q".into(), "--".into(), "--foo".into()])
+            .expect("fill -- separator parses");
+        match inv.action {
+            Action::Fill { source, .. } => {
+                assert!(matches!(source, TextInput::Inline(t) if t == "--foo"));
+            }
+            _ => panic!("expected Fill"),
+        }
+
+        let inv = parse_invocation(&[
+            "type".into(),
+            "#q".into(),
+            "--".into(),
+            "--session".into(),
+            "sneaky".into(),
+            "rest".into(),
+        ])
+        .expect("type with --session-looking text parses");
+        match inv.action {
+            Action::Type { selector, text, .. } => {
+                assert_eq!(selector, "#q");
+                assert_eq!(text, "--session sneaky rest");
+            }
+            _ => panic!("expected Type"),
+        }
+    }
+
+    /// The inline-text argv shield: a leading-dash value rides after `--` so
+    /// chrome-use's arg preprocessor forwards it verbatim.
+    #[test]
+    fn text_value_argv_shields_leading_dash_text() {
+        assert_eq!(text_value_argv("hello"), vec!["hello"]);
+        assert_eq!(text_value_argv("--foo"), vec!["--", "--foo"]);
+        assert_eq!(text_value_argv("-5"), vec!["--", "-5"]);
+        assert_eq!(text_value_argv(""), vec![""]);
+    }
+
+    #[test]
     fn parse_rejects_usage_errors() {
         assert!(parse_invocation(&["bogus".into()]).is_err());
         assert!(parse_invocation(&["open".into()]).is_err()); // missing url
@@ -2204,6 +2681,123 @@ mod tests {
         assert!(
             parse_invocation(&["expect".into(), "count".into(), ".c".into(), "==".into()]).is_err()
         );
+    }
+
+    /// Usage rejections for the text-input actions.
+    #[test]
+    fn parse_rejects_text_input_usage_errors() {
+        // fill: exactly one text source.
+        assert!(parse_invocation(&["fill".into(), "#q".into()]).is_err()); // none
+        assert!(
+            parse_invocation(&[
+                "fill".into(),
+                "#q".into(),
+                "a".into(),
+                "--file".into(),
+                "f".into()
+            ])
+            .is_err()
+        ); // inline + --file
+        assert!(
+            parse_invocation(&["fill".into(), "#q".into(), "a".into(), "--stdin".into()]).is_err()
+        ); // inline + --stdin
+        assert!(
+            parse_invocation(&[
+                "fill".into(),
+                "#q".into(),
+                "--stdin".into(),
+                "--file".into(),
+                "f".into()
+            ])
+            .is_err()
+        ); // --stdin + --file
+        assert!(parse_invocation(&["type".into(), "#q".into()]).is_err()); // missing text
+        assert!(parse_invocation(&["press".into(), "Enter".into(), "extra".into()]).is_err()); // extra positional
+        assert!(
+            parse_invocation(&[
+                "press".into(),
+                "Enter".into(),
+                "--hold".into(),
+                "abc".into()
+            ])
+            .is_err()
+        ); // non-numeric hold
+        assert!(parse_invocation(&["press".into(), "Enter".into(), "--selector".into()]).is_err()); // missing value
+    }
+
+    #[test]
+    fn text_input_ok_envelope_clean_success() {
+        let base = json!({ "selector": "#q" });
+        let resp = ChromeResponse {
+            success: Some(true),
+            data: Some(json!({ "value": "filled" })),
+            ..ChromeResponse::default()
+        };
+        let env = text_input_ok_envelope("fill", &base, resp);
+        assert!(env.ok);
+        assert_eq!(env.kind, OutKind::Ok);
+        assert_eq!(env.payload["data"]["value"], json!("filled"));
+        assert!(env.payload.get("warning").is_none());
+    }
+
+    /// chrome-use emits `readBack` on EVERY readable `type` success and
+    /// `keyListeners` on every listener-dependent `press` — they are not the
+    /// degraded signal. Without chrome-use's `warning` field these are clean
+    /// successes (rc 0).
+    #[test]
+    fn text_input_ok_envelope_read_back_and_key_listeners_without_warning_are_ok() {
+        let typed = ChromeResponse {
+            success: Some(true),
+            data: Some(json!({ "typed": "hi", "readBack": "hi" })),
+            ..ChromeResponse::default()
+        };
+        let env = text_input_ok_envelope("type", &json!({ "selector": "#q", "text": "hi" }), typed);
+        assert!(env.ok);
+        assert_eq!(env.kind, OutKind::Ok);
+
+        let press = ChromeResponse {
+            success: Some(true),
+            data: Some(json!({ "key": "ArrowDown", "keyListeners": 3 })),
+            ..ChromeResponse::default()
+        };
+        let env = text_input_ok_envelope("press", &json!({ "key": "ArrowDown" }), press);
+        assert!(env.ok);
+        assert_eq!(env.kind, OutKind::Ok);
+    }
+
+    #[test]
+    fn text_input_ok_envelope_warning_in_data_is_error() {
+        let base = json!({ "selector": "#q", "text": "hi" });
+        let resp = ChromeResponse {
+            success: Some(true),
+            data: Some(json!({
+                "typed": "hi", "readBack": "h",
+                "warning": "the field does not contain what was typed",
+            })),
+            ..ChromeResponse::default()
+        };
+        let env = text_input_ok_envelope("type", &base, resp);
+        assert!(!env.ok);
+        assert_eq!(env.kind, OutKind::Error);
+        assert_eq!(
+            env.payload["warning"],
+            json!("the field does not contain what was typed")
+        );
+    }
+
+    #[test]
+    fn text_input_ok_envelope_warning_at_top_level_is_error() {
+        let base = json!({ "key": "Enter" });
+        let resp = ChromeResponse {
+            success: Some(true),
+            data: Some(json!({})),
+            extra: serde_json::Map::from_iter([("warning".to_string(), json!("no key listeners"))]),
+            ..ChromeResponse::default()
+        };
+        let env = text_input_ok_envelope("press", &base, resp);
+        assert!(!env.ok);
+        assert_eq!(env.kind, OutKind::Error);
+        assert_eq!(env.payload["warning"], json!("no key listeners"));
     }
 
     #[test]

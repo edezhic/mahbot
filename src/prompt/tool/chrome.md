@@ -10,8 +10,13 @@ Opens a page and automatically returns a compact accessibility snapshot. Read th
 ### 2. Understand the page: `snapshot`
 Re-scan the page to get fresh element refs. Pass `compact: false` to include empty structural elements, `interactive_only: true` to see only buttons/links/inputs, or `depth: N` to limit tree depth (useful for deeply nested pages).
 
-### 3. Interact: `find` or `click`
+### 3. Interact: `find`, `click`, `fill`, `type`, `press`
 Use `find` with locators to click, fill, hover, or check elements. Use `click` with a CSS selector or ref (`@e1`) for simple clicks. Always take a fresh `snapshot` after navigation before using refs — they become stale on any DOM change.
+
+Text input — never set `.value` via eval; use the native actions (they route through React/Vue/Angular setters and rich-editor APIs like CodeMirror/Monaco/ProseMirror):
+* `fill { selector: "input#email", text: "user@example.com" }` — clear the field and write the text; the written value is read back and verified, so success means the field really holds it. The default choice, including multiline/large text.
+* `type { selector: "#search", text: "hello", key_events: true }` — type character-by-character WITHOUT clearing (appends to existing content). `key_events: true` sends real per-character keyDown/keyUp for autocomplete/combobox fields. Embedded newlines press Enter (which may submit a form) — use `fill` for multiline text. A ⚠ warning in the output means the page rewrote or filtered the typed text.
+* `press { key: "Enter", selector: "textarea[name=q]" }` — press a key at the focused element; `selector` focuses the element first (use it when focus may have moved). Press Enter after filling to submit forms. A ⚠ warning means the page cannot react to the key — click the target instead.
 
 ### 4. Extract content: `get_text`, `get_innertext`, `eval`, or `snapshot`
 * `get_text { selector: "body" }` — uses DOM `textContent`, so returns ALL descendant text including content inside `<script>` and `<style>` elements. For visible text only (no script/style), use `get_innertext` or `eval` with `document.querySelector('body').innerText`.

@@ -6,6 +6,18 @@
 
 use crate::chrome::escape_js_single_quoted;
 
+/// The inline-text argv element for a `fill`/`type` value: a leading-dash
+/// text is shielded with the standard `--` end-of-options marker, which
+/// chrome-use's arg preprocessor drops and forwards the value verbatim
+/// (otherwise a global/known flag of the same name could swallow it).
+pub(crate) fn text_value_argv(text: &str) -> Vec<String> {
+    if text.starts_with('-') {
+        vec!["--".to_string(), text.to_string()]
+    } else {
+        vec![text.to_string()]
+    }
+}
+
 /// What a `wait` waits for. The numeric sleep form (`wait 5000`) has no
 /// variant — [`wait_target`] rejects it before one can be built.
 #[derive(Debug, Clone, PartialEq, Eq)]

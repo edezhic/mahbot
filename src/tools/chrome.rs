@@ -52,8 +52,25 @@ enum ChromeAction {
     /// Get current URL.
     GetUrl {},
     /// Press a keyboard key at the current focus (e.g. "Enter", "Tab", "Escape").
-    /// Useful for submitting forms after filling inputs.
-    Press { key: String },
+    /// Useful for submitting forms after filling inputs. `selector` focuses the
+    /// element before pressing, use when focus may have moved.
+    Press {
+        key: String,
+        #[serde(default)]
+        selector: Option<String>,
+    },
+    /// Clear an input/textarea/contenteditable and fill it with text — the
+    /// written value is read back and verified, so success means the field
+    /// really holds it. Works on rich editors and framework inputs natively.
+    Fill { selector: String, text: String },
+    /// Type text character-by-character, appending without clearing.
+    /// Embedded newlines press Enter — use fill for multiline text.
+    Type {
+        selector: String,
+        text: String,
+        #[serde(default)]
+        key_events: bool,
+    },
     /// Run JavaScript in the page context. Returns the result as a string.
     /// Useful for inspecting element attributes, checking state, or debugging.
     Eval { js: String },
@@ -389,6 +406,7 @@ impl ChromeTool {
             // A timed-out/cancelled call must not leave the chrome-use child
             // running its retry loop in the background.
             cancel_kills: true,
+            input: None,
         })
         .await;
         let output = match run {
@@ -529,7 +547,32 @@ impl ChromeTool {
                 anyhow::bail!("GetInnerText is handled in execute(), not build_args")
             }
             ChromeAction::GetUrl { .. } => Ok(vec!["get".into(), "url".into()]),
-            ChromeAction::Press { key } => Ok(vec!["press".into(), key.clone()]),
+            ChromeAction::Press { key, selector } => {
+                let mut args = vec!["press".into(), key.clone()];
+                if let Some(sel) = selector {
+                    args.extend(["--selector".into(), sel.clone()]);
+                }
+                Ok(args)
+            }
+            ChromeAction::Fill { selector, text } => {
+                let mut args = vec!["fill".into(), selector.clone()];
+                args.extend(crate::chrome::forms::text_value_argv(text));
+                Ok(args)
+            }
+            ChromeAction::Type {
+                selector,
+                text,
+                key_events,
+            } => {
+                let mut args = vec!["type".into(), selector.clone()];
+                if *key_events {
+                    // Action flags BEFORE the `--` shield (everything after
+                    // it is a verbatim value).
+                    args.push("--key-events".into());
+                }
+                args.extend(crate::chrome::forms::text_value_argv(text));
+                Ok(args)
+            }
             ChromeAction::Eval { js } => Ok(vec!["eval".into(), js.clone()]),
             ChromeAction::Find {
                 by,
@@ -758,6 +801,7 @@ async fn close_all_chrome_sessions_inner() {
         capture_stderr: true,
         timeout: CliTimeout::Unbounded,
         cancel_kills: true,
+        input: None,
     })
     .await
     {
@@ -814,6 +858,7 @@ async fn close_all_chrome_sessions_inner() {
                     capture_stderr: false,
                     cancel_kills: true,
                     timeout: CliTimeout::Unbounded,
+                    input: None,
                 })
                 .await
                 {
@@ -1189,6 +1234,18 @@ impl ChromeTool {
         snapshot: &str,
         notes: &[String],
     ) -> String {
+        use std::fmt::Write as _;
+        // chrome-use's degraded-success `warning` only applies to the
+        // text-input actions (`type` read-back mismatch, `press` with no key
+        // listeners / provably nowhere) — don't scan the shared path for them.
+        let warning = if matches!(
+            action,
+            ChromeAction::Fill { .. } | ChromeAction::Type { .. } | ChromeAction::Press { .. }
+        ) {
+            crate::chrome::contract::chrome_use_warning(&response)
+        } else {
+            None
+        };
         let output = match response.data {
             Some(data) => match action {
                 ChromeAction::Snapshot { .. } | ChromeAction::GetText { .. } => {
@@ -1204,7 +1261,6 @@ impl ChromeTool {
                     if snapshot.trim().is_empty() {
                         s.push_str("\n\n(no page content captured)");
                     } else {
-                        use std::fmt::Write;
                         let _ = write!(s, "\n\n--- Page content ---\n{snapshot}");
                     }
                     s
@@ -1237,11 +1293,23 @@ impl ChromeTool {
             None => String::new(),
         };
 
-        let output = if output.is_empty() {
+        let mut output = if output.is_empty() {
             format!("[Tab: {tab}] (no output)")
         } else {
             format!("[Tab: {tab}] {output}")
         };
+
+        if let Some(warning) = warning {
+            // The warning is normally a plain string — render it unquoted,
+            // not as its JSON serialization.
+            let text = warning
+                .as_str()
+                .map_or_else(|| warning.to_string(), str::to_string);
+            let _ = write!(
+                output,
+                "\n\n⚠ chrome-use warning: {text} — treat the action as NOT applied and choose another approach"
+            );
+        }
 
         super::with_normalization_notes(output, notes)
     }
@@ -1511,6 +1579,8 @@ const KNOWN_ACTIONS: &[&str] = &[
     "innertext",
     "get_url",
     "press",
+    "fill",
+    "type",
     "eval",
     "find",
     "screenshot",
@@ -1525,7 +1595,10 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"open\":{\"url\":\"https://...\"}
     {\"snapshot\":{\"interactive_only\":bool,\"compact\":bool,\"depth\":int}}, \
     {\"click\":{\"selector\":\"...\"}}, {\"get_text\":{\"selector\":\"...\"}}, \
     {\"get_innertext\":{\"selector\":\"...\"}}, {\"get_url\":{}}, \
-    {\"press\":{\"key\":\"...\"}}, {\"eval\":{\"js\":\"...\"}}, \
+    {\"press\":{\"key\":\"...\",\"selector\":\"...\"}}, \
+    {\"fill\":{\"selector\":\"...\",\"text\":\"...\"}}, \
+    {\"type\":{\"selector\":\"...\",\"text\":\"...\",\"key_events\":bool}}, \
+    {\"eval\":{\"js\":\"...\"}}, \
     {\"find\":{\"by\":\"text|role|label|placeholder|alt|title|testid|first|last|nth\",\
     \"value\":\"...\",\"action\":\"click|fill|hover|check|text\"}}, \
     {\"screenshot\":{}}, {\"wait\":{\"selector\":\"...\"}}, \
@@ -1873,6 +1946,58 @@ mod tests {
                 action: ChromeAction::GetUrl {},
                 expected: &["get", "url"],
             },
+            Case {
+                name: "fill",
+                action: ChromeAction::Fill {
+                    selector: "#e".into(),
+                    text: "hi".into(),
+                },
+                expected: &["fill", "#e", "hi"],
+            },
+            Case {
+                name: "fill leading-dash text",
+                action: ChromeAction::Fill {
+                    selector: "#e".into(),
+                    text: "--foo".into(),
+                },
+                expected: &["fill", "#e", "--", "--foo"],
+            },
+            Case {
+                name: "type",
+                action: ChromeAction::Type {
+                    selector: "#e".into(),
+                    text: "hi".into(),
+                    key_events: true,
+                },
+                expected: &["type", "#e", "--key-events", "hi"],
+            },
+            Case {
+                name: "type leading-dash text",
+                action: ChromeAction::Type {
+                    selector: "#e".into(),
+                    text: "--foo".into(),
+                    key_events: true,
+                },
+                // The shield goes last: everything after `--` is a verbatim
+                // value, so --key-events must precede it.
+                expected: &["type", "#e", "--key-events", "--", "--foo"],
+            },
+            Case {
+                name: "press no selector",
+                action: ChromeAction::Press {
+                    key: "Enter".into(),
+                    selector: None,
+                },
+                expected: &["press", "Enter"],
+            },
+            Case {
+                name: "press with selector",
+                action: ChromeAction::Press {
+                    key: "Enter".into(),
+                    selector: Some("#t".into()),
+                },
+                expected: &["press", "Enter", "--selector", "#t"],
+            },
         ];
 
         for case in &cases {
@@ -2167,11 +2292,11 @@ mod tests {
             .as_array()
             .expect("oneOf should be an array");
 
-        // There are exactly 13 chrome actions.
+        // There are exactly 15 chrome actions.
         assert_eq!(
             action_schemas.len(),
-            13,
-            "expected 13 actions, got {}",
+            15,
+            "expected 15 actions, got {}",
             action_schemas.len()
         );
 
@@ -2193,6 +2318,8 @@ mod tests {
             "get_innertext",
             "get_url",
             "press",
+            "fill",
+            "type",
             "eval",
             "find",
             "screenshot",
@@ -2564,7 +2691,9 @@ mod tests {
                 "get_inner_text" | "get_innertext" | "innertext" => {
                     json!({"selector": "body"})
                 }
-                "press" => json!({"key": "Enter"}),
+                "press" => json!({"key": "Enter", "selector": "#t"}),
+                "fill" => json!({"selector": "#e", "text": "hi"}),
+                "type" => json!({"selector": "#e", "text": "hi", "key_events": true}),
                 "eval" => json!({"js": "1 + 1"}),
                 "find" => json!({"by": "text", "value": "x", "action": "click"}),
                 "wait" => json!({"selector": "#x"}),
@@ -2592,6 +2721,8 @@ mod tests {
             "get_inner_text",
             "get_url",
             "press",
+            "fill",
+            "type",
             "eval",
             "find",
             "screenshot",
@@ -2615,6 +2746,7 @@ mod tests {
         );
     }
 
+    #[expect(clippy::too_many_lines)] // the per-argv wait/expect shapes are one cohesive table
     #[test]
     fn build_args_for_wait_and_expect() {
         fn argv(args: &[String]) -> Vec<&str> {
@@ -3014,6 +3146,72 @@ mod tests {
             &[],
         );
         assert!(out.contains('{'), "should fall back to pretty-print: {out}");
+    }
+
+    #[test]
+    fn format_action_output_appends_warning_for_type_read_back_mismatch() {
+        // chrome-use's `type` warning on a read-back mismatch — exit 0, so the
+        // tool must flag it.
+        let response = ChromeResponse {
+            data: Some(json!({
+                "typed": "hi", "readBack": "h",
+                "warning": "the field does not contain what was typed",
+            })),
+            ..ChromeResponse::default()
+        };
+        let out = ChromeTool::format_action_output(
+            &ChromeAction::Type {
+                selector: "#e".into(),
+                text: "hi".into(),
+                key_events: false,
+            },
+            "default",
+            response,
+            "",
+            &[],
+        );
+        assert!(
+            out.contains("chrome-use warning"),
+            "output should surface the warning: {out}"
+        );
+        // The warning is rendered unquoted, not as its JSON serialization.
+        assert!(
+            out.contains("warning: the field does not contain what was typed —"),
+            "warning text should be rendered unquoted: {out}"
+        );
+        assert!(
+            out.contains("the field does not contain what was typed"),
+            "output should carry the warning text: {out}"
+        );
+        assert!(
+            out.contains("NOT applied"),
+            "output should tell the agent to treat the action as not applied: {out}"
+        );
+    }
+
+    /// `readBack` without a `warning` is chrome-use's normal success shape —
+    /// no note may be appended.
+    #[test]
+    fn format_action_output_clean_response_has_no_warning() {
+        let response = ChromeResponse {
+            data: Some(json!({"typed": "hi", "readBack": "hi"})),
+            ..ChromeResponse::default()
+        };
+        let out = ChromeTool::format_action_output(
+            &ChromeAction::Type {
+                selector: "#e".into(),
+                text: "hi".into(),
+                key_events: false,
+            },
+            "default",
+            response,
+            "",
+            &[],
+        );
+        assert!(
+            !out.contains("chrome-use warning"),
+            "clean output must not carry a warning: {out}"
+        );
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 /// There is no schema-version marker in chrome-use, and the envelope even
 /// varies within one binary (`session list` answers `ok:true`, everything
 /// else `success:true`), so tolerance is structural: every field is
-/// [`Option`], unknown keys are ignored.
+/// [`Option`], unknown keys are captured in [`extra`](Self::extra).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct ChromeResponse {
     /// Classic `success` envelope key — absent on newer `ok`-keyed envelopes.
@@ -36,6 +36,11 @@ pub(crate) struct ChromeResponse {
     /// agent as a retry hint.
     #[serde(default)]
     pub(crate) retryable: Option<bool>,
+    /// Any other top-level envelope keys, captured so chrome-use's degraded-
+    /// success `warning` field is visible wherever it puts it
+    /// ([`chrome_use_warning`]).
+    #[serde(flatten)]
+    pub(crate) extra: serde_json::Map<String, Value>,
 }
 
 impl ChromeResponse {
@@ -57,13 +62,33 @@ impl ChromeResponse {
         Some(self.is_success())
     }
 
-    /// The single `Value`-path parse entry: unknown keys are dropped and any
-    /// non-object / unparseable payload yields a default response (all fields
-    /// [`None`]).
+    /// The single `Value`-path parse entry: unknown keys are captured in
+    /// `extra` and any non-object / unparseable payload yields a default
+    /// response (all fields [`None`]).
     #[must_use]
     pub(crate) fn from_value(v: &Value) -> Self {
         serde_json::from_value(v.clone()).unwrap_or_default()
     }
+}
+
+/// chrome-use's `warning` field — the degraded-success signal for `type`
+/// (the page rewrote or filtered the typed text) and `press` (the key reached
+/// an element with no key listeners, or provably went nowhere). It rides
+/// inside `data` (the command's own warning) or at the envelope top level
+/// (the flattened `extra` map — chrome-use's `Response` struct carries a
+/// top-level `warning` for browser-replacement and settle notes, which also
+/// mean the typed input may not be where we think). chrome-use emits it ONLY
+/// on a degraded exit-0 success — never on a clean one — so its presence
+/// means "the action may not have taken effect".
+pub(crate) fn chrome_use_warning(resp: &ChromeResponse) -> Option<Value> {
+    let sources: [Option<&serde_json::Map<String, Value>>; 2] = [
+        Some(&resp.extra),
+        resp.data.as_ref().and_then(Value::as_object),
+    ];
+    sources
+        .into_iter()
+        .flatten()
+        .find_map(|map| map.get("warning").cloned())
 }
 
 /// Core envelope-success predicate with failure precedence: an explicit
