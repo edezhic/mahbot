@@ -35,12 +35,13 @@ pub(crate) const CLI_SESSION_PREFIX: &str = "mahbot-chrome-";
 /// hint) surfaces at the declared deadline, and mahbot kills only when the
 /// deadline is actually exceeded. Also the wall-clock margin the CLI `open`
 /// path may spend past the declared deadline (reserved for the chrome-error
-/// probe).
+/// probe, which is capped at this slack — open's post-navigation settle draws
+/// from the declared budget instead).
 pub(crate) const DEADLINE_SLACK: Duration = Duration::from_secs(2);
 
 /// Default `open` timeout (20 s) shared by both frontends: open is a
-/// whole-operation budget (nav + probe + expect wait + capture), so it
-/// defaults above the per-step 8 s.
+/// whole-operation budget (nav + probe + settle / expect wait + capture), so
+/// it defaults above the per-step 8 s.
 pub(crate) const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Prefix of per-invocation ephemeral CLI sessions — the ONLY CLI prefix the

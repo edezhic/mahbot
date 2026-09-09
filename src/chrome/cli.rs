@@ -10,8 +10,9 @@
 //! human-readable diagnostics. Exit codes follow the contract: 0 success,
 //! 1 site/data step failure (schedulable), 2 environment failure (fix the
 //! environment, don't blind-retry), 3 usage error. Every step timeout is
-//! enforced MAHBOT-side via [`CliTimeout::Bounded`]; `networkidle` is never a
-//! default here.
+//! enforced MAHBOT-side via [`CliTimeout::Bounded`]. The wait action never
+//! exposes `--load`; its one raw-argv use is `open`'s internal best-effort
+//! post-navigation settle.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -1475,11 +1476,35 @@ fn deadline_error(timeout: Duration, what: &str) -> String {
     format!("deadline reached after {}ms — {what}", timeout.as_millis())
 }
 
+/// Post-navigation settle cap for `open`'s plain path: a best-effort
+/// `wait --load networkidle` (what the interactive tool does after its open)
+/// so the first step after `open` on heavy SPAs is not racing a still-settling
+/// page under daemon contention.
+const SETTLE_CAP: Duration = Duration::from_secs(10);
+
+/// Budget reserved for content capture so the settle can never consume the
+/// whole remaining operation budget and silently drop the open's snapshot.
+const CAPTURE_RESERVE: Duration = Duration::from_millis(2500);
+
+/// Below this a settle spawn is not worth its startup cost — skipped.
+const MIN_SETTLE_BUDGET: Duration = Duration::from_secs(1);
+
+/// Settle budget for `open`'s plain path: capped at [`SETTLE_CAP`], must leave
+/// [`CAPTURE_RESERVE`] for content capture, skipped (None) when the remainder
+/// is too small for both. Pure so tests pin the policy.
+fn settle_budget(remaining: Duration) -> Option<Duration> {
+    let budget = remaining.saturating_sub(CAPTURE_RESERVE).min(SETTLE_CAP);
+    (budget >= MIN_SETTLE_BUDGET).then_some(budget)
+}
+
 /// `open` — navigate to `url`, optionally wait for `--expect` (redesign-aware
 /// via `--structural`), report the committed final URL and best-effort attach
-/// the page content (compact accessibility snapshot). `timeout` bounds the
-/// whole operation (navigation + error-page probe + `--expect` wait + content
-/// capture); total wall time stays within `timeout + DEADLINE_SLACK`.
+/// the page content (compact accessibility snapshot). On the plain path (no
+/// `--expect`, which already serves as the settle) the navigation is followed
+/// by a best-effort network settle, capped at [`SETTLE_CAP`]. `timeout` bounds
+/// the whole operation (navigation + error-page probe + settle / `--expect`
+/// wait + content capture); total wall time stays within `timeout +
+/// DEADLINE_SLACK`.
 #[expect(clippy::too_many_lines)]
 async fn open(
     url: &str,
@@ -1643,9 +1668,28 @@ async fn open(
             Err(f) => f.envelope("open", payload, timeout),
         };
     }
+    // Best-effort settle: heavy SPAs keep the network busy right after the
+    // navigation commits, so the first following step can otherwise hit its
+    // 8s default under contention. Raw argv — the `wait` action deliberately
+    // does not expose `--load`. chrome-use ignores `--timeout` for this form
+    // (its chrome-side deadline is the seeded 15s AGENT_BROWSER_DEFAULT_TIMEOUT,
+    // 25s only as chrome-use's own fallback), so the real cap is the
+    // mahbot-side bound below. The result is discarded — a settle timeout
+    // never downgrades a committed navigation.
+    if let Some(budget) = settle_budget(total.saturating_sub(started.elapsed())) {
+        let _ = spawn_step(
+            &path,
+            &["wait", "--load", "networkidle"],
+            Some(session),
+            budget,
+            None,
+            None,
+        )
+        .await;
+    }
     // Content capture is best-effort and bounded: it runs on the budget the
-    // navigation (+ error probe) left over, and a failure, exhaustion, or
-    // content-free page simply omits `content` — a successful navigation is
+    // navigation (+ error probe + settle) left over, and a failure, exhaustion,
+    // or content-free page simply omits `content` — a successful navigation is
     // never downgraded.
     let mut payload = json!({ "url": final_url });
     let budget = total.saturating_sub(started.elapsed());
@@ -2367,6 +2411,24 @@ mod tests {
         let (name, ephemeral) = resolve_session(None);
         assert!(name.starts_with(CLI_EPHEMERAL_PREFIX));
         assert!(ephemeral);
+    }
+
+    #[test]
+    fn settle_budget_caps_and_reserves_capture() {
+        // Plenty of room: capped at SETTLE_CAP.
+        assert_eq!(settle_budget(Duration::from_secs(22)), Some(SETTLE_CAP));
+        // Tight page: the capture reserve is honored first.
+        assert_eq!(
+            settle_budget(Duration::from_secs(4)),
+            Some(Duration::from_millis(1500))
+        );
+        // Exactly at the skip threshold still runs; a hair under is skipped.
+        assert_eq!(
+            settle_budget(Duration::from_millis(3500)),
+            Some(MIN_SETTLE_BUDGET)
+        );
+        assert_eq!(settle_budget(Duration::from_millis(3499)), None);
+        assert_eq!(settle_budget(Duration::ZERO), None);
     }
 
     #[test]

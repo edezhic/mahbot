@@ -438,8 +438,10 @@ impl ChromeTool {
     const EXPECT_DEADLINE: Duration = Duration::from_secs(20);
 
     /// Mahbot-side per-call kill bounds. chrome-use's own `--timeout` is
-    /// ignored by `wait --load networkidle` (always its internal 25s default)
-    /// and a wedged daemon hangs the CLI in its ~152s retry loop, so the tool
+    /// ignored by `wait --load networkidle` (which instead uses the seeded
+    /// AGENT_BROWSER_DEFAULT_TIMEOUT — 15s; 25s is chrome-use's fallback — so
+    /// the mahbot-side bound below always dominates) and a wedged daemon hangs
+    /// the CLI in its ~152s retry loop, so the tool
     /// bounds every dispatch itself: open = [`crate::chrome::DEFAULT_OPEN_TIMEOUT`]
     /// plus slack (whole-operation budget), wait/expect = their declared
     /// deadlines plus slack (condition waits), everything else=8s (the
