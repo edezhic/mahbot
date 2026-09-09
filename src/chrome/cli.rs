@@ -2051,8 +2051,9 @@ async fn r#type(
     }
 }
 
-/// `press` — press a key at the focused element, optionally focusing a
-/// `--selector` first and holding `--hold` ms before release.
+/// `press` — press a key at the focused element, optionally trying to focus a
+/// `--selector` first (a no-op for non-focusable elements) and holding `--hold`
+/// ms before release.
 async fn press(
     key: &str,
     selector: Option<&str>,

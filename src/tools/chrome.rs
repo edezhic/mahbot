@@ -57,8 +57,10 @@ enum ChromeAction {
     /// Get current URL.
     GetUrl {},
     /// Press a keyboard key at the current focus (e.g. "Enter", "Tab", "Escape").
-    /// Useful for submitting forms after filling inputs. `selector` focuses the
-    /// element before pressing, use when focus may have moved.
+    /// Useful for submitting forms after filling inputs. `selector` tries to
+    /// focus the element before pressing, but focus moves only if it is
+    /// focusable (input, textarea, button, ...); for a non-focusable selector
+    /// (e.g. `body`) the key lands wherever focus currently is.
     Press {
         key: String,
         #[serde(default)]

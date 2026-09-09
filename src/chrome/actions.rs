@@ -447,14 +447,17 @@ fn build_actions() -> Vec<ActionDesc> {
                     },
                     "selector": {
                         "type": "string",
-                        "description": "Focus this element (CSS selector or ref @e1) before pressing — use when focus may not be where you left it"
+                        "description": "Try to focus this element (CSS selector or ref @e1) before pressing. Focus moves only if it is focusable (input, textarea, select, button, ...); a non-focusable selector (e.g. body) is a silent no-op and the key lands wherever focus currently is"
                     }
                 }),
             }),
             cli: Some(CliHelp {
                 syntax: "<key> [--selector <sel>] [--hold <ms>] [--timeout <secs>]",
                 flags: &[
-                    ("--selector <sel>", "focus this element before pressing"),
+                    (
+                        "--selector <sel>",
+                        "try to focus this element before pressing (no-op if not focusable)",
+                    ),
                     (
                         "--hold <ms>",
                         "hold the key down for this long before releasing",
@@ -471,7 +474,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "Sends the key to the focused element; --selector focuses a target first (which makes kind not-found reachable). For JS-dependent keys chrome-use probes for key listeners; with none found, chrome-use's warning makes the action kind error (rc 1) — never a silent success.",
+                details: "Sends the key to the focused element. --selector tries to focus its target first (making kind not-found reachable), but focus moves only if the element is focusable (input, textarea, select, button, ...) — for a non-focusable selector (e.g. body) focus does not move and the key lands wherever focus currently is. data.target reports the element where the key actually landed (may differ from --selector, may be absent). For listener-dependent keys (Enter on a bare input, Escape, arrows/PageUp/PageDown in text fields) chrome-use probes for key listeners; with none found, chrome-use's warning makes the action kind error (rc 1) — never a silent success. Keys with browser defaults (e.g. Enter on a button) and command chords are never probed, so they can succeed even if the page ignores them; separately, an Enter that lands where nothing is focused (or on an iframe) also warns and makes the action kind error (rc 1).",
                 examples: &[
                     "mahbot chrome press Enter --selector \"textarea[name=q]\"",
                     "mahbot chrome press Escape",
