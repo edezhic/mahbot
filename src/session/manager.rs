@@ -15,11 +15,13 @@
 //!    (everything already durable) and is surfaced to the caller to log
 
 use std::fmt::Write;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use futures_util::future::join_all;
+use ignore::WalkBuilder;
 
 use crate::pipeline::board::BOARD;
 use crate::prompt::{build_workspace_context, format_ticket_block, load_prompt, substitute};
@@ -561,6 +563,7 @@ impl Session {
     /// workspace boilerplate  — from src/prompt/context/workspace.md, substituted (always)
     /// skills                 — if any skills exist in the workspace
     /// alarms                 — Assistant only, when the user has active alarms
+    /// personal_files         — Assistant only, when the personal workspace has files
     /// workspaces             — full-access Assistant only, when workspaces are registered
     /// board_context          — Manager role only, when active tickets exist
     /// ticket_block           — when a ticket is assigned to this session
@@ -664,12 +667,19 @@ impl Session {
         if !skills.is_empty() {
             msgs.push(ChatMessage::system(skills::skills_to_prompt(&skills, ws)));
         }
-        // Assistant sessions carry the user's alarm snapshot and, for a
-        // full-access Assistant, the registered workspace list — the same
-        // snapshot-at-session-start contract as the board block below.
+        // Assistant sessions carry the user's alarm snapshot, the personal
+        // workspace file listing and, for a full-access Assistant, the
+        // registered workspace list — the same snapshot-at-session-start
+        // contract as the board block below.
         if matches!(role, Role::Assistant) {
-            let (alarms, workspaces) = fetch_assistant_context(user_name, full_access).await;
-            for block in assistant_context_blocks(full_access, &alarms, &workspaces) {
+            let (alarms, workspaces, personal_files) =
+                fetch_assistant_context(user_name, full_access).await;
+            for block in assistant_context_blocks(
+                full_access,
+                &alarms,
+                &workspaces,
+                personal_files.as_deref(),
+            ) {
                 msgs.push(ChatMessage::system(&block));
             }
         }
@@ -685,8 +695,8 @@ impl Session {
     /// Build fresh system prompt + ticket context + user message for the
     /// current turn.
     /// Returns messages: [role_description, onboarding_guide?, active_models_opts?,
-    /// workspace_boilerplate, skills?, alarms?, workspaces?, board_context?,
-    /// ticket_block?, user_msg]
+    /// workspace_boilerplate, skills?, alarms?, personal_files?, workspaces?,
+    /// board_context?, ticket_block?, user_msg]
     /// plus the rendered active-models snapshot (Assistant only; `Default` when
     /// no block injected).
     ///
@@ -869,21 +879,21 @@ async fn build_board_context(ws: &Workspace, role: &Role) -> Option<String> {
     Some(output)
 }
 
-// ── Assistant context blocks (alarms + workspaces) ──────────────────────
+// ── Assistant context blocks (alarms + personal files + workspaces) ─────
 
 /// Upper char bound for a workspace's collapsed discovery-summary line.
-const MAX_WORKSPACE_SUMMARY_CHARS: usize = 200;
+const MAX_WORKSPACE_SUMMARY_CHARS: usize = 1000;
 
 /// Fetch the data for the Assistant's context blocks. Fail-open per store:
 /// an uninitialized store (`ALARMS.get()` / `WORKSPACES.get()` returning
 /// `None`) or a read error yields empty data, so the corresponding block is
-/// omitted — same contract as `build_board_context`. The alarm fetch and the
-/// workspace fetch run concurrently, and the per-workspace general-context
-/// reads are batched via `join_all`.
+/// omitted — same contract as `build_board_context`. The alarm fetch, the
+/// workspace fetch and the personal-files walk run concurrently, and the
+/// per-workspace general-context reads are batched via `join_all`.
 async fn fetch_assistant_context(
     user_name: &str,
     full_access: bool,
-) -> (Vec<Alarm>, Vec<(Workspace, Option<String>)>) {
+) -> (Vec<Alarm>, Vec<(Workspace, Option<String>)>, Option<String>) {
     let alarms = async {
         if crate::alarms::ALARMS.get().is_none() {
             return Vec::new();
@@ -919,23 +929,32 @@ async fn fetch_assistant_context(
         .collect::<Vec<_>>();
         registered.into_iter().zip(summaries).collect()
     };
-    tokio::join!(alarms, workspaces)
+    tokio::join!(alarms, workspaces, fetch_personal_files(user_name))
 }
 
 /// Compose the Assistant-only system-prompt blocks from pre-fetched data.
 /// Pure and fail-open: each block is omitted entirely when its content is
-/// empty, and the workspace list appears only for a full-access Assistant.
+/// empty, the personal-files listing is supplied pre-rendered (`None` when
+/// the workspace is empty or unlistable), and the workspace list appears only
+/// for a full-access Assistant. Order: alarms → personal files → workspaces.
 /// The caller gates on `role == Assistant` (before fetching).
 fn assistant_context_blocks(
     full_access: bool,
     alarms: &[Alarm],
     workspaces: &[(Workspace, Option<String>)],
+    personal_files: Option<&str>,
 ) -> Vec<String> {
     let mut blocks = Vec::new();
     if let Some(lines) = render_alarm_lines(alarms) {
         blocks.push(substitute(
             &load_prompt("context/alarms.md"),
             &[("{{alarms}}", &lines)],
+        ));
+    }
+    if let Some(lines) = personal_files {
+        blocks.push(substitute(
+            &load_prompt("context/personal_files.md"),
+            &[("{{files}}", lines)],
         ));
     }
     if full_access && let Some(lines) = render_workspace_lines(workspaces) {
@@ -993,6 +1012,92 @@ fn render_workspace_lines(workspaces: &[(Workspace, Option<String>)]) -> Option<
         }
     }
     (!out.is_empty()).then(|| out.trim_end().to_string())
+}
+
+/// Hard entry cap for the `<personal-files>` listing — the walk stops once
+/// exceeded (an exact "N more" count would require an unbounded walk).
+const MAX_PERSONAL_FILE_ENTRIES: usize = 200;
+
+/// Secondary stop condition on the rendered `<personal-files>` size, in bytes.
+const MAX_PERSONAL_FILES_BYTES: usize = 6 * 1024;
+
+/// List the user's personal-workspace files for the `<personal-files>` block.
+/// The path is the canonical `userspaces/<user>` resolution — the same
+/// directory the Assistant session is pinned to — so a blank or synthetic
+/// user name omits the block entirely instead of listing the userspaces root
+/// or other users' files. `None` also when the workspace has no listable
+/// files or the walk fails (fail-open, like the other blocks). The walk runs
+/// on the blocking pool so a large workspace never stalls the executor.
+async fn fetch_personal_files(user_name: &str) -> Option<String> {
+    let valid = !user_name.trim().is_empty()
+        && !user_name.contains(['/', '\\'])
+        && !matches!(user_name, "." | "..");
+    if !valid {
+        return None;
+    }
+    let root = crate::users::personal_workspace_path(user_name);
+    let listed = tokio::task::spawn_blocking(move || walk_personal_files(&root))
+        .await
+        .ok()?;
+    render_personal_file_lines(listed)
+}
+
+/// Walk the personal workspace and collect up to `MAX_PERSONAL_FILE_ENTRIES + 1`
+/// relative file paths (directories are implied by the paths and skipped).
+/// Ripgrep defaults apply: hidden entries (`.git/`, `.DS_Store`, all dotfiles)
+/// are skipped, and `generated/` / `uploads/` directories are pruned at the
+/// entry level so large media trees are never traversed. Symlinks are not
+/// followed.
+fn walk_personal_files(root: &Path) -> Vec<String> {
+    let cap = MAX_PERSONAL_FILE_ENTRIES + 1;
+    let mut out = Vec::new();
+    for entry in WalkBuilder::new(root)
+        .filter_entry(|e| {
+            e.depth() == 0
+                || !e.file_type().is_some_and(|t| t.is_dir())
+                || !matches!(e.file_name().to_str(), Some("generated" | "uploads"))
+        })
+        .build()
+        .flatten()
+    {
+        if entry.depth() == 0 || entry.file_type().is_some_and(|t| t.is_dir()) {
+            continue; // the workspace root itself, and directories (implied)
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        out.push(rel.display().to_string());
+        if out.len() >= cap {
+            break;
+        }
+    }
+    out
+}
+
+/// Render the byte-sorted relative paths for the `<personal-files>` block —
+/// directories are implied by the paths. Stops at the entry cap or the byte
+/// budget and appends a truncation tail; `None` when nothing remains.
+fn render_personal_file_lines(mut paths: Vec<String>) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    paths.sort();
+    let mut out = String::new();
+    let mut shown = 0;
+    for path in &paths {
+        if shown == MAX_PERSONAL_FILE_ENTRIES
+            || out.len() + path.len() + 1 > MAX_PERSONAL_FILES_BYTES
+        {
+            break;
+        }
+        out.push_str(path);
+        out.push('\n');
+        shown += 1;
+    }
+    if shown < paths.len() {
+        out.push_str("…listing truncated; use the read tool for the full picture");
+    }
+    Some(out.trim_end().to_string())
 }
 
 /// Try to find a stored workspace context for the given workspace and role.
@@ -1558,9 +1663,10 @@ mod tests {
     }
 
     /// Pure gating of the Assistant context blocks: a plain Assistant gets
-    /// only the alarms block (the workspace list is full-access only); a
-    /// full-access Assistant gets both blocks in alarms-then-workspaces
-    /// order; empty data omits both. (Role gating lives at the call site.)
+    /// the alarms and personal-files blocks (the workspace list is
+    /// full-access only); a full-access Assistant gets all three in
+    /// alarms → personal files → workspaces order; empty data omits all.
+    /// (Role gating lives at the call site.)
     #[test]
     fn assistant_blocks_gating() {
         let alarm = Alarm {
@@ -1577,21 +1683,84 @@ mod tests {
             crate::workspace::test_ws_named("/tmp/proj", "proj"),
             Some("summary".to_string()),
         )];
+        let files = Some("MEMORY.md\nnotes/projects.md");
 
-        // Plain Assistant: alarms block only, no workspace list.
-        let blocks = assistant_context_blocks(false, std::slice::from_ref(&alarm), &workspaces);
-        assert_eq!(blocks.len(), 1);
-        assert!(blocks[0].contains("<user-alarms>"));
-        assert!(!blocks[0].contains("<registered-workspaces>"));
-
-        // Full-access Assistant: both blocks, alarms first.
-        let blocks = assistant_context_blocks(true, std::slice::from_ref(&alarm), &workspaces);
+        // Plain Assistant: alarms + personal files, no workspace list.
+        let blocks =
+            assistant_context_blocks(false, std::slice::from_ref(&alarm), &workspaces, files);
         assert_eq!(blocks.len(), 2);
         assert!(blocks[0].contains("<user-alarms>"));
-        assert!(blocks[1].contains("<registered-workspaces>"));
+        assert!(blocks[1].contains("<personal-files>"));
+        assert!(!blocks[1].contains("<registered-workspaces>"));
 
-        // Empty data omits both blocks.
-        assert!(assistant_context_blocks(true, &[], &[]).is_empty());
+        // Full-access Assistant: all three blocks, alarms → files → workspaces.
+        let blocks =
+            assistant_context_blocks(true, std::slice::from_ref(&alarm), &workspaces, files);
+        assert_eq!(blocks.len(), 3);
+        assert!(blocks[0].contains("<user-alarms>"));
+        assert!(blocks[1].contains("<personal-files>"));
+        assert!(blocks[2].contains("<registered-workspaces>"));
+
+        // Empty data omits all blocks.
+        assert!(assistant_context_blocks(true, &[], &[], None).is_empty());
+    }
+
+    /// Personal-files walk: hidden entries and `generated/` / `uploads/`
+    /// directories never appear, while regular nested files do. An absent
+    /// workspace yields an empty listing.
+    #[test]
+    fn personal_files_walk_prunes_excluded_dirs() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("MEMORY.md"), "m").expect("write");
+        std::fs::create_dir_all(root.path().join("notes")).expect("mkdir");
+        std::fs::write(root.path().join("notes/topic.md"), "t").expect("write");
+        std::fs::create_dir_all(root.path().join("generated")).expect("mkdir");
+        std::fs::write(root.path().join("generated/big.bin"), "b").expect("write");
+        std::fs::create_dir_all(root.path().join(".git")).expect("mkdir");
+        std::fs::write(root.path().join(".git/config"), "c").expect("write");
+
+        let listed = walk_personal_files(root.path());
+        assert!(listed.contains(&"MEMORY.md".to_string()));
+        assert!(listed.contains(&Path::new("notes").join("topic.md").display().to_string()));
+        assert!(!listed.iter().any(|p| p.contains("generated")));
+        assert!(!listed.iter().any(|p| p.contains(".git")));
+        // Directories are implied by the file paths, never listed themselves.
+        assert!(!listed.iter().any(|p| p == "notes"));
+
+        assert!(walk_personal_files(&root.path().join("absent")).is_empty());
+    }
+
+    /// Path-safety guard: blank or synthetic user names (path separators,
+    /// dot segments) never resolve to a workspace — the block is omitted
+    /// instead of listing the userspaces root or another user's files.
+    #[tokio::test]
+    async fn personal_files_fetch_rejects_synthetic_names() {
+        for name in ["", "  ", ".", "..", "a/b", "a\\b"] {
+            assert!(fetch_personal_files(name).await.is_none(), "name: {name}");
+        }
+    }
+
+    /// Personal-files rendering: byte-sorted output stopped by the entry cap
+    /// or the byte budget, both appending a truncation tail; an empty listing
+    /// renders as `None`.
+    #[test]
+    fn personal_files_render_caps_budgets_and_sorts() {
+        let paths: Vec<String> = (0..MAX_PERSONAL_FILE_ENTRIES + 50)
+            .map(|i| format!("f{i:03}.txt"))
+            .collect();
+        let rendered = render_personal_file_lines(paths).expect("render");
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), MAX_PERSONAL_FILE_ENTRIES + 1); // entries + tail
+        assert!(lines[0] < lines[1]);
+        assert!(rendered.ends_with("use the read tool for the full picture"));
+
+        // Byte budget stops the listing before the entry cap is reached.
+        let long = "x".repeat(MAX_PERSONAL_FILES_BYTES / 2);
+        let rendered =
+            render_personal_file_lines(vec![long.clone(), long.clone(), long]).expect("render");
+        assert_eq!(rendered.lines().count(), 2); // one entry + tail
+
+        assert!(render_personal_file_lines(Vec::new()).is_none());
     }
 
     /// Alarm line rendering: a periodic interval is annotated, the command is
