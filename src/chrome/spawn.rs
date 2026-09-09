@@ -28,8 +28,9 @@ pub(crate) enum CliTimeout {
 /// Everything one chrome-use CLI invocation needs. The binary path is
 /// resolved by the caller so call-site-specific missing-CLI handling (and,
 /// for the tool, session tracking after the path resolves) stays at the call
-/// site. Argument ORDER is the caller's business: the helper only appends
-/// `--json` and `--session <s>` after the caller's args.
+/// site. Argument ORDER is the caller's business: the helper folds
+/// `--json` / `--session <s>` in last, or before a caller `--` marker (see
+/// [`build_argv`]).
 pub(crate) struct CliSpawn<'a> {
     pub(crate) path: &'a Path,
     pub(crate) args: &'a [&'a str],
@@ -112,24 +113,45 @@ pub(crate) fn apply_chrome_deadline(cmd: &mut Command, deadline: Option<Duration
     }
 }
 
+/// Caller args with the global `--json` / `--session <s>` flags folded in.
+/// The flags go before a `--` end-of-options marker when the caller args
+/// contain one (a fill/type leading-dash text shield): chrome-use's arg
+/// preprocessor drops everything after `--`, so appended flags would be
+/// swallowed into the text value (verified against chrome-use 1.5.111).
+/// Without a `--` the flags go last.
+fn build_argv(args: &[&str], json: bool, session: Option<&str>) -> Vec<String> {
+    let mut global: Vec<String> = Vec::new();
+    if json {
+        global.push("--json".to_string());
+    }
+    if let Some(s) = session {
+        global.extend(["--session".to_string(), s.to_string()]);
+    }
+    if global.is_empty() {
+        return args.iter().map(|a| (*a).to_string()).collect();
+    }
+    let insert_at = args.iter().position(|a| *a == "--").unwrap_or(args.len());
+    let mut folded: Vec<String> = args[..insert_at].iter().map(|a| (*a).to_string()).collect();
+    folded.extend(global);
+    folded.extend(args[insert_at..].iter().map(|a| (*a).to_string()));
+    folded
+}
+
 /// Spawn a chrome-use CLI invocation per [`CliSpawn`]: apply
-/// [`ensure_chrome_env`], the caller's args, the optional `--json` / `--session
-/// <s>` suffixes, pipe stdout and stderr per the `json` / `capture_stderr`
-/// flags, and kill-on-drop. A bounded call that hits its deadline reports
-/// [`CliRun::TimedOut`]; any spawn IO error is folded into
+/// [`ensure_chrome_env`], the caller's args with the global `--json` /
+/// `--session <s>` flags folded in, pipe stdout and stderr per the `json` /
+/// `capture_stderr` flags, and kill-on-drop. A bounded call that hits its
+/// deadline reports [`CliRun::TimedOut`]; any spawn IO error is folded into
 /// [`CliRun::SpawnFailure`].
 pub(crate) async fn spawn_cli(spec: CliSpawn<'_>) -> CliRun {
     let mut cmd = Command::new(spec.path);
     ensure_chrome_env(&mut cmd);
     apply_chrome_deadline(&mut cmd, spec.chrome_deadline);
-    cmd.args(spec.args);
+    cmd.args(build_argv(spec.args, spec.json, spec.session));
     if spec.json {
-        cmd.arg("--json").stdout(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
     } else {
         cmd.stdout(std::process::Stdio::null());
-    }
-    if let Some(session) = spec.session {
-        cmd.args(["--session", session]);
     }
     if spec.capture_stderr {
         cmd.stderr(std::process::Stdio::piped());
@@ -186,6 +208,38 @@ mod tests {
             .get_envs()
             .find(|(k, _)| *k == std::ffi::OsStr::new(key))
             .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn build_argv_folds_global_flags_before_dash_shield() {
+        assert_eq!(
+            build_argv(
+                &["fill", "#q", "--", "-tail"],
+                true,
+                Some("mahbot-chrome-abc")
+            ),
+            [
+                "fill",
+                "#q",
+                "--json",
+                "--session",
+                "mahbot-chrome-abc",
+                "--",
+                "-tail"
+            ]
+        );
+        assert_eq!(
+            build_argv(&["open", "https://x"], true, Some("s")),
+            ["open", "https://x", "--json", "--session", "s"]
+        );
+        assert_eq!(
+            build_argv(&["session", "list"], false, None),
+            ["session", "list"]
+        );
+        assert_eq!(
+            build_argv(&["session", "list"], false, Some("s")),
+            ["session", "list", "--session", "s"]
+        );
     }
 
     #[test]

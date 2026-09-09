@@ -521,6 +521,27 @@ fn parse_flags(
     value_flags: &[&str],
     bool_flags: &[&str],
 ) -> Result<(Vec<String>, Flags), String> {
+    parse_flags_impl(args, value_flags, bool_flags, false)
+}
+
+/// [`parse_flags`] for the fill/type text actions: a single-dash token is
+/// taken as literal positional text (these actions have no single-dash
+/// flags, so `fill '#q' -tail` fills the text `-tail` naturally instead of
+/// demanding the `--` shield). Unknown `--flags` are still rejected.
+fn parse_flags_text(
+    args: &[String],
+    value_flags: &[&str],
+    bool_flags: &[&str],
+) -> Result<(Vec<String>, Flags), String> {
+    parse_flags_impl(args, value_flags, bool_flags, true)
+}
+
+fn parse_flags_impl(
+    args: &[String],
+    value_flags: &[&str],
+    bool_flags: &[&str],
+    single_dash_is_text: bool,
+) -> Result<(Vec<String>, Flags), String> {
     let mut positionals = Vec::new();
     let mut flags = Flags::default();
     let mut i = 0;
@@ -561,7 +582,7 @@ fn parse_flags(
             }
             continue;
         }
-        if a.starts_with('-') && a.len() > 1 {
+        if a.starts_with('-') && a.len() > 1 && !single_dash_is_text {
             return Err(format!("unknown flag {a}"));
         }
         positionals.push(a.clone());
@@ -859,7 +880,7 @@ fn parse_fill(
     allowed: FlagSet,
 ) -> Result<Invocation, String> {
     let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let (positionals, flags) = parse_flags_text(rest, value_flags, bool_flags)?;
     let usage = "fill <selector> <text | --file <path> | --stdin>";
     let selector = match positionals.first() {
         Some(s) => s.clone(),
@@ -890,7 +911,7 @@ fn parse_type(
     allowed: FlagSet,
 ) -> Result<Invocation, String> {
     let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let (positionals, flags) = parse_flags_text(rest, value_flags, bool_flags)?;
     let usage = "type <selector> <text> [--key-events]";
     let selector = match positionals.first() {
         Some(s) => s.clone(),
@@ -1136,6 +1157,10 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
                     unreachable!("handled by the outer match")
                 }
             };
+            // Surface the resolved session (named or defaulted ephemeral) so
+            // a swallowed or silently defaulted `--session` is always
+            // observable in the envelope.
+            surface_session(&mut env, &name);
             // Deadline-expiration kinds carry the observed wall time alongside
             // the declared `timeout_ms` (redesign is open's `--structural`
             // deadline-expiration label).
@@ -1147,6 +1172,16 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
             append_named_session_timeout_hint(&mut env, step_named(Some(&name)));
             (env, Some(CliSession { name, ephemeral }))
         }
+    }
+}
+
+/// Insert the resolved session name as a top-level envelope field (the
+/// payload is flattened, so a payload key is a top-level stdout key). The
+/// `session` subcommand envelopes carry their own `session` key and skip
+/// this — they run session-unscoped.
+fn surface_session(env: &mut OutEnvelope, name: &str) {
+    if let Some(obj) = env.payload.as_object_mut() {
+        obj.insert("session".into(), json!(name));
     }
 }
 
@@ -3232,8 +3267,10 @@ mod tests {
         }
     }
 
-    /// The `--` end-of-options marker: a leading-dash text (even one that
-    /// looks like `--session`) is taken verbatim, never parsed as a flag.
+    /// `--` stays a true end-of-options terminator: every token after it is
+    /// verbatim text, even one that names a flag. (Single-dash text no longer
+    /// needs the shield — see [`fill_type_accept_single_dash_text`] — but the
+    /// terminator behavior itself is unchanged.)
     #[test]
     fn parse_dash_separator_takes_text_verbatim() {
         let inv = parse_invocation(&["fill".into(), "#q".into(), "--".into(), "--foo".into()])
@@ -3261,6 +3298,62 @@ mod tests {
             }
             _ => panic!("expected Type"),
         }
+    }
+
+    /// Single-dash text is accepted naturally in fill/type (they have no
+    /// single-dash flags, so any `-token` is literal text), while other
+    /// actions keep rejecting it as an unknown flag.
+    #[test]
+    fn fill_type_accept_single_dash_text() {
+        let inv =
+            parse_invocation(&["fill".into(), "#q".into(), "-tail".into()]).expect("fill parses");
+        match inv.action {
+            Action::Fill { source, .. } => {
+                assert!(matches!(source, TextInput::Inline(t) if t == "-tail"));
+            }
+            _ => panic!("expected Fill"),
+        }
+
+        // A `--session` after the text still binds globally.
+        let inv = parse_invocation(&[
+            "fill".into(),
+            "#q".into(),
+            "-tail".into(),
+            "--session".into(),
+            "abc".into(),
+        ])
+        .expect("fill with trailing --session parses");
+        assert_eq!(inv.session.as_deref(), Some("abc"));
+        match inv.action {
+            Action::Fill { source, .. } => {
+                assert!(matches!(source, TextInput::Inline(t) if t == "-tail"));
+            }
+            _ => panic!("expected Fill"),
+        }
+
+        let inv = parse_invocation(&["type".into(), "#q".into(), "-dashprobe".into()])
+            .expect("type parses");
+        match inv.action {
+            Action::Type { text, .. } => assert_eq!(text, "-dashprobe"),
+            _ => panic!("expected Type"),
+        }
+
+        // Other actions still reject single-dash tokens as unknown flags, and
+        // fill/type still reject unknown double-dash flags.
+        assert!(parse_invocation(&["count".into(), ".x".into(), "-bogus".into()]).is_err());
+        assert!(parse_invocation(&["open".into(), "https://x".into(), "-bogus".into()]).is_err());
+        assert!(parse_invocation(&["fill".into(), "#q".into(), "--bogus".into()]).is_err());
+    }
+
+    /// The resolved session lands as a top-level stdout field.
+    #[test]
+    fn surface_session_adds_top_level_field() {
+        let mut env = out_env("fill", true, OutKind::Ok, json!({ "selector": "#q" }));
+        surface_session(&mut env, "mahbot-chrome-abc");
+        assert_eq!(env.payload["session"], json!("mahbot-chrome-abc"));
+        let wire: Value = serde_json::from_str(&env.to_json()).expect("wire json");
+        assert_eq!(wire["session"], json!("mahbot-chrome-abc"));
+        assert_eq!(wire["kind"], json!("ok"));
     }
 
     /// The inline-text argv shield: a leading-dash value rides after `--` so

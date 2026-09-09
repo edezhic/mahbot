@@ -382,7 +382,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "Clears the field and fills it, replacing existing content; the written value is read back and verified before success — rich editors (CodeMirror, Monaco, ProseMirror, contenteditable) and framework inputs (React/Vue/Angular) are handled natively. Exactly one text source: the inline text (multi-word text is joined with spaces), --file <path>, or --stdin. A missing --file is kind usage; a target that does not exist is kind not-found; a read-back verification failure is kind error. A text beginning with '-' must be passed after `--` (or use --file/--stdin).",
+                details: "Clears the field and fills it, replacing existing content; the written value is read back and verified before success — rich editors (CodeMirror, Monaco, ProseMirror, contenteditable) and framework inputs (React/Vue/Angular) are handled natively. Exactly one text source: the inline text (multi-word text is joined with spaces), --file <path>, or --stdin. A missing --file is kind usage; a target that does not exist is kind not-found; a read-back verification failure is kind error. A text beginning with '-' is taken as literal text (fill has no single-dash flags), so `fill \"#q\" -tail` fills `-tail`; `--` may still shield one (or use --file/--stdin).",
                 examples: &[
                     "mahbot chrome fill \"#email\" \"user@example.com\"",
                     "mahbot chrome fill \".editor\" --file ./post.md",
@@ -428,7 +428,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "Types character-by-character without clearing (appends to existing content). --key-events sends real per-character keyDown/keyUp for autocomplete/combobox fields. Embedded newlines press Enter — they can submit a form; use fill for multiline text. When the page rewrites or filters the typed text, chrome-use's warning makes the action kind error (rc 1) — never a silent success. A text beginning with '-' must be passed after `--`.",
+                details: "Types character-by-character without clearing (appends to existing content). --key-events sends real per-character keyDown/keyUp for autocomplete/combobox fields. Embedded newlines press Enter — they can submit a form; use fill for multiline text. When the page rewrites or filters the typed text, chrome-use's warning makes the action kind error (rc 1) — never a silent success. A text beginning with '-' is taken as literal text (type has no single-dash flags); `--` may still shield one.",
                 examples: &[
                     "mahbot chrome type \"#search\" \"hello\"",
                     "mahbot chrome type \"#zip\" \"201-0001\" --key-events",
