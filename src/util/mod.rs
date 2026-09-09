@@ -273,6 +273,9 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
 ///
 /// Returns `None` if the storage root hasn't been initialized yet.  Per-model
 /// subdirectories are joined by each consumer (e.g. `audio::models_subdir`).
+/// Because this follows the storage root, a `$HOME`-overridden sandbox instance
+/// resolves an empty models dir and re-downloads its model set there instead of
+/// sharing the real home's cache.
 #[must_use]
 pub(crate) fn models_dir() -> Option<PathBuf> {
     crate::config::CONFIG

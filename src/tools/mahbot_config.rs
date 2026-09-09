@@ -169,9 +169,20 @@ impl MahbotConfigTool {
         let name = super::get_str(&args, "name")?;
         let handle = super::get_str(&args, "telegram")?;
 
+        // default_agent is required (as the original tool had it); the only
+        // valid value is Assistant — the single user-facing role. Checked before
+        // any store access so required-field errors stay store-free.
+        let agent: Role = super::get_str(&args, "default_agent")?
+            .parse::<Role>()
+            .context("default_agent must be 'assistant'")?;
+        if agent != Role::Assistant {
+            return Err(err("default_agent must be 'assistant'"));
+        }
+
         let store = crate::users::store();
-        // Normalize + guard the handle (reserved sentinel, anti-steal) before any
-        // other check so a rejected handle wins over e.g. "user already exists".
+        // Normalize + guard the handle (reserved sentinel, anti-steal) before
+        // the duplicate/admin checks so a rejected handle wins over e.g.
+        // "user already exists".
         let handle = store.validate_telegram_bind(name, handle).await?;
 
         let mut existing_unbound = false;
@@ -199,15 +210,6 @@ impl MahbotConfigTool {
                 )));
             }
             existing_unbound = true;
-        }
-
-        // default_agent is required (as the original tool had it); the only
-        // valid value is Assistant — the single user-facing role.
-        let agent: Role = super::get_str(&args, "default_agent")?
-            .parse::<Role>()
-            .context("default_agent must be 'assistant'")?;
-        if agent != Role::Assistant {
-            return Err(err("default_agent must be 'assistant'"));
         }
 
         if existing_unbound {
@@ -278,7 +280,8 @@ mod tests {
 
     /// The merged tool's error paths that fire before any store/persist access
     /// (action dispatch, unknown action, and per-action required-field and
-    /// provider validation) are pure and cheaply testable.
+    /// provider validation — including `add_user`'s `default_agent`, validated
+    /// ahead of the user store) are pure and cheaply testable.
     #[tokio::test]
     async fn action_dispatch_and_unknown_action() {
         let tool = MahbotConfigTool;
