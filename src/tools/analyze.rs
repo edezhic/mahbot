@@ -2765,7 +2765,10 @@ mod tests {
         // Load the caller session and run the resume+settle path.
         let mut session = crate::session::Session::default();
         session.init(pin).await.unwrap();
-        let pending = session.pending_tool_calls().expect("dangling analyze call");
+        let pending = session
+            .pending_tool_frame()
+            .expect("dangling analyze call")
+            .calls;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "call_analyze_f");
 

@@ -91,6 +91,16 @@ pub(crate) enum RewriteOutcome {
     UnpersistedTailNoop,
 }
 
+/// The unresolved tool calls of the session's LAST tool-call frame plus the
+/// frame-level context the sleep-delivery guard needs on the resume path:
+/// whether the frame carried non-empty raw text (which is never delivered
+/// in a tool round) and how many calls the round bundled.
+pub(crate) struct PendingToolFrame {
+    pub calls: Vec<crate::ToolCall>,
+    pub has_text: bool,
+    pub call_count: usize,
+}
+
 impl Session {
     // ── Session lifecycle ──────────────────────────────────────────────
 
@@ -313,15 +323,18 @@ impl Session {
     /// immediately-following Tool-role entries, collecting the `tool_call_id`s
     /// they resolved. Returns the frame's calls whose ids are missing: `None`
     /// when nothing is missing, or when there is no (undecodable) frame.
-    pub(crate) fn pending_tool_calls(&self) -> Option<Vec<crate::ToolCall>> {
+    pub(crate) fn pending_tool_frame(&self) -> Option<PendingToolFrame> {
         let frame_idx = self.history.iter().rposition(super::is_tool_call_frame)?;
         let Some(super::DecodedNativeHistoryMessage::Assistant {
+            content,
             tool_calls: Some(calls),
             ..
         }) = super::decode_native_history_message(&self.history[frame_idx])
         else {
             return None;
         };
+        let has_text = content.as_deref().is_some_and(|t| !t.trim().is_empty());
+        let call_count = calls.len();
         // Walk forward over Tool-role entries (stop at the first non-tool).
         let mut completed: std::collections::HashSet<String> = std::collections::HashSet::default();
         for msg in &self.history[frame_idx + 1..] {
@@ -343,7 +356,11 @@ impl Session {
         if pending.is_empty() {
             None
         } else {
-            Some(pending)
+            Some(PendingToolFrame {
+                calls: pending,
+                has_text,
+                call_count,
+            })
         }
     }
 
@@ -1287,13 +1304,13 @@ mod tests {
         .to_string()
     }
 
-    /// (a) `pending_tool_calls` returns the session's LAST tool-call frame's
+    /// (a) `pending_tool_frame` returns the session's LAST tool-call frame's
     /// result-less calls. No frame → None; a frame with calls and no results →
     /// all of them; one result present → only the missing one remains.
     #[test]
-    fn pending_tool_calls_none_and_dangling_and_partial() {
+    fn pending_tool_frame_none_and_dangling_and_partial() {
         // No frame → None.
-        assert!(Session::default().pending_tool_calls().is_none());
+        assert!(Session::default().pending_tool_frame().is_none());
 
         // Frame with two calls, no results → both dangling.
         let frame = crate::providers::reasoning::assistant_replay_payload(
@@ -1319,8 +1336,9 @@ mod tests {
             ..Default::default()
         };
         let pending = session
-            .pending_tool_calls()
-            .expect("dangling calls present");
+            .pending_tool_frame()
+            .expect("dangling calls present")
+            .calls;
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].id, "call_a");
         assert_eq!(pending[1].id, "call_b");
@@ -1329,7 +1347,10 @@ mod tests {
         session
             .history
             .push(ChatMessage::tool_result("call_a", "result a"));
-        let pending = session.pending_tool_calls().expect("still one dangling");
+        let pending = session
+            .pending_tool_frame()
+            .expect("still one dangling")
+            .calls;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "call_b");
 
@@ -1337,7 +1358,7 @@ mod tests {
         session
             .history
             .push(ChatMessage::tool_result("call_b", "result b"));
-        assert!(session.pending_tool_calls().is_none());
+        assert!(session.pending_tool_frame().is_none());
     }
 
     /// (b) `settle_tool_results` inserts the settled result directly after the

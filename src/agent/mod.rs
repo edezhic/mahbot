@@ -842,7 +842,7 @@ impl Agent {
     /// The single position where dangling calls are completed is intentionally
     /// ungated: a graceful drain mid-call, a hard crash and a stage re-drive all
     /// converge here. Already-completed calls are never re-run (their result is
-    /// present, so `pending_tool_calls` excludes them).
+    /// present, so `pending_tool_frame` excludes them).
     ///
     /// Returns `true` when any results were settled this run (used by `work`
     /// to skip destructive summarization — a turn that just settled dangling
@@ -854,9 +854,10 @@ impl Agent {
     #[expect(clippy::too_many_lines)] // deliberate: one cohesive resume+settle path
     fn complete_pending_tool_calls(&mut self) -> CompletePendingToolCallsFuture<'_> {
         Box::pin(async move {
-            let Some(calls) = self.session.pending_tool_calls() else {
+            let Some(frame) = self.session.pending_tool_frame() else {
                 return Ok(false);
             };
+            let calls = frame.calls;
             tracing::info!(
                 agent_id = %self.agent_id,
                 role = %self.role,
@@ -956,6 +957,30 @@ impl Agent {
                     find_tool(&self.tools, &call.name)
                         .map(|t| t.format_output(&content))
                         .unwrap_or(content)
+                } else if call.name == "sleep"
+                    && let Some(reason) =
+                        sleep_rejection_reason(frame.has_text, frame.call_count > 1)
+                {
+                    // Sleep-delivery guard on the resume path: re-executing the
+                    // sleep would settle a "Zzz..." result over text the user
+                    // never saw — settle the rejection instead so the model
+                    // resends the text as a plain round.
+                    tracing::warn!(
+                        agent_id = %self.agent_id,
+                        tool = %call.name,
+                        reason,
+                        "Sleep call rejected during resume-completion"
+                    );
+                    self.push_tool_call_record(
+                        call.name.clone(),
+                        &call.arguments,
+                        0,
+                        false,
+                        Some(reason.to_string()),
+                    );
+                    Self::failure_outcome(&call.name, &call.arguments, reason)
+                        .0
+                        .output
                 } else {
                     // Re-execute the call (under the tool task-local context).
                     let outcome = self
@@ -1127,6 +1152,7 @@ impl Agent {
                     mut display_text,
                     tool_calls,
                     history_content,
+                    raw_text,
                 } = prepare_assistant_turn(
                     llm_result.with_context(|| {
                         llm_step_failure_context(&self.session, tool_rounds)
@@ -1156,9 +1182,15 @@ impl Agent {
                         &self.agent_id,
                         &[ChatMessage::assistant(history_content.clone())],
                     )
-                    .await?;
-
-                let all_outcomes = self.execute_tool_group(&tool_calls).await;
+                    .await?;                // Sleep-delivery guard: a sleep call in a round with
+                // accompanying raw text or bundled with other tool calls is
+                // rejected (see `execute_tool_round`) instead of silently
+                // swallowing the text or ending the run.
+                let has_sleep = tool_calls.iter().any(|c| c.name == "sleep");
+                let sleep_rejection = has_sleep
+                    .then(|| sleep_rejection_reason(!raw_text.trim().is_empty(), tool_calls.len() > 1))
+                    .flatten();
+                let all_outcomes = self.execute_tool_round(&tool_calls, sleep_rejection).await;
 
                 // Track media generation outcomes for marker fallback
                 accumulated_media_paths.extend(extract_media_from_outcomes(
@@ -1242,6 +1274,64 @@ impl Agent {
         outcomes
     }
 
+    /// Execute one tool round under the sleep-delivery guard: when a rejection
+    /// is active, every `sleep` call in the round is intercepted BEFORE
+    /// execution (a successful sleep would end the run silently via
+    /// `ends_turn_on_success`) and settled as a synthetic failure outcome at
+    /// its original position, while all sibling calls execute normally. The
+    /// returned outcomes stay one-to-one with `tool_calls` (consumers
+    /// `extract_media_from_outcomes` and `commit_tool_results` rely on the
+    /// alignment).
+    async fn execute_tool_round(
+        &self,
+        tool_calls: &[ToolCall],
+        sleep_rejection: Option<&'static str>,
+    ) -> Vec<ToolExecutionOutcome> {
+        let Some(reason) = sleep_rejection else {
+            return self.execute_tool_group(tool_calls).await;
+        };
+
+        let rejected = tool_calls.iter().filter(|c| c.name == "sleep").count();
+        tracing::warn!(
+            agent_id = %self.agent_id,
+            role = %self.role,
+            rejected,
+            reason,
+            "Sleep call rejected — must run alone in a text-free round"
+        );
+
+        // Execute only the non-sleep calls; the sleep calls are intercepted
+        // and settled as synthetic failures at their original positions so the
+        // round stays aligned one-to-one with `tool_calls`.
+        let sibling_calls: Vec<ToolCall> = tool_calls
+            .iter()
+            .filter(|c| c.name != "sleep")
+            .cloned()
+            .collect();
+        let mut sibling_outcomes = self.execute_tool_group(&sibling_calls).await.into_iter();
+
+        let mut outcomes = Vec::with_capacity(tool_calls.len());
+        for call in tool_calls {
+            if call.name == "sleep" {
+                self.push_tool_call_record(
+                    call.name.clone(),
+                    &call.arguments,
+                    0,
+                    false,
+                    Some(reason.to_string()),
+                );
+                outcomes.push(Self::failure_outcome(&call.name, &call.arguments, reason).0);
+            } else {
+                outcomes.push(
+                    sibling_outcomes
+                        .next()
+                        .expect("non-sleep outcomes align one-to-one"),
+                );
+            }
+        }
+        outcomes
+    }
+
     /// Run `fut` under the `CURRENT_TOOL_*` task-local context derived from this
     /// agent's fields. Set once per tool batch (not per-call), so concurrent
     /// read-only tools never interleave each other's user context. Reused by
@@ -1317,6 +1407,31 @@ impl Agent {
             },
             reason,
         )
+    }
+
+    /// Record one tool invocation into the agent's in-memory stats (flushed to
+    /// the logs store on session finalization). The arguments are serialized,
+    /// credential-scrubbed, and length-truncated to the stats budget.
+    fn push_tool_call_record(
+        &self,
+        tool_name: String,
+        arguments: &serde_json::Value,
+        duration_ms: i64,
+        success: bool,
+        error_message: Option<String>,
+    ) {
+        let args_str = serde_json::to_string(arguments).expect("Value is always serializable");
+        let args_scrubbed = scrub_credentials(&args_str);
+        let arguments =
+            crate::util::truncate_bytes(&args_scrubbed, MAX_STATS_ARG_LENGTH).to_string();
+        let mut guard = self.tool_stats.lock().unwrap_poison();
+        guard.push(crate::ToolCallRecord {
+            tool_name,
+            arguments,
+            duration_ms,
+            success,
+            error_message,
+        });
     }
 
     /// Execute a single tool call and return the result.
@@ -1440,26 +1555,17 @@ impl Agent {
             }
         };
 
-        // Inlined per-call stats recording — each tool invocation produces
-        // one record with arguments, duration, success/failure, and error.
-        {
-            let elapsed_ms = start.elapsed().as_millis();
-            let duration_ms = i64::try_from(elapsed_ms).unwrap_or(0);
-            let args_str =
-                serde_json::to_string(&tool_arguments).expect("Value is always serializable");
-            let args_scrubbed = scrub_credentials(&args_str);
-            let arguments =
-                crate::util::truncate_bytes(&args_scrubbed, MAX_STATS_ARG_LENGTH).to_string();
-
-            let mut guard = self.tool_stats.lock().unwrap_poison();
-            guard.push(crate::ToolCallRecord {
-                tool_name,
-                arguments,
-                duration_ms,
-                success: outcome.success,
-                error_message: (!error_reason.is_empty()).then_some(error_reason),
-            });
-        }
+        // Per-call stats recording — each tool invocation produces one record
+        // with arguments, duration, success/failure, and error.
+        let elapsed_ms = start.elapsed().as_millis();
+        let duration_ms = i64::try_from(elapsed_ms).unwrap_or(0);
+        self.push_tool_call_record(
+            tool_name,
+            &tool_arguments,
+            duration_ms,
+            outcome.success,
+            (!error_reason.is_empty()).then_some(error_reason),
+        );
         outcome
     }
 
@@ -2248,6 +2354,11 @@ struct PreparedAssistantTurn {
     display_text: String,
     tool_calls: Vec<ToolCall>,
     history_content: String,
+    /// The raw LLM response text (the faithful carrier of accompanying text in
+    /// tool rounds, where `history_content` is a JSON payload and
+    /// `display_text` is empty). Reasoning content never reaches
+    /// `prepare_assistant_turn`, so this excludes it by construction.
+    raw_text: String,
 }
 
 /// Classify the "reasoning-only stop" class: raw empty content (think tags
@@ -2297,6 +2408,7 @@ fn llm_step_failure_context(session: &Session, tool_rounds: usize) -> String {
 /// Prepare assistant response data from the LLM response.
 fn prepare_assistant_turn(response: ChatResponse) -> PreparedAssistantTurn {
     let response_text = response.text_or_empty().to_string();
+    let raw_text = response_text.clone();
     let tool_calls = response.tool_calls;
     let reasoning = response.reasoning.as_ref();
 
@@ -2327,6 +2439,30 @@ fn prepare_assistant_turn(response: ChatResponse) -> PreparedAssistantTurn {
         display_text,
         tool_calls,
         history_content,
+        raw_text,
+    }
+}
+
+/// Rejection message for a `sleep` call made in a round with accompanying
+/// raw text: the text is never delivered (tool rounds are never displayed)
+/// and the successful sleep would end the run before anything is sent.
+const SLEEP_WITH_TEXT_REJECTION: &str = "sleep must be called alone: your text was NOT delivered — text written in any round that contains a tool call never reaches the user. Resend your text as a plain-text round with no tool calls, then call sleep alone.";
+
+/// Rejection message for a `sleep` call bundled with other tool calls.
+const SLEEP_BUNDLED_REJECTION: &str = "sleep must be called alone: it was bundled with other tool calls. Call sleep in its own round with no other tool calls — and no text, since text written in a tool round is never delivered to the user.";
+
+/// Sleep-delivery guard predicate: a `sleep` call must run alone in a
+/// text-free round, otherwise the round either swallows the accompanying
+/// text or ends the run silently right after it. Returns the model-facing
+/// rejection reason for the round, `None` when the round is legal.
+#[must_use]
+fn sleep_rejection_reason(has_text: bool, bundled: bool) -> Option<&'static str> {
+    if has_text {
+        Some(SLEEP_WITH_TEXT_REJECTION)
+    } else if bundled {
+        Some(SLEEP_BUNDLED_REJECTION)
+    } else {
+        None
     }
 }
 
@@ -3798,6 +3934,215 @@ mod tests {
         );
     }
 
+    /// A `sleep` call written in a round that also carries text is rejected at
+    /// runtime (the text is never delivered in a tool round and the successful
+    /// sleep ends the run silently) — the loop continues and the model resends
+    /// the text as a plain round.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn sleep_with_text_is_rejected_and_resend_is_delivered() {
+        crate::util::test::init_test_stores().await;
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok_text_and_tool_calls("here is the answer", &[("sleep", serde_json::json!({}))])
+                .ok("here is the answer"),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let ws = crate::workspace::test_ws_named("/tmp/ws_sleep_text", "sleep_text");
+        let agent_id = "sleep_text_agent".to_string();
+
+        let (agent, response) = run_agent(
+            agent_id.clone(),
+            crate::Role::Assistant,
+            &ws,
+            None,
+            "hello",
+            "sleep_text_user".to_string(),
+            "gui".to_string(),
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            response.as_deref(),
+            Some("here is the answer"),
+            "the text must be resent as a plain round after the rejection"
+        );
+        assert!(!agent.sleep_ended, "a rejected sleep must not end the run");
+        assert_eq!(
+            fake.request_messages.lock().unwrap().len(),
+            2,
+            "the rejection round plus the plain resend round"
+        );
+
+        // The sleep round committed a rejection Tool result, not a "Zzz..." one.
+        let history = agent.session.history();
+        let rejection_tools: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == crate::ChatRole::Tool)
+            .map(|m| {
+                serde_json::from_str::<crate::ToolResultPayload>(&m.content)
+                    .expect("tool message must be a ToolResultPayload")
+                    .content
+            })
+            .collect();
+        assert!(
+            rejection_tools
+                .iter()
+                .any(|c| c.contains("NOT delivered") && !c.contains("Zzz...")),
+            "the sleep rejection must be committed without a Zzz... result: {rejection_tools:?}"
+        );
+
+        assert!(
+            !crate::session::store().get_sleep_ended(&agent_id).await,
+            "the durable sleep-ended flag must stay clear"
+        );
+    }
+
+    /// A `sleep` call bundled with another tool call is rejected at runtime
+    /// (subsequent silent end), while the sibling call executes normally — the
+    /// loop continues and the model can resend as a plain round.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn sleep_bundled_with_other_tool_is_rejected_but_sibling_executes() {
+        crate::util::test::init_test_stores().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("seed.txt"), "bundle-marker\n").unwrap();
+        let ws = crate::Workspace::from_path(dir.path());
+
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok_text_and_tool_calls(
+                    "",
+                    &[
+                        ("read", serde_json::json!({"path": "seed.txt"})),
+                        ("sleep", serde_json::json!({})),
+                    ],
+                )
+                .ok("done"),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let agent_id = "sleep_bundle_agent".to_string();
+
+        let (agent, response) = run_agent(
+            agent_id.clone(),
+            crate::Role::Assistant,
+            &ws,
+            None,
+            "hello",
+            "sleep_bundle_user".to_string(),
+            "gui".to_string(),
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(response.as_deref(), Some("done"));
+        assert!(!agent.sleep_ended, "a bundled sleep must not end the run");
+        assert_eq!(fake.request_messages.lock().unwrap().len(), 2);
+
+        let history = agent.session.history();
+        let tool_results: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == crate::ChatRole::Tool)
+            .map(|m| {
+                serde_json::from_str::<crate::ToolResultPayload>(&m.content)
+                    .expect("tool message must be a ToolResultPayload")
+                    .content
+            })
+            .collect();
+        assert!(
+            tool_results.iter().any(|c| c.contains("bundle-marker")),
+            "the read sibling must execute normally: {tool_results:?}"
+        );
+        assert!(
+            tool_results
+                .iter()
+                .any(|c| c.contains("bundled with other tool calls")),
+            "the bundled sleep must be rejected: {tool_results:?}"
+        );
+    }
+
+    /// The sleep-delivery guard also covers the resume-completion path: a
+    /// dangling tool-call frame carrying text alongside a `sleep` call settles
+    /// the rejection (the ORIGINAL call id) instead of re-executing it into a
+    /// "Zzz..." result over text the user never saw.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn resume_completion_rejects_text_sleep_frame() {
+        crate::util::test::init_test_stores().await;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = crate::Workspace::from_path(dir.path());
+
+        let mut session = Session::default();
+        let frame = crate::providers::reasoning::assistant_replay_payload(
+            Some("the answer"),
+            &[crate::ToolCall {
+                id: "call_sleep_r".to_string(),
+                name: "sleep".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+            None,
+        )
+        .to_string();
+        session
+            .persist_messages(
+                "test-sleep-resume",
+                &[ChatMessage::user("wake"), ChatMessage::assistant(frame)],
+            )
+            .await
+            .unwrap();
+
+        let mut agent = make_agent_on(
+            vec![Box::new(crate::tools::SleepTool)],
+            "test-sleep-resume",
+            ws,
+        );
+        agent.session = session;
+        let settled = agent.complete_pending_tool_calls().await.unwrap();
+        assert!(
+            settled,
+            "a text-accompanied sleep frame settles the rejection"
+        );
+
+        let history = agent.session.history();
+        let roles: Vec<crate::ChatRole> = history.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                crate::ChatRole::User,
+                crate::ChatRole::Assistant,
+                crate::ChatRole::Tool
+            ],
+            "result contiguous after the frame: {roles:?}"
+        );
+        let payload: crate::ToolResultPayload = serde_json::from_str(&history[2].content).unwrap();
+        assert_eq!(
+            payload.tool_call_id, "call_sleep_r",
+            "rejection keeps the ORIGINAL call id"
+        );
+        assert!(
+            payload.content.contains("NOT delivered"),
+            "sleep rejection content: {}",
+            payload.content
+        );
+        assert!(!payload.content.contains("Zzz..."));
+        assert!(agent.session.pending_tool_frame().is_none());
+    }
+
     // ── Reasoning-only stop recovery ─────────────────────────────────
 
     /// The class predicate: raw empty content + no parsed tool calls,
@@ -5099,7 +5444,7 @@ mod tests {
             "real tool output recorded: {}",
             payload.content
         );
-        assert!(agent.session.pending_tool_calls().is_none());
+        assert!(agent.session.pending_tool_frame().is_none());
     }
 
     /// (d) Full drain lifecycle: a sync analyze dispatch under an active drain
@@ -5382,7 +5727,7 @@ mod tests {
             fake.request_fingerprints.lock().unwrap().is_empty(),
             "replaying Done slots must not call the model"
         );
-        assert!(agent.session.pending_tool_calls().is_none());
+        assert!(agent.session.pending_tool_frame().is_none());
 
         // Only the two bound jobs are terminalized; the unbound third job
         // stays launched (no orphan sweep — unfinished jobs survive unless

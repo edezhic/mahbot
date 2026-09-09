@@ -255,6 +255,37 @@ impl FakeProvider {
         self
     }
 
+    /// Push a scripted response with accompanying text AND one or more tool
+    /// calls (ids `call_test_0`, `call_test_1`, ... in order) — the
+    /// sleep-delivery-guard violation shapes.
+    #[must_use]
+    pub(crate) fn ok_text_and_tool_calls(
+        self,
+        text: &str,
+        calls: &[(&str, serde_json::Value)],
+    ) -> Self {
+        let tool_calls = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (name, args))| crate::ToolCall {
+                id: format!("call_test_{i}"),
+                name: name.to_string(),
+                arguments: args.clone(),
+            })
+            .collect();
+        let text = Some(text.to_string());
+        self.script
+            .lock()
+            .unwrap()
+            .push_back(Ok(crate::ChatResponse {
+                text,
+                tool_calls,
+                finish_reason: Some("tool_calls".to_string()),
+                ..crate::ChatResponse::default()
+            }));
+        self
+    }
+
     /// Push a scripted failure with the given granular class.
     #[must_use]
     pub(crate) fn err(self, class: crate::retry::FailureClass, msg: &str) -> Self {

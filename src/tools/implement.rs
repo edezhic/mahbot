@@ -386,8 +386,9 @@ mod tests {
         let mut session = crate::session::Session::default();
         session.init(pin).await.unwrap();
         let pending = session
-            .pending_tool_calls()
-            .expect("dangling implement call");
+            .pending_tool_frame()
+            .expect("dangling implement call")
+            .calls;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "call_implement_h");
 

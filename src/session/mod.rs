@@ -73,7 +73,7 @@ fn is_tool_call_frame(msg: &ChatMessage) -> bool {
 
 /// True when the message decodes as a native assistant tool-call frame
 /// carrying at least one tool call — the dangling-tail signal used by the
-/// dead-session recovery poller. Mirrors [`Session::pending_tool_calls`]:
+/// dead-session recovery poller. Mirrors [`Session::pending_tool_frame`]:
 /// a frame that is the session TAIL can have no following result rows, so
 /// non-empty calls there means unresolved calls.
 fn is_dangling_tool_call_frame(role: ChatRole, content: &str) -> bool {
