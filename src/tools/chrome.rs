@@ -3,8 +3,9 @@
 use crate::chrome::contract::{
     ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, classify_call_failure, eval_count,
     expect_outcome, extract_output, extract_snapshot_text, is_daemon_unavailable_code,
-    is_daemon_unavailable_error, net_error_phrase, parse_error_page_probe,
-    sanitize_timeout_message, with_condition_timeout_note,
+    is_daemon_unavailable_error, is_unreachable_tab_error, net_error_phrase,
+    parse_error_page_probe, sanitize_timeout_message, unreachable_tab_message,
+    with_condition_timeout_note,
 };
 use crate::chrome::escape_js_single_quoted;
 use crate::chrome::forms::{
@@ -567,8 +568,8 @@ impl ChromeTool {
     /// and leave health untouched (recovery cannot fix a Chrome-side orphan,
     /// and hiding the daemon would block other sessions for UNHEALTHY_TTL).
     fn fail_fast_if_daemon_down(error: &str, code: Option<&str>) -> anyhow::Result<()> {
-        if super::chrome_daemon::is_unreachable_tab_error(error) {
-            anyhow::bail!("{}", super::chrome_daemon::unreachable_tab_message(error));
+        if is_unreachable_tab_error(error) {
+            anyhow::bail!("{}", unreachable_tab_message(error));
         }
         if is_daemon_unavailable_error(error) || is_daemon_unavailable_code(code) {
             super::chrome_daemon::note_unhealthy(error);

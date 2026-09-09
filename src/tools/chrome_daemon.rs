@@ -42,6 +42,7 @@
 
 use crate::chrome::contract::{
     ChromeResponse, is_daemon_unavailable_error, is_relay_unavailable_error,
+    is_unreachable_tab_error,
 };
 use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, ensure_chrome_env, spawn_cli};
 use crate::util::UnwrapPoison;
@@ -1217,42 +1218,6 @@ async fn session_tab_list(name: &str, deadline: Instant) -> Option<Vec<SweepTab>
         sweep_warn_transition(SweepWarn::CannotEnumerate);
         None
     })
-}
-
-/// Error signatures of a leftover tab the daemon can no longer re-drive: its
-/// binding went stale (relay blip, kill during an outage) while the extension
-/// keeps the attach. The sweep's scratch tab is about:blank and the extension
-/// never re-attaches `about:` URLs (its `eligible()` filter), so only closing
-/// the tab by hand unblocks the session — the sweep logs this signal and keeps
-/// retrying. An orphan the extension fully dropped (service-worker restart)
-/// never produces these; it is invisible to every CLI path (see the sweep's
-/// pinned-behaviors note). Real chrome calls hitting this state fail fast
-/// with the same guidance without marking the daemon unhealthy — see
-/// [`unreachable_tab_message`]. The "or the relay lost it" variant is a
-/// permanent orphan (the relay dropped the attach); "navigated across
-/// processes" is a recoverable OAuth/SSO retarget and must stay OUT.
-pub(crate) fn is_unreachable_tab_error(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    lower.contains("can no longer be resolved")
-        || lower.contains("owns no resolvable tab")
-        || lower.contains("no attached tab")
-        || lower.contains("its tab is gone")
-        || lower.contains("stale session")
-        || lower.contains("unknown session")
-        || lower.contains("the relay lost it")
-}
-
-/// Actionable error for a real call that hit an orphaned tab: the daemon and
-/// relay are up, only the session's tab is unreachable (the extension never
-/// re-attaches about:blank tabs). Fail fast with hand-close guidance instead of
-/// paying the CLI's ~152 s retry loop, and do NOT mark the daemon unhealthy —
-/// recovery cannot fix a Chrome-side orphan.
-pub(crate) fn unreachable_tab_message(error: &str) -> String {
-    format!(
-        "{error}. The chrome-use extension lost its debugger attach to this tab and never \
-         re-attaches about:blank tabs — close the leftover tab in Chrome to unblock this \
-         session (the chrome daemon itself is healthy)."
-    )
 }
 
 /// Create a scratch tab and return its stable targetId, matched by the `t<N>`
@@ -2724,33 +2689,6 @@ mod tests {
         assert_eq!(h3.launch_budget.attempts, 0);
         assert!(!h3.restart_budget.halted);
         assert!(!h3.launch_budget.halted);
-    }
-
-    #[test]
-    fn unreachable_tab_error_signature_detected() {
-        for msg in [
-            "the tab this session was driving can no longer be resolved (it was closed, or a flaky relay dropped it)",
-            "the tab this command was driving is gone — it may have been closed, or the relay lost it",
-            "this session owns no resolvable tab in its group. Refusing to run on a tab this session does not drive",
-            "stale sessionId ... its tab is gone",
-            "unknown sessionId ...",
-            "no attached tab ...",
-        ] {
-            assert!(is_unreachable_tab_error(msg), "should detect: {msg}");
-        }
-        for msg in [
-            // Relay-side outage — owned by is_relay_unavailable_error, and the
-            // sweep's service_state skip gate already covers it.
-            "Auto-launch failed: Could not drive your Chrome through the ab-connect extension.",
-            // Recoverable CLI retarget (OAuth/SSO navigation), NOT a permanent
-            // orphan — must stay out of the unreachable-tab matcher.
-            "the tab this command was driving is gone — it navigated across processes",
-            // Daemon socket / page-level failures — not tab-attach problems.
-            "Failed to read: Resource temporarily unavailable (os error 35)",
-            "chrome-use error: Element not found",
-        ] {
-            assert!(!is_unreachable_tab_error(msg), "should NOT detect: {msg}");
-        }
     }
 
     #[test]

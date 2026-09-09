@@ -321,19 +321,38 @@ impl OutKind {
 // stays dependency-free: chrome_daemon imports them back, and both frontends
 // classify through this module without any frontend-to-frontend coupling.
 
+/// Per-session wedge signature: the session's CDP attach is unresponsive and
+/// every command on that named session times out while the daemon and relay
+/// may be perfectly healthy. The chrome_daemon watchdog reaches these texts
+/// through [`is_daemon_unavailable_error`] (they are DaemonWedge signals and
+/// MUST keep triggering its auto-recovery); the CLI uses this matcher
+/// directly to attach the wedge-specific remediation hint (the OutKind is
+/// Environment for both, so classification is unchanged).
+pub(crate) fn is_session_unresponsive_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("session unresponsive")
+        || lower.contains("cdp session is unresponsive after attaching")
+}
+
 /// Detect the daemon-unavailable signature chrome-use produces when its
 /// background daemon is dead or wedged: the CLI hangs in its own 5-retry loop
 /// (EAGAIN / "Resource temporarily unavailable") and eventually reports
 /// "daemon may be busy or unresponsive". Also covers the 1.5.8x-era texts
-/// (stuck-daemon auto-stop, disappeared daemon endpoint, failed auto-launch).
+/// (stuck-daemon auto-stop, disappeared daemon endpoint, failed auto-launch)
+/// and — via the [`is_session_unresponsive_error`] delegation — the
+/// session-wedge texts, which are DaemonWedge signals for the watchdog's
+/// auto-recovery.
 pub(crate) fn is_daemon_unavailable_error(msg: &str) -> bool {
+    // The session-wedge texts are also DaemonWedge signals — the watchdog's
+    // auto-recovery cause folds them in (see [`is_session_unresponsive_error`]).
+    if is_session_unresponsive_error(msg) {
+        return true;
+    }
     let lower = msg.to_ascii_lowercase();
     lower.contains("resource temporarily unavailable")
         || lower.contains("os error 35")
         || lower.contains("os error 11")
         || lower.contains("daemon may be busy or unresponsive")
-        || lower.contains("session unresponsive")
-        || lower.contains("cdp session is unresponsive after attaching")
         || lower.contains("daemon failed to start")
         || lower.contains("auto-launch failed")
         // Colon form only — "failed to connect to <host>" is a page-level
@@ -359,6 +378,39 @@ pub(crate) fn is_relay_unavailable_error(msg: &str) -> bool {
 /// the message-text matcher stays the source of truth for those.
 pub(crate) fn is_daemon_unavailable_code(code: Option<&str>) -> bool {
     matches!(code, Some("browser_not_launched"))
+}
+
+/// Error signatures of a leftover tab the daemon can no longer re-drive: its
+/// binding went stale (relay blip, kill during an outage) while the extension
+/// keeps the attach. The extension never re-attaches `about:` URLs, so only
+/// closing the tab by hand unblocks the session. An orphan the extension fully
+/// dropped (service-worker restart) never produces these. Real chrome calls
+/// hitting this state fail fast with the same guidance without marking the
+/// daemon unhealthy — see [`unreachable_tab_message`]. The "or the relay lost
+/// it" variant is a permanent orphan (the relay dropped the attach);
+/// "navigated across processes" is a recoverable OAuth/SSO retarget and must
+/// stay OUT.
+pub(crate) fn is_unreachable_tab_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("can no longer be resolved")
+        || lower.contains("owns no resolvable tab")
+        || lower.contains("no attached tab")
+        || lower.contains("its tab is gone")
+        || lower.contains("stale session")
+        || lower.contains("unknown session")
+        || lower.contains("the relay lost it")
+}
+
+/// Actionable error for a real call that hit an orphaned tab: the daemon and
+/// relay are up, only the session's tab is unreachable (the extension never
+/// re-attaches about:blank tabs). Fail fast with hand-close guidance and do
+/// NOT mark the daemon unhealthy — recovery cannot fix a Chrome-side orphan.
+pub(crate) fn unreachable_tab_message(error: &str) -> String {
+    format!(
+        "{error}. The chrome-use extension lost its debugger attach to this tab and never \
+         re-attaches about:blank tabs — close the leftover tab in Chrome to unblock this \
+         session (the chrome daemon itself is healthy)."
+    )
 }
 
 /// Classify a chrome-use step failure into an [`OutKind`]. Environment
@@ -991,5 +1043,51 @@ mod tests {
         with_condition_timeout_note("wait", OutKind::Error, &mut m);
         with_condition_timeout_note("eval", OutKind::Timeout, &mut m);
         assert_eq!(m, "some failure");
+    }
+
+    #[test]
+    fn session_unresponsive_error_signature_detected() {
+        for msg in [
+            "session unresponsive: no response within 45s",
+            "CDP session is unresponsive after attaching (Connection reset).",
+        ] {
+            assert!(is_session_unresponsive_error(msg), "should detect: {msg}");
+        }
+        // The daemon-busy phrasing is a DaemonWedge text, not a session wedge —
+        // the CLI must not attach the session hint to it.
+        assert!(!is_session_unresponsive_error(
+            "daemon may be busy or unresponsive"
+        ));
+    }
+
+    #[test]
+    fn unreachable_tab_signature_and_message_are_stable() {
+        for msg in [
+            "the tab this session was driving can no longer be resolved (it was closed, or a flaky relay dropped it)",
+            "the tab this command was driving is gone — it may have been closed, or the relay lost it",
+            "this session owns no resolvable tab in its group. Refusing to run on a tab this session does not drive",
+            "no attached tab ...",
+            "unknown sessionId ...",
+            "stale sessionId ... its tab is gone",
+        ] {
+            assert!(is_unreachable_tab_error(msg), "should detect: {msg}");
+        }
+        // The recoverable OAuth/SSO retarget and daemon/page-level failures
+        // are not tab-attach problems.
+        assert!(!is_unreachable_tab_error(
+            "the tab this command was driving is gone — it navigated across processes"
+        ));
+        assert!(!is_unreachable_tab_error(
+            "Auto-launch failed: Could not drive your Chrome through the ab-connect extension."
+        ));
+        assert!(!is_unreachable_tab_error(
+            "Failed to read: Resource temporarily unavailable (os error 35)"
+        ));
+        assert!(!is_unreachable_tab_error(
+            "chrome-use error: Element not found"
+        ));
+        let m = unreachable_tab_message("this session owns no resolvable tab");
+        assert!(m.ends_with("the chrome daemon itself is healthy)."));
+        assert!(m.contains("close the leftover tab in Chrome"));
     }
 }

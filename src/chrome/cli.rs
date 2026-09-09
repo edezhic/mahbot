@@ -23,8 +23,9 @@ use crate::chrome::actions;
 use crate::chrome::contract::{
     ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, ErrorPageProbe, ExpectOutcome,
     OutEnvelope, OutKind, classify_call_failure, eval_count, eval_result, expect_outcome,
-    extract_net_error_code, extract_output, extract_snapshot_text, net_error_phrase,
-    parse_error_page_probe, sanitize_timeout_message, with_condition_timeout_note,
+    extract_net_error_code, extract_output, extract_snapshot_text, is_session_unresponsive_error,
+    is_unreachable_tab_error, net_error_phrase, parse_error_page_probe, sanitize_timeout_message,
+    unreachable_tab_message, with_condition_timeout_note,
 };
 use crate::chrome::forms::{
     ExpectCond, ExtractGate, WaitTarget, count_eval_js, describe, expect_args, extract_gate,
@@ -46,6 +47,55 @@ use serde_json::{Value, json};
 /// `open` defaults higher: [`DEFAULT_OPEN_TIMEOUT`] (whole-operation budget).
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// `session stop` bound: chrome-use's stop (SIGTERM, ~1s wait, force-kill, tab
+/// cleanup) can legitimately take up to ~20s, so the 8s default step bound
+/// would report a misleading timeout after the stop actually succeeded.
+const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// `session status` probe bound: a real command against the named session, so
+/// chrome-use's own session-unresponsive classification has room to fire
+/// (its AGENT_BROWSER_DEFAULT_TIMEOUT is 15s) instead of the CLI preempting it.
+/// Opt-in — never part of the default per-command path.
+const SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The recovery flow for a wedged named session — the single source for both
+/// hint surfaces ([`with_session_wedge_hint`] and
+/// [`named_session_timeout_hint`]) so a wording change only happens here.
+/// References only verbs that exist in the mahbot surface.
+const SESSION_RECOVERY_FLOW: &str = "`mahbot chrome session stop <name>`, then re-run the action with \
+     `--session <name>` to re-create it (cookies persist in the profile; open \
+     tabs do not)";
+
+/// The session-wedge remediation appended by [`StepFailure::envelope`] to an
+/// Environment-classified chrome-use message that reads as a session wedge
+/// (matched by [`is_session_unresponsive_error`]); any other kind or message
+/// is returned unchanged. Gated on `named`: the `<name>` recovery verbs are
+/// only actionable for a session the agent chose (the interactive tool runs
+/// its own per-run sessions with daemon auto-recovery, so the CLI-only verbs
+/// would mislead there anyway).
+fn with_session_wedge_hint(kind: OutKind, message: &str, named: bool) -> String {
+    if named && kind == OutKind::Environment && is_session_unresponsive_error(message) {
+        format!(
+            "{message} — wedged: recover with {SESSION_RECOVERY_FLOW}. \
+             Probe first with `mahbot chrome session status <name>` if unsure."
+        )
+    } else {
+        message.to_string()
+    }
+}
+
+/// Appended to Timeout failures on a NAMED session: the CLI's own deadline
+/// preempts chrome-use's session-unresponsive diagnostic, so a wedged session
+/// surfaces as a generic per-command timeout. Factual hint only — no
+/// automatic recovery (a slow site would thrash). Shares the recovery flow
+/// with [`with_session_wedge_hint`] so the two hint surfaces cannot drift.
+fn named_session_timeout_hint() -> String {
+    format!(
+        " — a wedged session can also time out on every command; probe it with \
+         `mahbot chrome session status <name>`, or recover with {SESSION_RECOVERY_FLOW}."
+    )
+}
+
 /// Top-level `mahbot chrome -h` — rendered from the shared action registry.
 #[must_use]
 fn top_help() -> String {
@@ -66,7 +116,7 @@ fn top_help() -> String {
     }
     out.push_str("\nGlobal flags:\n");
     out.push_str(
-        "  --session <name>   use/name a session (not valid for status / session stop)\n\n",
+        "  --session <name>   use/name a session (not valid for status / session subcommands)\n\n",
     );
     out.push_str("Output (stdout, one JSON line):\n");
     out.push_str(
@@ -106,7 +156,7 @@ fn action_help(name: &str) -> String {
     if cli.session {
         flag_rows.push((
             "--session <name>",
-            "use/name a session (not valid for status / session stop)",
+            "use/name a session (not valid for status / session subcommands)",
         ));
     }
     if !flag_rows.is_empty() {
@@ -217,6 +267,9 @@ enum Action {
         name: String,
         force: bool,
     },
+    SessionStatus {
+        name: String,
+    },
 }
 
 /// Where `fill` gets its text.
@@ -242,19 +295,25 @@ impl TextInput {
 }
 
 /// A failed chrome-use step: the classified [`OutKind`] plus the error text
-/// (empty for a mahbot-side deadline kill).
+/// (empty for a mahbot-side deadline kill). `named` marks a step that ran in
+/// a named (non-ephemeral) session — it gates the session-wedge remediation
+/// hint, whose `session status/stop <name>` verbs are only actionable for a
+/// session the agent chose.
 #[derive(Debug)]
 struct StepFailure {
     kind: OutKind,
     message: String,
+    named: bool,
 }
 
 impl StepFailure {
     /// The failure envelope for `action`, layering the failure detail onto
     /// `base` params: a deadline kill reports `timeout_ms` plus a factual
-    /// `error`; any other failure reports the chrome-use `error` text, and
-    /// Network failures carry the extracted net error token as `error_code`
-    /// when the message contains one.
+    /// `error`; any other failure reports the chrome-use `error` text with
+    /// the accurate remediation layered on (unreachable-tab guidance, or the
+    /// session-wedge hint for named sessions), and Network failures carry the
+    /// extracted net error token as `error_code` when the message contains
+    /// one.
     fn envelope(self, action: &str, base: Value, timeout: Duration) -> OutEnvelope {
         let mut obj = match base {
             Value::Object(m) => m,
@@ -271,7 +330,12 @@ impl StepFailure {
                 json!(deadline_error(timeout, "the step did not complete")),
             );
         } else {
-            obj.insert("error".into(), json!(self.message));
+            let message = if is_unreachable_tab_error(&self.message) {
+                unreachable_tab_message(&self.message)
+            } else {
+                with_session_wedge_hint(self.kind, &self.message, self.named)
+            };
+            obj.insert("error".into(), json!(message));
         }
         if self.kind == OutKind::Network
             && let Some(code) = extract_net_error_code(&self.message)
@@ -382,7 +446,7 @@ fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
         "fill" => parse_fill(session.as_deref(), rest, allowed),
         "type" => parse_type(session.as_deref(), rest, allowed),
         "press" => parse_press(session.as_deref(), rest, allowed),
-        "session" => parse_session_stop(session.as_deref(), rest, allowed),
+        "session" => parse_session(session.as_deref(), rest, allowed),
         other => Err(format!("unknown action '{other}'")),
     }
 }
@@ -878,34 +942,49 @@ fn parse_press(
     })
 }
 
-fn parse_session_stop(
+fn parse_session(
     session: Option<&str>,
     rest: &[String],
     allowed: FlagSet,
 ) -> Result<Invocation, String> {
     if session.is_some() {
-        return Err("--session is not valid for session stop".to_string());
+        return Err("--session is not valid for session stop/status".to_string());
     }
     let sub = rest
         .first()
         .map(String::as_str)
-        .ok_or_else(|| "usage: session stop <name>".to_string())?;
-    if sub != "stop" {
-        return Err(format!(
-            "unknown session subcommand '{sub}' (expected 'stop')"
-        ));
+        .ok_or_else(|| "usage: session stop <name> | session status <name>".to_string())?;
+    match sub {
+        "stop" => {
+            let (value_flags, bool_flags) = allowed;
+            let (positionals, flags) = parse_flags(&rest[1..], value_flags, bool_flags)?;
+            let name = take_positional(&positionals, 0, "name")?;
+            reject_extra_positionals(&positionals, 1)?;
+            Ok(Invocation {
+                action: Action::SessionStop {
+                    name,
+                    force: flags.has("force"),
+                },
+                session: None,
+            })
+        }
+        "status" => {
+            let (value_flags, bool_flags) = allowed;
+            let (positionals, flags) = parse_flags(&rest[1..], value_flags, bool_flags)?;
+            if flags.has("force") {
+                return Err("--force is not valid for session status".to_string());
+            }
+            let name = take_positional(&positionals, 0, "name")?;
+            reject_extra_positionals(&positionals, 1)?;
+            Ok(Invocation {
+                action: Action::SessionStatus { name },
+                session: None,
+            })
+        }
+        other => Err(format!(
+            "unknown session subcommand '{other}' (expected 'stop' or 'status')"
+        )),
     }
-    let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags(&rest[1..], value_flags, bool_flags)?;
-    let name = take_positional(&positionals, 0, "name")?;
-    reject_extra_positionals(&positionals, 1)?;
-    Ok(Invocation {
-        action: Action::SessionStop {
-            name,
-            force: flags.has("force"),
-        },
-        session: None,
-    })
 }
 
 fn take_positional(positionals: &[String], idx: usize, name: &str) -> Result<String, String> {
@@ -975,26 +1054,34 @@ fn resolve_session(flag: Option<&str>) -> (String, bool) {
 /// the interactive tool's per-run sessions and link enrichment's sessions.
 const PROTECTED_SESSION_PREFIXES: [&str; 2] = ["agent-tab-", "link-enricher-"];
 
-/// Resolve a `session stop <name>` target. A bare name is treated as a CLI
-/// session name and prefixed (consistent with `--session`); a name in the CLI
-/// namespace passes through; a protected-namespace name is refused unless
-/// `force` — it is then used as-is (that is the point of forcing).
-fn resolve_stop_target(name: &str, force: bool) -> Result<String, String> {
-    if name.starts_with(CLI_SESSION_PREFIX) {
-        return Ok(name.to_string());
+/// Resolve a session name for a session-word subcommand. A bare name is
+/// treated as a CLI session name and prefixed (consistent with `--session`);
+/// CLI-namespace and protected-namespace names pass through as-is (status may
+/// probe protected sessions read-only; only stop gates them behind --force).
+fn resolve_session_target(name: &str) -> String {
+    if name.starts_with(CLI_SESSION_PREFIX)
+        || PROTECTED_SESSION_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+    {
+        return name.to_string();
     }
-    let protected = PROTECTED_SESSION_PREFIXES
-        .iter()
-        .any(|p| name.starts_with(p));
-    if protected {
-        if force {
-            return Ok(name.to_string());
-        }
+    format!("{CLI_SESSION_PREFIX}{name}")
+}
+
+/// `session stop` gating on top of [`resolve_session_target`].
+fn resolve_stop_target(name: &str, force: bool) -> Result<String, String> {
+    let target = resolve_session_target(name);
+    if !force
+        && PROTECTED_SESSION_PREFIXES
+            .iter()
+            .any(|p| target.starts_with(p))
+    {
         return Err(format!(
             "{name} is not a mahbot-chrome session; pass --force to stop it anyway"
         ));
     }
-    Ok(format!("{CLI_SESSION_PREFIX}{name}"))
+    Ok(target)
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────
@@ -1003,6 +1090,7 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
     match &invocation.action {
         Action::Status => (status().await, None),
         Action::SessionStop { name, force } => (session_stop(name, *force).await, None),
+        Action::SessionStatus { name } => (session_status(name).await, None),
         action => {
             let (name, ephemeral) = resolve_session(invocation.session.as_deref());
             let started = Instant::now();
@@ -1044,7 +1132,7 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
                     hold,
                     timeout,
                 } => press(key, selector.as_deref(), *hold, *timeout, &name).await,
-                Action::Status | Action::SessionStop { .. } => {
+                Action::Status | Action::SessionStop { .. } | Action::SessionStatus { .. } => {
                     unreachable!("handled by the outer match")
                 }
             };
@@ -1056,8 +1144,27 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
             {
                 obj.insert("elapsed_ms".into(), json!(started.elapsed().as_millis()));
             }
+            append_named_session_timeout_hint(&mut env, step_named(Some(&name)));
             (env, Some(CliSession { name, ephemeral }))
         }
+    }
+}
+
+/// Append the named-session timeout hint to a Timeout envelope. `named` is
+/// [`step_named`] on the resolved session name — the same predicate that
+/// gates the wedge hint in [`with_session_wedge_hint`], so the two surfaces
+/// agree on every input. The CLI's own deadline preempts chrome-use's
+/// session-unresponsive diagnostic, so a wedged named session otherwise
+/// surfaces as a bare timeout — the factual hint leaves it recoverable (rc
+/// stays 1, hint only; no automatic recovery, a slow site would thrash).
+fn append_named_session_timeout_hint(env: &mut OutEnvelope, named: bool) {
+    if env.kind == OutKind::Timeout
+        && named
+        && let Some(obj) = env.payload.as_object_mut()
+        && let Some(err) = obj.get("error").and_then(Value::as_str).map(str::to_string)
+    {
+        let hint = named_session_timeout_hint();
+        obj.insert("error".into(), json!(format!("{err}{hint}")));
     }
 }
 
@@ -1083,8 +1190,14 @@ async fn spawn_step(
     if session.is_some() {
         CHROME_USE_SPAWNED.store(true, Ordering::Relaxed);
     }
-    let failed = |kind: OutKind, message: String| Err(StepFailure { kind, message });
-    match spawn_cli(CliSpawn {
+    let failed = |kind: OutKind, message: String| {
+        Err(StepFailure {
+            kind,
+            message,
+            named: false,
+        })
+    };
+    let mut outcome = match spawn_cli(CliSpawn {
         path,
         args,
         session,
@@ -1104,6 +1217,7 @@ async fn spawn_step(
         CliRun::TimedOut => Err(StepFailure {
             kind: OutKind::Timeout,
             message: String::new(),
+            named: false,
         }),
         CliRun::Output(out) => classify_step_output(
             args.first() == Some(&"expect"),
@@ -1112,7 +1226,16 @@ async fn spawn_step(
             &out.stdout,
             String::from_utf8_lossy(&out.stderr).trim(),
         ),
+    };
+    if let Err(f) = &mut outcome {
+        f.named = step_named(session);
     }
+    outcome
+}
+
+/// Whether a spawned step ran in a named (non-ephemeral) session.
+fn step_named(session: Option<&str>) -> bool {
+    session.is_some_and(|s| !s.starts_with(CLI_EPHEMERAL_PREFIX))
 }
 
 /// Classify one chrome-use output (the `CliRun::Output` payload) into a step
@@ -1128,7 +1251,13 @@ fn classify_step_output(
     stdout: &[u8],
     stderr: &str,
 ) -> StepOutcome {
-    let failed = |kind: OutKind, message: String| Err(StepFailure { kind, message });
+    let failed = |kind: OutKind, message: String| {
+        Err(StepFailure {
+            kind,
+            message,
+            named: false,
+        })
+    };
     // Fallback message for a non-success exit / unparseable stdout.
     let fallback = || fallback_step_message(exit_code, stderr);
     let classified = |resp: ChromeResponse| {
@@ -1531,6 +1660,7 @@ async fn count_via_eval(
     eval_count(&resp).ok_or(StepFailure {
         kind: OutKind::Error,
         message: "count eval returned a non-numeric result".to_string(),
+        named: false,
     })
 }
 
@@ -1938,7 +2068,7 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
             );
         }
     };
-    let path = match require_cli("session", json!({ "session": name })) {
+    let path = match require_cli("session", json!({ "session": target })) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -1946,7 +2076,7 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
         &path,
         &["session", "stop", &target],
         None,
-        DEFAULT_STEP_TIMEOUT,
+        SESSION_STOP_TIMEOUT,
         None,
         None,
     )
@@ -1956,9 +2086,150 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
         Err(f) => f.envelope(
             "session",
             json!({ "session": target }),
-            DEFAULT_STEP_TIMEOUT,
+            SESSION_STOP_TIMEOUT,
         ),
     }
+}
+
+/// `session status <name>` — opt-in liveness probe for a named session. A
+/// daemon-free `session list` preflight (never creates a session or spawns a
+/// daemon) reports a stopped session as `empty` (rc 0); a listed session is
+/// probed with a real bounded `get url`. Any timeout on that probe is wedge
+/// evidence (the probe reads the current URL, it never navigates), so it
+/// re-classifies as Environment (rc 2) and picks up the wedge hint via
+/// [`StepFailure::envelope`].
+async fn session_status(name: &str) -> OutEnvelope {
+    let target = resolve_session_target(name);
+    let path = match require_cli("session", json!({ "session": target })) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let list = match spawn_step(
+        &path,
+        &["session", "list"],
+        None,
+        DEFAULT_STEP_TIMEOUT,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(f) => {
+            return f.envelope(
+                "session",
+                json!({ "session": target, "stage": "enumerate" }),
+                DEFAULT_STEP_TIMEOUT,
+            );
+        }
+    };
+    if !session_listed(&list, &target) {
+        return out_env(
+            "session",
+            true,
+            OutKind::Empty,
+            json!({ "session": target, "detail": "session is not running — nothing to probe" }),
+        );
+    }
+    match spawn_step(
+        &path,
+        &["get", "url"],
+        Some(&target),
+        SESSION_PROBE_TIMEOUT,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(resp) => {
+            let url = resp
+                .data
+                .as_ref()
+                .and_then(|d| d.get("url"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            out_env(
+                "session",
+                true,
+                OutKind::Ok,
+                json!({ "session": target, "status": "usable", "url": url }),
+            )
+        }
+        Err(mut f) => {
+            // Any timeout on the probe is wedge evidence (it reads the
+            // current URL, it never navigates) — re-classify as Environment
+            // with chrome-use's signature phrasing so the wedge hint attaches
+            // in `StepFailure::envelope`, exactly like chrome-use's own
+            // session-unresponsive classification. Namedness rides
+            // [`step_named`] (a literal `mahbot-chrome-ephemeral-*` argument
+            // is not a name the agent can recover through). Other failures
+            // pass through with their honest cause (not every failure is a
+            // wedge).
+            if f.kind == OutKind::Timeout {
+                f = StepFailure {
+                    kind: OutKind::Environment,
+                    message: format!(
+                        "session unresponsive: no answer to the liveness probe (get url) within {}s",
+                        SESSION_PROBE_TIMEOUT.as_secs()
+                    ),
+                    named: step_named(Some(&target)),
+                };
+            }
+            // A protected-namespace wedge needs `--force` to stop — make the
+            // recovery hint directly actionable for that edge. Only wedges
+            // get the note (an honest non-wedge cause must not carry stop
+            // guidance), and only protected ones (an ordinary session's stop
+            // needs no --force).
+            append_protected_stop_note(&mut f.message, &target);
+            f.envelope(
+                "session",
+                json!({ "session": target }),
+                SESSION_PROBE_TIMEOUT,
+            )
+        }
+    }
+}
+
+/// Append the protected-namespace `--force` note to a probe-failure message
+/// that reads as a session wedge on a protected (`agent-tab-*` /
+/// `link-enricher-*`) target: the shared wedge hint says
+/// `session stop <name>`, which is only actionable with `--force` here. Pure
+/// so tests pin both gates (protected membership, wedge-shaped message).
+fn append_protected_stop_note(message: &mut String, target: &str) {
+    if PROTECTED_SESSION_PREFIXES
+        .iter()
+        .any(|p| target.starts_with(p))
+        && is_session_unresponsive_error(message)
+    {
+        write!(
+            message,
+            " (protected namespace: stopping '{target}' requires `session stop {target} --force`)"
+        )
+        .expect("writing to a String cannot fail");
+    }
+}
+
+/// Tolerance-first membership check over a `session list` envelope: only an
+/// explicit failure verdict rules the target out as a hard miss; a payload
+/// with no verdict key still gets its names extracted. Handles both chrome-use
+/// shapes — latest `{"ok":true,"sessions":[{"name":..},..]}` (the top-level
+/// `sessions` key lands in `extra`) and legacy `{"data":{"sessions":["name",..]}}`.
+fn session_listed(resp: &ChromeResponse, target: &str) -> bool {
+    if resp.verdict() == Some(false) {
+        return false;
+    }
+    let names = resp
+        .extra
+        .get("sessions")
+        .or_else(|| resp.data.as_ref().and_then(|d| d.get("sessions")));
+    let Some(Value::Array(arr)) = names else {
+        return false;
+    };
+    arr.iter().any(|entry| match entry {
+        Value::String(s) => s == target,
+        Value::Object(_) => entry.get("name").and_then(Value::as_str) == Some(target),
+        _ => false,
+    })
 }
 
 /// Best-effort close of an ephemeral session AFTER the action envelope is
@@ -2080,6 +2351,274 @@ mod tests {
             "agent-tab-1"
         );
         assert!(resolve_stop_target("link-enricher-7", false).is_err());
+    }
+
+    #[test]
+    fn resolve_session_target_resolves_namespaces() {
+        // A bare name is prefixed like `--session`; both namespace names pass
+        // through as-is (status may probe protected sessions read-only).
+        assert_eq!(resolve_session_target("docs"), "mahbot-chrome-docs");
+        assert_eq!(
+            resolve_session_target("mahbot-chrome-foo"),
+            "mahbot-chrome-foo"
+        );
+        assert_eq!(resolve_session_target("agent-tab-1"), "agent-tab-1");
+        assert_eq!(resolve_session_target("link-enricher-7"), "link-enricher-7");
+    }
+
+    #[test]
+    fn session_status_parses_and_rejects() {
+        // status parses into SessionStatus.
+        let inv = parse_invocation(&["session".into(), "status".into(), "docs".into()])
+            .expect("session status parses");
+        match inv.action {
+            Action::SessionStatus { name } => assert_eq!(name, "docs"),
+            _ => panic!("expected SessionStatus"),
+        }
+
+        // The global --session flag is rejected for session subcommands.
+        let err = parse_invocation(&[
+            "session".into(),
+            "status".into(),
+            "docs".into(),
+            "--session".into(),
+            "x".into(),
+        ])
+        .err()
+        .expect("--session must be rejected for session subcommands");
+        assert_eq!(err, "--session is not valid for session stop/status");
+
+        // --force is rejected for status.
+        let err = parse_session(
+            None,
+            &["status".into(), "docs".into(), "--force".into()],
+            (&[], &["force"]),
+        )
+        .err()
+        .expect("--force must be rejected for session status");
+        assert_eq!(err, "--force is not valid for session status");
+
+        // Extra positionals are rejected for status.
+        assert!(
+            parse_session(
+                None,
+                &["status".into(), "a".into(), "b".into()],
+                (&[], &["force"]),
+            )
+            .is_err()
+        );
+
+        // An unknown sub names both verbs.
+        let err = parse_invocation(&["session".into(), "destroy".into(), "docs".into()])
+            .err()
+            .expect("unknown sub must be rejected");
+        assert!(
+            err.contains("unknown session subcommand 'destroy' (expected 'stop' or 'status')"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn session_listed_handles_both_shapes() {
+        // Latest shape: the top-level `sessions` array of objects (lands in
+        // `extra`), listed by name.
+        let latest: ChromeResponse = serde_json::from_value(json!({
+            "ok": true, "sessions": [{ "name": "mahbot-chrome-docs" }]
+        }))
+        .expect("deserialize latest shape");
+        assert!(session_listed(&latest, "mahbot-chrome-docs"));
+        assert!(!session_listed(&latest, "mahbot-chrome-other"));
+
+        // Legacy shape: `data.sessions` array of strings.
+        let legacy: ChromeResponse = serde_json::from_value(json!({
+            "success": true, "data": { "sessions": ["mahbot-chrome-docs"] }
+        }))
+        .expect("deserialize legacy shape");
+        assert!(session_listed(&legacy, "mahbot-chrome-docs"));
+
+        // An explicit failure verdict rules the target out.
+        let failed: ChromeResponse =
+            serde_json::from_value(json!({ "success": false })).expect("deserialize failure");
+        assert!(!session_listed(&failed, "mahbot-chrome-docs"));
+
+        // No sessions key at all → not listed.
+        let no_sessions: ChromeResponse =
+            serde_json::from_value(json!({ "success": true, "data": {} }))
+                .expect("deserialize empty payload");
+        assert!(!session_listed(&no_sessions, "mahbot-chrome-docs"));
+    }
+
+    #[test]
+    fn with_session_wedge_hint_appends_only_for_named_environment_matches() {
+        let message = "CDP session is unresponsive after attaching (Connection reset).";
+        let wedge = format!(
+            "{message} — wedged: recover with {SESSION_RECOVERY_FLOW}. \
+             Probe first with `mahbot chrome session status <name>` if unsure."
+        );
+        // Named + Environment + matcher hit → hint appended.
+        assert_eq!(
+            with_session_wedge_hint(OutKind::Environment, message, true),
+            wedge
+        );
+        // Ephemeral session → unchanged (the `<name>` verbs are unactionable).
+        assert_eq!(
+            with_session_wedge_hint(OutKind::Environment, message, false),
+            message
+        );
+        // Timeout + matcher hit → unchanged (the matcher only fires for
+        // Environment-classified messages).
+        assert_eq!(
+            with_session_wedge_hint(OutKind::Timeout, message, true),
+            message
+        );
+        // Environment + plain text → unchanged.
+        assert_eq!(
+            with_session_wedge_hint(OutKind::Environment, "some other failure", true),
+            "some other failure"
+        );
+    }
+
+    #[test]
+    fn protected_stop_note_targets_only_protected_wedges() {
+        // A wedge-shaped failure on a protected target gets the note — with
+        // the full actionable command, so no stitching with the shared hint.
+        let mut msg = "session unresponsive: no response within 45s".to_string();
+        append_protected_stop_note(&mut msg, "agent-tab-1");
+        assert!(
+            msg.ends_with("(protected namespace: stopping 'agent-tab-1' requires `session stop agent-tab-1 --force`)"),
+            "note missing: {msg}"
+        );
+
+        // An ordinary session's stop needs no --force — no note.
+        let mut msg = "session unresponsive: no response within 45s".to_string();
+        append_protected_stop_note(&mut msg, "mahbot-chrome-docs");
+        assert_eq!(msg, "session unresponsive: no response within 45s");
+
+        // A non-wedge failure on a protected target keeps its honest cause.
+        let mut msg = "element not found".to_string();
+        append_protected_stop_note(&mut msg, "agent-tab-1");
+        assert_eq!(msg, "element not found");
+    }
+
+    #[test]
+    fn envelope_layers_accurate_remediation() {
+        // An Environment-classified session wedge on a named session picks up
+        // the wedge hint.
+        let env = StepFailure {
+            kind: OutKind::Environment,
+            message: "session unresponsive: no response within 45s".to_string(),
+            named: true,
+        }
+        .envelope(
+            "session",
+            json!({ "session": "mahbot-chrome-docs" }),
+            DEFAULT_STEP_TIMEOUT,
+        );
+        let err = env
+            .payload
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("error present");
+        assert!(err.contains(&with_session_wedge_hint(
+            OutKind::Environment,
+            "session unresponsive: no response within 45s",
+            true
+        )));
+
+        // The same wedge on an ephemeral session is returned untouched (the
+        // `<name>` recovery verbs are unactionable there).
+        let env = StepFailure {
+            kind: OutKind::Environment,
+            message: "session unresponsive: no response within 45s".to_string(),
+            named: false,
+        }
+        .envelope("open", json!({ "url": "https://x" }), DEFAULT_STEP_TIMEOUT);
+        assert_eq!(
+            env.payload.get("error").and_then(Value::as_str),
+            Some("session unresponsive: no response within 45s")
+        );
+
+        // A non-wedge message is returned untouched (no hint).
+        let env = StepFailure {
+            kind: OutKind::Environment,
+            message: "relay isn't connected".to_string(),
+            named: true,
+        }
+        .envelope(
+            "session",
+            json!({ "session": "mahbot-chrome-docs" }),
+            DEFAULT_STEP_TIMEOUT,
+        );
+        assert_eq!(
+            env.payload.get("error").and_then(Value::as_str),
+            Some("relay isn't connected")
+        );
+
+        // A Timeout deadline kill still reports the factual deadline error.
+        let env = StepFailure {
+            kind: OutKind::Timeout,
+            message: String::new(),
+            named: true,
+        }
+        .envelope(
+            "session",
+            json!({ "session": "mahbot-chrome-docs" }),
+            Duration::from_secs(8),
+        );
+        let expected = deadline_error(Duration::from_secs(8), "the step did not complete");
+        assert_eq!(
+            env.payload.get("error").and_then(Value::as_str),
+            Some(expected.as_str())
+        );
+        assert!(env.payload.get("timeout_ms").is_some());
+    }
+
+    #[test]
+    fn append_named_session_timeout_hint_only_applies_to_named_timeouts() {
+        let timeout_error = "deadline reached after 8000ms — the step did not complete";
+        // A named Timeout envelope gets the hint appended to its error.
+        let mut env = out_env(
+            "open",
+            false,
+            OutKind::Timeout,
+            json!({ "url": "https://x", "error": timeout_error }),
+        );
+        append_named_session_timeout_hint(&mut env, true);
+        let err = env
+            .payload
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("error present");
+        assert!(
+            err.ends_with(&named_session_timeout_hint()),
+            "named timeout hint missing: {err}"
+        );
+
+        // An unnamed (ephemeral) session Timeout is untouched.
+        let mut env = out_env(
+            "open",
+            false,
+            OutKind::Timeout,
+            json!({ "url": "https://x", "error": timeout_error }),
+        );
+        append_named_session_timeout_hint(&mut env, false);
+        assert_eq!(
+            env.payload.get("error").and_then(Value::as_str),
+            Some(timeout_error)
+        );
+
+        // A named non-Timeout envelope is untouched.
+        let mut env = out_env(
+            "open",
+            false,
+            OutKind::Error,
+            json!({ "url": "https://x", "error": "some error" }),
+        );
+        append_named_session_timeout_hint(&mut env, true);
+        assert_eq!(
+            env.payload.get("error").and_then(Value::as_str),
+            Some("some error")
+        );
     }
 
     /// Direct pin of the spawn-level classification, including the crux of the
@@ -2256,6 +2795,7 @@ mod tests {
         let env = StepFailure {
             kind: OutKind::Timeout,
             message: String::new(),
+            named: false,
         }
         .envelope("wait", json!({ "selector": ".x" }), timeout);
         assert_eq!(env.payload["timeout_ms"], 8000);
@@ -2268,6 +2808,7 @@ mod tests {
         let env = StepFailure {
             kind: OutKind::Network,
             message: "net::ERR_NAME_NOT_RESOLVED".into(),
+            named: false,
         }
         .envelope("open", json!({ "url": "https://x" }), timeout);
         assert_eq!(env.payload["error"], "net::ERR_NAME_NOT_RESOLVED");
@@ -2279,6 +2820,7 @@ mod tests {
         let env = StepFailure {
             kind: OutKind::Network,
             message: "connection refused by peer".into(),
+            named: false,
         }
         .envelope("open", json!({ "url": "https://x" }), timeout);
         assert!(env.payload.get("error_code").is_none());

@@ -480,10 +480,10 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "session",
-            purpose: "stop a named CLI session (session stop)",
+            purpose: "manage named CLI sessions (session stop / session status)",
             tool: None,
             cli: Some(CliHelp {
-                syntax: "stop <name> [--force]",
+                syntax: "stop <name> [--force] | status <name>",
                 flags: &[(
                     "--force",
                     "also stop protected agent-tab-* / link-enricher-* sessions",
@@ -491,6 +491,7 @@ fn build_actions() -> Vec<ActionDesc> {
                 session: false,
                 kinds: &[
                     OutKind::Ok,
+                    OutKind::Empty,
                     OutKind::Timeout,
                     OutKind::Network,
                     OutKind::NotFound,
@@ -498,8 +499,11 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "Refuses to stop protected sessions (the interactive tool's agent-tab-* and the link enricher's link-enricher-*) unless --force is passed. Session names are prefixed with mahbot-chrome- unless already prefixed.",
-                examples: &["mahbot chrome session stop docs"],
+                details: "Manages named CLI sessions. stop refuses protected sessions (agent-tab-* / link-enricher-*) unless --force; names are prefixed mahbot-chrome- unless already prefixed. status is an opt-in liveness probe (worst case ~30s: session-list preflight + a real bounded get-url against the session): a not-running session reports empty (rc 0); a wedged one reports environment (rc 2) with the recovery hint. Recovery = graceful `session stop <name>`, then re-create by re-running the action with `--session <name>` — cookies persist in the profile, open tabs/tab-group identity do not. The global `status` action is session-unaware and can report healthy while a named session is wedged.",
+                examples: &[
+                    "mahbot chrome session stop docs",
+                    "mahbot chrome session status docs",
+                ],
             }),
         },
         ActionDesc {
