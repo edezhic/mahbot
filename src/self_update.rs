@@ -102,7 +102,7 @@ pub fn acquire_lock(storage_root: &Path) -> Result<()> {
         }
         None => Err(anyhow!(
             "Another instance of mahbot is already running (lock file: {}). \
-             If no other instance is running, delete this file manually.",
+             The lock is a kernel flock released automatically when that instance exits.",
             lock_path.display()
         )),
     }

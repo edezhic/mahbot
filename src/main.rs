@@ -32,6 +32,23 @@ const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-
 /// JetBrainsMono-Italic.ttf embedded for italic narration text in the Iced dashboard.
 const JETBRAINS_MONO_ITALIC_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Italic.ttf");
 
+/// Top-level `--help` text. Lists only the public subcommands (hidden
+/// internals like `__grep-engine` are excluded).
+const TOP_LEVEL_USAGE: &str = "\
+mahbot — autonomous agentic engineering system with a GUI dashboard daemon
+
+Usage:
+  mahbot                 Launch the GUI dashboard daemon
+  mahbot chrome <args>   Browser automation CLI over the shared chrome core
+  mahbot debug           Read-only SQL query tool against the live stores
+  mahbot bench-openrouter <args>
+                         Standalone OpenRouter provider benchmark
+
+Options:
+  -h, --help             Print this help and exit
+  -V, --version          Print the version and exit
+";
+
 /// INFO-log retention window (hours): the log-cleanup loop deletes INFO
 /// entries older than this. Independent of the session-purge cutoff.
 const LOG_RETENTION_HOURS: i64 = 8;
@@ -596,6 +613,23 @@ fn main() -> Result<()> {
         let args = std::env::args().skip(2).collect::<Vec<_>>();
         let code = rt.block_on(mahbot::run_chrome_cli(&args));
         std::process::exit(code);
+    }
+
+    // Top-level help/version flags: print and exit before temp-root init and
+    // lock acquisition, so they work while the daemon holds the instance flock
+    // (and when it doesn't — without this they would boot the GUI daemon).
+    // Only exact argv[1] tokens are matched; subcommand-level flags
+    // (`mahbot chrome -h` etc.) keep routing to their own CLI handlers.
+    match std::env::args().nth(1).as_deref() {
+        Some("-h" | "--help") => {
+            print!("{TOP_LEVEL_USAGE}");
+            return Ok(());
+        }
+        Some("-V" | "--version") => {
+            println!("mahbot {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        _ => {}
     }
 
     // Consolidate ALL daemon temp files under one private root
