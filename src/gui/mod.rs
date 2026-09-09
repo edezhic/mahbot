@@ -2525,7 +2525,9 @@ fn page_icon(page: Page, size: u32, color: Color) -> Element<'static, Message> {
 }
 
 /// Shared sidebar toggle wrapper — wraps an icon inside a centered,
-/// full-width button with a tooltip at the given `position`.
+/// full-width button with a tooltip at the given `position`. The generous
+/// vertical padding gives the nav buttons a large hit area within the fixed
+/// 56px rail.
 ///
 /// Used by [`Dashboard::sidebar_nav_column`] (the sidebar nav icons).
 fn render_sidebar_toggle<'a>(
@@ -2539,7 +2541,7 @@ fn render_sidebar_toggle<'a>(
             container(icon)
                 .width(Length::Fill)
                 .center_x(Length::Fill)
-                .padding([theme::PAD_4, 0.0]),
+                .padding([theme::PAD_10, 0.0]),
         )
         .width(Length::Fill)
         .padding(0)
@@ -2563,14 +2565,14 @@ impl Dashboard {
             .width(Length::Fixed(56.0))
             .height(Length::Fill)
             .style(theme::surface_container_style)
-            .padding(theme::PAD_12)
+            .padding(theme::PAD_4)
             .into()
     }
 
     /// Shared nav-icon column for the sidebar top and bottom navs. Each page
-    /// is rendered as a 28px icon button; the active page is accent-colored,
-    /// and Editor/Shell are disabled (TEXT_FAINT, no press) when no workspace
-    /// is selectable.
+    /// is rendered as a 48px-tall full-width icon button (28px icon); the
+    /// active page is accent-colored, and Editor/Shell are disabled
+    /// (TEXT_FAINT, no press) when no workspace is selectable.
     ///
     /// Uses Position::Right — iced snaps Top tooltips into the viewport,
     /// overlapping the topmost sidebar button.
@@ -2611,14 +2613,14 @@ impl Dashboard {
         col
     }
 
-    /// Sidebar top nav icons: Home, Editor, Shell (28px). Running Agents
+    /// Sidebar top nav icons: Home, Editor, Shell. Running Agents
     /// is not in the sidebar — it is reachable only via the footer activity
     /// indicators.
     fn render_sidebar_nav(&self) -> Element<'_, Message> {
         self.sidebar_nav_column(Page::sidebar_pages()).into()
     }
 
-    /// Sidebar bottom nav icons: Sessions, Logs, Settings (28px) — click-only,
+    /// Sidebar bottom nav icons: Sessions, Logs, Settings — click-only,
     /// no keyboard shortcut.
     fn render_sidebar_bottom_nav(&self) -> Element<'_, Message> {
         self.sidebar_nav_column(Page::sidebar_bottom_pages()).into()

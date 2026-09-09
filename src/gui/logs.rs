@@ -3,13 +3,13 @@
 //!
 //! Each tab (All Logs / Issues / Tool Failures) keeps its own entries,
 //! pagination state and search query, so switching tabs never reuses another
-//! tab's page index or search. Pause is a single global control. The bottom
-//! bar holds pagination + pause + search; the top bar holds only the tabs.
+//! tab's page index or search. The bottom bar holds pagination + search; the
+//! top bar holds only the tabs.
 
 use crate::logs::{LogEntry, LogQuery, LogStore};
 
 use iced::advanced::text::Span;
-use iced::widget::{Column, Space, button, column, container, row, text, tooltip};
+use iced::widget::{Column, Space, button, column, container, row, text};
 use iced::{Alignment, Element, Length, Subscription, Task, window};
 use iced_anim::Animated;
 use iced_anim::transition::Easing;
@@ -74,9 +74,6 @@ pub enum LogMessage {
     PrevPage,
     NextPage,
 
-    // Pause/Resume
-    TogglePause,
-
     /// Per-frame tick for the fade-in animation.
     AnimTick(Instant),
 
@@ -111,9 +108,6 @@ pub struct LogsState {
     // Tab state
     active_tab: LogsTab,
 
-    // Stream control (global across tabs)
-    paused: bool,
-
     /// Visual highlight for search input (Cmd+F).
     focus_search: bool,
 
@@ -135,7 +129,6 @@ impl LogsState {
             issues: PaginatedTabState::new(50),
             tool_failures_state: super::tool_failures::ToolFailuresState::new(),
             active_tab: LogsTab::AllLogs,
-            paused: false,
             focus_search: false,
             newest_entry_timestamp: None,
             fade_anim: Animated::transition(
@@ -239,12 +232,11 @@ impl LogsState {
     }
 
     pub fn subscription(&self) -> Subscription<LogMessage> {
-        // Live log stream only while the All Logs tab is active and unpaused.
-        // Frame ticks are subscribed only while the fade animation is running —
+        // Live log stream only while the All Logs tab is active. Frame ticks are subscribed only while the fade animation is running —
         // an always-on frames() subscription closes a self-sustaining redraw
         // loop (redraw → AnimTick → redraw).
         let mut subs: Vec<Subscription<LogMessage>> = Vec::new();
-        if !self.paused && self.active_tab == LogsTab::AllLogs {
+        if self.active_tab == LogsTab::AllLogs {
             subs.push(iced::Subscription::run(log_stream_producer));
         }
         if self.fade_anim.is_animating() {
@@ -275,8 +267,8 @@ impl LogsState {
                 Task::none()
             }
             LogMessage::LiveEntry(entry) => {
-                // Live entries only arrive while the All Logs tab is active and
-                // unpaused (the subscription is gated in `subscription()`).
+                // Live entries only arrive while the All Logs tab is active
+                // (the subscription is gated in `subscription()`).
                 let data = &mut self.all_logs;
                 // Only prepend live entries when on page 0 (the live view).
                 // Other pages are static snapshots from the database.
@@ -379,15 +371,6 @@ impl LogsState {
                     .next_page()
                     .map(LogMessage::ToolFailures),
             },
-            LogMessage::TogglePause => {
-                self.paused = !self.paused;
-                if !self.paused {
-                    // Resume refreshes whatever tab is active — the pause
-                    // button works from every tab.
-                    return self.refresh_active_tab(log_store);
-                }
-                Task::none()
-            }
             LogMessage::Escape => {
                 self.focus_search = false;
                 Task::none()
@@ -465,7 +448,7 @@ impl LogsState {
         // tracing to report them without recursing into itself).
         let write_error_banner = Self::write_error_banner();
 
-        // ── Bottom bar: pagination + pause + search ───────────────
+        // ── Bottom bar: pagination + search ────────────────────────
         let bottom_bar = self.bottom_bar();
 
         let content = column![tab_bar, write_error_banner, body, bottom_bar]
@@ -524,10 +507,8 @@ impl LogsState {
         .into()
     }
 
-    /// Render the bottom bar: pause button, pagination controls, and the
-    /// search input. Pagination and search are bound to the active tab; pause
-    /// is a single global control that works from every tab.
-    #[expect(clippy::too_many_lines)]
+    /// Render the bottom bar: pagination controls and the search input, both
+    /// bound to the active tab.
     fn bottom_bar(&self) -> Element<'_, LogMessage> {
         let (page, total_pages) = match self.tab_data(self.active_tab) {
             Some(d) => (d.pagination.page, d.pagination.total_pages()),
@@ -601,32 +582,7 @@ impl LogsState {
         ]
         .align_y(Alignment::Center);
 
-        let pause_button = {
-            let pause_btn: iced::Element<'_, LogMessage> = if self.paused {
-                lucide::play::<iced::Theme, iced::Renderer>()
-                    .size(theme::TEXT_13)
-                    .color(theme::TEXT_MUTED)
-                    .into()
-            } else {
-                lucide::pause::<iced::Theme, iced::Renderer>()
-                    .size(theme::TEXT_13)
-                    .color(theme::TEXT_MUTED)
-                    .into()
-            };
-            tooltip(
-                button(pause_btn)
-                    .style(theme::button_text)
-                    .on_press(LogMessage::TogglePause),
-                if self.paused { "Resume" } else { "Pause" },
-                tooltip::Position::Top,
-            )
-            .style(theme::tooltip_style)
-            .delay(Duration::from_millis(400))
-        };
-
         let bottom_row = row![
-            pause_button,
-            Space::new().width(theme::SPACE_12),
             pagination_cluster,
             Space::new().width(Length::Fill),
             search_group,
@@ -706,9 +662,8 @@ impl LogsState {
                     .spacing(theme::SPACE_2),
                 );
 
-                // Stick to bottom when not paused (latest entries at top, but we
-                // want to scroll to latest entries which are at position 0).
-                // For new live entries, we insert at position 0, so no scrolling needed.
+                // New live entries insert at position 0, so no scrolling is
+                // needed to keep the latest entry visible.
 
                 scroll
             };
