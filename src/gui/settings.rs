@@ -1439,7 +1439,7 @@ impl SettingsState {
                 if self.add_user_sender.text().is_empty() {
                     return Task::none();
                 }
-                // The permission-derived role pool no longer stores per-user
+                // The constant single-Assistant role pool stores no per-user
                 // roles; the manual Settings bypass always assigns the
                 // Assistant as the single default agent.
                 let default_role = Role::Assistant;
@@ -2626,7 +2626,7 @@ impl SettingsState {
             "Manager",
             crate::config::DEFAULT_MANAGER_MODEL,
             CONFIG_KEY_MANAGER_MODEL,
-            "Manager, Assistant, Discovery, Engineer, Support, Maintainer",
+            "Manager, Assistant, Discovery, Engineer, Maintainer",
         );
         let worker_row = self.config_model_slot_field(
             "Worker",

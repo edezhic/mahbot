@@ -398,7 +398,8 @@ pub enum BotCommand {
     /// `/update` — run a self-update and restart the daemon (admin, shown only
     /// when the shared availability cache confirms an update is available).
     Update,
-    /// `/agents` — open the inline role picker (pool-gated buttons).
+    /// `/agents` — reply that there is nothing to switch. No longer in any
+    /// command menu; kept as a graceful reply for users who still type it.
     Agents,
 }
 
@@ -465,7 +466,7 @@ pub struct ChannelMessage {
     /// Channel-side chat id of the message this message originated from.
     /// Populated for Telegram messages and callback queries; `None` for
     /// other channels. Used to address the source message in place (e.g.
-    /// editing the role-picker keyboard after a callback).
+    /// editing a picker keyboard after a callback).
     pub chat_id: Option<String>,
     /// Channel-side message id of the originating message (see [`Self::chat_id`]).
     pub message_id: Option<i64>,
@@ -695,7 +696,6 @@ pub enum Role {
     Maintainer,
     Sanitation,
     Assistant,
-    Support,
 }
 
 // ── Agent ───────────────────────────────────────────────────────
@@ -1636,7 +1636,7 @@ mod tests {
             ("/UPDATE", Some(Update)),
             ("/update foo", Some(Update)),
             ("  /update  ", Some(Update)),
-            // /agents inline role picker
+            // /agents (replies "nothing to switch" — no picker anymore)
             ("/agents", Some(Agents)),
             ("/AGENTS", Some(Agents)),
             ("/agents foo", Some(Agents)),

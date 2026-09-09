@@ -353,17 +353,13 @@ pub enum Message {
     OpenDiffModal(Option<String>),
     /// Close the diff modal.
     CloseDiffModal,
-    /// Set the selected user's active role + pool for the role switcher
-    /// indicator. Fetched together (single task, single pool read) to
-    /// avoid a double pool query.
-    RoleAndPoolLoaded {
-        role: Option<Role>,
-        pool: Vec<Role>,
+    /// Set the selected user's admin flag, fetched in a single task. Kept
+    /// separate from the removed role-switcher cache: the Settings lists and
+    /// the Sessions page are filtered by admin status, so they must re-sync
+    /// once it settles.
+    AdminLoaded {
         is_admin: bool,
     },
-    /// A role switch failed — refresh the role cache so the composer's
-    /// optimistic role icon reverts to the persisted active role.
-    RoleSwitchFailed(String),
     /// TTS model download progress event.
     TtsDownloadEvent(crate::audio::tts::TtsDownloadEvent),
 }
@@ -550,12 +546,6 @@ pub struct Dashboard {
     selected_workspace_name: Option<String>,
     /// Currently selected user name (for impersonation). Persisted in window state.
     selected_user_name: Option<String>,
-    /// Cached selected role for the current user — the composer role dropdown
-    /// uses it to visually indicate which role is active.
-    selected_user_role: Option<Role>,
-    /// Cached role pool for the current user — the switchable roles shown in
-    /// the composer role dropdown.
-    selected_user_roles: Vec<Role>,
     /// Cached admin status for the current user — the single reliable source
     /// of the active user's admin flag, used to gate shared-workspace
     /// membership across all GUI surfaces. Fail-closed: `false` until loaded.
@@ -619,8 +609,6 @@ impl Dashboard {
             workspaces: HashMap::new(),
             selected_workspace_name: None,
             selected_user_name: None,
-            selected_user_role: None,
-            selected_user_roles: Vec::new(),
             selected_user_is_admin: false,
             exit_requested_during_update: false,
             draining: false,
@@ -663,7 +651,7 @@ impl Dashboard {
 
                 // The Home chat now runs the Phase-1 scripted onboarding
                 // scenario while no LLM provider is configured (and fires the
-                // Phase-2 Support kickoff once a provider is set), so no boot
+                // Phase-2 Assistant kickoff once a provider is set), so no boot
                 // redirect to Settings is needed here. The decision is made
                 // after the config is fully loaded (bootstrap_mahbot
                 // finished), not in the initial loading state where CONFIG
@@ -761,8 +749,9 @@ impl Dashboard {
             self.home_state.selected_user = Some(user_name.clone());
             crate::audio::voice::set_active_user_name(user_name);
         }
-        // Load the selected user's role and role pool for the role switcher.
-        let role_cache = self.refresh_selected_user_role_cache();
+        // Load the selected user's admin status for the Settings/Sessions
+        // gating.
+        let admin_cache = self.refresh_selected_user_admin_cache();
 
         let load_users = self.home_state.load_users().map(Message::Home);
 
@@ -778,7 +767,7 @@ impl Dashboard {
             restored_name.to_owned()
         };
         Task::batch([
-            role_cache,
+            admin_cache,
             self.propagate_workspace_selection(&ws_name),
             load_users,
         ])
@@ -969,26 +958,19 @@ impl Dashboard {
         }
     }
 
-    /// Load the selected user's active role + role pool into the cached
-    /// role-switcher state (composer role dropdown pool guard and 'current'
-    /// marker). Called at boot, on user switch, and after Settings edits
-    /// that touch the selected user's role or pool.
-    fn refresh_selected_user_role_cache(&self) -> Task<Message> {
+    /// Load the selected user's admin status into the cached admin flag used
+    /// to gate shared-workspace membership across the Settings lists and the
+    /// Sessions page. Called at boot and on user switch.
+    fn refresh_selected_user_admin_cache(&self) -> Task<Message> {
         let Some(ref user) = self.selected_user_name else {
             return Task::none();
         };
         let user = user.clone();
-        // Single task, single permissions read: admin flag + pool together,
-        // then the role resolved from the already-fetched pool.
+        // Single task: the admin flag from a permissions read.
         Task::perform(
             async move {
-                let (is_admin, pool) = crate::users::admin_and_pool(&user).await;
-                let role = crate::users::resolve_active_role_from_pool(&user, &pool).await;
-                Message::RoleAndPoolLoaded {
-                    role,
-                    pool,
-                    is_admin,
-                }
+                let is_admin = crate::users::is_admin(&user).await;
+                Message::AdminLoaded { is_admin }
             },
             std::convert::identity,
         )
@@ -1246,60 +1228,13 @@ impl Dashboard {
                 if let home::HomeMessage::UserSelected(ref user) = msg {
                     self.selected_user_name = Some(user.clone());
                     self.board_state.current_user_name = Some(user.clone());
-                    self.selected_user_role = None; // reset until loaded
-                    self.selected_user_roles = Vec::new();
                     self.selected_user_is_admin = false; // fail-closed until loaded
                     crate::audio::voice::set_active_user_name(user);
                     self.persist_window_state();
-                    let role_cache = self.refresh_selected_user_role_cache();
+                    let admin_cache = self.refresh_selected_user_admin_cache();
                     return Task::batch([
-                        role_cache,
+                        admin_cache,
                         self.home_state.update(msg.clone()).map(Message::Home),
-                    ]);
-                }
-                // Intercept SwitchRole: user selected a new role from the
-                // composer role dropdown — persist it and show a toast. The
-                // dropdown is built from the cached pool, so the pool check
-                // is synchronous against that same list.
-                if let home::HomeMessage::SwitchRole(ref user_name, ref role) = msg {
-                    if !self.selected_user_roles.contains(role) {
-                        return Task::done(Message::Home(home::HomeMessage::Toast(
-                            ToastMessage::Error(format!(
-                                "Role '{}' is not in {}'s allowed roles.",
-                                role.as_str(),
-                                user_name
-                            )),
-                        )));
-                    }
-                    self.selected_user_role = Some(*role);
-                    let user = user_name.clone();
-                    let role = *role;
-                    return Task::batch([
-                        // Close the composer role dropdown (Home never sees
-                        // SwitchRole — it is intercepted here).
-                        Task::done(Message::Home(home::HomeMessage::RoleMenuClosed)),
-                        Task::perform(
-                            async move {
-                                crate::users::switch_active_role(&user, role)
-                                    .await
-                                    .map_err(|e| e.to_string())?;
-                                Ok(role)
-                            },
-                            |res| {
-                                match res {
-                                    Ok(role) => Message::Home(home::HomeMessage::Toast(
-                                        ToastMessage::SuccessMsg(format!(
-                                            "Switched to {} role",
-                                            crate::agent::role::role_info(&role).display_label
-                                        )),
-                                    )),
-                                    // On failure, refresh the role cache so the
-                                    // optimistic composer icon reverts to the
-                                    // persisted active role.
-                                    Err(e) => Message::RoleSwitchFailed(e),
-                                }
-                            },
-                        ),
                     ]);
                 }
                 self.home_state.update(msg).map(Message::Home)
@@ -1519,13 +1454,7 @@ impl Dashboard {
             // own recovery.
             Message::UsersCdcChanged => self.refresh_settings_users(),
             Message::Nop => Task::none(),
-            Message::RoleAndPoolLoaded {
-                role,
-                pool,
-                is_admin,
-            } => {
-                self.selected_user_role = role;
-                self.selected_user_roles = pool;
+            Message::AdminLoaded { is_admin } => {
                 let admin_changed = self.selected_user_is_admin != is_admin;
                 self.selected_user_is_admin = is_admin;
                 // The Settings lists and the Sessions page are filtered by
@@ -1540,15 +1469,6 @@ impl Dashboard {
                     }
                 }
                 Task::none()
-            }
-            Message::RoleSwitchFailed(e) => {
-                // Revert the optimistic composer icon and surface the error.
-                Task::batch([
-                    Task::done(Message::Home(home::HomeMessage::Toast(
-                        ToastMessage::Error(e),
-                    ))),
-                    self.refresh_selected_user_role_cache(),
-                ])
             }
             Message::TtsDownloadEvent(event) => self.handle_tts_download_event(event),
         }
@@ -1859,14 +1779,7 @@ impl Dashboard {
         let footer = self.footer_view();
         let content = match self.page {
             Page::Home => {
-                let home_view = self
-                    .home_state
-                    .view(
-                        self.selected_user_role,
-                        &self.selected_user_roles,
-                        self.draining,
-                    )
-                    .map(Message::Home);
+                let home_view = self.home_state.view(self.draining).map(Message::Home);
                 let sidebar = ticket_sidebar(&self.board_state);
                 // Wrap chat area in a right-click context menu with
                 // "Reset session". Per-bubble ContextMenus (Copy message,

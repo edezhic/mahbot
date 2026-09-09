@@ -413,8 +413,11 @@ impl ChromeTool {
                     ),
                     super::chrome_daemon::CliProbeFailure::BadVersion(status) => format!(
                         "chrome-use CLI is installed but its `--version` check failed \
-                         ({status}) — the install looks broken. Reinstall it by having the \
-                         Support agent re-run the user-consented `install_chrome_use` tool."
+                         ({status}) — the install looks broken. chrome-use self-updates \
+                         once per boot, which only replaces the binary when a newer \
+                         release exists; check the logs for the last update error, or \
+                         reinstall manually via the chrome-use CLI if you want \
+                         hands-on control."
                     ),
                     super::chrome_daemon::CliProbeFailure::Timeout => {
                         "chrome-use CLI probe timed out — the binary is present but \

@@ -2286,16 +2286,13 @@ mod tests {
     #[serial_test::serial(tts)]
     async fn test_init_listener_dispatches_speak() {
         // Initialize test stores and give the broadcast user an Assistant
-        // active role (the permission-derived pool for a non-full user is
-        // [Assistant]; Assistant is what the listener matches below).
+        // active role: `add_user` writes `selected_role='assistant'` on
+        // insert, which is what the listener matches below.
         crate::util::test::init_test_stores().await;
         crate::users::store()
             .add_user("testuser", None, crate::Role::Assistant)
             .await
             .expect("add_user");
-        crate::users::switch_active_role("testuser", crate::Role::Assistant)
-            .await
-            .expect("switch_active_role");
 
         // Set up CHAT_BROADCAST (idempotent — safe to call from parallel tests)
         crate::CHAT_BROADCAST.get_or_init(|| {

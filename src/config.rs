@@ -60,7 +60,7 @@
 //! them:
 //!
 //! > Manager group (`Role::Manager`, `Role::Assistant`, `Role::Discovery`,
-//! > `Role::Engineer`, `Role::Support`, `Role::Maintainer`) → manager slot;
+//! > `Role::Engineer`, `Role::Maintainer`) → manager slot;
 //! > every other role (Analyst, Coder, QA, Reviewer, Sanitation) →
 //! > worker slot.
 //!
@@ -237,7 +237,7 @@ pub struct ConfigData {
     /// never to OpenRouter.
     pub provider_endpoint_key: Option<String>,
     /// Model slot for the Manager group (Manager, Assistant, Discovery,
-    /// Engineer, Support, Maintainer).
+    /// Engineer, Maintainer).
     pub manager_model: Option<String>,
     /// Model slot for all worker roles (Analyst, Coder, QA,
     /// Reviewer, Sanitation).
@@ -285,10 +285,10 @@ pub struct ConfigData {
     /// JSON-serialized wake word enrollment (v2 schema: prototype + calibration)
     /// for the voice assistant.  Owned exclusively by the voice pipeline.
     pub wake_word_templates: Option<String>,
-    /// Onboarding state machine: "init" | "welcomed" | "finished".
+    /// Onboarding state machine: "init" | "finished".
     /// Absent = Init (fresh install). Set by the onboarding flow; existing
     /// installs keep the `finished` value seeded by the retired catalog's
-    /// one-time migration.
+    /// one-time migration. A legacy `"welcomed"` value reads as `Finished`.
     pub onboarding_state: Option<String>,
     /// Per-model provider routing.
     pub model_routings: Vec<ModelRouting>,
@@ -896,7 +896,7 @@ impl ConfigReload {
 
     /// Resolve the configured model for a role from the two model slots.
     ///
-    /// The manager group (Manager, Assistant, Discovery, Engineer, Support,
+    /// The manager group (Manager, Assistant, Discovery, Engineer,
     /// Maintainer) uses the manager slot; every other role (Analyst, Coder,
     /// QA, Reviewer, Sanitation) uses the worker slot. Unset slots
     /// fall back to their code default.
@@ -907,7 +907,6 @@ impl ConfigReload {
             | Role::Assistant
             | Role::Discovery
             | Role::Engineer
-            | Role::Support
             | Role::Maintainer => self.manager_model(),
             _ => self.worker_model(),
         }
@@ -1404,9 +1403,8 @@ async fn write_kv_and_update_config(key: &str, trimmed: &str) -> Result<()> {
 pub enum OnboardingState {
     /// Fresh install, no provider configured yet / first-time onboarding.
     Init,
-    /// "hi mah bot" has been auto-sent; the Support agent is active.
-    Welcomed,
-    /// The finalize tool was called; onboarding complete.
+    /// Onboarding complete: "hi mah bot" has been auto-sent and the admin
+    /// Assistant is active (the Assistant now drives onboarding).
     Finished,
 }
 
@@ -1414,8 +1412,13 @@ impl OnboardingState {
     #[must_use]
     pub fn from_raw(s: Option<&str>) -> Self {
         match s {
-            Some("welcomed") => Self::Welcomed,
-            Some("finished") => Self::Finished,
+            // Legacy `"welcomed"` (written before the Support role was removed,
+            // when Support ran the onboarding) is surfaced as `Finished`.
+            // Nothing writes it anymore, and a mid-onboarding user stuck at
+            // 'welcomed' is deliberately NOT migrated back to `Init` — they're
+            // treated as finished (the Assistant stays active). Any other
+            // unknown/corrupt value still fails toward `Init`, as before.
+            Some("welcomed" | "finished") => Self::Finished,
             _ => Self::Init,
         }
     }
@@ -1423,7 +1426,6 @@ impl OnboardingState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Init => "init",
-            Self::Welcomed => "welcomed",
             Self::Finished => "finished",
         }
     }
@@ -1495,6 +1497,26 @@ pub(crate) fn model_routing(model: &str, provider_order: Option<&str>) -> ModelR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn onboarding_from_raw_maps_legacy_welcomed_to_finished() {
+        // Legacy `"welcomed"` (pre-Support-removal) surfaces as `Finished`, not
+        // migrated back to `Init`. `"finished"` maps to `Finished`; anything
+        // else (absent or corrupt) fails toward `Init`.
+        assert_eq!(
+            OnboardingState::from_raw(Some("welcomed")),
+            OnboardingState::Finished
+        );
+        assert_eq!(
+            OnboardingState::from_raw(Some("finished")),
+            OnboardingState::Finished
+        );
+        assert_eq!(
+            OnboardingState::from_raw(Some("garbage")),
+            OnboardingState::Init
+        );
+        assert_eq!(OnboardingState::from_raw(None), OnboardingState::Init);
+    }
 
     /// All string keys that [`ConfigData::string_fields`] returns must be
     /// round-trippable through [`ConfigData::set_string_field`]: setting each
@@ -1642,7 +1664,6 @@ mod tests {
             Role::Assistant,
             Role::Discovery,
             Role::Engineer,
-            Role::Support,
             Role::Maintainer,
         ] {
             assert_eq!(reload.role_model(role), "manager-slot-model");

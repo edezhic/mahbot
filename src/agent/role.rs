@@ -86,7 +86,7 @@ pub struct RoleInfo {
 ///
 /// Used via struct update syntax (`..BASE_ROLE_INFO`) to keep each arm
 /// concise and make future field additions cheap. Arms that spell out every
-/// field (Discovery, Assistant, Support) do so because clippy's
+/// field (Discovery, Assistant) do so because clippy's
 /// `needless_update` fires when the base contributes nothing, so the update
 /// syntax is only valid when at least one field comes from the base.
 const BASE_ROLE_INFO: RoleInfo = RoleInfo {
@@ -158,12 +158,6 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             badge_fg: (0.153, 0.820, 0.757),
             default_reasoning_effort: "xhigh",
             display_label: "Assistant",
-        },
-        Role::Support => &RoleInfo {
-            has_discovery: false,
-            badge_fg: (0.463, 0.647, 0.843),
-            default_reasoning_effort: "high",
-            display_label: "Support",
         },
     }
 }
@@ -259,13 +253,11 @@ use crate::Tool;
 use crate::Workspace;
 use crate::config::CONFIG;
 use crate::tools::{
-    AddAlarmTool, AddCommentTool, AddUserTool, AddWorkspaceTool, AnalyzeTool, BindTelegramTool,
-    ChromeTool, ComputerTool, CreateTicketTool, DispatchMode, EditTool, FinalizeTool,
-    GetTicketTool, ImageGenTool, ImplementTool, InstallChromeUseTool, ListAlarmsTool,
-    ListTicketsTool, MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool,
-    SearchArchivedTicketsTool, SearchTool, SendMessageToManagerTool, SetupTelegramBotTool,
-    SetupWebSearchTool, ShellMode, ShellTool, SleepTool, UpdateTicketTool, VideoEditTool,
-    VideoGenTool, WebSearchBackend, WebSearchTool,
+    AddAlarmTool, AddCommentTool, AnalyzeTool, ChromeTool, ComputerTool, CreateTicketTool,
+    DispatchMode, EditTool, GetTicketTool, ImageGenTool, ImplementTool, ListAlarmsTool,
+    ListTicketsTool, MahbotConfigTool, MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool,
+    SearchArchivedTicketsTool, SearchTool, SendMessageToManagerTool, ShellMode, ShellTool,
+    SleepTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
 };
 
 impl Role {
@@ -411,24 +403,18 @@ impl Role {
                     // address the Manager of a project workspace. The
                     // Manager's messages auto-deliver back (see message_router).
                     t.push(Box::new(SendMessageToManagerTool));
+                    // The admin config surface: the merged `mahbot_config`
+                    // setup tool and the read-only DB query tool. Full-access
+                    // Assistant is now the single user-facing role, so these
+                    // migrated over from the removed Support role.
+                    t.push(Box::new(MahbotConfigTool));
+                    t.push(Box::new(MahbotDebugTool));
                 }
                 t
             }
-            Role::Support => {
-                vec![
-                    Box::new(MahbotDebugTool),
-                    Box::new(SetupTelegramBotTool),
-                    Box::new(BindTelegramTool),
-                    Box::new(AddWorkspaceTool),
-                    Box::new(AddUserTool),
-                    Box::new(SetupWebSearchTool),
-                    Box::new(InstallChromeUseTool),
-                    Box::new(FinalizeTool),
-                ]
-            }
         };
 
-        if !matches!(self, Role::Manager | Role::Sanitation | Role::Support) {
+        if !matches!(self, Role::Manager | Role::Sanitation) {
             Self::add_web_search_tool(&mut tools);
         }
 
@@ -599,39 +585,6 @@ mod tests {
     }
 
     #[test]
-    fn support_exposes_mahbot_debug_and_other_roles_do_not() {
-        // Acceptance pin for the in-process read-only SQL tool: only Support
-        // advertises `mahbot_debug` — it must not appear for the Analyst, the
-        // Assistant (either base or full-access), or any other role.
-        let ws = crate::workspace::test_ws("test");
-        let tools = crate::Role::Support.tools(&ws, false, test_sessions());
-        assert!(
-            tools.iter().any(|t| t.name() == "mahbot_debug"),
-            "support toolset must contain `mahbot_debug`"
-        );
-        for (role, full_access) in [
-            (crate::Role::Manager, false),
-            (crate::Role::Engineer, false),
-            (crate::Role::Coder, false),
-            (crate::Role::Analyst, false),
-            (crate::Role::Qa, false),
-            (crate::Role::Reviewer, false),
-            (crate::Role::Discovery, false),
-            (crate::Role::Maintainer, false),
-            (crate::Role::Sanitation, false),
-            (crate::Role::Assistant, false),
-            (crate::Role::Assistant, true),
-        ] {
-            let tools = role.tools(&ws, full_access, test_sessions());
-            assert!(
-                !tools.iter().any(|t| t.name() == "mahbot_debug"),
-                "{} must not advertise `mahbot_debug`",
-                role.as_str()
-            );
-        }
-    }
-
-    #[test]
     fn assistant_toolset_gates_full_access_tools() {
         // The Assistant toolset must differ by the triggering user's
         // full-access (admin) flag: base mode has no shell/implement/research/
@@ -670,6 +623,37 @@ mod tests {
             full_path_desc.contains("policy allowlist"),
             "full Assistant read must advertise the general allowlist boundary, got: {full_path_desc}"
         );
+    }
+
+    #[test]
+    fn config_and_debug_tools_only_in_full_access_assistant() {
+        // Acceptance pin: the merged `mahbot_config` setup tool and the
+        // read-only `mahbot_debug` query tool are granted ONLY to the
+        // full-access Assistant. The base Assistant and every other role must
+        // never advertise either.
+        let ws = crate::workspace::test_ws("test");
+        for role in Role::iter() {
+            for full_access in [false, true] {
+                let names: Vec<&str> = role
+                    .tools(&ws, full_access, test_sessions())
+                    .iter()
+                    .map(|t| t.name())
+                    .collect();
+                for name in ["mahbot_config", "mahbot_debug"] {
+                    let has = names.contains(&name);
+                    if role == crate::Role::Assistant && full_access {
+                        assert!(has, "full-access Assistant must advertise `{name}`");
+                    } else {
+                        assert!(
+                            !has,
+                            "{}{} must not advertise `{name}`",
+                            role.as_str(),
+                            if full_access { " (full)" } else { "" }
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

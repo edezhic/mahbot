@@ -21,8 +21,6 @@ const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 
 /// Description for the `/clear` command — used in `setMyCommands` API and `/start` welcome message.
 const CLEAR_COMMAND_DESC: &str = "Reset your session";
-/// Description for the `/agents` command (inline role picker).
-const AGENTS_COMMAND_DESC: &str = "Switch your active role";
 /// Description for the `/image_models` command.
 const IMAGE_MODELS_COMMAND_DESC: &str = "Select image generation model";
 /// Description for the `/video_models` command.
@@ -1167,15 +1165,14 @@ impl TelegramChannel {
     }
 
     /// Register the bot's global (unscoped) commands via Telegram's
-    /// `setMyCommands` API. `/clear` and `/agents` are global — per-user
-    /// commands are registered per chat via [`Self::spawn_menu_refresh`].
+    /// `setMyCommands` API. `/clear` is global — per-user commands are
+    /// registered per chat via [`Self::spawn_menu_refresh`].
     ///
     /// Failure is logged as a warning and does not block the caller.
     pub async fn set_my_commands(&self) {
         let body = serde_json::json!({
             "commands": [
                 {"command": "clear", "description": CLEAR_COMMAND_DESC},
-                {"command": "agents", "description": AGENTS_COMMAND_DESC},
             ]
         });
         post_set_my_commands(self.http_client(), &self.api_url("setMyCommands"), &body).await;
@@ -1724,30 +1721,6 @@ impl TelegramChannel {
         .await
         .map(|_| ())
         .map_err(|(_, desc)| classify_edit_failure(&desc))
-    }
-
-    /// Refresh the role-switch feedback: the per-role command menu and, when
-    /// the tap carried the pressed picker's identity, an in-place ✓ move on
-    /// that picker's keyboard (`picker_refresh` carries its
-    /// `(message_id, keyboard)`). Callers must serialize the preceding
-    /// `switch_active_role` write with this call (the bin holds one lock over
-    /// both) so rapid taps can't leave the last-landed checkmark disagreeing
-    /// with the persisted role.
-    pub async fn refresh_after_role_switch(
-        &self,
-        reply_target: &str,
-        picker_refresh: Option<(i64, serde_json::Value)>,
-    ) {
-        let (chat_id, _thread_id) = parse_recipient(reply_target);
-        // Same command-menu refresh the normal send path triggers.
-        self.spawn_menu_refresh(chat_id);
-        if let Some((message_id, keyboard)) = picker_refresh
-            && let Err(e) = self.edit_reply_markup(chat_id, message_id, &keyboard).await
-        {
-            // Best-effort: a deleted/48h-expired message or an identical
-            // keyboard (re-tap of the active role) is cosmetic — log and skip.
-            tracing::debug!(?e, "role picker keyboard refresh skipped");
-        }
     }
 
     async fn send_attachment(
@@ -2493,9 +2466,9 @@ pub fn format_board_line(
 }
 
 /// (command, description) entries for a user's Telegram command menu,
-/// derived from their role pool, admin status, and the state of their
-/// selected shared workspace. Shared by the per-chat `setMyCommands`
-/// refresh and the `/start` welcome message.
+/// derived from their admin status and the state of their selected shared
+/// workspace. Shared by the per-chat `setMyCommands` refresh and the
+/// `/start` welcome message.
 ///
 /// State-aware entries: exactly one of `/pause` or `/unpause` appears (the
 /// one matching the workspace's paused state), and exactly one of
@@ -2504,8 +2477,6 @@ pub fn format_board_line(
 #[must_use]
 pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
     let mut entries: Vec<(String, String)> = Vec::new();
-
-    let pool = crate::users::role_pool(user_name).await;
 
     if crate::users::is_admin(user_name).await {
         entries.push(("board".to_string(), BOARD_COMMAND_DESC.to_string()));
@@ -2555,12 +2526,10 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
         VIDEO_MODELS_COMMAND_DESC.to_string(),
     ));
 
-    // The role-switch entry (inline role picker, only for multi-role pools)
-    // is anchored at the very bottom of the menu.
+    // `/clear` is anchored at the very bottom of the menu. The `/agents`
+    // role-switch entry is gone: the pool is the constant single Assistant,
+    // so there is nothing to switch.
     entries.push(("clear".to_string(), CLEAR_COMMAND_DESC.to_string()));
-    if pool.len() > 1 {
-        entries.push(("agents".to_string(), AGENTS_COMMAND_DESC.to_string()));
-    }
     entries
 }
 

@@ -1840,7 +1840,7 @@ async fn setup_user_with_telegram_binding(user_name: &str, reply_target: &str, c
     use crate::users::store;
     let store = store();
     store
-        .add_user(user_name, Some("full"), crate::Role::Support)
+        .add_user(user_name, Some("full"), crate::Role::Assistant)
         .await
         .unwrap_or_else(|e| panic!("{ctx}: add_user: {e}"));
     store
@@ -2211,8 +2211,8 @@ async fn user_command_entries_reflect_admin_state() {
         .await
         .unwrap();
 
-    // alice: admin (full permissions), pool = onboarding roles →
-    // the single role-switch entry plus unconditional model commands and
+    // alice: admin (full permissions), pool = single Assistant role →
+    // no role-switch entry, just unconditional model commands and
     // state-aware admin commands. In the (LocalCheckout) test environment
     // the shared availability cache seeds `available = true`, so `/update`
     // is present for the admin.
@@ -2226,23 +2226,22 @@ async fn user_command_entries_reflect_admin_state() {
     assert!(!cmds.contains(&"unpause"));
     assert!(cmds.contains(&"maintenance_on"));
     assert!(!cmds.contains(&"maintenance_off"));
-    // Per-role switch commands are removed — the inline picker replaces them
-    // (the pool is still reflected in the picker's buttons, not the menu).
-    for cmd in ["manager", "support", "assistant", "engineer"] {
+    // Per-role switch commands are removed entirely — the role pool is the
+    // constant single Assistant, so nothing to switch.
+    for cmd in ["manager", "assistant", "engineer"] {
         assert!(!cmds.contains(&cmd));
     }
     // Model commands are unconditional (every user has the Assistant role).
     assert!(cmds.contains(&"image_models"));
     assert!(cmds.contains(&"video_models"));
     // Menu order: board/admin (+ /update), then workspace-state pairs,
-    // then model commands, with /clear second-to-last and the role-switch
-    // entry last.
-    assert_eq!(cmds.last(), Some(&"agents"));
+    // then model commands, with /clear last. The role-switch entry
+    // (/agents) is removed entirely.
+    assert_eq!(cmds.last(), Some(&"clear"));
     let pos = |cmd: &str| cmds.iter().position(|c| *c == cmd).unwrap();
     assert!(pos("board") < pos("update"));
     assert!(pos("update") < pos("image_models"));
     assert!(pos("image_models") < pos("clear"));
-    assert!(pos("clear") < pos("agents"));
 
     // Flipping the workspace state reverses the pairs (the ticket's
     // headline criterion): paused → /unpause, maintenance on →
@@ -2283,7 +2282,7 @@ async fn user_command_entries_reflect_admin_state() {
     assert!(!cmds.contains(&"pause"));
     assert!(!cmds.contains(&"unpause"));
     // Restricted user: pool is [Assistant] — per-role switch commands are
-    // absent, but model commands are unconditional.
+    // absent entirely, but model commands are unconditional.
     assert!(!cmds.contains(&"assistant"));
     assert!(!cmds.contains(&"manager"));
     assert!(cmds.contains(&"image_models"));

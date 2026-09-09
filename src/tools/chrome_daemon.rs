@@ -447,14 +447,18 @@ const CHROME_USE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const CHROME_USE_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for a chrome-use native-host registration subprocess (`extension
-/// install`): a hung registration must not block the Support agent's tool call
+/// install`): a hung registration must not block the background install task
 /// indefinitely.
 const CHROME_USE_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Install hint for the definitive not-found case — appended to every
-/// user-facing message that names the chrome-use CLI as missing.
-pub(crate) const CHROME_USE_INSTALL_HINT: &str = "To install it, the Support agent can run the \
-     user-consented `install_chrome_use` tool (a direct, checksum-verified release download).";
+/// user-facing message that names the chrome-use CLI as missing. chrome-use
+/// installs itself automatically in the background at startup (the user
+/// accepted quiet-install risk), so if it is still missing the quiet install
+/// failed and will retry on the next boot.
+pub(crate) const CHROME_USE_INSTALL_HINT: &str = "It installs automatically in the background at \
+     startup — if it is still missing the quiet install failed; check the logs \
+     and it will retry on the next boot.";
 
 /// Resolved absolute path of the chrome-use binary (managed dir first, then
 /// PATH, then common install locations), cached after the first probe.
@@ -1355,12 +1359,13 @@ pub(crate) fn daemon_down_message() -> String {
     let cause = match h.last_failure {
         Some(ProbeFailure::NotInstalled) => {
             "The chrome-use extension or native host is not installed — the chrome daemon \
-             cannot run. Enable the chrome-use extension at chrome://extensions (or reinstall \
-             the chrome-use CLI); health recovers automatically once it is installed."
+             cannot run. Enable the chrome-use extension at chrome://extensions (the CLI \
+             re-installs itself in the background at startup); health recovers automatically \
+             once it is installed."
         }
         Some(ProbeFailure::HostBroken) => {
-            "The chrome-use native host launcher is broken — run `chrome-use doctor` (or \
-             reinstall the chrome-use CLI); health recovers automatically once it is fixed."
+            "The chrome-use native host launcher is broken — run `chrome-use doctor`; health \
+             recovers automatically once it is fixed."
         }
         Some(ProbeFailure::ExtensionDisabled) => {
             "The chrome-use extension is disabled — enable it at chrome://extensions. Daemon \
@@ -1701,9 +1706,11 @@ async fn download_chrome_use_binary(tag: &str) -> Result<(tempfile::TempDir, Pat
 /// (SHA-256-verified against the published sidecar), place the single binary at
 /// the stable managed dir that [`find_cli_binary`] always resolves, then do a
 /// one-time native-host registration that never activates managed Chrome mode.
-/// Called by the Support install tool (first install only — the auto-updater
-/// swaps the binary in place and never re-registers). `Err` names the failing
-/// step and carries truncated stdout/stderr for diagnosis.
+/// Called by [`run_chrome_use_management`] when the CLI is missing (first
+/// install only — the updater swaps the binary in place and never re-registers;
+/// the user accepted quiet-install risk, so there is no consent gate and no
+/// user interaction). `Err` names the failing step and carries truncated
+/// stdout/stderr for diagnosis.
 pub(crate) async fn install_chrome_use() -> Result<(), String> {
     let tag = crate::util::managed_bin::fetch_latest_tag(
         CHROME_USE_RELEASE_REPO,
@@ -1722,6 +1729,10 @@ pub(crate) async fn install_chrome_use() -> Result<(), String> {
         .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     let fresh_install = !dest.exists();
     crate::util::managed_bin::swap_binary_in_place(&fresh, &dest)?;
+    // The swap preserves the old dest's mode, so a pre-existing install that
+    // lost its executable bit would survive a reinstall unchanged — force the
+    // bit back on (bun does the same).
+    crate::util::managed_bin::set_executable(&dest)?;
 
     // The binary landed at the managed dir; clear any cached path so the next
     // probe re-resolves to the stable managed location.
@@ -1744,10 +1755,11 @@ pub(crate) async fn install_chrome_use() -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(e) => {
             // A registration failure must not leave a half-installed state: a
-            // freshly created binary is removed again (re-running the tool
-            // re-downloads everything). When it replaced a previously working
-            // install, the binary stays — the host registration still points
-            // at the same absolute path, so the existing setup keeps working.
+            // freshly created binary is removed again (the next boot's quiet
+            // auto-install re-downloads everything). When it replaced a
+            // previously working install, the binary stays — the host
+            // registration still points at the same absolute path, so the
+            // existing setup keeps working.
             if fresh_install {
                 let _ = fs::remove_file(&dest);
                 invalidate_cli_path();
@@ -1785,24 +1797,47 @@ async fn run_install_step(label: &str, mut cmd: Command) -> Result<(), String> {
     ))
 }
 
-// ── Once-per-boot auto-update ─────────────────────────────────────────
-/// Best-effort once-per-boot auto-update of an existing chrome-use install.
-/// Runs ~5 minutes after startup (never competes with boot), is skipped when
-/// offline, and never first-installs — the first install stays behind the
-/// Support consent flow. On all platforms the update is a binary-only,
-/// checksum-verified release swap in place: the native-messaging launcher and
-/// manifests reference the binary by its fixed absolute path and keep working
-/// after the swap, so there is no re-registration. After success there is no
-/// periodic re-check (once per boot).
-pub async fn run_auto_update() {
-    const RETRY_WAIT: Duration = Duration::from_mins(10);
-    const MAX_RETRIES: u32 = 3;
-
-    // Spawned task — sleep first so it never competes with service startup.
-    tokio::time::sleep(Duration::from_mins(5)).await;
-
+// ── Managed install + once-per-boot auto-update ───────────────────────
+/// Spawned one-shot task: silent first install at startup (no consent flow —
+/// the user accepted quiet-install risk), then a delayed once-per-boot
+/// auto-update of an existing install. All failures are non-fatal (warn and
+/// retry next boot); there is no intra-boot retry loop.
+pub async fn run_chrome_use_management() {
     if cli_path().is_none() {
-        debug!("chrome-use not installed — first install stays user-confirmed (Support)");
+        match install_chrome_use().await {
+            Ok(()) => {
+                info!("chrome-use installed automatically at startup");
+                // The fresh install IS the latest release — no update check.
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    "chrome-use auto-install failed (non-fatal, retried on next boot): {}",
+                    crate::util::truncate(&e, 1024)
+                );
+                // Still no binary — the delayed update check would be a
+                // guaranteed no-op (it never first-installs), so end here.
+                return;
+            }
+        }
+    }
+    // Existing install: once-per-boot update check, delayed so it never
+    // competes with service startup.
+    tokio::time::sleep(Duration::from_mins(5)).await;
+    run_update_check().await;
+}
+
+/// Once-per-boot auto-update of an existing chrome-use install. No retry loop
+/// (a failed update retries next boot); never first-installs — only
+/// [`run_chrome_use_management`] installs a missing CLI. Is skipped when
+/// offline. On all platforms the update is a binary-only, checksum-verified
+/// release swap in place: the native-messaging launcher and manifests reference
+/// the binary by its fixed absolute path and keep working after the swap, so
+/// there is no re-registration. After success there is no periodic re-check
+/// (once per boot).
+async fn run_update_check() {
+    if cli_path().is_none() {
+        debug!("chrome-use not installed — update check skipped (management only installs)");
         return;
     }
     // Pre-existing installs never went through `install_chrome_use`, so ensure
@@ -1812,43 +1847,23 @@ pub async fn run_auto_update() {
     let local = cli_version().await;
 
     // Resolve the latest release tag (follow the releases/latest redirect — no
-    // api.github.com rate limit). Retry on network failure; a non-semver tag
-    // gives up immediately (cannot compare). The raw tag string is captured so
-    // the later download uses the SAME tag (no re-resolution race).
-    let mut latest: Option<semver::Version> = None;
-    let mut resolve_tag = String::new();
-    for attempt in 0..MAX_RETRIES {
-        match crate::util::managed_bin::fetch_latest_tag(
-            CHROME_USE_RELEASE_REPO,
-            CHROME_USE_RELEASE_TIMEOUT,
-        )
-        .await
-        {
-            Ok(tag) => {
-                if let Some(v) = crate::util::managed_bin::parse_tag_version(&tag, "v") {
-                    latest = Some(v);
-                    resolve_tag = tag;
-                    break;
-                }
-                info!(
-                    "chrome-use auto-update: latest release tag '{tag}' is not a semver version; giving up"
-                );
-                return;
-            }
-            Err(e) => {
-                debug!(
-                    "chrome-use auto-update: release check failed (attempt {}/{}): {e}",
-                    attempt + 1,
-                    MAX_RETRIES
-                );
-                if attempt + 1 < MAX_RETRIES {
-                    tokio::time::sleep(RETRY_WAIT).await;
-                }
-            }
-        }
-    }
-    let Some(latest) = latest else {
-        debug!("chrome-use auto-update skipped: release check kept failing (offline?)");
+    // api.github.com rate limit). A single attempt per boot (any failure
+    // retries next boot); a non-semver tag gives up immediately (cannot
+    // compare). The raw tag string is captured so the later download uses the
+    // SAME tag (no re-resolution race).
+    let Ok(tag) = crate::util::managed_bin::fetch_latest_tag(
+        CHROME_USE_RELEASE_REPO,
+        CHROME_USE_RELEASE_TIMEOUT,
+    )
+    .await
+    else {
+        debug!("chrome-use auto-update skipped: release check failed (offline?)");
+        return;
+    };
+    let Some(latest) = crate::util::managed_bin::parse_tag_version(&tag, "v") else {
+        info!(
+            "chrome-use auto-update: latest release tag '{tag}' is not a semver version; giving up"
+        );
         return;
     };
 
@@ -1871,14 +1886,14 @@ pub async fn run_auto_update() {
 
     // Binary-only, checksum-verified release swap. The swap helper never leaves
     // a broken install, so on any error the previous binary stays untouched and
-    // there is no same-boot retry (v1 policy). The native-messaging
-    // launcher/manifests reference the binary by its fixed absolute path and
-    // keep working after the swap — no `extension install`, no path
-    // invalidation. The failing step is named in the error.
+    // there is no same-boot retry. The native-messaging launcher/manifests
+    // reference the binary by its fixed absolute path and keep working after
+    // the swap — no `extension install`, no path invalidation. The failing step
+    // is named in the error.
     // The temp-dir guard must be bound OUTSIDE the match: it owns the freshly
     // extracted binary, and dropping it at the end of a match arm would delete
     // the file before the swap runs.
-    let (_temp, fresh) = match download_chrome_use_binary(&resolve_tag).await {
+    let (_temp, fresh) = match download_chrome_use_binary(&tag).await {
         Ok(pair) => pair,
         Err(e) => {
             info!(
@@ -1889,6 +1904,16 @@ pub async fn run_auto_update() {
         }
     };
     if let Err(e) = crate::util::managed_bin::swap_binary_in_place(&fresh, &dest) {
+        info!(
+            "chrome-use auto-update failed: {}",
+            crate::util::truncate(&e, 1024)
+        );
+        return;
+    }
+    // The swap preserves the old dest's mode, so a pre-existing install that
+    // lost its executable bit would survive a reinstall unchanged — force the
+    // bit back on after every swap (bun does the same).
+    if let Err(e) = crate::util::managed_bin::set_executable(&dest) {
         info!(
             "chrome-use auto-update failed: {}",
             crate::util::truncate(&e, 1024)
@@ -2140,12 +2165,12 @@ fn warn_transition(failure: ProbeFailure) {
         ProbeFailure::NotInstalled => warn!(
             "chrome-use extension or native host is not installed — the browser \
              daemon cannot run. Enable the chrome-use extension at \
-             chrome://extensions (or reinstall the chrome-use CLI). Auto-recovery \
-             paused until it is installed."
+             chrome://extensions (the CLI re-installs itself in the background at \
+             startup). Auto-recovery paused until it is installed."
         ),
         ProbeFailure::HostBroken => warn!(
-            "chrome-use native host launcher is broken — run `chrome-use doctor` or \
-             reinstall the chrome-use CLI. Auto-recovery paused until it is fixed."
+            "chrome-use native host launcher is broken — run `chrome-use doctor`. \
+             Auto-recovery paused until it is fixed."
         ),
         ProbeFailure::ExtensionDisabled => warn!(
             "chrome-use extension is disabled — enable it at chrome://extensions. \

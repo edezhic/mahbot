@@ -11,6 +11,7 @@ pub mod computer;
 pub(crate) mod edit;
 pub(crate) mod image_gen;
 pub(crate) mod implement;
+pub(crate) mod mahbot_config;
 pub(crate) mod mahbot_debug;
 pub(crate) mod manager_chat;
 pub mod media_catalog;
@@ -21,7 +22,6 @@ pub(crate) mod search;
 pub(crate) mod search_archived_tickets;
 pub(crate) mod shell;
 pub(crate) mod sleep;
-pub(crate) mod support;
 pub(crate) mod ticket;
 pub(crate) mod video_edit;
 pub(crate) mod video_gen;
@@ -164,6 +164,7 @@ pub(crate) use computer::ComputerTool;
 pub(crate) use edit::EditTool;
 pub(crate) use image_gen::ImageGenTool;
 pub(crate) use implement::ImplementTool;
+pub(crate) use mahbot_config::MahbotConfigTool;
 pub(crate) use mahbot_debug::MahbotDebugTool;
 pub(crate) use manager_chat::SendMessageToManagerTool;
 pub(crate) use read::ReadTool;
@@ -172,10 +173,6 @@ pub(crate) use search::SearchTool;
 pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
 pub(crate) use shell::{ShellMode, ShellTool};
 pub(crate) use sleep::SleepTool;
-pub(crate) use support::{
-    AddUserTool, AddWorkspaceTool, BindTelegramTool, FinalizeTool, InstallChromeUseTool,
-    SetupTelegramBotTool, SetupWebSearchTool,
-};
 pub(crate) use ticket::{
     AddCommentTool, CreateTicketTool, GetTicketTool, ListTicketsTool, UpdateTicketTool,
 };

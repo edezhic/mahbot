@@ -181,7 +181,6 @@ pub fn role_icon(role: &crate::Role) -> iced::widget::Text<'static, iced::Theme,
         crate::Role::Reviewer => lucide::file_check(),
         crate::Role::Sanitation => lucide::spray_can(),
         crate::Role::Assistant => lucide::message_square(),
-        crate::Role::Support => lucide::life_buoy(),
     }
 }
 
@@ -841,7 +840,7 @@ pub fn pick_list_style(_theme: &iced::Theme, _status: pick_list::Status) -> pick
 }
 
 /// Flexoki-dark themed style for the expanded menu of [`fn@pick_list`] widgets,
-/// matching the ContextMenu/RoleMenu overlay look (BG_ELEVATED fill, radius-4
+/// matching the ContextMenu overlay look (BG_ELEVATED fill, radius-4
 /// hairline border, TEXT_SECONDARY items highlighted to TEXT_PRIMARY on hover,
 /// no shadow). The menu's internal overflow scrollbar is styled by iced's
 /// default scrollable catalog and is not reachable through this API.

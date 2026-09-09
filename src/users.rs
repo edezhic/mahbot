@@ -93,9 +93,9 @@ impl UserStore {
 
     // ── User CRUD ─────────────────────────────────────────────
 
-    /// Create a new user with the given active role. The user's role pool is
-    /// permission-derived (no `user_roles` rows) — `default_role` is the
-    /// persisted active role, only applied on a fresh insert. Also creates
+    /// Create a new user with the given active role. The role pool is the
+    /// constant single Assistant (no per-user role rows) — `default_role` is
+    /// the persisted active role, only applied on a fresh insert. Also creates
     /// their personal workspace directory under
     /// `~/.mahbot/userspaces/<name>/` with `git init` (non-fatal on failure).
     /// Idempotent — re-adding an existing user preserves their stored
@@ -130,8 +130,8 @@ impl UserStore {
     }
 
     /// Delete a user and all their child rows (channel bindings). The
-    /// permission-derived role pool carries no per-user rows, so there is
-    /// nothing else to remove.
+    /// constant single-Assistant role pool carries no per-user rows, so there
+    /// is nothing else to remove.
     pub async fn delete_user(&self, name: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         tx.execute(
@@ -311,7 +311,7 @@ impl UserStore {
     async fn user_record_from_row(&self, row: &db::Row) -> Result<UserRecord> {
         let name: String = row.get(COL_USERS_NAME)?;
         let permissions = row.get::<Option<String>>(COL_USERS_PERMISSIONS)?;
-        let roles = role_pool_for_permissions(permissions.as_deref());
+        let roles = role_pool();
         Ok(UserRecord {
             name: name.clone(),
             permissions: permissions.clone(),
@@ -454,9 +454,9 @@ pub struct UserRecord {
     /// Selected active role, NULL = pool-dependent default (the first pool
     /// role). Empty pool → no routing.
     pub selected_role: Option<String>,
-    /// The role pool — the roles the user is allowed to use, derived from
-    /// their permissions (the permission-derived pool). No longer read from
-    /// a `user_roles` table.
+    /// The role pool — the roles the user is allowed to use. The user-facing
+    /// pool is the constant single Assistant for every user (the Support role
+    /// was removed); this is not read from a `user_roles` table.
     pub roles: Vec<String>,
     /// Channel bindings for this user (Telegram, etc.).
     pub channels: Vec<ChannelBinding>,
@@ -476,17 +476,12 @@ fn is_admin_permissions(permissions: Option<&str>) -> bool {
     permissions == Some("full")
 }
 
-/// The role pool for a permissions value, derived at read time (no `user_roles`
-/// table). Full-permissions (admin) users get `[Assistant, Support]` with the
-/// Assistant first (default + fallback); all other users are limited to the
-/// personal assistant role.
+/// The user-facing role pool — a single Assistant for every user since the
+/// Support role was removed. The Assistant is both the default and the
+/// fallback; it is the only role any user can route to.
 #[must_use]
-fn role_pool_for_permissions(permissions: Option<&str>) -> Vec<Role> {
-    if is_admin_permissions(permissions) {
-        vec![Role::Assistant, Role::Support]
-    } else {
-        vec![Role::Assistant]
-    }
+pub fn role_pool() -> Vec<Role> {
+    vec![Role::Assistant]
 }
 
 /// A single channel binding for a user.
@@ -756,79 +751,29 @@ pub async fn resolve_workspace_for_user_name(user_name: &str) -> Workspace {
     }
 }
 
-/// Fail-closed pool read for routing: returns `(pool, read_failed)` so the
-/// caller can distinguish a genuinely empty pool from a transient store
-/// error (and avoid a misleading 'no active role' user notice on the
-/// latter). The warning is logged here — a single warn site shared with
-/// [`role_pool`].
-pub async fn role_pool_status(user_name: &str) -> (Vec<Role>, bool) {
-    match store().get_permissions(user_name).await {
-        Ok(perms) => (role_pool_for_permissions(perms.as_deref()), false),
-        Err(e) => {
-            tracing::warn!(error = %e, user_name, "Failed to read role pool");
-            (Vec::new(), true)
-        }
-    }
-}
-
-/// The role pool for a user — the roles they are allowed to use, derived from
-/// their permissions at read time. Empty when the store read fails (fail
-/// closed with a warning), which an operator log distinguishes from a
-/// legitimate admin-permission classification.
-pub async fn role_pool(user_name: &str) -> Vec<Role> {
-    role_pool_status(user_name).await.0
-}
-
-/// The user's admin flag and role pool in a single permissions read — the
-/// shape the GUI role/admin cache needs. Fail-closed: a read failure yields
-/// `(false, [])` with a warning.
-pub(crate) async fn admin_and_pool(user_name: &str) -> (bool, Vec<Role>) {
-    match store().get_permissions(user_name).await {
-        Ok(perms) => {
-            let perms = perms.as_deref();
-            (
-                is_admin_permissions(perms),
-                role_pool_for_permissions(perms),
-            )
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, user_name, "Failed to read role pool");
-            (false, Vec::new())
-        }
-    }
-}
-
-/// Persist a user's active role. Callers must ensure `role` is in the
-/// user's pool (see [`role_pool`]).
-pub async fn switch_active_role(user_name: &str, role: Role) -> Result<()> {
-    store()
-        .update_user(
-            user_name,
-            FieldUpdate::Set(role.as_str()),
-            FieldUpdate::Unchanged,
-            FieldUpdate::Unchanged,
-        )
-        .await
-}
-
 /// Resolve the active role for a user from their role pool.
 ///
-/// Returns `None` when the user has no roles assigned (empty pool) — the
-/// caller must not route messages to any agent.
+/// Returns `None` when the `selected_role` store read fails (fail-closed) —
+/// the caller must not route messages to any agent.
 ///
 /// A stored selection is honoured when it is still in the pool; a selection
 /// outside the pool falls back to the first pool role. Without a stored
 /// selection, the first pool role is used (Assistant for every user — admins
 /// and non-admins alike).
 pub async fn resolve_active_role(user_name: &str) -> Option<Role> {
-    let pool = role_pool(user_name).await;
+    let pool = role_pool();
     resolve_active_role_from_pool(user_name, &pool).await
 }
 
-/// Resolve the active role from an already-fetched pool — avoids a second
-/// pool read when the caller needs the pool anyway (e.g. the
-/// Telegram command menu). Fails closed on a `selected_role` read error
-/// (warn + no routing), matching the pool-read failure policy.
+/// Resolve the active role from an already-fetched pool. Fails closed on a
+/// `selected_role` read error (warn + no routing) — callers that already
+/// have the pool pass it here rather than re-reading the (now constant)
+/// pool via [`role_pool`].
+///
+/// Deliberate (do not "fix"): a persisted `selected_role='support'` is now
+/// out of pool — the Support variant is gone — so it fails pool-membership
+/// resolution and falls back to the first pool role (Assistant). Re-adding
+/// Support would resurrect the removed role; the fallback is intended.
 pub async fn resolve_active_role_from_pool(user_name: &str, pool: &[Role]) -> Option<Role> {
     if pool.is_empty() {
         return None;
@@ -850,14 +795,14 @@ pub async fn resolve_active_role_from_pool(user_name: &str, pool: &[Role]) -> Op
     }
 }
 
-/// The user-facing roles pinned to the user's personal workspace.
+/// The user-facing role pinned to the user's personal workspace.
 #[must_use]
 fn is_pinned_role(role: Role) -> bool {
-    matches!(role, Role::Assistant | Role::Support)
+    matches!(role, Role::Assistant)
 }
 
 /// Whether an agent role is pinned to the user's personal workspace:
-/// Assistant and Support always work there regardless of the selected
+/// the Assistant always works there regardless of the selected
 /// workspace. An empty `user_name` disables pinning — there is no
 /// personal identity to pin to, so callers with an unresolvable user must
 /// pass the real user explicitly (the voice admin fallback passes "admin").
@@ -866,15 +811,15 @@ fn pins_to_personal(role: Role, ws_name: &str, user_name: &str) -> bool {
     !user_name.is_empty() && is_pinned_role(role) && !is_personal_workspace(ws_name)
 }
 
-/// Execution-time invariant enforcer: a pinned role (Assistant/Support)
-/// must never run outside the envelope user's OWN personal workspace,
-/// regardless of what a producer stored — a non-personal workspace is
-/// re-pinned to `personal:{user}`, and a personal workspace belonging to a
-/// different user is re-pinned to the envelope user's own. Returns `None`
-/// when the routing must be refused outright: a pinned role with an empty
-/// `user_name` has no personal identity to pin to, and running it unpinned is
-/// never acceptable, so callers reject the job loudly instead. Non-pinned
-/// roles pass through unchanged.
+/// Execution-time invariant enforcer: a pinned role (Assistant) must never
+/// run outside the envelope user's OWN personal workspace, regardless of what
+/// a producer stored — a non-personal workspace is re-pinned to
+/// `personal:{user}`, and a personal workspace belonging to a different user
+/// is re-pinned to the envelope user's own. Returns `None` when the routing
+/// must be refused outright: a pinned role with an empty `user_name` has no
+/// personal identity to pin to, and running it unpinned is never acceptable,
+/// so callers reject the job loudly instead. Non-pinned roles pass through
+/// unchanged.
 #[must_use]
 pub(crate) fn enforce_personal_pinning(
     role: Role,
@@ -890,11 +835,11 @@ pub(crate) fn enforce_personal_pinning(
     Some(personal_workspace_name(user_name))
 }
 
-/// Resolve the [`Workspace`] an agent role actually operates in: Assistant
-/// and Support always work in the user's personal workspace regardless of
-/// the selected workspace, giving path-dependent callers (enrichment
-/// uploads, generated-media writes) the personal workspace's filesystem
-/// path. Other roles pass through unchanged.
+/// Resolve the [`Workspace`] an agent role actually operates in: the Assistant
+/// always works in the user's personal workspace regardless of the selected
+/// workspace, giving path-dependent callers (enrichment uploads,
+/// generated-media writes) the personal workspace's filesystem path. Other
+/// roles pass through unchanged.
 /// An empty `user_name` disables pinning (no personal identity to pin to),
 /// so callers must pass a resolvable user (the voice admin fallback passes
 /// "admin").
@@ -920,13 +865,11 @@ pub fn effective_workspace_for_role(role: Role, ws: Workspace, user_name: &str) 
 /// Resolve the (role, workspace) a user's messages route to and their
 /// session lives in — the same resolution as routing, so ClearChat and
 /// Telegram /clear always clear the actual recipient: the DB-selected
-/// workspace, the pool-clamped active role (Assistant fallback for an
-/// empty pool), and Assistant/Support pinning.
+/// workspace, the pool-clamped active role (Assistant — the sole pool role),
+/// and Assistant pinning.
 pub async fn resolve_session_target(user_name: &str) -> (Role, Workspace) {
-    let (ws, pool) = tokio::join!(
-        resolve_workspace_for_user_name(user_name),
-        role_pool(user_name),
-    );
+    let ws = resolve_workspace_for_user_name(user_name).await;
+    let pool = role_pool();
     let role = resolve_active_role_from_pool(user_name, &pool)
         .await
         .unwrap_or(Role::Assistant);
@@ -1035,7 +978,7 @@ pub(crate) mod test_util {
         // (INSERT OR REPLACE) are idempotent.
         if let Some(store) = USER_STORE.get() {
             store
-                .add_user("alice", Some("full"), Role::Support)
+                .add_user("alice", Some("full"), Role::Assistant)
                 .await
                 .expect("failed to add alice to test USER_STORE");
             store
@@ -1059,15 +1002,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn role_pool_for_permissions_is_permission_derived() {
-        // Full-permissions (admin) → [Assistant, Support] with the Assistant
-        // first (default + fallback); everyone else → the personal assistant
-        // role. The default (first) role drives routing.
-        assert_eq!(
-            role_pool_for_permissions(Some("full")),
-            vec![Role::Assistant, Role::Support]
-        );
-        assert_eq!(role_pool_for_permissions(None), vec![Role::Assistant]);
+    fn role_pool_returns_single_assistant() {
+        // Every user routes to a single Assistant role: Support is gone and
+        // no other user-facing role exists.
+        assert_eq!(role_pool(), vec![Role::Assistant]);
     }
 
     #[tokio::test]
@@ -1075,15 +1013,15 @@ mod tests {
         crate::util::test::init_test_stores().await;
         let store = store();
 
-        // add_user persists the default active role; the pool is
-        // permission-derived (no user_roles rows).
+        // add_user persists the default active role; the pool is the constant
+        // single Assistant (no user_roles rows).
         store
             .add_user("pool_user", None, Role::Assistant)
             .await
             .unwrap();
-        // A non-full user's permission-derived pool is always [Assistant];
-        // the persisted default role resolves as active.
-        assert_eq!(role_pool("pool_user").await, vec![Role::Assistant]);
+        // The pool is the constant [Assistant]; the persisted default role
+        // resolves as active.
+        assert_eq!(role_pool(), vec![Role::Assistant]);
         assert_eq!(
             resolve_active_role("pool_user").await,
             Some(Role::Assistant)
@@ -1136,8 +1074,8 @@ mod tests {
         let store = store();
 
         // add_user creates the user; deleting it removes the channel bindings
-        // and the user row. There is no `user_roles` table anymore (the pool is
-        // permission-derived), so nothing else needs a cascade.
+        // and the user row. The role pool is the constant single Assistant
+        // (no per-user pool rows), so nothing else needs a cascade.
         store
             .add_user("doomed", None, Role::Assistant)
             .await
@@ -1219,10 +1157,9 @@ mod tests {
     }
 
     #[test]
-    fn pinning_helpers_pin_assistant_support_to_personal() {
-        // Assistant/Support + non-personal workspace + non-empty user pin.
+    fn pinning_helpers_pin_assistant_to_personal() {
+        // Assistant + non-personal workspace + non-empty user pin.
         assert!(pins_to_personal(Role::Assistant, "ws1", "alice"));
-        assert!(pins_to_personal(Role::Support, "ws1", "alice"));
         // Already personal, other roles, and empty user_name never pin.
         assert!(!pins_to_personal(
             Role::Assistant,
@@ -1245,19 +1182,17 @@ mod tests {
         // Non-pinned roles keep the project workspace; already-personal passes through.
         let kept = effective_workspace_for_role(Role::Engineer, project.clone(), "alice");
         assert_eq!(kept.name, "ws1");
-        let already = effective_workspace_for_role(Role::Support, personal.clone(), "alice");
+        let already = effective_workspace_for_role(Role::Assistant, personal.clone(), "alice");
         assert_eq!(already.name, "personal:alice");
     }
 
     #[test]
     fn enforce_personal_pinning_repins_pinned_roles_and_refuses_empty_user() {
         // Pinned roles in a non-personal workspace re-pin to the user's personal.
-        for role in [Role::Assistant, Role::Support] {
-            assert_eq!(
-                enforce_personal_pinning(role, "proj-ws", "alice"),
-                Some("personal:alice".to_string())
-            );
-        }
+        assert_eq!(
+            enforce_personal_pinning(Role::Assistant, "proj-ws", "alice"),
+            Some("personal:alice".to_string())
+        );
         // The user's own personal workspace resolves to itself.
         assert_eq!(
             enforce_personal_pinning(Role::Assistant, "personal:alice", "alice"),
@@ -1279,7 +1214,6 @@ mod tests {
             enforce_personal_pinning(Role::Assistant, "proj-ws", ""),
             None
         );
-        assert_eq!(enforce_personal_pinning(Role::Support, "proj-ws", ""), None);
     }
 
     #[tokio::test]

@@ -6,7 +6,6 @@ use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use strum::IntoEnumIterator;
 use tokio::task::spawn;
 use tracing::{debug, error, info, warn};
 
@@ -312,15 +311,15 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::chrome_daemon::run_watchdog(),
     );
 
-    // chrome-use auto-update: best-effort once-per-boot check that swaps an
-    // existing installation's binary in place (binary-only release swap, all
-    // platforms); skips silently when offline and never blocks or first-installs
-    // without consent.
+    // Managed chrome-use: silent first install at startup (no consent flow —
+    // the user accepted quiet-install risk) plus a delayed once-per-boot
+    // auto-update of an existing install. All failures are non-fatal and
+    // retried next boot.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
-        "chrome-use-updater",
-        mahbot::tools::chrome_daemon::run_auto_update(),
+        "chrome-use-manager",
+        mahbot::tools::chrome_daemon::run_chrome_use_management(),
     );
 
     // Managed bun runtime: silent first install at startup (no consent flow —
@@ -782,7 +781,8 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
         BotCommand::ImageModels | BotCommand::VideoModels => {
             handle_models_command(msg, cmd == BotCommand::ImageModels).await;
         }
-        // Role-switch entry: opens the inline role picker (pool-gated).
+        // `/agents` replies that there is nothing to switch (the pool is the
+        // constant single Assistant).
         BotCommand::Agents => handle_agents_command(msg).await,
         // Global admin command: `/update` has its own dispatch path (it is
         // workspace-independent and must not go through `handle_admin_command`,
@@ -813,106 +813,14 @@ async fn send_telegram_reply(msg: &ChannelMessage, content: String) {
     mahbot::channels::telegram::send_reply(&msg.reply_target, &content).await;
 }
 
-/// Serializes role-switch writes with their feedback (picker checkmark +
-/// command-menu refresh) so two rapid taps commit and repaint in tap order.
-/// Held across the Telegram HTTP feedback: role switches are human-paced and
-/// the HTTP client timeout caps any stall — the accepted tradeoff for
-/// deterministic ordering.
-static ROLE_SWITCH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
-/// Handle a role switch request — pool-gated (revalidated at tap time),
-/// persists the new active role and confirms after a successful switch.
-async fn handle_role_switch(msg: &ChannelMessage, role: Role) {
-    let pool = mahbot::users::role_pool(&msg.user_name).await;
-    if !pool.contains(&role) {
-        send_telegram_reply(
-            msg,
-            format!(
-                "Role '{}' is not in your allowed roles — ask an admin to add it.",
-                role.as_str()
-            ),
-        )
-        .await;
-        return;
-    }
-    let picker_refresh = msg
-        .message_id
-        .map(|message_id| (message_id, build_role_picker_keyboard(&pool, Some(role))));
-    // Awaited inline (the callback handler is spawned per message, so this
-    // never stalls the dispatch loop) under the lock that also covers the
-    // write, making the persisted role and the last checkmark tap-ordered.
-    let guard = ROLE_SWITCH_LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
-    if let Err(e) = mahbot::users::switch_active_role(&msg.user_name, role).await {
-        // Release before the denial reply's network I/O.
-        drop(guard);
-        send_telegram_reply(msg, format!("Failed to switch role: {e}")).await;
-        return;
-    }
-    let Some(channel) = mahbot::channel_registry().get("telegram") else {
-        return;
-    };
-    let tc = channel
-        .as_any()
-        .downcast_ref::<mahbot::channels::telegram::TelegramChannel>()
-        .expect("registered telegram channel");
-    tc.refresh_after_role_switch(&msg.reply_target, picker_refresh)
-        .await;
-}
-
-/// Handle `/agents` — send the inline role picker listing the roles in the
-/// user's pool, the active one marked with ✓. Sent directly through the
-/// channel so the inline keyboard survives (same bypass as the model
-/// pickers — the router delivery path has no inline-keyboard support).
+/// Handle `/agents` — reply that there is nothing to switch: the role pool
+/// is the constant single Assistant for every user.
 async fn handle_agents_command(msg: &ChannelMessage) {
-    let pool = mahbot::users::role_pool(&msg.user_name).await;
-    if pool.is_empty() {
-        // Fail-closed store read or genuinely empty pool — render gracefully.
-        send_telegram_reply(
-            msg,
-            "No roles available for your account — ask an admin to add you.".to_string(),
-        )
-        .await;
-        return;
-    }
-    if pool.len() <= 1 {
-        // Non-admin users now route to a single role (Assistant).
-        send_telegram_reply(
-            msg,
-            "You have only the Assistant role — there is nothing to switch.".to_string(),
-        )
-        .await;
-        return;
-    }
-    let active = mahbot::users::resolve_active_role_from_pool(&msg.user_name, &pool).await;
-    let _ = mahbot::channels::telegram::send_direct(
-        &msg.reply_target,
-        "Select your active role:".to_string(),
-        Some(build_role_picker_keyboard(&pool, active)),
+    send_telegram_reply(
+        msg,
+        "You have only the Assistant role — there is nothing to switch.".to_string(),
     )
     .await;
-}
-
-/// Build the inline role-picker keyboard: one row per pool role, the active
-/// role marked with ✓, each button tapping back `__act__set_role|<role>`.
-fn build_role_picker_keyboard(pool: &[Role], active: Option<Role>) -> serde_json::Value {
-    let rows = pool
-        .iter()
-        .map(|role| {
-            let label = if Some(*role) == active {
-                format!("\u{2713} {}", role.display_label())
-            } else {
-                role.display_label().to_string()
-            };
-            serde_json::json!([{
-                "text": label,
-                "callback_data": format!("__act__set_role|{}", role.as_str()),
-            }])
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({ "inline_keyboard": rows })
 }
 
 /// Handle `/start` command for Telegram — sends a per-user welcome message
@@ -934,7 +842,7 @@ async fn handle_start_command(msg: &ChannelMessage) {
 async fn handle_clear_session(msg: &ChannelMessage) {
     // Clear the session the user actually talks to: the same (role, workspace)
     // resolution as routing — DB-selected workspace, pool-clamped active role
-    // with Assistant fallback, and Assistant/Support pinning.
+    // with Assistant fallback, and Assistant pinning.
     let (effective_role, ws) = mahbot::users::resolve_session_target(&msg.user_name).await;
     let reply = match clear_session(&msg.user_name, effective_role.as_str(), &ws.name).await {
         Ok(reply) => reply,
@@ -948,7 +856,7 @@ async fn handle_clear_session(msg: &ChannelMessage) {
 
 /// Deliver a session-clear confirmation via the router's raw `reply_target`
 /// path (broadcast + persist + transport). The caller passes the already
-/// effective role (pool-clamped, Assistant/Support pinning applied) so the
+/// effective role (pool-clamped, Assistant pinning applied) so the
 /// confirmation bubble matches agent responses.
 async fn deliver_clear_reply(
     reply: &str,
@@ -1207,32 +1115,19 @@ async fn handle_action_callback(msg: ChannelMessage, decoded: (String, String)) 
             answer_telegram_callback(&msg, None).await;
             handle_clear_session(&msg).await;
         }
-        "set_role" => {
-            // Acknowledge first (dismiss the spinner); the confirmation or
-            // denial arrives through the same feedback path the old
-            // per-role commands used.
-            answer_telegram_callback(&msg, None).await;
-            handle_set_role_action(&msg, &payload).await;
-        }
         _ => {
-            // Always acknowledge callback queries to dismiss the Telegram
-            // loading spinner, even for unknown actions.
-            answer_telegram_callback(&msg, None).await;
+            // Acknowledge callback queries to dismiss the Telegram loading
+            // spinner and surface a toast for unknown actions. This catches
+            // stale inline keyboards (e.g. a removed role-picker button) whose
+            // tap must not fail silently.
+            answer_telegram_callback(
+                &msg,
+                Some("This action is no longer available.".to_string()),
+            )
+            .await;
             tracing::warn!(action = %action, "Unknown __act__ action — ignoring");
         }
     }
-}
-
-/// Handle a role-picker tap (`__act__set_role|<role_name>`). Delegates to the
-/// shared switch path, which revalidates the tapped role against the user's
-/// CURRENT pool — a stale tap on a role no longer available gets the standard
-/// denial, not a switch.
-async fn handle_set_role_action(msg: &ChannelMessage, payload: &str) {
-    let Some(role) = Role::iter().find(|r| r.as_str() == payload) else {
-        tracing::warn!(%payload, "set_role action with unknown role — ignoring");
-        return;
-    };
-    handle_role_switch(msg, role).await;
 }
 
 /// Serializes per-user model writes (see [`handle_set_model_action`]).
@@ -1356,13 +1251,11 @@ async fn process_channel_message(mut msg: ChannelMessage) {
         mahbot::util::truncate(&msg.content, 80)
     );
 
-    let (ws, (pool, pool_read_failed)) = tokio::join!(
-        mahbot::users::resolve_workspace_for_user_name(&msg.user_name),
-        mahbot::users::role_pool_status(&msg.user_name),
-    );
+    let ws = mahbot::users::resolve_workspace_for_user_name(&msg.user_name).await;
+    let pool = mahbot::users::role_pool();
     let role = mahbot::users::resolve_active_role_from_pool(&msg.user_name, &pool).await;
 
-    // Assistant/Support always work in the user's personal workspace
+    // The Assistant always works in the user's personal workspace
     // regardless of the selected workspace — resolved before enrichment and
     // before `msg.workspace` is set so uploads, broadcast, persist and
     // chat_history stay consistent with the routed workspace.
@@ -1438,21 +1331,11 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     }
 
     // ── Route through the agent-ID message router ─────────────────
-    // An empty role pool means no role is allowed — the message was still
-    // broadcast/persisted above, but no agent answers. The user notice
-    // fires only for a genuinely empty pool; a transient store read
-    // failure (pool or selected role) drops silently — operator warns
-    // are already logged, and the notice would be misleading.
+    // A failed selected-role store read (fail-closed) drops the message — it
+    // was still broadcast/persisted above, but no agent answers. The operator
+    // warn is already logged; the pool is the constant single Assistant (never
+    // empty), so no 'no roles' notice is needed.
     let Some(effective_role) = effective_role else {
-        if msg.channel == "telegram" && !pool_read_failed && pool.is_empty() {
-            send_telegram_reply(
-                &msg,
-                "You have no active role assigned — ask an admin to assign roles \
-                 in Settings → Users."
-                    .to_string(),
-            )
-            .await;
-        }
         return;
     };
 

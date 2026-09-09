@@ -1242,6 +1242,10 @@ fn direct_agent_id(user_name: &str, role: &str, ws_name: &str) -> String {
     // full `{user}_{ws_name}_{role}` form. The leading segment stays escaped
     // (`safe_user_segment`), comparing the embedded user raw so reserved names
     // like `manager` yield `user_manager_personal:{role}`.
+    //
+    // Orphaned persisted sessions keyed `{user}_personal:support` are
+    // intentionally NOT migrated or cleaned up — the Support role is gone and
+    // those rows are dead weight by design.
     if ws_name.strip_prefix("personal:") == Some(user_name) {
         return format!("{}_personal:{role}", safe_user_segment(user_name));
     }

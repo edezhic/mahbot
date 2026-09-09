@@ -554,6 +554,9 @@ impl Session {
     ///
     /// ```text
     /// role_description       — from src/prompt/role/{role}.md (always)
+    /// onboarding_guide       — full-access Assistant only, while onboarding
+    ///                          state is Init (or via the greeting kickoff's
+    ///                          pending-guide bridge)
     /// active_models_opts     — Assistant only, when the catalogs are available
     /// workspace boilerplate  — from src/prompt/context/workspace.md, substituted (always)
     /// skills                 — if any skills exist in the workspace
@@ -620,8 +623,29 @@ impl Session {
         let role_description = role.role_description_for(full_access);
         let skills = skills::load_skills(ws).await;
 
-        let mut msgs = Vec::with_capacity(6);
+        let mut msgs = Vec::with_capacity(7);
         msgs.push(ChatMessage::system(&role_description));
+
+        // Onboarding guide (full-access Assistant only, while onboarding is
+        // live). One-shot / no-re-onboarding contract: the guide disappears
+        // once state is `Finished`. The greeting kickoff persists `Finished`
+        // BEFORE the pipeline builds the greeting's session (many async hops
+        // vs a single fast config_kv upsert), so the state check alone would
+        // deterministically miss the guide — the kickoff also arms a
+        // process-local pending flag that the first full-access Assistant
+        // build consumes here (see `GREETING_GUIDE_PENDING`). After that
+        // single consumption nothing re-arms it and the state can only move
+        // `Init` → `Finished`. Audience is global state and admin-only:
+        // non-admin users receive no onboarding and none is planned.
+        if matches!(role, Role::Assistant) && full_access {
+            let live = crate::config::CONFIG.onboarding_stage()
+                != crate::config::OnboardingState::Finished;
+            if live || crate::onboarding::take_greeting_guide_pending() {
+                msgs.push(ChatMessage::system(crate::prompt::load_prompt(
+                    "role/onboarding.md",
+                )));
+            }
+        }
 
         // Assistant sessions carry the <active-models-opts> block: the active
         // image/video models' parameter envelope, rendered from the live
@@ -660,8 +684,9 @@ impl Session {
 
     /// Build fresh system prompt + ticket context + user message for the
     /// current turn.
-    /// Returns messages: [role_description, active_models_opts?, workspace_boilerplate,
-    /// skills?, alarms?, workspaces?, board_context?, ticket_block?, user_msg]
+    /// Returns messages: [role_description, onboarding_guide?, active_models_opts?,
+    /// workspace_boilerplate, skills?, alarms?, workspaces?, board_context?,
+    /// ticket_block?, user_msg]
     /// plus the rendered active-models snapshot (Assistant only; `Default` when
     /// no block injected).
     ///

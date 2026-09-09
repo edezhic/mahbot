@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use super::ToastMessage;
 use super::common::MAX_INPUT_CHARS;
-use super::menus::{ContextMenu, MenuItem, RoleMenu, RoleMenuItem};
+use super::menus::{ContextMenu, MenuItem};
 use super::theme;
 use super::widgets::{BubbleSide, PickOption, align_bubble};
 
@@ -298,8 +298,6 @@ pub enum HomeMessage {
     /// stale and dropped, so per-keystroke and out-of-order writes are
     /// impossible.
     DraftSaveSettled { generation: u64 },
-    /// Switch user's active role. Carries (user_name, new_role).
-    SwitchRole(String, Role),
     /// Chat history cleared successfully — divider inserted.
     ChatCleared,
     /// Chat history clear failed.
@@ -326,11 +324,6 @@ pub enum HomeMessage {
     OnboardingScriptRePrompt,
     /// The Phase-2 kickoff task finished (marker; the work is done inside the task).
     OnboardingKickoffDone,
-    /// Toggle the composer role dropdown open/closed.
-    RoleMenuToggled,
-    /// Close the composer role dropdown (on role selection, message send,
-    /// chat clear, or user switch).
-    RoleMenuClosed,
 }
 
 pub struct HomeState {
@@ -380,8 +373,6 @@ pub struct HomeState {
     pagination_gen: u64,
     /// Undo/redo stack for the chat input text editor.
     undo_stack: super::common::UndoStack,
-    /// Whether the composer role dropdown is open.
-    role_menu_open: bool,
     /// Captured {author, snippet} of the message being replied to. `Some`
     /// while a reply preview is shown above the composer; cleared on send,
     /// cancel, chat clear, or user/workspace switch.
@@ -399,7 +390,7 @@ pub struct HomeState {
 
 /// The chat view for the selected user: two workspaces — the picker-resolved
 /// one plus a merge partner. Symmetric visibility: the picker only selects
-/// the recipient, it never filters the view (personal Assistant/Support
+/// the recipient, it never filters the view (personal Assistant
 /// messages show at any picker, and the user's project chat shows at the
 /// Personal picker).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,7 +438,6 @@ impl HomeState {
             loading_older: false,
             pagination_gen: 0,
             undo_stack: super::common::UndoStack::new(),
-            role_menu_open: false,
             pending_reply: None,
             drafts: crate::channels::chat_draft::DraftStore::global().clone(),
             draft_save: super::common::DebounceState::new(),
@@ -491,7 +481,7 @@ impl HomeState {
     }
 
     /// Whether `workspace` is the selected user's personal workspace
-    /// (`personal:{user}`) — the Assistant/Support chat shown at any picker.
+    /// (`personal:{user}`) — the Assistant chat shown at any picker.
     fn is_selected_user_personal_workspace(&self, workspace: &str) -> bool {
         self.selected_user
             .as_deref()
@@ -621,7 +611,7 @@ impl HomeState {
     }
 
     /// Reset pagination and auto-scroll state. Called at all cleanup sites
-    /// (user change, workspace change, role change, clear, stream lag).
+    /// (user change, workspace change, clear, stream lag).
     const fn reset_pagination_state(&mut self) {
         self.oldest_loaded_id = None;
         self.has_more = false;
@@ -636,7 +626,6 @@ impl HomeState {
         self.seen_ids.clear();
         self.history_loaded = false;
         self.onboarding_script_active = false;
-        self.role_menu_open = false;
         self.pending_reply = None;
         self.reset_pagination_state();
     }
@@ -705,7 +694,7 @@ impl HomeState {
     }
 
     /// Start the Phase-1 scripted onboarding (no provider) or fire the Phase-2
-    /// Support kickoff (provider configured, state Init). Called after the first
+    /// Assistant kickoff (provider configured, state Init). Called after the first
     /// history load for a selected user. No-op when the scenario is already active.
     fn maybe_start_onboarding(&mut self) -> Task<HomeMessage> {
         if self.selected_user.is_none() {
@@ -715,8 +704,9 @@ impl HomeState {
         // the selected user being the admin — the onboarding flow is admin-only,
         // but a non-admin created via the Settings bypass before a provider is
         // set would see it and could set the global provider. That edge is out of
-        // scope; only the Phase-2 `kickoff_support` is admin-gated (via its
-        // `role_pool` Support check) so a non-admin never consumes the state.
+        // scope; only the Phase-2 `kickoff_onboarding` is admin-gated (an explicit
+        // admin-permission check on the triggering user) so a non-admin never
+        // consumes the state.
         if !crate::config::provider_configured() {
             if self.onboarding_script_active {
                 return Task::none();
@@ -736,7 +726,7 @@ impl HomeState {
                     &format!("onboarding-intro-{i}"),
                     msg,
                     crate::ChatDirection::Agent,
-                    Some("support".to_string()),
+                    Some("assistant".to_string()),
                     None,
                 );
             }
@@ -746,7 +736,7 @@ impl HomeState {
             let user = self.selected_user.clone().unwrap_or_default();
             let user_for_task = user.clone();
             Task::perform(
-                async move { crate::onboarding::kickoff_support(&user_for_task).await },
+                async move { crate::onboarding::kickoff_onboarding(&user_for_task).await },
                 |_res| HomeMessage::OnboardingKickoffDone,
             )
         } else {
@@ -899,12 +889,7 @@ impl HomeState {
     }
 
     #[expect(clippy::too_many_lines)]
-    pub fn view(
-        &self,
-        active_role: Option<Role>,
-        role_pool: &[Role],
-        draining: bool,
-    ) -> Element<'_, HomeMessage> {
+    pub fn view(&self, draining: bool) -> Element<'_, HomeMessage> {
         // ── Chat message area ────────────────────────────────────
         let chat_area = if self.messages.is_empty() {
             let empty_hint = if self.selected_user.is_none() {
@@ -1164,58 +1149,8 @@ impl HomeState {
         let transcription_disabled = crate::audio::voice::is_transcription_disabled();
         let recording_unavailable = mic_busy || transcription_disabled;
 
-        // Controls for the composer action toolbar: role selector + mic button.
+        // Controls for the composer action toolbar: the mic button.
         let mut controls: Vec<Element<'_, HomeMessage>> = Vec::new();
-        let role_icon = match active_role {
-            Some(role) => {
-                let (fg, _) = theme::role_badge_color_for(&role);
-                theme::role_icon(&role).size(theme::TEXT_14).color(fg)
-            }
-            None => lucide::bot::<iced::Theme, iced::Renderer>()
-                .size(theme::TEXT_14)
-                .color(theme::TEXT_MUTED),
-        };
-        let role_btn = button(role_icon)
-            .on_press_maybe(
-                (self.selected_user.is_some() && !role_pool.is_empty())
-                    .then_some(HomeMessage::RoleMenuToggled),
-            )
-            .style(theme::icon_button_style(false))
-            .padding(theme::PAD_3);
-
-        // ── Role dropdown (overlay, above the composer) ────────────
-        // The role list floats above the whole widget tree via
-        // `RoleMenu`'s overlay (Widget::overlay + Overlay trait) anchored
-        // to the role button — opening it no longer shifts the chat
-        // layout. Items carry the same roles/selection as before; the
-        // current role is disabled with a checkmark, and selecting a role
-        // publishes SwitchRole, which the Dashboard intercepts and persists
-        // (it also sends RoleMenuClosed). Outside-click / Escape dismissal
-        // is handled by the popup itself via RoleMenuClosed.
-        let role_btn: Element<'_, HomeMessage> = if !role_pool.is_empty() {
-            let user = self.selected_user.clone().unwrap_or_default();
-            let items: Vec<RoleMenuItem<HomeMessage>> = role_pool
-                .iter()
-                .map(|role| {
-                    let is_current = active_role.as_ref() == Some(role);
-                    RoleMenuItem::new(
-                        *role,
-                        is_current,
-                        (!is_current).then(|| HomeMessage::SwitchRole(user.clone(), *role)),
-                    )
-                })
-                .collect();
-            RoleMenu::new(
-                role_btn,
-                items,
-                self.role_menu_open,
-                HomeMessage::RoleMenuClosed,
-            )
-            .into()
-        } else {
-            role_btn.into()
-        };
-        controls.push(super::widgets::tooltip_hint(role_btn, "switch agent"));
 
         let mic_tooltip = if transcription_disabled {
             "voice recording unavailable — local transcription is disabled"
@@ -1465,10 +1400,7 @@ impl HomeState {
                 self.restore_chat_draft();
                 self.refresh_history()
             }
-            HomeMessage::SendMessage => {
-                self.role_menu_open = false;
-                self.send_message()
-            }
+            HomeMessage::SendMessage => self.send_message(),
             HomeMessage::HistoryLoaded(entries, has_more) => {
                 // Track oldest loaded ID and whether more exist for pagination.
                 self.oldest_loaded_id = entries.first().map(|e| e.id);
@@ -1508,7 +1440,6 @@ impl HomeState {
                 self.sending = false;
                 self.typing = false;
                 self.typing_tick_state = 0;
-                self.role_menu_open = false;
                 self.pending_reply = None;
                 self.reset_pagination_state();
                 // Capture synchronously (not from the ChatCleared callback):
@@ -1529,7 +1460,7 @@ impl HomeState {
                         // [`crate::users::resolve_session_target`]): the
                         // starting role/workspace resolve from the user's DB
                         // record, never the GUI picker position, and the
-                        // resolvable roles (Assistant/Support) are pinned —
+                        // resolvable role (Assistant) is pinned —
                         // so the cleared session is always the user's
                         // personal-workspace session.
                         let (effective_role, ws) =
@@ -1618,11 +1549,6 @@ impl HomeState {
                 if self.draft_save.should_process(generation) {
                     self.drafts.clone().persist_async();
                 }
-                Task::none()
-            }
-            HomeMessage::SwitchRole(user, role) => {
-                // Intercepted by Dashboard — no-op in Home
-                tracing::debug!("Home: SwitchRole({user}, {role}) — handled by Dashboard");
                 Task::none()
             }
             HomeMessage::ChatClearError(e) => {
@@ -1811,16 +1737,7 @@ impl HomeState {
                 }
                 Task::none()
             }
-            HomeMessage::RoleMenuToggled => {
-                self.role_menu_open = !self.role_menu_open;
-                Task::none()
-            }
-            HomeMessage::RoleMenuClosed => {
-                self.role_menu_open = false;
-                Task::none()
-            }
             HomeMessage::StartVoiceRecording => {
-                self.role_menu_open = false;
                 // Best-effort pre-flight check surfaced by the pipeline itself
                 // (single source of truth for the blocked-state mapping). The
                 // pipeline remains the authoritative guard — this predicate can
@@ -2030,7 +1947,7 @@ impl HomeState {
                             &crate::generate_id(),
                             crate::onboarding::invalid_message(),
                             crate::ChatDirection::Agent,
-                            Some("support".to_string()),
+                            Some("assistant".to_string()),
                             None,
                         );
                         Err("invalid provider input".to_string())
@@ -2043,7 +1960,7 @@ impl HomeState {
                                 &crate::generate_id(),
                                 crate::onboarding::success_message(),
                                 crate::ChatDirection::Agent,
-                                Some("support".to_string()),
+                                Some("assistant".to_string()),
                                 None,
                             );
                             Ok(())
@@ -2055,7 +1972,7 @@ impl HomeState {
                                 &crate::generate_id(),
                                 &format!("Couldn't save that: {e:#}"),
                                 crate::ChatDirection::Agent,
-                                Some("support".to_string()),
+                                Some("assistant".to_string()),
                                 None,
                             );
                             Err(e.to_string())
@@ -2459,7 +2376,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // personal-workspace visibility (Assistant/Support at any picker)
+    // personal-workspace visibility (Assistant at any picker)
     // ------------------------------------------------------------------
 
     #[test]
@@ -2476,7 +2393,7 @@ mod tests {
         assert!(project.workspace_visible("ws1"));
         assert!(
             project.workspace_visible("personal:alice"),
-            "personal Assistant/Support messages must be visible at any picker"
+            "personal Assistant messages must be visible at any picker"
         );
         assert!(!project.workspace_visible("ws2"));
         assert!(
@@ -2737,7 +2654,7 @@ mod tests {
     #[test]
     fn test_call_site_wiring_symmetric_at_any_picker() {
         // (picker, message workspace, agent role, content) — both directions:
-        // at the project picker personal Assistant/Support messages append and
+        // at the project picker personal Assistant messages append and
         // clear sending/typing; at the personal picker Assistant messages
         // still append into the user's DB project workspace (the merge partner).
         let cases = [

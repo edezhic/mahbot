@@ -1,5 +1,5 @@
 //! Onboarding flow: the Phase-1 scripted provider-setup scenario (GUI Home
-//! chat) and the Phase-2 Support kickoff ("hi mah bot" auto-send).
+//! chat) and the Phase-2 Assistant kickoff ("hi mah bot" auto-send).
 //!
 //! Phase 1 runs in the GUI Home chat while no LLM provider is configured
 //! (`provider_configured() == false`): a hard-coded scripted scenario guides
@@ -8,21 +8,45 @@
 //! scripted exchange is transient (never persisted to chat_history).
 //!
 //! Phase 2 fires once a provider is configured and the onboarding state is
-//! `Init`: the admin's active role is set to Support and a single real
-//! "hi mah bot" user message is routed through the normal pipeline.
+//! `Init` for an admin: the kickoff persists `OnboardingState::Finished`
+//! (closing the flow) and routes a single real "hi mah bot" user message
+//! through the normal pipeline. The Assistant drives onboarding now (the
+//! Support role is gone); the onboarding guide reaches the greeting session
+//! via the pending-guide bridge, not the onboarding state.
 
+use crate::ChannelMessage;
 use crate::config::{
     CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY, CONFIG_KEY_PROVIDER_KEY,
 };
-use crate::{ChannelMessage, Role};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Process-local guard ensuring `kickoff_support` fires exactly once per
-/// process lifetime, closing the narrow window where two concurrent Home
-/// renders both read `Init` before either persists `Welcomed`. The persisted
-/// `Welcomed` state is the durable guard across restarts; this only covers the
-/// in-process race.
+/// Process-local CAS guard ensuring only one `kickoff_onboarding` attempt is
+/// in flight per process; it is reset on a persist failure so a later kickoff
+/// attempt can retry. The persisted `Finished` state is the durable guard
+/// across restarts.
 static KICKOFF_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// Bridge over the greeting race: `kickoff_onboarding` persists `Finished`
+/// BEFORE the async pipeline builds the session that handles the greeting
+/// (the greeting crosses many channel hops; the persist is a single fast
+/// config_kv upsert), so `Session::build_context_messages` cannot rely on
+/// `onboarding_stage() != Finished` alone to inject the onboarding guide.
+/// The kickoff arms this flag; the first full-access Assistant session built
+/// afterwards consumes it and gets the guide — in practice the greeting
+/// session, since nothing else builds an admin Assistant session during the
+/// kickoff window. If the greeting send fails, the next admin Assistant
+/// session receives the guide instead (a reasonable fallback).
+static GREETING_GUIDE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Arm the pending-guide bridge (see [`GREETING_GUIDE_PENDING`]).
+pub fn mark_greeting_guide_pending() {
+    GREETING_GUIDE_PENDING.store(true, Ordering::SeqCst);
+}
+
+/// Consume the pending-guide bridge; returns true exactly once per kickoff.
+pub fn take_greeting_guide_pending() -> bool {
+    GREETING_GUIDE_PENDING.swap(false, Ordering::SeqCst)
+}
 
 /// Parsed Phase-1 provider input.
 #[derive(Debug)]
@@ -138,7 +162,7 @@ pub fn intro_messages() -> [&'static str; 2] {
 /// Phase-1 success message after the provider is configured.
 #[must_use]
 pub fn success_message() -> &'static str {
-    "Provider configured! Setting up your Support assistant — one moment."
+    "Provider configured! Setting up your admin Assistant — one moment."
 }
 
 /// Phase-1 re-prompt for unparseable input.
@@ -148,12 +172,17 @@ pub fn invalid_message() -> &'static str {
 }
 
 /// Phase-2 kickoff: if onboarding state is `Init` and a provider is
-/// configured, mark it `Welcomed` (the idempotency guard), set the admin's
-/// active role to Support, and auto-send a single real "hi mah bot" user
-/// message through the normal GUI pipeline. No-op when the state is already
-/// `Welcomed`/`Finished`, when no provider is configured, or when the user
-/// has no Support in their role pool.
-pub async fn kickoff_support(user_name: &str) -> anyhow::Result<()> {
+/// configured, persist `OnboardingState::Finished` (closing the flow) and
+/// auto-send a single real "hi mah bot" user message through the normal GUI
+/// pipeline. No-op when the state is not `Init`, when no provider is
+/// configured, or when the user is not an admin.
+///
+/// Onboarding is strictly one-shot: the `== Init` gate plus the `KICKOFF_FIRED`
+/// CAS make re-trigger impossible, even after a provider reconnection or a
+/// second workspace — the state can only move `Init` → `Finished` and only this
+/// route moves it. Non-admin users NEVER trigger onboarding (none is planned
+/// for them): the `is_admin` gate fails closed.
+pub async fn kickoff_onboarding(user_name: &str) -> anyhow::Result<()> {
     use crate::config::OnboardingState;
     if crate::config::CONFIG.onboarding_stage() != OnboardingState::Init {
         return Ok(());
@@ -161,38 +190,37 @@ pub async fn kickoff_support(user_name: &str) -> anyhow::Result<()> {
     if !crate::config::provider_configured() {
         return Ok(());
     }
-    // The Support/onboarding flow is admin-only: bail before touching the
-    // global state when the user's pool has no Support. This keeps a non-admin
-    // (created via the Settings bypass pre-provider) from consuming the
-    // onboarding state or emitting the auto-message.
-    let pool = crate::users::role_pool(user_name).await;
-    if !pool.contains(&Role::Support) {
+    // The onboarding flow is admin-only: bail before touching the
+    // global state when the triggering user is not an admin (fails closed).
+    // This keeps a non-admin (created via the Settings bypass pre-provider)
+    // from consuming the onboarding state or emitting the auto-message.
+    if !crate::users::is_admin(user_name).await {
         return Ok(());
     }
-    // Compare-and-set: only one kickoff fires per process lifetime.
+    // Compare-and-set: only one kickoff attempt is in flight per process;
+    // the CAS is reset below on a persist failure so a later attempt retries.
     if KICKOFF_FIRED.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-    // Switch the active role BEFORE persisting `Welcomed`: if the role switch
-    // fails the durable state is still `Init`, so the next render retries
-    // (role-setting is idempotent). Persisting first would strand the state at
-    // `Welcomed` with `hi mah bot` never sent.
-    if let Err(e) = crate::users::switch_active_role(user_name, Role::Support).await {
-        KICKOFF_FIRED.store(false, Ordering::SeqCst);
-        return Err(e);
-    }
-    // Mark Welcomed — the durable guard against double-fire on reload/render.
-    // If the persist fails, reset the in-process CAS so a later render can
-    // retry (the durable `Init` state is unchanged; the role stays Support).
+    // Persist `Finished` FIRST: if it fails, nothing has been sent and the
+    // CAS is reset, so the next kickoff attempt (the Home path re-fires it on
+    // a later HistoryLoaded render) retries cleanly — no duplicate greeting
+    // is possible. On success the durable one-shot guard is in place before
+    // any side effect.
     if let Err(e) = crate::config::persist_settled_string_field(
         crate::config::CONFIG_KEY_ONBOARDING_STATE,
-        OnboardingState::Welcomed.as_str(),
+        OnboardingState::Finished.as_str(),
     )
     .await
     {
         KICKOFF_FIRED.store(false, Ordering::SeqCst);
         return Err(e);
     }
+    // The greeting session is built only after several async hops, by which
+    // time the `Finished` write above is long since visible — arm the pending
+    // bridge so `Session::build_context_messages` still injects the onboarding
+    // guide into exactly that session.
+    mark_greeting_guide_pending();
     let msg = ChannelMessage {
         user_name: user_name.to_string(),
         reply_target: user_name.to_string(),
@@ -204,7 +232,9 @@ pub async fn kickoff_support(user_name: &str) -> anyhow::Result<()> {
     if let Some(tx) = crate::GUI_MESSAGE_TX.get()
         && let Err(e) = tx.send(msg)
     {
-        // The state is already `Welcomed`; the message is best-effort.
+        // Best-effort: the onboarding state is already `Finished`, so a later
+        // kickoff cannot re-send; the next admin Assistant session simply
+        // receives the guide instead.
         tracing::error!("kickoff: failed to send 'hi mah bot' via GUI_MESSAGE_TX: {e}");
     }
     Ok(())

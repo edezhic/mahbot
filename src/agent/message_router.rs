@@ -71,7 +71,6 @@ fn telegram_role_emoji(role: Role) -> &'static str {
         Role::Maintainer => "⚙️",
         Role::Sanitation => "🧼",
         Role::Assistant => "💬",
-        Role::Support => "🛟",
     }
 }
 
@@ -511,7 +510,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             }
         };
 
-        // Execution-time invariant: pinned roles (Assistant/Support)
+        // Execution-time invariant: pinned roles (Assistant)
         // never run outside the user's personal workspace, no matter what the
         // producer stored. Empty-user envelopes for pinned roles are refused
         // outright.
@@ -879,8 +878,9 @@ async fn route_manager_notify(response: &str, source_workspace: &str) {
 
 /// Transport-deliver `response` to every channel binding of `users`
 /// (broadcast + chat_history persistence happen at the call sites). Telegram
-/// deliveries get the per-role attribution prefix when the recipient can
-/// switch roles. Logs both diagnostics per reachable binding: an
+/// deliveries carry the per-role attribution prefix only for multi-role
+/// recipients — under the constant single-Assistant pool the prefix is
+/// effectively never applied. Logs both diagnostics per reachable binding: an
 /// unresolvable recipient (warn — the response is persisted but not
 /// transport-delivered) and a transport failure (error). `workspace` names
 /// the workspace in the no-channels diagnostic (which also names the affected

@@ -1594,17 +1594,17 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
 /// Resolves the active user's role and workspace from the user's DB record,
 /// then routes through the agent-ID message router.
 ///
-/// Falls back to the admin user's pool role if no active user can be
-/// determined.
+/// Falls back to the admin user's role (Assistant — the sole pool role) if
+/// no active user can be determined.
 async fn route_to_agent(text: String) {
     // Try active user first (set by GUI on user switch)
     let user_name = active_user_name();
     if !user_name.is_empty() {
-        let pool = crate::users::role_pool(&user_name).await;
+        let pool = crate::users::role_pool();
         let Some(role) = crate::users::resolve_active_role_from_pool(&user_name, &pool).await
         else {
-            // Empty pool or a failed selected-role store read (fail-closed)
-            // — no role is allowed to answer.
+            // A failed selected-role store read (fail-closed) — no role is
+            // allowed to answer.
             info!("Voice command dropped (no active role) (user: {user_name}): {text}");
             return;
         };
@@ -1614,15 +1614,10 @@ async fn route_to_agent(text: String) {
     }
 
     // No active user: fall back to the admin user's DB workspace (same
-    // warning + personal fallback as the active-user path). Pool-gated
-    // like the active-user path: an emptied admin pool drops the command.
+    // warning + personal fallback as the active-user path). The role pool is
+    // the constant single Assistant.
     let ws = crate::users::resolve_workspace_for_user_name("admin").await;
-    let admin_pool = crate::users::role_pool("admin").await;
-    let Some(&role) = admin_pool.first() else {
-        info!("Voice command dropped (no active role) (user: admin): {text}");
-        return;
-    };
-    route_voice_to_role(text, "admin", role, ws).await;
+    route_voice_to_role(text, "admin", crate::Role::Assistant, ws).await;
 }
 
 /// Shared tail of [`route_to_agent`]: pin the pool-selected role to its
@@ -1630,8 +1625,7 @@ async fn route_to_agent(text: String) {
 /// the message router.
 ///
 /// Pool-gating applies to both callers: the routed role stays inside the
-/// pool — with Assistant/Support pinning to the personal workspace,
-/// atomically.
+/// pool — with Assistant pinning to the personal workspace, atomically.
 ///
 /// The routed user_name is the active user, or "admin" (the seeded admin
 /// identity) for the no-active-user fallback — an empty name would produce
@@ -2351,7 +2345,7 @@ impl PipelineCtx {
         }
         let role = crate::users::resolve_active_role(&user_name).await;
         let ws = crate::users::resolve_workspace_for_user_name(&user_name).await;
-        // Assistant/Support conversations live in the user's personal workspace;
+        // Assistant conversations live in the user's personal workspace;
         // a None role (empty pool or store failure) fails closed to the
         // resolved workspace — the notice stays visible in the current view.
         let ws = match role {

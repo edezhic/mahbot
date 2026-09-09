@@ -1,8 +1,8 @@
-//! In-process read-only SQL query tool for the Support role — wraps the
-//! `mahbot debug` read-only query mechanism against the daemon's own live
+//! In-process read-only SQL query tool for the full-access Assistant — wraps
+//! the `mahbot debug` read-only query mechanism against the daemon's own live
 //! connections (the consolidated `core.db` via [`crate::db::DOMAIN_CONN`], the
-//! `logs.db` via [`crate::logs::LOG_STORE`]) so a trusted Support agent can query
-//! them without a subprocess or a second store instance.
+//! `logs.db` via [`crate::logs::LOG_STORE`]) so a trusted admin Assistant can
+//! query them without a subprocess or a second store instance.
 
 use crate::db::Value;
 use crate::db::debug;
@@ -11,7 +11,7 @@ use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 use crate::{Tool, Workspace};
 use anyhow::anyhow;
 
-/// Struct implementing the [`Tool`] trait for the Support role's read-only DB query.
+/// Struct implementing the [`Tool`] trait for the Assistant's read-only DB query.
 pub(crate) struct MahbotDebugTool;
 
 #[async_trait::async_trait]
