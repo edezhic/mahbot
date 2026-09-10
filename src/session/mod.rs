@@ -4,6 +4,7 @@
 //! ([`transcript`]) that the Running Agents GUI reads to show a running
 //! agent's in-memory conversation including the unpersisted tail.
 
+mod compaction_dump;
 pub mod dead_session;
 pub(crate) mod image_strip;
 mod manager;

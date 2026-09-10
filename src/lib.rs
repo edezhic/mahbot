@@ -1278,7 +1278,7 @@ pub(crate) enum ChatRole {
 
 // ── Provider trait + types ──────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ChatMessage {
     pub role: ChatRole,
     pub content: String,

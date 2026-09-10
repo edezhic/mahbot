@@ -462,9 +462,14 @@ impl Session {
     /// user messages + assistant answers from the pre-compaction history
     /// (tool traffic excluded — see `select_retention_window`).
     ///
+    /// Before persisting, the messages this compaction deletes are dumped to
+    /// a file via [`super::compaction_dump`] and the dump path is appended to
+    /// the summary message, so the agent can re-read dropped content with the
+    /// read tool. A dump failure is fail-open (no path line).
+    ///
     /// The LLM call to produce the summary text is the responsibility of
     /// [`crate::Agent::summarize`] — this method
-    /// handles only the history rebuild and persistence.
+    /// handles only the history rebuild, dump, and persistence.
     ///
     /// KV-cache preservation: called by Agent after producing a summary
     /// with byte-identical parameters (model, reasoning_effort, tools,
@@ -491,8 +496,30 @@ impl Session {
         // chronological order. The in-flight user message is already among
         // them (newest user message) — no separate re-append here.
         let prefix = load_prompt("context/summary_prefix.md");
-        compacted.push(ChatMessage::system(format!("{prefix}{summary_text}")));
-        compacted.extend(crate::session::select_retention_window(&self.history));
+        let retained = crate::session::select_retention_window(&self.history);
+        // Dump what this compaction deletes BEFORE persisting, so the path
+        // rides inside the persisted summary message; a persist failure then
+        // orphans the dump (accepted: dumps are never GC'd). A dump failure
+        // fails open.
+        let dump_path = super::compaction_dump::dump_deleted_messages(
+            agent_id,
+            &self.history,
+            &retained,
+            role,
+            user_name,
+        )
+        .await;
+        let mut summary = format!("{prefix}{summary_text}");
+        if let Some(path) = &dump_path {
+            summary.push_str("\n\n");
+            let rendered_path = path.display().to_string();
+            summary.push_str(&substitute(
+                &load_prompt("context/summary_spill.md"),
+                &[("{{path}}", rendered_path.as_str())],
+            ));
+        }
+        compacted.push(ChatMessage::system(summary));
+        compacted.extend(retained);
 
         // Persist compacted history (system prompt + summary + retained window).
         // On success, update in-memory history to match. On failure, keep the
@@ -1029,10 +1056,7 @@ const MAX_PERSONAL_FILES_BYTES: usize = 6 * 1024;
 /// files or the walk fails (fail-open, like the other blocks). The walk runs
 /// on the blocking pool so a large workspace never stalls the executor.
 async fn fetch_personal_files(user_name: &str) -> Option<String> {
-    let valid = !user_name.trim().is_empty()
-        && !user_name.contains(['/', '\\'])
-        && !matches!(user_name, "." | "..");
-    if !valid {
+    if !crate::users::is_valid_personal_user_name(user_name) {
         return None;
     }
     let root = crate::users::personal_workspace_path(user_name);
@@ -1044,10 +1068,10 @@ async fn fetch_personal_files(user_name: &str) -> Option<String> {
 
 /// Walk the personal workspace and collect up to `MAX_PERSONAL_FILE_ENTRIES + 1`
 /// relative file paths (directories are implied by the paths and skipped).
-/// Ripgrep defaults apply: hidden entries (`.git/`, `.DS_Store`, all dotfiles)
-/// are skipped, and `generated/` / `uploads/` directories are pruned at the
-/// entry level so large media trees are never traversed. Symlinks are not
-/// followed.
+/// Ripgrep defaults apply: hidden entries (`.git/`, `.DS_Store`, all dotfiles —
+/// including the hidden `.compaction` dump dir) are skipped, and `generated/`
+/// / `uploads/` directories are pruned at the entry level so large media
+/// trees are never traversed. Symlinks are not followed.
 fn walk_personal_files(root: &Path) -> Vec<String> {
     let cap = MAX_PERSONAL_FILE_ENTRIES + 1;
     let mut out = Vec::new();

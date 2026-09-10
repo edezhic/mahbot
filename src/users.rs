@@ -535,6 +535,18 @@ fn fallback_storage_root() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join("mahbot_userspaces"))
 }
 
+/// Whether `user_name` may be used to resolve a personal-workspace path:
+/// non-empty, no path separators, not a dot entry. Everything that resolves
+/// `userspaces/<user>` for listing or writing guards here — a synthetic or
+/// path-bearing name must never address the userspaces root or another
+/// user's directory.
+#[must_use]
+pub(crate) fn is_valid_personal_user_name(user_name: &str) -> bool {
+    !user_name.trim().is_empty()
+        && !user_name.contains(['/', '\\'])
+        && !matches!(user_name, "." | "..")
+}
+
 /// Return the filesystem path for a user's personal workspace:
 /// `<storage_root>/userspaces/<name>/`.
 ///
