@@ -124,8 +124,8 @@ tokio::task_local! {
 ///   implement → review cycles, and sequential tool dependencies all require
 ///   many turns — this is deliberate problem-solving, not a runaway loop.
 ///
-/// * Cost is not a concern. Even a full 1000-round run with the default model
-///   (GLM 5.3 Flash) costs well under $1, so there is zero cost reason to
+/// * Cost is not a concern. Even a full 1000-round run on the current
+///   default models costs well under $1, so there is zero cost reason to
 ///   lower the limit.
 ///
 /// * Running to the tool-round cap is EXTREMELY rare with modern models. The

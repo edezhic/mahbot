@@ -750,8 +750,11 @@ impl OpenAiCompatibleProvider {
 
         // Reasoning effort — model-family-aware for custom endpoints.
         // The default OpenRouter endpoint stays byte-identical: the effort
-        // passes through unchanged (OpenRouter normalizes the value per
-        // model). Custom endpoints get the family's
+        // passes through unchanged. OpenRouter silently ignores parameters
+        // absent from a model's supported-parameters list (accepted but never
+        // forwarded), so a model without `reasoning_effort` support simply
+        // runs its own default — no per-model gating here, and requests can
+        // never break on it. Custom endpoints get the family's
         // native field/value vocabulary (e.g. Ollama 400s on `xhigh`), so
         // reasoning works by default on self-hosted servers too.
         match reasoning_fields_for_request(

@@ -3965,7 +3965,7 @@ mod tests {
         let typed = "deepseek/deepseek-chat";
         // An editor holding the typed text with the caret parked at the end,
         // as it sits while the user pauses between keystrokes.
-        let mut editor = SingleLineEditorState::new(typed);
+        let editor = SingleLineEditorState::new(typed);
         editor.buffer.move_to(0, typed.chars().count());
         state.field_editors.insert(field.to_string(), editor);
 
