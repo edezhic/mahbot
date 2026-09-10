@@ -636,10 +636,13 @@ impl SettingsState {
         map
     }
 
-    /// Re-create/re-sync the stateless field editors from the current config
-    /// snapshot. Config text editors get `set_text` (so an in-flight external
-    /// refresh is applied); routing editors use insert-if-absent so an
-    /// existing routing row keeps its undo stack / caret across refreshes.
+    /// Re-sync the config text editors from the current config snapshot.
+    /// Called from [`Self::refresh`] (page navigation). A config editor is
+    /// rewritten only when the snapshot value actually differs from what it
+    /// already shows — an identical-value rewrite would reset its caret and
+    /// undo stack. Routing editors are seeded insert-if-absent (see
+    /// [`Self::seed_routing_editors`]) so existing routing rows keep their
+    /// undo stack / caret across refreshes.
     fn resync_field_editors(&mut self) {
         for key in TEXT_INPUT_KEYS {
             let field = format!("config:{key}");
@@ -650,7 +653,11 @@ impl SettingsState {
                 .to_string();
             self.field_editors
                 .entry(field)
-                .and_modify(|e| e.set_text(&value))
+                .and_modify(|e| {
+                    if e.text() != value {
+                        e.set_text(&value);
+                    }
+                })
                 .or_insert_with(|| SingleLineEditorState::new(&value));
         }
         self.seed_routing_editors();
@@ -677,17 +684,21 @@ impl SettingsState {
     }
 
     /// Push the canonical value for a single field id into its editor (if the
-    /// editor has been created). Called after an external config reload or a
-    /// completed persist so the rendered value reflects the source of truth.
+    /// editor has been created). Called after a completed persist (via
+    /// [`Self::sync_persisted`]) and from the endpoint toggle-off cascade so
+    /// the rendered value reflects the source of truth.
+    ///
+    /// The rewrite is skipped when the editor already shows the canonical
+    /// value: a settled persist echoes back exactly what the user typed, and
+    /// rewriting identical text would snap the caret to (0,0) (cursor reset
+    /// lives in `EditorBuffer::set_text`) and drop the undo stack (cleared in
+    /// `SingleLineEditorState::set_text`). A genuinely different canonical
+    /// value (e.g. whitespace trimmed on save) still rewrites the editor and
+    /// moves the caret — accepted, the text changed.
     fn resync_field_editor(&mut self, field: &str) {
         if let Some(value) = self.staged_value(field) {
             if let Some(editor) = self.field_editors.get_mut(field) {
-                // A routing-order editor keeps its undo/caret across a
-                // completed persist: only rewrite the text when the canonical
-                // value actually differs from what is already shown (e.g.
-                // whitespace trimmed on save). Rewriting identical text would
-                // drop the undo stack for a model that already has a row.
-                if field.starts_with("routing_order:") && editor.text() == value {
+                if editor.text() == value {
                     return;
                 }
                 editor.set_text(&value);
@@ -3945,6 +3956,79 @@ mod tests {
                 .contains("config:web_search_provider"),
             "flushed persist re-marks the field in flight"
         );
+    }
+
+    #[test]
+    fn identical_persist_echo_preserves_caret_and_undo() {
+        let mut state = SettingsState::new();
+        let field = "config:manager_model";
+        let typed = "deepseek/deepseek-chat";
+        // An editor holding the typed text with the caret parked at the end,
+        // as it sits while the user pauses between keystrokes.
+        let mut editor = SingleLineEditorState::new(typed);
+        editor.buffer.move_to(0, typed.chars().count());
+        state.field_editors.insert(field.to_string(), editor);
+
+        // One more keystroke right as the typing pause ends...
+        state
+            .field_editors
+            .get_mut(field)
+            .unwrap()
+            .apply_action(EditorAction::Insert('2'));
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "manager_model",
+            value: "deepseek/deepseek-chat2".into(),
+        });
+        let generation = state.field_gen.get(field).copied().unwrap_or(0);
+
+        // ...and the debounced settle completes, echoing the identical value.
+        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: field.into(),
+            generation,
+            result: Ok(crate::config::PersistOutcome {
+                value: "deepseek/deepseek-chat2".into(),
+                warning: None,
+            }),
+        });
+
+        {
+            let editor = state.field_editor(field);
+            assert_eq!(editor.text(), "deepseek/deepseek-chat2");
+            assert_eq!(
+                editor.buffer.cursor().column,
+                "deepseek/deepseek-chat2".chars().count(),
+                "identical-value persist echo must not reset the caret to 0"
+            );
+        }
+
+        // The undo stack survived the echo too: undo still reverts the last
+        // keystroke.
+        state
+            .field_editors
+            .get_mut(field)
+            .unwrap()
+            .apply_action(EditorAction::Undo);
+        assert_eq!(
+            state.field_editor(field).text(),
+            "deepseek/deepseek-chat",
+            "identical-value echo must not clear the undo stack"
+        );
+
+        // A genuinely different canonical value still rewrites the editor.
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "manager_model",
+            value: "openai/gpt-4o".into(),
+        });
+        let generation = state.field_gen.get(field).copied().unwrap_or(0);
+        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: field.into(),
+            generation,
+            result: Ok(crate::config::PersistOutcome {
+                value: "openai/gpt-4o".into(),
+                warning: None,
+            }),
+        });
+        assert_eq!(state.field_editor(field).text(), "openai/gpt-4o");
     }
 
     #[test]
