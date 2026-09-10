@@ -5,7 +5,7 @@ use std::time::Duration;
 use super::path::shell_quote;
 use crate::tools::{ShellMode, ShellTool, search::SearchTool};
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
-use crate::util::tree_sitter::ALL_TREE_SITTER_EXTENSIONS;
+use crate::util::tree_sitter::supported_extensions;
 use crate::{Tool, Workspace};
 use async_trait::async_trait;
 use serde_json::json;
@@ -897,7 +897,7 @@ async fn read_and_parse(resolved_path: &Path, mode_label: &str) -> anyhow::Resul
         anyhow::bail!(
             "Unsupported file extension '.{ext}' for {mode_label}. \
              Supported extensions: .{}",
-            ALL_TREE_SITTER_EXTENSIONS.join(", .")
+            supported_extensions().collect::<Vec<_>>().join(", .")
         );
     };
     let language = ls.language;
@@ -1213,11 +1213,8 @@ mod tests {
         (dir, path)
     }
 
-    /// Every extension in the canonical `ALL_TREE_SITTER_EXTENSIONS` constant
-    /// must have a `language_support` entry. Derived automatically from the
-    /// canonical source (`crate::util::tree_sitter::ALL_TREE_SITTER_EXTENSIONS`)
-    /// so that adding an extension to the canonical function automatically
-    /// updates this test.
+    /// Every extension in the canonical tree-sitter mapping (`supported_extensions`)
+    /// must have a `language_support` entry, and must be listed only once.
     ///
     /// This is a regression check: `language_support` calls
     /// `tree_sitter_language_for_extension` first (which returns `None` for
@@ -1228,7 +1225,12 @@ mod tests {
     /// previously supported extension, this test catches the regression.
     #[test]
     fn all_supported_extensions_have_language() {
-        for ext in ALL_TREE_SITTER_EXTENSIONS {
+        let mut seen = std::collections::HashSet::new();
+        for ext in supported_extensions() {
+            assert!(
+                seen.insert(ext),
+                "extension '{ext}' is listed twice in the tree-sitter grammar mapping"
+            );
             assert!(
                 language_support(ext).is_some(),
                 "expected language support for .{ext}"
@@ -1238,8 +1240,7 @@ mod tests {
 
     /// Spot-check that common non-code extensions return no language support.
     /// Helps catch accidental regressions in `language_support` match arms.
-    /// Not exhaustive — adding a new supported extension without updating the
-    /// error message still passes silently.
+    /// Not exhaustive.
     #[test]
     fn unsupported_extensions_return_none() {
         let unsupported: &[&str] = &[

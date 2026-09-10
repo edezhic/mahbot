@@ -735,51 +735,40 @@ mod tests {
         assert!(q.is_ok(), "MD inline query failed: {:?}", q.err());
     }
 
-    /// Verify that every extension in [`ALL_TREE_SITTER_EXTENSIONS`] maps to a
+    /// Verify that every extension in the canonical tree-sitter mapping
+    /// (`crate::util::tree_sitter::supported_extensions`) maps to a
     /// [`HighlightLanguage`] variant and that every variant has at least one
     /// extension mapped to it.
     ///
     /// This guards against:
-    /// - Adding an extension to [`tree_sitter_language_for_extension`] and
-    ///   [`ALL_TREE_SITTER_EXTENSIONS`] without a matching `language_and_query`
-    ///   arm (extension unmapped — `from_extension` returns `None`).
-    /// - Adding a variant without any extension in
-    ///   [`tree_sitter_language_for_extension`] (variant unreachable from
-    ///   extension).
-    ///
-    /// Unlike the previous test that used a separate `VARIANT_EXTENSIONS`
-    /// constant, this test derives all checks from the canonical
-    /// [`ALL_TREE_SITTER_EXTENSIONS`] list, eliminating the maintenance burden
-    /// of keeping a test-side copy in sync.
-    ///
-    /// [`ALL_TREE_SITTER_EXTENSIONS`]: crate::util::tree_sitter::ALL_TREE_SITTER_EXTENSIONS
-    /// [`tree_sitter_language_for_extension`]: crate::util::tree_sitter::tree_sitter_language_for_extension
+    /// - Adding an extension to the grammar table without a matching
+    ///   `language_and_query` arm (extension unmapped — `from_extension`
+    ///   returns `None`).
+    /// - Adding a variant without any extension in the grammar table (variant
+    ///   unreachable from an extension).
     #[test]
     fn test_variant_extension_roundtrip() {
-        use crate::util::tree_sitter::ALL_TREE_SITTER_EXTENSIONS;
+        use crate::util::tree_sitter::supported_extensions;
 
-        // Every extension in ALL_TREE_SITTER_EXTENSIONS must map to *some* variant.
-        for ext in ALL_TREE_SITTER_EXTENSIONS {
+        for ext in supported_extensions() {
             assert!(
                 HighlightLanguage::from_extension(ext).is_some(),
-                "extension '{ext}' is listed in ALL_TREE_SITTER_EXTENSIONS but \
+                "extension '{ext}' is in the tree-sitter grammar table but \
                  from_extension returned None. \
-                 Either add a match arm in tree_sitter_language_for_extension, or \
-                 remove '{ext}' from ALL_TREE_SITTER_EXTENSIONS.",
+                 Add a matching language_and_query arm in gui::highlight.",
             );
         }
 
         // Every variant must have at least one extension that maps to it.
         // This catches orphaned variants that have no extension mapping.
         for variant in HighlightLanguage::VARIANTS {
-            let has_extension = ALL_TREE_SITTER_EXTENSIONS
-                .iter()
+            let has_extension = supported_extensions()
                 .any(|ext| HighlightLanguage::from_extension(ext) == Some(*variant));
             assert!(
                 has_extension,
                 "HighlightLanguage variant {variant:?} has no extension mapped to it. \
-                 Add at least one extension to tree_sitter_language_for_extension and \
-                 ALL_TREE_SITTER_EXTENSIONS that maps to this variant's tree-sitter Language.",
+                 Add at least one extension for this variant's tree-sitter Language \
+                 to the grammar table in util::tree_sitter.",
             );
         }
     }
