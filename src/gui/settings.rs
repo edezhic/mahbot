@@ -488,8 +488,9 @@ pub struct SettingsState {
     /// through the shared single-line editor. Keyed by the canonical field id
     /// (`config:<key>`, `routing_order:<model>`), so each field owns its own
     /// buffer and undo stack across renders while `view(&self)` stays immutable.
-    /// Entries are (re)populated from the config snapshot on [`Self::refresh`];
-    /// update handlers insert lazily via [`Self::field_editor_mut`].
+    /// Entries are seeded from the config snapshot at construction and
+    /// re-synced on [`Self::refresh`]; update handlers insert lazily via
+    /// [`Self::field_editor_mut`].
     field_editors: HashMap<String, SingleLineEditorState>,
     /// Shared empty editor used as a never-panicking render fallback by
     /// [`Self::field_editor`]. Config keys are always pre-populated and routing
@@ -568,19 +569,19 @@ fn sync_voice_state(enabled: bool) {
 
 impl SettingsState {
     pub fn new() -> Self {
-        // One snapshot shared by the editable config and the pre-populated
-        // field editors: two independent snapshots could race a concurrent
-        // CONFIG write and seed routing editors for a model set that does not
-        // match `config`, leaving the current model to render the empty
+        // The field editors are seeded from `self.config` (see
+        // `resync_field_editors`), so the editable config and the editors always
+        // reflect one snapshot: two independent CONFIG reads could race a
+        // concurrent write and seed routing editors for a model set that does
+        // not match `config`, leaving the current model to render the empty
         // fallback instead of its saved routing order.
-        let snapshot = CONFIG.snapshot();
-        Self {
-            config: snapshot.clone(),
+        let mut state = Self {
+            config: CONFIG.snapshot(),
             field_gen: HashMap::new(),
             in_flight_persists: HashSet::new(),
             pending_persists: HashMap::new(),
             field_errors: HashMap::new(),
-            field_editors: Self::initial_field_editors(&snapshot),
+            field_editors: HashMap::new(),
             empty_field_editor: SingleLineEditorState::new(""),
             endpoint_warning: None,
             error: None,
@@ -600,7 +601,9 @@ impl SettingsState {
             transcription_toggle_gen: 0,
             wake_word_phrase_input: SingleLineEditorState::new(""),
             tts_toggle_gen: 0,
-        }
+        };
+        state.resync_field_editors();
+        state
     }
 
     /// Reload the editable snapshot from the current CONFIG.
@@ -616,33 +619,13 @@ impl SettingsState {
         self.resync_field_editors();
     }
 
-    /// Pre-populate the lazy field editors from a config snapshot: every
-    /// `config:<key>` in [`TEXT_INPUT_KEYS`] plus a `routing_order:<model>`
-    /// entry for the two routable slots (manager + worker), the set reflected
-    /// by [`Self::routing_section`]. Kept in sync on [`Self::refresh`] via
-    /// [`Self::resync_field_editors`].
-    fn initial_field_editors(config: &ConfigData) -> HashMap<String, SingleLineEditorState> {
-        let mut map = HashMap::new();
-        for key in TEXT_INPUT_KEYS {
-            let field = format!("config:{key}");
-            let value = config.get_string_field(key).unwrap_or_default().to_string();
-            map.insert(field, SingleLineEditorState::new(&value));
-        }
-        for model in routing_slots(config) {
-            let field = format!("routing_order:{model}");
-            let value = routing_order_of(config, &model).unwrap_or_default();
-            map.insert(field, SingleLineEditorState::new(&value));
-        }
-        map
-    }
-
     /// Re-sync the config text editors from the current config snapshot.
-    /// Called from [`Self::refresh`] (page navigation). A config editor is
-    /// rewritten only when the snapshot value actually differs from what it
-    /// already shows — an identical-value rewrite would reset its caret and
-    /// undo stack. Routing editors are seeded insert-if-absent (see
-    /// [`Self::seed_routing_editors`]) so existing routing rows keep their
-    /// undo stack / caret across refreshes.
+    /// Called from [`Self::new`] (initial seeding) and [`Self::refresh`] (page
+    /// navigation). A config editor is rewritten only when the snapshot value
+    /// actually differs from what it already shows — an identical-value
+    /// rewrite would reset its caret and undo stack. Routing editors are
+    /// seeded insert-if-absent (see [`Self::seed_routing_editors`]) so
+    /// existing routing rows keep their undo stack / caret across refreshes.
     fn resync_field_editors(&mut self) {
         for key in TEXT_INPUT_KEYS {
             let field = format!("config:{key}");
@@ -4237,8 +4220,8 @@ mod tests {
             }],
             ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
-        let config = state.config.clone();
-        state.field_editors = SettingsState::initial_field_editors(&config);
+        state.field_editors = HashMap::new();
+        state.resync_field_editors();
 
         // ── Mid-edit window: a raw/partial model name must render its routing
         // row (empty = auto-routing) instead of panicking on a missing editor.
