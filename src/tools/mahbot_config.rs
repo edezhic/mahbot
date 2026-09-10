@@ -299,7 +299,7 @@ mod tests {
             // dispatcher routes to the right handler.
             let err = tool.execute(&ws, args).await.unwrap_err().to_string();
             assert!(
-                err.contains("Missing required field:"),
+                err.contains("usage: missing required argument"),
                 "action '{action}' should report a missing field, got: {err}"
             );
         }
@@ -350,7 +350,7 @@ mod tests {
             let case_desc = format!("{args}");
             let err = tool.execute(&ws, args).await.unwrap_err().to_string();
             assert!(
-                err.contains(&format!("Missing required field: {field}")),
+                err.contains(&format!("usage: missing required argument \"{field}\"")),
                 "case {case_desc} should report missing '{field}', got: {err}"
             );
         }

@@ -289,7 +289,7 @@ pub(crate) async fn run_analyze_with_job(
                 response: None,
             } => (
                 crate::jobs::RowStatus::Failed,
-                agent.failure_reason("analyst produced no response"),
+                agent.failure_reason("no-response: analyst produced no response"),
             ),
             AnalyzeRun::Failed { reason } => (crate::jobs::RowStatus::Failed, reason.clone()),
         };
@@ -373,13 +373,14 @@ async fn run_analyze_slots(
         .map(|m| match m {
             RoundMember::Done((agent, response)) => AnalyzeRun::Completed { agent, response },
             RoundMember::TimedOut => AnalyzeRun::Failed {
-                reason: "analyst still running when the round deadline expired".to_string(),
+                reason: "timeout: analyst still running when the round deadline expired"
+                    .to_string(),
             },
             RoundMember::Panicked => AnalyzeRun::Failed {
-                reason: "analyst task panicked".to_string(),
+                reason: "panic: analyst task panicked".to_string(),
             },
             RoundMember::Cancelled => AnalyzeRun::Failed {
-                reason: "analyst task was cancelled".to_string(),
+                reason: "cancelled: analyst task was cancelled".to_string(),
             },
         })
         .collect()
@@ -710,7 +711,7 @@ async fn consolidate_analyst_runs(
                 .map(|r| match r {
                     AnalyzeRun::Failed { reason } => reason.clone(),
                     AnalyzeRun::Completed { agent, .. } => {
-                        agent.failure_reason("analyst produced no response")
+                        agent.failure_reason("no-response: analyst produced no response")
                     }
                 })
                 .collect();
@@ -719,7 +720,9 @@ async fn consolidate_analyst_runs(
             } else {
                 format!(" ({})", reasons.join("; "))
             };
-            anyhow::bail!("All parallel analysts failed to produce a response{suffix}");
+            Err(super::internal_fault(&format!(
+                "all parallel analysts failed to produce a response{suffix}"
+            )))
         }
         1 => Ok(single_raw_response(&runs).expect("exactly one valid response")),
         _ => {
@@ -759,11 +762,13 @@ async fn extract_findings(
                     }
                 };
                 let Some(raw) = response else {
-                    let reason = agent.failure_reason("analyst produced no response");
+                    let reason = agent.failure_reason("no-response: analyst produced no response");
                     return AnalystOutcome::NoResponse(crate::util::scrub_credentials(&reason));
                 };
                 if raw.trim().is_empty() {
-                    return AnalystOutcome::NoResponse("analyst produced no response".to_string());
+                    return AnalystOutcome::NoResponse(
+                        "no-response: analyst produced no response".to_string(),
+                    );
                 }
                 match agent
                     .extract_verdict::<AnalystFindings>(&extraction_prompt, None, None)
@@ -784,14 +789,15 @@ async fn extract_findings(
         .map(|m| match m {
             RoundMember::Done(outcome) => outcome,
             RoundMember::TimedOut => AnalystOutcome::NoResponse(
-                "findings extraction still running when the round deadline expired".to_string(),
+                "timeout: findings extraction still running when the round deadline expired"
+                    .to_string(),
             ),
             RoundMember::Panicked => {
-                AnalystOutcome::NoResponse("findings extraction task panicked".to_string())
+                AnalystOutcome::NoResponse("panic: findings extraction task panicked".to_string())
             }
-            RoundMember::Cancelled => {
-                AnalystOutcome::NoResponse("findings extraction task was cancelled".to_string())
-            }
+            RoundMember::Cancelled => AnalystOutcome::NoResponse(
+                "cancelled: findings extraction task was cancelled".to_string(),
+            ),
         })
         .collect()
 }
@@ -1547,7 +1553,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Missing required field: analyze"),
+                .contains("usage: missing required argument \"analyze\""),
             "Should mention missing analyze"
         );
     }
@@ -1632,7 +1638,8 @@ mod tests {
         .await;
         let err = result.expect_err("0 valid responses should error");
         assert!(
-            err.to_string().contains("All parallel analysts failed"),
+            err.to_string()
+                .contains("internal: all parallel analysts failed"),
             "error should mention analyst failure: {err}"
         );
         assert!(

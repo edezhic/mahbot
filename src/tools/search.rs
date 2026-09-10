@@ -343,9 +343,9 @@ impl SearchTool {
             }
         };
 
-        let case_sensitive = super::get_bool(args, "case_sensitive", true);
+        let case_sensitive = super::get_bool(args, "case_sensitive", true)?;
 
-        let context_lines = super::get_usize(args, "context_lines", 0);
+        let context_lines = super::get_usize(args, "context_lines", 0)?;
 
         let fff_query = parse_grep_query(query);
 
@@ -595,7 +595,7 @@ impl Tool for SearchTool {
         let query_constraints: Vec<Constraint<'_>> = fff_query.constraints.clone();
 
         let max_results =
-            super::get_usize(&args, "max_results", DEFAULT_MAX_RESULTS).min(MAX_RESULTS_LIMIT);
+            super::get_usize(&args, "max_results", DEFAULT_MAX_RESULTS)?.min(MAX_RESULTS_LIMIT);
 
         if max_results == 0 {
             anyhow::bail!(
@@ -604,7 +604,7 @@ impl Tool for SearchTool {
             );
         }
 
-        let offset = super::get_usize(&args, "offset", 0);
+        let offset = super::get_usize(&args, "offset", 0)?;
 
         let entry = resolve_workspace_engine(ws).await?;
 

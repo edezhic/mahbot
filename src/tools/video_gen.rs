@@ -88,12 +88,12 @@ impl Tool for VideoGenTool {
         let user_name = crate::agent::tool_user_name();
         let model = crate::users::resolve_video_model(&user_name).await;
 
-        let duration = super::get_opt_i64(&args, "duration");
+        let duration = super::get_opt_i64(&args, "duration")?;
         let resolution = super::get_opt_str(&args, "resolution");
         let aspect_ratio = super::get_opt_str(&args, "aspect_ratio");
         let size = super::get_opt_str(&args, "size");
-        let generate_audio = super::get_opt_bool(&args, "generate_audio");
-        let seed = super::get_opt_i64(&args, "seed");
+        let generate_audio = super::get_opt_bool(&args, "generate_audio")?;
+        let seed = super::get_opt_i64(&args, "seed")?;
 
         // Build the API base URL (strip /chat/completions if present).
         // Video generation always targets OpenRouter — a custom
@@ -113,9 +113,10 @@ impl Tool for VideoGenTool {
         set_opt(&mut body, "generate_audio", generate_audio);
         set_opt(&mut body, "seed", seed);
 
-        // Optional: add reference image via input_references. Reference-load
-        // failures are hard errors — never silently degrade to text-to-video.
-        let images: Vec<String> = super::get_str_array(&args, "images");
+        // Reference-load failures are hard errors — never silently degrade
+        // to text-to-video. `get_str_array` rejects malformed values
+        // (bare string or non-string elements) instead of dropping them.
+        let images: Vec<String> = super::get_str_array(&args, "images")?;
 
         if images.len() > 1 {
             anyhow::bail!(

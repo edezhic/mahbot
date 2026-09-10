@@ -215,28 +215,33 @@ impl WebSearchCache {
         &self,
         args: &'a Value,
     ) -> anyhow::Result<(&'a str, Option<u64>)> {
-        let has_query = args.get("query").and_then(|q| q.as_str()).is_some();
-        let has_expand = args.get("expand").and_then(Value::as_u64).is_some();
+        let query = match args.get("query") {
+            None | Some(Value::Null) => None,
+            // `get_opt_str` is deliberately silent, so a wrong-typed query
+            // would masquerade as absent — reject it here instead.
+            Some(v) => Some(
+                v.as_str()
+                    .ok_or_else(|| super::wrong_type("query", "a string", v))?
+                    .trim(),
+            ),
+        };
+        let expand_id = super::get_opt_u64(args, "expand")?;
 
-        match (has_query, has_expand) {
-            (true, true) => {
+        match (query, expand_id) {
+            (Some(_), Some(_)) => {
                 anyhow::bail!(
                     "The web_search tool accepts either `query` (to run a new search) \
                      or `expand` (to expand a cached result), but not both at the same \
                      time. Please use one or the other."
                 );
             }
-            (false, false) => {
+            (None, None) => {
                 anyhow::bail!(
                     "Missing required argument. Provide either `query` (to search \
                      the web) or `expand` (to expand a previous result by id)."
                 );
             }
-            (true, false) => {
-                let query = super::get_opt_str(args, "query")
-                    .map(str::trim)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid `query` value"))?;
-
+            (Some(query), None) => {
                 if query.chars().count() <= 2 {
                     anyhow::bail!(
                         "Search query must be at least 3 characters long. \
@@ -247,10 +252,7 @@ impl WebSearchCache {
 
                 Ok((query, None))
             }
-            (false, true) => {
-                let id = super::get_opt_u64(args, "expand")
-                    .ok_or_else(|| anyhow::anyhow!("Invalid `expand` value"))?;
-
+            (None, Some(id)) => {
                 if id >= self.next_counter() {
                     anyhow::bail!(
                         "Invalid expand id: {id}. No search has been run yet in this \
@@ -473,6 +475,20 @@ mod tests {
                 "expand_invalid_future_id",
                 json!({"expand": 999_999_999}),
                 Some("Invalid expand id"),
+                None,
+            ),
+            // Wrong-typed expand is a usage error from the shared helper.
+            (
+                "expand_wrong_type",
+                json!({"expand": "1"}),
+                Some("usage: argument \"expand\" must be a non-negative integer"),
+                None,
+            ),
+            // So is a wrong-typed query.
+            (
+                "query_wrong_type",
+                json!({"query": 42}),
+                Some("usage: argument \"query\" must be a string"),
                 None,
             ),
             (

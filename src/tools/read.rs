@@ -454,7 +454,7 @@ async fn read_resolved(
                 let contents = String::from_utf8_lossy(&bytes);
                 return Ok(finish_read_body(
                     resolved_path,
-                    format_content(&contents, args),
+                    format_content(&contents, args)?,
                     recovery_note,
                 ));
             }
@@ -541,14 +541,15 @@ async fn execute_content(resolved_path: &Path, args: &serde_json::Value) -> anyh
             if let Some(annotation) = sniff_guard(resolved_path, contents.as_bytes()) {
                 return Ok(annotation);
             }
-            Ok(format_content(&contents, args))
+            Ok(format_content(&contents, args)?)
         }
         Err(e) => {
             // Not valid UTF-8 — read raw bytes and try to extract text
             let bytes = tokio::fs::read(resolved_path).await.map_err(|ee| {
                 anyhow::anyhow!(
-                    "Initial error: {e}\n\
-                         Failed to read file: {ee}"
+                    "io: cannot read {}: failed to read file: {ee} \
+                     (initial error: {e}) — hint: verify the file exists and is readable",
+                    resolved_path.display()
                 )
             })?;
 
@@ -713,21 +714,20 @@ async fn execute_read(
 }
 
 /// Format file contents for content-mode output (line numbering + offset/limit).
-#[must_use]
-fn format_content(contents: &str, args: &serde_json::Value) -> String {
+fn format_content(contents: &str, args: &serde_json::Value) -> anyhow::Result<String> {
     let lines: Vec<&str> = contents.lines().collect();
     let total = lines.len();
 
     if total == 0 {
-        return String::new();
+        return Ok(String::new());
     }
 
-    let offset = super::get_opt_u64(args, "offset").map_or(0, |v| {
+    let offset = super::get_opt_u64(args, "offset")?.map_or(0, |v| {
         usize::try_from(v).unwrap_or(usize::MAX).saturating_sub(1)
     });
     let start = offset.min(total);
 
-    let end = match super::get_opt_u64(args, "limit") {
+    let end = match super::get_opt_u64(args, "limit")? {
         Some(l) => {
             let limit = usize::try_from(l).unwrap_or(usize::MAX);
             (start.saturating_add(limit)).min(total)
@@ -736,7 +736,7 @@ fn format_content(contents: &str, args: &serde_json::Value) -> String {
     };
 
     if start >= end {
-        return format!("[No lines in range, file has {total} lines]");
+        return Ok(format!("[No lines in range, file has {total} lines]"));
     }
 
     let numbered: String = lines[start..end]
@@ -753,7 +753,7 @@ fn format_content(contents: &str, args: &serde_json::Value) -> String {
         format!("[{total} lines total]")
     };
 
-    format!("{summary}\n{numbered}")
+    Ok(format!("{summary}\n{numbered}"))
 }
 
 /// Default bound on FIFO (named pipe) reads: how long to wait for a writer
@@ -1330,7 +1330,7 @@ mod tests {
             .await;
         assert!(result.is_err(), "traversal should be blocked: {result:?}");
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("not allowed"));
+        assert!(err.contains("outside the allowed read envelope"));
         // absolute path
         let result = tool()
             .execute(
@@ -1343,7 +1343,7 @@ mod tests {
             "absolute path should be blocked: {result:?}"
         );
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("not allowed"));
+        assert!(err.contains("outside the allowed read envelope"));
         // null byte in path — separate workspace
         drop(dir1);
         let (_dir2, ws_path2) = temp_workspace(&[]);
@@ -1359,7 +1359,7 @@ mod tests {
             "null byte path should be blocked: {result:?}"
         );
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("not allowed"));
+        assert!(err.contains("outside the allowed read envelope"));
     }
 
     #[tokio::test]
@@ -1404,7 +1404,7 @@ mod tests {
             "symlink escape should be blocked: {result:?}"
         );
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("security policy"));
+        assert!(err.contains("outside the allowed read envelope"));
     }
 
     #[cfg(unix)]
@@ -1422,7 +1422,7 @@ mod tests {
             let result = tool.execute(&ws, json!({"path": "id_rsa"})).await;
             assert!(result.is_err(), "id_rsa should be denied: {result:?}");
             let err = format!("{}", result.unwrap_err());
-            assert!(err.contains("protected credential"), "err: {err}");
+            assert!(err.contains("protected credential location"), "err: {err}");
         }
         drop(dir);
 
@@ -1443,7 +1443,7 @@ mod tests {
             "symlinked key should be denied: {result:?}"
         );
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("protected credential"), "err: {err}");
+        assert!(err.contains("protected credential location"), "err: {err}");
 
         // Directory-link case: `dirlink` -> canonicalized <tmp>/keys (dir). The file
         // under it is protected; the directory-link itself is the path-level case
@@ -1455,7 +1455,7 @@ mod tests {
             "dir-symlinked key should be denied: {result:?}"
         );
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("protected credential"), "err: {err}");
+        assert!(err.contains("protected credential location"), "err: {err}");
     }
 
     #[tokio::test]

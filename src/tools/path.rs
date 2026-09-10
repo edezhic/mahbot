@@ -96,7 +96,11 @@ pub(crate) async fn resolve_write_target(
 
     // Pre-canonicalization check — strict, no extra allowed paths
     if !is_path_safe_for_workspace(path, workspace_root) {
-        anyhow::bail!("Path not allowed by security policy: {path}");
+        anyhow::bail!(
+            "forbidden: cannot write to {path}: outside the workspace — hint: writes are only \
+             allowed inside the workspace root ({}); use a path under it",
+            workspace_root.display()
+        );
     }
 
     let Some(parent) = full_path.parent() else {
@@ -121,8 +125,10 @@ pub(crate) async fn resolve_write_target(
 
     if !is_path_safe_for_workspace(&resolved_parent.to_string_lossy(), workspace_root) {
         anyhow::bail!(
-            "Path not allowed by security policy: {}",
-            resolved_parent.display()
+            "forbidden: cannot write to {}: resolves outside the workspace — hint: writes are \
+             only allowed inside the workspace root ({}); check for symlinks pointing outside it",
+            resolved_parent.display(),
+            workspace_root.display()
         );
     }
 
@@ -131,7 +137,8 @@ pub(crate) async fn resolve_write_target(
         && meta.file_type().is_symlink()
     {
         anyhow::bail!(
-            "Refusing to write through symlink: {}",
+            "forbidden: cannot write to {}: it is a symlink — hint: write to the symlink's \
+             resolved target directly, provided it stays inside the workspace",
             resolved_target.display()
         );
     }
@@ -476,14 +483,21 @@ fn check_path_read_allowed(path: &str, workspace_root: &Path, strict: bool) -> a
     // Hard credential denial wins over the allowlist and applies to the
     // strict workspace-only variant too. Runs pre- and post-canonicalization.
     if is_denied_credential_path(path) {
-        anyhow::bail!("Path is a protected credential location and cannot be read: {path}");
+        anyhow::bail!(
+            "forbidden: cannot read {path}: protected credential location — hint: this denial is \
+             intentional; do not attempt to reach credential files through other paths"
+        );
     }
 
     if strict {
         if is_path_safe_for_workspace(path, workspace_root) {
             return Ok(());
         }
-        anyhow::bail!("Path not allowed by security policy: {path}");
+        anyhow::bail!(
+            "forbidden: cannot read {path}: outside the workspace — hint: in this mode only \
+             paths inside the workspace root ({}) are readable",
+            workspace_root.display()
+        );
     }
 
     let path_buf = Path::new(path);
@@ -492,13 +506,22 @@ fn check_path_read_allowed(path: &str, workspace_root: &Path, strict: bool) -> a
     // If a path looks like a spill file but is NOT on a temp root, reject it.
     if is_mahbot_spill_shaped(path_buf) {
         if !is_grandparent_temp_root(path_buf) {
-            anyhow::bail!("Path not allowed by security policy: {path}");
+            anyhow::bail!(
+                "forbidden: cannot read {path}: spill-shaped paths are only readable from an OS \
+                 temp root — hint: use the exact background-session output path the shell tool \
+                 returned"
+            );
         }
         return Ok(());
     }
 
     if !is_path_safe_for_workspace(path, workspace_root) && !is_path_in_extra_allowed(path_buf) {
-        anyhow::bail!("Path not allowed by security policy: {path}");
+        anyhow::bail!(
+            "forbidden: cannot read {path}: outside the allowed read envelope — hint: reads are \
+             allowed inside the workspace root ({}) and whitelisted system directories (OS temp \
+             roots, dependency caches, toolchain/SDK sources); use a path under one of those",
+            workspace_root.display()
+        );
     }
     Ok(())
 }
@@ -1555,7 +1578,7 @@ mod tests {
             for path in denied_abs {
                 let err = check_path_read_allowed(path, &workspace, strict).unwrap_err();
                 assert!(
-                    err.to_string().contains("protected credential"),
+                    err.to_string().contains("protected credential location"),
                     "strict={strict}: {path} should be credential-denied: {err}"
                 );
             }
@@ -1565,7 +1588,7 @@ mod tests {
             for path in denied_rel {
                 let err = check_path_read_allowed(path, &workspace, strict).unwrap_err();
                 assert!(
-                    err.to_string().contains("protected credential"),
+                    err.to_string().contains("protected credential location"),
                     "strict={strict}: workspace private key {path} should be denied: {err}"
                 );
             }
@@ -1631,7 +1654,7 @@ mod tests {
             check_path_read_allowed("~/.gradle/gradle.properties", &workspace, false).unwrap_err();
         assert!(
             err.to_string()
-                .contains("Path not allowed by security policy"),
+                .contains("outside the allowed read envelope"),
             "~/.gradle/gradle.properties should fall through to the generic error: {err}"
         );
     }
@@ -1649,7 +1672,7 @@ mod tests {
             for strict in [true, false] {
                 let err = check_path_read_allowed(&abs_str, &workspace, strict).unwrap_err();
                 assert!(
-                    err.to_string().contains("protected credential"),
+                    err.to_string().contains("protected credential location"),
                     "strict={strict}: post-canonicalization credential path should be denied: {err}"
                 );
             }
@@ -1815,8 +1838,8 @@ mod tests {
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("Path not allowed by security policy"),
-            "strict rejection should cite the security policy: {err}"
+            err.contains("forbidden: cannot read") && err.contains("outside the workspace"),
+            "strict rejection should cite the workspace-only read envelope: {err}"
         );
 
         let _ = tokio::fs::remove_file(&spill_file).await;
@@ -1914,8 +1937,8 @@ mod tests {
         assert!(result.is_err(), "Should refuse to write through symlink");
         let err = result.unwrap_err();
         assert!(
-            err.to_string().contains("symlink"),
-            "Error should mention symlink: {err}"
+            err.to_string().contains("it is a symlink"),
+            "Error should mention the symlink refusal: {err}"
         );
     }
 
@@ -1928,8 +1951,9 @@ mod tests {
         assert!(result.is_err(), "Should reject write outside workspace");
         let err = result.unwrap_err();
         assert!(
-            err.to_string().contains("Path not allowed"),
-            "Error should mention security policy: {err}"
+            err.to_string().contains("forbidden: cannot write to")
+                && err.to_string().contains("outside the workspace"),
+            "Error should cite the write gate: {err}"
         );
     }
 

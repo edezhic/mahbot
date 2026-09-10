@@ -1,9 +1,22 @@
-//! JSON helper functions for extracting typed values from `serde_json::Value`
-//! and parsing JSON from LLM output (including markdown-fenced blocks with repair).
+//! Typed value extraction and LLM-output JSON parsing helpers.
 //!
-//! Value extraction functions operate on `&serde_json::Value` and a string key,
-//! providing convenient access to commonly-needed extraction patterns used throughout
-//! the codebase — particularly in tool argument parsing.
+//! # Tool argument extraction
+//!
+//! The `get_*` functions below are the shared argument-parsing layer for tools
+//! (see [`crate::tools`]). They follow the workspace tool-error convention:
+//! errors carry a leading lowercase machine-recognizable code token, and for
+//! wrong tool arguments that token is `usage`.
+//!
+//! Semantics:
+//! - Absent (or JSON `null`) is *not* an error — helpers with a default or an
+//!   `Option` return it, and [`get_str`] reports a distinct "missing" message.
+//! - A present value of the wrong type *is* a usage error; helpers never
+//!   silently default or silently drop values anymore.
+//!
+//! The one deliberate exception is [`get_opt_str`], which stays silent
+//! (`Option<&str>`) because its callers treat any non-string as absent.
+//!
+//! # JSON parsing from LLM output
 //!
 //! Parse/repair functions handle the common case of LLMs emitting JSON inside
 //! fenced code blocks with minor formatting issues (trailing commas, unquoted keys,
@@ -12,56 +25,151 @@
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-/// Extract a required string field from JSON args, returning an error if missing.
+/// Human-readable description of a `serde_json::Value`'s JSON type.
+#[must_use]
+fn found_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Build a standardized usage error for a wrong-typed tool argument.
+///
+/// Shared by the `get_*` helpers and by tools that do bespoke optional-field
+/// type checks (the deliberately silent [`get_opt_str`] has no error path of
+/// its own).
+pub(crate) fn wrong_type(key: &str, expected: &str, found_value: &Value) -> anyhow::Error {
+    let hint = match expected {
+        "a string" => "wrap the value in double quotes".to_string(),
+        "a boolean" => {
+            "pass unquoted true or false, or omit the argument to use the default".to_string()
+        }
+        "a non-negative integer" => format!("pass a JSON number, e.g. {key}: 5"),
+        "an integer" => "pass a JSON number".to_string(),
+        "an array of strings" => {
+            format!("pass a JSON array of strings, e.g. {key}: [\"a\", \"b\"]")
+        }
+        _ => "pass a JSON value of the expected type".to_string(),
+    };
+    anyhow::anyhow!(
+        "usage: argument \"{key}\" must be {expected}, got {} — hint: {hint}",
+        found_type(found_value)
+    )
+}
+
+/// Extract a required string field from JSON args.
+///
+/// Absent or null is a distinct "missing" usage error; a present non-string is
+/// a wrong-type usage error.
 pub(crate) fn get_str<'a>(val: &'a Value, key: &str) -> anyhow::Result<&'a str> {
-    val.get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("Missing required field: {key}"))
+    match val.get(key) {
+        None | Some(Value::Null) => Err(anyhow::anyhow!(
+            "usage: missing required argument \"{key}\" (expected a string) — \
+             hint: pass it as a JSON string, e.g. \"{key}\": \"value\""
+        )),
+        Some(v) => v.as_str().ok_or_else(|| wrong_type(key, "a string", v)),
+    }
 }
 
 /// Extract an optional string field from JSON args.
+///
+/// Deliberately silent: any absent/non-string value maps to [`Option::None`].
 pub(crate) fn get_opt_str<'a>(val: &'a Value, key: &str) -> Option<&'a str> {
     val.get(key).and_then(Value::as_str)
 }
 
 /// Extract a boolean field with default value.
-pub(crate) fn get_bool(val: &Value, key: &str, default: bool) -> bool {
-    val.get(key).and_then(Value::as_bool).unwrap_or(default)
+///
+/// Absent or null yields `default`; a present non-boolean is a usage error.
+pub(crate) fn get_bool(val: &Value, key: &str, default: bool) -> anyhow::Result<bool> {
+    match val.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(v) => Err(wrong_type(key, "a boolean", v)),
+    }
 }
 
 /// Extract an optional i64 field.
-pub(crate) fn get_opt_i64(val: &Value, key: &str) -> Option<i64> {
-    val.get(key).and_then(Value::as_i64)
+///
+/// Absent or null yields [`Option::None`]; a present value outside the i64
+/// range (or non-integer) is a usage error.
+pub(crate) fn get_opt_i64(val: &Value, key: &str) -> anyhow::Result<Option<i64>> {
+    match val.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| wrong_type(key, "an integer", v)),
+    }
 }
 
 /// Extract an optional u64 field.
-pub(crate) fn get_opt_u64(val: &Value, key: &str) -> Option<u64> {
-    val.get(key).and_then(Value::as_u64)
+///
+/// Absent or null yields [`Option::None`]; a present negative or non-integer
+/// value is a usage error.
+pub(crate) fn get_opt_u64(val: &Value, key: &str) -> anyhow::Result<Option<u64>> {
+    match val.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| wrong_type(key, "a non-negative integer", v)),
+    }
 }
 
 /// Extract a usize field with default value.
-pub(crate) fn get_usize(val: &Value, key: &str, default: usize) -> usize {
-    val.get(key)
-        .and_then(Value::as_u64)
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or(default)
+///
+/// Absent or null yields `default`; a present value that is not a u64
+/// representable as `usize` is a usage error.
+pub(crate) fn get_usize(val: &Value, key: &str, default: usize) -> anyhow::Result<usize> {
+    match val.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| wrong_type(key, "a non-negative integer", v))?;
+            // Only reachable on 32-bit targets; still reported as a usage error.
+            usize::try_from(n).map_err(|_| wrong_type(key, "a non-negative integer", v))
+        }
+    }
 }
 
 /// Extract a string array field as `Vec<String>`.
-pub(crate) fn get_str_array(val: &Value, key: &str) -> Vec<String> {
-    val.get(key)
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+///
+/// Absent or null yields an empty vector; a non-array value or an array with
+/// any non-string element is a usage error.
+pub(crate) fn get_str_array(val: &Value, key: &str) -> anyhow::Result<Vec<String>> {
+    match val.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                let Some(s) = v.as_str() else {
+                    return Err(wrong_type(key, "an array of strings", v));
+                };
+                out.push(s.to_string());
+            }
+            Ok(out)
+        }
+        Some(v) => Err(wrong_type(key, "an array of strings", v)),
+    }
 }
 
 /// Extract an optional bool field.
-pub(crate) fn get_opt_bool(val: &Value, key: &str) -> Option<bool> {
-    val.get(key).and_then(Value::as_bool)
+///
+/// Absent or null yields [`Option::None`]; a present non-boolean is a usage
+/// error.
+pub(crate) fn get_opt_bool(val: &Value, key: &str) -> anyhow::Result<Option<bool>> {
+    match val.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(v) => Err(wrong_type(key, "a boolean", v)),
+    }
 }
 
 // ── JSON parsing from LLM output ─────────────────────────────────────────
@@ -212,5 +320,158 @@ mod tests {
         let text = "This is just plain text with no JSON whatsoever.";
         let result = parse_fenced_json::<Verdict>(text);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod arg_extraction_tests {
+    use super::{
+        get_bool, get_opt_bool, get_opt_i64, get_opt_str, get_opt_u64, get_str, get_str_array,
+        get_usize,
+    };
+    use serde_json::{Value, json};
+
+    /// Absent and null both count as "not provided" for defaulted helpers.
+    #[test]
+    fn absent_and_null_yield_defaults() {
+        let absent = json!({});
+        let null = json!({ "k": null });
+
+        for (val, label) in [(&absent, "absent"), (&null, "null")] {
+            assert!(get_bool(val, "k", true).unwrap(), "{label}");
+            assert_eq!(get_usize(val, "k", 7).unwrap(), 7, "{label}");
+            assert_eq!(get_opt_i64(val, "k").unwrap(), None, "{label}");
+            assert_eq!(get_opt_u64(val, "k").unwrap(), None, "{label}");
+            assert_eq!(get_opt_bool(val, "k").unwrap(), None, "{label}");
+            assert!(get_str_array(val, "k").unwrap().is_empty(), "{label}");
+        }
+
+        // get_opt_str stays silent for absent values.
+        assert_eq!(get_opt_str(&absent, "k"), None);
+    }
+
+    /// get_str must distinguish "missing" from "wrong type" in its message.
+    #[test]
+    fn get_str_distinguishes_absent_from_wrong_type() {
+        let absent = json!({});
+        let err = get_str(&absent, "path").unwrap_err().to_string();
+        assert!(err.contains("usage:"), "got: {err}");
+        assert!(
+            err.contains("missing required argument \"path\""),
+            "got: {err}"
+        );
+
+        let wrong = json!({ "path": 42 });
+        let err = get_str(&wrong, "path").unwrap_err().to_string();
+        assert!(err.contains("usage:"), "got: {err}");
+        assert!(
+            err.contains("argument \"path\" must be a string"),
+            "got: {err}"
+        );
+        assert!(err.contains("got a number"), "got: {err}");
+
+        // null is "missing", not "wrong type".
+        let null = json!({ "path": null });
+        let err = get_str(&null, "path").unwrap_err().to_string();
+        assert!(err.contains("missing required argument"), "got: {err}");
+
+        // Happy path.
+        let ok = json!({ "path": "a" });
+        assert_eq!(get_str(&ok, "path").unwrap(), "a");
+    }
+
+    /// Wrong-typed present values are usage errors naming the field and type.
+    #[test]
+    fn wrong_type_errors_are_usage_errors() {
+        let cases: [(&Value, &str, &str, &str); 5] = [
+            (
+                &json!({ "k": "yes" }),
+                "bool",
+                "must be a boolean",
+                "got a string",
+            ),
+            (
+                &json!({ "k": "5" }),
+                "usize",
+                "must be a non-negative integer",
+                "got a string",
+            ),
+            (
+                &json!({ "k": "x" }),
+                "opt_i64",
+                "must be an integer",
+                "got a string",
+            ),
+            (
+                &json!({ "k": -1 }),
+                "opt_u64",
+                "must be a non-negative integer",
+                "got a number",
+            ),
+            (
+                &json!({ "k": 1.5 }),
+                "opt_bool",
+                "must be a boolean",
+                "got a number",
+            ),
+        ];
+        for (val, helper, expected_phrase, found_phrase) in cases {
+            let err = match helper {
+                "bool" => get_bool(val, "k", false).unwrap_err().to_string(),
+                "usize" => get_usize(val, "k", 0).unwrap_err().to_string(),
+                "opt_i64" => get_opt_i64(val, "k").unwrap_err().to_string(),
+                "opt_u64" => get_opt_u64(val, "k").unwrap_err().to_string(),
+                "opt_bool" => get_opt_bool(val, "k").unwrap_err().to_string(),
+                _ => unreachable!(),
+            };
+            assert!(err.contains("usage:"), "helper {helper}: got: {err}");
+            assert!(err.contains("\"k\""), "helper {helper}: got: {err}");
+            assert!(err.contains(expected_phrase), "helper {helper}: got: {err}");
+            assert!(err.contains(found_phrase), "helper {helper}: got: {err}");
+        }
+    }
+
+    /// get_str_array rejects both non-array values and non-string elements.
+    #[test]
+    fn get_str_array_rejects_non_string_elements() {
+        let non_array = json!({ "k": "a, b" });
+        let err = get_str_array(&non_array, "k").unwrap_err().to_string();
+        assert!(err.contains("usage:"), "got: {err}");
+        assert!(
+            err.contains("\"k\" must be an array of strings"),
+            "got: {err}"
+        );
+
+        let mixed = json!({ "k": ["a", 2, "b"] });
+        let err = get_str_array(&mixed, "k").unwrap_err().to_string();
+        assert!(
+            err.contains("\"k\" must be an array of strings"),
+            "got: {err}"
+        );
+        assert!(err.contains("got a number"), "got: {err}");
+
+        let ok = json!({ "k": ["a", "b"] });
+        assert_eq!(
+            get_str_array(&ok, "k").unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    /// Happy paths: valid values round-trip, including a bool overriding its default.
+    #[test]
+    fn valid_values_round_trip() {
+        let val = json!({
+            "flag": false,
+            "count": 5,
+            "signed": -3,
+            "text": "hello",
+            "list": ["a"],
+        });
+        assert!(!get_bool(&val, "flag", true).unwrap());
+        assert_eq!(get_usize(&val, "count", 0).unwrap(), 5);
+        assert_eq!(get_opt_i64(&val, "signed").unwrap(), Some(-3));
+        assert_eq!(get_opt_u64(&val, "count").unwrap(), Some(5));
+        assert_eq!(get_opt_bool(&val, "flag").unwrap(), Some(false));
+        assert_eq!(get_str_array(&val, "list").unwrap(), vec!["a".to_string()]);
     }
 }

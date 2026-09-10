@@ -561,7 +561,7 @@ impl ChromeTool {
                     kind,
                     &mut error_msg,
                 );
-                anyhow::bail!("chrome-use error: {error_msg}");
+                anyhow::bail!("{}: {error_msg}", kind.as_str());
             }
         }
     }

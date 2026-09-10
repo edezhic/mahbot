@@ -190,7 +190,7 @@ use std::time::{Duration, Instant};
 
 use crate::util::json::{
     get_bool, get_opt_bool, get_opt_i64, get_opt_str, get_opt_u64, get_str, get_str_array,
-    get_usize,
+    get_usize, wrong_type,
 };
 
 /// Prepend a note about argument normalization so the model can see what was
@@ -311,6 +311,19 @@ pub(crate) fn format_tool_failure_feedback(
          tool: {tool_name}\n\
          arguments: {args_preview}\n\
          reason:\n{reason}"
+    )
+}
+
+/// Build the canonical `internal` tool error for a mahbot-side fault the
+/// model cannot recover from (lost state, missing internal rows, all-worker
+/// failure): no argument change or retry can fix it — a user or engineer
+/// must investigate the mahbot service.
+#[must_use]
+pub(crate) fn internal_fault(cause: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "internal: {cause} (mahbot-side fault) — \
+         hint: no model action can recover this; a user or engineer must \
+         investigate the mahbot service"
     )
 }
 

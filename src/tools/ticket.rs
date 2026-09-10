@@ -424,7 +424,7 @@ impl Tool for GetTicketTool {
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let ticket_id = resolve_ticket_id(&self.ws_name, super::get_str(&args, "ticket_id")?)?;
-        let full = super::get_bool(&args, "full", false);
+        let full = super::get_bool(&args, "full", false)?;
 
         let store = board_store();
 

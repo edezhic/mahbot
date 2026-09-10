@@ -57,7 +57,7 @@ impl Tool for ImageGenTool {
         let model = crate::users::resolve_image_gen_model(&user_name).await;
         let aspect_ratio_arg = super::get_opt_str(&args, "aspect_ratio");
         let size = super::get_opt_str(&args, "size");
-        let images: Vec<String> = super::get_str_array(&args, "images");
+        let images: Vec<String> = super::get_str_array(&args, "images")?;
 
         // Capability and parameter decisions come from the catalog. A membership
         // miss forces one catalog refresh before the verdict; a catalog outage

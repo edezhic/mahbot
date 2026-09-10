@@ -59,12 +59,23 @@ impl Tool for EditTool {
         match old_string {
             None | Some("") => self.execute_write(ws, &path, new_string).await,
             Some(old) => {
-                let multiple = super::get_bool(&args, "multiple", false);
+                let multiple = super::get_bool(&args, "multiple", false)?;
                 self.execute_edit(ws, &path, old, new_string, multiple)
                     .await
             }
         }
     }
+}
+
+/// Build the canonical `not-found` tool error for a failed `old_string` match.
+///
+/// `detail` carries the optional variant clause, e.g.
+/// `" (whitespace differs; try without multiple=true)"`.
+fn not_found_error(path: &str, detail: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "not-found: cannot edit {path}: old_string not found in file{detail} \
+         — hint: re-read the file and copy old_string exactly from its current contents"
+    )
 }
 
 impl EditTool {
@@ -83,7 +94,7 @@ impl EditTool {
 
         tokio::fs::write(&resolved_target, new_string)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to write file: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("io: cannot write {path}: failed to write file: {e} — hint: check that the parent directory exists and is writable"))?;
         update_search_index_after_write(ws, &resolved_target);
         Ok(format!("Written {} bytes to {path}", new_string.len()))
     }
@@ -125,7 +136,9 @@ impl EditTool {
         let content = match tokio::fs::read_to_string(&resolved_target).await {
             Ok(c) => c,
             Err(e) => {
-                anyhow::bail!("Failed to read file: {e}");
+                anyhow::bail!(
+                    "io: cannot edit {path}: failed to read file: {e} — hint: verify the file exists and contains valid UTF-8 text"
+                );
             }
         };
 
@@ -142,11 +155,12 @@ impl EditTool {
                 if use_ws_matching
                     && find_ws_insensitive(&content, old_string).is_ok_and(|r| r.is_some())
                 {
-                    anyhow::bail!(
-                        "old_string not found exactly (whitespace differs); try without multiple=true"
-                    );
+                    return Err(not_found_error(
+                        path,
+                        " (whitespace differs; try without multiple=true)",
+                    ));
                 }
-                anyhow::bail!("old_string not found in file (multiple=true mode)");
+                return Err(not_found_error(path, " (multiple=true mode)"));
             }
 
             new_content = content.replace(old_string, new_string);
@@ -172,9 +186,10 @@ impl EditTool {
                             replaced_count = 1;
                         }
                         Ok(None) => {
-                            anyhow::bail!(
-                                "old_string not found in file (whitespace-insensitive matching tried)"
-                            );
+                            return Err(not_found_error(
+                                path,
+                                " (whitespace-insensitive matching tried)",
+                            ));
                         }
                         Err(e) => {
                             return Err(e);
@@ -182,7 +197,7 @@ impl EditTool {
                     }
                 }
                 0 => {
-                    anyhow::bail!("old_string not found in file (exact match required)");
+                    return Err(not_found_error(path, " (exact match required)"));
                 }
                 _ => {
                     anyhow::bail!(
@@ -194,7 +209,7 @@ impl EditTool {
 
         tokio::fs::write(&resolved_target, &new_content)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to write file: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("io: cannot edit {path}: failed to write file: {e} — hint: check disk space and file permissions"))?;
         update_search_index_after_write(ws, &resolved_target);
         Ok(format!(
             "Edited {path}: replaced {replaced_count} occurrence{} ({} bytes)",
@@ -851,7 +866,10 @@ mod tests {
             "edit with no matches should fail: {result:?}"
         );
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("not found"));
+        assert!(
+            err.contains("not-found: cannot edit test.txt: old_string not found in file"),
+            "canonical not-found shape: {err}"
+        );
 
         // multiple=true with single match works too
         tokio::fs::write(dir.path().join("test.txt"), "only one")
@@ -904,7 +922,10 @@ mod tests {
             "edit with nonexistent string should fail: {result:?}"
         );
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("not found"));
+        assert!(
+            err.contains("not-found: cannot edit test.txt: old_string not found in file"),
+            "canonical not-found shape: {err}"
+        );
         // multiple matches rejected
         tokio::fs::write(dir.path().join("test.txt"), "aaa bbb aaa")
             .await
@@ -1014,7 +1035,10 @@ mod tests {
                 .await;
             assert!(result.is_err(), "traversal should be blocked: {result:?}");
             let err = format!("{}", result.unwrap_err());
-            assert!(err.contains("not allowed"));
+            assert!(
+                err.contains("forbidden: cannot write to ../../etc/passwd"),
+                "canonical forbidden shape: {err}"
+            );
             let result = EditTool
                 .execute(
                     &test_ws(&dir),
@@ -1026,7 +1050,10 @@ mod tests {
                 "absolute path should be blocked: {result:?}"
             );
             let err = format!("{}", result.unwrap_err());
-            assert!(err.contains("not allowed"));
+            assert!(
+                err.contains("forbidden: cannot write to /etc/passwd"),
+                "canonical forbidden shape: {err}"
+            );
         })
         .await;
     }
@@ -1215,7 +1242,10 @@ mod tests {
             );
             let err = format!("{}", result.unwrap_err());
             assert!(
-                err.contains("not found"),
+                err.contains(
+                    "not-found: cannot edit readme.txt: old_string not found in file \
+                     (exact match required)"
+                ),
                 ".txt should use exact matching only, got: {err}"
             );
         })

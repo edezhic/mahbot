@@ -3316,8 +3316,8 @@ async fn run_deep_research(
     // ── Round 1 — one analyst per sub-question (resumable) ────────────
     if state.stage == ResearchStage::Round1 {
         let Some(plan) = state.plan.as_ref() else {
-            return ResearchExit::Terminal(Err(anyhow::anyhow!(
-                "research state missing plan at round 1"
+            return ResearchExit::Terminal(Err(super::internal_fault(
+                "research lost its plan state before round 1",
             )));
         };
         let Some((r1, r1_timed_out)) = round1_research(
@@ -3379,8 +3379,8 @@ async fn run_deep_research(
         // Clone the plan so gap_rounds can take &mut state (per-round
         // checkpoints) while still referencing the merged decomposition.
         let Some(plan) = state.plan.clone() else {
-            return ResearchExit::Terminal(Err(anyhow::anyhow!(
-                "research state missing plan at gap rounds"
+            return ResearchExit::Terminal(Err(super::internal_fault(
+                "research lost its plan state before gap rounds",
             )));
         };
         let gap_outcome = gap_rounds(

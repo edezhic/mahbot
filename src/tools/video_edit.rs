@@ -659,23 +659,8 @@ impl Tool for VideoEditTool {
         // no intent and must not trigger mode/exclusivity validation).
         let video_url = super::get_opt_str(&args, "video_url").filter(|s| !s.is_empty());
         let instruction = super::get_str(&args, "instruction")?;
-        let duration = super::get_opt_i64(&args, "duration");
-        // Reject a malformed `images` value (bare string or non-string
-        // elements) instead of silently omitting the reference — silent
-        // input drops are exactly what the exclusivity rules exist to
-        // prevent. Null is treated as absent, like the other optionals.
-        if let Some(v) = args.get("images")
-            && !v.is_null()
-            && !v
-                .as_array()
-                .is_some_and(|a| a.iter().all(serde_json::Value::is_string))
-        {
-            anyhow::bail!(
-                "images must be an array of image paths or URLs, got: {}",
-                crate::util::truncate(&v.to_string(), 200)
-            );
-        }
-        let images: Vec<String> = super::get_str_array(&args, "images")
+        let duration = super::get_opt_i64(&args, "duration")?;
+        let images: Vec<String> = super::get_str_array(&args, "images")?
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect();

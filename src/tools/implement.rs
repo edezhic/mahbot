@@ -143,9 +143,9 @@ pub(crate) async fn run_implement_with_job(
     } = args;
     let (coder_agent_id, pre_done) = if resume {
         let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
-        let row = rows
-            .first()
-            .ok_or_else(|| anyhow!("Implement resume: no coder roster row"))?;
+        let row = rows.first().ok_or_else(|| {
+            super::internal_fault("implement resume found no coder roster row for the stored job")
+        })?;
         // Only a completed (done) coder's outcome is reconstructable — a
         // failed/launched coder is re-run with its stored task on resume.
         let pre_done = (row.status == crate::jobs::RowStatus::Done.as_str())
@@ -281,7 +281,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Missing required field: task"),
+                .contains("usage: missing required argument \"task\""),
             "Should mention missing task"
         );
     }

@@ -858,7 +858,7 @@ impl ShellTool {
         // these arguments — its behavior is byte-identical to before.
         if self.mode == ShellMode::Full {
             let stop_path = super::get_opt_str(&args, "stop").filter(|s| !s.is_empty());
-            let background = super::get_opt_bool(&args, "background").unwrap_or(false);
+            let background = super::get_opt_bool(&args, "background")?.unwrap_or(false);
             if let Some(stop_path) = stop_path {
                 if background {
                     anyhow::bail!(
@@ -919,7 +919,7 @@ impl ShellTool {
 
         // Allow agent to override the default timeout via `timeout_secs`.
         // Capped at MAX_SHELL_TIMEOUT_SECS to prevent absurdly long runs.
-        let timeout_secs = super::get_opt_u64(&args, "timeout_secs")
+        let timeout_secs = super::get_opt_u64(&args, "timeout_secs")?
             .map_or(DEFAULT_SHELL_TIMEOUT_SECS, |s| {
                 s.min(MAX_SHELL_TIMEOUT_SECS)
             });

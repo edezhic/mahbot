@@ -115,7 +115,7 @@ impl Tool for AddAlarmTool {
         let ident = identity()?;
         let text = super::get_str(&args, "text")?;
         let fire_at = super::get_opt_str(&args, "fire_at");
-        let interval_seconds = super::get_opt_u64(&args, "interval_seconds");
+        let interval_seconds = super::get_opt_u64(&args, "interval_seconds")?;
 
         let alarm = add_alarm(
             &ident.agent_id,
