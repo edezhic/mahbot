@@ -217,24 +217,24 @@ impl SearchTool {
         max_results: usize,
         offset: usize,
         constraints: &[Constraint<'_>],
-    ) -> anyhow::Result<String> {
+    ) -> String {
         let (paths, total_matched, total_files) =
-            Self::fuzzy_file_search(entry, query, max_results, offset)?;
+            Self::fuzzy_file_search(entry, query, max_results, offset);
         if paths.is_empty() {
-            return Ok(Self::format_files_zero_result(
+            return Self::format_files_zero_result(
                 query,
                 max_results,
                 offset,
                 constraints,
                 total_matched,
                 total_files,
-            ));
+            );
         }
 
         let mut output = paths.join("\n");
         let total = paths.len();
         let _ = write!(output, "\n\nTotal: {total} files");
-        Ok(output)
+        output
     }
 
     /// Run a single fuzzy file search, returning owned relative paths and
@@ -245,7 +245,7 @@ impl SearchTool {
         query: &str,
         max_results: usize,
         offset: usize,
-    ) -> anyhow::Result<(Vec<String>, usize, usize)> {
+    ) -> (Vec<String>, usize, usize) {
         let fff_query = parse_grep_query(query);
         let search_opts = FuzzySearchOptions {
             max_threads: 4,
@@ -259,9 +259,7 @@ impl SearchTool {
             },
         };
         let guard = entry.picker.read().unwrap();
-        let Some(picker) = guard.as_ref() else {
-            anyhow::bail!("Search engine not yet initialized.")
-        };
+        let picker = guard.as_ref().unwrap();
         let qt_guard = entry.query_tracker.read().unwrap();
         let qt_ref = qt_guard.as_ref();
         let result = picker.fuzzy_search(&fff_query, qt_ref, search_opts);
@@ -270,7 +268,7 @@ impl SearchTool {
             .iter()
             .map(|file| file.relative_path(picker))
             .collect();
-        Ok((paths, result.total_matched, result.total_files))
+        (paths, result.total_matched, result.total_files)
     }
 
     fn format_files_zero_result(
@@ -318,7 +316,7 @@ impl SearchTool {
             return Ok(vec![]);
         }
         let entry = resolve_workspace_engine(ws).await?;
-        let (paths, _, _) = Self::fuzzy_file_search(&entry, query, max_results, 0)?;
+        let (paths, _, _) = Self::fuzzy_file_search(&entry, query, max_results, 0);
         Ok(paths)
     }
 
@@ -365,9 +363,7 @@ impl SearchTool {
         };
 
         let guard = entry.picker.read().unwrap();
-        let Some(picker) = guard.as_ref() else {
-            anyhow::bail!("Search engine not yet initialized.")
-        };
+        let picker = guard.as_ref().unwrap();
 
         let result = picker.grep(&fff_query, &grep_opts);
 
@@ -617,9 +613,9 @@ impl Tool for SearchTool {
                 offset,
                 &args,
                 &query_constraints,
-            ),
+            )?,
             _ => anyhow::bail!("Invalid mode '{mode}'. Allowed values: 'files', 'grep'."),
-        }?;
+        };
 
         // Append unknown parameter warning to the result (after the main output,
         // so it doesn't disrupt valid results)
