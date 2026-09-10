@@ -813,16 +813,6 @@ fn is_pinned_role(role: Role) -> bool {
     matches!(role, Role::Assistant)
 }
 
-/// Whether an agent role is pinned to the user's personal workspace:
-/// the Assistant always works there regardless of the selected
-/// workspace. An empty `user_name` disables pinning — there is no
-/// personal identity to pin to, so callers with an unresolvable user must
-/// pass the real user explicitly (the voice admin fallback passes "admin").
-#[must_use]
-fn pins_to_personal(role: Role, ws_name: &str, user_name: &str) -> bool {
-    !user_name.is_empty() && is_pinned_role(role) && !is_personal_workspace(ws_name)
-}
-
 /// Execution-time invariant enforcer: a pinned role (Assistant) must never
 /// run outside the envelope user's OWN personal workspace, regardless of what
 /// a producer stored — a non-personal workspace is re-pinned to
@@ -860,18 +850,24 @@ pub(crate) fn enforce_personal_pinning(
 /// reachable by Assistant tools (e.g. video_edit path confinement).
 #[must_use]
 pub fn effective_workspace_for_role(role: Role, ws: Workspace, user_name: &str) -> Workspace {
-    if pins_to_personal(role, &ws.name, user_name) {
-        personal_workspace_struct(user_name)
-    } else {
-        if user_name.is_empty() && is_pinned_role(role) && !is_personal_workspace(&ws.name) {
-            tracing::error!(
-                role = %role.as_str(),
-                workspace = %ws.name,
-                "Personal-workspace pin bypassed: pinned role with empty user_name — caller must pass a resolvable user"
-            );
-        }
-        ws
+    if !is_pinned_role(role) {
+        return ws;
     }
+    // Pass-through asymmetry with `enforce_personal_pinning`: an already-personal
+    // name stays as-is, even when it names another user, whereas the enforcer
+    // re-pins that case to the envelope user's own workspace.
+    if is_personal_workspace(&ws.name) {
+        return ws;
+    }
+    if user_name.is_empty() {
+        tracing::error!(
+            role = %role.as_str(),
+            workspace = %ws.name,
+            "Personal-workspace pin bypassed: pinned role with empty user_name — caller must pass a resolvable user"
+        );
+        return ws;
+    }
+    personal_workspace_struct(user_name)
 }
 
 /// Resolve the (role, workspace) a user's messages route to and their
@@ -1169,17 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn pinning_helpers_pin_assistant_to_personal() {
-        // Assistant + non-personal workspace + non-empty user pin.
-        assert!(pins_to_personal(Role::Assistant, "ws1", "alice"));
-        // Already personal, other roles, and empty user_name never pin.
-        assert!(!pins_to_personal(
-            Role::Assistant,
-            "personal:alice",
-            "alice"
-        ));
-        assert!(!pins_to_personal(Role::Assistant, "ws1", ""));
-
+    fn effective_workspace_pins_assistant_to_personal() {
         let project = Workspace {
             name: "ws1".to_string(),
             ..Default::default()
@@ -1196,6 +1182,9 @@ mod tests {
         assert_eq!(kept.name, "ws1");
         let already = effective_workspace_for_role(Role::Assistant, personal.clone(), "alice");
         assert_eq!(already.name, "personal:alice");
+        // An empty user_name disables pinning — the workspace passes through.
+        let unpinned = effective_workspace_for_role(Role::Assistant, project, "");
+        assert_eq!(unpinned.name, "ws1");
     }
 
     #[test]

@@ -854,16 +854,11 @@ async fn route_manager_notify(response: &str, source_workspace: &str) {
         ],
     );
     for admin in admins {
-        let Some(workspace_name) = crate::users::enforce_personal_pinning(
-            Role::Assistant,
-            &crate::users::personal_workspace_name(&admin.name),
-            &admin.name,
-        ) else {
-            continue;
-        };
         let job = AgentJob {
             content: content.clone(),
-            workspace_name,
+            // The admin's own personal workspace; the consumer loop re-validates
+            // the pinning invariant, so no re-pinning is needed here.
+            workspace_name: crate::users::personal_workspace_name(&admin.name),
             user_name: admin.name.clone(),
             channel: "gui".to_string(),
             kind: MessageKind::ManagerNotify,
