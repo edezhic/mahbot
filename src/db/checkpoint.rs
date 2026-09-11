@@ -1,11 +1,11 @@
 //! WAL checkpointing for all Turso database stores.
 //!
 //! The daemon runs in turso's default single-process mode (no
-//! `multiprocess_wal`, no `.tshm` coordination file) — a single process holds
-//! the sole writer connection. Checkpoints are hygiene, not a durability
-//! requirement: committed transactions are durable at COMMIT time (fsync'd
-//! WAL frames), and checkpointing merely compacts those frames into the main
-//! DB file, reclaims WAL space, and resets the shared frame index.
+//! `multiprocess_wal`) — a single process holds the sole writer connection.
+//! Checkpoints are hygiene, not a durability requirement: committed
+//! transactions are durable at COMMIT time (fsync'd WAL frames), and
+//! checkpointing merely compacts those frames into the main DB file, reclaims
+//! WAL space, and resets the shared frame index.
 //!
 //! TRUNCATE at exit leaves a header-only WAL for a clean store handoff; it is
 //! avoided under live writers because resetting the shared WAL frame index
@@ -234,12 +234,11 @@ async fn checkpoint_stores(round: CheckpointRound) {
     for_each_store(|name, conn| {
         let root = root.clone();
         async move {
-            // Single-process mode has no `.tshm` coordination and no
-            // external writer, so there is no coordination identity to
-            // re-check, and a structurally-corrupt store's checkpoint is
-            // attempted and its failure logged like any other. The only
-            // consumer of a store inspection is the periodic round's
-            // TRUNCATE-vs-PASSIVE cap (WAL size), and that check must be
+            // There is no external writer in single-process mode, so there is
+            // no coordination identity to re-check, and a structurally-corrupt
+            // store's checkpoint is attempted and its failure logged like any
+            // other. The only consumer of a store inspection is the periodic
+            // round's TRUNCATE-vs-PASSIVE cap (WAL size), and that check must be
             // STAT-ONLY (wal_guard's lock rule); the exit round needs no
             // inspection at all.
             let truncate = match policy {
@@ -263,7 +262,7 @@ async fn checkpoint_stores(round: CheckpointRound) {
                     root.as_deref()
                         .map(|r| {
                             let db_path = crate::db::store_db_path(r, name);
-                            crate::db::wal_guard::store_file_facts(&db_path).wal_size
+                            crate::db::wal_guard::wal_size(&db_path)
                         })
                         .is_some_and(|wal_size| wal_size > cap)
                         && truncate_gate
@@ -382,15 +381,15 @@ fn store_failure_report(
         .store(name)
         .reason(format!("{e:#}"))
         .environment(crate::db::is_actionable_signal(e));
-    with_store_file_facts(report, name, root)
+    with_store_file_state(report, name, root)
 }
 
 /// Add the store's db path and its stat-only artifact state — the `-wal` size
-/// and stale-`.tshm` debris from [`crate::db::wal_guard::store_file_facts`],
-/// never a header read: wal_guard's lock rule puts one out of reach in a
-/// process that already holds the store. The storage root is unresolvable on
-/// some paths; the record says so instead of dropping the line.
-fn with_store_file_facts(
+/// from [`crate::db::wal_guard::wal_size`], never a header read: wal_guard's
+/// lock rule puts one out of reach in a process that already holds the store.
+/// The storage root is unresolvable on some paths; the record says so instead of
+/// dropping the line.
+fn with_store_file_state(
     report: FailureReport,
     name: &'static str,
     root: Option<&Path>,
@@ -398,11 +397,10 @@ fn with_store_file_facts(
     match root {
         Some(root) => {
             let db_path = crate::db::store_db_path(root, name);
-            let facts = crate::db::wal_guard::store_file_facts(&db_path);
-            report.db_path(db_path).extra(format!(
-                "artifact state: wal_size={} has_stale_tshm={}",
-                facts.wal_size, facts.has_stale_tshm
-            ))
+            let wal_size = crate::db::wal_guard::wal_size(&db_path);
+            report
+                .db_path(db_path)
+                .extra(format!("artifact state: wal_size={wal_size}"))
         }
         None => report.extra(ARTIFACT_STATE_UNAVAILABLE),
     }
@@ -533,11 +531,10 @@ async fn recover_failed_checkpoint_inner(
 /// a panic guard so a turso panic cannot escape to the outer `for_each_store`
 /// `catch_unwind` (which would skip the drain and leave the service running
 /// with a persistently failing checkpoint). The artifact state comes from the
-/// stat-only [`crate::db::wal_guard::store_file_facts`] (wal_guard's lock rule:
-/// no header read), so it reports the `-wal` size and stale-`.tshm` debris and
-/// deliberately no corruption class — a header-level class is exactly what the
-/// lock rule puts out of reach, and the `quick_check` section carries the
-/// integrity detail instead.
+/// stat-only [`crate::db::wal_guard::wal_size`] (wal_guard's lock rule: no
+/// header read), so it reports the `-wal` size and deliberately no corruption
+/// class — a header-level class is exactly what the lock rule puts out of reach,
+/// and the `quick_check` section carries the integrity detail instead.
 async fn build_failure_report(
     name: &'static str,
     error: &anyhow::Error,
@@ -570,7 +567,7 @@ async fn build_failure_report(
             Err(_) => "quick_check: probe panicked".to_string(),
         },
     );
-    report = with_store_file_facts(report, name, root);
+    report = with_store_file_state(report, name, root);
     report.render()
 }
 
@@ -608,7 +605,7 @@ mod tests {
             "db path:",
             failure_record::ENVIRONMENT_CAUSE,
             "reason: no space left on device",
-            "artifact state: wal_size=0 has_stale_tshm=false",
+            "artifact state: wal_size=0",
         ] {
             assert!(
                 body.contains(needle),

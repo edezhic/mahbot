@@ -19,10 +19,6 @@
 //! data-preserving repairs boots even when quick_check reports a condition those
 //! repairs deliberately leave report-only (see [`crate::db::open_store`]).
 //!
-//! A stale `.tshm` file is a leftover from a pre-removal multiprocess run; it
-//! is detected and reported (`has_stale_tshm` / a boot `warn!`) but is never
-//! created in normal operation.
-//!
 //! # The lock rule
 //!
 //! The engine takes a whole-file `fcntl` `F_WRLCK` record lock on a store's
@@ -31,7 +27,7 @@
 //! descriptor this process holds for such a file drops every record lock the
 //! process holds on it — the engine never re-takes it, and an in-process check
 //! can never notice. So the running service must never open a store file: facts
-//! about a live store come from a stat (`store_file_facts`) or from the engine
+//! about a live store come from a stat ([`wal_size`]) or from the engine
 //! itself. Reading a store's header ([`classify_store_shape`], via
 //! [`read_db_header`]) opens the file, so it is allowed only where this process
 //! holds no lock yet: the boot bring-up (the pre-flight scan and the open of
@@ -39,8 +35,6 @@
 //! while this process holds the store.
 
 use std::path::Path;
-
-use tracing::warn;
 
 /// A store data file's file-level shape, classified before any store is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,24 +89,13 @@ impl ShapeDefect {
     }
 }
 
-/// Stat-only facts about one store's file set — the fact source for the running
+/// The store's `-wal` size, read stat-only — the fact source for the running
 /// service (the periodic checkpoint cap and the persistent-failure report both
-/// use this). See the module doc's lock rule for why nothing here may be opened.
-#[derive(Debug)]
-pub(super) struct StoreFileFacts {
-    pub wal_size: u64,
-    pub has_stale_tshm: bool,
-}
-
-/// Collect a store's [`StoreFileFacts`] without opening anything. The running
-/// service must use this rather than read the store's header.
+/// use it). The `-wal` can hold committed-but-not-checkpointed frames; see the
+/// module doc's lock rule for why the store itself may not be opened.
 #[must_use]
-pub(super) fn store_file_facts(db_path: &Path) -> StoreFileFacts {
-    let sidecars = crate::db::store_sidecars(db_path);
-    StoreFileFacts {
-        wal_size: std::fs::metadata(&sidecars.wal).map_or(0, |m| m.len()),
-        has_stale_tshm: sidecars.tshm.exists(),
-    }
+pub(super) fn wal_size(db_path: &Path) -> u64 {
+    std::fs::metadata(crate::db::wal_path(db_path)).map_or(0, |m| m.len())
 }
 
 /// Classify a store data file's file-level shape: absent, present, or unusable
@@ -198,8 +181,6 @@ pub(crate) struct UnusableStore {
 /// stores. Read-only (a stat plus one 18-byte header read per store): no engine
 /// open, so the refusal leaves both stores untouched. See the module doc's lock
 /// rule for when a header may be read.
-///
-/// [`cleanup_stale_tshm`] is a separate boot step that runs after this.
 #[must_use]
 pub(crate) fn scan_store_shapes(root: &Path) -> Vec<UnusableStore> {
     let mut unusable = Vec::new();
@@ -214,38 +195,6 @@ pub(crate) fn scan_store_shapes(root: &Path) -> Vec<UnusableStore> {
         }
     }
     unusable
-}
-
-/// Remove any stale `.tshm` coordination leftover from a pre-removal
-/// `multiprocess_wal` run.
-///
-/// Single-process mode NEVER creates a `.tshm` (see the module doc), so any
-/// `.tshm` present after the removal is necessarily stale debris from a dead
-/// multiprocess daemon — safe to delete without a liveness probe. The `-wal`
-/// file is NEVER touched: it may hold committed frames from a crash, and
-/// deleting it would cause silent commit loss (historically class-A). Call only
-/// when the daemon is down (boot before any store opens, or `mahbot debug`'s
-/// daemon-down direct-open path).
-pub(crate) fn cleanup_stale_tshm(root: &Path) {
-    for (name, _) in crate::db::iter_checkpoint_stores() {
-        let tshm = crate::db::store_sidecars(&crate::db::store_db_path(root, name)).tshm;
-        if !tshm.exists() {
-            continue;
-        }
-        match std::fs::remove_file(&tshm) {
-            Ok(()) => warn!(
-                db = %name,
-                path = %tshm.display(),
-                "removed stale .tshm coordination leftover from a pre-removal multiprocess run",
-            ),
-            Err(e) => warn!(
-                db = %name,
-                path = %tshm.display(),
-                error = %e,
-                "failed to remove stale .tshm leftover",
-            ),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -349,27 +298,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The stat-only facts the persistent checkpoint-failure report reads: the
-    /// on-disk `-wal` size and the stale `.tshm` flag, both without opening the
+    /// The stat-only fact the persistent checkpoint-failure report and the
+    /// periodic WAL-size cap read: the on-disk `-wal` size, without opening the
     /// store.
     #[test]
-    fn store_file_facts_reports_wal_size_and_stale_tshm() {
+    fn wal_size_reports_the_wal_size() {
         let dir = std::env::temp_dir().join(format!("wal_guard_facts_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let db_path = dir.join("db/core.db");
         write(&db_path, &valid_header(4096));
         write(&dir.join("db/core.db-wal"), &[0xAA; 512]);
-        write(&dir.join("db/core.db-tshm"), &[0u8; 32]);
 
-        let facts = store_file_facts(&db_path);
-        assert_eq!(facts.wal_size, 512);
-        assert!(facts.has_stale_tshm);
+        assert_eq!(wal_size(&db_path), 512);
 
         let _ = std::fs::remove_file(dir.join("db/core.db-wal"));
-        let _ = std::fs::remove_file(dir.join("db/core.db-tshm"));
-        let facts = store_file_facts(&db_path);
-        assert_eq!(facts.wal_size, 0);
-        assert!(!facts.has_stale_tshm);
+        assert_eq!(wal_size(&db_path), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -426,42 +369,6 @@ mod tests {
         );
 
         std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cleanup_stale_tshm_removes_only_tshm_not_wal() {
-        let dir = std::env::temp_dir().join(format!("wal_guard_cleanup_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let db_dir = dir.join("db");
-        write(&db_dir.join("core.db"), &[0u8; 4096]);
-        // Simulate a stale multiprocess leftover: `.tshm` present next to the
-        // main DB, and a WAL that may hold committed frames.
-        write(&db_dir.join("core.db-tshm"), &[0u8; 64]);
-        write(&db_dir.join("core.db-wal"), &[0xAA; 512]);
-        write(&db_dir.join("logs.db-tshm"), &[0u8; 64]);
-
-        crate::db::wal_guard::cleanup_stale_tshm(&dir);
-
-        // The stale `.tshm` files are gone; the `-wal` (which may hold
-        // committed-but-uncheckpointed frames) is NEVER touched.
-        assert!(
-            !db_dir.join("core.db-tshm").exists(),
-            "stale .tshm should be removed"
-        );
-        assert!(
-            !db_dir.join("logs.db-tshm").exists(),
-            "stale .tshm should be removed"
-        );
-        assert!(
-            db_dir.join("core.db-wal").exists(),
-            "-wal must never be removed (class-A commit-loss footgun)"
-        );
-        assert_eq!(
-            std::fs::metadata(db_dir.join("core.db-wal")).unwrap().len(),
-            512,
-            "-wal contents must be untouched"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -67,10 +67,9 @@ pub(crate) fn replay_boot_diagnostics() {
 ///
 /// The order is load-bearing: the file-level shape check of BOTH stores runs
 /// before anything opens a store (a stat plus one 18-byte header read — no
-/// engine open, so a refusal here leaves both stores untouched), stale `.tshm`
-/// debris is dropped, the logs store opens inside `init_tracing` (which
-/// publishes the GUI log broadcast), then the process-global inits and the
-/// consolidated domain store.
+/// engine open, so a refusal here leaves both stores untouched), the logs store
+/// opens inside `init_tracing` (which publishes the GUI log broadcast), then the
+/// process-global inits and the consolidated domain store.
 /// The store-lock check drives this same function, so a boot-order change cannot
 /// silently weaken it.
 ///
@@ -104,7 +103,6 @@ pub async fn open_stores() -> anyhow::Result<Arc<crate::logs::LogStore>> {
             .join("; ");
         return Err(anyhow::anyhow!(named));
     }
-    crate::db::wal_guard::cleanup_stale_tshm(&root);
     let (log_store, log_broadcast) = crate::logs::init_tracing(&root)
         .await
         .map_err(|e| record_bring_up_failure(&root, "logs", e))?;

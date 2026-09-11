@@ -269,9 +269,8 @@ fn init_cell<T>(cell: &tokio::sync::OnceCell<T>, value: T, name: &str) -> anyhow
 /// [`Connection::open`] reads its builder calls from this function, and
 /// [`EXPERIMENTAL_FEATURES`] lists the feature names for test verification.
 ///
-/// The daemon runs in **default single-process mode** — there is no
-/// `multiprocess_wal` coordination; `-tshm` is a stale leftover from a
-/// pre-removal multiprocess run and is never created in normal operation.
+/// The daemon runs in **default single-process mode**: there is no
+/// `multiprocess_wal` coordination.
 ///
 /// Forensic-family reads (`mahbot debug --family`, via `open_readonly` in
 /// `debug.rs`) use this same opts: family snapshots are copied from live stores
@@ -368,9 +367,6 @@ pub(crate) fn sql_in_placeholders(count: usize) -> String {
 /// `turso::Connection::dangling_tx` pattern at wrapper level, avoiding async
 /// in `Drop`).
 ///
-/// The daemon runs in **default single-process mode**: there is no `.tshm`
-/// coordination file, so no persistent sidecar fds are held.
-///
 /// # Shared-connection discipline (consolidated layout)
 ///
 /// After consolidation all the domain stores hold a **clone of one** connection
@@ -429,20 +425,16 @@ const FTS_INTERNAL_INDEX_PREFIX: &str = "__turso_internal_fts_dir_";
 pub(crate) const USER_OBJECT_FILTER: &str = "name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' \
      AND name NOT IN ('turso_cdc', 'turso_cdc_version')";
 
-/// Best-effort removal of a rebuild temp family (main + `-wal`/`-shm`
-/// sidecars, paths built by [`store_sidecars`]). The `-tshm` path is
-/// deliberately **never** removed — a pre-removal multiprocess leftover must
-/// stay available for stale-leftover detection.
+/// Best-effort removal of a rebuild temp family (main + `-wal`, paths built by
+/// [`wal_path`]).
 fn remove_rebuild_temp(temp: &Path) {
     let _ = std::fs::remove_file(temp);
-    let StoreSidecars { wal, shm, .. } = store_sidecars(temp);
-    let _ = std::fs::remove_file(wal);
-    let _ = std::fs::remove_file(shm);
+    let _ = std::fs::remove_file(wal_path(temp));
 }
 
 /// RAII cleanup of the rebuild temp family: every exit from the migration —
 /// including a turso panic mid-copy (the documented pager-OOB class) —
-/// removes the temp main + sidecars. A panic is absorbed by `open_store` as a
+/// removes the temp main + `-wal`. A panic is absorbed by `open_store` as a
 /// refusal, so the fully-read migrated data is discarded either way — the
 /// accepted panic trade-off.
 struct TempCleanup<'a>(&'a Path);
@@ -1919,26 +1911,13 @@ pub(crate) fn store_db_path(root: &Path, name: &str) -> std::path::PathBuf {
     root.join("db").join(format!("{stem}.db"))
 }
 
-/// Sidecar files (`-wal`, `-shm`) beside a store's database file.
-///
-/// The `-tshm` field is retained for stale-leftover detection: it is a
-/// leftover from a pre-removal multiprocess run and is **never** created in
-/// normal operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StoreSidecars {
-    pub wal: std::path::PathBuf,
-    pub shm: std::path::PathBuf,
-    pub tshm: std::path::PathBuf,
-}
-
+/// The `-wal` sidecar path of a store's database file. The WAL is the engine's
+/// own: it can hold committed-but-uncheckpointed frames, so it is moved aside
+/// with the store by the quarantine and by the rebuild swap, and it is never
+/// deleted while it might hold them.
 #[must_use]
-pub(crate) fn store_sidecars(db_path: &Path) -> StoreSidecars {
-    let base = db_path.display().to_string();
-    StoreSidecars {
-        wal: std::path::PathBuf::from(format!("{base}-wal")),
-        shm: std::path::PathBuf::from(format!("{base}-shm")),
-        tshm: std::path::PathBuf::from(format!("{base}-tshm")),
-    }
+pub(crate) fn wal_path(db_path: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}-wal", db_path.display()))
 }
 
 /// Resource/permission keywords for [`is_actionable_signal`]: actionable
@@ -2495,10 +2474,8 @@ async fn migrate_overflow_aliased_store(
     name: &str,
     schema: &str,
 ) -> anyhow::Result<(RepairOutcome, Connection)> {
-    // The old `.tshm` frame-index precondition (`frame_index_len == max_fr`)
-    // no longer applies — multiprocess_wal was removed and the daemon runs in
-    // default single-process mode, so there is no shared WAL frame index to
-    // reset before a rebuild.
+    // multiprocess_wal was removed: there is no shared WAL frame index to reset
+    // before a rebuild.
 
     // ── Readability + row-count per user table (quick_check does not name
     // the aliased index, so every table's read is gated; unreadable →
@@ -2650,12 +2627,12 @@ async fn migrate_overflow_aliased_store(
             ))
         };
     }
-    // Main-file rename first; the sidecars move only when it succeeds. The
+    // Main-file rename first; the `-wal` moves only when it succeeds. The
     // fresh store was TRUNCATE-checkpointed, so its main file alone holds
-    // every row — a failed sidecar rename is benign, and a crash between
+    // every row — a failed `-wal` rename is benign, and a crash between
     // the renames cannot leave a valid-but-empty store.
-    let sidecars = store_sidecars(db_path);
-    let temp_sidecars = store_sidecars(&temp);
+    let wal = wal_path(db_path);
+    let temp_wal = wal_path(&temp);
     if let Err(e) = std::fs::rename(&temp, db_path) {
         // The swap cannot proceed: the store path is absent and the original
         // family is in the quarantine. Bail loudly (the store's boot fails)
@@ -2666,21 +2643,15 @@ async fn migrate_overflow_aliased_store(
              family discarded; original family quarantined for recovery",
         ));
     }
-    for (src, dst) in [
-        (&temp_sidecars.wal, &sidecars.wal),
-        (&temp_sidecars.shm, &sidecars.shm),
-        (&temp_sidecars.tshm, &sidecars.tshm),
-    ] {
-        if src.exists()
-            && let Err(e) = std::fs::rename(src, dst)
-        {
-            warn!(
-                error = %e,
-                from = %src.display(),
-                to = %dst.display(),
-                "rebuild swap sidecar rename failed",
-            );
-        }
+    if temp_wal.exists()
+        && let Err(e) = std::fs::rename(&temp_wal, &wal)
+    {
+        warn!(
+            error = %e,
+            from = %temp_wal.display(),
+            to = %wal.display(),
+            "rebuild swap sidecar rename failed",
+        );
     }
     let reopened = match open_with_schema(db_path, schema).await {
         Ok(reopened) => reopened,
@@ -2987,24 +2958,15 @@ impl CheckpointMode {
     }
 }
 
-/// Move a store's whole artifact family (`db`/`-wal`/`-shm`/`-tshm`) aside to
-/// a timestamped quarantine name. Best-effort: a rename failure is logged,
-/// never fatal. The quarantine copy is never deleted — it is the forensic
-/// record for the verify-then-swap rebuild. Returns false when any existing file
-/// could not be moved (a partial quarantine — the migration path must abort with
-/// the un-moved files in place).
+/// Move a store's whole artifact family (`db` + `-wal`) aside to a timestamped
+/// quarantine name. Best-effort: a rename failure is logged, never fatal. The
+/// quarantine copy is never deleted — it is the forensic record for the
+/// verify-then-swap rebuild. Returns false when any existing file could not be
+/// moved (a partial quarantine — the migration path must abort with the
+/// un-moved files in place).
 #[must_use]
 pub(crate) fn quarantine_store_artifacts(db_path: &Path) -> bool {
-    let sidecars = store_sidecars(db_path);
-    quarantine_family(
-        db_path,
-        &[
-            (db_path, ""),
-            (&sidecars.wal, "-wal"),
-            (&sidecars.shm, "-shm"),
-            (&sidecars.tshm, "-tshm"),
-        ],
-    )
+    quarantine_family(db_path, &[(db_path, ""), (&wal_path(db_path), "-wal")])
 }
 
 /// Shared quarantine-family rename (timestamped, PID + seq-suffixed to never
@@ -3336,19 +3298,15 @@ mod tests {
     fn family_writer_names_parse_via_debug_parser() {
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join("board.db");
-        let wal = dir.path().join("board.db-wal");
-        let tshm = dir.path().join("board.db-tshm");
-        for f in [&db_path, &wal, &tshm] {
+        let wal = wal_path(&db_path);
+        for f in [&db_path, &wal] {
             std::fs::write(f, b"x").unwrap();
         }
 
-        // Quarantine: move db + wal + tshm aside; every moved base name must
-        // be a valid `--family` id (the listing/query contract).
+        // Quarantine: move db + wal aside; every moved base name must be a
+        // valid `--family` id (the listing/query contract).
         assert!(
-            quarantine_family(
-                &db_path,
-                &[(&db_path, ""), (&wal, "-wal"), (&tshm, "-tshm")],
-            ),
+            quarantine_store_artifacts(&db_path),
             "quarantine writer must move every existing source"
         );
         let moved: Vec<String> = std::fs::read_dir(dir.path())
@@ -3356,12 +3314,9 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains("board.db.quarantine-"))
             .collect();
-        assert_eq!(moved.len(), 3, "db + wal + tshm moved: {moved:?}");
+        assert_eq!(moved.len(), 2, "db + wal moved: {moved:?}");
         for name in moved {
-            let base = ["-wal", "-tshm"]
-                .iter()
-                .find_map(|s| name.strip_suffix(s))
-                .unwrap_or(&name);
+            let base = name.strip_suffix("-wal").unwrap_or(&name);
             let meta = crate::db::debug::parse_family_name(base).unwrap_or_else(|| {
                 panic!("quarantine writer name must parse as a family id: {name}")
             });
@@ -3727,7 +3682,7 @@ mod tests {
             std::fs::write(&db_path, &bytes).unwrap();
             let wal_bytes = [0x7au8; 512];
             if with_wal {
-                std::fs::write(store_sidecars(&db_path).wal, wal_bytes).unwrap();
+                std::fs::write(wal_path(&db_path), wal_bytes).unwrap();
             }
 
             let err = open_store(root, "board", "")
@@ -3744,7 +3699,7 @@ mod tests {
             );
             if with_wal {
                 assert_eq!(
-                    std::fs::read(store_sidecars(&db_path).wal).unwrap(),
+                    std::fs::read(wal_path(&db_path)).unwrap(),
                     wal_bytes,
                     "{name}: the -wal must be unchanged"
                 );

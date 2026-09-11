@@ -277,7 +277,7 @@ mod tests {
             .db_path(PathBuf::from("/tmp/core.db"))
             .environment(true)
             .reason("the check could not run")
-            .extra("artifact state: wal_size=0 has_stale_tshm=false")
+            .extra("artifact state: wal_size=0")
             .render();
         let lines: Vec<&str> = report.lines().collect();
         let (header, timestamp) = lines[0]
@@ -299,7 +299,7 @@ mod tests {
         );
         assert_eq!(lines[4], "reason: the check could not run", "got: {report}");
         assert_eq!(
-            lines[5], "artifact state: wal_size=0 has_stale_tshm=false",
+            lines[5], "artifact state: wal_size=0",
             "extras must follow verbatim: {report}"
         );
 

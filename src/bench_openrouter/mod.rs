@@ -406,7 +406,7 @@ fn read_config_kv_file(db_path: &Path, key: &str) -> anyhow::Result<Option<Strin
     // Callers guarantee `db_path` exists (see `read_config_kv_inner`), so this
     // does not re-check — a missing file degrades to `Ok(None)` there.
     let opts = crate::db::experimental_database_opts();
-    let (io, db) = crate::db::debug::open_readonly(db_path, db_path, opts)?;
+    let (io, db) = crate::db::debug::open_readonly(db_path, opts)?;
     let conn = crate::db::debug::connect_readonly(&db, db_path)?;
 
     let mut stmt = conn
