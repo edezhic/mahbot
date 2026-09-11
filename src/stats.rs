@@ -12,9 +12,8 @@
 //!   `llm_failures` rows via [`LlmOperationCtx`], fed by the retry pipeline.
 //!
 //! All tables (and their indexes) are created by the logs store's baseline
-//! schema catalog entry (in the append-only catalog), so a logs-store
-//! quarantine recreate also recreates them. Consumers access the store
-//! through [`crate::logs::LOG_STORE`].
+//! schema catalog entry (in the append-only catalog) — the sole creator of this
+//! schema. Consumers access the store through [`crate::logs::LOG_STORE`].
 
 use crate::db::{self};
 use anyhow::Result;

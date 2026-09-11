@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::OnceCell;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::warn;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -108,41 +107,12 @@ impl LogStore {
     /// `pub(crate)` (matching every other store's generated `open`) so tests in
     /// other modules can create a real log store via [`crate::open_test_store!`].
     ///
-    /// Boot-time quarantine: if the existing store fails integrity verification
-    /// (corruption-class `quick_check` output, or the open/verify path
-    /// panicking — opening a corrupt store can panic),
-    /// the whole artifact family (database plus `-wal`/`-shm`
-    /// sidecars) is moved aside to a timestamped quarantine name and a fresh
-    /// store is created. Logs-only by construction: this lives in the logs
-    /// open path and is never reachable from the shared store helpers. Boot
-    /// never fails because of the quarantine mechanism — rename failures are
-    /// logged and the store is recreated (or, in the extreme case, the
-    /// pre-quarantine error is surfaced).
+    /// An existing logs store must be usable — [`crate::db::open_store`] refuses
+    /// otherwise, exactly like the main store (the refusal covers both physical
+    /// stores). A missing file is a first launch and is created here.
     pub(crate) async fn open(root: &Path) -> anyhow::Result<Self> {
-        let conn = match open_verified_logs_store(root).await {
-            Ok(conn) => conn,
-            Err(OpenFailure::Corrupt(reason)) => {
-                warn!(
-                    error = %reason,
-                    "logs store failed integrity verification — quarantining artifact family \
-                     and recreating a fresh store",
-                );
-                quarantine_logs_artifacts(root);
-                // The recreate is on a fresh store — the boot diagnosis was
-                // already consumed by the failed open, so this bypasses the
-                // heal path. Any post-recreate failure propagates WITHOUT a
-                // second quarantine: the fresh store is not corrupt, a failure
-                // is a code bug, and a double quarantine would destroy the
-                // forensic record.
-                crate::db::open_with_schema(&db::store_db_path(root, "logs"), "")
-                    .await
-                    .context("Failed to recreate logs store after quarantine")?
-            }
-            Err(OpenFailure::Other(e)) => return Err(e),
-        };
-        // The catalog owns the logs schema; run it OUTSIDE the catch_unwind /
-        // quarantine wrappers so a catalog failure is a hard boot failure,
-        // never reclassified as corruption and healed.
+        let conn = crate::db::open_store(root, "logs", "").await?;
+        // The catalog owns the logs schema; a catalog failure is a hard boot failure.
         crate::db::migrations::run_migrations(&conn, crate::db::migrations::TargetDb::Logs).await?;
         Ok(Self { conn })
     }
@@ -282,90 +252,6 @@ impl LogStore {
     }
 }
 
-/// Outcome of opening + verifying the logs store at boot.
-enum OpenFailure {
-    /// Quarantine-worthy: integrity verification failed, the open failed with
-    /// a corruption-class error, or the open/verify path panicked (opening a
-    /// corrupt store can panic).
-    Corrupt(String),
-    /// Non-quarantine failures (busy/locked/IO) — propagate unchanged.
-    Other(anyhow::Error),
-}
-
-/// Open the logs store and verify its integrity.
-///
-/// On a corruption-class failure the connection is dropped before returning so
-/// the caller can rename the artifact family (POSIX open-file rename
-/// semantics) and recreate the store — the recreated store must be the one
-/// registered in `LOG_STORE`/`iter_checkpoint_stores`.
-///
-/// The open itself is panic-absorbed: opening a corrupt store
-/// can panic (e.g. a pager/WAL index OOB), and
-/// a boot-time panic here must quarantine rather than crash startup.
-async fn open_verified_logs_store(root: &Path) -> Result<crate::db::Connection, OpenFailure> {
-    let db_path = db::store_db_path(root, "logs");
-    // The boot path (a pre-flight diagnosis exists) already ran quick_check
-    // inside open_and_repair — the verify below would duplicate the logs
-    // store's boot scan. Non-boot opens (tests) verify here.
-    let boot_verified = crate::db::wal_guard::has_boot_diagnosis(&db_path);
-    let open = AssertUnwindSafe(crate::db::open_store(root, "logs", ""))
-        .catch_unwind()
-        .await;
-    let conn = match open {
-        Ok(Ok(conn)) => conn,
-        Ok(Err(e)) => {
-            // A store that exists but cannot be opened at all is corrupt —
-            // quarantine so boot can proceed with a fresh store. A missing
-            // file (first boot) opens fine, so this path implies an existing
-            // file that is unreadable. Busy/locked/IO-class open errors
-            // (disk full, transient permission) never quarantine — route
-            // through the same classifier as the quick_check path. A fresh
-            // store open failure after the boot-heal path already quarantined
-            // the original family is NOT corrupt either — the recreate itself
-            // failed; propagate without a second quarantine.
-            if let Some(crate::db::RecreateFailed(inner)) =
-                e.downcast_ref::<crate::db::RecreateFailed>()
-            {
-                return Err(OpenFailure::Other(anyhow::anyhow!("{inner:#}")));
-            }
-            if db_path.exists() && crate::db::is_corruption_class(&e) {
-                return Err(OpenFailure::Corrupt(format!("open failed: {e:#}")));
-            }
-            return Err(OpenFailure::Other(e));
-        }
-        Err(payload) => {
-            return Err(OpenFailure::Corrupt(format!(
-                "open panicked: {}",
-                crate::util::panic_message(&*payload)
-            )));
-        }
-    };
-    if boot_verified {
-        return Ok(conn);
-    }
-    let verify = AssertUnwindSafe(conn.quick_check()).catch_unwind().await;
-    match verify {
-        Ok(Ok(())) => Ok(conn),
-        Ok(Err(e)) if crate::db::is_corruption_class(&e) => {
-            Err(OpenFailure::Corrupt(format!("{e:#}")))
-        }
-        Ok(Err(e)) => Err(OpenFailure::Other(e)),
-        Err(payload) => Err(OpenFailure::Corrupt(format!(
-            "integrity check panicked: {}",
-            crate::util::panic_message(&*payload)
-        ))),
-    }
-}
-
-/// Move the logs store's whole artifact family aside to a timestamped
-/// quarantine name. Best-effort: a rename failure is logged, never fatal.
-/// Delegates to the shared store-family quarantine (identical naming scheme;
-/// the logs-specific wrapper keeps the call sites' intent explicit). The
-/// recreate path tolerates a partial quarantine — the bool is ignored.
-fn quarantine_logs_artifacts(root: &Path) {
-    let _ = db::quarantine_store_artifacts(&db::store_db_path(root, "logs"));
-}
-
 /// Parameters for filtering log queries.
 #[derive(Debug, Clone, Default)]
 pub struct LogQuery {
@@ -497,7 +383,7 @@ pub async fn init_tracing(
         .init();
     crate::boot::mark_tracing_initialized();
 
-    // Surface pre-tracing boot diagnostics (pre-flight, logs heal) in the
+    // Surface pre-tracing boot diagnostics (the pre-flight shape check) in the
     // logs store so the GUI boot log shows them.
     crate::boot::replay_boot_diagnostics();
 
@@ -1141,21 +1027,6 @@ mod tests {
         tmp
     }
 
-    /// Assert that quarantine artifacts exist in the store's `db` dir after a
-    /// corrupted store is reopened and recreated.
-    fn assert_quarantine_artifacts(root: &std::path::Path, what: &str) {
-        let quarantined: Vec<_> = std::fs::read_dir(root.join("db"))
-            .expect("read db dir")
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.contains("quarantine-"))
-            .collect();
-        assert!(
-            !quarantined.is_empty(),
-            "{what} must be quarantined, found: {quarantined:?}"
-        );
-    }
-
     #[tokio::test]
     async fn test_spawn_log_writer_writes_to_store() {
         let (store, _dir) = test_store().await;
@@ -1529,73 +1400,35 @@ mod tests {
         );
     }
 
-    /// Boot-time quarantine: a logs store whose main DB file is corrupt is
-    /// moved aside to a timestamped quarantine name and a fresh store is
-    /// created in its place, without failing the open.
+    /// Boot-time refusal: a logs store whose main DB file is corrupt is never
+    /// quarantined or recreated — `LogStore::open` errors with a `StoreRefusal`
+    /// and leaves the file byte-for-byte as it was.
     #[tokio::test]
-    async fn test_log_store_open_quarantines_corrupt_store() {
+    async fn test_log_store_open_refuses_corrupt_store() {
         let tmp = seeded_closed_store().await;
         let root = tmp.path();
 
         // Corrupt a b-tree page in the main DB file (zero page 2; the header
-        // page 1 stays intact so the file still opens).
+        // page 1 stays intact so the file still passes the shape check).
         let db_path = db::store_db_path(root, "logs");
         let bytes = std::fs::read(&db_path).expect("read db file");
         assert!(bytes.len() > 8192, "test needs a multi-page db file");
         let mut corrupted = bytes.clone();
         corrupted[4096..8192].fill(0);
-        std::fs::write(&db_path, corrupted).expect("corrupt db file");
+        std::fs::write(&db_path, &corrupted).expect("corrupt db file");
 
-        // Open must succeed with a fresh store, leaving the corrupt artifact
-        // family quarantined.
-        let store = LogStore::open(root).await.expect("open must not fail");
-        let (_, total) = store
-            .query(&LogQuery::default())
+        let err = LogStore::open(root)
             .await
-            .expect("fresh store query");
-        assert_eq!(total, 0, "fresh store must be empty");
-        // The consolidated stats tables are part of the logs schema — a
-        // quarantine recreate must recreate them too (not silently discard).
-        let stats_tables: i64 = store
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master \
-                 WHERE type='table' AND name IN ('tool_calls')",
-                params![],
-                |row| row.get::<i64>(0),
-            )
-            .await
-            .expect("count consolidated stats tables");
-        assert_eq!(
-            stats_tables, 1,
-            "consolidated stats tables must exist after quarantine recreate"
+            .expect_err("a corrupt store must be refused, not recreated");
+        assert!(
+            err.downcast_ref::<crate::db::StoreRefusal>().is_some(),
+            "expected a StoreRefusal, got: {err:#}"
         );
-        assert_quarantine_artifacts(root, "corrupt artifact family");
-    }
-
-    /// Boot-time quarantine via the open-failure path: a store whose header is
-    /// so corrupt it cannot even be opened (invalid page-size field) is still
-    /// quarantined and recreated, rather than failing boot.
-    #[tokio::test]
-    async fn test_log_store_open_quarantines_unopenable_store() {
-        let tmp = seeded_closed_store().await;
-        let root = tmp.path();
-
-        // Zero the header's page-size field (big-endian u16 at byte offset 16)
-        // so the file cannot be opened at all — Turso bails with a corruption
-        // error ("invalid page size in database header") rather than an IO error.
-        let db_path = db::store_db_path(root, "logs");
-        let mut bytes = std::fs::read(&db_path).expect("read db file");
-        bytes[16] = 0;
-        bytes[17] = 0;
-        std::fs::write(&db_path, bytes).expect("corrupt db file");
-
-        let store = LogStore::open(root).await.expect("open must not fail");
-        let (_, total) = store
-            .query(&LogQuery::default())
-            .await
-            .expect("fresh store query");
-        assert_eq!(total, 0, "fresh store must be empty");
-        assert_quarantine_artifacts(root, "unopenable store");
+        assert_eq!(
+            std::fs::read(&db_path).expect("read db file"),
+            corrupted,
+            "the refused store's main file must be unchanged"
+        );
+        crate::db::test_support::assert_not_quarantined(&root.join("db"), "a refused logs store");
     }
 }

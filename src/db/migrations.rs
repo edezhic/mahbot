@@ -39,8 +39,8 @@
 //!
 //! # Failure semantics
 //!
-//! A catalog/logic error is a hard boot failure — it is **never** absorbed by
-//! the heal/quarantine/`catch_unwind` wrappers and never triggers a recreate.
+//! A catalog/logic error is a hard boot failure — it is never a repair finding
+//! and never a reason to replace the store.
 
 use anyhow::Context;
 use futures_util::future::BoxFuture;
@@ -552,28 +552,36 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
 /// database or whose id is already recorded in `schema_migrations`. Each
 /// SQL entry runs inside its own transaction (schema change + tracking row
 /// commit atomically); each Rust entry runs without a surrounding transaction.
-/// A failure propagates — it is a hard boot failure, never healed/quarantined.
+/// A failure propagates — it is a hard boot failure, never a reason to replace
+/// the store.
 pub(crate) async fn run_migrations(conn: &Connection, db: TargetDb) -> anyhow::Result<()> {
     run_catalog(conn, db, MIGRATIONS).await
 }
 
+/// The ledger table every product install carries: the catalog records applied
+/// ids in it, and the boot usability gate ([`crate::db::has_product_schema`])
+/// uses it as the marker of "built by this product".
+pub(crate) const MIGRATIONS_TABLE: &str = "schema_migrations";
+
 /// The migration loop, parameterized by a catalog so tests can replay the
-/// retired `1`–`23` chain (see the test fixtures). Creates `schema_migrations`,
+/// retired `1`–`23` chain (see the test fixtures). Creates [`MIGRATIONS_TABLE`],
 /// reads the applied ids, and runs each entry once, in catalog order, targeting
 /// only `db`.
 async fn run_catalog(conn: &Connection, db: TargetDb, catalog: &[Migration]) -> anyhow::Result<()> {
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (\
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {MIGRATIONS_TABLE} (\
              id         TEXT PRIMARY KEY,\
              applied_at TEXT NOT NULL\
-         )",
+         )"
+        ),
         (),
     )
     .await
     .context("Failed to create schema_migrations tracking table")?;
 
     let applied: HashSet<String> = conn
-        .query("SELECT id FROM schema_migrations", ())
+        .query(&format!("SELECT id FROM {MIGRATIONS_TABLE}"), ())
         .await
         .context("Failed to read applied migrations")?
         .into_iter()
@@ -596,7 +604,7 @@ async fn run_catalog(conn: &Connection, db: TargetDb, catalog: &[Migration]) -> 
                     .await
                     .with_context(|| format!("Migration '{}' failed", migration.id))?;
                 tx.execute(
-                    "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
+                    &format!("INSERT INTO {MIGRATIONS_TABLE} (id, applied_at) VALUES (?1, ?2)"),
                     params![migration.id, crate::db::now()],
                 )
                 .await
@@ -618,7 +626,7 @@ async fn run_catalog(conn: &Connection, db: TargetDb, catalog: &[Migration]) -> 
                     .await
                     .with_context(|| format!("Migration '{}' failed", migration.id))?;
                 conn.execute(
-                    "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
+                    &format!("INSERT INTO {MIGRATIONS_TABLE} (id, applied_at) VALUES (?1, ?2)"),
                     params![migration.id, crate::db::now()],
                 )
                 .await

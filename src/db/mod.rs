@@ -14,6 +14,7 @@ pub(crate) use turso::{IntoParams, Row, Value, params};
 pub(crate) mod cdc;
 pub mod checkpoint;
 pub mod debug;
+pub(crate) mod failure_record;
 pub mod ipc;
 pub(crate) mod migrations;
 #[cfg(all(unix, test))]
@@ -236,8 +237,8 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
     let _ = DOMAIN_CONN.set(conn.clone());
 
     // Start the CDC drain loop once. It broadcasts ticket change events to the
-    // GUI and the chronicle subscriber; resuming after a heal/recreate re-enables
-    // capture in open_consolidated_store (above).
+    // GUI and the chronicle subscriber; a reopen (the data-preserving rebuild)
+    // re-enables capture in open_consolidated_store (above).
     crate::db::cdc::spawn_drainer(conn.clone());
 
     init_cell(&crate::pipeline::board::BOARD, board, "BOARD")?;
@@ -441,9 +442,9 @@ fn remove_rebuild_temp(temp: &Path) {
 
 /// RAII cleanup of the rebuild temp family: every exit from the migration —
 /// including a turso panic mid-copy (the documented pager-OOB class) —
-/// removes the temp main + sidecars. The panic fallback in open_store
-/// (recreate on the Healthy arm, propagate/retry on the other arms) discards
-/// the fully-read migrated data either way — the accepted panic trade-off.
+/// removes the temp main + sidecars. A panic is absorbed by `open_store` as a
+/// refusal, so the fully-read migrated data is discarded either way — the
+/// accepted panic trade-off.
 struct TempCleanup<'a>(&'a Path);
 impl Drop for TempCleanup<'_> {
     fn drop(&mut self) {
@@ -599,8 +600,8 @@ fn is_open_time_lock_error(err: &turso::Error) -> bool {
 
 /// True when `e`, or any cause beneath it, is [the open-time store lock]:
 /// another process holds a store this process is trying to open. The daemon's
-/// store bring-up records its refusal through this; the heal path decides
-/// through [`is_actionable_signal`] / [`is_corruption_class`] instead.
+/// store bring-up records its refusal through this; the repair path decides
+/// through [`is_actionable_signal`] instead.
 ///
 /// [the open-time store lock]: is_open_time_lock_error
 pub(crate) fn is_store_lock_error(e: &anyhow::Error) -> bool {
@@ -610,6 +611,43 @@ pub(crate) fn is_store_lock_error(e: &anyhow::Error) -> bool {
             .is_some_and(is_open_time_lock_error)
     })
 }
+
+/// A store that exists but is not positively recognised as usable. The service
+/// refuses to start; the store's files are left exactly as they are — nothing
+/// is created, modified, renamed or deleted, and no schema, migration or admin
+/// account is built in its place.
+#[derive(Debug)]
+pub(crate) struct StoreRefusal {
+    /// Physical store name (`core` or `logs`).
+    pub store: &'static str,
+    /// The store's data-file path (for the durable record).
+    pub db_path: std::path::PathBuf,
+    /// One-line reason.
+    pub reason: String,
+}
+
+impl StoreRefusal {
+    #[must_use]
+    pub(crate) fn new(store: &'static str, db_path: &Path, reason: impl Into<String>) -> Self {
+        Self {
+            store,
+            db_path: db_path.to_path_buf(),
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for StoreRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to start: store '{}' is not usable — {}",
+            self.store, self.reason
+        )
+    }
+}
+
+impl std::error::Error for StoreRefusal {}
 
 /// Retries `attempt` only for the transient open-time store lock.
 ///
@@ -1833,7 +1871,7 @@ pub(crate) async fn open_with_schema(db_path: &Path, schema: &str) -> anyhow::Re
 
     // Never embed the DDL in the error: a multi-kilobyte schema string hides
     // the engine's actual reason (e.g. `no such column: ticket_id`) and was
-    // how a quarantine of a readable store went undiagnosed.
+    // how a schema-DDL failure against a readable store went undiagnosed.
     execute_schema_ddl(&conn, schema).await?;
 
     Ok(conn)
@@ -1892,9 +1930,9 @@ pub(crate) fn store_sidecars(db_path: &Path) -> StoreSidecars {
     }
 }
 
-/// Resource/permission keywords shared by the error classifiers: actionable
-/// signals (never corruption) — ENOSPC/EMFILE/OOM/permission must not trigger
-/// a quarantine. One base predicate keeps the two classifiers from drifting.
+/// Resource/permission keywords for [`is_actionable_signal`]: actionable
+/// conditions (never damage) — ENOSPC/EMFILE/OOM/permission must not be
+/// reported as a repair finding.
 const RESOURCE_SIGNAL_KEYWORDS: [&str; 4] = [
     "no space left on device",
     "too many open files",
@@ -1906,226 +1944,176 @@ fn has_resource_signal(lower: &str) -> bool {
     RESOURCE_SIGNAL_KEYWORDS.iter().any(|k| lower.contains(k))
 }
 
-/// Lock/busy contention keywords shared by both error classifiers. The engine
+/// Lock/busy contention keywords for [`is_actionable_signal`]. The engine
 /// reports another process holding a store as the open-time whole-file lock
 /// (`Locking error: … File is locked by another process`), a locked table, or a
-/// busy database. All of them are one external condition — never corruption,
-/// never a reason to quarantine, and never silently ignored.
+/// busy database. All of them are one external condition — never damage, and
+/// never silently ignored.
 const LOCK_SIGNAL_KEYWORDS: [&str; 3] = ["locking", "locked", "busy"];
 
 fn has_lock_signal(lower: &str) -> bool {
     LOCK_SIGNAL_KEYWORDS.iter().any(|k| lower.contains(k))
 }
 
-/// True when a `quick_check`/open failure is corruption-class rather than a
-/// busy/locked/IO failure of the PRAGMA itself.
-///
-/// Two forms qualify: the PRAGMA returned a non-`ok` row (our
-/// `Database integrity check failed` bail), or the PRAGMA failed to execute
-/// with a message that is not a lock/busy, I/O, or resource condition (e.g. a
-/// page-level error reading a zeroed page — `Invalid page type`). Only
-/// corruption-class failures quarantine — a busy or locked store must never
-/// trigger the rename path, and ENOSPC/EMFILE are actionable signals, never
-/// corruption (the unified guarded-open path must not quarantine on them).
-/// Unknown messages classify as corruption (fail-closed): a novel turso error
-/// string at boot could trigger a recreate the matrix does not justify.
-/// Accepted trade-off — genuine corruption must not pass as an actionable
-/// signal; reclassify new strings as they surface.
-///
-/// Schema-mismatch / DDL-shape errors are **never** corruption — they are a
-/// code bug (a catalog migration ordering error, a typo, …). Those must fail
-/// boot with the store intact; quarantining them destroyed readable installs.
-/// See [`is_schema_mismatch`].
-pub(crate) fn is_corruption_class(e: &anyhow::Error) -> bool {
-    if is_schema_mismatch(e) {
-        return false;
-    }
-    let msg = format!("{e:#}");
-    if msg.contains("Database integrity check failed") {
-        return true;
-    }
-    let lower = msg.to_lowercase();
-    !(has_resource_signal(&lower)
-        || has_lock_signal(&lower)
-        || lower.contains("i/o error")
-        || lower.contains("no such file"))
-}
-
-/// True when a schema/`execute_batch` failure is a DDL shape error, not
-/// page-level damage.
-///
-/// `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table even when the
-/// live columns differ from the expected shape. A later `CREATE INDEX … ON
-/// t(new_col)` then fails with `no such column` — that is a catalog ordering
-/// bug, not an unreadable file. Keep this list in lockstep with Turso/SQLite
-/// wording as new strings surface; do **not** fold these into the fail-closed
-/// corruption path.
-fn is_schema_mismatch(e: &anyhow::Error) -> bool {
-    const DDL_SHAPE: [&str; 8] = [
-        "no such column",
-        "no such table",
-        "no such index",
-        "has no column",
-        "duplicate column",
-        "already exists",
-        "syntax error",
-        "parse error",
-    ];
-    let lower = format!("{e:#}").to_lowercase();
-    DDL_SHAPE.iter().any(|k| lower.contains(k))
-}
-
-/// True when a heal-phase failure is an actionable signal: a resource/permission
-/// condition (ENOSPC/EMFILE/OOM/permission) or lock contention with another
-/// process (the engine's open-time file lock, a locked table, a busy database).
-/// Neither is corruption, so neither may trigger a quarantine/recreate — the
-/// boot-heal path propagates them instead, and the daemon refuses to start
-/// rather than destroy a store another process is using. Persistent I/O errors
-/// and unreadable states are the recreate candidates.
+/// True when a repair-phase failure is an actionable signal: a
+/// resource/permission condition (ENOSPC/EMFILE/OOM/permission) or lock
+/// contention with another process (the engine's open-time file lock, a locked
+/// table, a busy database). Neither is damage, so the repair path propagates
+/// them loud rather than reporting a spurious repair finding.
 fn is_actionable_signal(e: &anyhow::Error) -> bool {
     let lower = format!("{e:#}").to_lowercase();
     has_resource_signal(&lower) || has_lock_signal(&lower)
 }
 
-/// Marker wrapping a fresh-store open failure after the boot-heal path already
-/// quarantined the original family. The outer quarantine (logs path) must not
-/// run again on this error — the fresh store is not corrupt, the recreate
-/// itself failed.
-#[derive(Debug)]
-pub(crate) struct RecreateFailed(pub anyhow::Error);
-
-impl std::fmt::Display for RecreateFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "fresh store open failed after quarantine: {}", self.0)
-    }
-}
-
-impl std::error::Error for RecreateFailed {}
-
 /// Open a store database under `<root>/db/<name>.db` (path built by
 /// [`store_db_path`]).
 ///
-/// Creates parent directories if needed and runs the provided `schema` via
-/// [`open_with_schema`]. Per-store `open()` constructors are generated by
-/// [`crate::define_store!`] on top of [`open_consolidated_store`] (which calls
-/// this function for the consolidated file); this free function is the
-/// heal/recreate-aware open path used by that caller and by tests.
-///
-/// During daemon boot (when a pre-flight diagnosis exists for `name`), the
-/// open runs the per-store heal strategy derived by the pre-flight:
-/// PASSIVE-first + TRUNCATE for durable-B (0-byte main DB + non-empty WAL),
-/// quarantine + recreate for structural damage, and class-B btree-index repair
-/// after the open. Every diagnosed open is panic-absorbed (turso's own reopen
-/// of a damaged store can panic; boot must never fail because of a damaged
-/// store): heal-phase panics and errors recreate, while post-heal
-/// standard-open panics propagate loudly (recreate is not justified for a
-/// store whose data was just preserved). Outside the boot flow (tests, CLI)
-/// the diagnosis map is empty and this behaves exactly like
-/// [`open_with_schema`].
+/// The bring-up gate lives here. An absent data file is a genuine first launch:
+/// the store is created (the only path that builds a schema in place of
+/// nothing). An existing file must pass the file-level shape check
+/// ([`crate::db::wal_guard::classify_store_shape`]) and then open AND carry the
+/// product's own schema, otherwise the call refuses with a [`StoreRefusal`] and
+/// leaves the file exactly as it is. The data-preserving repairs still run on an
+/// opened store; only a repair that *fails* refuses — a condition the repairs
+/// deliberately leave report-only (an unknown quick_check signature) opens the
+/// store exactly as it does today. Per-store `open()` constructors are generated
+/// by [`crate::define_store!`] on top of [`open_consolidated_store`] (which calls
+/// this function for the consolidated file).
 pub(crate) async fn open_store(
     root: &Path,
-    name: &str,
+    name: &'static str,
     schema: &str,
 ) -> anyhow::Result<Connection> {
     let db_path = store_db_path(root, name);
-    let Some(diagnosis) = crate::db::wal_guard::take_boot_diagnosis(&db_path) else {
-        return open_with_schema(&db_path, schema).await;
-    };
+    match crate::db::wal_guard::classify_store_shape(&db_path) {
+        // No data file — a genuine first launch. Creating the store is the only
+        // path that builds a schema in place of nothing.
+        crate::db::wal_guard::StoreShape::Absent => open_with_schema(&db_path, schema).await,
+        crate::db::wal_guard::StoreShape::Unusable(defect) => {
+            Err(StoreRefusal::new(name, &db_path, defect.reason()).into())
+        }
+        crate::db::wal_guard::StoreShape::Present => {
+            let opened = AssertUnwindSafe(open_present_store(&db_path, name, schema))
+                .catch_unwind()
+                .await;
+            match opened {
+                Ok(result) => result,
+                // turso's own reopen of a damaged store can panic; a panic is a
+                // refusal, not a reason to replace the file.
+                Err(payload) => Err(StoreRefusal::new(
+                    name,
+                    &db_path,
+                    format!("open panicked: {}", crate::util::panic_message(&*payload)),
+                )
+                .into()),
+            }
+        }
+    }
+}
 
-    match diagnosis {
-        crate::db::wal_guard::BootDiagnosis::Healthy => {
-            // Healthy main-DB header + open panic is a main-DB content issue
-            // (pager OOB), not a coordination one — the sidecar-only
-            // quarantine path would discard -wal durability while the
-            // "intact main DB" premise is contradicted by the panic itself.
-            // Recreate (the incurable path).
-            let result = AssertUnwindSafe(open_and_repair(&db_path, name, schema))
-                .catch_unwind()
-                .await;
-            match result {
-                Ok(Ok(conn)) => Ok(conn),
-                Ok(Err(e)) => Err(e),
-                Err(payload) => {
-                    recreate_after_failed_heal(&db_path, name, schema, &panic_err(&*payload)).await
-                }
-            }
+/// Open an existing, shape-valid store: require it to open and to carry the
+/// product's own schema, then run the data-preserving repairs. Every failure is
+/// a refusal — the store is never quarantined, recreated or emptied.
+async fn open_present_store(
+    db_path: &Path,
+    name: &'static str,
+    schema: &str,
+) -> anyhow::Result<Connection> {
+    let conn = match open_with_schema(db_path, schema).await {
+        Ok(conn) => conn,
+        // A resource/permission/lock condition is environmental, never store
+        // damage; it propagates unwrapped (the boot recorder names the lock case
+        // with its own wording, and records neither as a refusal).
+        Err(e) if is_actionable_signal(&e) => return Err(e),
+        Err(e) => {
+            return Err(
+                StoreRefusal::new(name, db_path, format!("it could not be opened: {e:#}")).into(),
+            );
         }
-        crate::db::wal_guard::BootDiagnosis::DurableB => {
-            // Phase 1: the heal connection's own open — the risky reopen of a
-            // 0-byte main DB with a non-empty WAL. A panic here recreates; a
-            // persistent error recreates unless it is an actionable signal —
-            // resource exhaustion or lock contention (another process holds
-            // the store) must never trigger a quarantine.
-            let healed = AssertUnwindSafe(heal_checkpoint_sequence(
-                &db_path,
+    };
+    match has_product_schema(&conn).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(StoreRefusal::new(
                 name,
-                crate::db::wal_guard::BootDiagnosis::DurableB,
-            ))
-            .catch_unwind()
-            .await;
-            match healed {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    // Persistent heal failure (I/O, unreadable) is a recreate
-                    // candidate per the heal fallback; only actionable signals
-                    // (ENOSPC/EMFILE/OOM/permission, or a store locked by
-                    // another process) propagate instead.
-                    if is_actionable_signal(&e) {
-                        return Err(e);
-                    }
-                    return recreate_after_failed_heal(&db_path, name, schema, &e).await;
-                }
-                Err(payload) => {
-                    return recreate_after_failed_heal(
-                        &db_path,
-                        name,
-                        schema,
-                        &panic_err(&*payload),
-                    )
-                    .await;
-                }
-            }
-            // Phase 2: standard open + schema + class-B repair. The heal
-            // succeeded — a panic here is not a heal failure and recreate is
-            // not justified (recreate only for heal-phase failures and
-            // structural/unreadable states); propagate loudly.
-            let result = AssertUnwindSafe(open_and_repair(&db_path, name, schema))
-                .catch_unwind()
-                .await;
-            match result {
-                Ok(Ok(conn)) => Ok(conn),
-                Ok(Err(e)) => Err(e),
-                Err(payload) => Err(anyhow::anyhow!(
-                    "post-heal open of store '{name}' panicked: {}",
-                    crate::util::panic_message(&*payload)
-                )),
-            }
+                db_path,
+                "it opens but does not carry the product's own schema",
+            )
+            .into());
         }
-        crate::db::wal_guard::BootDiagnosis::Structural => {
-            crate::boot::boot_diagnostic(format!(
-                "store '{name}' structurally damaged (pre-flight diagnosis) — \
-                 quarantining and recreating",
-            ));
-            // The recreate path tolerates a partial quarantine (un-moved
-            // files stay in place) — the bool is intentionally ignored.
-            let _ = quarantine_store_artifacts(&db_path);
-            // Fresh store: open_with_schema directly — open_and_repair's
-            // schema-error path would quarantine the fresh store a second
-            // time (opposite policy of the logs path). Marker: the original
-            // family is already quarantined — a further quarantine (logs
-            // outer path) would move the fresh store.
-            let result = AssertUnwindSafe(open_with_schema(&db_path, schema))
-                .catch_unwind()
-                .await;
-            match result {
-                Ok(Ok(conn)) => Ok(conn),
-                Ok(Err(e)) => Err(anyhow::anyhow!(RecreateFailed(e))),
-                Err(payload) => Err(anyhow::anyhow!(RecreateFailed(anyhow::anyhow!(
-                    "recreated store '{name}' open panicked: {}",
-                    crate::util::panic_message(&*payload)
-                )))),
-            }
+        // Environmental, like an open failure — never recorded as damage.
+        Err(e) if is_actionable_signal(&e) => return Err(e),
+        Err(e) => {
+            return Err(StoreRefusal::new(
+                name,
+                db_path,
+                format!("the schema probe failed: {e:#}"),
+            )
+            .into());
         }
+    }
+    run_repairs(conn, db_path, name, schema).await
+}
+
+/// True when an opened store carries the product's own schema — the ledger every
+/// install of this product writes ([`crate::db::migrations::MIGRATIONS_TABLE`]).
+/// A present store without it was never built by the product (an empty file, a
+/// foreign SQLite file, or a store left before its first catalog run) and must
+/// not have a schema built inside it.
+///
+/// The ledger is the marker for every install this product ever created (the
+/// catalog has owned it since before the retired `1`–`23` chain), so an older
+/// install is not refused: it carries the ledger and migrates as usual.
+async fn has_product_schema(conn: &Connection) -> anyhow::Result<bool> {
+    let table = crate::db::migrations::MIGRATIONS_TABLE;
+    let ledger: Option<i64> = conn
+        .query_optional(
+            &format!(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '{table}'"
+            ),
+            (),
+            |row| row.get::<i64>(0),
+        )
+        .await?;
+    if ledger.unwrap_or(0) == 0 {
+        return Ok(false);
+    }
+    let recorded: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), (), |row| {
+            row.get::<i64>(0)
+        })
+        .await?;
+    Ok(recorded > 0)
+}
+
+/// Run the data-preserving repairs on an opened store. Only outcomes that used
+/// to fall back to moving the store aside and recreating it are refusals now;
+/// every repair that preserves the data keeps handling exactly what it handles
+/// today.
+async fn run_repairs(
+    conn: Connection,
+    db_path: &Path,
+    name: &'static str,
+    schema: &str,
+) -> anyhow::Result<Connection> {
+    match repair_btree_index_if_desynced(conn, db_path, name, schema).await {
+        Ok((RepairOutcome::Unreadable, _conn)) => {
+            Err(StoreRefusal::new(name, db_path, "its integrity check cannot read a table").into())
+        }
+        Ok((_, conn)) => Ok(conn),
+        // A resource/permission/lock condition is environmental, never store
+        // damage: propagate it unwrapped so it is recorded (and shown) as the
+        // condition it is, not as an unusable store.
+        Err(e) if is_actionable_signal(&e) => Err(e),
+        // Only a data-preserving rebuild that could not complete reaches here:
+        // the original family is preserved or quarantined for recovery and the
+        // store is refused, never replaced with an empty one.
+        Err(e) => Err(StoreRefusal::new(
+            name,
+            db_path,
+            format!("the data-preserving rebuild could not be completed: {e:#}"),
+        )
+        .into()),
     }
 }
 
@@ -2149,8 +2137,8 @@ pub(crate) async fn open_store(
 /// point live in the [`crate::db::migrations`] module doc — the single owner
 /// of that list. The only control flow is the id-based applied check (skip if
 /// the id is already recorded, otherwise run and record). A catalog failure
-/// is a hard boot failure — it is never classified as corruption and never
-/// triggers a quarantine/recreate.
+/// is a hard boot failure — it is never a repair finding and never a reason
+/// to replace the store.
 ///
 /// # Why tables → ALTER → indexes is baked into the catalog order
 ///
@@ -2158,7 +2146,7 @@ pub(crate) async fn open_store(
 /// jobs(kind, ticket_id)` while `ticket_id` was only added by a later ALTER.
 /// `CREATE TABLE IF NOT EXISTS jobs` left the old table unchanged; the index
 /// failed with `no such column` and the store was misclassified as corruption
-/// and recreated empty. In the baseline, `jobs` is created WITH `ticket_id`, so
+/// and rebuilt empty. In the baseline, `jobs` is created WITH `ticket_id`, so
 /// `idx_jobs_phase_ticket` is safe to create in the same batch.
 ///
 /// Returns a **fresh** connection. Production shares it across all domain
@@ -2167,35 +2155,26 @@ pub(crate) async fn open_store(
 /// isolation never leaks a connection across roots.
 pub(crate) async fn open_consolidated_store(root: &Path) -> anyhow::Result<Connection> {
     // The catalog owns the ENTIRE schema. Open the raw connection (no DDL) and
-    // run the catalog; a catalog failure is a hard boot error — never healed
-    // or quarantined. A fresh/recreated store is empty until the catalog builds
-    // the full current shape.
+    // run the catalog; a catalog failure is a hard boot error — never a repair
+    // finding and never a reason to replace the store. A fresh store is empty
+    // until the catalog builds the full current shape.
     let conn = open_store(root, CONSOLIDATED_DB_NAME, "").await?;
     migrations::run_migrations(&conn, migrations::TargetDb::Core).await?;
 
     // Enable CDC on the FINAL connection, after all migrations, so
-    // boot-time schema writes are not captured. This single chokepoint
-    // covers every connection-recreation path (open_store's heal/recreate arms
-    // all funnel back through here) and the test-store opens (open_test_store!
-    // and init_test_stores both call open_consolidated_store).
+    // boot-time schema writes are not captured. This single chokepoint covers
+    // the boot open and the test-store opens (open_test_store! and
+    // init_test_stores both call open_consolidated_store).
     cdc::enable_capture(&conn).await?;
 
     Ok(conn)
 }
 
-/// Format a catch_unwind panic payload into a store-open error.
-fn panic_err(payload: &(dyn std::any::Any + Send)) -> anyhow::Error {
-    anyhow::anyhow!(
-        "store open panicked: {}",
-        crate::util::panic_message(payload)
-    )
-}
-
 /// Outcome of the class-B btree-index repair.
 enum RepairOutcome {
-    /// No recreate needed: quick_check passed, or a report-only condition
-    /// (unknown signature / failed in-place repair / aborted migration left
-    /// for operator review). The store opens normally either way.
+    /// No repair needed: quick_check passed, or a report-only condition
+    /// (unknown signature / failed in-place repair / aborted rebuild left for
+    /// operator review). The store opens normally either way.
     NoRepair,
     /// REINDEX (or the DROP+CREATE fallback) cleared the desync.
     Repaired,
@@ -2204,58 +2183,36 @@ enum RepairOutcome {
     /// double-free the shared overflow page and re-corrupt the freelist).
     /// The returned connection is the reopened, verified store.
     Migrated,
-    /// The table is unreadable (quick_check scan failure) — recreate is
-    /// justified per the recreate matrix.
+    /// The table is unreadable (quick_check scan failure) — the store is
+    /// refused, never recreated.
     Unreadable,
 }
 
-/// Open with the schema, then run the class-B btree-index repair (boot path
-/// only — single-writer, exclusive access before any live traffic). This
-/// runs a full quick_check per store it opens (2 physical stores → 2 full-DB
-/// scans, plus a verification scan after a repair) — the fixed boot cost of
-/// the repair-at-init design.
-async fn open_and_repair(db_path: &Path, name: &str, schema: &str) -> anyhow::Result<Connection> {
-    let conn = match open_with_schema(db_path, schema).await {
-        Ok(conn) => conn,
-        Err(e) if is_corruption_class(&e) => {
-            // Schema application choked on a corrupt table (e.g. CREATE INDEX
-            // scans it and hits "Invalid page type") — unreadable table,
-            // recreate justified. Schema-mismatch (`no such column`, …) is
-            // excluded from [`is_corruption_class`]: fail boot, keep the file.
-            return recreate_after_failed_heal(db_path, name, schema, &e).await;
-        }
-        Err(e) => return Err(e),
-    };
-    match repair_btree_index_if_desynced(conn, db_path, name, schema).await {
-        Ok((RepairOutcome::Unreadable, conn)) => {
-            drop(conn); // release the fds before the family rename
-            recreate_after_failed_heal(
-                db_path,
-                name,
-                schema,
-                &anyhow::anyhow!("class-B unreadable table — recreate justified"),
-            )
-            .await
-        }
-        Ok((_, conn)) => Ok(conn),
-        // An actionable quick_check failure (ENOSPC/EMFILE/permission, or lock
-        // contention) propagated from the repair — never a recreate trigger.
-        Err(e) => Err(e),
-    }
+/// Open a raw-DDL fixture store and run the repair half of the existing-store
+/// open (the boot path additionally requires the product-schema ledger, which
+/// these fixtures are built without).
+#[cfg(test)]
+async fn open_and_repair_for_test(
+    db_path: &Path,
+    name: &'static str,
+    schema: &str,
+) -> anyhow::Result<Connection> {
+    let conn = open_with_schema(db_path, schema).await?;
+    run_repairs(conn, db_path, name, schema).await
 }
 
 /// The baked overflow-aliasing signature: a prior REINDEX/DROP+CREATE on a
 /// store whose index leaves shared an overflow page left the page doubly on
 /// the freelist, so a later allocation reuses it as both a b-tree page and an
 /// overflow chain; reading that chain yields this exact short-read on every
-/// scan. The table stays readable there — table-rebuild in place applies,
-/// recreate (data loss) is not justified.
+/// scan. The table stays readable there — the store is rebuilt
+/// data-preservingly in a fresh sibling file, never recreated empty.
 const BAKED_OVERFLOW_ALIASING_READ: &str = "short read on page 167772160";
 
 /// What the class-B repair should do given the full quick_check problem list.
 enum RepairTarget {
-    /// The table cannot be scanned ("Invalid page type"/"short read") —
-    /// recreate is justified.
+    /// The table cannot be scanned ("Invalid page type"/"short read") — the
+    /// store is refused.
     Unreadable,
     /// Shared overflow pages between index leaves (fresh "Page N referenced
     /// multiple times" or the baked short-read) — never REINDEX (bakes a
@@ -2349,17 +2306,16 @@ async fn snapshot_store_via_engine(
 /// validated on the 324MB prod sessions copy — both M>N and M<N desync forms,
 /// survives reopen and TRUNCATE). Returns `Ok(([`RepairOutcome`], conn))`; an
 /// actionable quick_check failure (ENOSPC/EMFILE/permission, or lock
-/// contention) propagates as `Err` — it is a signal, never a recreate trigger.
+/// contention) propagates as `Err` — it is a signal, never a repair finding.
 ///
 /// Preconditions are satisfied by construction at boot: single-writer,
-/// exclusive access, the WAL frame index already healed/reset (fi_len==maxf),
-/// and a snapshot (engine-produced `VACUUM INTO`) taken before the
-/// REINDEX. The overflow-aliasing signature ("referenced multiple times" /
+/// exclusive access, and a snapshot (engine-produced `VACUUM INTO`) taken before
+/// the REINDEX. The overflow-aliasing signature ("referenced multiple times" /
 /// shared overflow pages, fresh or baked as "short read on page 167772160") is
 /// **never** REINDEXed — that bakes a worse error; the store is rebuilt
 /// data-preservingly instead (see [`migrate_overflow_aliased_store`]).
 /// Unreadable tables surface as quick_check scan failures ("Invalid page
-/// type"/"short read") and fall through to the recreate path.
+/// type"/"short read") and refuse the store.
 async fn repair_btree_index_if_desynced(
     conn: Connection,
     db_path: &Path,
@@ -2375,13 +2331,13 @@ async fn repair_btree_index_if_desynced(
         Err(e) => {
             // The quick_check itself failed to run — an actionable signal
             // (resource/permission condition or lock contention) is never a
-            // recreate trigger; propagate it like the heal-phase arm.
+            // repair finding; propagate it.
             if is_actionable_signal(&e) {
                 return Err(e);
             }
             crate::boot::boot_diagnostic(format!(
-                "store '{name}' quick_check could not run: {e} — unreadable table, \
-                 recreate justified",
+                "store '{name}' quick_check could not run: {e} — unreadable table; the \
+                 store is refused",
             ));
             return Ok((RepairOutcome::Unreadable, conn));
         }
@@ -2389,8 +2345,8 @@ async fn repair_btree_index_if_desynced(
     let index = match classify_repair_target(&problems) {
         RepairTarget::Unreadable => {
             crate::boot::boot_diagnostic(format!(
-                "store '{name}' quick_check cannot scan a table ({}) — unreadable table, \
-                 recreate justified",
+                "store '{name}' quick_check cannot scan a table ({}) — unreadable table; \
+                 the store is refused",
                 problems.join("; "),
             ));
             return Ok((RepairOutcome::Unreadable, conn));
@@ -2406,6 +2362,9 @@ async fn repair_btree_index_if_desynced(
             ));
             return migrate_overflow_aliased_store(conn, db_path, name, schema).await;
         }
+        // Report-only by decision: an unrecognised quick_check signature is not
+        // proof that the data is unusable, so the store boots exactly as it does
+        // today — never a refusal, and never a rebuild over the operator's data.
         RepairTarget::Unknown => {
             crate::boot::boot_diagnostic(format!(
                 "store '{name}' quick_check flagged an unknown condition: {}",
@@ -2495,15 +2454,17 @@ async fn count_table_rows(conn: &Connection, table: &str) -> turso::Result<i64> 
 ///
 /// Preconditions hold at boot: single-writer, exclusive access before any
 /// live traffic. The original family is quarantined (renamed aside, never
-/// deleted — the forensic record) before the swap, satisfying the
-/// recreate-path preservation guarantee. Returns
-/// `Ok(([`RepairOutcome::Migrated`], reopened))` on success; aborts as
-/// `NoRepair` (report-only) on a constraint violation during the data copy —
-/// a data-integrity finding, not corruption, and never a silent recreate — or
-/// on any other non-actionable failure (the original store is preserved).
-/// An unreadable table surfaces as `Unreadable` (recreate justified).
-/// Actionable resource conditions (ENOSPC/EMFILE/permission) propagate as
-/// `Err` — they must never trigger a quarantine.
+/// deleted — the forensic record) before the swap, so the original data is
+/// preserved even when the rebuild aborts. Returns
+/// `Ok(([`RepairOutcome::Migrated`], reopened))` on success. Before the swap a
+/// constraint violation during the data copy (a data-integrity finding, not
+/// damage) or a fresh store that cannot be built leaves the original untouched
+/// and reports only (`NoRepair`). A table that cannot be read propagates as
+/// `Err` (the store is refused). A swap that could not complete — a partial
+/// quarantine with the main file already moved, a failed main-file rename, or a
+/// rebuilt store that will not reopen — propagates as `Err`, which refuses the
+/// store rather than replacing it with an empty one. Actionable resource
+/// conditions (ENOSPC/EMFILE/permission) also propagate as `Err`.
 #[expect(clippy::too_many_lines)] // one linear boot-repair flow, split across helpers
 async fn migrate_overflow_aliased_store(
     conn: Connection,
@@ -2518,8 +2479,8 @@ async fn migrate_overflow_aliased_store(
 
     // ── Readability + row-count per user table (quick_check does not name
     // the aliased index, so every table's read is gated; unreadable →
-    // recreate). `__turso_internal_%` tables reject user writes and are
-    // recreated by the DDL replay — excluded from the copy + verification.
+    // the store is refused). `__turso_internal_%` tables reject user writes and
+    // are recreated by the DDL replay — excluded from the copy + verification.
     let mut counts: Vec<(String, i64)> = Vec::new();
     let tables = match conn
         .query(
@@ -2534,8 +2495,7 @@ async fn migrate_overflow_aliased_store(
         Ok(t) => t,
         // A table-enumeration failure is an engine-level read problem, not
         // proof the data is unreadable — report-only (conservative, no data
-        // loss), unlike the checkpoint precondition below which recreate
-        // clears.
+        // loss), unlike the per-table read below which refuses the store.
         Err(e) => {
             let err = anyhow::anyhow!(e);
             if is_actionable_signal(&err) {
@@ -2565,11 +2525,15 @@ async fn migrate_overflow_aliased_store(
         match count_table_rows(&conn, &tbl).await {
             Ok(count) => counts.push((tbl, count)),
             Err(e) => {
-                crate::boot::boot_diagnostic(format!(
-                    "store '{name}' table '{tbl}' is unreadable ({e}) — the data cannot \
-                     be preserved by the rebuild; recreate justified",
-                ));
-                return Ok((RepairOutcome::Unreadable, conn));
+                // The data cannot be read, so the rebuild cannot preserve it: the
+                // store is refused (never replaced). An actionable condition is
+                // the environment, not the store — the caller propagates it.
+                let err = anyhow::anyhow!(e);
+                return Err(if is_actionable_signal(&err) {
+                    err
+                } else {
+                    err.context(format!("table '{tbl}' cannot be read"))
+                });
             }
         }
     }
@@ -2636,9 +2600,9 @@ async fn migrate_overflow_aliased_store(
         // without a forensic record — never swap onto a partial quarantine.
         // The temp guard cleans the migrated family. The main renames
         // first; sibling renames normally fail together, so main-in-place
-        // means the original main is preserved (the reopen assumes it is
-        // complete — the precondition checkpoint normally guarantees that)
-        // and main-moved means the data is not at its path.
+        // means the original main is preserved (reopening it reads the main
+        // file plus its `-wal`) and main-moved means the data is not at its
+        // path.
         crate::boot::boot_diagnostic(format!(
             "store '{name}' original family could not be fully quarantined — the \
              rebuild swap would clobber it without a forensic record; rebuild aborted, \
@@ -2658,8 +2622,8 @@ async fn migrate_overflow_aliased_store(
                  path is empty — boot aborted; recover from the quarantine and retry",
             ));
             Err(anyhow::anyhow!(
-                "store '{name}' rebuild aborted: partial quarantine with the main file \
-                 already moved — the store path was not rebuilt"
+                "the rebuild aborted with the original family partially quarantined and the \
+                 main file already moved — the store path was not rebuilt"
             ))
         };
     }
@@ -2674,10 +2638,10 @@ async fn migrate_overflow_aliased_store(
         // family is in the quarantine. Bail loudly (the store's boot fails)
         // instead of opening a fresh empty store over the abandoned migrated
         // data; the temp guard discards the migrated family.
-        return Err(anyhow::anyhow!(e).context(format!(
-            "store '{name}' rebuild swap main-file rename failed — migrated temp \
-             family discarded; original family quarantined for recovery"
-        )));
+        return Err(anyhow::anyhow!(e).context(
+            "the rebuild swap could not move the rebuilt store into place — migrated temp \
+             family discarded; original family quarantined for recovery",
+        ));
     }
     for (src, dst) in [
         (&temp_sidecars.wal, &sidecars.wal),
@@ -3000,114 +2964,12 @@ impl CheckpointMode {
     }
 }
 
-/// Run the heal strategy on a dedicated connection per mode (each call opens
-/// and fully closes its own connection — durable-B's PASSIVE-first requires a
-/// reopen before the TRUNCATE). The heal connection's own open is the risky
-/// turso reopen of damaged coordination; panics there are handled by the
-/// caller (recreate).
-async fn heal_checkpoint_sequence(
-    db_path: &Path,
-    name: &str,
-    diagnosis: crate::db::wal_guard::BootDiagnosis,
-) -> anyhow::Result<()> {
-    let sidecars = store_sidecars(db_path);
-    // PASSIVE-first for durable-B (0-byte main DB + live WAL): backfill
-    // without truncating, then a reopen + TRUNCATE compacts. Defensively
-    // re-checked here — TRUNCATE-first on a 0-byte main DB destroys
-    // committed frames.
-    let durable_b = matches!(diagnosis, crate::db::wal_guard::BootDiagnosis::DurableB)
-        || (std::fs::metadata(db_path).is_ok_and(|m| m.len() == 0)
-            && std::fs::metadata(&sidecars.wal).is_ok_and(|m| m.len() > 0));
-    if durable_b {
-        heal_checkpoint(db_path, CheckpointMode::Passive, name).await?;
-        heal_checkpoint(db_path, CheckpointMode::Truncate, name).await?;
-    }
-    Ok(())
-}
-
-/// Quarantine the whole artifact family and recreate the store fresh.
-/// The quarantine copy is never deleted — it is the forensic record.
-async fn recreate_after_failed_heal(
-    db_path: &Path,
-    name: &str,
-    schema: &str,
-    reason: &anyhow::Error,
-) -> anyhow::Result<Connection> {
-    crate::boot::boot_diagnostic(format!(
-        "store '{name}' heal failed: {reason} — quarantining artifact family and \
-         recreating a fresh store",
-    ));
-    // The recreate path tolerates a partial quarantine — the bool is
-    // intentionally ignored.
-    let _ = quarantine_store_artifacts(db_path);
-    match open_with_schema(db_path, schema).await {
-        Ok(conn) => Ok(conn),
-        // Marker: the original family is already quarantined — a further
-        // quarantine (logs outer path) would move the fresh store.
-        Err(e) => Err(anyhow::anyhow!(RecreateFailed(e))),
-    }
-}
-
-/// Retries for a heal checkpoint that returns busy (1s interval — the LLM
-/// retry policies are deliberately not reused).
-const HEAL_CHECKPOINT_RETRIES: usize = 3;
-
-/// Run a single-mode WAL checkpoint on a dedicated heal connection, retrying
-/// busy outcomes ~3 times with a 1-second interval. The connection is closed
-/// before the next mode's open (or the standard store open).
-///
-/// Benign here: the heal runs in the single-writer boot window before the
-/// main connection exists, and the instance flock already excludes a second
-/// daemon.
-async fn heal_checkpoint(db_path: &Path, mode: CheckpointMode, name: &str) -> anyhow::Result<()> {
-    let conn = Connection::open(db_path)
-        .await
-        .with_context(|| format!("heal connection open failed for {name}"))?;
-    let mut attempts_left = HEAL_CHECKPOINT_RETRIES;
-    loop {
-        attempts_left -= 1;
-        let outcome = conn.run_checkpoint(mode).await;
-        match outcome {
-            Ok(o) if o.is_complete() => return Ok(()),
-            Ok(o) if attempts_left > 0 => {
-                // is_complete() is also false for a non-busy partial backfill
-                // (log > checkpointed); the frame counts make that visible.
-                warn!(
-                    db = %name,
-                    busy = o.busy,
-                    checkpointed = o.checkpointed_frames,
-                    log = o.log_frames,
-                    "heal checkpoint incomplete — retrying",
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Ok(o) => anyhow::bail!(
-                "heal checkpoint {} incomplete after {HEAL_CHECKPOINT_RETRIES} attempts \
-                 (busy={}, checkpointed={}/{})",
-                mode.label(),
-                o.busy,
-                o.checkpointed_frames,
-                o.log_frames,
-            ),
-            Err(e) if attempts_left > 0 => {
-                warn!(db = %name, error = %e, "heal checkpoint failed — retrying");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("heal checkpoint {} failed for {name}", mode.label())
-                });
-            }
-        }
-    }
-}
-
 /// Move a store's whole artifact family (`db`/`-wal`/`-shm`/`-tshm`) aside to
 /// a timestamped quarantine name. Best-effort: a rename failure is logged,
 /// never fatal. The quarantine copy is never deleted — it is the forensic
-/// record for the recreate decision. Returns false when any existing file
-/// could not be moved (a partial quarantine — the recreate path proceeds with
-/// the un-moved files in place; the migration path must abort instead).
+/// record for the verify-then-swap rebuild. Returns false when any existing file
+/// could not be moved (a partial quarantine — the migration path must abort with
+/// the un-moved files in place).
 #[must_use]
 pub(crate) fn quarantine_store_artifacts(db_path: &Path) -> bool {
     let sidecars = store_sidecars(db_path);
@@ -3129,8 +2991,8 @@ pub(crate) fn quarantine_store_artifacts(db_path: &Path) -> bool {
 ///
 /// Returns true when every existing source was moved aside — a partial
 /// quarantine means a subsequent clobbering rename would destroy part of the
-/// forensic record; the recreate path tolerates that (the un-moved files stay
-/// in place), the migration path does not.
+/// forensic record, so the migration path aborts instead (the un-moved files
+/// stay in place).
 #[must_use]
 fn quarantine_family(db_path: &Path, sources: &[(&Path, &str)]) -> bool {
     static QUARANTINE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3312,13 +3174,28 @@ pub(crate) mod test_support {
              CREATE INDEX {TICKETS_FTS_INDEX_NAME} ON tickets(title);"
         )
     }
+
+    /// Assert that no forensic quarantine family was left in a store directory —
+    /// a refused store must be left exactly as it was.
+    pub(crate) fn assert_not_quarantined(dir: &std::path::Path, what: &str) {
+        let quarantined: Vec<String> = std::fs::read_dir(dir)
+            .expect("read the store dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("quarantine-"))
+            .collect();
+        assert!(
+            quarantined.is_empty(),
+            "{what} must not be quarantined, found: {quarantined:?}"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
-    use test_support::{fts_corruption_ddl, insert_fts_ticket};
+    use test_support::{assert_not_quarantined, fts_corruption_ddl, insert_fts_ticket};
 
     #[test]
     fn experimental_features_are_consistent() {
@@ -3386,43 +3263,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn schema_mismatch_is_not_corruption() {
-        for msg in [
-            "no such column: ticket_id",
-            "no such table: jobs",
-            "no such index: idx_jobs_phase_ticket",
-            "table jobs has no column named ticket_id",
-            "duplicate column name: ticket_id",
-            "index idx_jobs_phase_ticket already exists",
-            "syntax error",
-            "parse error at line 1",
-        ] {
-            let e = anyhow::anyhow!("{msg}");
-            assert!(is_schema_mismatch(&e), "mismatch: {msg}");
-            assert!(
-                !is_corruption_class(&e),
-                "schema-mismatch must not quarantine: {msg}"
-            );
-            let wrapped = e.context("Failed to run schema DDL");
-            assert!(
-                !is_corruption_class(&wrapped),
-                "wrapped schema-mismatch must not quarantine: {msg}"
-            );
-        }
-        let page = anyhow::anyhow!("Invalid page type");
-        assert!(!is_schema_mismatch(&page));
-        assert!(
-            is_corruption_class(&page),
-            "page-level damage stays corruption-class"
-        );
-    }
-
-    /// An existing, readable store whose open-time DDL indexes a column the
-    /// live table does not have must fail boot — never quarantine. This is
-    /// the job-per-phase incident in miniature.
+    /// An existing store built with raw DDL only (no `schema_migrations`
+    /// ledger) was never created by the product: opening it must refuse rather
+    /// than build a schema inside it, and the file must stay byte-for-byte as
+    /// it was.
     #[tokio::test]
-    async fn schema_mismatch_does_not_quarantine_existing_store() {
+    async fn existing_store_without_product_schema_is_refused() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let db_path = store_db_path(root, "board");
@@ -3435,33 +3281,27 @@ mod tests {
             .await
             .unwrap();
         }
-        crate::db::wal_guard::set_boot_diagnosis(
-            &db_path,
-            crate::db::wal_guard::BootDiagnosis::Healthy,
-        );
-        let err = open_store(
-            root,
-            "board",
-            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY);\
-             CREATE INDEX IF NOT EXISTS idx_t_missing ON t(missing_col);",
-        )
-        .await
-        .expect_err("schema mismatch must fail boot, not succeed");
+        let before = std::fs::read(&db_path).unwrap();
+
+        let err = open_store(root, "board", "")
+            .await
+            .expect_err("a store without the product schema must be refused");
+        let refusal = err
+            .downcast_ref::<StoreRefusal>()
+            .unwrap_or_else(|| panic!("expected a StoreRefusal, got: {err:#}"));
         assert!(
-            is_schema_mismatch(&err) || format!("{err:#}").to_lowercase().contains("no such"),
-            "expected a DDL-shape error, got: {err:#}"
+            refusal.reason.contains("product's own schema"),
+            "the reason must name the missing product schema: {}",
+            refusal.reason
         );
-        let quarantined = std::fs::read_dir(db_path.parent().unwrap())
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .any(|e| e.file_name().to_string_lossy().contains("quarantine-"));
-        assert!(
-            !quarantined,
-            "readable store must not be quarantined on schema mismatch"
+        assert_not_quarantined(
+            db_path.parent().unwrap(),
+            "a store without the product schema",
         );
-        assert!(
-            db_path.exists(),
-            "original main file must still be at the live path"
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            before,
+            "the main file must be unchanged byte-for-byte"
         );
     }
 
@@ -3842,42 +3682,98 @@ mod tests {
         assert!(!genuine_unique.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE));
     }
 
-    /// A Structural boot diagnosis makes `open_store` quarantine the artifact
-    /// family and recreate a fresh store (the unified recreate path).
+    /// An existing store data file that fails the file-level shape check refuses
+    /// the boot: the file (and any `-wal`) is left byte-for-byte as it was — no
+    /// quarantine, no recreate. An absent file is a genuine first launch and is
+    /// created.
     #[tokio::test]
-    async fn open_store_recreates_structural_store() {
+    async fn open_store_refuses_unusable_store_files() {
+        let mut bad_page = vec![0u8; 4096];
+        bad_page[..16].copy_from_slice(b"SQLite format 3\0");
+        let cases = [
+            ("0 bytes", Vec::new(), true),
+            ("64 bytes", vec![0u8; 64], false),
+            ("garbage (bad magic)", vec![0x42; 128], false),
+            ("valid magic, page size 0", bad_page, false),
+        ];
+        for (name, bytes, with_wal) in cases {
+            let tmp = tempfile::TempDir::new().expect("temp dir for test");
+            let root = tmp.path();
+            let db_path = store_db_path(root, "board");
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            std::fs::write(&db_path, &bytes).unwrap();
+            let wal_bytes = [0x7au8; 512];
+            if with_wal {
+                std::fs::write(store_sidecars(&db_path).wal, wal_bytes).unwrap();
+            }
+
+            let err = open_store(root, "board", "")
+                .await
+                .expect_err("an unusable store file must refuse the boot");
+            assert!(
+                err.downcast_ref::<StoreRefusal>().is_some(),
+                "{name}: expected a StoreRefusal, got: {err:#}"
+            );
+            assert_eq!(
+                std::fs::read(&db_path).unwrap(),
+                bytes,
+                "{name}: the main file must be unchanged"
+            );
+            if with_wal {
+                assert_eq!(
+                    std::fs::read(store_sidecars(&db_path).wal).unwrap(),
+                    wal_bytes,
+                    "{name}: the -wal must be unchanged"
+                );
+            }
+            assert_not_quarantined(db_path.parent().unwrap(), name);
+        }
+
+        // First launch: no data file — the store is created.
         let tmp = tempfile::TempDir::new().expect("temp dir for test");
         let root = tmp.path();
         let db_path = store_db_path(root, "board");
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        // Truncated main DB header → structural.
-        std::fs::write(&db_path, [0u8; 64]).unwrap();
-        std::fs::write(format!("{}-tshm", db_path.display()), [0u8; 32]).unwrap();
-        crate::db::wal_guard::set_boot_diagnosis(
-            &db_path,
-            crate::db::wal_guard::BootDiagnosis::Structural,
-        );
+        let _conn = open_store(root, "board", "CREATE TABLE IF NOT EXISTS t (id INTEGER);")
+            .await
+            .expect("an absent store file is a genuine first launch");
+        assert!(db_path.exists(), "first launch must create the store file");
+    }
 
-        let conn = open_store(root, "board", "CREATE TABLE IF NOT EXISTS t (id INTEGER);")
+    /// A plausible-shaped real store with content damage must refuse, never be
+    /// quarantined or recreated: `open_consolidated_store` errors with a
+    /// `StoreRefusal` and leaves the main file byte-for-byte as it was.
+    #[tokio::test]
+    async fn existing_corrupt_store_is_refused_not_recreated() {
+        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let root = tmp.path();
+        {
+            let conn = open_consolidated_store(root)
+                .await
+                .expect("build a real product store");
+            conn.checkpoint()
+                .await
+                .expect("checkpoint the fixture store");
+        }
+        let db_path = store_db_path(root, CONSOLIDATED_DB_NAME);
+        let bytes = std::fs::read(&db_path).unwrap();
+        assert!(bytes.len() > 8192, "fixture needs a multi-page core.db");
+        let mut corrupted = bytes.clone();
+        corrupted[4096..8192].fill(0); // zero the page-2 b-tree page
+        std::fs::write(&db_path, &corrupted).unwrap();
+
+        let err = open_consolidated_store(root)
             .await
-            .expect("structural store must be recreated, not fail boot");
-        let rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='t'",
-                (),
-                |r| r.get::<i64>(0),
-            )
-            .await
-            .expect("schema applied on the recreated store");
-        assert_eq!(rows, 1, "recreated store must carry the schema");
-        let quarantined = std::fs::read_dir(db_path.parent().unwrap())
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .any(|e| e.file_name().to_string_lossy().contains("quarantine-"));
+            .expect_err("a content-damaged store must be refused");
         assert!(
-            quarantined,
-            "artifact family must be quarantined (forensic copy)"
+            err.downcast_ref::<StoreRefusal>().is_some(),
+            "expected a StoreRefusal, got: {err:#}"
         );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            corrupted,
+            "the refused store's main file must be unchanged"
+        );
+        assert_not_quarantined(db_path.parent().unwrap(), "a refused store");
     }
 
     /// The quick_check desync parser names exactly the non-FTS btree index,
@@ -3912,7 +3808,7 @@ mod tests {
     /// matcher covers turso's real message shape ("Page N referenced multiple
     /// times (references=[...], page_category=...)") and the baked short-read
     /// (page 0x0A000000) — both route to the data-preserving rebuild, while a
-    /// genuine short read on a real page stays unreadable (recreate).
+    /// genuine short read on a real page stays unreadable (refused).
     #[test]
     fn overflow_aliasing_vetoes_reindex_across_rows() {
         assert!(matches!(
@@ -3940,7 +3836,7 @@ mod tests {
             RepairTarget::OverflowAliasing
         ));
         // The baked overflow-aliasing signature routes to the rebuild, not
-        // to the recreate-whole path.
+        // to a refusal.
         assert!(matches!(
             classify_repair_target(&["short read on page 167772160".to_string()]),
             RepairTarget::OverflowAliasing
@@ -4170,7 +4066,7 @@ mod tests {
         let shared = synthesize_overflow_aliasing(&db_path);
         assert!(shared > 0, "surgery must reference a real overflow page");
 
-        let conn = open_and_repair(&db_path, "board", schema)
+        let conn = open_and_repair_for_test(&db_path, "board", schema)
             .await
             .expect("overflow-aliasing repair must succeed on an FTS store");
         conn.quick_check()
@@ -4247,7 +4143,7 @@ mod tests {
         build_aliasing_candidate(&db_path, schema, Some(("v09999x", 99))).await;
         synthesize_overflow_aliasing(&db_path);
 
-        let conn = open_and_repair(&db_path, "board", schema)
+        let conn = open_and_repair_for_test(&db_path, "board", schema)
             .await
             .expect("aborted rebuild must still open the store (report-only)");
         let count: i64 = conn
@@ -4258,13 +4154,9 @@ mod tests {
             count, 5001,
             "original data must be preserved, not recreated"
         );
-        let quarantined = std::fs::read_dir(db_path.parent().unwrap())
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .any(|e| e.file_name().to_string_lossy().contains("quarantine-"));
-        assert!(
-            !quarantined,
-            "a constraint finding must not quarantine/recreate the store"
+        assert_not_quarantined(
+            db_path.parent().unwrap(),
+            "a constraint finding (the rebuild abort)",
         );
     }
 
@@ -4305,7 +4197,7 @@ mod tests {
             drop(conn);
         }
 
-        let conn = open_and_repair(&db_path, "board", schema)
+        let conn = open_and_repair_for_test(&db_path, "board", schema)
             .await
             .expect("overflow-aliasing repair must succeed on an AUTOINCREMENT store");
         conn.quick_check()
@@ -4390,11 +4282,11 @@ mod tests {
         )));
     }
 
-    /// The two actionable-signal families (lock contention, resource exhaustion)
-    /// must propagate instead of recreating a store, and neither may classify as
-    /// corruption — corruption itself stays a recreate candidate.
+    /// The two actionable-signal families (lock contention, resource
+    /// exhaustion) must propagate instead of being reported as a repair
+    /// finding.
     #[test]
-    fn lock_and_resource_signals_are_actionable_and_not_corruption() {
+    fn lock_and_resource_signals_are_actionable() {
         for msg in [
             "Locking error: File is locked by another process",
             "Runtime error: database table is locked",
@@ -4406,19 +4298,11 @@ mod tests {
                 is_actionable_signal(&err),
                 "an external condition must propagate, not recreate: {msg}"
             );
-            assert!(
-                !is_corruption_class(&err),
-                "an external condition must never classify as corruption: {msg}"
-            );
         }
         let corrupt = anyhow::Error::new(turso::Error::Error("Invalid page type".to_string()));
         assert!(
-            is_corruption_class(&corrupt),
-            "a page-level read error is corruption"
-        );
-        assert!(
             !is_actionable_signal(&corrupt),
-            "corruption must stay a recreate candidate"
+            "corruption must not classify as an actionable signal"
         );
     }
 

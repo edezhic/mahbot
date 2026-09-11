@@ -13,8 +13,14 @@
 //!
 //! [`tests::a_store_held_by_another_process_refuses_the_boot`] covers the other
 //! half: while a foreign process holds a store's lock, the daemon's bring-up must
-//! refuse — recorded on the boot-diagnostic channel — rather than heal,
-//! quarantine or recreate what it cannot open.
+//! refuse — recorded on the boot-diagnostic channel — rather than open what it
+//! cannot lock.
+//!
+//! [`tests::an_unusable_store_file_refuses_the_boot`] and
+//! [`tests::both_unusable_stores_are_named_in_the_durable_record`] cover the
+//! sibling rule: a store file that exists but is not usable refuses the boot
+//! before either store is opened, leaving both stores untouched and recording a
+//! refusal that names every unusable store.
 //!
 //! Verified on macOS, runnable on Linux — the two platforms the project is tested
 //! on (the module is Unix-only, so elsewhere the property is left unverified
@@ -322,8 +328,8 @@ mod tests {
 
     /// The other half of the guarantee, end to end and across two processes:
     /// while another process holds the engine's own lock on a store's main file,
-    /// the daemon's bring-up must refuse — must not heal, quarantine or recreate
-    /// what it cannot open, and must record the refusal on the boot-diagnostic
+    /// the daemon's bring-up must refuse — must not quarantine or replace what it
+    /// cannot open, and must record the refusal on the boot-diagnostic
     /// channel. The holder takes the lock the way the service does: an fcntl
     /// `F_WRLCK` over the whole main file, held for as long as the process holds
     /// the descriptor.
@@ -363,7 +369,88 @@ mod tests {
         assert_eq!(
             before,
             core_family(&store_dir).expect("fingerprint the core store"),
-            "a store that cannot be opened must not be healed, quarantined or recreated",
+            "a store that cannot be opened must be left exactly as it is",
+        );
+    }
+
+    /// A store file that exists but is not usable refuses the boot, and does so
+    /// before either store is opened: the logs store is never created, the
+    /// unusable file is left byte-for-byte and timestamp-for-timestamp as it
+    /// was, and the refusal lands in the storage root's durable record.
+    #[test]
+    fn an_unusable_store_file_refuses_the_boot() {
+        let _env = crate::util::test::env_lock().lock().unwrap_poison();
+        let home = tempfile::TempDir::new().expect("hermetic home");
+        let root = home.path().join(".mahbot");
+        let store_dir = root.join("db");
+        std::fs::create_dir_all(&store_dir).expect("create the store dir");
+        // A present but empty data file: not a recoverable state, and the boot
+        // must refuse rather than back the journal into it or build a schema.
+        std::fs::write(store_dir.join("core.db"), []).expect("write the empty store");
+        let before = core_family(&store_dir).expect("fingerprint the core store");
+
+        let refused = boot_stores(&home);
+        let text = child_text(&refused);
+        assert!(
+            !refused.status.success(),
+            "an unusable store file must refuse the boot:\n{text}"
+        );
+        assert!(
+            text.contains("refusing to start: store 'core' is not usable"),
+            "the refusal must name the store and the reason:\n{text}"
+        );
+        assert!(
+            !store_dir.join("logs.db").exists(),
+            "the gate must run before the logs store is opened — nothing may be created",
+        );
+        assert_eq!(
+            before,
+            core_family(&store_dir).expect("fingerprint the core store"),
+            "the refused store must be left completely untouched",
+        );
+        let record = std::fs::read_to_string(root.join("error.log")).expect("error.log");
+        assert!(
+            record.contains("MahBot start-up refusal")
+                && record.contains("store: core")
+                && record.contains("the data file is empty"),
+            "the refusal must be recorded durably:\n{record}"
+        );
+    }
+
+    /// Both physical stores unusable: the refusal names every one of them, in the
+    /// diagnostic output and in the durable record, and neither is touched.
+    #[test]
+    fn both_unusable_stores_are_named_in_the_durable_record() {
+        let _env = crate::util::test::env_lock().lock().unwrap_poison();
+        let home = tempfile::TempDir::new().expect("hermetic home");
+        let root = home.path().join(".mahbot");
+        let store_dir = root.join("db");
+        std::fs::create_dir_all(&store_dir).expect("create the store dir");
+        std::fs::write(store_dir.join("core.db"), []).expect("write the empty core store");
+        std::fs::write(store_dir.join("logs.db"), [0x42; 128]).expect("write the bad logs store");
+        let before = dir_fingerprint(&store_dir).expect("fingerprint the store dir");
+
+        let refused = boot_stores(&home);
+        let text = child_text(&refused);
+        assert!(
+            !refused.status.success(),
+            "unusable stores must refuse the boot:\n{text}"
+        );
+        for store in ["core", "logs"] {
+            assert!(
+                text.contains(&format!("refusing to start: store '{store}' is not usable")),
+                "the refusal must name the {store} store:\n{text}"
+            );
+        }
+        let record = std::fs::read_to_string(root.join("error.log")).expect("error.log");
+        assert!(
+            record.contains("store: core") && record.contains("store: logs"),
+            "the durable record must name both damaged stores:\n{record}"
+        );
+        assert_eq!(
+            before,
+            dir_fingerprint(&store_dir).expect("fingerprint the store dir"),
+            "both refused stores must be left completely untouched",
         );
     }
 

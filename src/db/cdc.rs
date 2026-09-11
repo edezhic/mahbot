@@ -380,10 +380,9 @@ pub(crate) async fn enable_capture(conn: &Connection) -> anyhow::Result<()> {
 /// Spawn the background drain loop (once per process), pumping [`drain_once`]
 /// at a fixed cadence (`DRAIN_POLL`).
 ///
-/// The connection is the post-heal boot connection (the one every domain store
-/// shares via the `DOMAIN_CONN` cell); heals only occur during the boot open,
-/// before this runs, and the shared connection is process-stable after that —
-/// so no runtime re-pointing is needed.
+/// The connection is the boot connection (the one every domain store shares via
+/// the `DOMAIN_CONN` cell), established during the boot open before this runs
+/// and process-stable after that — so no runtime re-pointing is needed.
 pub(crate) fn spawn_drainer(conn: Connection) {
     static STARTED: OnceLock<()> = OnceLock::new();
     if STARTED.get().is_some() {

@@ -31,8 +31,9 @@
 //! [`crate::db::repair_ticket_title_fts_on_failed_checkpoint`]) and the
 //! checkpoint retried; only an actual FTS rebuild decides the retry. On a
 //! persistent failure the failure report is appended to `<root>/error.log`
-//! (best-effort) and the graceful drain begins — the exit-time path never
-//! recovers or drains, since the process is already exiting.
+//! (best-effort; the shared writer lives in [`crate::db::failure_record`]) and
+//! the graceful drain begins — the exit-time path never recovers or drains,
+//! since the process is already exiting.
 
 use futures_util::future::{FutureExt, join_all};
 use std::future::Future;
@@ -52,7 +53,7 @@ const WAL_CHECKPOINT_CAP_BYTES: u64 = 32 * 1024 * 1024;
 /// Default minimum free disk space (bytes) below which TRUNCATE checkpoints
 /// are skipped (only PASSIVE runs). Overridable via
 /// `MAHBOT_CHECKPOINT_MIN_FREE_BYTES`; `0` disables the gate. ENOSPC is never
-/// corruption — it is an actionable signal, not a quarantine/recreate trigger.
+/// corruption — it is an actionable signal, not evidence about the store.
 const DEFAULT_CHECKPOINT_MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Parse the TRUNCATE-min-free-space threshold from the environment.
@@ -282,8 +283,8 @@ async fn checkpoint_stores(round: CheckpointRound) {
                 }
             }
             // Integrity verification is independent of the checkpoint.
-            // Log-only: runtime-detected btree/index desync is healed at
-            // the next store init (boot), not in place mid-run. (The known
+            // Log-only: runtime-detected btree/index desync is handled by the
+            // next boot's store open, not in place mid-run. (The known
             // FTS count-mismatch false positive is already filtered by the
             // quick_check row scan.)
             if verify {
@@ -366,7 +367,7 @@ async fn recover_failed_checkpoint_inner(
     )
     .await;
     match root {
-        Some(root) => match write_checkpoint_error_log(root, &report) {
+        Some(root) => match crate::db::failure_record::append_failure_record(root, &report) {
             Ok(path) => {
                 error!(
                     db = %name,
@@ -462,23 +463,6 @@ async fn build_failure_report(
         );
     }
     body
-}
-
-/// Append the failure report block to `<root>/error.log`, creating it if
-/// absent. Returns the log path. Pure std::fs — no async, never panics on the
-/// caller's behalf. The report + terminator go out as a single `write_all`
-/// (one O_APPEND write in practice); even if the libc layer splits a large
-/// buffer, each chunk is offset-atomic, so the worst case under concurrent
-/// store failures is interleaved chunks, never torn bytes.
-fn write_checkpoint_error_log(root: &Path, report: &str) -> std::io::Result<std::path::PathBuf> {
-    use std::io::Write;
-    let path = root.join("error.log");
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    file.write_all(format!("{report}\n").as_bytes())?;
-    Ok(path)
 }
 
 #[cfg(test)]

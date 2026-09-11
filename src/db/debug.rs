@@ -34,14 +34,14 @@
 //!
 //! ## Other verbs
 //!
-//! - `mahbot debug detect [--db <name>]` — classify store file sets without
-//!   opening any database via `wal_guard::inspect_store_at`, reporting
-//!   `healthy`/`durable-b`/`structural` plus the on-disk `-wal` size and a
-//!   stale `.tshm` flag. Exits 1 when any store is structurally corrupt.
-//! - `mahbot debug families [--db <name>]` — list every quarantine and
-//!   pre-reindex family in the store directory with its original store,
-//!   artifact type, timestamp, total size, and a file-set/header
-//!   classification. No database is opened.
+//! - `mahbot debug detect [--db <name>]` — classify store file sets with a
+//!   stat plus an 18-byte header read (no engine open) via
+//!   `wal_guard::inspect_store_at`, reporting
+//!   `absent`/`present`/`unusable:<defect>` plus the on-disk `-wal` size and a
+//!   stale `.tshm` flag. Exits 1 when any store is not usable.
+//! - `mahbot debug families [--db <name>]` — list every forensic family in the
+//!   store directory with its original store, artifact type, timestamp, total
+//!   size, and a file-set/header classification. No engine is opened.
 //! - `mahbot debug --family <id> "SQL query"` — query one forensic family
 //!   (a static snapshot) with the same read-only guarantees as live stores.
 //!   Families have no live-store layers; the engine opens single-process
@@ -174,11 +174,11 @@ pub(crate) fn validate_store_name(name: &str, all_valid: bool) -> Result<()> {
     bail!("invalid database name '{name}'. Valid names: {hint}");
 }
 
-/// `mahbot debug detect [--db <name>]` — classify every store's file set
-/// without opening any database. Prints one line per physical store
-/// (`name\tclass\twal_size=N\tstale_tshm=B`). Exit 0 when all stores are
-/// healthy; exit 1 (via `Err`) when a store is structurally corrupt (a bad
-/// main-DB header — the only class the single-process classifier fails on).
+/// `mahbot debug detect [--db <name>]` — classify every store's file set with a
+/// stat plus an 18-byte header read (no engine open). Prints one line per
+/// physical store (`name\tclass\twal_size=N\tstale_tshm=B`). Exit 0 when every
+/// store is usable; exit 1 (via `Err`) when a store is not usable (its data file
+/// fails the file-level shape check — the boot refusal condition).
 fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<()> {
     let mahbot_home = resolve_home(home_override)?;
     let selected = match parse_db_flag(args, "detect")? {
@@ -208,12 +208,12 @@ fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<(
             status.wal_size,
             status.has_stale_tshm,
         ))?;
-        if status.class == wal_guard::BootDiagnosis::Structural {
+        if matches!(status.class, wal_guard::StoreShape::Unusable(_)) {
             failures += 1;
         }
     }
     if failures > 0 {
-        bail!("{failures} store(s) structurally corrupt — see above");
+        bail!("{failures} store(s) are not usable — see above");
     }
     Ok(())
 }
@@ -223,7 +223,9 @@ fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<(
 /// Artifact type of a forensic family. Variant order is the listing sort order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum FamilyKind {
-    /// Renamed-aside artifact family (the boot corruption record; never deleted).
+    /// Renamed-aside artifact family: the original family the verify-then-swap
+    /// rebuild moved aside before putting the rebuilt store in place (never
+    /// deleted).
     Quarantine,
     /// Pre-repair copy taken before an in-place REINDEX.
     PreReindex,
@@ -301,10 +303,10 @@ pub(crate) struct FamilyMeta {
 /// (16 chars, digits around `T`/`Z`), not calendar-validated; a store name of
 /// `.` or `..` parses (flat filename — no traversal possible).
 ///
-/// The formats are written by `turso.rs::quarantine_family` (quarantine) and
-/// the pre-reindex snapshot in `turso.rs` (REINDEX repair) — keep both sides
-/// of the naming contract in sync; the writer round-trip test locks the
-/// coupling.
+/// The formats are written by `db::quarantine_family` (quarantine) and the
+/// pre-reindex snapshot in `db::snapshot_store_via_engine` (REINDEX repair) —
+/// keep both sides of the naming contract in sync; the writer round-trip test
+/// locks the coupling.
 pub(crate) fn parse_family_name(name: &str) -> Option<FamilyMeta> {
     let (kind, marker) = if name.contains(".quarantine-") {
         (FamilyKind::Quarantine, ".quarantine-")
@@ -472,8 +474,8 @@ fn db_header_ok(db_path: &Path) -> bool {
 }
 
 /// `mahbot debug families [--db <name>]` — list all forensic families
-/// (quarantine + pre-reindex) without opening any database. Informational:
-/// exits 0 whether or not families exist.
+/// (quarantine + pre-reindex) with a stat plus a header read per family, never
+/// an engine open. Informational: exits 0 whether or not families exist.
 fn run_debug_families(args: &[String], home_override: Option<PathBuf>) -> Result<()> {
     let mahbot_home = resolve_home(home_override)?;
     let mut families = list_families(&mahbot_home)?;
@@ -1511,7 +1513,7 @@ fn print_usage() {
     eprintln!("              database in per-store sections (per-store errors; exit 1 if");
     eprintln!("              any store failed)");
     eprintln!("  SQL query   read-only SQL, quoted as a single argument");
-    eprintln!("  detect      classify single-process store health (structural/durable-b)");
+    eprintln!("  detect      classify store file-set shape (absent/present/unusable)");
     eprintln!("               without opening stores; reports stale .tshm leftovers");
     eprintln!("  families    list quarantine/pre-reindex forensic families (--db filters by");
     eprintln!("               store name; a name matching nothing prints an empty list)");
@@ -2254,19 +2256,19 @@ mod tests {
     }
 
     /// `debug detect` classifies synthetic file sets without opening the store
-    /// through turso: a valid main DB reports `healthy` (succeeds), a garbage
-    /// (structurally corrupt) main DB reports `structural` and fails.
+    /// through the engine: a valid main DB reports `present` (succeeds), a
+    /// garbage (unusable) main DB fails.
     #[test]
-    fn debug_detect_reports_non_healthy_state() {
+    fn debug_detect_reports_unusable_store() {
         let dir = tempfile::TempDir::new().unwrap();
         let db_dir = dir.path().join("db");
         std::fs::create_dir_all(&db_dir).unwrap();
 
-        // A structurally corrupt main DB (garbage header) + a healthy one.
+        // An unusable main DB (garbage header) + a usable one.
         std::fs::write(db_dir.join("core.db"), vec![0x42; 128]).unwrap();
         std::fs::write(db_dir.join("logs.db"), valid_db_bytes()).unwrap();
 
-        // Healthy store (logs) — detect succeeds.
+        // Usable store (logs) — detect succeeds.
         let args = vec![
             "mahbot".to_string(),
             "debug".to_string(),
@@ -2276,7 +2278,7 @@ mod tests {
         ];
         assert!(run_debug_detect(&args, Some(dir.path().to_path_buf())).is_ok());
 
-        // Structurally corrupt store (board resolves to core.db) — detect fails.
+        // Unusable store (board resolves to core.db) — detect fails.
         let args = vec![
             "mahbot".to_string(),
             "debug".to_string(),
@@ -2285,9 +2287,9 @@ mod tests {
             "board".to_string(),
         ];
         let err = run_debug_detect(&args, Some(dir.path().to_path_buf()))
-            .expect_err("structurally corrupt store must fail detect");
+            .expect_err("an unusable store must fail detect");
         assert!(
-            format!("{err:#}").contains("structurally corrupt"),
+            format!("{err:#}").contains("store(s) are not usable"),
             "got: {err:#}"
         );
     }
