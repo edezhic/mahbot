@@ -34,14 +34,24 @@
 //! (best-effort; the shared writer lives in [`crate::db::failure_record`]) and
 //! the graceful drain begins — the exit-time path never recovers or drains,
 //! since the process is already exiting.
+//!
+//! Both rounds and the periodic integrity check record durably: an exit-round
+//! checkpoint failure (which cannot drain or recover) is its own block, and a
+//! failing periodic `quick_check` records a block once per store per process —
+//! every further failing round only warns with the running count, so a persistent
+//! condition cannot append a block every 5 minutes.
 
 use futures_util::future::{FutureExt, join_all};
+use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 use tracing::{debug, error, info, warn};
 
+use crate::db::failure_record::{self, FailureKind, FailureReport};
 use crate::db::{CheckpointOutcome, Connection, TicketTitleFtsRuntimeRepair};
+use crate::util::UnwrapPoison;
 
 /// Cap on a store's on-disk `-wal` size (bytes) for the periodic checkpoint
 /// mode. Below the cap the periodic loop runs non-truncating (PASSIVE)
@@ -171,9 +181,11 @@ where
 /// top of this file. The TRUNCATE is downgraded to PASSIVE when free disk
 /// space is below the ENOSPC gate (`truncate_allowed`).
 ///
-/// Skips stores that haven't been initialized yet; per-store errors are
-/// logged and swallowed to avoid blocking shutdown — a structurally-corrupt
-/// store's checkpoint is still attempted, with its failure logged.
+/// Stores that were never initialized (connection is `None`) are skipped; a
+/// panicking store operation is isolated to that store (see [`for_each_store`])
+/// so one store cannot abort the round; an exit-round checkpoint failure is
+/// filed in the durable record ([`record_store_failure`]) because the exit path
+/// can neither recover nor drain.
 ///
 /// The store entries come from [`crate::db::iter_checkpoint_stores`] — the
 /// single source of truth for which stores get checkpointed. Periodic
@@ -201,7 +213,8 @@ pub async fn periodic_checkpoint_and_verify() {
 /// (the process is already exiting).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointRound {
-    /// Exit-time round: TRUNCATE, warn-only on failure.
+    /// Exit-time round: TRUNCATE; a failure is recorded durably, never
+    /// recovered.
     Exit,
     /// Periodic hygiene round: PASSIVE-capped, verify, and recover on failure.
     Periodic,
@@ -275,22 +288,58 @@ async fn checkpoint_stores(round: CheckpointRound) {
                     warn!(error = %e, db = %name, "Failed to checkpoint database WAL");
                     // Periodic round only: attempt the runtime FTS repair and
                     // re-checkpoint; persistent failure drains (logs it). The
-                    // exit-time round just logs — the process is already going
-                    // away and must not trigger recovery/shutdown.
+                    // exit-time round records the failure instead — the process
+                    // is already going away, so the durable record is the only
+                    // place it can surface and it must trigger no
+                    // recovery/shutdown.
                     if verify {
                         recover_failed_checkpoint(name, conn, &e, truncate, root.as_deref()).await;
+                    } else {
+                        record_store_failure(
+                            FailureKind::ExitCheckpointFailure,
+                            "exit checkpoint failure",
+                            name,
+                            &e,
+                            root.as_deref(),
+                        );
                     }
                 }
             }
-            // Integrity verification is independent of the checkpoint.
-            // Log-only: runtime-detected btree/index desync is handled by the
-            // next boot's store open, not in place mid-run. (The known
-            // FTS count-mismatch false positive is already filtered by the
-            // quick_check row scan.)
+            // Integrity verification is independent of the checkpoint. No
+            // in-place action: runtime-detected btree/index desync is handled by
+            // the next boot's store open, not mid-run, and the known FTS
+            // count-mismatch false positive is already filtered by the
+            // quick_check row scan. The failing rounds are recorded durably
+            // (see [`record_integrity_failure`]).
             if verify {
-                match conn.quick_check().await {
-                    Ok(()) => debug!(db = %name, "Database integrity check passed"),
-                    Err(e) => error!(error = %e, db = %name, "Database integrity check failed"),
+                // The filtered problem list, not `quick_check()`: a condition
+                // the boot path deliberately leaves report-only (an
+                // unrecognised signature) is tolerated here too, and only a
+                // check that cannot run or names actionable damage is recorded.
+                match conn.quick_check_problems().await {
+                    Ok(problems) if problems.is_empty() => {
+                        debug!(db = %name, "Database integrity check passed");
+                    }
+                    Ok(problems) if crate::db::is_tolerated_integrity_report(&problems) => {
+                        // A tolerated finding is deliberately neither filed in
+                        // the durable record nor a stop — but it must not be
+                        // silent either. `warn`, chosen deliberately: the
+                        // signature may well be a corruption report the boot
+                        // path has not learned yet, so it stays visible at a
+                        // level operators watch, below the `error` of a filed
+                        // failure.
+                        warn!(
+                            db = %name,
+                            problems = %problems.join("; "),
+                            "Database integrity check reported only tolerated findings — not recorded, not fatal",
+                        );
+                    }
+                    Ok(problems) => record_integrity_failure(
+                        name,
+                        &anyhow::anyhow!("{}", problems.join("; ")),
+                        root.as_deref(),
+                    ),
+                    Err(e) => record_integrity_failure(name, &e, root.as_deref()),
                 }
             }
         }
@@ -305,7 +354,7 @@ async fn checkpoint_stores(round: CheckpointRound) {
 /// [`recover_failed_checkpoint_inner`] (the test-injectable seam) and is not
 /// surfaced here — the production call site already discards it.
 async fn recover_failed_checkpoint(
-    name: &str,
+    name: &'static str,
     conn: &Connection,
     error: &anyhow::Error,
     truncate: bool,
@@ -315,12 +364,106 @@ async fn recover_failed_checkpoint(
     recover_failed_checkpoint_inner(name, conn, error, root, retry).await;
 }
 
+/// The artifact state cannot be probed when the storage root is unresolvable;
+/// the record says so instead of dropping the line.
+const ARTIFACT_STATE_UNAVAILABLE: &str =
+    "artifact state: not obtainable on this path (the storage root is unresolvable)";
+
+/// The common body of a per-store runtime failure report: the store, its db
+/// path, the reason, the environment note, and the artifact state — shared by
+/// every per-store failure kind so their blocks cannot drift apart.
+fn store_failure_report(
+    kind: FailureKind,
+    name: &'static str,
+    e: &anyhow::Error,
+    root: Option<&Path>,
+) -> FailureReport {
+    let report = FailureReport::new(kind)
+        .store(name)
+        .reason(format!("{e:#}"))
+        .environment(crate::db::is_actionable_signal(e));
+    with_store_file_facts(report, name, root)
+}
+
+/// Add the store's db path and its stat-only artifact state — the `-wal` size
+/// and stale-`.tshm` debris from [`crate::db::wal_guard::store_file_facts`],
+/// never a header read: wal_guard's lock rule puts one out of reach in a
+/// process that already holds the store. The storage root is unresolvable on
+/// some paths; the record says so instead of dropping the line.
+fn with_store_file_facts(
+    report: FailureReport,
+    name: &'static str,
+    root: Option<&Path>,
+) -> FailureReport {
+    match root {
+        Some(root) => {
+            let db_path = crate::db::store_db_path(root, name);
+            let facts = crate::db::wal_guard::store_file_facts(&db_path);
+            report.db_path(db_path).extra(format!(
+                "artifact state: wal_size={} has_stale_tshm={}",
+                facts.wal_size, facts.has_stale_tshm
+            ))
+        }
+        None => report.extra(ARTIFACT_STATE_UNAVAILABLE),
+    }
+}
+
+/// File one per-store runtime failure block and point the operator at the file
+/// it landed in, on the log channel (the boot path prints the same pointer on
+/// its own diagnostics channel before tracing is up).
+fn record_store_failure(
+    kind: FailureKind,
+    what: &str,
+    name: &'static str,
+    e: &anyhow::Error,
+    root: Option<&Path>,
+) {
+    let filed = failure_record::record(root, &store_failure_report(kind, name, e, root).render());
+    if let Some(pointer) = failure_record::recorded_pointer(what, filed) {
+        info!("{pointer}");
+    }
+}
+
+/// Per-store count of periodic rounds whose integrity check has failed, for the
+/// process's lifetime (see [`record_integrity_failure`]).
+static INTEGRITY_FAILURE_ROUNDS: LazyLock<Mutex<HashMap<&'static str, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Record a failed periodic integrity check: the first failing round of a store
+/// files a [`FailureKind::RuntimeIntegrityFailure`] block, every further round
+/// only warns. No drain and no behaviour change otherwise.
+fn record_integrity_failure(name: &'static str, e: &anyhow::Error, root: Option<&Path>) {
+    let further_rounds = {
+        let mut rounds = INTEGRITY_FAILURE_ROUNDS.lock().unwrap_poison();
+        let count = rounds.entry(name).or_insert(0);
+        *count += 1;
+        *count - 1
+    };
+    if further_rounds > 0 {
+        warn!(
+            error = %e,
+            db = %name,
+            further_rounds,
+            "Database integrity check failed again — already recorded on its first failure",
+        );
+        return;
+    }
+    error!(error = %e, db = %name, "Database integrity check failed");
+    record_store_failure(
+        FailureKind::RuntimeIntegrityFailure,
+        "runtime integrity failure",
+        name,
+        e,
+        root,
+    );
+}
+
 /// Test-injectable core of [`recover_failed_checkpoint`]: `retry` is the
 /// post-repair checkpoint attempt; `root` is the storage root the failure
 /// report is written under (None when unresolvable). The returned bool is the
 /// continue-serving decision, consumed by tests.
 async fn recover_failed_checkpoint_inner(
-    name: &str,
+    name: &'static str,
     conn: &Connection,
     error: &anyhow::Error,
     root: Option<&Path>,
@@ -354,9 +497,11 @@ async fn recover_failed_checkpoint_inner(
         );
         return true;
     }
-    // Persistent failure: append the full report to <root>/error.log, then
-    // begin the graceful drain (shutdown::drain_begin; the drain cap bounds
-    // stragglers). The write is synchronous and happens BEFORE the drain.
+    // Persistent failure: file the full report in <root>/error.log, then begin
+    // the graceful drain (shutdown::drain_begin; the drain cap bounds
+    // stragglers). The write is synchronous and happens BEFORE the drain;
+    // `record` puts the block on stderr when the root is unresolvable or the
+    // write itself fails.
     let report = build_failure_report(
         name,
         error,
@@ -366,28 +511,17 @@ async fn recover_failed_checkpoint_inner(
         root,
     )
     .await;
-    match root {
-        Some(root) => match crate::db::failure_record::append_failure_record(root, &report) {
-            Ok(path) => {
-                error!(
-                    db = %name,
-                    log = %path.display(),
-                    "Checkpoint failure persists after repair — error.log written, initiating graceful shutdown"
-                );
-            }
-            Err(_) => {
-                error!(
-                    db = %name,
-                    "Checkpoint failure persists after repair — error.log write FAILED, initiating graceful shutdown"
-                );
-            }
-        },
-        None => {
-            error!(
-                db = %name,
-                "storage root unresolvable — error.log not written, initiating graceful shutdown"
-            );
-        }
+    if let Some(path) = failure_record::record(root, &report) {
+        error!(
+            db = %name,
+            record = %path.display(),
+            "Checkpoint failure persists after repair — recorded, initiating graceful shutdown"
+        );
+    } else {
+        error!(
+            db = %name,
+            "Checkpoint failure persists after repair — the durable record could not be written (block on stderr), initiating graceful shutdown"
+        );
     }
     crate::shutdown::drain_begin();
     false
@@ -405,64 +539,39 @@ async fn recover_failed_checkpoint_inner(
 /// lock rule puts out of reach, and the `quick_check` section carries the
 /// integrity detail instead.
 async fn build_failure_report(
-    name: &str,
+    name: &'static str,
     error: &anyhow::Error,
     repair: &TicketTitleFtsRuntimeRepair,
     retry_error: Option<&anyhow::Error>,
     conn: &Connection,
     root: Option<&Path>,
 ) -> String {
-    use std::fmt::Write;
-    let mut body = String::new();
-    let _ = writeln!(
-        body,
-        "MahBot checkpoint failure — {}",
-        chrono::Utc::now().to_rfc3339()
-    );
-    let _ = writeln!(body, "store: {name}");
-    match root {
-        Some(r) => {
-            let _ = writeln!(
-                body,
-                "db path: {}",
-                crate::db::store_db_path(r, name).display()
-            );
-        }
-        None => {
-            let _ = writeln!(body, "db path: unresolvable (storage root unavailable)");
-        }
-    }
-    let _ = writeln!(body, "checkpoint error: {error:#}");
+    // The checkpoint error is the report's reason, rendered as its own
+    // long-standing `checkpoint error:` line rather than a `reason:` line.
+    let mut report = FailureReport::new(FailureKind::CheckpointFailure)
+        .store(name)
+        .environment(
+            crate::db::is_actionable_signal(error)
+                || retry_error.is_some_and(crate::db::is_actionable_signal),
+        )
+        .extra(format!("checkpoint error: {error:#}"));
     if let Some(re) = retry_error {
-        let _ = writeln!(body, "retry error: {re:#}");
+        report = report.extra(format!("retry error: {re:#}"));
     }
-    let _ = writeln!(body, "repair outcome: {}", repair.summary());
-    match AssertUnwindSafe(conn.quick_check_problems())
-        .catch_unwind()
-        .await
-    {
-        Ok(Ok(problems)) if problems.is_empty() => {
-            let _ = writeln!(body, "quick_check: ok");
-        }
-        Ok(Ok(problems)) => {
-            let _ = writeln!(body, "quick_check problems: {}", problems.join("; "));
-        }
-        Ok(Err(e)) => {
-            let _ = writeln!(body, "quick_check error: {e:#}");
-        }
-        Err(_) => {
-            let _ = writeln!(body, "quick_check: probe panicked");
-        }
-    }
-    if let Some(r) = root {
-        let facts = crate::db::wal_guard::store_file_facts(&crate::db::store_db_path(r, name));
-        let _ = writeln!(
-            body,
-            "artifact state: wal_size={} has_stale_tshm={}",
-            facts.wal_size, facts.has_stale_tshm
-        );
-    }
-    body
+    report = report.extra(format!("repair outcome: {}", repair.summary()));
+    report = report.extra(
+        match AssertUnwindSafe(conn.quick_check_problems())
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(problems)) if problems.is_empty() => "quick_check: ok".to_string(),
+            Ok(Ok(problems)) => format!("quick_check problems: {}", problems.join("; ")),
+            Ok(Err(e)) => format!("quick_check error: {e:#}"),
+            Err(_) => "quick_check: probe panicked".to_string(),
+        },
+    );
+    report = with_store_file_facts(report, name, root);
+    report.render()
 }
 
 #[cfg(test)]
@@ -476,6 +585,93 @@ mod tests {
     async fn noop_when_no_stores() {
         checkpoint_all_databases().await;
         periodic_checkpoint_and_verify().await;
+    }
+
+    /// An exit-round checkpoint failure is recorded durably — the exit path can
+    /// neither recover nor drain, so that block is the only place it can
+    /// surface — with the stat-only artifact state and the environment note when
+    /// the cause is an external condition.
+    #[test]
+    fn exit_checkpoint_failure_is_recorded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        record_store_failure(
+            FailureKind::ExitCheckpointFailure,
+            "exit checkpoint failure",
+            "core",
+            &anyhow::anyhow!("no space left on device"),
+            Some(tmp.path()),
+        );
+        let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
+        for needle in [
+            "MahBot exit checkpoint failure",
+            "store: core",
+            "db path:",
+            failure_record::ENVIRONMENT_CAUSE,
+            "reason: no space left on device",
+            "artifact state: wal_size=0 has_stale_tshm=false",
+        ] {
+            assert!(
+                body.contains(needle),
+                "error.log must contain {needle:?}: {body}"
+            );
+        }
+    }
+
+    /// A failing periodic integrity check is recorded once per store per process;
+    /// later rounds only warn.
+    #[test]
+    fn integrity_failure_is_recorded_once_then_counted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A store name no other test uses — the round count is process-global.
+        let name = "integrity_probe";
+        for _ in 0..3 {
+            record_integrity_failure(
+                name,
+                &anyhow::anyhow!("the integrity check cannot run"),
+                Some(tmp.path()),
+            );
+        }
+        let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
+        assert_eq!(
+            body.matches("MahBot runtime integrity failure").count(),
+            1,
+            "only the first failing round may file a block: {body}"
+        );
+        for needle in [
+            "store: integrity_probe",
+            "db path:",
+            "reason: the integrity check cannot run",
+        ] {
+            assert!(
+                body.contains(needle),
+                "error.log must contain {needle:?}: {body}"
+            );
+        }
+    }
+
+    /// Every field of a per-store runtime failure report is rendered, including
+    /// the ones that cannot be obtained on the path.
+    #[test]
+    fn store_failure_report_renders_unobtainable_fields() {
+        let report = store_failure_report(
+            FailureKind::ExitCheckpointFailure,
+            "core",
+            &anyhow::anyhow!("disk gone"),
+            None,
+        )
+        .render();
+        for needle in [
+            "MahBot exit checkpoint failure",
+            "store: core",
+            crate::db::failure_record::UNKNOWN_DB_PATH,
+            "reason: disk gone",
+            ARTIFACT_STATE_UNAVAILABLE,
+        ] {
+            assert!(
+                report.contains(needle),
+                "the report must contain {needle:?}: {report}"
+            );
+        }
     }
 
     /// A checkpoint failure on a store whose title FTS index was corrupted is
@@ -592,7 +788,8 @@ mod tests {
     }
 
     /// A store with no ticket-title FTS index (repair is NotApplicable) skips
-    /// the retry entirely yet still writes error.log and begins the drain.
+    /// the retry entirely yet still writes error.log and begins the drain; an
+    /// environment-caused checkpoint error is marked as such in the record.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn checkpoint_failure_without_fts_store_writes_error_log_and_drains() {
@@ -610,7 +807,7 @@ mod tests {
         let ok = recover_failed_checkpoint_inner(
             "core",
             &conn,
-            &anyhow::anyhow!("injected checkpoint failure"),
+            &anyhow::anyhow!("no space left on device"),
             Some(tmp.path()),
             retry,
         )
@@ -622,8 +819,12 @@ mod tests {
 
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
         assert!(
-            body.contains("injected checkpoint failure"),
-            "the checkpoint error must be in the report"
+            body.contains("checkpoint error: no space left on device"),
+            "the checkpoint error must be in the report: {body}"
+        );
+        assert!(
+            body.contains(failure_record::ENVIRONMENT_CAUSE),
+            "a resource-caused checkpoint failure must be marked environment-caused: {body}"
         );
         assert!(
             crate::shutdown::is_draining(),

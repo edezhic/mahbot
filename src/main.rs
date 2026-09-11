@@ -53,23 +53,31 @@ Options:
 const LOG_RETENTION_HOURS: i64 = 8;
 
 /// Run [`bootstrap_mahbot`] and convert panics into `Err` so the dashboard shows
-/// a boot error instead of hanging on "Starting…" forever.
+/// a boot error instead of hanging on "Starting…" forever. A panic is recorded
+/// as a start-up failure like any other; the `Ok(Err(_))` arm is not recorded
+/// again, since the failing step already recorded it.
 async fn bootstrap_mahbot_safe() -> Result<(), String> {
     match AssertUnwindSafe(bootstrap_mahbot()).catch_unwind().await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(format!("{e:#}")),
-        Err(payload) => Err(format_startup_panic(&*payload)),
+        Err(payload) => {
+            let message = mahbot::util::panic_message(&*payload);
+            // Recorded like any other start-up failure; the error it returns is
+            // what the start-failure screen shows.
+            let boot_error = mahbot::boot::record_startup_failure(
+                "bootstrap",
+                mahbot::boot::startup_panic_error(&message),
+            );
+            Err(format!("{boot_error:#}"))
+        }
     }
-}
-
-/// Format a startup panic payload into an error string for the boot log.
-fn format_startup_panic(payload: &(dyn std::any::Any + Send)) -> String {
-    format!("Startup panicked: {}", mahbot::util::panic_message(payload))
 }
 
 /// Async startup for `MahBot` — runs on Iced's Tokio runtime via a boot [`Task`].
 async fn bootstrap_mahbot() -> Result<()> {
-    mahbot::config::load_or_init().await?;
+    mahbot::config::load_or_init()
+        .await
+        .map_err(|e| mahbot::boot::record_startup_failure("config::load_or_init", e))?;
 
     // Bring the stores up in their one supported order — the pre-flight
     // classification, the logs store, the process-global inits and the
@@ -83,7 +91,9 @@ async fn bootstrap_mahbot() -> Result<()> {
 
     // Config DB must be loaded before providers, so that API keys
     // and model settings take effect.
-    mahbot::config::reload_from_db().await?;
+    mahbot::config::reload_from_db()
+        .await
+        .map_err(|e| mahbot::boot::record_startup_failure("config::reload_from_db", e))?;
 
     // Local Qwen3-ASR transcriber: start the load-or-download chain as a
     // background task. Config is authoritative here (honors a user-set
@@ -91,7 +101,8 @@ async fn bootstrap_mahbot() -> Result<()> {
     // init below, so the ~4s model load overlaps with the rest of boot. Never
     // awaited — the app and background services start regardless.
     mahbot::audio::local_transcriber::spawn_background_init_if_enabled();
-    mahbot::providers::init_global()?;
+    mahbot::providers::init_global()
+        .map_err(|e| mahbot::boot::record_startup_failure("providers::init_global", e))?;
 
     // Try to load TTS models from cache; if not available, spawn background download.
     // Only run when TTS is enabled in config to avoid unnecessary ~400 MB download.
@@ -106,7 +117,12 @@ async fn bootstrap_mahbot() -> Result<()> {
 
     BOOT_LOG_STORE
         .set(log_store.as_ref().clone())
-        .map_err(|_| anyhow::anyhow!("BOOT_LOG_STORE already set"))?;
+        .map_err(|_| {
+            mahbot::boot::record_startup_failure(
+                "BOOT_LOG_STORE::set",
+                anyhow::anyhow!("BOOT_LOG_STORE already set"),
+            )
+        })?;
 
     spawn_background_tasks(log_store.clone());
 
@@ -620,10 +636,12 @@ fn main() -> Result<()> {
     // temp use (config, logs, stores, shell children). The debug,
     // __grep-engine, bench-openrouter and chrome subcommands above must NOT
     // create the root (they exit before this point).
-    mahbot::temp::init_temp_root()?;
+    mahbot::temp::init_temp_root()
+        .map_err(|e| mahbot::boot::record_startup_failure("temp::init_temp_root", e))?;
 
     // Resolve storage root before config init, so we can acquire the lock.
-    let storage_root = mahbot::config::default_config_dir()?;
+    let storage_root = mahbot::config::default_config_dir()
+        .map_err(|e| mahbot::boot::record_startup_failure("config::default_config_dir", e))?;
 
     // Acquire the instance lock before Iced runtime starts.
     // Stored in a global so the update flow can release/re-acquire it.

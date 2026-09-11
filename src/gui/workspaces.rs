@@ -263,24 +263,37 @@ impl WorkspacesState {
                 self.diagnostics_busy = false;
                 self.diagnostics_error = None;
 
-                // Populate edit buffers from current diagnostics (or leave empty).
-                let fields = self
+                // Populate edit buffers from current diagnostics. An absent or
+                // empty blob is legitimately empty; a non-empty blob that
+                // fails to parse must surface instead of rendering as the
+                // "(skipped)" placeholders.
+                let raw = self
                     .workspaces
                     .iter()
                     .find(|w| w.name == name)
-                    .and_then(|w| w.diagnostics.as_deref())
-                    .and_then(|json| serde_json::from_str::<crate::DiagnosticsCommands>(json).ok())
-                    .map_or(
-                        std::array::from_fn(|_| SingleLineEditorState::new("")),
-                        |cmds| {
-                            std::array::from_fn(|i| {
-                                cmds.commands()[i].1.map_or_else(
-                                    || SingleLineEditorState::new(""),
-                                    SingleLineEditorState::new,
-                                )
-                            })
-                        },
-                    );
+                    .and_then(|w| w.diagnostics.clone());
+                let commands = match raw.as_deref().filter(|json| !json.trim().is_empty()) {
+                    Some(json) => match serde_json::from_str::<crate::DiagnosticsCommands>(json) {
+                        Ok(cmds) => Some(cmds),
+                        Err(e) => {
+                            self.diagnostics_error =
+                                Some(format!("failed to parse saved diagnostics: {e}"));
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let fields = commands.map_or(
+                    std::array::from_fn(|_| SingleLineEditorState::new("")),
+                    |cmds| {
+                        std::array::from_fn(|i| {
+                            cmds.commands()[i].1.map_or_else(
+                                || SingleLineEditorState::new(""),
+                                SingleLineEditorState::new,
+                            )
+                        })
+                    },
+                );
                 self.diagnostics_edit_buffers.insert(name, fields);
                 Task::none()
             }
@@ -472,6 +485,37 @@ impl WorkspacesState {
                 Task::none()
             }
             WorkspacesMessage::Toast(_) => Task::none(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_diagnostics(diagnostics: Option<String>) -> WorkspacesState {
+        let mut state = WorkspacesState::new();
+        state.workspaces.push(Workspace {
+            name: "ws".to_string(),
+            diagnostics,
+            ..Workspace::default()
+        });
+        state
+    }
+
+    #[test]
+    fn show_diagnostics_surfaces_unparsable_blob() {
+        let mut state = state_with_diagnostics(Some("{not json".to_string()));
+        let _ = state.update(WorkspacesMessage::ShowDiagnostics("ws".to_string()));
+        assert!(state.diagnostics_error.is_some());
+    }
+
+    #[test]
+    fn show_diagnostics_treats_absent_or_empty_blob_as_empty() {
+        for diagnostics in [None, Some(String::new()), Some("  ".to_string())] {
+            let mut state = state_with_diagnostics(diagnostics);
+            let _ = state.update(WorkspacesMessage::ShowDiagnostics("ws".to_string()));
+            assert!(state.diagnostics_error.is_none());
         }
     }
 }

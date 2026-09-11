@@ -1579,15 +1579,16 @@ impl SettingsState {
 
     // ── View ─────────────────────────────────────────────────────
 
-    pub fn view(
-        &self,
+    pub fn view<'a>(
+        &'a self,
         active_user: Option<&str>,
         active_is_admin: bool,
-    ) -> Element<'_, SettingsMessage> {
+        workspace_map_error: Option<&'a str>,
+    ) -> Element<'a, SettingsMessage> {
         // Workspace management section (right column). The workspace list &
         // add form are gated on the active user's admin status (shared
         // membership is admin-only).
-        let ws_section = self.workspaces_section(active_is_admin);
+        let ws_section = self.workspaces_section(active_is_admin, workspace_map_error);
 
         // User management section (right column, below workspaces)
         let us_section = self.users_section(active_user);
@@ -1661,13 +1662,22 @@ impl SettingsState {
     /// an admin, the row list and the add-workspace form are hidden entirely
     /// and a single muted explanatory line is rendered instead (the error
     /// banner, if present, is still shown).
+    ///
+    /// `map_error` is the Dashboard's workspace-map read failure, passed in so
+    /// the footer picker and this list render one state bit rather than two
+    /// copies of it.
     #[expect(clippy::too_many_lines)]
-    fn workspaces_section(&self, active_is_admin: bool) -> Element<'_, SettingsMessage> {
+    fn workspaces_section<'a>(
+        &'a self,
+        active_is_admin: bool,
+        map_error: Option<&'a str>,
+    ) -> Element<'a, SettingsMessage> {
         let ws = &self.workspaces_state;
 
         if !active_is_admin {
             let mut rows = Column::new().spacing(theme::SPACE_4);
             rows = widgets::push_error_banner(rows, ws.load_state.error());
+            rows = widgets::push_error_banner(rows, map_error);
             rows = rows.push(
                 text("Shared workspaces are available to admin users only.")
                     .size(theme::TEXT_12)
@@ -1677,15 +1687,19 @@ impl SettingsState {
         }
 
         let mut rows = Column::new().spacing(theme::SPACE_4);
-
         rows = widgets::push_error_banner(rows, ws.load_state.error());
+        rows = widgets::push_error_banner(rows, map_error);
 
         if ws.workspaces.is_empty() {
-            rows = rows.push(
-                text("No workspaces configured. Add one below.")
-                    .size(theme::TEXT_12)
-                    .color(theme::TEXT_MUTED),
-            );
+            // A failed map read is not an empty installation — the banner above
+            // stands in for the "add one below" empty state.
+            if map_error.is_none() {
+                rows = rows.push(
+                    text("No workspaces configured. Add one below.")
+                        .size(theme::TEXT_12)
+                        .color(theme::TEXT_MUTED),
+                );
+            }
         } else {
             for ws_item in &ws.workspaces {
                 let ws_row = container(
@@ -2024,13 +2038,18 @@ impl SettingsState {
         rows = widgets::push_error_banner(rows, us.load_state.error());
 
         if us.users.is_empty() {
-            rows = rows.push(
-                text("No users configured. Add one below.")
-                    .size(theme::TEXT_12)
-                    .color(theme::TEXT_MUTED),
-            );
+            // A failed read is not an installation with no users: the banner
+            // above is the surface for it, not this empty state.
+            if us.load_state.error().is_none() {
+                rows = rows.push(
+                    text("No users configured. Add one below.")
+                        .size(theme::TEXT_12)
+                        .color(theme::TEXT_MUTED),
+                );
+            }
         } else {
-            for user in &us.users {
+            for entry in &us.users {
+                let user = &entry.record;
                 let is_admin = user.is_admin();
                 let is_active = active_user == Some(user.name.as_str());
 
@@ -2064,7 +2083,12 @@ impl SettingsState {
 
                 let telegram_binding = user.channels.iter().find(|c| c.channel == "telegram");
                 let telegram_elem: Element<'_, SettingsMessage> =
-                    if us.bind_target.as_deref() == Some(&user.name) {
+                    if let Some(err) = &entry.channels_error {
+                        // The channel read failed — surface it instead of the
+                        // "Bind Telegram" affordance, which would falsely imply
+                        // the user has no binding.
+                        widgets::error_banner(err)
+                    } else if us.bind_target.as_deref() == Some(&user.name) {
                         // Inline binding input open
                         let mut row_elements: Vec<Element<'_, SettingsMessage>> = vec![
                             text("Telegram:")

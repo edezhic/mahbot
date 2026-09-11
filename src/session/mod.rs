@@ -413,6 +413,39 @@ where
         .collect()
 }
 
+/// The session-list SQL with an optional `WHERE` fragment. Shared by the
+/// infallible and checked session-list readers.
+fn sessions_list_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT {SESSION_LIST_COLUMNS} \
+         FROM session_metadata sm \
+         {where_clause} \
+         ORDER BY sm.last_activity DESC",
+    )
+}
+
+/// The session-transcript SQL for one agent, oldest message first. Shared by
+/// the infallible [`SessionStore::load`] and strict
+/// [`SessionStore::load_checked`] readers, so the two read contracts cannot
+/// read different statements.
+fn session_messages_sql() -> String {
+    format!("SELECT {SESSION_MESSAGE_COLUMNS} FROM sessions WHERE agent_id = ?1 ORDER BY id ASC")
+}
+
+/// Decode one [`SESSION_LIST_COLUMNS`] row. Shared by the infallible and
+/// checked session-list readers.
+fn session_metadata_row(row: &Row) -> Result<SessionMetadata> {
+    session_metadata_from_row(
+        &row.get::<String>(COL_SL_AGENT_ID)?,
+        &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
+        row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
+        row.get::<Option<i64>>(COL_SL_TOKEN_LENGTH)?,
+        row.get::<Option<String>>(COL_SL_ROLE)?,
+        row.get::<Option<String>>(COL_SL_USER_NAME)?,
+        row.get::<Option<String>>(COL_SL_WORKSPACE_NAME)?,
+    )
+}
+
 /// Run the session-listing query body (metadata columns only, no message-table
 /// join) with an optional `WHERE` fragment. Shared by
 /// [`SessionStore::list_sessions_with_metadata`] and
@@ -433,28 +466,26 @@ async fn list_sessions_where(
 ) -> Vec<SessionMetadata> {
     query_map_collect(
         conn,
-        &format!(
-            "SELECT {SESSION_LIST_COLUMNS} \
-             FROM session_metadata sm \
-             {where_clause} \
-             ORDER BY sm.last_activity DESC",
-        ),
+        &sessions_list_sql(where_clause),
         params,
-        |row| {
-            session_metadata_from_row(
-                &row.get::<String>(COL_SL_AGENT_ID)?,
-                &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
-                row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
-                row.get::<Option<i64>>(COL_SL_TOKEN_LENGTH)?,
-                row.get::<Option<String>>(COL_SL_ROLE)?,
-                row.get::<Option<String>>(COL_SL_USER_NAME)?,
-                row.get::<Option<String>>(COL_SL_WORKSPACE_NAME)?,
-            )
-        },
+        session_metadata_row,
         warn_context,
         None,
     )
     .await
+}
+
+/// Decode one [`SESSION_MESSAGE_COLUMNS`] row into a [`ChatMessage`]. Shared
+/// by the infallible [`SessionStore::load`] and strict
+/// [`SessionStore::load_checked`] reads.
+fn session_message_from_row(row: &Row) -> Result<ChatMessage> {
+    Ok(ChatMessage {
+        role: row
+            .get::<String>(COL_SM_ROLE)?
+            .parse::<ChatRole>()
+            .map_err(|e| anyhow!(e))?,
+        content: row.get(COL_SM_CONTENT)?,
+    })
 }
 
 /// A `session_metadata` column the read/write helpers may target; the closed
@@ -554,23 +585,29 @@ impl SessionStore {
     pub(crate) async fn load(&self, agent_id: &str) -> Vec<ChatMessage> {
         query_map_collect(
             &self.conn,
-            &format!(
-                "SELECT {SESSION_MESSAGE_COLUMNS} FROM sessions WHERE agent_id = ?1 ORDER BY id ASC"
-            ),
+            &session_messages_sql(),
             params![agent_id],
-            |row| {
-                Ok::<_, anyhow::Error>(ChatMessage {
-                    role: row
-                        .get::<String>(COL_SM_ROLE)?
-                        .parse::<ChatRole>()
-                        .map_err(|e| anyhow!(e))?,
-                    content: row.get(COL_SM_CONTENT)?,
-                })
-            },
+            session_message_from_row,
             "load session",
             Some(agent_id),
         )
         .await
+    }
+
+    /// Strict [`Self::load`]: a query error or the first undecodable row is
+    /// returned as an `Err`. Used by the Sessions transcript, which must render
+    /// a failed read as an error rather than as an empty transcript. The trade
+    /// is deliberate and total: one undecodable row replaces the whole read, so
+    /// the rows that were readable are not shown either — skipping it would
+    /// render a transcript that silently omits what the store holds.
+    pub(crate) async fn load_checked(&self, agent_id: &str) -> Result<Vec<ChatMessage>> {
+        self.conn
+            .query_map_strict(
+                &session_messages_sql(),
+                params![agent_id],
+                session_message_from_row,
+            )
+            .await
     }
 
     /// Session-non-emptiness check (resume dispatch rule): true when the
@@ -867,8 +904,25 @@ impl SessionStore {
         Ok(deleted > 0)
     }
 
+    /// The full session list, infallible by contract: whatever could be read is
+    /// returned (a query error yields an empty list). Kept for readers with no
+    /// person in front of them — the exclusion helper's no-prefix case, where an
+    /// empty list is a safe input — and for tests; the Sessions page reads
+    /// [`Self::list_sessions_with_metadata_checked`], which renders a failed read
+    /// as a failure rather than as an empty list.
     pub(crate) async fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
         list_sessions_where(&self.conn, "", (), "list sessions").await
+    }
+
+    /// Strict [`Self::list_sessions_with_metadata`]: a query error or the first
+    /// undecodable row is returned as an `Err`. Used by the Sessions list,
+    /// which must render a failed read as a failure rather than as an empty
+    /// list. The trade is deliberate and total: one undecodable row replaces
+    /// the whole read rather than silently shortening the list.
+    pub(crate) async fn list_sessions_with_metadata_checked(&self) -> Result<Vec<SessionMetadata>> {
+        self.conn
+            .query_map_strict(&sessions_list_sql(""), (), session_metadata_row)
+            .await
     }
 
     /// Like [`list_sessions_with_metadata`], but excludes sessions whose
@@ -1440,6 +1494,48 @@ mod tests {
         let msgs = store().load(&k).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "hello");
+    }
+
+    /// The checked readers back the person-facing GUI: a query/decode failure
+    /// must be an `Err` (rendered as a failure) while the infallible readers
+    /// keep their degrade-and-skip contract for non-GUI callers.
+    #[tokio::test]
+    async fn checked_readers_propagate_undecodable_rows() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        store()
+            .batch_append(&k, &[ChatMessage::user("hello")])
+            .await
+            .unwrap();
+
+        // Happy paths: both checked readers return the same data as the
+        // infallible ones.
+        let checked = store().load_checked(&k).await.unwrap();
+        assert_eq!(checked.len(), 1);
+        assert_eq!(checked[0].content, "hello");
+        let listed = store().list_sessions_with_metadata_checked().await.unwrap();
+        assert!(listed.iter().any(|s| s.agent_id == k));
+
+        // A row with an unknown role is undecodable: the strict reader
+        // surfaces it, the infallible reader skips just that row.
+        store()
+            .conn
+            .execute(
+                "INSERT INTO sessions (agent_id, role, content, created_at) \
+                 VALUES (?1, 'bogus', 'x', ?2)",
+                params![k.as_str(), db::now()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store().load_checked(&k).await.is_err(),
+            "undecodable row must be an error for the checked reader"
+        );
+        assert_eq!(
+            store().load(&k).await.len(),
+            1,
+            "the infallible reader keeps its skip-undecodable-rows contract"
+        );
     }
 
     #[tokio::test]

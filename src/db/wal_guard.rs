@@ -84,6 +84,15 @@ impl ShapeDefect {
             Self::BadPageSize => "the SQLite header carries an invalid page size".to_string(),
         }
     }
+
+    /// True when the defect is an environment condition rather than evidence
+    /// about the store's contents. A file that could not be read (permissions, a
+    /// failing or full filesystem) says nothing about the data, so it must be
+    /// recorded as an environment-caused refusal — never as damage.
+    #[must_use]
+    pub(crate) fn is_environment_caused(self) -> bool {
+        matches!(self, Self::Unreadable)
+    }
 }
 
 /// Stat-only facts about one store's file set — the fact source for the running

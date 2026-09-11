@@ -59,7 +59,13 @@ pub(crate) enum SessionsMessage {
     RefreshError(String),
     SelectSession(String),
     SessionMessages(String, Vec<ChatMessage>),
-    SessionError(String),
+    /// A transcript read failure. `key` is the session the failed read
+    /// belonged to, so a slow read for a session the user has since left does
+    /// not render in the newly selected transcript.
+    SessionError {
+        key: String,
+        error: String,
+    },
     /// Toggle an element's collapsed preview / full content, keyed by
     /// (entry index, element index within entry). Expanding applies
     /// immediately; collapsing is deferred past the double-click window (see
@@ -126,6 +132,10 @@ pub(crate) struct SessionsState {
     /// ledger via `session_view::parse_entry_bodies`).
     entry_md: Vec<Option<Vec<markdown::Item>>>,
     selected_loading: bool,
+    /// Last transcript read failure for the selected session. Rendered in the
+    /// transcript pane (instead of the previous/empty transcript) until a
+    /// successful load or a new selection clears it.
+    selected_error: Option<String>,
     /// Elements the user expanded beyond their collapsed preview, keyed by
     /// (entry index, element index within entry): 0 = body/narration,
     /// 1 = thinking block, 2+j = result block of call `j`. Cleared on
@@ -164,6 +174,7 @@ impl SessionsState {
             entries: Vec::new(),
             entry_md: Vec::new(),
             selected_loading: false,
+            selected_error: None,
             expanded: HashSet::new(),
             pending_collapses: HashSet::new(),
             measure_cache: RefCell::new(HashMap::new()),
@@ -181,7 +192,10 @@ impl SessionsState {
         Task::perform(
             async move {
                 let store = crate::session::store();
-                let mut list = store.list_sessions_with_metadata().await;
+                let mut list = store
+                    .list_sessions_with_metadata_checked()
+                    .await
+                    .map_err(|e| e.to_string())?;
                 if hide_shared_workspaces {
                     list.retain(|s| {
                         s.workspace_name.as_deref().is_none_or(|ws| {
@@ -198,11 +212,16 @@ impl SessionsState {
         )
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per transcript interaction; the per-session selection bookkeeping is only readable inline"
+    )]
     pub(crate) fn update(&mut self, msg: SessionsMessage) -> Task<SessionsMessage> {
         match msg {
             SessionsMessage::Refreshed(sessions) => {
                 self.sessions = sessions;
                 self.rebuild_session_cache();
+                self.load_state.clear_error();
                 self.load_state.finish_loading();
                 Task::none()
             }
@@ -213,29 +232,27 @@ impl SessionsState {
             SessionsMessage::SelectSession(key) => {
                 self.selected_session = Some(key.clone());
                 self.selected_loading = true;
+                self.selected_error = None;
                 self.expanded.clear();
                 self.pending_collapses.clear();
                 // The measurement cache is cleared in SessionMessages when the
-                // new session's messages actually arrive. The loading frames in
-                // between show "Loading..." (old messages are not rendered),
-                // but the cache must not be cleared here: on SessionError the
-                // fallback keeps rendering the previous session's messages,
-                // whose cache entries are still valid for that path. `expanded`
-                // is cleared eagerly because the design resets collapse state
-                // on session switch; on the error path that simply renders the
-                // previous transcript collapsed (cosmetic, error-path only).
-                // Do NOT set auto_scroll_enabled here — let ScrollChanged
-                // determine it from the user's scroll behavior. The initial
-                // snap to bottom happens eagerly in SessionMessages.
+                // new session's messages actually arrive; a failure for the new
+                // session renders the error rather than the previous
+                // transcript, so stale cache entries stay unused until the next
+                // successful load clears them. Do NOT set auto_scroll_enabled
+                // here — ScrollChanged owns it; the initial snap to bottom
+                // happens in SessionMessages.
                 Task::perform(
                     async move {
                         let store = crate::session::store();
-                        let messages = store.load(&key).await;
-                        Ok::<_, String>((key, messages))
+                        match store.load_checked(&key).await {
+                            Ok(messages) => Ok::<_, (String, String)>((key, messages)),
+                            Err(e) => Err((key, e.to_string())),
+                        }
                     },
                     |res| match res {
                         Ok((key, messages)) => SessionsMessage::SessionMessages(key, messages),
-                        Err(e) => SessionsMessage::SessionError(e),
+                        Err((key, error)) => SessionsMessage::SessionError { key, error },
                     },
                 )
             }
@@ -249,15 +266,20 @@ impl SessionsState {
                     self.measure_cache.borrow_mut().clear();
                     self.pending_collapses.clear();
                     self.selected_loading = false;
+                    self.selected_error = None;
                     // Snap to bottom so the user sees the most recent messages
                     // immediately.
                     return iced::widget::operation::snap_to_end(self.scrollable_id.clone());
                 }
                 Task::none()
             }
-            SessionsMessage::SessionError(e) => {
-                self.load_state.fail(e);
-                self.selected_loading = false;
+            SessionsMessage::SessionError { key, error } => {
+                // A slow read for a session the user has since left must not
+                // render its failure in the newly selected transcript.
+                if self.selected_session.as_deref() == Some(&key) {
+                    self.selected_error = Some(error);
+                    self.selected_loading = false;
+                }
                 Task::none()
             }
             SessionsMessage::ScrollChanged(viewport) => {
@@ -353,6 +375,7 @@ impl SessionsState {
         self.entries.clear();
         self.entry_md.clear();
         self.selected_loading = false;
+        self.selected_error = None;
         self.expanded.clear();
         self.pending_collapses.clear();
         self.auto_scroll_enabled = false;
@@ -452,11 +475,15 @@ impl SessionsState {
         if self.load_state.loading() && !self.load_state.has_loaded() {
             content = content.push(widgets::scroll_h_inset(widgets::loading_text()));
         } else if self.sessions.is_empty() {
-            content = content.push(widgets::empty_state_placeholder(
-                lucide::layout_dashboard::<iced::Theme, iced::Renderer>(),
-                "No sessions",
-                theme::TEXT_MUTED,
-            ));
+            // A failed read must not masquerade as a legitimately empty list:
+            // the error banner above is the only thing rendered.
+            if self.load_state.error().is_none() {
+                content = content.push(widgets::empty_state_placeholder(
+                    lucide::layout_dashboard::<iced::Theme, iced::Renderer>(),
+                    "No sessions",
+                    theme::TEXT_MUTED,
+                ));
+            }
         } else {
             // Session list on the left side — built from cached display data.
             // The cache is rebuilt when `self.sessions` changes (in
@@ -573,6 +600,15 @@ impl SessionsState {
             // first render and after every window resize.
             let transcript: iced::Element<'_, SessionsMessage> = if self.selected_loading {
                 iced::widget::container(widgets::loading_text())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(theme::PAD_16)
+                    .into()
+            } else if let Some(err) = self.selected_error.as_deref() {
+                // The transcript read failed: render the failure where the
+                // transcript would be, instead of the previous transcript or
+                // the empty-session message.
+                container(widgets::error_banner_fill(err))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .padding(theme::PAD_16)
@@ -1171,5 +1207,47 @@ mod tests {
         ];
         let new = vec![msg(ChatRole::User, Some("a"))];
         assert_eq!(common_entry_prefix(&old, &new), 1);
+    }
+
+    #[test]
+    fn transcript_error_stays_out_of_the_list_banner() {
+        let mut state = SessionsState::new();
+        state.selected_session = Some("s1".to_string());
+        state.selected_loading = true;
+
+        let _ = state.update(SessionsMessage::SessionError {
+            key: "s1".to_string(),
+            error: "read failed".to_string(),
+        });
+
+        assert_eq!(state.selected_error.as_deref(), Some("read failed"));
+        assert!(!state.selected_loading);
+        assert!(
+            state.load_state.error().is_none(),
+            "a transcript failure must not surface in the session-list banner"
+        );
+
+        // An error for a session the user has since left is ignored.
+        state.selected_error = None;
+        state.selected_loading = true;
+        let _ = state.update(SessionsMessage::SessionError {
+            key: "s2".to_string(),
+            error: "stale failure".to_string(),
+        });
+        assert!(state.selected_error.is_none());
+        assert!(state.selected_loading);
+    }
+
+    #[test]
+    fn successful_transcript_load_clears_the_error() {
+        let mut state = SessionsState::new();
+        state.selected_session = Some("s1".to_string());
+        state.selected_error = Some("old failure".to_string());
+        state.selected_loading = true;
+
+        let _ = state.update(SessionsMessage::SessionMessages("s1".to_string(), vec![]));
+
+        assert!(state.selected_error.is_none());
+        assert!(!state.selected_loading);
     }
 }

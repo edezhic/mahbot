@@ -2087,7 +2087,11 @@ impl BoardStore {
     ///
     /// Returns full [`Ticket`] objects (without comments) ordered by FTS
     /// relevance (`fts_score DESC`), up to `limit` results.
-    /// On SQL error, logs a warning and returns an empty vec.
+    ///
+    /// A query error and a ticket row that fails to parse are both propagated
+    /// to the caller: the GUI sidebar renders the failure instead of silently
+    /// showing an empty (or incomplete) result as "No matching tickets". Each is
+    /// also logged, so a failed sidebar search leaves a trail outside the GUI.
     pub async fn search_by_fts(
         &self,
         query: &str,
@@ -2110,35 +2114,22 @@ impl BoardStore {
              ORDER BY fts_score(t.title, ?2) DESC \
              LIMIT {limit}"
         );
-        match self
+        let rows = self
             .conn
-            .query(&sql, db::params![workspace_name, sanitized.clone()])
+            .query(&sql, db::params![workspace_name, sanitized])
             .await
-        {
-            Ok(rows) => {
-                let mut tickets = Vec::with_capacity(rows.len());
-                for row in rows {
-                    match self.ticket_from_row(&row, LoadComments::No).await {
-                        Ok(t) => tickets.push(t),
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "Failed to parse ticket row from FTS search"
-                            );
-                        }
-                    }
-                }
-                Ok(tickets)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    query = %sanitized,
-                    error = %e,
-                    "FTS search failed"
-                );
-                Ok(Vec::new())
-            }
+            .inspect_err(|e| warn!(error = %e, "Ticket FTS search failed"))?;
+        let mut tickets = Vec::with_capacity(rows.len());
+        for row in rows {
+            tickets.push(
+                self.ticket_from_row(&row, LoadComments::No)
+                    .await
+                    .inspect_err(
+                        |e| warn!(error = %e, "Ticket row failed to parse in FTS search"),
+                    )?,
+            );
         }
+        Ok(tickets)
     }
 
     /// List archived tickets with non-NULL embeddings, deserialized, scoped to

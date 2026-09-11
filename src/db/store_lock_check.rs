@@ -22,6 +22,11 @@
 //! before either store is opened, leaving both stores untouched and recording a
 //! refusal that names every unusable store.
 //!
+//! [`tests::an_unreadable_store_file_refuses_the_boot_as_an_environment_cause`]
+//! adds the environment-caused half of that rule with a real permission failure:
+//! the refusal is recorded as an environment condition, never as damage (skipped
+//! when the test runs as root, where mode 000 denies nothing).
+//!
 //! Verified on macOS, runnable on Linux — the two platforms the project is tested
 //! on (the module is Unix-only, so elsewhere the property is left unverified
 //! rather than checked). Driven by this module's own test drivers, which
@@ -414,6 +419,57 @@ mod tests {
                 && record.contains("store: core")
                 && record.contains("the data file is empty"),
             "the refusal must be recorded durably:\n{record}"
+        );
+    }
+
+    /// A store the process cannot read (permissions) refuses the boot like any
+    /// other unusable file, and its refusal is recorded as environment-caused —
+    /// the file is intact and the cause is outside it, so it must never be filed
+    /// as damage. Skipped when the suite runs as root, where mode 000 denies
+    /// nothing (the classification itself is unit-tested in `wal_guard`/`boot`).
+    #[test]
+    fn an_unreadable_store_file_refuses_the_boot_as_an_environment_cause() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            println!("skipped: running as root, mode 000 does not deny access");
+            return;
+        }
+        let _env = crate::util::test::env_lock().lock().unwrap_poison();
+        let home = tempfile::TempDir::new().expect("hermetic home");
+        let root = home.path().join(".mahbot");
+        let store_dir = root.join("db");
+        std::fs::create_dir_all(&store_dir).expect("create the store dir");
+        // Long enough to carry a header (512 bytes), so the defect is the read
+        // and not the size: this file is a store the process is not allowed to
+        // open, not a damaged one.
+        let core = store_dir.join("core.db");
+        std::fs::write(&core, [0x42; 512]).expect("write the store");
+        std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o000))
+            .expect("make the store unreadable");
+        let before = core_family(&store_dir).expect("fingerprint the core store");
+
+        let refused = boot_stores(&home);
+        let text = child_text(&refused);
+        assert!(
+            !refused.status.success(),
+            "a store the process cannot read must refuse the boot:\n{text}"
+        );
+        assert!(
+            text.contains("refusing to start: store 'core' is not usable"),
+            "the refusal must name the store and the reason:\n{text}"
+        );
+        assert_eq!(
+            before,
+            core_family(&store_dir).expect("fingerprint the core store"),
+            "the refused store must be left completely untouched",
+        );
+        let record = std::fs::read_to_string(root.join("error.log")).expect("error.log written");
+        assert!(
+            record.contains("MahBot start-up refusal")
+                && record.contains("store: core")
+                && record.contains(crate::db::failure_record::ENVIRONMENT_CAUSE),
+            "a refusal caused by the environment must say so, never read as damage:\n{record}"
         );
     }
 

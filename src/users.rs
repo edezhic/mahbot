@@ -307,35 +307,46 @@ impl UserStore {
             .await
     }
 
-    /// Convert a `users` table row into a [`UserRecord`], loading channel bindings.
-    async fn user_record_from_row(&self, row: &db::Row) -> Result<UserRecord> {
+    /// Convert a `users` table row into a [`UserRecordEntry`], loading channel
+    /// bindings.
+    async fn user_entry_from_row(&self, row: &db::Row) -> Result<UserRecordEntry> {
         let name: String = row.get(COL_USERS_NAME)?;
         let permissions = row.get::<Option<String>>(COL_USERS_PERMISSIONS)?;
         let roles = role_pool();
-        Ok(UserRecord {
-            name: name.clone(),
-            permissions: permissions.clone(),
-            selected_workspace: row.get::<Option<String>>(COL_USERS_SELECTED_WORKSPACE)?,
-            selected_role: row.get::<Option<String>>(COL_USERS_SELECTED_ROLE)?,
-            roles: roles.iter().map(|r| r.as_str().to_string()).collect(),
-            channels: self.get_user_channels(&name).await.unwrap_or_default(),
+        // A failed channel read must not render as "no binding": carry the
+        // failure beside the record so the GUI can surface it instead of
+        // offering to bind.
+        let (channels, channels_error) = match self.get_user_channels(&name).await {
+            Ok(channels) => (channels, None),
+            Err(e) => (Vec::new(), Some(e.to_string())),
+        };
+        Ok(UserRecordEntry {
+            record: UserRecord {
+                name,
+                permissions,
+                selected_workspace: row.get::<Option<String>>(COL_USERS_SELECTED_WORKSPACE)?,
+                selected_role: row.get::<Option<String>>(COL_USERS_SELECTED_ROLE)?,
+                roles: roles.iter().map(|r| r.as_str().to_string()).collect(),
+                channels,
+            },
+            channels_error,
         })
     }
 
     // ── Lookup / listing ──────────────────────────────────────
 
     /// Shared listing body: run `suffix` (everything after `FROM users`) and
-    /// collect full [`UserRecord`]s with channel bindings.
+    /// collect one [`UserRecordEntry`] per row with channel bindings.
     async fn list_users_where(
         &self,
         suffix: &str,
         params: impl db::IntoParams + Send + 'static,
-    ) -> Result<Vec<UserRecord>> {
+    ) -> Result<Vec<UserRecordEntry>> {
         let sql = format!("SELECT {USERS_COLUMNS} FROM users {suffix}");
         let rows = self.conn.query(&sql, params).await?;
         let mut users = Vec::with_capacity(rows.len());
         for row in rows {
-            users.push(self.user_record_from_row(&row).await?);
+            users.push(self.user_entry_from_row(&row).await?);
         }
         Ok(users)
     }
@@ -345,11 +356,11 @@ impl UserStore {
     pub async fn find_by_name(&self, user_name: &str) -> Result<Option<UserRecord>> {
         self.list_users_where("WHERE name = ?1", db::params![user_name])
             .await
-            .map(|users| users.into_iter().next())
+            .map(|users| users.into_iter().next().map(|entry| entry.record))
     }
 
-    /// List all users.
-    pub async fn list_users(&self) -> Result<Vec<UserRecord>> {
+    /// List all users with the outcome of each user's channel-binding read.
+    pub async fn list_users(&self) -> Result<Vec<UserRecordEntry>> {
         self.list_users_where("", db::params![]).await
     }
 
@@ -357,6 +368,7 @@ impl UserStore {
     pub async fn find_admins(&self) -> Result<Vec<UserRecord>> {
         self.list_users_where("WHERE permissions = ?1", db::params!["full"])
             .await
+            .map(|entries| entries.into_iter().map(|entry| entry.record).collect())
     }
 
     /// Find the user with admin (full) permissions, if any.
@@ -442,7 +454,7 @@ async fn upsert_user_column(
 
 // ── UserRecord ────────────────────────────────────────────────
 
-/// A full user row, returned by [`UserStore::list_users`].
+/// A full user row, e.g. returned by [`UserStore::find_by_name`].
 #[derive(Debug, Clone, Serialize)]
 pub struct UserRecord {
     /// The canonical user name.
@@ -460,6 +472,18 @@ pub struct UserRecord {
     pub roles: Vec<String>,
     /// Channel bindings for this user (Telegram, etc.).
     pub channels: Vec<ChannelBinding>,
+}
+
+/// One `users` row together with the outcome of its channel-binding read. The
+/// domain [`UserRecord`] is channel-empty both when the user has no bindings
+/// and when the read failed, so a surface that renders bindings needs the
+/// outcome to tell the two apart; it travels beside the record, not inside it.
+#[derive(Debug, Clone)]
+pub struct UserRecordEntry {
+    pub record: UserRecord,
+    /// `Some` when the channel-binding read failed; `record.channels` is then
+    /// empty.
+    pub channels_error: Option<String>,
 }
 
 impl UserRecord {

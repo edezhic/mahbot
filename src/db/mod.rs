@@ -624,6 +624,10 @@ pub(crate) struct StoreRefusal {
     pub db_path: std::path::PathBuf,
     /// One-line reason.
     pub reason: String,
+    /// True when the refusal is an environment condition (an unreadable file,
+    /// resource exhaustion, permissions) rather than evidence about the store's
+    /// contents. Records it as environment-caused, never as damage.
+    pub environment: bool,
 }
 
 impl StoreRefusal {
@@ -633,7 +637,14 @@ impl StoreRefusal {
             store,
             db_path: db_path.to_path_buf(),
             reason: reason.into(),
+            environment: false,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_environment(mut self, environment: bool) -> Self {
+        self.environment = environment;
+        self
     }
 }
 
@@ -1955,12 +1966,13 @@ fn has_lock_signal(lower: &str) -> bool {
     LOCK_SIGNAL_KEYWORDS.iter().any(|k| lower.contains(k))
 }
 
-/// True when a repair-phase failure is an actionable signal: a
-/// resource/permission condition (ENOSPC/EMFILE/OOM/permission) or lock
-/// contention with another process (the engine's open-time file lock, a locked
-/// table, a busy database). Neither is damage, so the repair path propagates
-/// them loud rather than reporting a spurious repair finding.
-fn is_actionable_signal(e: &anyhow::Error) -> bool {
+/// True when a failure is an actionable signal: a resource/permission condition
+/// (ENOSPC/EMFILE/OOM/permission) or lock contention with another process (the
+/// engine's open-time file lock, a locked table, a busy database). Neither is
+/// damage, so the repair path propagates them loud rather than reporting a
+/// spurious repair finding, and the durable failure record marks them as
+/// environment-caused.
+pub(crate) fn is_actionable_signal(e: &anyhow::Error) -> bool {
     let lower = format!("{e:#}").to_lowercase();
     has_resource_signal(&lower) || has_lock_signal(&lower)
 }
@@ -1990,7 +2002,9 @@ pub(crate) async fn open_store(
         // path that builds a schema in place of nothing.
         crate::db::wal_guard::StoreShape::Absent => open_with_schema(&db_path, schema).await,
         crate::db::wal_guard::StoreShape::Unusable(defect) => {
-            Err(StoreRefusal::new(name, &db_path, defect.reason()).into())
+            Err(StoreRefusal::new(name, &db_path, defect.reason())
+                .with_environment(defect.is_environment_caused())
+                .into())
         }
         crate::db::wal_guard::StoreShape::Present => {
             let opened = AssertUnwindSafe(open_present_store(&db_path, name, schema))
@@ -2022,8 +2036,8 @@ async fn open_present_store(
     let conn = match open_with_schema(db_path, schema).await {
         Ok(conn) => conn,
         // A resource/permission/lock condition is environmental, never store
-        // damage; it propagates unwrapped (the boot recorder names the lock case
-        // with its own wording, and records neither as a refusal).
+        // damage; it propagates unwrapped so the boot recorder names it (the lock
+        // case with its own wording) and records it with the environment note.
         Err(e) if is_actionable_signal(&e) => return Err(e),
         Err(e) => {
             return Err(
@@ -2248,6 +2262,15 @@ fn classify_repair_target(problems: &[String]) -> RepairTarget {
             None => RepairTarget::Unknown,
         }
     }
+}
+
+/// True when a filtered `quick_check` problem list names only conditions the
+/// boot path deliberately leaves report-only (an unrecognised signature) rather
+/// than damage it acts on (repair or refusal). The runtime integrity record uses
+/// this so a tolerated finding is never filed as damage.
+#[must_use]
+pub(crate) fn is_tolerated_integrity_report(problems: &[String]) -> bool {
+    matches!(classify_repair_target(problems), RepairTarget::Unknown)
 }
 
 /// Pre-repair forensic snapshot path (engine-produced):
@@ -3860,6 +3883,24 @@ mod tests {
             classify_repair_target(&["row 5 missing from index idx_x".to_string()]),
             RepairTarget::Unknown
         ));
+    }
+
+    /// The runtime integrity record must not file an unknown (report-only)
+    /// quick_check signature as damage, but must file every signature the boot
+    /// path acts on.
+    #[test]
+    fn only_unrecognised_integrity_signatures_are_tolerated() {
+        assert!(is_tolerated_integrity_report(&[
+            "row 5 missing from index idx_x".to_string(),
+        ]));
+        assert!(!is_tolerated_integrity_report(&[
+            "wrong # of entries in index idx_phase".to_string(),
+        ]));
+        assert!(!is_tolerated_integrity_report(&[
+            "Invalid page type: page 7".to_string(),
+        ]));
+        // A clean check names nothing to act on; the caller matches it first.
+        assert!(is_tolerated_integrity_report(&[]));
     }
 
     /// turso rolls back DDL: the class-B DROP+CREATE fallback wraps the pair

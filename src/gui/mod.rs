@@ -321,17 +321,37 @@ pub enum Message {
     /// Result of a per-workspace toggle DB write. Carries (kind, result, workspace_name, intended_state).
     /// On success, the workspace map is reloaded from the store; on error an error toast is shown.
     ToggleResult(ToggleKind, Result<(), String>, String, bool),
-    /// No-op — produced by refresh helpers on transient DB errors to avoid
-    /// sending empty state maps that would wipe cached toggle state.
+    /// No-op — the completion message for a fire-and-forget write whose
+    /// failure is already logged at the write site.
     Nop,
-    /// Workspace info and restored selection loaded during boot. The
-    /// selection is the resolved name ("" = "Personal" default).
-    BootWorkspaces(HashMap<String, Workspace>, String),
+    /// Workspace info and restored selection loaded during boot. The read
+    /// result is carried as-is so a failed boot read surfaces in the picker
+    /// and Settings list instead of silently rendering as "no workspaces".
+    /// The selection is the resolved name ("" = "Personal" default). The
+    /// generation is the reload generation the read was issued under, so a
+    /// reload that answered while it was in flight wins.
+    BootWorkspaces {
+        workspaces: Result<HashMap<String, Workspace>, String>,
+        restored_name: String,
+        generation: u64,
+    },
     /// Full workspace map reloaded from the store (CDC workspaces event,
     /// stream lag, toggle completion, or a settings add/delete). The handler
     /// re-resolves the live selection against this fresh map — "" = "Personal"
-    /// default when the selected workspace vanished or none was set.
-    WorkspacesReloaded(HashMap<String, Workspace>),
+    /// default when the selected workspace vanished or none was set. The
+    /// generation is the reload it answers, so a slow read cannot overwrite a
+    /// newer one.
+    WorkspacesReloaded {
+        workspaces: HashMap<String, Workspace>,
+        generation: u64,
+    },
+    /// The post-ready workspace map reload failed (all retries exhausted). The
+    /// current map is preserved and the failure is rendered where the picker /
+    /// Settings list would be — unless a newer reload has already answered.
+    WorkspacesReloadFailed {
+        error: String,
+        generation: u64,
+    },
     Home(home::HomeMessage),
     Logs(logs::LogMessage),
     Board(board::BoardMessage),
@@ -540,6 +560,13 @@ pub struct Dashboard {
     /// [`Message::WorkspacesReloaded`], which rebuilds the whole map from the
     /// store (no incremental boolean patching).
     workspaces: HashMap<String, Workspace>,
+    /// Last workspace-map read failure (boot or a post-ready reload), rendered
+    /// where the footer picker and the Settings workspace list would be.
+    /// `None` once a successful read replaces it.
+    workspaces_error: Option<String>,
+    /// Generation of the latest workspace-map reload, so a slow read cannot
+    /// apply its (now stale) outcome over a newer one.
+    workspaces_reload_gen: u64,
     /// Currently selected workspace name. `Some("personal:{user}")` = the
     /// impersonated user's "Personal" workspace; `Some("ws")` = a shared
     /// workspace; `None` = nothing selected.
@@ -607,6 +634,8 @@ impl Dashboard {
             last_position: iced::Point::new(-1.0, -1.0),
             toasts: Vec::new(),
             workspaces: HashMap::new(),
+            workspaces_error: None,
+            workspaces_reload_gen: 0,
             selected_workspace_name: None,
             selected_user_name: None,
             selected_user_is_admin: false,
@@ -645,7 +674,10 @@ impl Dashboard {
                 self.selected_user_name = prev.selected_user;
                 self.board_state.current_user_name = self.selected_user_name.clone();
                 let boot_workspaces = Task::perform(
-                    load_workspace_options(self.selected_user_name.clone()),
+                    load_workspace_options(
+                        self.selected_user_name.clone(),
+                        self.workspaces_reload_gen,
+                    ),
                     std::convert::identity,
                 );
 
@@ -732,16 +764,23 @@ impl Dashboard {
         format!("MahBot — {page_name}")
     }
 
-    /// Apply workspace configuration loaded during boot.
+    /// Apply workspace configuration loaded during boot. The boot path must
+    /// complete either way: a failed read leaves an empty map beside the failure
+    /// that stands in for it.
+    ///
+    /// `read_generation` is the reload generation the read was issued under. A
+    /// reload that landed while it was in flight read the same table later, so
+    /// its map (or its failure) wins and this read's outcome is dropped — the
+    /// rest of the boot path still completes.
     fn apply_boot_workspaces(
         &mut self,
-        workspaces: HashMap<String, Workspace>,
+        workspaces: Result<HashMap<String, Workspace>, String>,
         restored_name: &str,
+        read_generation: u64,
     ) -> Task<Message> {
-        self.workspaces = workspaces;
-        // Sync the Settings workspace list from the freshly-loaded map (no
-        // separate DB read).
-        self.sync_settings_lists_from_map();
+        if read_generation == self.workspaces_reload_gen {
+            self.apply_boot_workspace_map(workspaces);
+        }
         // Pre-set Home's selected_user from persisted window state
         // so UsersLoaded doesn't auto-select the first user when
         // a previous user was saved.
@@ -802,7 +841,7 @@ impl Dashboard {
                 self.settings_state.refresh();
                 // Workspace list comes from the shared map; only the users
                 // list needs a DB refresh on navigation.
-                self.sync_settings_lists_from_map();
+                self.sync_settings_workspaces_from_map();
                 self.refresh_settings_users()
             }
         };
@@ -827,7 +866,7 @@ impl Dashboard {
     /// an admin, the Workspaces settings list is emptied (every `workspaces`
     /// table row is a shared workspace; personal workspaces never live in the
     /// map).
-    fn sync_settings_lists_from_map(&mut self) {
+    fn sync_settings_workspaces_from_map(&mut self) {
         let mut list: Vec<Workspace> = self.workspaces.values().cloned().collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
         if !self.selected_user_is_admin {
@@ -872,12 +911,11 @@ impl Dashboard {
                 } else {
                     kind.label_off()
                 };
-                Task::batch([
-                    self.push_toast(format!("{label} for {ws_name}"), ToastKind::Success),
-                    // Immediate post-toggle refresh; the CDC stream provides
-                    // the durable confirmation later.
-                    Self::reload_workspace_map(),
-                ])
+                let toast = self.push_toast(format!("{label} for {ws_name}"), ToastKind::Success);
+                // Immediate post-toggle refresh; the CDC stream provides the
+                // durable confirmation later.
+                let refresh = self.reload_workspace_map();
+                Task::batch([toast, refresh])
             }
             Err(e) => self.push_toast(format!("{}: {e}", kind.label_err()), ToastKind::Error),
         }
@@ -1013,7 +1051,7 @@ impl Dashboard {
         // reanalyze, diagnostics/notes edits) refreshes the shared
         // workspace map from one full DB read — the map is the single source
         // of truth, and syncing the Settings workspace list from it (see
-        // [`Self::sync_settings_lists_from_map`]) gives the page its immediate
+        // [`Self::sync_settings_workspaces_from_map`]) gives the page its immediate
         // post-op feedback. The workspaces sub-state itself never reads the
         // store.
         let needs_global_reload = matches!(
@@ -1032,11 +1070,12 @@ impl Dashboard {
         // Stack-allocated batch: only Some tasks are included via
         // flatten. Avoids Vec heap allocation for the common
         // no-intercept no-reload path.
-        let tasks = [
-            intercept_task,
-            Some(settings_task),
-            needs_global_reload.then(Self::reload_workspace_map),
-        ];
+        let reload = if needs_global_reload {
+            Some(self.reload_workspace_map())
+        } else {
+            None
+        };
+        let tasks = [intercept_task, Some(settings_task), reload];
 
         Task::batch(tasks.into_iter().flatten())
     }
@@ -1115,9 +1154,11 @@ impl Dashboard {
         match message {
             // ── Pre-ready handlers (execute regardless of ready state) ──
             Message::Boot(result) => self.finish_boot(result),
-            Message::BootWorkspaces(workspaces, restored_name) => {
-                self.apply_boot_workspaces(workspaces, &restored_name)
-            }
+            Message::BootWorkspaces {
+                workspaces,
+                restored_name,
+                generation,
+            } => self.apply_boot_workspaces(workspaces, &restored_name, generation),
             Message::CloseRequested(_) => {
                 if crate::self_update::update_in_progress()
                     && crate::self_update::update_is_finalizing()
@@ -1419,10 +1460,17 @@ impl Dashboard {
             // A workspaces-table row changed (or the stream lagged/baseline
             // fired) — one full map reload; the handler below resolves the
             // selection fallback against the fresh map.
-            Message::WorkspacesCdcChanged => Self::reload_workspace_map(),
-            Message::WorkspacesReloaded(workspaces) => {
-                self.workspaces = workspaces;
-                self.sync_settings_lists_from_map();
+            Message::WorkspacesCdcChanged => self.reload_workspace_map(),
+            Message::WorkspacesReloaded {
+                workspaces,
+                generation,
+            } => {
+                // Stale-result guard: a slow reload must not overwrite a newer
+                // one that has already answered.
+                if generation != self.workspaces_reload_gen {
+                    return Task::none();
+                }
+                self.apply_workspace_reload(Ok(workspaces));
 
                 // Re-resolve the LIVE selection against the fresh map instead of
                 // a value captured when the reload was triggered: that snapshot
@@ -1453,6 +1501,18 @@ impl Dashboard {
             // lagged) — re-list the Settings users page. Full re-list is its
             // own recovery.
             Message::UsersCdcChanged => self.refresh_settings_users(),
+            Message::WorkspacesReloadFailed { error, generation } => {
+                // Stale-result guard, mirroring the success arm: without it a
+                // reload that fails after a newer one succeeded would re-set the
+                // failure over the map that read produced.
+                if generation != self.workspaces_reload_gen {
+                    return Task::none();
+                }
+                // Keep the current map (the selection may still resolve) and
+                // render the failure where the picker / Settings list would be.
+                self.apply_workspace_reload(Err(error));
+                Task::none()
+            }
             Message::Nop => Task::none(),
             Message::AdminLoaded { is_admin } => {
                 let admin_changed = self.selected_user_is_admin != is_admin;
@@ -1463,7 +1523,7 @@ impl Dashboard {
                 // appear). Running Agents reads the flag at render time and
                 // needs no refresh.
                 if admin_changed {
-                    self.sync_settings_lists_from_map();
+                    self.sync_settings_workspaces_from_map();
                     if self.page == Page::Sessions {
                         return sessions::SessionsState::refresh(!is_admin).map(Message::Sessions);
                     }
@@ -1617,7 +1677,11 @@ impl Dashboard {
         self.board_state.workspace_name = Some(name.to_string());
         self.board_state.search_query.clear();
         self.board_state.search_results.clear();
+        self.board_state.search_error = None;
         self.board_state.search_generation += 1;
+        // The previous workspace's load failure does not describe the board
+        // being loaded now.
+        self.board_state.load_state.clear_error();
         // Bump the board generation so a stale in-flight snapshot from the
         // previous workspace is dropped on arrival.
         self.board_state.board_generation += 1;
@@ -1703,8 +1767,46 @@ impl Dashboard {
     /// [`Message::WorkspacesReloaded`] handler falls back to "Personal".
     /// Resolution is done at apply time from the live selection, so a reload
     /// triggered before the boot selection is applied cannot clobber it.
-    fn reload_workspace_map() -> Task<Message> {
-        Task::perform(load_workspace_map(), std::convert::identity)
+    ///
+    /// The reload carries the generation it was issued under: this read retries
+    /// for a second on a transient failure, so without it a delayed failure
+    /// could re-set the error over a newer read that has already succeeded.
+    fn reload_workspace_map(&mut self) -> Task<Message> {
+        self.workspaces_reload_gen = self.workspaces_reload_gen.wrapping_add(1);
+        let generation = self.workspaces_reload_gen;
+        Task::perform(load_workspace_map(generation), std::convert::identity)
+    }
+
+    /// Apply the boot workspace-map read. There is no previous map to keep, so a
+    /// failure leaves an empty map beside the failure that stands in for it and
+    /// the boot path completes either way. The Settings list is re-derived here,
+    /// so it can never diverge from the map.
+    fn apply_boot_workspace_map(&mut self, result: Result<HashMap<String, Workspace>, String>) {
+        match result {
+            Ok(map) => {
+                self.workspaces = map;
+                self.workspaces_error = None;
+            }
+            Err(e) => {
+                self.workspaces = HashMap::new();
+                self.workspaces_error = Some(e);
+            }
+        }
+        self.sync_settings_workspaces_from_map();
+    }
+
+    /// Apply a post-ready workspace-map reload: a failed read keeps the map the
+    /// live selection may still resolve against, while the failure is recorded
+    /// for the picker and the Settings list.
+    fn apply_workspace_reload(&mut self, result: Result<HashMap<String, Workspace>, String>) {
+        match result {
+            Ok(map) => {
+                self.workspaces = map;
+                self.workspaces_error = None;
+            }
+            Err(e) => self.workspaces_error = Some(e),
+        }
+        self.sync_settings_workspaces_from_map();
     }
 
     /// Return the selected shared-workspace name, or `None` if the "Personal"
@@ -1826,6 +1928,7 @@ impl Dashboard {
                 .view(
                     self.selected_user_name.as_deref(),
                     self.selected_user_is_admin,
+                    self.workspaces_error.as_deref(),
                 )
                 .map(Message::Settings),
             Page::RunningAgents => running::view(
@@ -2056,6 +2159,13 @@ fn section_hint(label: &str) -> Element<'_, Message> {
 /// Render the normal ticket list partitioned into groups (In Progress,
 /// Queued, Pending, Completed).
 fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Message> {
+    // A failed list read must show the failure in the body itself — otherwise
+    // a first failure renders "Loading…" forever and a later failure leaves a
+    // stale list that looks current.
+    if let Some(err) = board_state.load_state.error() {
+        return widgets::error_banner(err);
+    }
+
     let [in_progress, queued, pending, completed] =
         board::BoardState::board_sections(&board_state.tickets);
 
@@ -2086,6 +2196,10 @@ fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Mes
 
 /// Render FTS search results as ticket cards in a scrollable list.
 fn render_search_results(board_state: &board::BoardState) -> Element<'_, Message> {
+    // A failed search must not render as "No matching tickets".
+    if let Some(err) = board_state.search_error.as_deref() {
+        return widgets::error_banner(err);
+    }
     if board_state.search_results.is_empty() {
         section_hint("No matching tickets")
     } else {
@@ -2593,22 +2707,52 @@ impl Dashboard {
         )
     }
 
+    /// The failure the footer picker must show in place of its dropdown: a
+    /// failed workspace-map read that left nothing to pick. A read that failed
+    /// but preserved a usable map keeps the working picker — the Settings
+    /// workspace list shows that failure.
+    fn picker_failure<'a>(&'a self, options: &[widgets::PickOption]) -> Option<&'a str> {
+        if options.is_empty() {
+            self.workspaces_error.as_deref()
+        } else {
+            None
+        }
+    }
+
     /// Footer workspace picker: shared workspaces only, admin-gated, persists
     /// via [`Self::select_workspace`]. With a single shared workspace the
     /// dropdown degrades to a static label (that workspace's display name,
     /// or the "Select workspace" placeholder when nothing is selected —
-    /// including a Personal/unset selection). Returns `None` for the no-user,
-    /// non-admin, and zero-shared-workspaces states — the admin flag is
-    /// fail-closed `false` until loaded, so the picker is hidden at boot
-    /// (intended).
+    /// including a Personal/unset selection). When a failed workspace-map read
+    /// leaves nothing to pick, a static, non-selectable "Workspaces
+    /// unavailable" pill replaces it in the same footprint. Returns `None` for
+    /// the no-user, non-admin, and zero-shared-workspaces states — the admin
+    /// flag is fail-closed `false` until loaded, so the picker is hidden at
+    /// boot (intended).
     fn render_workspace_picker(&self) -> Option<Element<'_, Message>> {
         if self.selected_user_name.is_none() || !self.selected_user_is_admin {
             return None;
         }
+        // Nothing left to pick: the failed read renders a static, non-selectable
+        // failure pill in the picker's footprint. The error text lives only in
+        // the tooltip — it must never become an option of the dropdown.
         let options = shared_workspace_options(&self.workspaces);
-        // No shared workspaces exist — an inert placeholder dropdown would
-        // suggest a choice that isn't there; hide the picker instead.
+        if let Some(err) = self.picker_failure(&options) {
+            return Some(widgets::tooltip_hint(
+                container(
+                    text("Workspaces unavailable")
+                        .size(theme::TEXT_14)
+                        .color(theme::STATUS_ERROR),
+                )
+                .width(Length::Fixed(140.0))
+                .padding([theme::PAD_4, theme::PAD_8])
+                .style(theme::pill_style(theme::STATUS_ERROR.scale_alpha(0.08))),
+                err,
+            ));
+        }
         if options.is_empty() {
+            // No shared workspaces exist — an inert placeholder dropdown would
+            // suggest a choice that isn't there; hide the picker instead.
             return None;
         }
         if options.len() == 1 {
@@ -3167,13 +3311,13 @@ fn save_window_state(pos: iced::Point, size: iced::Size, selected_user: Option<&
 /// [`Message::WorkspacesReloaded`] handler re-resolves the live selection at
 /// apply time.
 ///
-/// On a transient read failure (the ticket's one scoped retry exception), it
+/// On a transient read failure — the one scoped retry in this reload path — it
 /// retries once after a short delay; if the retry also fails, it returns
-/// [`Message::Nop`] so the current (non-empty) map is preserved rather than
-/// wiped.
-async fn load_workspace_map() -> Message {
-    // Transient read failure: retry once after a short delay, then give up
-    // and keep the current map.
+/// [`Message::WorkspacesReloadFailed`] so the current (non-empty) map is
+/// preserved and the failure is rendered instead of silently vanishing.
+async fn load_workspace_map(generation: u64) -> Message {
+    // Transient read failure: retry once after a short delay, then report the
+    // failure while keeping the current map.
     let mut attempt = 0;
     let workspaces = loop {
         match read_workspace_map().await {
@@ -3184,12 +3328,18 @@ async fn load_workspace_map() -> Message {
                     attempt += 1;
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 } else {
-                    return Message::Nop;
+                    return Message::WorkspacesReloadFailed {
+                        error: e.to_string(),
+                        generation,
+                    };
                 }
             }
         }
     };
-    Message::WorkspacesReloaded(workspaces)
+    Message::WorkspacesReloaded {
+        workspaces,
+        generation,
+    }
 }
 
 /// Read the full workspace map from the store (one row per name).
@@ -3224,20 +3374,42 @@ fn resolve_workspace_selection(
 /// missing from the map (the boot path must complete). Because membership is
 /// admin-only, a non-admin's shared selection is clamped to their personal
 /// workspace by the primitive before this resolver ever sees it.
-async fn load_workspace_options(user: Option<String>) -> Message {
+///
+/// The read result travels to [`Dashboard::apply_boot_workspaces`] as-is: a
+/// failed boot read still completes with an empty map, but the failure is
+/// rendered by the workspace picker / Settings list instead of being
+/// indistinguishable from an installation with no workspaces.
+///
+/// `generation` is captured when the read is dispatched and travels back with
+/// it, so a reload that answered meanwhile supersedes this read.
+async fn load_workspace_options(user: Option<String>, generation: u64) -> Message {
     let prev = match user.as_deref() {
         Some(user) => crate::users::resolve_selected_workspace_name(user).await,
         None => None,
     };
-    let workspaces = read_workspace_map().await.unwrap_or_default();
     // The personal default is the impersonated user's `personal:{user}` name
     // (empty when no user is selected — no personal workspace exists yet).
     let personal_name = user
         .as_deref()
         .map(crate::users::personal_workspace_name)
         .unwrap_or_default();
-    let restored = resolve_workspace_selection(&workspaces, prev.as_deref(), &personal_name);
-    Message::BootWorkspaces(workspaces, restored)
+    let (workspaces, restored) = match read_workspace_map().await {
+        Ok(map) => {
+            let restored = resolve_workspace_selection(&map, prev.as_deref(), &personal_name);
+            (Ok(map), restored)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to load workspaces during boot");
+            // A failed read leaves no map to resolve against, i.e. the Personal
+            // default (nothing else can be selected from an unknown map).
+            (Err(e.to_string()), personal_name)
+        }
+    };
+    Message::BootWorkspaces {
+        workspaces,
+        restored_name: restored,
+        generation,
+    }
 }
 
 /// Build the footer workspace picker options from the shared workspace map:
@@ -3335,6 +3507,23 @@ mod tests {
         dash
     }
 
+    /// A `WorkspacesReloaded` for generation 0 — the generation a dashboard that
+    /// has not reloaded yet carries (the reload guard drops anything older).
+    fn reloaded(map: HashMap<String, Workspace>) -> Message {
+        Message::WorkspacesReloaded {
+            workspaces: map,
+            generation: 0,
+        }
+    }
+
+    /// [`reloaded`]'s failure counterpart.
+    fn reload_failed(error: &str) -> Message {
+        Message::WorkspacesReloadFailed {
+            error: error.to_string(),
+            generation: 0,
+        }
+    }
+
     #[test]
     fn workspaces_reloaded_replaces_map_and_falls_back_on_delete() {
         let mut dash = ready_dashboard();
@@ -3349,7 +3538,7 @@ mod tests {
             ("ws1".to_string(), ws("ws1")),
             ("ws3".to_string(), ws("ws3")),
         ]);
-        let _ = dash.update(Message::WorkspacesReloaded(new_map));
+        let _ = dash.update(reloaded(new_map));
         assert_eq!(dash.selected_workspace_name, None);
         assert!(dash.workspaces.contains_key("ws1"));
         assert!(dash.workspaces.contains_key("ws3"));
@@ -3361,7 +3550,7 @@ mod tests {
         // reload triggered while the selection was still None must not reset it.
         dash.selected_workspace_name = Some("ws3".to_string());
         let new_map2 = HashMap::from([("ws3".to_string(), ws("ws3"))]);
-        let _ = dash.update(Message::WorkspacesReloaded(new_map2));
+        let _ = dash.update(reloaded(new_map2));
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws3"));
     }
 
@@ -3374,8 +3563,49 @@ mod tests {
         let mut dash = ready_dashboard();
         dash.selected_workspace_name = Some("mahbot".to_string());
         let map = HashMap::from([("mahbot".to_string(), ws("mahbot"))]);
-        let _ = dash.update(Message::WorkspacesReloaded(map));
+        let _ = dash.update(reloaded(map));
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("mahbot"));
+    }
+
+    /// A workspace switch drops the board failure that described the previous
+    /// workspace: its banner must not paint over the board being loaded now.
+    #[test]
+    fn workspace_switch_clears_the_previous_board_failure() {
+        let mut dash = ready_dashboard();
+        dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
+        dash.board_state.load_state.fail("db down".to_string());
+
+        let _ = dash.propagate_workspace_selection("ws1");
+
+        assert!(dash.board_state.load_state.error().is_none());
+    }
+
+    /// A reload that lands after a newer one has answered is dropped: its
+    /// failure must not re-set the error over the map the newer read produced
+    /// (the reload retries for a second, so this window is real).
+    #[test]
+    fn stale_workspace_reload_outcomes_are_dropped() {
+        let mut dash = ready_dashboard();
+        dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
+        dash.workspaces_reload_gen = 2;
+
+        let _ = dash.update(Message::WorkspacesReloadFailed {
+            error: "db down".to_string(),
+            generation: 1,
+        });
+        assert!(
+            dash.workspaces_error.is_none(),
+            "a stale failure must not re-set the error"
+        );
+
+        let _ = dash.update(Message::WorkspacesReloaded {
+            workspaces: HashMap::from([("ws2".to_string(), ws("ws2"))]),
+            generation: 1,
+        });
+        assert!(
+            dash.workspaces.contains_key("ws1"),
+            "a stale map must not replace the newer one"
+        );
     }
 
     #[test]
@@ -3406,7 +3636,7 @@ mod tests {
         ]);
         // Admin active (shared membership): the shared workspace list appears.
         dash.selected_user_is_admin = true;
-        let _ = dash.update(Message::WorkspacesReloaded(map.clone()));
+        let _ = dash.update(reloaded(map.clone()));
 
         // Settings workspace list = map values sorted by name.
         let ws_names: Vec<&str> = dash
@@ -3420,8 +3650,76 @@ mod tests {
 
         // Non-admin active (fail-closed): the shared workspace list is emptied.
         dash.selected_user_is_admin = false;
-        let _ = dash.update(Message::WorkspacesReloaded(map));
+        let _ = dash.update(reloaded(map));
         assert!(dash.settings_state.workspaces_state.workspaces.is_empty());
+    }
+
+    /// A failed workspace-map read is a persistent, visible state: the current
+    /// map is preserved, the failure stays on the Dashboard for the picker and
+    /// the Settings list, and a later successful reload clears it.
+    #[test]
+    fn workspaces_reload_failure_sets_and_clears_error() {
+        let mut dash = ready_dashboard();
+        dash.selected_user_is_admin = true;
+        dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
+
+        let _ = dash.update(reload_failed("db down"));
+
+        assert_eq!(dash.workspaces_error.as_deref(), Some("db down"));
+        assert!(
+            dash.workspaces.contains_key("ws1"),
+            "a failed reload must preserve the current map"
+        );
+        assert!(
+            dash.picker_failure(&shared_workspace_options(&dash.workspaces))
+                .is_none(),
+            "a preserved map keeps the picker working — the pill is for a read that left nothing to pick"
+        );
+
+        let new_map = HashMap::from([("ws2".to_string(), ws("ws2"))]);
+        let _ = dash.update(reloaded(new_map));
+
+        assert!(dash.workspaces_error.is_none());
+    }
+
+    /// A failed boot read still completes boot: the map stays empty and the
+    /// failure is carried so the picker / Settings list can render it.
+    #[test]
+    fn boot_workspace_read_failure_completes_with_error_state() {
+        let mut dash = Dashboard::loading();
+
+        let _ = dash.apply_boot_workspaces(Err("boot read failed".to_string()), "", 0);
+
+        assert_eq!(dash.workspaces_error.as_deref(), Some("boot read failed"));
+        assert!(dash.workspaces.is_empty());
+        assert_eq!(
+            dash.picker_failure(&shared_workspace_options(&dash.workspaces)),
+            Some("boot read failed"),
+            "a read that left nothing to pick must show the failure in the picker"
+        );
+    }
+
+    /// A reload that answered while the boot read was in flight read the same
+    /// table later: its map (and its cleared failure) stands, and the boot read's
+    /// outcome is dropped.
+    #[test]
+    fn late_boot_read_does_not_replace_a_newer_reload() {
+        let mut dash = Dashboard::loading();
+        let read_generation = dash.workspaces_reload_gen;
+        dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
+        dash.workspaces_reload_gen = read_generation + 1; // a reload answered
+
+        let _ =
+            dash.apply_boot_workspaces(Err("boot read failed".to_string()), "", read_generation);
+
+        assert!(
+            dash.workspaces_error.is_none(),
+            "the superseded boot read must not set the failure over the newer read"
+        );
+        assert!(
+            dash.workspaces.contains_key("ws1"),
+            "the superseded boot read must not clear the newer map"
+        );
     }
 
     /// The DB-sourced boot resolution: an admin (permissions='full') with a
@@ -3462,13 +3760,16 @@ mod tests {
         }
 
         // Admin with a shared stored workspace present in the map → restored.
-        let Message::BootWorkspaces(map, restored) =
-            load_workspace_options(Some("boot_admin_gui".to_string())).await
+        let Message::BootWorkspaces {
+            workspaces: Ok(map),
+            restored_name,
+            ..
+        } = load_workspace_options(Some("boot_admin_gui".to_string()), 0).await
         else {
-            panic!("expected BootWorkspaces");
+            panic!("expected BootWorkspaces with a loaded map");
         };
         assert!(map.contains_key("boot_ws_gui"));
-        assert_eq!(restored, "boot_ws_gui");
+        assert_eq!(restored_name, "boot_ws_gui");
 
         for (user, why, expected) in [
             (
@@ -3493,11 +3794,13 @@ mod tests {
             ),
             (None, "no user selected", ""),
         ] {
-            let Message::BootWorkspaces(_, restored) = load_workspace_options(user).await else {
+            let Message::BootWorkspaces { restored_name, .. } =
+                load_workspace_options(user, 0).await
+            else {
                 panic!("expected BootWorkspaces");
             };
             assert_eq!(
-                restored, expected,
+                restored_name, expected,
                 "{why} must resolve to the Personal default"
             );
         }

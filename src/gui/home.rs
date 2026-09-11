@@ -224,6 +224,17 @@ fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
     .into()
 }
 
+/// The transcript a chat-history read belongs to: the selected user and the
+/// visible chat's primary workspace. A result (entries or failure) carrying a key
+/// that no longer matches the current selection belongs to a transcript the page
+/// has left and must not be applied. Its fields are private, so only this module
+/// builds one — a key cannot be assembled with the wrong meaning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryReadKey {
+    user: String,
+    workspace: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum HomeMessage {
     /// User selected (from picker, Users page icon, or auto-selected at boot).
@@ -234,10 +245,19 @@ pub enum HomeMessage {
     InputChanged(super::editor_widget::EditorAction),
     /// Send button pressed or Enter key in editor.
     SendMessage,
-    /// Chat history loaded from the store (entries, has_more).
-    HistoryLoaded(Vec<ChatHistoryEntry>, bool),
-    /// History load failed.
-    HistoryLoadError(String),
+    /// Chat history loaded from the store (entries, has_more), carrying the
+    /// [`HistoryReadKey`] the read was issued under: a successful read for a
+    /// transcript the page has since left must not replace the current one (nor
+    /// clear the failure of the one it left behind).
+    HistoryLoaded {
+        entries: Vec<ChatHistoryEntry>,
+        has_more: bool,
+        key: HistoryReadKey,
+    },
+    /// History load failed. Carries the key (selected user, primary workspace)
+    /// the read was issued under, so a failure for a transcript the page has
+    /// since left is dropped.
+    HistoryLoadError { key: HistoryReadKey, error: String },
     /// Live chat event from CHAT_BROADCAST subscription.
     ChatEvent(crate::ChatEvent),
     /// Stream lagged — resync needed.
@@ -248,10 +268,12 @@ pub enum HomeMessage {
     LoadOlderMessages,
     /// Older history loaded (entries, has_more, pagination_gen for staleness check).
     OlderHistoryLoaded(Vec<ChatHistoryEntry>, bool, u64),
-    /// Older history load failed.
-    OlderHistoryLoadError(String),
+    /// Older history load failed (error, pagination_gen for staleness check).
+    OlderHistoryLoadError(String, u64),
     /// User list loaded for the picker.
     UsersLoaded(Vec<PickOption>),
+    /// User list load failed (store read error or uninitialized store).
+    UsersLoadError(String),
     /// Markdown link was clicked.
     LinkClicked(String),
     /// Request a workspace change at the Dashboard level (reverse sync:
@@ -370,6 +392,9 @@ pub struct HomeState {
     /// Whether an older-messages load is in-flight.
     loading_older: bool,
     /// Generation counter for stale OlderHistoryLoaded callback detection.
+    /// Advanced only by [`Self::reset_pagination_state`], which clears
+    /// `loading_older` with it — so a result dropped as stale can never leave
+    /// the "load older" action stuck.
     pagination_gen: u64,
     /// Undo/redo stack for the chat input text editor.
     undo_stack: super::common::UndoStack,
@@ -386,6 +411,18 @@ pub struct HomeState {
     /// draft capture is suppressed so it cannot land on the stale key;
     /// restore runs at the completing cascade instead.
     context_resolving: bool,
+    /// Persistent failure of the last chat-history read for the current
+    /// context. Rendered in place of the empty-chat hint so a failed read is
+    /// never mistaken for a legitimately empty history; cleared on the next
+    /// successful load.
+    history_error: Option<String>,
+    /// Persistent failure of the last user-list read. Rendered in place of
+    /// the "no user selected" hint; cleared on the next successful load.
+    users_error: Option<String>,
+    /// Persistent failure of the last "load older messages" read. Rendered
+    /// above the transcript so a failed read is never mistaken for "nothing
+    /// older exists"; cleared on the next successful load.
+    older_history_error: Option<String>,
 }
 
 /// The chat view for the selected user: two workspaces — the picker-resolved
@@ -442,6 +479,9 @@ impl HomeState {
             drafts: crate::channels::chat_draft::DraftStore::global().clone(),
             draft_save: super::common::DebounceState::new(),
             context_resolving: false,
+            history_error: None,
+            users_error: None,
+            older_history_error: None,
         }
     }
 
@@ -451,18 +491,22 @@ impl HomeState {
         Task::perform(
             async {
                 let Some(store) = crate::users::USER_STORE.get() else {
-                    return Vec::new();
+                    return Err("user store is not initialized".to_string());
                 };
-                let users = store.list_users().await.unwrap_or_default();
-                users
-                    .iter()
-                    .map(|u| PickOption {
-                        value: u.name.clone(),
-                        label: u.name.clone(),
-                    })
-                    .collect()
+                store.list_users().await.map_err(|e| e.to_string())
             },
-            HomeMessage::UsersLoaded,
+            |result| match result {
+                Ok(users) => HomeMessage::UsersLoaded(
+                    users
+                        .iter()
+                        .map(|entry| PickOption {
+                            value: entry.record.name.clone(),
+                            label: entry.record.name.clone(),
+                        })
+                        .collect(),
+                ),
+                Err(e) => HomeMessage::UsersLoadError(e),
+            },
         )
     }
 
@@ -504,6 +548,26 @@ impl HomeState {
             },
         };
         Some(chat)
+    }
+
+    /// The selected user, the visible chat, and the [`HistoryReadKey`] a history
+    /// read is issued under — one definition, so the dispatch and the staleness
+    /// checks cannot disagree about what a read belongs to.
+    fn history_read_context(&self) -> Option<(String, VisibleChat, HistoryReadKey)> {
+        let user = self.selected_user.clone()?;
+        let chat = self.visible_workspaces()?;
+        let key = HistoryReadKey {
+            user: user.clone(),
+            workspace: chat.primary.clone(),
+        };
+        Some((user, chat, key))
+    }
+
+    /// The key a chat-history read is issued under: the selected user and the
+    /// transcript's primary workspace. A result whose key no longer matches the
+    /// current selection belongs to a transcript the page has left.
+    fn history_read_key(&self) -> Option<HistoryReadKey> {
+        self.history_read_context().map(|(_, _, key)| key)
     }
 
     /// Whether a message or typing event in `workspace` belongs to the
@@ -581,11 +645,7 @@ impl HomeState {
     /// Refresh chat history from the store for the current user's visible
     /// workspaces (the selected workspace plus the user's personal workspace).
     fn refresh_history(&self) -> Task<HomeMessage> {
-        let user_name = match &self.selected_user {
-            Some(s) => s.clone(),
-            None => return Task::none(),
-        };
-        let Some(chat) = self.visible_workspaces() else {
+        let Some((user_name, chat, key)) = self.history_read_context() else {
             return Task::none();
         };
         Task::perform(
@@ -596,9 +656,13 @@ impl HomeState {
                     .await
                     .map_err(|e| e.to_string())
             },
-            |result| match result {
-                Ok((entries, has_more)) => HomeMessage::HistoryLoaded(entries, has_more),
-                Err(e) => HomeMessage::HistoryLoadError(e),
+            move |result| match result {
+                Ok((entries, has_more)) => HomeMessage::HistoryLoaded {
+                    entries,
+                    has_more,
+                    key,
+                },
+                Err(e) => HomeMessage::HistoryLoadError { error: e, key },
             },
         )
     }
@@ -612,10 +676,11 @@ impl HomeState {
 
     /// Reset pagination and auto-scroll state. Called at all cleanup sites
     /// (user change, workspace change, clear, stream lag).
-    const fn reset_pagination_state(&mut self) {
+    fn reset_pagination_state(&mut self) {
         self.oldest_loaded_id = None;
         self.has_more = false;
         self.loading_older = false;
+        self.older_history_error = None;
         self.auto_scroll_enabled = true;
         self.pagination_gen = self.pagination_gen.wrapping_add(1);
     }
@@ -627,6 +692,9 @@ impl HomeState {
         self.history_loaded = false;
         self.onboarding_script_active = false;
         self.pending_reply = None;
+        // The transcript this failure described is gone; the read that follows
+        // reports its own outcome.
+        self.history_error = None;
         self.reset_pagination_state();
     }
     /// Resolve the draft key: `(selected_user, resolved send-target
@@ -899,17 +967,32 @@ impl HomeState {
             } else {
                 "No messages yet. Type something below to start."
             };
-            container(
+            // A failed read must render in place of the empty hint and stay
+            // until a successful read replaces it — a log line or toast is
+            // not enough.
+            let body: Element<'_, HomeMessage> = if let Some(err) = &self.history_error {
+                super::widgets::error_banner(err)
+            } else if self.selected_user.is_none() {
+                match &self.users_error {
+                    Some(err) => super::widgets::error_banner(err),
+                    None => text(empty_hint)
+                        .color(theme::TEXT_SECONDARY)
+                        .size(theme::TEXT_13)
+                        .into(),
+                }
+            } else {
                 text(empty_hint)
                     .color(theme::TEXT_SECONDARY)
-                    .size(theme::TEXT_13),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .style(theme::base_container_style)
-            .into()
+                    .size(theme::TEXT_13)
+                    .into()
+            };
+            container(body)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(theme::base_container_style)
+                .into()
         } else {
             // Build message bubbles with typing indicator.
             let mut children: Vec<Element<'_, HomeMessage>> = self
@@ -1111,6 +1194,27 @@ impl HomeState {
                 // inset (8 pre-rework column padding, now the wrapper's) —
                 // kept untrimmed so the pill stays 4px deeper than bubbles.
                 children.insert(0, container(load_btn).padding(theme::PAD_4).into());
+            }
+
+            // A failed history read must not leave the transcript looking
+            // current: the failure stays above the loaded messages until a read
+            // succeeds. (This is the resync case — with an empty transcript the
+            // same failure renders in the empty state above.)
+            if let Some(err) = &self.history_error {
+                children.insert(
+                    0,
+                    super::widgets::scroll_h_inset(super::widgets::error_banner(err)),
+                );
+            }
+
+            // A failed "load older" read must not leave the transcript looking
+            // as if nothing older existed: the failure stays above the loaded
+            // messages until a later load succeeds.
+            if let Some(err) = &self.older_history_error {
+                children.insert(
+                    0,
+                    super::widgets::scroll_h_inset(super::widgets::error_banner(err)),
+                );
             }
 
             super::widgets::page_bare(super::widgets::vscroll_tracked(
@@ -1401,7 +1505,21 @@ impl HomeState {
                 self.refresh_history()
             }
             HomeMessage::SendMessage => self.send_message(),
-            HomeMessage::HistoryLoaded(entries, has_more) => {
+            HomeMessage::HistoryLoaded {
+                entries,
+                has_more,
+                key,
+            } => {
+                // A read issued for a transcript the page has since left must not
+                // replace the current one — nor clear the failure of the one it
+                // left behind.
+                if self.history_read_key().as_ref() != Some(&key) {
+                    return Task::none();
+                }
+                self.history_error = None;
+                // A fresh transcript has not attempted to page further back, so
+                // a previous transcript's failed "load older" no longer applies.
+                self.older_history_error = None;
                 // Track oldest loaded ID and whether more exist for pagination.
                 self.oldest_loaded_id = entries.first().map(|e| e.id);
                 self.has_more = has_more;
@@ -1413,11 +1531,17 @@ impl HomeState {
                 let onboarding = self.maybe_start_onboarding();
                 Task::batch([self.maybe_snap(), onboarding])
             }
-            HomeMessage::HistoryLoadError(e) => {
-                tracing::warn!(error = %e, "Home: failed to load chat history");
+            HomeMessage::HistoryLoadError { key, error } => {
+                // A read issued for a user/workspace the page has since left must
+                // not paint its failure over the current transcript.
+                tracing::warn!(error = %error, "Home: failed to load chat history");
+                if self.history_read_key().as_ref() == Some(&key) {
+                    self.history_error = Some(error);
+                }
                 Task::none()
             }
             HomeMessage::UsersLoaded(options) => {
+                self.users_error = None;
                 // If no user is selected, auto-select the first one (admin at boot).
                 if self.selected_user.is_none() && !options.is_empty() {
                     let first = options[0].value.clone();
@@ -1433,6 +1557,11 @@ impl HomeState {
                 }
                 Task::none()
             }
+            HomeMessage::UsersLoadError(e) => {
+                tracing::warn!(error = %e, "Home: failed to load users");
+                self.users_error = Some(e);
+                Task::none()
+            }
             HomeMessage::ClearChat => {
                 // Clear messages synchronously first (prevents flash).
                 self.messages.clear();
@@ -1441,6 +1570,9 @@ impl HomeState {
                 self.typing = false;
                 self.typing_tick_state = 0;
                 self.pending_reply = None;
+                // The transcript this failure described is gone; the reload the
+                // `ChatCleared` callback issues reports its own outcome.
+                self.history_error = None;
                 self.reset_pagination_state();
                 // Capture synchronously (not from the ChatCleared callback):
                 // the reply is dropped but the draft text is kept, and the
@@ -1675,21 +1807,22 @@ impl HomeState {
                                 before_id,
                             )
                             .await
-                            .map(|(entries, has_more)| (entries, has_more, generation))
                             .map_err(|e| e.to_string())
                     },
-                    |result| match result {
-                        Ok((entries, has_more, generation)) => {
+                    move |result| match result {
+                        Ok((entries, has_more)) => {
                             HomeMessage::OlderHistoryLoaded(entries, has_more, generation)
                         }
-                        Err(e) => HomeMessage::OlderHistoryLoadError(e),
+                        Err(e) => HomeMessage::OlderHistoryLoadError(e, generation),
                     },
                 )
             }
             HomeMessage::OlderHistoryLoaded(display_entries, has_more, generation) => {
-                // Guard against stale callbacks.
+                // Stale-result guard: `pagination_gen` advances only through
+                // `reset_pagination_state` (which clears `loading_older`), so a
+                // dropped result cannot strand the action — and clearing the flag
+                // here could take it away from a newer load already in flight.
                 if generation != self.pagination_gen {
-                    self.loading_older = false;
                     return Task::none();
                 }
                 // Prepend entries to the beginning of messages.
@@ -1697,6 +1830,7 @@ impl HomeState {
                     .into_iter()
                     .map(DisplayMessage::from)
                     .collect();
+                self.older_history_error = None;
                 // Track seen_ids for the prepended messages.
                 for msg in &prepended {
                     self.seen_ids.insert(msg.message_id.clone());
@@ -1710,9 +1844,18 @@ impl HomeState {
                 // Snap to end if auto-scroll enabled.
                 self.maybe_snap()
             }
-            HomeMessage::OlderHistoryLoadError(msg) => {
+            HomeMessage::OlderHistoryLoadError(msg, generation) => {
+                // Stale-result guard, mirroring `OlderHistoryLoaded`: a failed
+                // read for a transcript the page has left must not pin its
+                // failure on the current one (nor touch its in-flight flag).
+                if generation != self.pagination_gen {
+                    return Task::none();
+                }
+                // The persistent banner is the signal; a toast here would report
+                // the same failure a second time and then vanish.
                 self.loading_older = false;
-                Task::done(HomeMessage::Toast(ToastMessage::Error(msg)))
+                self.older_history_error = Some(msg);
+                Task::none()
             }
             HomeMessage::Toast(_) | HomeMessage::RequestWorkspaceChange(_) => {
                 // Intercepted by the Dashboard (Toast → toast stack,
@@ -2084,6 +2227,115 @@ mod tests {
         let _ = state.update(HomeMessage::UserSelected("alice".to_string()));
         let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws1".to_string())));
         assert_eq!(state.editor_content.text(), "h");
+    }
+
+    #[test]
+    fn failed_reads_stay_set_until_a_successful_load() {
+        let mut state = HomeState::new();
+        state.selected_user = Some("alice".to_string());
+
+        // A failed history read is retained; a successful load clears it.
+        let key = state
+            .history_read_key()
+            .expect("a selected user resolves a read key");
+        let _ = state.update(HomeMessage::HistoryLoadError {
+            key: key.clone(),
+            error: "db down".to_string(),
+        });
+        assert_eq!(state.history_error.as_deref(), Some("db down"));
+
+        // A failure whose key no longer matches the current selection belongs to
+        // a transcript the page has left: it must not overwrite the current one.
+        let stale_key = HistoryReadKey {
+            user: "bob".to_string(),
+            workspace: "personal:bob".to_string(),
+        };
+        let _ = state.update(HomeMessage::HistoryLoadError {
+            key: stale_key.clone(),
+            error: "stale".to_string(),
+        });
+        assert_eq!(state.history_error.as_deref(), Some("db down"));
+
+        // Neither may a successful read of that left transcript: applying it
+        // would replace the current transcript and clear the failure it shows.
+        let _ = state.update(HomeMessage::HistoryLoaded {
+            entries: Vec::new(),
+            has_more: false,
+            key: stale_key,
+        });
+        assert_eq!(
+            state.history_error.as_deref(),
+            Some("db down"),
+            "a stale successful read must not clear the current failure"
+        );
+
+        let _ = state.update(HomeMessage::HistoryLoaded {
+            entries: Vec::new(),
+            has_more: false,
+            key: key.clone(),
+        });
+        assert!(state.history_error.is_none());
+
+        // A transcript replacement drops the failure with the transcript it
+        // described; the read that follows reports its own outcome.
+        let _ = state.update(HomeMessage::HistoryLoadError {
+            key: key.clone(),
+            error: "db down".to_string(),
+        });
+        state.reset_chat_state();
+        assert!(state.history_error.is_none());
+
+        // Same for a cleared chat, which reloads through its own callback.
+        let _ = state.update(HomeMessage::HistoryLoadError {
+            key,
+            error: "db down".to_string(),
+        });
+        let _ = state.update(HomeMessage::ClearChat);
+        assert!(state.history_error.is_none());
+
+        // Same for the user list: the failure survives until a load succeeds.
+        let _ = state.update(HomeMessage::UsersLoadError("db down".to_string()));
+        assert_eq!(state.users_error.as_deref(), Some("db down"));
+        let _ = state.update(HomeMessage::UsersLoaded(Vec::new()));
+        assert!(state.users_error.is_none());
+
+        // Same for the older-messages read: the failure survives until a load
+        // succeeds.
+        let generation = state.pagination_gen;
+        let _ = state.update(HomeMessage::OlderHistoryLoadError(
+            "db down".to_string(),
+            generation,
+        ));
+        assert_eq!(state.older_history_error.as_deref(), Some("db down"));
+        let _ = state.update(HomeMessage::OlderHistoryLoaded(
+            Vec::new(),
+            false,
+            generation,
+        ));
+        assert!(state.older_history_error.is_none());
+
+        // A paging failure from a transcript the page has left is dropped, like
+        // its successful counterpart.
+        let _ = state.update(HomeMessage::OlderHistoryLoadError(
+            "stale".to_string(),
+            generation.wrapping_sub(1),
+        ));
+        assert!(state.older_history_error.is_none());
+
+        // A fresh transcript drops a stale older-messages failure: it belongs
+        // to the transcript that was replaced.
+        let _ = state.update(HomeMessage::OlderHistoryLoadError(
+            "db down".to_string(),
+            state.pagination_gen,
+        ));
+        let _ = state.update(HomeMessage::HistoryLoaded {
+            entries: Vec::new(),
+            has_more: false,
+            key: state
+                .history_read_key()
+                .expect("a selected user resolves a key"),
+        });
+        assert!(state.older_history_error.is_none());
     }
 
     fn make_msg(

@@ -42,7 +42,12 @@ pub(crate) enum BoardMessage {
         tickets: Vec<Ticket>,
         generation: u64,
     },
-    RefreshError(String),
+    /// A failed board read. Carries the board generation captured at dispatch,
+    /// mirroring [`BoardMessage::Refreshed`], so a stale failure is dropped.
+    RefreshError {
+        error: String,
+        generation: u64,
+    },
     /// A ticket change delivered by the CDC change stream (see
     /// [`crate::db::cdc`]). The board applies the delta idempotently by ticket id.
     TicketChanged(Box<crate::db::cdc::ChangeEvent>),
@@ -140,6 +145,9 @@ pub(crate) enum BoardMessage {
     /// Search results returned from async FTS query.
     /// Carries a generation counter for stale-callback detection.
     SearchResults(Vec<Ticket>, u64),
+    /// The async FTS query failed. Carries the generation counter so a stale
+    /// failure cannot replace the results of a newer search.
+    SearchError(String, u64),
     /// Clear the active search and restore the normal ticket list.
     SearchCleared,
 }
@@ -217,6 +225,10 @@ pub struct BoardState {
     pub(crate) search_query: super::common::SingleLineEditorState,
     /// Search results, populated when `search_query` is non-empty.
     pub(crate) search_results: Vec<Ticket>,
+    /// Last FTS search failure for the active query. Rendered in the sidebar
+    /// instead of "No matching tickets" until a successful search or a cleared
+    /// search replaces it.
+    pub(crate) search_error: Option<String>,
     /// Incremented on each new search; stale callbacks check this before
     /// applying results. Follows the same pattern as `commit_stats_generation`.
     pub(crate) search_generation: u64,
@@ -255,6 +267,7 @@ impl BoardState {
             undo_stack: super::common::UndoStack::new(),
             search_query: super::common::SingleLineEditorState::new(""),
             search_results: Vec::new(),
+            search_error: None,
             search_generation: 0,
         }
     }
@@ -329,7 +342,10 @@ impl BoardState {
                     tickets,
                     generation,
                 },
-                Err(e) => BoardMessage::RefreshError(e),
+                Err(e) => BoardMessage::RefreshError {
+                    error: e,
+                    generation,
+                },
             },
         )
     }
@@ -522,6 +538,8 @@ impl BoardState {
             }
             self.tickets = merged;
         }
+        // A successful snapshot replaces any previous load failure.
+        self.load_state.clear_error();
         self.load_state.finish_loading();
     }
 
@@ -898,8 +916,13 @@ impl BoardState {
                 }
                 Task::none()
             }
-            BoardMessage::RefreshError(e) => {
-                self.load_state.fail(e);
+            BoardMessage::RefreshError { error, generation } => {
+                // Stale-result guard, mirroring `Refreshed`: a failed read for a
+                // workspace/refresh the board has since left must not paint its
+                // failure over the current list.
+                if generation == self.board_generation {
+                    self.load_state.fail(error);
+                }
                 Task::none()
             }
             BoardMessage::TicketChanged(event) => self.apply_ticket_change(&event),
@@ -1331,6 +1354,7 @@ impl BoardState {
 
                 if query.is_empty() {
                     self.search_results.clear();
+                    self.search_error = None;
                     return Task::none();
                 }
 
@@ -1359,7 +1383,7 @@ impl BoardState {
                     },
                     move |res| match res {
                         Ok(tickets) => BoardMessage::SearchResults(tickets, generation),
-                        Err(_) => BoardMessage::SearchResults(vec![], generation),
+                        Err(e) => BoardMessage::SearchError(e, generation),
                     },
                 )
             }
@@ -1367,12 +1391,23 @@ impl BoardState {
                 if generation == self.search_generation {
                     // Apply only if still the latest generation (stale callback guard)
                     self.search_results = tickets;
+                    self.search_error = None;
+                }
+                Task::none()
+            }
+            BoardMessage::SearchError(e, generation) => {
+                if generation == self.search_generation {
+                    // A failed search is not an empty result: drop any previous
+                    // results and render the failure instead.
+                    self.search_results.clear();
+                    self.search_error = Some(e);
                 }
                 Task::none()
             }
             BoardMessage::SearchCleared => {
                 self.search_query.clear();
                 self.search_results.clear();
+                self.search_error = None;
                 self.search_generation += 1;
                 Task::none()
             }
@@ -2995,6 +3030,7 @@ mod tests {
                 .build(),
         ];
         state.search_generation = 5;
+        state.search_error = Some("old failure".to_string());
 
         let _task = state.update(BoardMessage::SearchInputChanged(EditorAction::Paste(
             String::new(),
@@ -3002,6 +3038,7 @@ mod tests {
 
         assert!(state.search_query.text().is_empty());
         assert!(state.search_results.is_empty());
+        assert!(state.search_error.is_none());
         // Generation bumped even on empty — invalidates any in-flight tasks
         assert_eq!(state.search_generation, 6);
     }
@@ -3021,6 +3058,35 @@ mod tests {
             state.search_generation > 3,
             "generation should be incremented"
         );
+    }
+
+    /// A failed board list read stays visible until a successful refresh replaces it.
+    #[test]
+    fn refresh_error_is_visible_until_a_successful_refresh() {
+        let mut state = make_board_state();
+
+        let _ = state.update(BoardMessage::RefreshError {
+            error: "db down".to_string(),
+            generation: state.board_generation,
+        });
+        assert_eq!(state.load_state.error(), Some("db down"));
+        assert!(!state.load_state.has_loaded());
+
+        // A failure carrying a stale generation must not overwrite the current
+        // list's load state.
+        let stale_generation = state.board_generation.wrapping_sub(1);
+        let _ = state.update(BoardMessage::RefreshError {
+            error: "stale".to_string(),
+            generation: stale_generation,
+        });
+        assert_eq!(state.load_state.error(), Some("db down"));
+
+        let _ = state.update(BoardMessage::Refreshed {
+            tickets: Vec::new(),
+            generation: state.board_generation,
+        });
+        assert!(state.load_state.error().is_none());
+        assert!(state.load_state.has_loaded());
     }
 
     #[test]
@@ -3049,6 +3115,7 @@ mod tests {
         let mut state = make_board_state();
         state.search_query.set_text("network");
         state.search_generation = 42;
+        state.search_error = Some("previous failure".to_string());
 
         let _task = state.update(BoardMessage::SearchResults(
             vec![
@@ -3061,6 +3128,42 @@ mod tests {
 
         assert_eq!(state.search_results.len(), 1);
         assert_eq!(state.search_results[0].id, "T-fresh");
+        assert!(
+            state.search_error.is_none(),
+            "a successful search must clear the previous failure"
+        );
+    }
+
+    #[test]
+    fn test_search_error_current_generation_sets_error_and_clears_results() {
+        let mut state = make_board_state();
+        state.search_generation = 7;
+        state.search_results = vec![
+            TicketFixture::new("T-stale", TicketPhase::Backlog)
+                .title("Stale result")
+                .build(),
+        ];
+
+        let _task = state.update(BoardMessage::SearchError("fts unavailable".to_string(), 7));
+
+        assert!(
+            state.search_results.is_empty(),
+            "a failed search must not keep rendering stale results"
+        );
+        assert_eq!(state.search_error.as_deref(), Some("fts unavailable"));
+    }
+
+    #[test]
+    fn test_search_error_stale_callback_discarded() {
+        let mut state = make_board_state();
+        state.search_generation = 9;
+
+        let _task = state.update(BoardMessage::SearchError("old failure".to_string(), 3));
+
+        assert!(
+            state.search_error.is_none(),
+            "a stale failure must not replace the current search state"
+        );
     }
 
     #[test]

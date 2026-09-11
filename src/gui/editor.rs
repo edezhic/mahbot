@@ -114,6 +114,11 @@ const GLOBAL_SEARCH_MATCHES_PER_FILE: usize = 20;
 /// Debounce delay for global search query input (milliseconds).
 const GLOBAL_SEARCH_DEBOUNCE_MS: u64 = 300;
 
+/// Shown with a failed saved-tabs restore: the restore failure blocks tab
+/// persistence for the session, and that consequence belongs in the failure the
+/// person sees.
+const TABS_SAVE_PAUSED: &str = "tab saving is paused until this is resolved";
+
 /// Check whether a file name is an OS-generated metadata file that should
 /// be hidden from the file tree.
 #[must_use]
@@ -433,9 +438,12 @@ pub enum EditorMessage {
         r#gen: u64,
         result: Result<FileLoadData, String>,
     },
-    /// Saved tabs were loaded from the database with file contents.
+    /// Saved tabs were loaded from the database with file contents. `Err`
+    /// carries a restore failure (DB read or a non-`NotFound` per-file read);
+    /// the persisted tabs are then left untouched and saving is blocked until
+    /// a successful reload.
     SavedTabsLoaded {
-        tabs_data: Vec<SavedTabData>,
+        tabs_data: Result<Vec<SavedTabData>, String>,
         r#gen: u64,
     },
     /// User selected an existing tab.
@@ -1388,7 +1396,16 @@ pub struct EditorState {
     /// Pending close action to execute after the next successful save.
     pending_close: Option<PendingCloseAction>,
     /// Whether the workspace tabs have been loaded at least once this session.
+    /// Set by a successful restore and by opening a file directly; a failed
+    /// restore leaves it false. Independent of [`Self::tabs_error`]: opening a
+    /// file after a failed restore sets this flag but does not clear that one.
     session_initialized: bool,
+    /// Persistent failure of the last saved-tabs restore, as shown: the read
+    /// error plus its consequence. While set, tab persistence stays blocked so
+    /// an incomplete/empty in-memory set can never overwrite the still-intact
+    /// persisted tabs, and the message is rendered until a successful reload
+    /// replaces it.
+    tabs_error: Option<String>,
     /// When Enter expands a directory that needs async loading, this holds
     /// the directory path so DirExpanded can advance focus to the first child.
     pending_enter_dir: Option<String>,
@@ -1492,6 +1509,7 @@ impl EditorState {
             tab_viewport_w: None,
             pending_close: None,
             session_initialized: false,
+            tabs_error: None,
             pending_enter_dir: None,
             git_status_cache: HashMap::new(),
             git_status_loading: false,
@@ -1803,13 +1821,14 @@ impl EditorState {
     ///
     /// Returns a task that performs the async DB write, or [`None`] if:
     /// - Tabs haven't been initialized yet this session
+    /// - The saved-tabs restore failed (saving would delete the persisted set)
     /// - No workspace is selected
     ///
     /// Uses the shared atomic counter for stale-result prevention: the pre-write
     /// guard inside the async task checks whether a newer save has superseded
     /// this one before writing.
     fn try_save_current_tabs(&self) -> Option<Task<EditorMessage>> {
-        if !self.session_initialized {
+        if !self.session_initialized || self.tabs_error.is_some() {
             return None;
         }
         let workspace_name = self.selected_workspace_name.as_ref()?;
@@ -2159,6 +2178,7 @@ impl EditorState {
         self.git_dirty_mtimes = None;
         self.ignore_matcher = None;
         self.session_initialized = false;
+        self.tabs_error = None;
         self.active_modal = None;
         self.pending_close = None;
         self.file_tree.visible_tree_nodes.clear();
@@ -2447,6 +2467,10 @@ impl EditorState {
     // ── Extracted handler methods ────────────────────────────────────
 
     /// Handle workspace selection — initializes file tree, loads tabs, sets up workspace.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one branch per workspace-selection step; splitting would scatter the generation-counter bookkeeping"
+    )]
     fn workspace_selected(&mut self, name: &str, path: Option<&str>) -> Task<EditorMessage> {
         // An empty name with no path is the "no workspace selected" clear.
         // Personal workspaces arrive as a named `personal:{user}` selection
@@ -2501,10 +2525,16 @@ impl EditorState {
         let load_tabs_task = Task::perform(
             async move {
                 let store = crate::workspace::store();
-                let records = store.load_editor_tabs(&tab_ws).await.unwrap_or_else(|e| {
-                    tracing::warn!(?e, workspace = %tab_ws, "Failed to load editor tabs");
-                    Vec::new()
-                });
+                let records = match store.load_editor_tabs(&tab_ws).await {
+                    Ok(records) => records,
+                    Err(e) => {
+                        tracing::warn!(?e, workspace = %tab_ws, "Failed to load editor tabs");
+                        return EditorMessage::SavedTabsLoaded {
+                            tabs_data: Err(format!("failed to load saved editor tabs: {e}")),
+                            r#gen: tab_gen,
+                        };
+                    }
+                };
                 let ws_path = tab_path;
 
                 let mut loaded: Vec<SavedTabData> = Vec::new();
@@ -2530,14 +2560,29 @@ impl EditorState {
 
                     let loaded_text = if let Some(dirty) = record.dirty_content.clone() {
                         Some(dirty)
-                    } else if let Ok(bytes) = tokio::fs::read(&file_path).await {
-                        if validate_file_content(&bytes).is_ok() {
-                            String::from_utf8(bytes).ok()
-                        } else {
-                            None
-                        }
                     } else {
-                        None
+                        match tokio::fs::read(&file_path).await {
+                            Ok(bytes) => {
+                                if validate_file_content(&bytes).is_ok() {
+                                    String::from_utf8(bytes).ok()
+                                } else {
+                                    None
+                                }
+                            }
+                            // A missing file is a legitimate absence — the tab
+                            // is dropped. Any other read failure leaves the
+                            // restore set incomplete, so it must surface.
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(e) => {
+                                tracing::warn!(?e, path = %file_path, "Failed to read saved editor tab");
+                                return EditorMessage::SavedTabsLoaded {
+                                    tabs_data: Err(format!(
+                                        "failed to read saved tab {file_path}: {e}"
+                                    )),
+                                    r#gen: tab_gen,
+                                };
+                            }
+                        }
                     };
 
                     if let Some(text) = loaded_text {
@@ -2552,7 +2597,7 @@ impl EditorState {
                     }
                 }
                 EditorMessage::SavedTabsLoaded {
-                    tabs_data: loaded,
+                    tabs_data: Ok(loaded),
                     r#gen: tab_gen,
                 }
             },
@@ -2623,12 +2668,28 @@ impl EditorState {
     /// builds Tab/TabData structures.
     fn saved_tabs_loaded(
         &mut self,
-        tabs_data: Vec<SavedTabData>,
+        tabs_data: Result<Vec<SavedTabData>, String>,
         r#gen: u64,
     ) -> Task<EditorMessage> {
         if r#gen != self.saved_tabs_gen {
             return Task::none();
         }
+
+        let tabs_data = match tabs_data {
+            Ok(tabs_data) => {
+                self.tabs_error = None;
+                tabs_data
+            }
+            Err(e) => {
+                // Leave `session_initialized` false and block writes: the
+                // persisted tabs are still intact and must not be overwritten
+                // by the incomplete in-memory set. The message shown carries
+                // that consequence; it stays until a successful reload.
+                tracing::warn!(error = %e, "Editor: failed to restore saved tabs");
+                self.tabs_error = Some(format!("{e} — {TABS_SAVE_PAUSED}"));
+                return Task::none();
+            }
+        };
 
         // Track which tab was active when persisted.
         let mut active_idx = 0;
@@ -5058,6 +5119,15 @@ impl EditorState {
 
     fn build_editor_panel(&self, dashboard_modal_open: bool) -> Element<'_, EditorMessage> {
         if self.tabs.is_empty() {
+            // A failed restore must stay visible here, where the legitimately
+            // empty state would render.
+            if let Some(err) = &self.tabs_error {
+                return widgets::empty_state_placeholder(
+                    lucide::triangle_alert(),
+                    err,
+                    theme::STATUS_ERROR,
+                );
+            }
             return widgets::empty_state_placeholder(
                 lucide::file_text(),
                 "Select a file to edit",
@@ -5079,7 +5149,17 @@ impl EditorState {
         }
         col = col.push(editor_widget);
 
-        col.height(Length::Fill).into()
+        match &self.tabs_error {
+            // The restore failure — and the paused tab persistence that goes
+            // with it — stays visible until a successful reload replaces it,
+            // also once the editor has tabs of its own.
+            Some(err) => column![widgets::error_banner(err), col]
+                .spacing(0)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            None => col.height(Length::Fill).into(),
+        }
     }
 
     fn build_tab_bar(&self) -> Element<'_, EditorMessage> {

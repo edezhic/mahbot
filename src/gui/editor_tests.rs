@@ -203,6 +203,39 @@ fn test_save_result_ignores_stale_save() {
     );
 }
 
+// ── saved-tabs restore failure ─────────────────────────────
+
+#[test]
+fn test_failed_saved_tabs_restore_blocks_persistence() {
+    let mut state = EditorState::new();
+    state.selected_workspace_name = Some("ws".to_string());
+
+    // A failed restore keeps the failure visible — with the persistence block
+    // it implies — and the session uninitialized.
+    let _ = state.saved_tabs_loaded(Err("db down".to_string()), state.saved_tabs_gen);
+    let err = state
+        .tabs_error
+        .as_deref()
+        .expect("a failed restore is recorded");
+    assert!(err.starts_with("db down"), "got: {err}");
+    assert!(
+        err.contains(TABS_SAVE_PAUSED),
+        "the shown failure must state the paused saving: {err}"
+    );
+    assert!(!state.session_initialized);
+    assert!(state.try_save_current_tabs().is_none());
+
+    // Opening a file marks the session initialized, but the failed restore
+    // still blocks persistence so the persisted tab set is never overwritten.
+    state.session_initialized = true;
+    assert!(state.try_save_current_tabs().is_none());
+
+    // A successful reload clears the failure so saving is re-enabled.
+    let _ = state.saved_tabs_loaded(Ok(Vec::new()), state.saved_tabs_gen);
+    assert!(state.tabs_error.is_none());
+    assert!(state.session_initialized);
+}
+
 // ── byte_offset_to_line_col ────────────────────────────────
 
 #[test]

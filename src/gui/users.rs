@@ -1,6 +1,6 @@
 //! Users dashboard page — manage user preferences.
 
-use crate::users::{FieldUpdate, UserRecord, UserStore};
+use crate::users::{FieldUpdate, UserRecordEntry, UserStore};
 
 use iced::Task;
 
@@ -34,7 +34,7 @@ pub(crate) async fn update_user_field(sender: String, workspace: String) -> Resu
 
 #[derive(Debug, Clone)]
 pub enum UsersMessage {
-    Refreshed(Vec<UserRecord>),
+    Refreshed(Vec<UserRecordEntry>),
     RefreshError(String),
     DeleteUser(String),
     ConfirmDelete(String),
@@ -65,7 +65,7 @@ pub enum UsersMessage {
 }
 
 pub struct UsersState {
-    pub(crate) users: Vec<UserRecord>,
+    pub(crate) users: Vec<UserRecordEntry>,
     pub(crate) load_state: super::common::AsyncLoadState,
 
     // Delete confirmation
@@ -114,6 +114,8 @@ impl UsersState {
         match msg {
             UsersMessage::Refreshed(users) => {
                 self.users = users;
+                // A successful read replaces the previous failure.
+                self.load_state.clear_error();
 
                 Task::none()
             }
