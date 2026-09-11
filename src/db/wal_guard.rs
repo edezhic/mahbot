@@ -1,20 +1,31 @@
 //! Boot pre-flight + detect classifier for single-process store corruption.
 //!
 //! The daemon runs in **default single-process mode** (multiprocess_wal was
-//! removed), so there is no `.tshm` coordination file. The genuine corruption
-//! classes are:
+//! removed).
+//!
+//! The genuine corruption classes are:
 //!
 //! - **Structural** — a bad/truncated main-DB header (quarantine + recreate).
 //! - **Durable-B** — a 0-byte main DB with a non-empty WAL (healable via a
 //!   PASSIVE-first checkpoint).
 //!
 //! A stale `.tshm` file is a leftover from a pre-removal multiprocess run; it
-//! is detected and reported (`has_stale_tshm` / a boot `warn!`) but never
-//! created in normal operation (single-process mode uses the standard `-shm`).
+//! is detected and reported (`has_stale_tshm` / a boot `warn!`) but is never
+//! created in normal operation.
 //!
-//! `inspect_store` / `inspect_store_at` classify one store's file set
-//! without opening the database. [`diagnose_all_stores`] is the boot
-//! pre-flight that feeds each store's heal strategy in `crate::db::open_store`.
+//! # The lock rule
+//!
+//! The engine takes a whole-file `fcntl` `F_WRLCK` record lock on a store's
+//! main file and its `-wal` when it opens them, and holds it until the process
+//! exits. POSIX ties record locks to the *process and inode*: closing ANY
+//! descriptor this process holds for such a file drops every record lock the
+//! process holds on it — the engine never re-takes it, and an in-process check
+//! can never notice. So the running service must never open a store file: facts
+//! about a live store come from a stat (`store_file_facts`) or from the engine
+//! itself. Only `inspect_store_at` (via `read_db_header`) opens the
+//! main file, and it may run ONLY from the boot pre-flight — which runs before
+//! this process holds any lock — or from a separate process (`mahbot debug
+//! detect`).
 
 use std::path::Path;
 
@@ -67,7 +78,7 @@ pub(crate) fn has_boot_diagnosis(db_path: &Path) -> bool {
 /// before any store is opened. The heal strategy flows from this map —
 /// turso's own reopen (RebuildFromDisk → install_snapshot) would consume the
 /// evidence, so the strategy must not be re-derived post-open. The same
-/// classification is surfaced by [`inspect_store`] / [`StoreArtifactStatus`]
+/// classification is surfaced by [`inspect_store_at`] / [`StoreArtifactStatus`]
 /// for the `debug detect` output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BootDiagnosis {
@@ -93,13 +104,12 @@ impl BootDiagnosis {
     }
 }
 
-/// Classification of one store's file set.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Classification of one store's file set for the `debug detect` output: the
+/// corruption class — from the stat facts, plus the main-DB header when the file
+/// is long enough to have one — and the facts it was read from.
+#[derive(Debug)]
 pub(super) struct StoreArtifactStatus {
-    /// Store name (matches the `--db` argument of `mahbot debug`).
-    pub store: String,
-    /// Corruption class (main-DB header + WAL size); stale `.tshm` debris is
-    /// reported separately by [`StoreArtifactStatus::has_stale_tshm`].
+    /// Corruption class (main-DB header + `-wal` size).
     pub class: BootDiagnosis,
     /// On-disk `-wal` size in bytes (0 when missing or empty).
     pub wal_size: u64,
@@ -107,34 +117,38 @@ pub(super) struct StoreArtifactStatus {
     pub has_stale_tshm: bool,
 }
 
-/// Classify the file set of one store given its main database file path.
-///
-/// The store name is derived from the file name (`core.db` → `core`).
-/// This is a pure filesystem inspection — it never opens the database, so it
-/// is safe to run against live stores and is unit-testable with synthetic
-/// file states.
+/// Stat-only facts about one store's file set — the fact source for the running
+/// service (the periodic checkpoint cap and the persistent-failure report both
+/// use this). See the module doc's lock rule for why nothing here may be opened.
+#[derive(Debug)]
+pub(super) struct StoreFileFacts {
+    pub wal_size: u64,
+    pub has_stale_tshm: bool,
+}
+
+/// Collect a store's [`StoreFileFacts`] without opening anything. The running
+/// service must use this instead of [`inspect_store_at`].
 #[must_use]
-pub(super) fn inspect_store_at(db_path: &Path) -> StoreArtifactStatus {
+pub(super) fn store_file_facts(db_path: &Path) -> StoreFileFacts {
     let sidecars = crate::db::store_sidecars(db_path);
-    let wal_size = std::fs::metadata(&sidecars.wal).map_or(0, |m| m.len());
-    let has_stale_tshm = sidecars.tshm.exists();
-    let class = classify_main_db(db_path, sidecars.wal.exists(), wal_size);
-    let store = db_path.file_stem().map_or_else(
-        || db_path.display().to_string(),
-        |s| s.to_string_lossy().into_owned(),
-    );
-    StoreArtifactStatus {
-        store,
-        class,
-        wal_size,
-        has_stale_tshm,
+    StoreFileFacts {
+        wal_size: std::fs::metadata(&sidecars.wal).map_or(0, |m| m.len()),
+        has_stale_tshm: sidecars.tshm.exists(),
     }
 }
 
-/// Classify the file set of one store under `root/db/`.
+/// Classify one store's file set given its main database file path. Reading the
+/// main-DB header is subject to the module doc's lock rule: boot pre-flight or a
+/// separate process only. Pure filesystem inspection, unit-testable with
+/// synthetic file states.
 #[must_use]
-pub(super) fn inspect_store(root: &Path, name: &str) -> StoreArtifactStatus {
-    inspect_store_at(&crate::db::store_db_path(root, name))
+pub(super) fn inspect_store_at(db_path: &Path) -> StoreArtifactStatus {
+    let facts = store_file_facts(db_path);
+    StoreArtifactStatus {
+        class: classify_main_db(db_path, facts.wal_size),
+        wal_size: facts.wal_size,
+        has_stale_tshm: facts.has_stale_tshm,
+    }
 }
 
 /// Main SQLite header magic (first 16 bytes of every `.db` file).
@@ -145,6 +159,9 @@ pub(crate) const DB_HEADER_MIN_SIZE: u64 = 100;
 /// Read the 18-byte main-DB header (magic + u16 BE page-size field). `None`
 /// on any I/O failure or a file shorter than the header — the caller decides
 /// what `None` means (wal_guard: fail-open → healthy; debug: fail-closed).
+///
+/// This OPENS the store's main file — module doc's lock rule: boot pre-flight or
+/// a separate process only, never the running service.
 pub(crate) fn read_db_header(db_path: &Path) -> Option<[u8; 18]> {
     use std::io::Read;
     let mut header = [0u8; 18];
@@ -168,15 +185,16 @@ pub(crate) fn db_header_valid(header: &[u8; 18]) -> bool {
 
 /// Classify the main-DB file itself: 0-byte with a live WAL
 /// → durable-B; truncated/zeroed header → structural; otherwise healthy.
-fn classify_main_db(db_path: &Path, wal_exists: bool, wal_size: u64) -> BootDiagnosis {
+fn classify_main_db(db_path: &Path, wal_size: u64) -> BootDiagnosis {
     let Ok(meta) = std::fs::metadata(db_path) else {
         return BootDiagnosis::Healthy; // no DB yet — fresh install
     };
     let size = meta.len();
     if size == 0 {
         // 0-byte DB with a non-empty WAL → durable-B (healable via PASSIVE-
-        // first). A fresh install (0-byte + empty WAL) is healthy.
-        return if wal_exists && wal_size > 0 {
+        // first). A fresh install (0-byte + empty WAL) is healthy; `wal_size`
+        // is 0 for a missing WAL and for a present-but-empty one alike.
+        return if wal_size > 0 {
             BootDiagnosis::DurableB
         } else {
             BootDiagnosis::Healthy
@@ -203,14 +221,15 @@ fn classify_main_db(db_path: &Path, wal_exists: bool, wal_size: u64) -> BootDiag
 /// Boot pre-flight: classify every physical store (the consolidated `core.db`
 /// plus the separate `logs.db`) **before any store is opened** (logs opens
 /// first inside `init_tracing`; turso's own reopen would consume the evidence).
-/// Runs before the process holds any lock, so path-based reads are safe; the
-/// instance lock already excludes a second daemon.
+/// Runs before the process holds any lock, so the header read in
+/// [`inspect_store_at`] is safe here (module doc's lock rule); the instance
+/// lock already excludes a second daemon.
 ///
 /// The result feeds the per-store heal strategy in `crate::db::open_store`.
 /// [`cleanup_stale_tshm`] is a separate boot step — it runs after this and
 /// removes leftover `.tshm` coordination debris (single-process mode never
 /// creates one); it never touches the `-wal`/`-shm` files.
-pub fn diagnose_all_stores(root: &Path) {
+pub(crate) fn diagnose_all_stores(root: &Path) {
     for (name, _) in crate::db::iter_checkpoint_stores() {
         let db_path = crate::db::store_db_path(root, name);
         let status = inspect_store_at(&db_path);
@@ -229,14 +248,14 @@ pub fn diagnose_all_stores(root: &Path) {
 /// Remove any stale `.tshm` coordination leftover from a pre-removal
 /// `multiprocess_wal` run.
 ///
-/// Single-process mode NEVER creates a `.tshm` (turso rebuilds the standard
-/// `-shm` from `-wal`), so any `.tshm` present after the removal is necessarily
-/// stale debris from a dead multiprocess daemon — safe to delete without a
-/// liveness probe. The `-wal` file is NEVER touched: it may hold committed
-/// frames from a crash, and deleting it would cause silent commit loss
-/// (historically class-A). Call only when the daemon is down (boot before any
-/// store opens, or `mahbot debug`'s daemon-down direct-open path).
-pub fn cleanup_stale_tshm(root: &Path) {
+/// Single-process mode NEVER creates a `.tshm` (see the module doc), so any
+/// `.tshm` present after the removal is necessarily stale debris from a dead
+/// multiprocess daemon — safe to delete without a liveness probe. The `-wal`
+/// file is NEVER touched: it may hold committed frames from a crash, and
+/// deleting it would cause silent commit loss (historically class-A). Call only
+/// when the daemon is down (boot before any store opens, or `mahbot debug`'s
+/// daemon-down direct-open path).
+pub(crate) fn cleanup_stale_tshm(root: &Path) {
     for (name, _) in crate::db::iter_checkpoint_stores() {
         let tshm = crate::db::store_sidecars(&crate::db::store_db_path(root, name)).tshm;
         if !tshm.exists() {
@@ -282,46 +301,44 @@ mod tests {
     }
 
     #[test]
-    fn inspect_store_classifies_synthetic_file_sets() {
+    fn inspect_store_at_classifies_synthetic_file_sets() {
         let dir = std::env::temp_dir().join(format!("wal_guard_state_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("db/core.db");
+        let wal = dir.join("db/core.db-wal");
 
         // Healthy store: valid 64 KiB-page DB header, no WAL.
         let mut db = vec![0u8; 4096];
         db[..16].copy_from_slice(b"SQLite format 3\0");
         db[16..18].copy_from_slice(&1u16.to_be_bytes());
-        write(&dir.join("db/core.db"), &db);
-        let s = inspect_store(&dir, "board");
+        write(&db_path, &db);
+        let s = inspect_store_at(&db_path);
         assert_eq!(s.class, BootDiagnosis::Healthy);
         assert!(!s.has_stale_tshm);
 
         // Structural: truncated main-DB header.
-        write(&dir.join("db/core.db"), &[0u8; 64]);
-        let s = inspect_store(&dir, "sessions");
-        assert_eq!(s.class, BootDiagnosis::Structural);
+        write(&db_path, &[0u8; 64]);
+        assert_eq!(inspect_store_at(&db_path).class, BootDiagnosis::Structural);
 
         // Durable-B: 0-byte main DB with a non-empty WAL.
-        write(&dir.join("db/core.db"), &[]);
-        write(&dir.join("db/core.db-wal"), &[0u8; 512]);
-        let s = inspect_store(&dir, "users");
-        assert_eq!(s.class, BootDiagnosis::DurableB);
+        write(&db_path, &[]);
+        write(&wal, &[0u8; 512]);
+        assert_eq!(inspect_store_at(&db_path).class, BootDiagnosis::DurableB);
 
         // Fresh store: no main DB file → healthy.
-        let _ = std::fs::remove_file(dir.join("db/core.db"));
-        let s = inspect_store(&dir, "config");
-        assert_eq!(s.class, BootDiagnosis::Healthy);
+        let _ = std::fs::remove_file(&db_path);
+        assert_eq!(inspect_store_at(&db_path).class, BootDiagnosis::Healthy);
 
         // Stale .tshm debris is reported (never quarantined) while the class
         // is still computed from the main DB / WAL only.
         write(&dir.join("db/core.db-tshm"), &[0u8; 32]);
-        let s = inspect_store(&dir, "chat_history");
-        assert!(s.has_stale_tshm);
+        assert!(inspect_store_at(&db_path).has_stale_tshm);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn inspect_store_visits_every_store() {
+    fn inspect_store_at_visits_every_store() {
         let dir = std::env::temp_dir().join(format!("wal_guard_all_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // Only the PHYSICAL store files exist on disk: one consolidated domain
@@ -334,7 +351,7 @@ mod tests {
         write(&dir.join("db/core.db"), &db);
         write(&dir.join("db/logs.db"), &db);
         for name in crate::db::store_names() {
-            let s = inspect_store(&dir, name);
+            let s = inspect_store_at(&crate::db::store_db_path(&dir, name));
             assert_eq!(
                 s.class,
                 BootDiagnosis::Healthy,

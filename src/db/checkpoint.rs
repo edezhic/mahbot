@@ -181,15 +181,15 @@ pub async fn checkpoint_all_databases() {
     checkpoint_stores(CheckpointRound::Exit).await;
 }
 
-/// One 5-minute hygiene round: WAL checkpoint + integrity verification (an
-/// independent `quick_check` per store). Also the periodic-loop policy:
-/// PASSIVE below the WAL-size
-/// cap, TRUNCATE above it — TRUNCATE resets the shared WAL frame index (the
-/// live-writer corruption vector), so it is avoided under live
-/// writers; the TRUNCATE-above-cap branch is the only mechanism that shrinks
-/// the WAL file (turso's own auto-checkpoint is PASSIVE-only). A checkpoint
-/// failure on this round triggers the runtime FTS repair + graceful-shutdown
-/// recovery (see [`recover_failed_checkpoint`]).
+/// One 5-minute hygiene round: the periodic inspection — WAL checkpoint and an
+/// independent `quick_check` per store.
+///
+/// Checkpoint policy: PASSIVE below the WAL-size cap, TRUNCATE above it —
+/// TRUNCATE resets the shared WAL frame index (the live-writer corruption
+/// vector), so it is avoided under live writers; the TRUNCATE-above-cap branch
+/// is the only mechanism that shrinks the WAL file (turso's own auto-checkpoint
+/// is PASSIVE-only). A checkpoint failure on this round triggers the runtime FTS
+/// repair + graceful-shutdown recovery (see [`recover_failed_checkpoint`]).
 pub async fn periodic_checkpoint_and_verify() {
     checkpoint_stores(CheckpointRound::Periodic).await;
 }
@@ -225,8 +225,9 @@ async fn checkpoint_stores(round: CheckpointRound) {
             // re-check, and a structurally-corrupt store's checkpoint is
             // attempted and its failure logged like any other. The only
             // consumer of a store inspection is the periodic round's
-            // TRUNCATE-vs-PASSIVE cap (WAL size), so the exit round never
-            // runs `inspect_store`.
+            // TRUNCATE-vs-PASSIVE cap (WAL size), and that check must be
+            // STAT-ONLY (wal_guard's lock rule); the exit round needs no
+            // inspection at all.
             let truncate = match policy {
                 // Exit-time TRUNCATE (self-update handoff / shutdown): the
                 // ENOSPC gate below applies here too — a TRUNCATE that runs
@@ -246,8 +247,11 @@ async fn checkpoint_stores(round: CheckpointRound) {
                     // exactly the unresolvable-root case (no stores
                     // initialized anyway).
                     root.as_deref()
-                        .map(|r| crate::db::wal_guard::inspect_store(r, name))
-                        .is_some_and(|s| s.wal_size > cap)
+                        .map(|r| {
+                            let db_path = crate::db::store_db_path(r, name);
+                            crate::db::wal_guard::store_file_facts(&db_path).wal_size
+                        })
+                        .is_some_and(|wal_size| wal_size > cap)
                         && truncate_gate
                 }
             };
@@ -272,7 +276,7 @@ async fn checkpoint_stores(round: CheckpointRound) {
                     // re-checkpoint; persistent failure drains (logs it). The
                     // exit-time round just logs — the process is already going
                     // away and must not trigger recovery/shutdown.
-                    if matches!(round, CheckpointRound::Periodic) {
+                    if verify {
                         recover_failed_checkpoint(name, conn, &e, truncate, root.as_deref()).await;
                     }
                 }
@@ -390,10 +394,15 @@ async fn recover_failed_checkpoint_inner(
 
 /// Multi-line failure report for the persistent-checkpoint-failure terminal
 /// path. Every diagnostic is best-effort — a failing OR panicking probe must
-/// never prevent the report or its write: both probes are wrapped in panic
-/// guards so a turso panic cannot escape to the outer `for_each_store`
+/// never prevent the report or its write: the `quick_check` probe is wrapped in
+/// a panic guard so a turso panic cannot escape to the outer `for_each_store`
 /// `catch_unwind` (which would skip the drain and leave the service running
-/// with a persistently failing checkpoint).
+/// with a persistently failing checkpoint). The artifact state comes from the
+/// stat-only [`crate::db::wal_guard::store_file_facts`] (wal_guard's lock rule:
+/// no header read), so it reports the `-wal` size and stale-`.tshm` debris and
+/// deliberately no corruption class — a header-level class is exactly what the
+/// lock rule puts out of reach, and the `quick_check` section carries the
+/// integrity detail instead.
 async fn build_failure_report(
     name: &str,
     error: &anyhow::Error,
@@ -445,21 +454,12 @@ async fn build_failure_report(
         }
     }
     if let Some(r) = root {
-        let status = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            crate::db::wal_guard::inspect_store(r, name)
-        }));
-        match status {
-            Ok(status) => {
-                let _ = writeln!(
-                    body,
-                    "artifact state: store={} class={:?} wal_size={} has_stale_tshm={}",
-                    status.store, status.class, status.wal_size, status.has_stale_tshm
-                );
-            }
-            Err(_) => {
-                let _ = writeln!(body, "artifact state: inspection panicked");
-            }
-        }
+        let facts = crate::db::wal_guard::store_file_facts(&crate::db::store_db_path(r, name));
+        let _ = writeln!(
+            body,
+            "artifact state: wal_size={} has_stale_tshm={}",
+            facts.wal_size, facts.has_stale_tshm
+        );
     }
     body
 }

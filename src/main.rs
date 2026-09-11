@@ -71,27 +71,11 @@ fn format_startup_panic(payload: &(dyn std::any::Any + Send)) -> String {
 async fn bootstrap_mahbot() -> Result<()> {
     mahbot::config::load_or_init().await?;
 
-    // Boot pre-flight: classify every physical store (the consolidated
-    // `core.db` plus the separate `logs.db`) BEFORE any store is opened (the
-    // logs store opens first inside init_tracing, and turso's own reopen
-    // would consume the coordination evidence). The per-store heal strategy
-    // flows from this scan into turso::open_store.
-    let storage_root = mahbot::config::CONFIG.global_storage_root();
-    mahbot::db::wal_guard::diagnose_all_stores(std::path::Path::new(&storage_root));
-    // Single-process mode never creates a `.tshm`; remove any stale leftover
-    // from a pre-removal multiprocess run (the `-wal` is never touched).
-    mahbot::db::wal_guard::cleanup_stale_tshm(std::path::Path::new(&storage_root));
-
-    let (log_store, log_broadcast) = mahbot::logs::init_tracing(&storage_root).await?;
-    let _ = mahbot::gui::LOG_BROADCAST.set(log_broadcast);
-
-    mahbot::search_engine::init_global(); // sync — no I/O
-    mahbot::pipeline::chronicle::init_global(); // sync — no I/O
-    mahbot::agent::message_router::init_global()?;
-    mahbot::audio::voice::init_global()?;
-    mahbot::audio::tts::init_global()?;
-
-    mahbot::db::init_all_stores().await?;
+    // Bring the stores up in their one supported order — the pre-flight
+    // classification, the logs store, the process-global inits and the
+    // consolidated domain store. Shared with the store-lock check so the two
+    // cannot drift.
+    let log_store = mahbot::boot::open_stores().await?;
 
     // Start the CDC-driven chronicle subscriber (materializes ticket_chronicle
     // transitions from ticket change events). Must run after the stores are up.

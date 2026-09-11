@@ -25,8 +25,8 @@
 //! single-process read-only mode via `turso::core::Database::open_file_with_flags`
 //! with `OpenFlags::ReadOnly | OpenFlags::NoLock`. This cannot create or
 //! mutate files (the SDK `Builder` has no read-only option and always passes
-//! `OpenFlags::Create`, which would create a missing `-shm`/`-wal` pair), and
-//! it reads committed WAL frames in single-process mode.
+//! `OpenFlags::Create`, which would create a missing `-wal`), and it reads
+//! committed WAL frames in single-process mode.
 //!
 //! Two defense-in-depth layers remain on top of the read-only open: an
 //! upfront file-existence check and a SQL validator (mutation-keyword
@@ -411,11 +411,12 @@ fn list_families(root: &Path) -> Result<Vec<FamilyInfo>> {
 fn classify_family(root: &Path, id: String, meta: FamilyMeta) -> FamilyInfo {
     let db_path = root.join("db").join(&id);
     // Expected members per family kind — one source of truth for both the
-    // listing and the Complete check. `-shm` is deliberately not expected:
-    // the engine never creates it (turso_core 0.7.2 has no `-shm`
-    // references), so a complete quarantine is db + wal + tshm — requiring
-    // `-shm` would label every real full quarantine as `partial`. A leftover
-    // foreign `-shm` still counts toward the listing below.
+    // listing and the Complete check. `-shm` is deliberately not expected (the
+    // engine creates none), so a complete quarantine is db + wal + tshm:
+    // requiring it would label every real full quarantine as `partial`. A
+    // leftover `-shm` still counts toward the listing below, and a pre-reindex
+    // snapshot is db + wal: `VACUUM INTO` leaves an empty `<dest>-wal` beside
+    // the copy (see `snapshot_store_via_engine`).
     let expected: &[(&str, &'static str)] = match meta.kind {
         FamilyKind::Quarantine => &[("", "db"), ("-wal", "wal"), ("-tshm", "tshm")],
         FamilyKind::PreReindex => &[("", "db"), ("-wal", "wal")],
@@ -1640,8 +1641,9 @@ mod tests {
         );
 
         // The read-only open must not have created or modified any files in
-        // the store directory (in particular no -tshm — single-process mode
-        // uses the standard -shm and never creates a -tshm).
+        // the store directory — in particular no `-tshm` (the pre-removal
+        // multi-process coordination leftover, never created in single-process
+        // mode).
         let db_dir = dir.path().join("db");
         let names: Vec<String> = std::fs::read_dir(&db_dir)
             .unwrap()

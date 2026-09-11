@@ -964,7 +964,7 @@ async fn finalize_install(
 /// 3. Remove the temp update roots BEFORE releasing the instance lock or
 ///    spawning: `exit(0)` below bypasses Rust destructors, so the multi-GB
 ///    deletion must complete here while the old process still holds Turso's
-///    exclusive open-time fcntl locks on the `-wal` files (connections are
+///    exclusive open-time fcntl locks on the store files (connections are
 ///    never formally closed). If the child booted while they were held, its
 ///    store open would fail on the lock — boot has only a bounded retry, not
 ///    immunity. Keeping the instance flock held during cleanup also prevents a

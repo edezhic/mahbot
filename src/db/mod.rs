@@ -16,6 +16,8 @@ pub mod checkpoint;
 pub mod debug;
 pub mod ipc;
 pub(crate) mod migrations;
+#[cfg(all(unix, test))]
+mod store_lock_check;
 pub mod wal_guard;
 
 // ── Timestamp helper ────────────────────────────────────────────────
@@ -556,29 +558,35 @@ async fn run_readonly_query(
     })
 }
 
-/// Number of retry attempts for the open-time WAL lock held by another process.
+/// Number of retry attempts for the open-time store lock held by another process.
 const OPEN_LOCK_RETRY_ATTEMPTS: usize = 10;
 
-/// Delay between open-time WAL lock retries.
+/// Delay between open-time store-lock retries.
 const OPEN_LOCK_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-/// Whether an error is the transient open-time WAL lock from [turso_core].
+/// Whether an error is the transient open-time store lock from [turso_core].
 ///
-/// Turso's [`turso::Builder::build`] takes the fcntl `F_SETLK` lock on the
-/// `-wal` file while the database is opened. When another process already
-/// holds that lock (e.g. the previous daemon process during a self-update
-/// restart), the open fails with a `WouldBlock` that [turso_core] folds into
-/// [`turso::Error::Error`] via the catch-all `From` impl, surfacing as a
-/// `"Locking error: Failed locking file '...'. File is locked by another
-/// process"` message. [`Connection::open`]'s `busy_timeout` does **not** cover
-/// this open-time lock — it only governs per-statement waits after the handle
-/// is connected.
+/// Turso's [`turso::Builder::build`] takes a whole-file fcntl `F_SETLK`
+/// `F_WRLCK` record lock on the store files it opens read-write while the
+/// database is opened — the main file and its `-wal` (see `wal_guard`'s lock
+/// rule). When another process already holds that lock (e.g. the previous
+/// daemon process during a self-update restart), the open fails with a
+/// `WouldBlock` that [turso_core] folds into [`turso::Error::Error`] via the
+/// catch-all `From` impl, surfacing as a `"Locking error: Failed locking file
+/// '...'. File is locked by another process"` message. [`Connection::open`]'s
+/// `busy_timeout` does **not** cover this open-time lock — it only governs
+/// per-statement waits after the handle is connected.
 ///
 /// The predicate is deliberately narrow: it requires both the `"Locking
 /// error:"` and `"File is locked by another process"` substrings, so it never
 /// treats generic `"database is locked"` / "table is locked" busy errors
 /// (which have their own retry/backoff semantics) or unrelated corruption or
 /// I/O messages as this transient condition.
+///
+/// This is narrower than [`has_lock_signal`]: it gates the bounded open retry
+/// (the departing process's brief hold during a self-update handoff), so it
+/// demands that exact pair. Any other lock/busy wording is still actionable
+/// through [`is_actionable_signal`] — it is simply not retried.
 ///
 /// [turso_core]: https://github.com/tursodatabase/turso
 fn is_open_time_lock_error(err: &turso::Error) -> bool {
@@ -589,9 +597,23 @@ fn is_open_time_lock_error(err: &turso::Error) -> bool {
     )
 }
 
-/// Retries `attempt` only for the transient open-time WAL lock.
+/// True when `e`, or any cause beneath it, is [the open-time store lock]:
+/// another process holds a store this process is trying to open. The daemon's
+/// store bring-up records its refusal through this; the heal path decides
+/// through [`is_actionable_signal`] / [`is_corruption_class`] instead.
 ///
-/// The previous process still holds the `-wal` lock briefly during a
+/// [the open-time store lock]: is_open_time_lock_error
+pub(crate) fn is_store_lock_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<turso::Error>()
+            .is_some_and(is_open_time_lock_error)
+    })
+}
+
+/// Retries `attempt` only for the transient open-time store lock.
+///
+/// The previous process still holds the store locks briefly during a
 /// self-update restart; this bounded retry (a few seconds total) absorbs that
 /// race without masking any other open failure. `attempts` is the number of
 /// retries *after* the first try, so the maximum number of total tries is
@@ -617,7 +639,7 @@ where
                     attempt = attempts - remaining + 1,
                     total_attempts = attempts + 1,
                     error = ?err,
-                    "database open blocked by another process (open-time WAL lock)"
+                    "database open blocked by another process (open-time store lock)"
                 );
                 if remaining == 0 {
                     return Err(err);
@@ -1852,7 +1874,7 @@ pub(crate) fn store_db_path(root: &Path, name: &str) -> std::path::PathBuf {
 ///
 /// The `-tshm` field is retained for stale-leftover detection: it is a
 /// leftover from a pre-removal multiprocess run and is **never** created in
-/// normal operation (single-process mode uses the standard `-shm`).
+/// normal operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoreSidecars {
     pub wal: std::path::PathBuf,
@@ -1884,6 +1906,17 @@ fn has_resource_signal(lower: &str) -> bool {
     RESOURCE_SIGNAL_KEYWORDS.iter().any(|k| lower.contains(k))
 }
 
+/// Lock/busy contention keywords shared by both error classifiers. The engine
+/// reports another process holding a store as the open-time whole-file lock
+/// (`Locking error: … File is locked by another process`), a locked table, or a
+/// busy database. All of them are one external condition — never corruption,
+/// never a reason to quarantine, and never silently ignored.
+const LOCK_SIGNAL_KEYWORDS: [&str; 3] = ["locking", "locked", "busy"];
+
+fn has_lock_signal(lower: &str) -> bool {
+    LOCK_SIGNAL_KEYWORDS.iter().any(|k| lower.contains(k))
+}
+
 /// True when a `quick_check`/open failure is corruption-class rather than a
 /// busy/locked/IO failure of the PRAGMA itself.
 ///
@@ -1913,8 +1946,7 @@ pub(crate) fn is_corruption_class(e: &anyhow::Error) -> bool {
     }
     let lower = msg.to_lowercase();
     !(has_resource_signal(&lower)
-        || lower.contains("busy")
-        || lower.contains("locked")
+        || has_lock_signal(&lower)
         || lower.contains("i/o error")
         || lower.contains("no such file"))
 }
@@ -1943,13 +1975,16 @@ fn is_schema_mismatch(e: &anyhow::Error) -> bool {
     DDL_SHAPE.iter().any(|k| lower.contains(k))
 }
 
-/// True when a heal-phase failure is an actionable resource/permission
-/// condition: ENOSPC/EMFILE/OOM must never trigger a quarantine (they are
-/// signals, not corruption — the boot-heal path propagates them instead of
-/// recreating). Persistent busy, I/O errors, and unreadable states are
-/// recreate candidates, so only this narrow set propagates.
+/// True when a heal-phase failure is an actionable signal: a resource/permission
+/// condition (ENOSPC/EMFILE/OOM/permission) or lock contention with another
+/// process (the engine's open-time file lock, a locked table, a busy database).
+/// Neither is corruption, so neither may trigger a quarantine/recreate — the
+/// boot-heal path propagates them instead, and the daemon refuses to start
+/// rather than destroy a store another process is using. Persistent I/O errors
+/// and unreadable states are the recreate candidates.
 fn is_actionable_signal(e: &anyhow::Error) -> bool {
-    has_resource_signal(&format!("{e:#}").to_lowercase())
+    let lower = format!("{e:#}").to_lowercase();
+    has_resource_signal(&lower) || has_lock_signal(&lower)
 }
 
 /// Marker wrapping a fresh-store open failure after the boot-heal path already
@@ -2017,10 +2052,10 @@ pub(crate) async fn open_store(
         }
         crate::db::wal_guard::BootDiagnosis::DurableB => {
             // Phase 1: the heal connection's own open — the risky reopen of a
-            // 0-byte main DB with a non-empty WAL. A panic or persistent
-            // error (e.g. busy) here is a recreate candidate — but only for
-            // corruption-class failures: ENOSPC/EMFILE are actionable signals
-            // and must never trigger a quarantine.
+            // 0-byte main DB with a non-empty WAL. A panic here recreates; a
+            // persistent error recreates unless it is an actionable signal —
+            // resource exhaustion or lock contention (another process holds
+            // the store) must never trigger a quarantine.
             let healed = AssertUnwindSafe(heal_checkpoint_sequence(
                 &db_path,
                 name,
@@ -2031,10 +2066,10 @@ pub(crate) async fn open_store(
             match healed {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    // Persistent heal failure (busy after retries, I/O,
-                    // unreadable) is a recreate candidate per the heal
-                    // fallback; only actionable resource conditions
-                    // (ENOSPC/EMFILE/OOM/permission) propagate as signals.
+                    // Persistent heal failure (I/O, unreadable) is a recreate
+                    // candidate per the heal fallback; only actionable signals
+                    // (ENOSPC/EMFILE/OOM/permission, or a store locked by
+                    // another process) propagate instead.
                     if is_actionable_signal(&e) {
                         return Err(e);
                     }
@@ -2203,8 +2238,8 @@ async fn open_and_repair(db_path: &Path, name: &str, schema: &str) -> anyhow::Re
             .await
         }
         Ok((_, conn)) => Ok(conn),
-        // An actionable quick_check failure (ENOSPC/EMFILE/permission)
-        // propagated from the repair — never a recreate trigger.
+        // An actionable quick_check failure (ENOSPC/EMFILE/permission, or lock
+        // contention) propagated from the repair — never a recreate trigger.
         Err(e) => Err(e),
     }
 }
@@ -2258,7 +2293,7 @@ fn classify_repair_target(problems: &[String]) -> RepairTarget {
     }
 }
 
-/// Pre-repair forensic snapshot path (db + wal, no tshm):
+/// Pre-repair forensic snapshot path (engine-produced):
 /// `{db}.pre-reindex-{stamp}-{pid}`. The base name must stay parseable by
 /// `debug::parse_family_name` — the writer round-trip test locks the coupling.
 #[must_use]
@@ -2270,19 +2305,58 @@ fn pre_reindex_snapshot_path(db_path: &Path) -> std::path::PathBuf {
     ))
 }
 
+/// Forensic pre-repair snapshot of a store, produced BY THE ENGINE
+/// (`VACUUM INTO`) rather than copied with `fs::copy`: copying opens the store's
+/// main file, which wal_guard's lock rule forbids in the running service. It
+/// leaves an empty `<dest>-wal` beside the copy, so the forensic family stays
+/// db + wal. Two accepted consequences: the artifact is a logical copy, not the
+/// store's original bytes, and a store the engine cannot vacuum gets no snapshot
+/// at all — the caller only warns, since the artifact exists for the
+/// REINDEX-bakes-a-worse-error case and an engine that cannot read the store
+/// cannot REINDEX it either.
+///
+/// Panic-absorbed: the vacuum walks every btree of an already-damaged store,
+/// which is exactly where the engine can panic, and a panic must not unwind boot
+/// for missing evidence.
+async fn snapshot_store_via_engine(
+    conn: &Connection,
+    db_path: &Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let dest = pre_reindex_snapshot_path(db_path);
+    // `VACUUM INTO` takes a SQL string literal (no bind parameter), so the
+    // path is single-quote escaped.
+    let escaped = dest.display().to_string().replace('\'', "''");
+    // `Connection::execute` routes through `run_detached`, which holds the
+    // connection mutex for the whole statement — no other statement is active.
+    match AssertUnwindSafe(conn.execute(&format!("VACUUM INTO '{escaped}'"), ()))
+        .catch_unwind()
+        .await
+    {
+        Ok(Ok(_)) => Ok(dest),
+        Ok(Err(e)) => {
+            Err(anyhow::Error::from(e).context(format!("VACUUM INTO {}", dest.display())))
+        }
+        Err(payload) => Err(anyhow::anyhow!(
+            "VACUUM INTO {} panicked: {}",
+            dest.display(),
+            crate::util::panic_message(&*payload)
+        )),
+    }
+}
+
 /// Class-B btree-index desync repair: `quick_check` names a specific
 /// non-FTS index → REINDEX in place, DROP+CREATE as the fallback (both
 /// validated on the 324MB prod sessions copy — both M>N and M<N desync forms,
 /// survives reopen and TRUNCATE). Returns `Ok(([`RepairOutcome`], conn))`; an
-/// actionable quick_check failure (ENOSPC/EMFILE/permission) propagates as
-/// `Err` — it is a signal, never a recreate trigger.
+/// actionable quick_check failure (ENOSPC/EMFILE/permission, or lock
+/// contention) propagates as `Err` — it is a signal, never a recreate trigger.
 ///
 /// Preconditions are satisfied by construction at boot: single-writer,
 /// exclusive access, the WAL frame index already healed/reset (fi_len==maxf),
-/// and a snapshot copy (db + wal, no tshm) taken before the REINDEX. The
-/// overflow-aliasing signature ("referenced multiple times" / shared overflow
-/// pages, fresh or baked as "short read on page 167772160") is **never**
-/// REINDEXed — that bakes a worse error; the store is rebuilt
+/// and a snapshot (engine-produced `VACUUM INTO`) taken before the
+/// REINDEX. The overflow-aliasing signature ("referenced multiple times" /
+/// shared overflow pages, fresh or baked as "short read on page 167772160") is
+/// **never** REINDEXed — that bakes a worse error; the store is rebuilt
 /// data-preservingly instead (see [`migrate_overflow_aliased_store`]).
 /// Unreadable tables surface as quick_check scan failures ("Invalid page
 /// type"/"short read") and fall through to the recreate path.
@@ -2299,8 +2373,8 @@ async fn repair_btree_index_if_desynced(
         Ok(p) if p.is_empty() => return Ok((RepairOutcome::NoRepair, conn)),
         Ok(p) => p,
         Err(e) => {
-            // The quick_check itself failed to run — an actionable resource
-            // condition (ENOSPC/EMFILE/permission) is a signal, never a
+            // The quick_check itself failed to run — an actionable signal
+            // (resource/permission condition or lock contention) is never a
             // recreate trigger; propagate it like the heal-phase arm.
             if is_actionable_signal(&e) {
                 return Err(e);
@@ -2366,20 +2440,11 @@ async fn repair_btree_index_if_desynced(
             index
         }
     };
-    // Forensic snapshot (db + wal, no tshm) before the in-place repair.
-    let snap = pre_reindex_snapshot_path(db_path);
-    let sidecars = store_sidecars(db_path);
-    for (src, suffix) in [(db_path, ""), (&sidecars.wal, "-wal")] {
-        if let Err(e) = std::fs::copy(
-            src,
-            std::path::PathBuf::from(format!("{}{suffix}", snap.display())),
-        ) {
-            warn!(
-                error = %e,
-                from = %src.display(),
-                "Failed to copy pre-reindex snapshot",
-            );
-        }
+    // Forensic snapshot before the in-place repair, produced by the engine
+    // rather than copied (see [`snapshot_store_via_engine`] for why). Best
+    // effort: the snapshot is evidence, not a precondition for the repair.
+    if let Err(e) = snapshot_store_via_engine(&conn, db_path).await {
+        warn!("Failed to write pre-reindex snapshot: {e:#}");
     }
     // REINDEX rewrites the index btree in place. Quoting: identifiers may
     // contain special characters.
@@ -2652,7 +2717,7 @@ async fn migrate_overflow_aliased_store(
     match reopened.quick_check().await {
         Ok(()) => {}
         Err(e) if is_actionable_signal(&e) => {
-            warn!(error = %e, db = %name, "post-swap verification quick_check hit a resource signal");
+            warn!(error = %e, db = %name, "post-swap verification quick_check hit an actionable signal");
             verified = false;
         }
         Err(e) => {
@@ -2677,7 +2742,7 @@ async fn migrate_overflow_aliased_store(
                         error = %err,
                         db = %name,
                         table = %tbl,
-                        "post-swap counts verification query hit a resource signal",
+                        "post-swap counts verification query hit an actionable signal",
                     );
                 } else {
                     crate::boot::boot_diagnostic(format!(
@@ -2716,14 +2781,14 @@ async fn migrate_overflow_aliased_store(
 
 /// Failures of the overflow-aliasing rebuild, classified for the caller.
 enum MigrateFailure {
-    /// Actionable resource condition (ENOSPC/EMFILE/permission) — propagate.
+    /// Actionable signal (resource/permission or lock contention) — propagate.
     Actionable(anyhow::Error),
     /// Data-integrity finding (constraint violation) or any other
     /// non-actionable failure — report only; the original store is preserved.
     Finding(String),
 }
 
-/// Classify a rebuild-path error: actionable resource conditions propagate,
+/// Classify a rebuild-path error: actionable signals propagate,
 /// everything else is a report-only finding (covers both `turso::Error` from
 /// the wrapper's query/execute and `anyhow::Error` from checkpoint/quick_check).
 fn classify_migrate<E: Into<anyhow::Error>>(e: E) -> MigrateFailure {
@@ -4323,6 +4388,84 @@ mod tests {
         assert!(!is_open_time_lock_error(&lock(
             "Database file is corrupted"
         )));
+    }
+
+    /// The two actionable-signal families (lock contention, resource exhaustion)
+    /// must propagate instead of recreating a store, and neither may classify as
+    /// corruption — corruption itself stays a recreate candidate.
+    #[test]
+    fn lock_and_resource_signals_are_actionable_and_not_corruption() {
+        for msg in [
+            "Locking error: File is locked by another process",
+            "Runtime error: database table is locked",
+            "Database is busy",
+            "no space left on device",
+        ] {
+            let err = anyhow::Error::new(turso::Error::Error(msg.to_string()));
+            assert!(
+                is_actionable_signal(&err),
+                "an external condition must propagate, not recreate: {msg}"
+            );
+            assert!(
+                !is_corruption_class(&err),
+                "an external condition must never classify as corruption: {msg}"
+            );
+        }
+        let corrupt = anyhow::Error::new(turso::Error::Error("Invalid page type".to_string()));
+        assert!(
+            is_corruption_class(&corrupt),
+            "a page-level read error is corruption"
+        );
+        assert!(
+            !is_actionable_signal(&corrupt),
+            "corruption must stay a recreate candidate"
+        );
+    }
+
+    /// The forensic snapshot is engine-produced, so it must be a complete,
+    /// independently queryable copy — and taking it must leave the source store
+    /// usable (nothing here opens the source's main file).
+    #[tokio::test]
+    async fn engine_snapshot_is_queryable_and_leaves_the_source_usable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("core.db");
+        let conn = open_with_schema(&db_path, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t (v) VALUES ('kept')", ())
+            .await
+            .unwrap();
+
+        let snap = snapshot_store_via_engine(&conn, &db_path).await.unwrap();
+        assert!(
+            snap.exists(),
+            "the snapshot must exist at {}",
+            snap.display()
+        );
+        // `debug::classify_family` expects a pre-reindex family to be db + wal,
+        // so the forensic listing depends on the engine leaving this sibling
+        // beside the copy. Pin it here, where the snapshot is really produced:
+        // an engine bump that drops it must move that expectation with it.
+        let wal = std::path::PathBuf::from(format!("{}-wal", snap.display()));
+        assert!(
+            wal.exists(),
+            "VACUUM INTO must leave {} beside the snapshot",
+            wal.display()
+        );
+
+        let reopened = open_with_schema(&snap, "").await.unwrap();
+        let v: String = reopened
+            .query_row("SELECT v FROM t WHERE id = 1", (), |r| r.get(0))
+            .await
+            .unwrap();
+        assert_eq!(v, "kept", "the snapshot must carry the committed row");
+        drop(reopened);
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", (), |r| r.get(0))
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "the source store must stay queryable");
     }
 
     #[tokio::test]

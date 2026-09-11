@@ -14,7 +14,7 @@ pub mod agent;
 pub mod alarms;
 pub mod audio;
 pub mod bench_openrouter;
-pub(crate) mod boot;
+pub mod boot;
 pub mod channels;
 pub(crate) mod chrome;
 pub mod config;
