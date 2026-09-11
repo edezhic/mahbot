@@ -1520,7 +1520,7 @@ async fn is_fts_index(conn: &Connection, index: &str) -> bool {
 /// Name of the ticket-title FTS index. This const pair is the single shared
 /// known-good copy used by [`crate::db::ensure_fts_index`], the boot repair
 /// ([`crate::db::repair_ticket_title_fts_if_corrupt`]), and the runtime repair
-/// ([`crate::db::repair_ticket_title_fts_on_failed_checkpoint`]) — imported by
+/// ([`crate::db::repair_ticket_title_fts_runtime`]) — imported by
 /// `crate::pipeline::board::after_open`. The append-only migrations catalog
 /// independently carries its own raw-SQL schema entry (by design); the const
 /// pair is the authoritative known-good form.
@@ -1814,12 +1814,12 @@ pub(crate) async fn repair_ticket_title_fts_if_corrupt(
     }
 }
 
-/// Outcome of the runtime (post-checkpoint-failure) ticket-title FTS repair.
+/// Outcome of the runtime (periodic-round) ticket-title FTS repair.
 #[derive(Debug)]
 pub(crate) enum TicketTitleFtsRuntimeRepair {
     /// Store carries no ticket-title FTS index — nothing to repair.
     NotApplicable,
-    /// Index present and healthy — the checkpoint failure is not FTS-attributable.
+    /// Index present and healthy — nothing about this attempt was FTS-attributable.
     Healthy,
     /// Corruption detected and the rebuild ran; payload summarizes detection
     /// evidence and repair outcome for the caller's report.
@@ -1843,8 +1843,8 @@ impl TicketTitleFtsRuntimeRepair {
     }
 }
 
-/// Runtime variant of the boot-time ticket-title FTS repair: invoked from the
-/// periodic checkpoint loop after a checkpoint failure. Runs the same boot
+/// The periodic round's variant of the boot-time ticket-title FTS repair: invoked
+/// after a first attempt that failed or was answered busy. Runs the same boot
 /// primitives (see [`repair_ticket_title_fts_if_corrupt`]) — detection and the
 /// drop+recreate rebuild — via its own wrapper so the post-rebuild checkpoint
 /// mode and the caller-visible outcome can differ from the boot path. Blocking
@@ -1857,12 +1857,13 @@ impl TicketTitleFtsRuntimeRepair {
 /// [`Connection`] wrapper serializes every operation behind one mutex, so no
 /// other in-process op (writer or checkpoint) can be in flight during the
 /// DROP+CREATE.
-pub(crate) async fn repair_ticket_title_fts_on_failed_checkpoint(
+pub(crate) async fn repair_ticket_title_fts_runtime(
     conn: &Connection,
 ) -> TicketTitleFtsRuntimeRepair {
     // Absent index → nothing to repair (non-domain stores never carry it).
-    // Panic-guarded like every probe on this path: a turso panic must reach
-    // the caller's Failed arm (→ drain), never the outer per-store catch.
+    // Panic-guarded like every probe on this path: a turso panic must become
+    // this repair's own `Failed` outcome, never escape to the outer per-store
+    // catch and skip the checkpoint round's record-and-stop.
     let present = AssertUnwindSafe(conn.query_optional(
         "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
         params![TICKETS_FTS_INDEX_NAME.to_string()],
@@ -1895,7 +1896,7 @@ pub(crate) async fn repair_ticket_title_fts_on_failed_checkpoint(
     .catch_unwind()
     .await;
     let evidence = match detected {
-        // Present and probe-clean → the checkpoint failure is not FTS-shaped.
+        // Present and probe-clean → nothing about this attempt was FTS-shaped.
         Ok(Ok(None)) => return TicketTitleFtsRuntimeRepair::Healthy,
         Ok(Ok(Some(evidence))) => evidence,
         Ok(Err(e)) => {
@@ -5082,14 +5083,14 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            repair_ticket_title_fts_on_failed_checkpoint(&plain).await,
+            repair_ticket_title_fts_runtime(&plain).await,
             TicketTitleFtsRuntimeRepair::NotApplicable
         ));
 
         let conn = open_consolidated_store(tmp.path()).await.unwrap();
         insert_fts_ticket(&conn, "t-1", "Important bug fix").await;
         assert!(matches!(
-            repair_ticket_title_fts_on_failed_checkpoint(&conn).await,
+            repair_ticket_title_fts_runtime(&conn).await,
             TicketTitleFtsRuntimeRepair::Healthy
         ));
     }

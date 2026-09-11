@@ -67,9 +67,9 @@ pub(crate) enum FailureKind {
     /// A start-up step failed without a store refusal (a store bring-up error,
     /// config, a provider or another global init).
     StartUpFailure,
-    /// A periodic checkpoint round ended with a genuine failure and no
-    /// completion. Recorded on every such round; whether the service then
-    /// continues is the round's decision (see [`crate::db::checkpoint`]).
+    /// A periodic checkpoint round ended with a genuine failure and no attempt
+    /// completed a checkpoint — the round then stops the service (see
+    /// [`crate::db::checkpoint`]). Recorded on every such round.
     CheckpointFailure,
     /// A checkpoint failed on the exit-time round.
     ExitCheckpointFailure,

@@ -27,40 +27,34 @@
 //! TRUNCATE above it, plus an independent per-store integrity verification —
 //! the auto-checkpoint loop spawned by the binary's background task set).
 //!
-//! A failed periodic checkpoint triggers runtime corruption recovery: the
-//! ticket-title FTS index is detect+repaired (see
-//! [`crate::db::repair_ticket_title_fts_on_failed_checkpoint`]) and the
-//! checkpoint attempted again. The periodic round makes three attempts in total
-//! (the original plus at most two more) for EVERY store, whether or not it
-//! carries a search index; the FTS repair still runs between the first and the
-//! second attempt (it may be what makes a retry succeed) but never gates the
-//! attempts. Only an `Err` from an attempt is a failed attempt — a busy/partial
-//! `Ok` is not a *new* stop reason, but it is not a completion either, so after a
-//! genuine failure the remaining attempts still run. Panics are panic-guarded
-//! per attempt ([`guarded_checkpoint`]), so a panic is a failed attempt and never
-//! escapes the round. A round that ends with a genuine failure and no completion
-//! appends the failure report to `<root>/error.log` (best-effort; the shared
-//! writer lives in [`crate::db::failure_record`]) and begins the graceful drain —
-//! unless that round's repair actually rebuilt the FTS index, which keeps the
-//! service serving while still recording the same block. The exit-time path keeps
-//! exactly one attempt, records the failure instead, and never recovers or
-//! drains, since the process is already exiting.
+//! A periodic round makes up to three attempts at a store's checkpoint — the
+//! original plus at most two more — for EVERY store, whether or not it carries a
+//! search index. What the engine answers decides the round, arm by arm
+//! ([`periodic_checkpoint_inner`]), and only a genuine failure that no completion
+//! follows stops the service. The exit-time round keeps its single attempt and
+//! never recovers or drains ([`exit_checkpoint`]).
+//!
+//! The round's only recovery step runs after a first attempt that failed or was
+//! answered busy — whatever held that attempt back, it can be what lets a retry
+//! complete: the ticket-title FTS index is detect+repaired (see
+//! [`crate::db::repair_ticket_title_fts_runtime`]) before the second attempt, and the
+//! round is not decided by it.
 //!
 //! A reclaiming checkpoint the pre-shrink gate refuses is not one of those
 //! attempts: the refusal ends the round, because the gate would refuse another
 //! probe — and what a refusal is and is not is [`crate::db::shrink_gate`]'s to
-//! state. A genuine failure from an earlier attempt in the same round still
-//! decides that round.
+//! state. A refusal never stops the service by itself: a round in which nothing
+//! else ran keeps serving, while a genuine failure from an earlier attempt in the
+//! same round still decides that round.
 //!
 //! Both rounds and the periodic integrity check record durably: an exit-round
 //! checkpoint failure (which cannot drain or recover) is its own block, and a
 //! failing periodic `quick_check` records a block once per store per process —
 //! every further failing round only warns with the running count, so a persistent
 //! condition cannot append a block every 5 minutes. A checkpoint-failure block is
-//! by contrast filed on every round that reaches it, because the one round that
-//! can repeat while the service keeps serving — a repair that rebuilds the index
-//! every round while the checkpoint never completes — is exactly the condition
-//! that must keep being recorded.
+//! by contrast filed on every round that reaches it, never deduplicated: such a
+//! round is terminal (it stops the service), so that stop being recorded with its
+//! own cause matters more than a filing rate the drain already bounds.
 //!
 //! # Reclaiming checkpoints are gated before they run
 //!
@@ -78,16 +72,21 @@
 //! for a failed checkpoint travels with the checkpoint error — see
 //! [`crate::db::checkpoint_cause`] for how it is obtained and what it costs. The
 //! warn lines print that error's outermost message; the durable record renders the
-//! whole chain.
+//! whole chain. That reason is also the only thing that tells a blocked store —
+//! which never stops the service — from a genuine pager error, which does
+//! ([`crate::db::checkpoint_cause::is_blocked_checkpoint`]).
 
 use futures_util::future::{FutureExt, join_all};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::db::failure_record::{self, FailureKind, FailureReport, RoundCounter};
-use crate::db::{CheckpointOutcome, Connection, TicketTitleFtsRuntimeRepair, shrink_gate};
+use crate::db::{
+    CheckpointOutcome, Connection, TicketTitleFtsRuntimeRepair, checkpoint_cause, shrink_gate,
+};
 
 /// Cap on a store's on-disk `-wal` size (bytes) for the periodic checkpoint
 /// mode. Below the cap the periodic loop runs non-truncating (PASSIVE)
@@ -102,9 +101,14 @@ const WAL_CHECKPOINT_CAP_BYTES: u64 = 32 * 1024 * 1024;
 /// corruption — it is an actionable signal, not evidence about the store.
 const DEFAULT_CHECKPOINT_MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Total attempts a failing periodic checkpoint round makes (the original plus
-/// at most two more), for every store.
+/// Total attempts a periodic checkpoint round makes (the original plus at most
+/// two more) before it decides, for every store.
 const CHECKPOINT_ATTEMPTS: usize = 3;
+
+/// Pause before retrying a store that answered busy: it could not fold the journal
+/// at that moment, so the retry gives whatever held it back this beat to clear. A
+/// genuine failure is retried immediately — there is nothing to wait for.
+const CHECKPOINT_RETRY_PAUSE: Duration = Duration::from_millis(100);
 
 /// The `record` field's value when the durable block could not be filed: the
 /// whole block already went to stderr (see [`failure_record::record`]).
@@ -245,22 +249,24 @@ pub async fn checkpoint_all_databases() {
 /// TRUNCATE resets the shared WAL frame index (the live-writer corruption
 /// vector), so it is avoided under live writers; the TRUNCATE-above-cap branch
 /// is the only mechanism that shrinks the WAL file (turso's own auto-checkpoint
-/// is PASSIVE-only). A checkpoint failure on this round triggers the runtime FTS
-/// repair + graceful-shutdown recovery (see [`periodic_checkpoint_inner`]).
+/// is PASSIVE-only). A round's attempts, the runtime FTS repair it runs after a
+/// first attempt that failed or was answered busy, and the genuine-failure-only
+/// stop are [`periodic_checkpoint_inner`]'s.
 pub async fn periodic_checkpoint_and_verify() {
     checkpoint_stores(CheckpointRound::Periodic).await;
 }
 
 /// Discriminates the two [`checkpoint_stores`] rounds. Periodic implies
-/// integrity verification plus runtime recovery on a checkpoint failure; Exit
-/// is the TRUNCATE exit-time path and must never trigger recovery/shutdown
-/// (the process is already exiting).
+/// integrity verification plus the retry/recovery rule
+/// [`periodic_checkpoint_inner`] owns; Exit is the TRUNCATE exit-time path and
+/// must never trigger recovery/shutdown (the process is already exiting).
 #[derive(Clone, Copy)]
 enum CheckpointRound {
     /// Exit-time round: TRUNCATE; a failure is recorded durably, never
     /// recovered.
     Exit,
-    /// Periodic hygiene round: PASSIVE-capped, verify, and recover on failure.
+    /// Periodic hygiene round: PASSIVE-capped, verify, and recover per
+    /// [`periodic_checkpoint_inner`].
     Periodic,
 }
 
@@ -367,7 +373,10 @@ async fn verify_integrity(name: &'static str, conn: &Connection, root: Option<&P
 
 /// The result of one checkpoint attempt the round asked for.
 enum Attempted {
-    /// The attempt ran and the engine answered.
+    /// The attempt ran and the engine answered: a completed or partially folded
+    /// checkpoint, or the engine's failure row — a genuine pager error or a
+    /// blocked checkpoint, told apart by the reason the engine reports with it
+    /// (see [`crate::db::checkpoint_cause`]).
     Ran(anyhow::Result<CheckpointOutcome>),
     /// The reclaiming checkpoint was refused by the pre-shrink gate: no
     /// checkpoint was issued (the gate recorded the refusal loudly).
@@ -467,8 +476,8 @@ async fn periodic_checkpoint(
     .await;
 }
 
-/// The periodic round's attempt loop. The module header owns the round's rule
-/// and [`crate::db::shrink_gate`] owns what a refusal is.
+/// The periodic round's attempt loop. Its arms own the round's rule (what each
+/// engine answer means) and [`crate::db::shrink_gate`] owns what a refusal is.
 ///
 /// `attempt` is a parameter because this decision table has to be exercised
 /// without an engine-side failing checkpoint, which is not reproducible
@@ -486,21 +495,23 @@ async fn periodic_checkpoint_inner<'a, Fut>(
 ) where
     Fut: Future<Output = Attempted> + Send + 'a,
 {
-    let mut errors: Vec<(usize, anyhow::Error)> = Vec::new();
+    let mut failures: Vec<(usize, anyhow::Error)> = Vec::new();
     let mut repair: Option<TicketTitleFtsRuntimeRepair> = None;
     for attempt_no in 1..=CHECKPOINT_ATTEMPTS {
+        let mut answered_busy = false;
         match attempt().await {
-            // A refusal is never an attempt: the gate recorded it, no
-            // checkpoint was issued, and the service keeps serving. With nothing
-            // failed yet the round ends here; after a genuine failure the round
-            // decides on that real failure instead of spending a retry on a
-            // checkpoint the gate has already refused.
+            // A refusal is never an attempt: the gate recorded it and no checkpoint
+            // was issued. It never stops the service by itself, so with no genuine
+            // failure the round ends here.
             Attempted::ShrinkRefused => {
-                if errors.is_empty() {
+                if failures.is_empty() {
                     return;
                 }
                 break;
             }
+            // A completed checkpoint keeps the service serving, on any attempt: this
+            // completion — never the repair's returned outcome — is what cures a
+            // round whose earlier attempts failed.
             Attempted::Ran(Ok(o)) if o.is_complete() => {
                 debug!(
                     db = %name,
@@ -508,71 +519,83 @@ async fn periodic_checkpoint_inner<'a, Fut>(
                     checkpointed = o.checkpointed_frames,
                     "Database WAL checkpointed",
                 );
-                // Only reachable after a failed attempt, and only an actual FTS
-                // rebuild may be credited with the recovery: the repair runs for
-                // every store and usually finds nothing to rebuild.
-                if !errors.is_empty() {
-                    let after = if matches!(repair, Some(TicketTitleFtsRuntimeRepair::Rebuilt(_))) {
-                        "the FTS repair"
-                    } else {
-                        "a retry"
-                    };
+                if !failures.is_empty() {
                     info!(
                         db = %name,
-                        repair = ?repair,
-                        complete = true,
-                        "Checkpoint recovered after {after} — continuing"
+                        "Checkpoint completed on a retry after a genuine failure — continuing"
                     );
                 }
                 return;
             }
+            // Not a completion, so a partially folded journal: normal — a reader
+            // (this process's own reads included) capped how far the fold could go.
+            // The round does nothing about it: no retry, no record, no warning, just
+            // an INFO line (the level the log store retains). With no genuine failure
+            // pending it ends the round; after one, the retries it opened still run. A
+            // busy flag cannot ride a successful statement — the engine reports a
+            // blocked store as the error below — so this arm is the whole
+            // non-completion case.
             Attempted::Ran(Ok(o)) => {
-                warn!(
+                info!(
                     db = %name,
-                    busy = o.busy,
                     log = o.log_frames,
                     checkpointed = o.checkpointed_frames,
-                    "Checkpoint busy or partial — WAL frames left uncheckpointed",
+                    "Checkpoint folded the journal partially",
                 );
-                // With nothing failed yet this is today's warning, not a stop.
-                // After a genuine failure it is not a completion either, so the
-                // remaining attempts still run — and the accumulated failure,
-                // not this partial result, decides the round.
-                if errors.is_empty() {
+                if failures.is_empty() {
                     return;
                 }
             }
+            // The engine's blocked answer: retried like a busy one, told from a
+            // genuine pager error by the reason it carries (see
+            // [`crate::db::checkpoint_cause`]). A store that stays blocked through the
+            // budget keeps serving with its journal unfolded — the accepted trade for
+            // never stopping on busy-ness — so its WAL keeps growing until it
+            // unblocks.
+            Attempted::Ran(Err(e)) if checkpoint_cause::is_blocked_checkpoint(&e) => {
+                answered_busy = true;
+                info!(attempt = attempt_no, error = %e, db = %name, "Checkpoint blocked — retrying");
+            }
+            // A genuine failure: kept for the report, retried immediately, and — when
+            // nothing completes anywhere in the round — the reason the service stops.
             Attempted::Ran(Err(e)) => {
                 warn!(attempt = attempt_no, error = %e, db = %name, "Failed to checkpoint database WAL");
-                errors.push((attempt_no, e));
+                failures.push((attempt_no, e));
             }
         }
-        // The runtime FTS repair runs here, after the first failed attempt — the
-        // module header owns the attempts rule it must not gate.
+        // The runtime FTS repair runs here, after a first attempt that failed or was
+        // answered busy; its outcome is reported, never used to decide.
         if attempt_no == 1 {
-            repair = Some(crate::db::repair_ticket_title_fts_on_failed_checkpoint(conn).await);
+            repair = Some(crate::db::repair_ticket_title_fts_runtime(conn).await);
+        }
+        // Every iteration that reaches here leads to a retry (a completion and a
+        // lone partial fold return, a refusal breaks); only a busy answer asks for
+        // the pause first.
+        if attempt_no < CHECKPOINT_ATTEMPTS && answered_busy {
+            tokio::time::sleep(CHECKPOINT_RETRY_PAUSE).await;
         }
     }
-    // The module header's stop rule, with the one detail it leaves to the code:
-    // the write is synchronous and happens BEFORE the drain.
-    let repaired = matches!(repair, Some(TicketTitleFtsRuntimeRepair::Rebuilt(_)));
-    let report = build_failure_report(name, &errors, repair.as_ref(), conn).await;
+    // The budget ran out with nothing but busy answers (a partially folded one
+    // returns above): not a failure, nothing to record, nothing to warn about — the
+    // next round tries again.
+    if failures.is_empty() {
+        info!(db = %name, "Checkpoint round ended without a completion — continuing");
+        return;
+    }
+    // No completion anywhere in the round and at least one genuine failure: this is
+    // the stop. The report is written (synchronously) before the drain, and the
+    // round's repair outcome has no say in it. Nothing restarts the process after it
+    // and the app shows no reason of its own for it, so this record and the log line
+    // below are the operator's only trace.
+    let report = build_failure_report(name, &failures, repair.as_ref(), conn).await;
     let pointer = failure_record::recorded_pointer(
         "checkpoint failure",
         failure_record::record(root, &report.render()),
     );
-    if repaired {
-        error!(
-            db = %name,
-            record = pointer.as_deref().unwrap_or(BLOCK_ON_STDERR),
-            "Checkpoint failure persisted but the FTS repair rebuilt the index — recorded, continuing",
-        );
-        return;
-    }
     error!(
         db = %name,
         record = pointer.as_deref().unwrap_or(BLOCK_ON_STDERR),
-        "Checkpoint failure persists after repair — recorded, initiating graceful shutdown",
+        "Genuine checkpoint failure with no completion — recorded, initiating graceful shutdown",
     );
     crate::shutdown::drain_begin();
 }
@@ -655,9 +678,9 @@ fn record_integrity_failure(
     );
 }
 
-/// Multi-line failure report for the persistent-checkpoint-failure terminal
-/// path. Each attempt error already carries the engine's own reason when the
-/// engine reported one (attached by [`Connection::run_checkpoint`] via
+/// Multi-line failure report for the genuine-failure terminal path. The engine's
+/// own reason travels with each attempt's error when the engine reported one
+/// (attached by [`Connection::run_checkpoint`] via
 /// [`crate::db::checkpoint_cause`]), so the report needs no separate fold-in.
 /// Every diagnostic is best-effort — a failing OR panicking probe must
 /// never prevent the report or its write: the `quick_check` probe is wrapped in
@@ -671,33 +694,33 @@ fn record_integrity_failure(
 /// `quick_check` section carries the integrity detail instead.
 async fn build_failure_report(
     name: &'static str,
-    errors: &[(usize, anyhow::Error)],
+    failures: &[(usize, anyhow::Error)],
     repair: Option<&TicketTitleFtsRuntimeRepair>,
     conn: &Connection,
 ) -> FailureReport {
     // The checkpoint error is the report's reason, rendered as its own
     // long-standing `checkpoint error:` line rather than a `reason:` line; each
     // further attempt's error follows as its own `attempt N error:` line, N being
-    // the attempt that produced it (the attempts that returned a partial outcome
-    // leave a gap, deliberately). The first error is always attempt 1's: a
-    // partial, refused or completed attempt 1 ends the round while nothing has
-    // failed, so a later attempt only ever runs after a real failure has been
-    // recorded — which is why the first line needs no attempt number.
+    // the attempt that produced it (attempts that were only answered busy, or that
+    // folded the journal partially, leave a gap, deliberately). That first line is
+    // the round's FIRST genuine failure and keeps the shape it has always had: an
+    // attempt answered busy before it leaves no line of its own to carry a number,
+    // so no number is claimed here.
     let mut report = FailureReport::new(FailureKind::CheckpointFailure)
         .store(name)
         .environment(
-            errors
+            failures
                 .iter()
                 .any(|(_, e)| crate::db::is_actionable_signal(e)),
         );
-    // This report is built only after the attempts loop ended without a
-    // completion, which requires at least one `Err`, and the repair has always
-    // run by then — so both are present by construction, not defensively.
-    let (_, first) = errors
+    // This report is built only after the attempts loop ended with a genuine
+    // failure recorded, and the repair has always run by then — so both are
+    // present by construction, not defensively.
+    let (_, first) = failures
         .first()
         .expect("a failure report is built only after a failed attempt");
     report = report.extra(format!("checkpoint error: {first:#}"));
-    for (attempt_no, e) in errors.iter().skip(1) {
+    for (attempt_no, e) in failures.iter().skip(1) {
         report = report.extra(format!("attempt {attempt_no} error: {e:#}"));
     }
     let repair = repair.expect("the round runs the repair before it can report");
@@ -745,6 +768,29 @@ mod tests {
         .await
         .unwrap();
         (tmp, conn)
+    }
+
+    /// A consolidated store whose ticket-title FTS index is corrupt — a same-named
+    /// plain btree in its place — so the round's repair detects it and rebuilds it.
+    async fn a_store_with_a_corrupt_fts_index(root: &Path) -> Connection {
+        let conn = crate::db::open_consolidated_store(root).await.unwrap();
+        insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
+        insert_fts_ticket(&conn, "t-2", "Another relevant thing").await;
+        conn.execute_batch(&fts_corruption_ddl()).await.unwrap();
+        conn
+    }
+
+    /// The error a blocked checkpoint reaches the round as: the engine's own busy
+    /// sentence — taken from [`checkpoint_cause::BLOCKED_REASON`], the constant the
+    /// production classifier matches, so the two cannot drift — attached the way
+    /// [`checkpoint_cause::CauseSink::attach`] attaches it around the product's
+    /// constant text. The capture that produces the sentence, and the engine
+    /// rendering it reads, are driven for real in `checkpoint_cause`'s own tests.
+    fn blocked_checkpoint_error() -> anyhow::Error {
+        anyhow::anyhow!("Unexpected result from PRAGMA wal_checkpoint").context(format!(
+            "engine cause: {}",
+            checkpoint_cause::BLOCKED_REASON
+        ))
     }
 
     /// An exit-round checkpoint failure is recorded durably — the exit path can
@@ -891,20 +937,15 @@ mod tests {
 
     /// A checkpoint failure on a store whose title FTS index was corrupted is
     /// recovered: the FTS index is rebuilt (from the known DDL) and the next
-    /// attempt succeeds, so the service continues serving.
+    /// attempt completes a checkpoint, so the service continues serving — the
+    /// completion is the cure, and the rebuild merely happens to be what made one
+    /// possible.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn failed_checkpoint_with_broken_fts_repairs_and_retries() {
         crate::shutdown::drain_clear();
         let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_consolidated_store(tmp.path())
-            .await
-            .unwrap();
-        insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
-        insert_fts_ticket(&conn, "t-2", "Another relevant thing").await;
-
-        // Break it: replace the FTS index with a same-named plain btree.
-        conn.execute_batch(&fts_corruption_ddl()).await.unwrap();
+        let conn = a_store_with_a_corrupt_fts_index(tmp.path()).await;
         assert!(
             !crate::db::is_fts_index(&conn, crate::db::TICKETS_FTS_INDEX_NAME).await,
             "index must be a btree before the recovery"
@@ -936,11 +977,11 @@ mod tests {
         );
         assert!(
             !crate::shutdown::is_draining(),
-            "a checkpoint recovered by the repair must not begin the drain"
+            "a checkpoint completed by the retry must not begin the drain"
         );
         assert!(
             !tmp.path().join("error.log").exists(),
-            "a checkpoint recovered by the repair must not file a failure block"
+            "a checkpoint completed by the retry must not file a failure block"
         );
 
         assert!(
@@ -970,19 +1011,15 @@ mod tests {
     }
 
     /// The repair rebuilt the index and every attempt still failed: the failure
-    /// report is written to error.log with its real cause, and the service keeps
-    /// serving — a repair that actually rebuilt the index is what decides the
-    /// continue-versus-stop here.
+    /// report is written to error.log with its real cause, and the service stops
+    /// — a rebuilt index does not exempt the round, because no attempt completed
+    /// a checkpoint.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
-    async fn a_rebuilt_index_keeps_serving_and_records_the_failure() {
+    async fn a_rebuilt_index_does_not_exempt_a_persistently_failing_round() {
         crate::shutdown::drain_clear();
         let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_consolidated_store(tmp.path())
-            .await
-            .unwrap();
-        insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
-        conn.execute_batch(&fts_corruption_ddl()).await.unwrap();
+        let conn = a_store_with_a_corrupt_fts_index(tmp.path()).await;
 
         let mut attempt_no = 0;
         periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
@@ -1014,26 +1051,25 @@ mod tests {
         );
         assert!(
             body.contains("repair outcome: rebuilt after detection"),
-            "the report must name the repair that decided the round: {body}"
+            "the report must name what the round's repair returned: {body}"
         );
         assert!(
-            !crate::shutdown::is_draining(),
-            "a round whose repair rebuilt the index must keep the service serving"
+            crate::shutdown::is_draining(),
+            "a rebuilt index must not exempt a round in which no attempt completed a checkpoint"
         );
+        crate::shutdown::drain_clear();
     }
 
-    /// A genuine failure, a repair that rebuilt the index, and a later attempt
-    /// that ends only partial: the round keeps serving with the failure recorded.
+    /// A genuine failure, a repair that rebuilt the index, and attempts that
+    /// follow it folding the journal only part of the way: the round still stops —
+    /// a partially folded journal is not a completion, it does not cut the
+    /// failure's budget short, and the repair's outcome decides nothing.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
-    async fn a_rebuilt_index_keeps_serving_after_a_partial_retry() {
+    async fn a_rebuilt_index_does_not_exempt_a_partial_retry() {
         crate::shutdown::drain_clear();
         let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_consolidated_store(tmp.path())
-            .await
-            .unwrap();
-        insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
-        conn.execute_batch(&fts_corruption_ddl()).await.unwrap();
+        let conn = a_store_with_a_corrupt_fts_index(tmp.path()).await;
 
         let mut attempt_no = 0;
         periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
@@ -1044,7 +1080,7 @@ mod tests {
                     Attempted::Ran(Err(anyhow::anyhow!("injected checkpoint failure")))
                 } else {
                     Attempted::Ran(Ok(CheckpointOutcome {
-                        busy: true,
+                        busy: false,
                         log_frames: 5,
                         checkpointed_frames: 1,
                     }))
@@ -1053,16 +1089,105 @@ mod tests {
         })
         .await;
 
+        assert_eq!(
+            attempt_no, CHECKPOINT_ATTEMPTS,
+            "a partially folded attempt must not cut the failure's budget short"
+        );
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
         assert!(
             body.contains("checkpoint error: injected checkpoint failure"),
             "the genuine failure must still be recorded with its real cause: {body}"
         );
         assert!(
-            !crate::shutdown::is_draining(),
-            "a rebuilt index must keep the service serving even when the later attempt is \
-             only partial"
+            crate::shutdown::is_draining(),
+            "a rebuilt index must not exempt a round in which a genuine failure had no completion"
         );
+        crate::shutdown::drain_clear();
+    }
+
+    /// The round both repair variants below are run through: failing attempts and a
+    /// completion on the last one. The service must serve and nothing may be filed —
+    /// whatever the round's repair returned.
+    async fn a_round_cured_by_its_last_attempt(conn: &Connection, root: &Path) {
+        let mut attempt_no = 0;
+        periodic_checkpoint_inner("core", conn, Some(root), || {
+            attempt_no += 1;
+            let n = attempt_no;
+            async move {
+                Attempted::Ran(if n == CHECKPOINT_ATTEMPTS {
+                    Ok(CheckpointOutcome {
+                        busy: false,
+                        log_frames: 0,
+                        checkpointed_frames: 0,
+                    })
+                } else {
+                    Err(anyhow::anyhow!("injected checkpoint failure"))
+                })
+            }
+        })
+        .await;
+
+        assert_eq!(
+            attempt_no, CHECKPOINT_ATTEMPTS,
+            "a completed last attempt ends the round without a fourth one"
+        );
+        assert!(
+            !crate::shutdown::is_draining(),
+            "a completed checkpoint after a failure must keep the service serving"
+        );
+        assert!(
+            !root.join("error.log").exists(),
+            "a round cured by its own retry must not file a failure block"
+        );
+    }
+
+    /// The repair's outcome decides nothing: this store carries no ticket-title FTS
+    /// index (so the repair found nothing to rebuild), and the round is cured by its
+    /// own completed retry all the same.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn a_completed_retry_keeps_serving_whatever_the_repair_returned() {
+        crate::shutdown::drain_clear();
+        let (tmp, conn) = temp_store("core").await;
+        assert!(
+            matches!(
+                crate::db::repair_ticket_title_fts_runtime(&conn).await,
+                TicketTitleFtsRuntimeRepair::NotApplicable
+            ),
+            "this store must classify as a store with nothing to rebuild"
+        );
+
+        a_round_cured_by_its_last_attempt(&conn, tmp.path()).await;
+    }
+
+    /// A repair that fails outright decides nothing either: this store's
+    /// ticket-title index cannot be rebuilt — its `tickets` table has no title
+    /// column, so the MATCH probe reads it as corrupt and the rebuild's CREATE
+    /// INDEX cannot succeed — and the round is cured by its own retry all the same.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn a_failed_repair_does_not_stop_a_round_its_retry_completes() {
+        crate::shutdown::drain_clear();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), "core"),
+            "CREATE TABLE tickets (id INTEGER PRIMARY KEY);\
+             CREATE INDEX idx_tickets_title_fts ON tickets (id);",
+        )
+        .await
+        .unwrap();
+        // The premise, asserted rather than assumed: this store makes the round's
+        // repair fail, so the round's outcome is the `Failed` one (a rollback, so
+        // the state the round then sees is unchanged).
+        assert!(
+            matches!(
+                crate::db::repair_ticket_title_fts_runtime(&conn).await,
+                TicketTitleFtsRuntimeRepair::Failed(_)
+            ),
+            "this store must classify as a store whose repair fails"
+        );
+
+        a_round_cured_by_its_last_attempt(&conn, tmp.path()).await;
     }
 
     /// A store with no ticket-title FTS index (repair is NotApplicable) still
@@ -1072,13 +1197,7 @@ mod tests {
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn checkpoint_failure_without_fts_store_writes_error_log_and_drains() {
         crate::shutdown::drain_clear();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_with_schema(
-            &crate::db::store_db_path(tmp.path(), "core"),
-            "CREATE TABLE plain (id INTEGER PRIMARY KEY);",
-        )
-        .await
-        .unwrap();
+        let (tmp, conn) = temp_store("core").await;
 
         let mut attempts = 0usize;
         periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
@@ -1143,61 +1262,121 @@ mod tests {
         crate::shutdown::drain_clear();
     }
 
-    /// A busy or partial checkpoint is a completed attempt that is not a stop
-    /// reason: the round keeps serving, the attempt is not retried, and no
-    /// failure block is filed.
+    /// A partially folded journal is normal: the round does nothing about it —
+    /// no retry, no record, no warning — and the service keeps serving.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
-    async fn a_busy_or_partial_checkpoint_is_not_a_stop_and_is_not_retried() {
+    async fn a_partially_folded_journal_is_normal_and_ends_the_round() {
         crate::shutdown::drain_clear();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_with_schema(
-            &crate::db::store_db_path(tmp.path(), "core"),
-            "CREATE TABLE plain (id INTEGER PRIMARY KEY);",
-        )
-        .await
-        .unwrap();
+        let (tmp, conn) = temp_store("core").await;
 
         let mut attempts = 0usize;
         periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
             attempts += 1;
             async {
                 Attempted::Ran(Ok(CheckpointOutcome {
-                    busy: true,
+                    busy: false,
                     log_frames: 5,
                     checkpointed_frames: 1,
                 }))
             }
         })
         .await;
-        assert_eq!(attempts, 1, "a busy/partial outcome must not be retried");
+
+        assert_eq!(
+            attempts, 1,
+            "a partially folded journal must not be retried"
+        );
         assert!(
             !crate::shutdown::is_draining(),
-            "a busy/partial outcome must not begin the drain"
+            "a partially folded journal must not begin the drain"
         );
         assert!(
             !tmp.path().join("error.log").exists(),
-            "a busy/partial outcome must not file a failure block"
+            "a partially folded journal must not file a failure block"
         );
     }
 
-    /// A genuine failure followed by a busy/partial outcome still stops: a
-    /// partial attempt is not a completion, so the remaining attempts run and the
-    /// accumulated failure drives the record and the drain. The retries never
-    /// weaken the stop rule — a genuine checkpoint failure has always stopped the
-    /// service unless a retry completed, and the retry is not gated on the FTS
-    /// repair.
+    /// A store that answers busy is retried after a pause, and a round that stays
+    /// busy through the whole budget still stops nothing and records nothing:
+    /// busy-ness is never a reason to stop.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
-    async fn a_failure_followed_by_a_partial_outcome_still_stops() {
+    async fn a_busy_store_is_retried_and_a_still_busy_round_keeps_serving() {
         crate::shutdown::drain_clear();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_with_schema(
-            &crate::db::store_db_path(tmp.path(), "core"),
-            "CREATE TABLE plain (id INTEGER PRIMARY KEY);",
-        )
-        .await
-        .unwrap();
+        let (tmp, conn) = temp_store("core").await;
+
+        let mut attempts = 0usize;
+        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
+            attempts += 1;
+            async { Attempted::Ran(Err(blocked_checkpoint_error())) }
+        })
+        .await;
+
+        assert_eq!(
+            attempts, CHECKPOINT_ATTEMPTS,
+            "a blocked checkpoint must be retried up to the round's budget"
+        );
+        assert!(
+            !crate::shutdown::is_draining(),
+            "a round that stayed busy must keep the service serving"
+        );
+        assert!(
+            !tmp.path().join("error.log").exists(),
+            "a round that stayed busy must not file a failure block"
+        );
+    }
+
+    /// A round whose first genuine failure comes after a busy attempt records it on
+    /// the long-standing `checkpoint error:` line with no number on it — a busy
+    /// attempt leaves no line of its own — while the failures that follow keep their
+    /// own `attempt N error:` lines.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn a_busy_attempt_before_a_failure_leaves_the_cause_line_unmarked() {
+        crate::shutdown::drain_clear();
+        let (tmp, conn) = temp_store("core").await;
+
+        let mut attempt_no = 0usize;
+        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
+            attempt_no += 1;
+            let n = attempt_no;
+            async move {
+                if n == 1 {
+                    Attempted::Ran(Err(blocked_checkpoint_error()))
+                } else {
+                    Attempted::Ran(Err(anyhow::anyhow!("injected checkpoint failure")))
+                }
+            }
+        })
+        .await;
+
+        let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
+        assert!(
+            body.lines()
+                .any(|line| line == "checkpoint error: injected checkpoint failure"),
+            "a busy first attempt leaves no line, so the cause line stays unmarked: {body}"
+        );
+        assert!(
+            body.contains("attempt 3 error: injected checkpoint failure"),
+            "the later failure must keep its own labelled line: {body}"
+        );
+        assert!(
+            crate::shutdown::is_draining(),
+            "a genuine failure with no completion must stop the service"
+        );
+        crate::shutdown::drain_clear();
+    }
+
+    /// A genuine failure followed by attempts the engine answers busy still stops:
+    /// busy is not a completion, the failure's budget runs to its end, and the
+    /// round's failure is the record's cause. Busy-ness never stops the service by
+    /// itself, but it does not erase a genuine failure either.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn a_failure_followed_by_busy_attempts_still_stops() {
+        crate::shutdown::drain_clear();
+        let (tmp, conn) = temp_store("core").await;
 
         let mut attempt_no = 0usize;
         periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
@@ -1207,11 +1386,7 @@ mod tests {
                 if n == 1 {
                     Attempted::Ran(Err(anyhow::anyhow!("injected checkpoint failure")))
                 } else {
-                    Attempted::Ran(Ok(CheckpointOutcome {
-                        busy: true,
-                        log_frames: 5,
-                        checkpointed_frames: 1,
-                    }))
+                    Attempted::Ran(Err(blocked_checkpoint_error()))
                 }
             }
         })
@@ -1219,7 +1394,7 @@ mod tests {
 
         assert_eq!(
             attempt_no, CHECKPOINT_ATTEMPTS,
-            "a partial outcome after a genuine failure must not cut the attempts short"
+            "a busy attempt must not cut a genuine failure's budget short"
         );
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
         assert!(
@@ -1228,25 +1403,20 @@ mod tests {
         );
         assert!(
             crate::shutdown::is_draining(),
-            "a genuine failure must still stop the service despite a later partial outcome"
+            "a genuine failure must still stop the service despite later busy attempts"
         );
         crate::shutdown::drain_clear();
     }
 
-    /// The report labels each error after the first with the attempt that
-    /// produced it, so a round with a gap — a partial outcome between two
-    /// failures — still records which attempt failed.
+    /// A round with a gap — a busy attempt between two failures — still records the
+    /// failures it has: the first keeps the long-standing unmarked `checkpoint
+    /// error:` line, the later ones carry their own attempt number, and the attempt
+    /// that produced no error contributes no line.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
-    async fn the_report_labels_each_error_with_its_attempt_number() {
+    async fn the_report_numbers_each_failure_after_the_first() {
         crate::shutdown::drain_clear();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_with_schema(
-            &crate::db::store_db_path(tmp.path(), "core"),
-            "CREATE TABLE plain (id INTEGER PRIMARY KEY);",
-        )
-        .await
-        .unwrap();
+        let (tmp, conn) = temp_store("core").await;
 
         let mut attempt_no = 0usize;
         periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
@@ -1255,11 +1425,7 @@ mod tests {
             async move {
                 match n {
                     1 => Attempted::Ran(Err(anyhow::anyhow!("injected first failure"))),
-                    2 => Attempted::Ran(Ok(CheckpointOutcome {
-                        busy: true,
-                        log_frames: 5,
-                        checkpointed_frames: 1,
-                    })),
+                    2 => Attempted::Ran(Err(blocked_checkpoint_error())),
                     _ => Attempted::Ran(Err(anyhow::anyhow!("injected third failure"))),
                 }
             }
@@ -1268,8 +1434,9 @@ mod tests {
 
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
         assert!(
-            body.contains("checkpoint error: injected first failure"),
-            "the first error is the report's reason: {body}"
+            body.lines()
+                .any(|line| line == "checkpoint error: injected first failure"),
+            "attempt 1's cause line keeps its long-standing byte-for-byte shape: {body}"
         );
         assert!(
             body.contains("attempt 3 error: injected third failure"),
@@ -1277,7 +1444,7 @@ mod tests {
         );
         assert!(
             !body.contains("attempt 2 error:"),
-            "the partial attempt produced no error to record: {body}"
+            "the busy/partial attempt produced no error to record: {body}"
         );
         assert!(
             crate::shutdown::is_draining(),
@@ -1292,13 +1459,7 @@ mod tests {
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn a_panicking_attempt_is_a_failed_attempt_and_stops_after_three() {
         crate::shutdown::drain_clear();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_with_schema(
-            &crate::db::store_db_path(tmp.path(), "core"),
-            "CREATE TABLE plain (id INTEGER PRIMARY KEY);",
-        )
-        .await
-        .unwrap();
+        let (tmp, conn) = temp_store("core").await;
 
         let mut attempts = 0usize;
         periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
@@ -1422,13 +1583,7 @@ mod tests {
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn a_refusal_on_a_retry_still_stops_on_the_rounds_real_failure() {
         crate::shutdown::drain_clear();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_with_schema(
-            &crate::db::store_db_path(tmp.path(), "core"),
-            "CREATE TABLE plain (id INTEGER PRIMARY KEY);",
-        )
-        .await
-        .unwrap();
+        let (tmp, conn) = temp_store("core").await;
 
         let mut attempt_no = 0usize;
         periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {

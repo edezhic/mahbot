@@ -71,6 +71,9 @@ pub fn env_lock() -> &'static std::sync::Mutex<()> {
 // shutdown drain flag. A test needs a key whenever it MUTATES the guarded
 // global or its assertions depend on the global's value — a drain-flag reader
 // asserting non-drain behavior needs `drain` just as much as a mutator does.
+// A test awaiting a routed manager envelope is such a reader: manager-envelope
+// routing skips the live route while the flag is set, so its wait would never
+// resolve.
 // Multi-key attributes may list keys in any order: serial_test's derive macro
 // sorts them alphabetically at expansion ("avoids dining philosopher issues"),
 // so the library itself guarantees a consistent global acquisition order.

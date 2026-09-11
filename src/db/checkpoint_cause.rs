@@ -12,6 +12,11 @@
 //! to another store's call, and attaches it to the checkpoint error instead of
 //! emitting it as a log record of its own.
 //!
+//! That reason carries two duties: it is what the failure record shows the
+//! operator ([`crate::db::failure_record`]), and — through
+//! [`is_blocked_checkpoint`] — the only thing that tells a blocked store, which
+//! never stops the service, from a genuine pager error, which does.
+//!
 //! Accepted cost: enabling DEBUG on that engine module enables its other debug
 //! callsites too (notably its once-per-transaction-end event), whose arguments
 //! are evaluated and reach this layer's cheap "no sink armed" check whether or
@@ -24,7 +29,9 @@
 //! What is verified where: the site ([`ENGINE_TARGET`], [`CAUSE_PREFIX`]) is
 //! checked against the pinned engine's own source (turso_core 0.7.2,
 //! `vdbe/execute.rs`), the capture and its attachment are exercised through the
-//! production seam, and the product's own failure path is driven from the
+//! production seam — including under the real layer stack
+//! ([`crate::logs::log_layers`]), which is what installs this layer in the
+//! daemon — and the product's own failure path is driven from the
 //! checkpoint round's attempt seam. An end-to-end engine failure stays
 //! unobserved — that limit is stated with the record format it affects, in
 //! [`crate::db::failure_record`].
@@ -38,11 +45,30 @@ use crate::util::UnwrapPoison;
 const ENGINE_TARGET: &str = "turso_core::vdbe::execute";
 /// The message prefix of the engine's checkpoint-failure event.
 const CAUSE_PREFIX: &str = "PRAGMA wal_checkpoint failed";
+/// The engine's reason for a checkpoint it could not run because another
+/// operation held the store back: `LimboError::Busy`, as the captured sentence
+/// renders it (the engine formats its error with `{:?}`, and `Busy` is a unit
+/// variant). A blocked checkpoint shares the engine's failure row and sentence
+/// with every genuine pager error, so this reason is the only thing that tells
+/// them apart.
+pub(crate) const BLOCKED_REASON: &str = "PRAGMA wal_checkpoint failed: Busy";
 
 tokio::task_local! {
     /// The sink armed for the polls of the engine call currently running, if
     /// any. Set only by [`CauseSink::scoped`].
     static ARMED: Arc<Mutex<Option<String>>>;
+}
+
+/// True when the engine's own reason in `e` says the checkpoint was blocked by
+/// another operation rather than genuinely failing. Matched up to a word
+/// boundary, never as a bare `Busy` substring, so the engine's `BusySnapshot`
+/// is not read as a blocked checkpoint. A reason that never arrived is not a
+/// blocked checkpoint: this capture is the only thing that can exempt a store
+/// from the stop, so such a failure stays a genuine one and stops the service.
+pub(crate) fn is_blocked_checkpoint(e: &anyhow::Error) -> bool {
+    format!("{e:#}")
+        .split_once(BLOCKED_REASON)
+        .is_some_and(|(_, rest)| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
 }
 
 /// The capture layer's filter: this one engine target at DEBUG, nothing else.
@@ -152,6 +178,50 @@ mod tests {
     /// A subscriber with the production filter applied (see [`filter`]).
     fn filtered_subscriber() -> impl tracing::Subscriber + Send + Sync {
         Registry::default().with(CauseCaptureLayer.with_filter(filter()))
+    }
+
+    /// The engine's blocked checkpoint and its genuine pager errors arrive as the
+    /// same failure row, so the captured reason is the only thing that tells them
+    /// apart: the engine's own busy sentence — captured for real here — is the
+    /// blocked answer, and every other reason, including the engine's similarly
+    /// spelled `BusySnapshot`, is a genuine failure. The sentence is written out
+    /// instead of read from [`BLOCKED_REASON`], so the classifier's constant meets
+    /// an independently spelled copy; the engine's own rendering is only checkable
+    /// against the pinned source (see the module header).
+    #[tokio::test]
+    async fn only_the_engines_busy_sentence_reads_as_blocked() {
+        let _guard = tracing::subscriber::set_default(filtered_subscriber());
+        let sink = CauseSink::new();
+        sink.scoped(async {
+            tracing::debug!(target: ENGINE_TARGET, "PRAGMA wal_checkpoint failed: Busy");
+        })
+        .await;
+        let blocked = sink.attach(anyhow::anyhow!(
+            "Unexpected result from PRAGMA wal_checkpoint"
+        ));
+        assert!(
+            blocked
+                .to_string()
+                .contains("engine cause: PRAGMA wal_checkpoint failed: Busy"),
+            "the captured sentence must reach the error: {blocked:#}"
+        );
+        assert!(
+            is_blocked_checkpoint(&blocked),
+            "the engine's busy reason must read as a blocked checkpoint: {blocked:#}"
+        );
+
+        for genuine in [
+            "PRAGMA wal_checkpoint failed: BusySnapshot",
+            "PRAGMA wal_checkpoint failed: Corrupt(\"page 3\")",
+            "no engine reason was captured",
+        ] {
+            let e = anyhow::anyhow!("Unexpected result from PRAGMA wal_checkpoint")
+                .context(format!("engine cause: {genuine}"));
+            assert!(
+                !is_blocked_checkpoint(&e),
+                "{genuine:?} must not read as a blocked checkpoint: {e:#}"
+            );
+        }
     }
 
     /// A sink is armed only for its own calls: each concurrent scope keeps its

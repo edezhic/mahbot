@@ -101,7 +101,7 @@ mod tests {
     /// The admin user is attached to the workspace with a live spy-channel
     /// binding — exactly the setup the removed mirroring delivered to.
     #[tokio::test]
-    #[serial_test::serial(channel_registry)]
+    #[serial_test::serial(channel_registry, drain)] // serializes the process-global channel registry + shutdown drain flag
     async fn manager_send_stays_internal() {
         crate::util::test::init_management_test_stores().await;
 
@@ -157,8 +157,14 @@ mod tests {
             .await;
         assert!(res.is_ok(), "tool must succeed: {:#}", res.unwrap_err());
 
-        // The envelope reached the Manager consumer.
-        let job = rx.recv().await.expect("envelope must reach the manager");
+        // The envelope reached the Manager consumer. Bounded because
+        // `stamp_and_route` skips the live route while the drain flag is set (see
+        // the drain serialization on this test): an unrouted envelope must fail
+        // here instead of hanging the whole test binary.
+        let job = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("the manager envelope must be routed within 30s")
+            .expect("envelope must reach the manager");
         assert_eq!(
             job.kind,
             crate::agent::message_router::MessageKind::AgentMessage
