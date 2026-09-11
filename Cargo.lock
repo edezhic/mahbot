@@ -4048,6 +4048,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-bash",

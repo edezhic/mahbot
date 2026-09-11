@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 crate::define_store! {
     /// Global board store.
     pub static BOARD: BoardStore,
-    post_open = after_open,
+    post_open_rooted = after_open,
     expect = "BOARD not initialized — call init_all_stores() first",
 }
 
@@ -682,7 +682,10 @@ impl BoardStore {
     /// After the FTS index is ensured, a boot-time detect+repair of corruption
     /// localized to the title FTS index runs (fail-safe: it never fails the
     /// boot — see [`crate::db::repair_ticket_title_fts_if_corrupt`]).
-    pub(crate) async fn after_open(&self) -> anyhow::Result<()> {
+    /// `root` is the storage root the store was opened under (the repair files
+    /// its refusal record there) — it comes from the caller, never from a
+    /// re-resolution of the global config.
+    pub(crate) async fn after_open(&self, root: &std::path::Path) -> anyhow::Result<()> {
         crate::db::ensure_fts_index(
             &self.conn,
             crate::db::TICKETS_FTS_INDEX_NAME,
@@ -694,6 +697,8 @@ impl BoardStore {
             &self.conn,
             crate::db::TICKETS_FTS_INDEX_NAME,
             crate::db::TICKETS_FTS_INDEX_DDL,
+            crate::db::CONSOLIDATED_DB_NAME,
+            Some(root),
         )
         .await;
         Ok(())

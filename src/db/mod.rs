@@ -13,10 +13,12 @@ pub(crate) use turso::{IntoParams, Row, Value, params};
 
 pub(crate) mod cdc;
 pub mod checkpoint;
+pub(crate) mod checkpoint_cause;
 pub mod debug;
 pub(crate) mod failure_record;
 pub mod ipc;
 pub(crate) mod migrations;
+pub(crate) mod shrink_gate;
 #[cfg(all(unix, test))]
 mod store_lock_check;
 pub mod wal_guard;
@@ -222,7 +224,7 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
     // Run the idempotent per-store post-open hooks on the shared connection,
     // in a defined order, before exposing the store cells.
     let board = crate::pipeline::board::BoardStore { conn: conn.clone() };
-    board.after_open().await?;
+    board.after_open(&root).await?;
     let users = crate::users::UserStore { conn: conn.clone() };
     users.ensure_admin_user().await?;
 
@@ -389,6 +391,10 @@ pub(crate) struct Connection {
     /// Mirrors the upstream `turso::Connection::dangling_tx` pattern but
     /// works at our wrapper level so we don't need async in Drop.
     has_dangling_tx: Arc<AtomicBool>,
+    /// The store's main-file path, stamped at open. The pre-shrink gate's
+    /// stat source (main and `-wal` sizes); never opened — wal_guard's lock
+    /// rule.
+    db_path: Arc<std::path::Path>,
 }
 
 /// Result of a read-only query: column names, row values, and whether the
@@ -731,7 +737,13 @@ impl Connection {
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
             has_dangling_tx: Arc::new(AtomicBool::new(false)),
+            db_path: Arc::from(path),
         })
+    }
+
+    /// The main-file path this connection was opened on.
+    pub(crate) fn db_path(&self) -> &std::path::Path {
+        &self.db_path
     }
 
     /// Lock the inner connection and rollback any dangling transaction.
@@ -777,14 +789,37 @@ impl Connection {
             > + Send
             + 'static,
     {
+        self.run_detached_capturing(op, None).await
+    }
+
+    /// [`Self::run_detached`] with an engine-cause sink: the sink arms the
+    /// engine-cause capture for the op's own polls (see [`checkpoint_cause`]),
+    /// so the captured reason belongs to this call and no other.
+    async fn run_detached_capturing<T, F>(
+        &self,
+        op: F,
+        cause: Option<&checkpoint_cause::CauseSink>,
+    ) -> turso::Result<T>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(
+                &'a tokio::sync::MutexGuard<'a, turso::Connection>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
+            > + Send
+            + 'static,
+    {
         let conn = self.conn.clone();
         let dangling = self.has_dangling_tx.clone();
-        match tokio::spawn(async move {
+        let task = async move {
             let guard = Self::lock_and_cleanup_owned(&conn, &dangling).await;
             op(&guard).await
-        })
-        .await
-        {
+        };
+        let joined = match cause.cloned() {
+            Some(cause) => tokio::spawn(cause.scoped(task)).await,
+            None => tokio::spawn(task).await,
+        };
+        match joined {
             Ok(inner) => inner,
             Err(joined) => match joined.try_into_panic() {
                 // A panicking op propagates the ORIGINAL panic payload (the
@@ -855,10 +890,24 @@ impl Connection {
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
+        self.query_with_cause(sql, params, None).await
+    }
+
+    /// [`Self::query`] with an optional engine-cause sink armed for the query's
+    /// own polls, so a reason the engine emits belongs to this call and no other
+    /// (see [`checkpoint_cause`]). Used by the checkpoint path, whose failure row
+    /// cannot carry the engine's reason.
+    async fn query_with_cause(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        cause: Option<&checkpoint_cause::CauseSink>,
+    ) -> turso::Result<Vec<Row>> {
         let sql = sql.to_owned();
-        self.run_detached(move |conn| {
-            Box::pin(async move { Self::query_impl(conn, &sql, params).await })
-        })
+        self.run_detached_capturing(
+            move |conn| Box::pin(async move { Self::query_impl(conn, &sql, params).await }),
+            cause,
+        )
         .await
     }
 
@@ -1151,7 +1200,7 @@ impl Connection {
         optional_row(self.query_row_cached(sql, params, map).await)
     }
 
-    /// Force a WAL checkpoint with TRUNCATE mode.
+    /// Force a WAL checkpoint with TRUNCATE mode — the raw, UNGATED engine call.
     ///
     /// Writes all pending WAL content to the main database file and truncates
     /// the WAL. Run before hard process termination (e.g.,
@@ -1165,7 +1214,11 @@ impl Connection {
     /// distinguish a complete checkpoint from a busy or partial one — Turso
     /// never reports a busy result in the row's first column on its success
     /// path, so incompleteness must be derived from `log > checkpointed`.
-    pub(crate) async fn checkpoint(&self) -> anyhow::Result<CheckpointOutcome> {
+    ///
+    /// A reclaiming checkpoint must pass
+    /// [`crate::db::shrink_gate::shrink_allowed`] first — the checkpoint rounds
+    /// and the boot-time repairs do (see [`crate::db::shrink_gate`]).
+    pub(crate) async fn checkpoint_ungated(&self) -> anyhow::Result<CheckpointOutcome> {
         self.run_checkpoint(CheckpointMode::Truncate).await
     }
 
@@ -1181,32 +1234,36 @@ impl Connection {
     }
 
     /// Run a WAL checkpoint in TRUNCATE mode when `truncate`, PASSIVE
-    /// otherwise — the bool-based mode selection shared by the periodic
-    /// checkpoint round, the failed-checkpoint recovery retry, and tests.
+    /// otherwise — the bool-based mode selection used by the checkpoint rounds
+    /// and tests. `truncate == true` is the same ungated TRUNCATE as
+    /// [`Self::checkpoint_ungated`]: the caller must have passed the pre-shrink
+    /// gate first (see [`crate::db::shrink_gate`]).
     pub(crate) async fn checkpoint_mode(
         &self,
         truncate: bool,
     ) -> anyhow::Result<CheckpointOutcome> {
         if truncate {
-            self.checkpoint().await
+            self.checkpoint_ungated().await
         } else {
             self.checkpoint_passive().await
         }
     }
 
     async fn run_checkpoint(&self, mode: CheckpointMode) -> anyhow::Result<CheckpointOutcome> {
+        // The engine reports a failed checkpoint as a successful row that cannot
+        // carry the reason, so an armed sink is the only source for it (see
+        // [`checkpoint_cause`]).
+        let cause = checkpoint_cause::CauseSink::new();
+        let sql = format!("PRAGMA wal_checkpoint({});", mode.label());
         let rows = self
-            .query(&format!("PRAGMA wal_checkpoint({});", mode.label()), ())
+            .query_with_cause(&sql, (), Some(&cause))
             .await
+            .map_err(|e| cause.attach(anyhow::Error::from(e)))
             .context("Failed to checkpoint WAL")?;
         let row = rows
             .first()
             .context("PRAGMA wal_checkpoint returned no result row")?;
-        Ok(CheckpointOutcome {
-            busy: int_column(row, 0)? != 0,
-            log_frames: int_column(row, 1)?,
-            checkpointed_frames: int_column(row, 2)?,
-        })
+        parse_checkpoint_row(row).map_err(|e| cause.attach(e))
     }
 
     /// Run PRAGMA quick_check to verify database integrity.
@@ -1288,6 +1345,15 @@ fn int_column(row: &Row, idx: usize) -> anyhow::Result<i64> {
         Value::Integer(n) => Ok(n),
         _ => anyhow::bail!("Unexpected result from PRAGMA wal_checkpoint"),
     }
+}
+
+/// `PRAGMA wal_checkpoint`'s three columns as a [`CheckpointOutcome`].
+fn parse_checkpoint_row(row: &Row) -> anyhow::Result<CheckpointOutcome> {
+    Ok(CheckpointOutcome {
+        busy: int_column(row, 0)? != 0,
+        log_frames: int_column(row, 1)?,
+        checkpointed_frames: int_column(row, 2)?,
+    })
 }
 
 /// A locked connection handle scoped to a single transaction.
@@ -1586,22 +1652,23 @@ struct TicketTitleFtsRebuildOutcome {
 /// DROP+CREATE: a failed CREATE rolls the DROP back, leaving the original
 /// index for operator review; ticket rows are never touched. Then verify
 /// (filtered quick_check, index presence, MATCH smoke on a known title) and,
-/// on request (`checkpoint_truncate`), run a WAL checkpoint — successful
+/// on request (`reclaim_after_rebuild`), run a WAL checkpoint — successful
 /// checkpointing is the observable that the corruption is actually gone. All
 /// outcomes logged, never propagated (fail-safe).
 ///
-/// `checkpoint_truncate` controls the post-rebuild checkpoint: `true` runs a
-/// TRUNCATE checkpoint (boot path, pre-serve, no live writers) so a clean store
-/// handoff is observable; `false` skips the internal checkpoint entirely — the
-/// runtime caller re-checkpoints itself right after in the failed attempt's
-/// mode, so a second back-to-back PASSIVE here would be redundant (and TRUNCATE
-/// under live writers is the corruption vector the periodic loop deliberately
-/// avoids).
+/// `reclaim_after_rebuild` controls the post-rebuild checkpoint: `true` (boot
+/// path, pre-serve, no live writers) runs a TRUNCATE checkpoint so a clean store
+/// handoff is observable. `false` skips the internal checkpoint for either of
+/// two reasons — the runtime caller re-checkpoints itself right after in the
+/// failed attempt's mode (a second back-to-back PASSIVE here would be redundant,
+/// and TRUNCATE under live writers is the corruption vector the periodic loop
+/// deliberately avoids), or the boot path's pre-shrink gate refused the
+/// reclaiming checkpoint.
 async fn rebuild_ticket_title_fts(
     conn: &Connection,
     index: &str,
     ddl: &str,
-    checkpoint_truncate: bool,
+    reclaim_after_rebuild: bool,
 ) -> TicketTitleFtsRebuildOutcome {
     let quoted = index.replace('"', "\"\"");
     // Transactional DROP+CREATE: a failed CREATE rolls the DROP back via the
@@ -1629,8 +1696,8 @@ async fn rebuild_ticket_title_fts(
             );
         }
     }
-    if checkpoint_truncate {
-        match conn.checkpoint().await {
+    if reclaim_after_rebuild {
+        match conn.checkpoint_ungated().await {
             Ok(o) if o.is_complete() => {
                 info!(
                     index,
@@ -1675,7 +1742,24 @@ async fn rebuild_ticket_title_fts(
 /// rebuild is still attempted; a panicking rebuild is logged loudly and boot
 /// continues. The daemon must never crash-loop over this path, and detection
 /// must never be silently skipped.
-pub(crate) async fn repair_ticket_title_fts_if_corrupt(conn: &Connection, index: &str, ddl: &str) {
+///
+/// `store` and `root` are the refusal record's identity and artifact directory:
+/// the post-rebuild TRUNCATE is a reclaiming checkpoint, so it passes the
+/// pre-shrink gate first (see [`crate::db::shrink_gate`]), and a refusal means
+/// the rebuild runs without shrinking. The probe necessarily runs BEFORE the
+/// DROP+CREATE rebuild (the gate guards the checkpoint at the end of it), so a
+/// refusal blocks a round in which no reclaiming checkpoint may ever be issued
+/// (the rebuild itself may then fail or find nothing to do), and the page count
+/// it judges can be one rebuild older than the checkpoint it guards — the
+/// documented pre-check window, with the refusal cost being one conservative
+/// skipped shrink.
+pub(crate) async fn repair_ticket_title_fts_if_corrupt(
+    conn: &Connection,
+    index: &str,
+    ddl: &str,
+    store: &'static str,
+    root: Option<&Path>,
+) {
     let detected = AssertUnwindSafe(detect_ticket_title_fts_corruption(conn, index))
         .catch_unwind()
         .await;
@@ -1710,9 +1794,17 @@ pub(crate) async fn repair_ticket_title_fts_if_corrupt(conn: &Connection, index:
         evidence = %evidence,
         "ticket-title FTS corruption signature detected at boot — rebuilding the index (ticket rows untouched)"
     );
-    let rebuilt = AssertUnwindSafe(rebuild_ticket_title_fts(conn, index, ddl, true))
-        .catch_unwind()
-        .await;
+    // The post-rebuild TRUNCATE is the reclaiming checkpoint this gate
+    // protects; a refusal means the rebuild runs without shrinking.
+    let reclaim_after_rebuild = crate::db::shrink_gate::shrink_allowed(conn, store, root).await;
+    let rebuilt = AssertUnwindSafe(rebuild_ticket_title_fts(
+        conn,
+        index,
+        ddl,
+        reclaim_after_rebuild,
+    ))
+    .catch_unwind()
+    .await;
     if let Err(panic) = rebuilt {
         error!(
             index,
@@ -1952,7 +2044,13 @@ fn has_lock_signal(lower: &str) -> bool {
 /// spurious repair finding, and the durable failure record marks them as
 /// environment-caused.
 pub(crate) fn is_actionable_signal(e: &anyhow::Error) -> bool {
-    let lower = format!("{e:#}").to_lowercase();
+    text_is_actionable_signal(&format!("{e:#}"))
+}
+
+/// [`is_actionable_signal`] over an already-rendered message — for callers that
+/// hold probe text rather than a rendered error chain.
+pub(crate) fn text_is_actionable_signal(text: &str) -> bool {
+    let lower = text.to_lowercase();
     has_resource_signal(&lower) || has_lock_signal(&lower)
 }
 
@@ -1986,7 +2084,7 @@ pub(crate) async fn open_store(
                 .into())
         }
         crate::db::wal_guard::StoreShape::Present => {
-            let opened = AssertUnwindSafe(open_present_store(&db_path, name, schema))
+            let opened = AssertUnwindSafe(open_present_store(root, &db_path, name, schema))
                 .catch_unwind()
                 .await;
             match opened {
@@ -2008,6 +2106,7 @@ pub(crate) async fn open_store(
 /// product's own schema, then run the data-preserving repairs. Every failure is
 /// a refusal — the store is never quarantined, recreated or emptied.
 async fn open_present_store(
+    root: &Path,
     db_path: &Path,
     name: &'static str,
     schema: &str,
@@ -2045,7 +2144,7 @@ async fn open_present_store(
             .into());
         }
     }
-    run_repairs(conn, db_path, name, schema).await
+    run_repairs(conn, root, db_path, name, schema).await
 }
 
 /// True when an opened store carries the product's own schema — the ledger every
@@ -2085,11 +2184,12 @@ async fn has_product_schema(conn: &Connection) -> anyhow::Result<bool> {
 /// today.
 async fn run_repairs(
     conn: Connection,
+    root: &Path,
     db_path: &Path,
     name: &'static str,
     schema: &str,
 ) -> anyhow::Result<Connection> {
-    match repair_btree_index_if_desynced(conn, db_path, name, schema).await {
+    match repair_btree_index_if_desynced(conn, root, db_path, name, schema).await {
         Ok((RepairOutcome::Unreadable, _conn)) => {
             Err(StoreRefusal::new(name, db_path, "its integrity check cannot read a table").into())
         }
@@ -2186,12 +2286,13 @@ enum RepairOutcome {
 /// these fixtures are built without).
 #[cfg(test)]
 async fn open_and_repair_for_test(
+    root: &Path,
     db_path: &Path,
     name: &'static str,
     schema: &str,
 ) -> anyhow::Result<Connection> {
     let conn = open_with_schema(db_path, schema).await?;
-    run_repairs(conn, db_path, name, schema).await
+    run_repairs(conn, root, db_path, name, schema).await
 }
 
 /// The baked overflow-aliasing signature: a prior REINDEX/DROP+CREATE on a
@@ -2320,8 +2421,9 @@ async fn snapshot_store_via_engine(
 /// type"/"short read") and refuse the store.
 async fn repair_btree_index_if_desynced(
     conn: Connection,
+    root: &Path,
     db_path: &Path,
-    name: &str,
+    name: &'static str,
     schema: &str,
 ) -> anyhow::Result<(RepairOutcome, Connection)> {
     // All problem rows, not just the first: quick_check can surface a named
@@ -2362,7 +2464,7 @@ async fn repair_btree_index_if_desynced(
                  the store data-preservingly in a fresh file",
                 problems.join("; "),
             ));
-            return migrate_overflow_aliased_store(conn, db_path, name, schema).await;
+            return migrate_overflow_aliased_store(conn, root, db_path, name, schema).await;
         }
         // Report-only by decision: an unrecognised quick_check signature is not
         // proof that the data is unusable, so the store boots exactly as it does
@@ -2470,8 +2572,9 @@ async fn count_table_rows(conn: &Connection, table: &str) -> turso::Result<i64> 
 #[expect(clippy::too_many_lines)] // one linear boot-repair flow, split across helpers
 async fn migrate_overflow_aliased_store(
     conn: Connection,
+    root: &Path,
     db_path: &Path,
-    name: &str,
+    name: &'static str,
     schema: &str,
 ) -> anyhow::Result<(RepairOutcome, Connection)> {
     // multiprocess_wal was removed: there is no shared WAL frame index to reset
@@ -2558,18 +2661,7 @@ async fn migrate_overflow_aliased_store(
     let migrated = migrate_schema_and_data(&conn, &fresh, &counts).await;
     let outcome = match migrated {
         Ok(()) => match fresh.quick_check().await {
-            // TRUNCATE-checkpoint the fresh store before the swap so the temp
-            // main file holds every frame — a crash between the main and wal
-            // renames then cannot leave a valid-but-empty store (turso does
-            // not checkpoint on close).
-            Ok(()) => match fresh.checkpoint().await {
-                Ok(o) if o.is_complete() => Ok(()),
-                Ok(o) => Err(MigrateFailure::Finding(format!(
-                    "rebuilt store checkpoint incomplete (busy={}, {} of {} frames)",
-                    o.busy, o.checkpointed_frames, o.log_frames,
-                ))),
-                Err(e) => Err(classify_migrate(e)),
-            },
+            Ok(()) => checkpoint_rebuilt_before_swap(&fresh, name, root).await,
             Err(e) => Err(classify_migrate(e)),
         },
         Err(f) => Err(f),
@@ -2627,10 +2719,12 @@ async fn migrate_overflow_aliased_store(
             ))
         };
     }
-    // Main-file rename first; the `-wal` moves only when it succeeds. The
-    // fresh store was TRUNCATE-checkpointed, so its main file alone holds
-    // every row — a failed `-wal` rename is benign, and a crash between
-    // the renames cannot leave a valid-but-empty store.
+    // Main-file rename first; the `-wal` moves only when it succeeds. The fresh
+    // store is normally TRUNCATE-checkpointed first (see
+    // `checkpoint_rebuilt_before_swap`), so its main file alone holds every row;
+    // when the pre-shrink gate refused that checkpoint the journal still holds
+    // committed frames, and these two renames are the crash window that refusal
+    // accepts.
     let wal = wal_path(db_path);
     let temp_wal = wal_path(&temp);
     if let Err(e) = std::fs::rename(&temp, db_path) {
@@ -2734,6 +2828,33 @@ async fn migrate_overflow_aliased_store(
             warn!(db = %name, "post-swap verification incomplete (transient read errors) — store is in place; re-verified on the next boot");
         }
         Ok((RepairOutcome::NoRepair, reopened))
+    }
+}
+
+/// Fold the rebuilt store's WAL into the temp main file before the swap, so
+/// a crash between the main and `-wal` renames cannot leave a valid-but-empty
+/// store (turso does not checkpoint on close). The checkpoint is reclaiming, so
+/// it passes the pre-shrink gate first; a refused gate simply skips the
+/// checkpoint and the swap proceeds without the fold-in, leaving those two
+/// renames as the crash window — the gate owns what a refusal means and where it
+/// is recorded (see [`crate::db::shrink_gate`]).
+///
+/// The gate checks the rebuilt TEMP file (`conn`), not the live store's file.
+async fn checkpoint_rebuilt_before_swap(
+    conn: &Connection,
+    name: &'static str,
+    root: &Path,
+) -> Result<(), MigrateFailure> {
+    if !crate::db::shrink_gate::shrink_allowed(conn, name, Some(root)).await {
+        return Ok(());
+    }
+    match conn.checkpoint_ungated().await {
+        Ok(o) if o.is_complete() => Ok(()),
+        Ok(o) => Err(MigrateFailure::Finding(format!(
+            "rebuilt store checkpoint incomplete (busy={}, {} of {} frames)",
+            o.busy, o.checkpointed_frames, o.log_frames,
+        ))),
+        Err(e) => Err(classify_migrate(e)),
     }
 }
 
@@ -3137,6 +3258,12 @@ fn family_stamp() -> String {
 /// Test-support helpers shared by the db test modules (`mod.rs`, `checkpoint.rs`).
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::path::Path;
+    use std::process::Command;
+
+    use anyhow::{Context, Result, ensure};
+
+    use super::wal_guard::WAL_HEADER_BYTES;
     use super::{Connection, TICKETS_FTS_INDEX_NAME, now, params};
 
     /// Insert a minimal ticket row whose title is FTS-indexed (the
@@ -3173,6 +3300,327 @@ pub(crate) mod test_support {
             quarantined.is_empty(),
             "{what} must not be quarantined, found: {quarantined:?}"
         );
+    }
+
+    /// Byte offset of the page-1 header's "database size in pages" field (a
+    /// big-endian `u32`) — exactly the `database_size` the engine's reclaiming
+    /// (TRUNCATE) checkpoint derives the new main-file size from.
+    const PAGE_1_DATABASE_SIZE_OFFSET: u64 = 28;
+
+    /// The fixed frame-header size of the SQLite WAL format: the page number, the
+    /// commit marker, the two salts and the checksum pair, ahead of the page image
+    /// (the 32-byte file header is [`WAL_HEADER_BYTES`]).
+    const WAL_FRAME_HEADER_BYTES: usize = 24;
+
+    /// The DDL and one row of every shrink-gate fixture store: real pages with a
+    /// row that must survive, so a reclaiming checkpoint that shrank the store to
+    /// nothing would destroy data.
+    const FIXTURE_SCHEMA: &str = "CREATE TABLE fixture (id INTEGER PRIMARY KEY, v TEXT);";
+    const FIXTURE_ROW: &str = "INSERT INTO fixture (v) VALUES ('data')";
+
+    /// Create the fixture store (schema plus one row) through the engine and close
+    /// the connection. turso takes no checkpoint on drop, so the committed frames
+    /// stay in the `-wal` where fixture builders want them.
+    async fn create_fixture_store(db_path: &Path) {
+        let conn = super::open_with_schema(db_path, FIXTURE_SCHEMA)
+            .await
+            .expect("create the shrink-gate fixture store");
+        conn.execute(FIXTURE_ROW, ())
+            .await
+            .expect("insert the shrink-gate fixture row");
+        drop(conn);
+    }
+
+    /// Build the destructive state whose resolved page-1 header declares no pages
+    /// (see [`crate::db::shrink_gate`]): the store's own `PRAGMA page_count`
+    /// answers 0 while its main file holds real pages and it still reads its rows —
+    /// so an ungated reclaiming checkpoint would truncate it to nothing.
+    ///
+    /// A real store is checkpointed (TRUNCATE, leaving the pages in the main
+    /// file and the journal reclaimed) and its page-1 header's declared page
+    /// count is then patched to 0. A test fixture may open the store file; the
+    /// product may not (wal_guard's lock rule).
+    pub(crate) async fn build_zero_page_count_store(db_path: &Path) {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let conn = super::open_with_schema(db_path, FIXTURE_SCHEMA)
+            .await
+            .expect("create the shrink-gate fixture store");
+        conn.execute(FIXTURE_ROW, ())
+            .await
+            .expect("insert the shrink-gate fixture row");
+        conn.checkpoint_ungated()
+            .await
+            .expect("truncate-checkpoint the shrink-gate fixture store");
+        drop(conn);
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(db_path)
+            .expect("open the shrink-gate fixture store to patch its page-1 header");
+        file.seek(SeekFrom::Start(PAGE_1_DATABASE_SIZE_OFFSET))
+            .expect("seek to the page-1 database-size field");
+        file.write_all(&0u32.to_be_bytes())
+            .expect("zero the page-1 database-size field");
+    }
+
+    /// Build the destructive state of an empty main file with a non-empty journal:
+    /// a real store whose committed frames are still in the `-wal` (turso takes no
+    /// checkpoint on drop), with the main file then truncated to 0 bytes.
+    ///
+    /// The engine that reopens it sees an empty database — `sqlite_schema` is
+    /// empty, so the fixture's rows are NOT readable in this state — while the
+    /// journal holds the only copy of the committed frames, which a reclaiming
+    /// checkpoint would discard.
+    pub(crate) async fn build_empty_main_file_store(db_path: &Path) {
+        create_fixture_store(db_path).await;
+        let wal = super::wal_path(db_path);
+        let wal_bytes = std::fs::metadata(&wal)
+            .expect("the fixture store must leave a journal")
+            .len();
+        assert!(
+            wal_bytes > WAL_HEADER_BYTES,
+            "the fixture must leave committed frames in its journal, found {wal_bytes} bytes",
+        );
+        // Truncate only the main file: the journal is left exactly as the engine
+        // committed it.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(db_path)
+            .expect("truncate the fixture's main file");
+    }
+
+    /// Build the destructive state whose newest in-journal page-1 image declares
+    /// no pages: the main file is intact, but the page-1 image the engine resolves
+    /// comes from the journal, so `PRAGMA page_count` answers 0 while the rows stay
+    /// readable. [`zero_wal_page_1_database_size`] self-checks the frame checksums
+    /// it rewrites; what the engine resolves from the patched journal is the
+    /// caller's to assert.
+    pub(crate) async fn build_zero_page_count_wal_store(db_path: &Path) {
+        create_fixture_store(db_path).await;
+        zero_wal_page_1_database_size(db_path);
+    }
+
+    /// Zero the page-1 "database size in pages" field of the newest in-journal
+    /// page-1 image, re-checksumming the WAL's frame chain from that frame to the
+    /// end (the stored checksums of the frames after it are seeded by it).
+    ///
+    /// A test fixture may write these bytes; the product may not (wal_guard's lock
+    /// rule) — this runs on a hermetic fixture the engine is not holding.
+    fn zero_wal_page_1_database_size(db_path: &Path) {
+        let wal = super::wal_path(db_path);
+        let mut bytes = std::fs::read(&wal).expect("read the fixture journal");
+        let header_len = usize::try_from(WAL_HEADER_BYTES).expect("the WAL header fits a usize");
+        // The WAL's magic selects the byte order every checksum word is read in
+        // (see [`wal_checksum`]).
+        let use_native = cfg!(target_endian = "big") == (be_u32(&bytes, 0) & 1 == 1);
+        let page_size = usize::try_from(be_u32(&bytes, 8)).expect("the WAL page size fits a usize");
+        let frame_size = WAL_FRAME_HEADER_BYTES + page_size;
+
+        // Self-check first: every frame's stored checksum must be the cumulative
+        // checksum of what is on disk. If it is not, this helper's algorithm does
+        // not match the engine's and any patch it wrote would be a bogus fixture —
+        // fail loudly rather than fabricate one. Frame numbering follows the
+        // engine's own scan: it stops at the first frame header with page 0.
+        let mut seed = (be_u32(&bytes, 24), be_u32(&bytes, 28));
+        let mut newest_page_1 = None;
+        let mut offset = header_len;
+        while offset + frame_size <= bytes.len() && be_u32(&bytes, offset) != 0 {
+            let computed = frame_checksum(&bytes, offset, frame_size, seed, use_native);
+            assert_eq!(
+                computed,
+                (be_u32(&bytes, offset + 16), be_u32(&bytes, offset + 20)),
+                "the fixture journal's frame at offset {offset} does not carry the cumulative \
+                 checksum of its bytes — the fixture's checksum algorithm does not match the \
+                 engine's",
+            );
+            seed = computed;
+            if be_u32(&bytes, offset) == 1 {
+                newest_page_1 = Some(offset);
+            }
+            offset += frame_size;
+        }
+        let patch_at = newest_page_1.expect("the fixture journal must hold a page-1 image");
+
+        let field = patch_at
+            + WAL_FRAME_HEADER_BYTES
+            + usize::try_from(PAGE_1_DATABASE_SIZE_OFFSET)
+                .expect("the page-1 database-size offset fits a usize");
+        bytes[field..field + 4].fill(0);
+
+        // Re-checksum the whole chain with the patched page image; the frames
+        // before the patch are unchanged and recompute to the values already
+        // stored, so only the patched frame and the frames after it change.
+        let mut seed = (be_u32(&bytes, 24), be_u32(&bytes, 28));
+        let mut offset = header_len;
+        while offset + frame_size <= bytes.len() && be_u32(&bytes, offset) != 0 {
+            let computed = frame_checksum(&bytes, offset, frame_size, seed, use_native);
+            bytes[offset + 16..offset + 20].copy_from_slice(&computed.0.to_be_bytes());
+            bytes[offset + 20..offset + 24].copy_from_slice(&computed.1.to_be_bytes());
+            seed = computed;
+            offset += frame_size;
+        }
+        std::fs::write(&wal, &bytes).expect("write the patched fixture journal");
+    }
+
+    /// The cumulative checksum a journal frame at `offset` stores: the frame
+    /// header's first 8 bytes (page number and commit marker) fed the running
+    /// chain, then its page image.
+    fn frame_checksum(
+        bytes: &[u8],
+        offset: usize,
+        frame_size: usize,
+        seed: (u32, u32),
+        use_native: bool,
+    ) -> (u32, u32) {
+        wal_checksum(
+            &bytes[offset + WAL_FRAME_HEADER_BYTES..offset + frame_size],
+            wal_checksum(&bytes[offset..offset + 8], seed, use_native),
+            use_native,
+        )
+    }
+
+    /// The engine's cumulative WAL checksum (SQLite's), mirrored from turso's
+    /// `checksum_wal`: 32-bit word pairs read in the byte order the WAL header's
+    /// magic selects, folded into two running sums. `data` must be a multiple of
+    /// 8 bytes.
+    fn wal_checksum(data: &[u8], seed: (u32, u32), use_native: bool) -> (u32, u32) {
+        let word = |bytes: &[u8]| {
+            let mut word = [0u8; 4];
+            word.copy_from_slice(bytes);
+            if use_native {
+                u32::from_ne_bytes(word)
+            } else {
+                u32::from_ne_bytes(word).swap_bytes()
+            }
+        };
+        let (mut s1, mut s2) = seed;
+        let (groups, remainder) = data.as_chunks::<8>();
+        assert!(
+            remainder.is_empty(),
+            "the cumulative WAL checksum is defined over 8-byte groups only",
+        );
+        for group in groups {
+            let v0 = word(&group[0..4]);
+            let v1 = word(&group[4..8]);
+            s1 = s1.wrapping_add(v0.wrapping_add(s2));
+            s2 = s2.wrapping_add(v1.wrapping_add(s1));
+        }
+        (s1, s2)
+    }
+
+    /// The big-endian `u32` the WAL format stores at `offset` (every field,
+    /// checksums included).
+    fn be_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("the field is four bytes"),
+        )
+    }
+
+    /// The fixture store's row count — it still answers queries in the gate's
+    /// destructive state.
+    pub(crate) async fn fixture_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM fixture", (), |r| r.get::<i64>(0))
+            .await
+            .expect("count the fixture rows")
+    }
+
+    /// The store's own `PRAGMA page_count` answer: exactly the field the
+    /// pre-shrink gate reads.
+    pub(crate) async fn page_count(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA page_count;", (), |r| r.get::<i64>(0))
+            .await
+            .expect("ask the fixture store for its page count")
+    }
+
+    /// The two foreign-client probes: a read (needs a SHARED lock to load the
+    /// schema) and a write (needs a RESERVED lock).
+    pub(crate) const PROBES: [(&str, &str); 2] = [
+        ("read", "SELECT count(*) FROM sqlite_schema;"),
+        (
+            "write",
+            "CREATE TABLE lock_probe (x); INSERT INTO lock_probe VALUES (1);",
+        ),
+    ];
+
+    /// Whether the stock `sqlite3` CLI is on `PATH`.
+    ///
+    /// The probes need it; the project's test run does not (see the module doc),
+    /// so its absence skips them — the evidence then says so in place of the probe
+    /// results, and the run still passes.
+    pub(crate) fn sqlite3_available() -> bool {
+        Command::new("sqlite3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    /// Run one `sqlite3` probe against a live store, require it to be refused as
+    /// locked, and return the first line of the client's refusal text. Only ever
+    /// called after [`sqlite3_available`]: a spawn failure here is a hard error, not
+    /// a skip — running no probe is not the same as a refused probe.
+    ///
+    /// Both assertions matter — a non-zero exit alone is not proof, because a lost
+    /// lock lets `sqlite3` reach the schema, where turso's FTS DDL (`CREATE INDEX …
+    /// USING fts`) is unparseable and also exits non-zero. Assert on the lock/busy
+    /// substring, never on a byte-exact message: the wording varies by version.
+    pub(crate) fn probe_store(store: &Path, sql: &str) -> Result<String> {
+        let output = Command::new("sqlite3")
+            .arg(store)
+            .arg(sql)
+            .output()
+            .with_context(|| format!("spawning sqlite3 to probe {}", store.display()))?;
+        let refusal = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        ensure!(
+            !output.status.success(),
+            "sqlite3 was NOT refused by {} (exit {}) — the store is unlocked: {}",
+            store.display(),
+            output.status,
+            refusal.trim(),
+        );
+        let lower = refusal.to_lowercase();
+        ensure!(
+            lower.contains("locked") || lower.contains("busy"),
+            "sqlite3 was refused by {} without a lock/busy error — the failure is not the lock: {}",
+            store.display(),
+            refusal.trim(),
+        );
+        Ok(refusal
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string())
+    }
+
+    /// Require both foreign probes against a live store to be refused as locked —
+    /// the engine's process-wide record locks can only be observed from another
+    /// process, so a refusal here is what says the store is still held. Skipped,
+    /// with a line saying so, when the stock `sqlite3` CLI is absent.
+    pub(crate) fn foreign_client_is_refused(store: &Path) {
+        if !sqlite3_available() {
+            println!(
+                "foreign-client probes SKIPPED for {}: no stock sqlite3 on PATH",
+                store.display(),
+            );
+            return;
+        }
+        for (kind, sql) in PROBES {
+            let refusal = probe_store(store, sql).unwrap_or_else(|e| {
+                panic!("the foreign {kind} probe must be refused as locked: {e:#}")
+            });
+            println!(
+                "foreign {kind} probe on {} refused: {refusal}",
+                store.display()
+            );
+        }
     }
 }
 
@@ -3728,7 +4176,7 @@ mod tests {
             let conn = open_consolidated_store(root)
                 .await
                 .expect("build a real product store");
-            conn.checkpoint()
+            conn.checkpoint_ungated()
                 .await
                 .expect("checkpoint the fixture store");
         }
@@ -4006,7 +4454,7 @@ mod tests {
         }
         {
             let conn = Connection::open(db_path).await.unwrap();
-            conn.checkpoint().await.unwrap();
+            conn.checkpoint_ungated().await.unwrap();
             drop(conn);
         }
     }
@@ -4056,13 +4504,13 @@ mod tests {
         }
         {
             let conn = Connection::open(&db_path).await.unwrap();
-            conn.checkpoint().await.unwrap();
+            conn.checkpoint_ungated().await.unwrap();
             drop(conn);
         }
         let shared = synthesize_overflow_aliasing(&db_path);
         assert!(shared > 0, "surgery must reference a real overflow page");
 
-        let conn = open_and_repair_for_test(&db_path, "board", schema)
+        let conn = open_and_repair_for_test(root, &db_path, "board", schema)
             .await
             .expect("overflow-aliasing repair must succeed on an FTS store");
         conn.quick_check()
@@ -4139,7 +4587,7 @@ mod tests {
         build_aliasing_candidate(&db_path, schema, Some(("v09999x", 99))).await;
         synthesize_overflow_aliasing(&db_path);
 
-        let conn = open_and_repair_for_test(&db_path, "board", schema)
+        let conn = open_and_repair_for_test(root, &db_path, "board", schema)
             .await
             .expect("aborted rebuild must still open the store (report-only)");
         let count: i64 = conn
@@ -4193,7 +4641,7 @@ mod tests {
             drop(conn);
         }
 
-        let conn = open_and_repair_for_test(&db_path, "board", schema)
+        let conn = open_and_repair_for_test(root, &db_path, "board", schema)
             .await
             .expect("overflow-aliasing repair must succeed on an AUTOINCREMENT store");
         conn.quick_check()
@@ -4577,6 +5025,8 @@ mod tests {
             "idx_tickets_title_fts",
             "CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
              USING fts (title) WITH (tokenizer = 'ngram')",
+            "core",
+            Some(tmp.path()),
         )
         .await;
 

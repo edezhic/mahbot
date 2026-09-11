@@ -17,8 +17,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::OnceCell;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt};
 
 /// Schema for a single log entry stored in Turso.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -342,9 +343,79 @@ fn log_entry_from_row(row: &Row) -> anyhow::Result<LogEntry> {
 
 // ── Tracing initialization ──────────────────────────────────────────
 
+/// The default filter, applied as a LAYER filter on the JSON log layer — see
+/// [`log_layers`] for why it must not be a global subscriber filter. `tantivy`
+/// reports through the standard `log` interface, so its directive only ever
+/// matches records that arrive over the bridge [`install_log_bridge`] installs.
+pub(crate) const DEFAULT_LOG_FILTER: &str =
+    "info,turso_core=warn,tantivy=warn,fff_search=error,fff_search::grep=error";
+
+/// The production layer stack: the JSON log layer, with the log filter applied
+/// PER LAYER, plus the engine-cause capture layer (see
+/// [`crate::db::checkpoint_cause`]). The filter must be a layer filter and never
+/// the subscriber's: installed globally it would drop the engine's DEBUG
+/// checkpoint-failure event and silently degrade the failure record to the
+/// product's constant text. Extracted from [`init_tracing`] so a test can
+/// install the real stack instead of a copy of it.
+pub(crate) fn log_layers<W>(
+    writer: W,
+    env_filter: EnvFilter,
+) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'a> fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::registry()
+        .with(
+            fmt::Layer::new()
+                .json()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_filter(env_filter),
+        )
+        .with(
+            crate::db::checkpoint_cause::CauseCaptureLayer
+                .with_filter(crate::db::checkpoint_cause::filter()),
+        )
+}
+
+/// Install the `log` → `tracing` bridge: the libraries this product depends on
+/// report through the standard `log` interface, and without this bridge their
+/// records never reach the log store. MahBot requests the forwarding itself, and
+/// a failed install is a boot failure — a `log` logger some dependency installed
+/// before us included — because silently losing every dependency's records is
+/// the regression this bridge exists to prevent. Upstream's `init` provided it
+/// only through the `tracing-log` feature this manifest declares (see
+/// `Cargo.toml`).
+///
+/// `level` is what the `log` crate gates on, and it must be the log layer's own
+/// filter level ([`log_bridge_level`]) — never [`LevelFilter::current`], which
+/// the engine-cause capture layer raises to DEBUG process-wide; a higher level
+/// here would let every dependency's `log::debug!` through only to be dropped
+/// again one layer later.
+fn install_log_bridge(level: LevelFilter) -> anyhow::Result<()> {
+    use tracing_log::AsLog;
+
+    tracing_log::LogTracer::builder()
+        .with_max_level(level.as_log())
+        .init()
+        .map_err(|e| anyhow::anyhow!("failed to install the log→tracing bridge: {e}"))
+}
+
+/// The level the `log` bridge gates on: the log layer's own filter's level, read
+/// before the filter moves into [`log_layers`] (see [`install_log_bridge`] for
+/// why the layer's level and not the subscriber's). A filter with no level hint
+/// leaves the bridge at `TRACE`: the layers still decide what is written, so the
+/// conservative side is to hand the `log` crate nothing it has to drop.
+fn log_bridge_level(env_filter: &EnvFilter) -> LevelFilter {
+    env_filter.max_level_hint().unwrap_or(LevelFilter::TRACE)
+}
+
 /// Initialize tracing: JSON to Turso store only (no terminal output).
 /// Returns the [`LogStore`] for querying and a broadcast sender
-/// for live log streaming to the Iced native GUI dashboard.
+/// for live streaming to the Iced native GUI dashboard.
+///
+/// Installs [`log_layers`] as the global subscriber and, for the same filter's
+/// level, the `log` bridge ([`install_log_bridge`]).
 pub async fn init_tracing(
     storage_root: &Path,
 ) -> anyhow::Result<(Arc<LogStore>, tokio::sync::broadcast::Sender<String>)> {
@@ -366,21 +437,12 @@ pub async fn init_tracing(
 
     spawn_log_writer(Arc::clone(&log_store), log_rx, broadcast_tx.clone());
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(
-            "info,turso_core=warn,tantivy=warn,ort=warn,fff_search=error,fff_search::grep=error",
-        )
-    });
-
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(
-            fmt::Layer::new()
-                .json()
-                .with_writer(make_log_writer(log_tx))
-                .with_ansi(false),
-        )
-        .init();
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    let bridge_level = log_bridge_level(&env_filter);
+    tracing::subscriber::set_global_default(log_layers(make_log_writer(log_tx), env_filter))
+        .expect("Unable to install the global tracing subscriber");
+    install_log_bridge(bridge_level)?;
     crate::boot::mark_tracing_initialized();
 
     // Surface pre-tracing boot diagnostics (the pre-flight shape check) in the
@@ -1020,7 +1082,7 @@ mod tests {
             .await;
             store
                 .conn
-                .checkpoint()
+                .checkpoint_ungated()
                 .await
                 .expect("checkpoint so pages land in the main DB file");
         }
@@ -1430,5 +1492,54 @@ mod tests {
             "the refused store's main file must be unchanged"
         );
         crate::db::test_support::assert_not_quarantined(&root.join("db"), "a refused logs store");
+    }
+
+    /// A record written through the standard third-party `log` interface — how
+    /// every dependency of this product reports — reaches the log layer under its
+    /// real target, through the production stack and the production bridge, and
+    /// the line the layer wrote is a row the store's own parser accepts.
+    ///
+    /// The bridge installs a process-global `log` logger, which is why the
+    /// production `install_log_bridge` treats a logger that is already there as a
+    /// failure; the stack itself goes on this thread's dispatcher, so the rest of
+    /// the suite sees no global subscriber change. The real `EnvFilter` is in the
+    /// stack, so the assertion on the record's `target` also pins the
+    /// `tracing-log` feature this manifest declares: without it the layer stores
+    /// the literal target `log` instead of the callsite's own.
+    #[test]
+    fn dependency_log_records_reach_the_log_store() {
+        const MESSAGE: &str = "a dependency record through the standard logging interface";
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let env_filter = EnvFilter::new(DEFAULT_LOG_FILTER);
+        let bridge_level = log_bridge_level(&env_filter);
+        let _guard = tracing::subscriber::set_default(log_layers(make_log_writer(tx), env_filter));
+        install_log_bridge(bridge_level).expect("install the log→tracing bridge");
+
+        tracing_log::log::warn!("{MESSAGE}");
+
+        let mut written = String::new();
+        while let Ok(line) = rx.try_recv() {
+            written.push_str(&line);
+        }
+        let record = written
+            .lines()
+            .find(|line| line.contains(MESSAGE))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a record written through the standard `log` interface must reach the log \
+                     layer: {written}"
+                )
+            });
+        let entry = parse_tracing_json(record).expect("the log store must parse the written line");
+        assert_eq!(
+            entry.message, MESSAGE,
+            "the store row must carry the record's message",
+        );
+        assert_eq!(
+            entry.target,
+            module_path!(),
+            "the record's real target must survive the bridge, not become the literal `log`",
+        );
     }
 }

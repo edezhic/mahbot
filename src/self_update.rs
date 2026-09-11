@@ -1512,18 +1512,33 @@ mod tests {
             "Should return None when lock is held"
         );
 
-        // After releasing the holder, the lock should be acquirable again —
-        // via both the raw fd and try_acquire_lock.
+        // Dropping the holder must release the lock — through the production
+        // helper, which is the same builder + `flock` pair asserted on above.
         drop(holder);
         drop(contender);
-        let reacquired = open_lock_file(&lock_path).unwrap();
         assert!(
-            try_flock(&reacquired).unwrap(),
-            "After release, flock should succeed"
+            lock_becomes_free(&lock_path).expect("lock the released lock file"),
+            "After release, the lock must be acquirable again"
         );
-        drop(reacquired);
-        let result = try_acquire_lock(&lock_path).unwrap();
-        assert!(result.is_some(), "After release, lock should be acquirable");
+    }
+
+    /// Poll for `path` to become lockable again, for up to ~2s.
+    ///
+    /// The release is polled rather than read once because every `Command::spawn`
+    /// in the suite forks: until the child execs it still carries this process's
+    /// open file description, and the kernel holds a flock for as long as any
+    /// description of the file exists — so a release can look held for a moment.
+    /// A lock that is never released (the regression this test exists for) comes
+    /// back `Ok(false)`; an OS error comes back as it is, never polled away.
+    fn lock_becomes_free(path: &Path) -> Result<bool> {
+        for _ in 0..100 {
+            match try_acquire_lock(path) {
+                Ok(Some(_)) => return Ok(true),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(false)
     }
 
     #[test]

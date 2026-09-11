@@ -89,9 +89,12 @@ directories = "6.0"
 # System locale (surfaced into agent session context for locale-aware chat)
 sys-locale = "0.3"
 
-# Logging
+# Logging — `tracing-log` and the `tracing-subscriber` feature are requested by
+# name so the `log`→`tracing` bridge cannot vanish with a dependency-graph change
+# (see `logs::install_log_bridge`).
 tracing = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json"] }
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "tracing-log"] }
 
 # Error handling
 anyhow = "1.0"

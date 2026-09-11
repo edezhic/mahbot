@@ -3,16 +3,28 @@
 //! Every severe failure the service survives — or refuses to survive — is
 //! appended here as a block: a start-up refusal, any other store bring-up
 //! failure, a persistent periodic checkpoint failure, an exit-time checkpoint
-//! failure, and a runtime integrity failure. [`record`] is the single write
-//! entry point, so that no severe failure can be silent: with a resolvable
-//! storage root the block lands in the file, and without one (or when the write
-//! itself fails) the full block goes to stderr instead.
+//! failure, a runtime integrity failure, and a refused reclaiming-checkpoint
+//! shrink. [`record`] is the single write entry point, so that no severe
+//! failure can be silent: with a resolvable storage root the block lands in the
+//! file, and without one (or when the write itself fails) the full block goes
+//! to stderr instead.
 //!
 //! Callers render a [`FailureReport`] and hand it to [`record`]; the raw append
 //! lives in [`append_failure_record`]. All of it is here so there is one file,
 //! one format, and one place that knows how to append a block without tearing.
+//!
+//! One stated limit of this format: the engine's own reason for a failed
+//! checkpoint ([`crate::db::checkpoint_cause`]) comes from a genuinely failing
+//! engine checkpoint, which is not reproducible hermetically — one serialised
+//! connection per store, and no fault injection into the engine — so the tests
+//! that pin a checkpoint failure's block drive the cause-capturing path rather
+//! than an end-to-end engine failure. The path in production is the same one.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+
+use crate::util::UnwrapPoison;
 
 /// The record's file name under a storage root.
 const ERROR_LOG_NAME: &str = "error.log";
@@ -23,6 +35,22 @@ const ERROR_LOG_NAME: &str = "error.log";
 /// persistent-checkpoint block has always used.
 pub(crate) const UNKNOWN_STORE: &str = "store: unknown (not obtainable on this path)";
 pub(crate) const UNKNOWN_DB_PATH: &str = "db path: unresolvable (storage root unavailable)";
+
+/// The artifact-state line's not-obtainable wording (see [`artifact_state_line`]).
+/// Kept neutral about who failed to measure: the callers that reach it are a
+/// failed stat and a probe that answered nothing at all.
+const ARTIFACT_STATE_UNAVAILABLE: &str = "artifact state: not obtainable (no -wal size measured)";
+
+/// The artifact state every per-store block reports: the size of the store's
+/// `-wal` file, read stat-only (wal_guard's lock rule), rendered here so every
+/// block spells that one fact the same way. `None` renders the explicit
+/// not-obtainable line instead of dropping the field.
+pub(crate) fn artifact_state_line(wal_bytes: Option<u64>) -> String {
+    match wal_bytes {
+        Some(bytes) => format!("artifact state: wal_size={bytes}"),
+        None => ARTIFACT_STATE_UNAVAILABLE.to_string(),
+    }
+}
 
 /// The environment-cause marker: this failure is an external condition
 /// (permissions, resource exhaustion, lock contention), not evidence about a
@@ -39,13 +67,18 @@ pub(crate) enum FailureKind {
     /// A start-up step failed without a store refusal (a store bring-up error,
     /// config, a provider or another global init).
     StartUpFailure,
-    /// A periodic checkpoint still fails after the runtime FTS repair: the
-    /// service drains.
+    /// A periodic checkpoint round ended with a genuine failure and no
+    /// completion. Recorded on every such round; whether the service then
+    /// continues is the round's decision (see [`crate::db::checkpoint`]).
     CheckpointFailure,
     /// A checkpoint failed on the exit-time round.
     ExitCheckpointFailure,
     /// A store's periodic integrity check failed.
     RuntimeIntegrityFailure,
+    /// A reclaiming checkpoint was refused because the store's own page count
+    /// did not match its files (see [`crate::db::shrink_gate`]). Not a
+    /// failure: the service keeps serving.
+    ShrinkRefused,
 }
 
 impl FailureKind {
@@ -58,6 +91,7 @@ impl FailureKind {
             Self::CheckpointFailure => "MahBot checkpoint failure — ",
             Self::ExitCheckpointFailure => "MahBot exit checkpoint failure — ",
             Self::RuntimeIntegrityFailure => "MahBot runtime integrity failure — ",
+            Self::ShrinkRefused => "MahBot store shrink refused — ",
         }
     }
 }
@@ -159,6 +193,32 @@ impl FailureReport {
     }
 }
 
+/// One process-lifetime per-key round counter behind the "file the durable block
+/// on the first round, then only count" rule a repeating-but-survivable condition
+/// follows (a persistent condition must not append a block every round). One
+/// static per failure kind keeps their counts independent; the key names the
+/// artifact the condition is about (a store's db path for the shrink gate, the
+/// store's name for the runtime integrity check), so two different files never
+/// share a count. [`crate::db::checkpoint`]'s module header owns which kinds
+/// deliberately skip it and why.
+pub(crate) struct RoundCounter(LazyLock<Mutex<HashMap<String, u64>>>);
+
+impl RoundCounter {
+    pub(crate) const fn new() -> Self {
+        Self(LazyLock::new(|| Mutex::new(HashMap::new())))
+    }
+
+    /// Count a round for `key`: `0` on the key's first round in this process
+    /// (file the durable block), otherwise the number of rounds already counted
+    /// (only warn with the running count).
+    pub(crate) fn prior_rounds(&self, key: &str) -> u64 {
+        let mut rounds = self.0.lock().unwrap_poison();
+        let count = rounds.entry(key.to_string()).or_insert(0);
+        *count += 1;
+        *count - 1
+    }
+}
+
 /// Raw append: `report` as a block to `<root>/error.log`, creating the file if
 /// absent. Returns the log path. Pure `std::fs` — no async, never panics on the
 /// caller's behalf. The report + terminator go out as a single `write_all`
@@ -215,6 +275,16 @@ pub(crate) fn record(root: Option<&Path>, block: &str) -> Option<std::path::Path
 /// after), so the record is reachable from both.
 pub(crate) fn recorded_pointer(what: &str, path: Option<PathBuf>) -> Option<String> {
     path.map(|path| format!("{what} recorded in {}", path.display()))
+}
+
+/// File `report` and point the operator at the file it landed in, on the log
+/// channel (the boot path prints the same pointer on its diagnostics channel
+/// instead — see [`crate::boot`]). `what` names the failure in that pointer.
+pub(crate) fn record_and_point(root: Option<&Path>, what: &str, report: &FailureReport) {
+    let filed = record(root, &report.render());
+    if let Some(pointer) = recorded_pointer(what, filed) {
+        tracing::info!("{pointer}");
+    }
 }
 
 /// The stderr fallback's text: the whole block plus why it could not be filed —
@@ -350,9 +420,9 @@ mod tests {
         );
     }
 
-    /// Requirement 3's fallback in text: a block that cannot be filed reaches
-    /// stderr whole, followed by the reason it could not be filed — never a
-    /// pointer to a record that does not hold it.
+    /// The stderr fallback in text: a block that cannot be filed reaches stderr
+    /// whole, followed by the reason it could not be filed — never a pointer to
+    /// a record that does not hold it.
     #[test]
     fn unfiled_block_carries_the_block_and_the_reason() {
         let text = unfiled_block(

@@ -89,13 +89,31 @@ impl ShapeDefect {
     }
 }
 
+/// The `-wal` header's size in bytes (fixed by the SQLite WAL format): a `-wal`
+/// file of exactly this size holds no frames, so anything larger does.
+pub(crate) const WAL_HEADER_BYTES: u64 = 32;
+
+/// A stat-only file size: 0 when the file is absent, `Err` when it exists but
+/// cannot be read. The shared read behind the size facts the running service
+/// compares — the `-wal` size the checkpoint cap uses, and the file sizes the
+/// pre-shrink gate checks the store's own page count against.
+pub(crate) fn stat_size(path: &Path) -> std::io::Result<u64> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(meta.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
 /// The store's `-wal` size, read stat-only — the fact source for the running
 /// service (the periodic checkpoint cap and the persistent-failure report both
 /// use it). The `-wal` can hold committed-but-not-checkpointed frames; see the
-/// module doc's lock rule for why the store itself may not be opened.
+/// module doc's lock rule for why the store itself may not be opened. A stat
+/// that fails reads as 0, which leaves the cap below its threshold — the
+/// conservative side for a size the caller only compares against a cap.
 #[must_use]
 pub(super) fn wal_size(db_path: &Path) -> u64 {
-    std::fs::metadata(crate::db::wal_path(db_path)).map_or(0, |m| m.len())
+    stat_size(&crate::db::wal_path(db_path)).unwrap_or(0)
 }
 
 /// Classify a store data file's file-level shape: absent, present, or unusable

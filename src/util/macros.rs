@@ -79,9 +79,13 @@ macro_rules! columns {
 /// Eliminates ~64 lines of boilerplate per store module.
 ///
 /// The `post_open` field is optional.  When present, it names an
-/// `async fn(&self) -> anyhow::Result<()>` method that is called after
-/// the database connection is established (via `this.$method().await?`)
-/// but before the store is returned.  The method must be defined in a
+/// `async fn(&self) -> anyhow::Result<()>` method that is called after the
+/// database connection is established (via `this.$method().await?`) but before
+/// the store is returned.  A hook that needs the storage root the store was
+/// opened under declares itself with `post_open_rooted` instead, naming an
+/// `async fn(&self, root: &Path) -> anyhow::Result<()>` (via
+/// `this.$method(root).await?`) — so no hook has to re-resolve the root and no
+/// hook takes a parameter it does not use.  The method must be defined in a
 /// separate `impl Store { … }` block.
 ///
 /// # Generated items
@@ -108,6 +112,7 @@ macro_rules! define_store {
         $(#[$attr:meta])*
         $vis:vis static $name:ident: $ty:ident,
         $(post_open = $method:ident,)?
+        $(post_open_rooted = $rooted_method:ident,)?
         expect = $expect:expr,
     ) => {
         $(#[$attr])*
@@ -139,6 +144,7 @@ macro_rules! define_store {
                 let conn = $crate::db::open_consolidated_store(root).await?;
                 let this = Self { conn };
                 $(this.$method().await?;)?
+                $(this.$rooted_method(root).await?;)?
                 Ok(this)
             }
         }

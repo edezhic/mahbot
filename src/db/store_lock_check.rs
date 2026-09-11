@@ -11,6 +11,11 @@
 //! whole-file lock on the MAIN file, which a client's own byte-range lock
 //! conflicts with — a lock left only on a `-wal` would not show up this way.
 //!
+//! The pre-shrink gate ([`crate::db::shrink_gate::shrink_allowed`]) is another
+//! path that must not cost the lock: [`verify`] runs it on every live store and
+//! requires it to allow the shrink, and the foreign probes that follow then prove
+//! the lock survived it.
+//!
 //! [`tests::a_store_held_by_another_process_refuses_the_boot`] covers the other
 //! half: while a foreign process holds a store's lock, the daemon's bring-up must
 //! refuse — recorded on the boot-diagnostic channel — rather than open what it
@@ -37,22 +42,14 @@
 //! test run must never depend on a tool that may be absent from the machine
 //! running it. The boot bring-up, the paths above and the fingerprint run either
 //! way — only the foreign-client observation is left to a machine that has the
-//! CLI (see [`sqlite3_available`]).
+//! CLI (see [`crate::db::test_support::sqlite3_available`]).
 
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
 
-/// The two foreign-client probes: a read (needs a SHARED lock to load the
-/// schema) and a write (needs a RESERVED lock).
-const PROBES: [(&str, &str); 2] = [
-    ("read", "SELECT count(*) FROM sqlite_schema;"),
-    (
-        "write",
-        "CREATE TABLE lock_probe (x); INSERT INTO lock_probe VALUES (1);",
-    ),
-];
+use crate::db::test_support::{PROBES, probe_store, sqlite3_available};
 
 /// Boot the real stores, exercise the real inspection/snapshot paths, then
 /// prove from a foreign process that every store is locked. Returns the
@@ -98,12 +95,28 @@ async fn verify() -> Result<String> {
 
     // The real inspection round — the other path that historically dropped the
     // lock — runs last on purpose: it folds the settled WAL into the main files
-    // immediately before the fingerprint below, so the engine's own
-    // auto-checkpoint cannot move a store inside the probe window. Repeated,
-    // because the rounds are not identical: the first folds a settled WAL and
-    // the later ones inspect the already-folded state.
+    // immediately before the read-only gate probe and the fingerprint below, so
+    // the engine's own auto-checkpoint cannot move a store inside the probe
+    // window. Repeated, because the rounds are not identical: the first folds a
+    // settled WAL and the later ones inspect the already-folded state.
     for _ in 0..3 {
         crate::db::checkpoint::periodic_checkpoint_and_verify().await;
+    }
+
+    // The pre-shrink gate is another path that must not cost the store's lock:
+    // it is a stat-only probe plus one pragma in the product. Run it against
+    // every live store and require it to allow the shrink on a healthy store —
+    // the fingerprint and foreign probes below then prove it kept the lock.
+    let mut gated = Vec::new();
+    for (name, store_conn) in super::iter_checkpoint_stores() {
+        let Some(store_conn) = store_conn else {
+            continue;
+        };
+        ensure!(
+            crate::db::shrink_gate::shrink_allowed(store_conn, name, Some(&root)).await,
+            "the pre-shrink gate refused a healthy store ({name})",
+        );
+        gated.push(name);
     }
 
     let before = dir_fingerprint(&store_dir)?;
@@ -127,65 +140,12 @@ async fn verify() -> Result<String> {
     );
 
     Ok(format!(
-        "store-lock check: ok on {}\nsnapshot: {}\n{probes}\nstore directory unchanged ({})",
+        "store-lock check: ok on {}\nsnapshot: {}\npre-shrink gate allowed on {}\n{probes}\nstore directory unchanged ({})",
         std::env::consts::OS,
         snapshot.display(),
+        gated.join(", "),
         store_dir.display(),
     ))
-}
-
-/// Whether the stock `sqlite3` CLI is on `PATH`.
-///
-/// The probes need it; the project's test run does not (see the module doc), so
-/// its absence skips them — the evidence then says so in place of the probe
-/// results, and the run still passes.
-fn sqlite3_available() -> bool {
-    Command::new("sqlite3")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-/// Run one `sqlite3` probe against a live store, require it to be refused as
-/// locked, and return the first line of the client's refusal text. Only ever
-/// called after [`sqlite3_available`]: a spawn failure here is a hard error, not
-/// a skip — running no probe is not the same as a refused probe.
-///
-/// Both assertions matter — a non-zero exit alone is not proof, because a lost
-/// lock lets `sqlite3` reach the schema, where turso's FTS DDL (`CREATE INDEX …
-/// USING fts`) is unparseable and also exits non-zero. Assert on the lock/busy
-/// substring, never on a byte-exact message: the wording varies by version.
-fn probe_store(store: &Path, sql: &str) -> Result<String> {
-    let output = Command::new("sqlite3")
-        .arg(store)
-        .arg(sql)
-        .output()
-        .with_context(|| format!("spawning sqlite3 to probe {}", store.display()))?;
-    let refusal = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    ensure!(
-        !output.status.success(),
-        "sqlite3 was NOT refused by {} (exit {}) — the store is unlocked: {}",
-        store.display(),
-        output.status,
-        refusal.trim(),
-    );
-    let lower = refusal.to_lowercase();
-    ensure!(
-        lower.contains("locked") || lower.contains("busy"),
-        "sqlite3 was refused by {} without a lock/busy error — the failure is not the lock: {}",
-        store.display(),
-        refusal.trim(),
-    );
-    Ok(refusal
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string())
 }
 
 /// One store-directory entry as the check sees it: the name of every entry, plus
