@@ -34,11 +34,6 @@
 //!
 //! ## Other verbs
 //!
-//! - `mahbot debug detect [--db <name>]` — classify store file sets with a
-//!   stat plus an 18-byte header read (no engine open) via
-//!   `wal_guard::inspect_store_at`, reporting
-//!   `absent`/`present`/`unusable:<defect>` plus the on-disk `-wal` size and a
-//!   stale `.tshm` flag. Exits 1 when any store is not usable.
 //! - `mahbot debug families [--db <name>]` — list every forensic family in the
 //!   store directory with its original store, artifact type, timestamp, total
 //!   size, and a file-set/header classification. No engine is opened.
@@ -144,7 +139,7 @@ fn print_line(args: std::fmt::Arguments<'_>) -> Result<()> {
     write_stdout(&format!("{args}\n"))
 }
 
-/// Shared `[--db <name>]` flag parser for the detect/families verbs
+/// Shared `[--db <name>]` flag parser for the families verb
 /// (`mahbot debug <verb> --db <name>`); `None` means no flag was given.
 fn parse_db_flag(args: &[String], subcommand: &str) -> Result<Option<String>> {
     match args.get(3).map(String::as_str) {
@@ -163,7 +158,7 @@ fn parse_db_flag(args: &[String], subcommand: &str) -> Result<Option<String>> {
 ///
 /// Accepts both the LOGICAL store names ([`turso_mod::store_names`]) and the
 /// PHYSICAL consolidated file name ([`turso_mod::CONSOLIDATED_DB_NAME`], shown
-/// as the label in `--db all`/`detect` output). Both lists must stay in sync
+/// as the label in `--db all` output). Both lists must stay in sync
 /// with the debug CLI's `--db` surface.
 pub(crate) fn validate_store_name(name: &str, all_valid: bool) -> Result<()> {
     let names = turso_mod::debug_db_names();
@@ -172,50 +167,6 @@ pub(crate) fn validate_store_name(name: &str, all_valid: bool) -> Result<()> {
     }
     let hint = names.join(", ") + if all_valid { ", all" } else { "" };
     bail!("invalid database name '{name}'. Valid names: {hint}");
-}
-
-/// `mahbot debug detect [--db <name>]` — classify every store's file set with a
-/// stat plus an 18-byte header read (no engine open). Prints one line per
-/// physical store (`name\tclass\twal_size=N\tstale_tshm=B`). Exit 0 when every
-/// store is usable; exit 1 (via `Err`) when a store is not usable (its data file
-/// fails the file-level shape check — the boot refusal condition).
-fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<()> {
-    let mahbot_home = resolve_home(home_override)?;
-    let selected = match parse_db_flag(args, "detect")? {
-        Some(name) if name == "all" => physical_store_list(&mahbot_home)
-            .into_iter()
-            .map(|(n, _)| n)
-            .collect(),
-        Some(name) => {
-            validate_store_name(&name, false)?;
-            vec![name]
-        }
-        // No `--db` → diagnose each PHYSICAL file once (core + logs), not
-        // once per logical domain name (every logical name maps to one of the
-        // physical files).
-        None => physical_store_list(&mahbot_home)
-            .into_iter()
-            .map(|(n, _)| n)
-            .collect(),
-    };
-    let mut failures = 0usize;
-    for name in &selected {
-        let status = wal_guard::inspect_store_at(&turso_mod::store_db_path(&mahbot_home, name));
-        print_line(format_args!(
-            "{}\t{}\twal_size={}\tstale_tshm={}",
-            name,
-            status.class.label(),
-            status.wal_size,
-            status.has_stale_tshm,
-        ))?;
-        if matches!(status.class, wal_guard::StoreShape::Unusable(_)) {
-            failures += 1;
-        }
-    }
-    if failures > 0 {
-        bail!("{failures} store(s) are not usable — see above");
-    }
-    Ok(())
 }
 
 // ── Forensic families (quarantine / pre-reindex) ─────────────────────────
@@ -253,8 +204,8 @@ struct FamilyInfo {
     stamp: String,
     /// Total size in bytes of every present family file.
     size: u64,
-    /// File-set/header classification (family-specific — never the live-store
-    /// wal_guard coordination labels, which are meaningless for static files).
+    /// File-set/header classification (family-specific — never a live-store
+    /// class, which is meaningless for static files).
     class: FamilyClass,
     /// Present members, comma-joined (`db,wal,shm,tshm`).
     files: String,
@@ -654,11 +605,6 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
     if tail.contains(&"--help") || tail.contains(&"-h") {
         print_usage();
         return Ok(());
-    }
-
-    // `mahbot debug detect [--db <name>]` — full predicate, no opens, no gate.
-    if args.get(2).is_some_and(|a| a == "detect") {
-        return run_debug_detect(&args, home_override);
     }
 
     // `mahbot debug families [--db <name>]` — list forensic families, no opens.
@@ -1225,9 +1171,9 @@ fn quote_ident(name: &str) -> String {
 
 /// The physical database files for the debug CLI, each opened once.
 ///
-/// After consolidation all the domain stores share ONE file, so `--db all` and
-/// `detect` (with no `--db`) open each unique file once rather than once per
-/// logical domain name. Labels are the physical store names from
+/// After consolidation all the domain stores share ONE file, so `--db all`
+/// opens each unique file once rather than once per logical domain name. Labels
+/// are the physical store names from
 /// [`turso_mod::iter_checkpoint_stores`].
 fn physical_store_list(root: &Path) -> Vec<(String, PathBuf)> {
     turso_mod::iter_checkpoint_stores()
@@ -1501,7 +1447,6 @@ pub(crate) fn format_truncation_row(column_count: usize) -> String {
 
 fn print_usage() {
     eprintln!("Usage: mahbot debug --db <name> [\"SQL query\"]");
-    eprintln!("       mahbot debug detect [--db <name>]");
     eprintln!("       mahbot debug families [--db <name>]");
     eprintln!("       mahbot debug --family <id> \"SQL query\"");
     let names = turso_mod::debug_db_names().join(" | ");
@@ -1513,8 +1458,6 @@ fn print_usage() {
     eprintln!("              database in per-store sections (per-store errors; exit 1 if");
     eprintln!("              any store failed)");
     eprintln!("  SQL query   read-only SQL, quoted as a single argument");
-    eprintln!("  detect      classify store file-set shape (absent/present/unusable)");
-    eprintln!("               without opening stores; reports stale .tshm leftovers");
     eprintln!("  families    list quarantine/pre-reindex forensic families (--db filters by");
     eprintln!("               store name; a name matching nothing prints an empty list)");
     eprintln!("  --family <id>  read-only SQL against one forensic family (id from `families`)");
@@ -1524,7 +1467,6 @@ fn print_usage() {
     eprintln!("  mahbot debug --db all");
     eprintln!("  mahbot debug --db board \"SELECT phase, COUNT(*) FROM tickets GROUP BY phase\"");
     eprintln!("  mahbot debug --db all \"SELECT name FROM sqlite_master WHERE type='table'\"");
-    eprintln!("  mahbot debug detect");
     eprintln!("  mahbot debug families");
     eprintln!(
         "  mahbot debug --family board.db.quarantine-20260812T120000Z-1234 \"SELECT COUNT(*) FROM tickets\""
@@ -2170,13 +2112,10 @@ mod tests {
             vec!["--help"],
             vec!["-h"],
             vec!["families", "--help"],
-            vec!["detect", "--help"],
             vec!["families", "-h"],
-            vec!["detect", "-h"],
             vec!["--family", "--help"],
             vec!["--family", "-h"],
             vec!["families", "--db", "--help"],
-            vec!["detect", "--db", "--help"],
             vec!["--db", "--help"],
             vec!["--db", "-h"],
             vec!["--family", "--help", "extra"],
@@ -2191,8 +2130,6 @@ mod tests {
             vec!["--db", "board", "--help", "extra"],
             vec!["--db", "board", "-h", "extra"],
             vec!["families", "--db", "board", "--help"],
-            vec!["detect", "--db", "board", "--help"],
-            vec!["detect", "--help", "extra"],
         ] {
             let mut args = vec!["mahbot".to_string(), "debug".to_string()];
             args.extend(tail.into_iter().map(str::to_owned));
@@ -2253,68 +2190,6 @@ mod tests {
         run_debug_with_args(args, Some(dir.path().to_path_buf()))
             .await
             .expect("legacy store family must be filterable by --db");
-    }
-
-    /// `debug detect` classifies synthetic file sets without opening the store
-    /// through the engine: a valid main DB reports `present` (succeeds), a
-    /// garbage (unusable) main DB fails.
-    #[test]
-    fn debug_detect_reports_unusable_store() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_dir = dir.path().join("db");
-        std::fs::create_dir_all(&db_dir).unwrap();
-
-        // An unusable main DB (garbage header) + a usable one.
-        std::fs::write(db_dir.join("core.db"), vec![0x42; 128]).unwrap();
-        std::fs::write(db_dir.join("logs.db"), valid_db_bytes()).unwrap();
-
-        // Usable store (logs) — detect succeeds.
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "detect".to_string(),
-            "--db".to_string(),
-            "logs".to_string(),
-        ];
-        assert!(run_debug_detect(&args, Some(dir.path().to_path_buf())).is_ok());
-
-        // Unusable store (board resolves to core.db) — detect fails.
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "detect".to_string(),
-            "--db".to_string(),
-            "board".to_string(),
-        ];
-        let err = run_debug_detect(&args, Some(dir.path().to_path_buf()))
-            .expect_err("an unusable store must fail detect");
-        assert!(
-            format!("{err:#}").contains("store(s) are not usable"),
-            "got: {err:#}"
-        );
-    }
-
-    /// `debug detect --db all` resolves to every physical store (core + logs),
-    /// matching the `--db all` form of the main debug verb.
-    #[test]
-    fn detect_db_all_diagnoses_every_physical_store() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_dir = dir.path().join("db");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        std::fs::write(db_dir.join("core.db"), valid_db_bytes()).unwrap();
-        std::fs::write(db_dir.join("logs.db"), valid_db_bytes()).unwrap();
-
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "detect".to_string(),
-            "--db".to_string(),
-            "all".to_string(),
-        ];
-        assert!(
-            run_debug_detect(&args, Some(dir.path().to_path_buf())).is_ok(),
-            "detect --db all must succeed on healthy core + logs stores"
-        );
     }
 
     /// End-to-end daemon-down path: a row committed to the WAL (the store is

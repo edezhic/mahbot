@@ -32,11 +32,11 @@
 //! process holds on it — the engine never re-takes it, and an in-process check
 //! can never notice. So the running service must never open a store file: facts
 //! about a live store come from a stat (`store_file_facts`) or from the engine
-//! itself. Reading a store's header ([`classify_store_shape`] /
-//! [`inspect_store_at`], via [`read_db_header`]) opens the file, so it is
-//! allowed only where this process holds no lock yet: the boot bring-up (the
-//! pre-flight scan and the open of each store both run before that store is
-//! locked) or a separate process (`mahbot debug detect`).
+//! itself. Reading a store's header ([`classify_store_shape`], via
+//! [`read_db_header`]) opens the file, so it is allowed only where this process
+//! holds no lock yet: the boot bring-up (the pre-flight scan and the open of
+//! each store both run before that store is locked). No other read is permitted
+//! while this process holds the store.
 
 use std::path::Path;
 
@@ -69,31 +69,7 @@ pub(crate) enum ShapeDefect {
     BadPageSize,
 }
 
-impl StoreShape {
-    /// Short stable label for logs and the `debug detect` output.
-    #[must_use]
-    pub(crate) fn label(self) -> String {
-        match self {
-            Self::Absent => "absent".to_string(),
-            Self::Present => "present".to_string(),
-            Self::Unusable(defect) => format!("unusable:{}", defect.label()),
-        }
-    }
-}
-
 impl ShapeDefect {
-    /// Short stable label for the defect, composed into [`StoreShape::label`].
-    #[must_use]
-    fn label(self) -> &'static str {
-        match self {
-            Self::ZeroBytes => "empty",
-            Self::TooShort(_) => "short",
-            Self::Unreadable => "unreadable",
-            Self::BadMagic => "bad-magic",
-            Self::BadPageSize => "bad-page-size",
-        }
-    }
-
     /// Human one-liner, for the durable refusal record and the start-failure
     /// screen.
     #[must_use]
@@ -110,19 +86,6 @@ impl ShapeDefect {
     }
 }
 
-/// Classification of one store's file set for the `debug detect` output: the
-/// file-level shape — from the stat facts, plus the main-DB header when the file
-/// is long enough to have one — and the facts it was read from.
-#[derive(Debug)]
-pub(super) struct StoreArtifactStatus {
-    /// File-level shape (main-DB header).
-    pub class: StoreShape,
-    /// On-disk `-wal` size in bytes (0 when missing or empty).
-    pub wal_size: u64,
-    /// True when a leftover `.tshm` file exists (stale coordination debris).
-    pub has_stale_tshm: bool,
-}
-
 /// Stat-only facts about one store's file set — the fact source for the running
 /// service (the periodic checkpoint cap and the persistent-failure report both
 /// use this). See the module doc's lock rule for why nothing here may be opened.
@@ -133,27 +96,13 @@ pub(super) struct StoreFileFacts {
 }
 
 /// Collect a store's [`StoreFileFacts`] without opening anything. The running
-/// service must use this instead of [`inspect_store_at`].
+/// service must use this rather than read the store's header.
 #[must_use]
 pub(super) fn store_file_facts(db_path: &Path) -> StoreFileFacts {
     let sidecars = crate::db::store_sidecars(db_path);
     StoreFileFacts {
         wal_size: std::fs::metadata(&sidecars.wal).map_or(0, |m| m.len()),
         has_stale_tshm: sidecars.tshm.exists(),
-    }
-}
-
-/// Classify one store's file set given its main database file path. Reading the
-/// main-DB header is subject to the module doc's lock rule: the boot bring-up
-/// (before that store is opened) or a separate process only. Pure filesystem
-/// inspection, unit-testable with synthetic file states.
-#[must_use]
-pub(super) fn inspect_store_at(db_path: &Path) -> StoreArtifactStatus {
-    let facts = store_file_facts(db_path);
-    StoreArtifactStatus {
-        class: classify_store_shape(db_path),
-        wal_size: facts.wal_size,
-        has_stale_tshm: facts.has_stale_tshm,
     }
 }
 
@@ -322,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_store_at_classifies_synthetic_file_sets() {
+    fn classify_store_shape_classifies_synthetic_file_sets() {
         let dir = std::env::temp_dir().join(format!("wal_guard_shape_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let db_path = dir.join("db/core.db");
@@ -330,14 +279,12 @@ mod tests {
 
         // Present: valid magic + a page size in range.
         write(&db_path, &valid_header(4096));
-        let s = inspect_store_at(&db_path);
-        assert_eq!(s.class, StoreShape::Present);
-        assert!(!s.has_stale_tshm);
+        assert_eq!(classify_store_shape(&db_path), StoreShape::Present);
 
         // Unusable: truncated file — shorter than a valid header.
         write(&db_path, &[0u8; 64]);
         assert_eq!(
-            inspect_store_at(&db_path).class,
+            classify_store_shape(&db_path),
             StoreShape::Unusable(ShapeDefect::TooShort(64))
         );
 
@@ -345,19 +292,19 @@ mod tests {
         write(&db_path, &[]);
         write(&wal, &[0u8; 512]);
         assert_eq!(
-            inspect_store_at(&db_path).class,
+            classify_store_shape(&db_path),
             StoreShape::Unusable(ShapeDefect::ZeroBytes)
         );
         let _ = std::fs::remove_file(&wal);
 
         // Absent: no data file at all — a genuine first launch.
         let _ = std::fs::remove_file(&db_path);
-        assert_eq!(inspect_store_at(&db_path).class, StoreShape::Absent);
+        assert_eq!(classify_store_shape(&db_path), StoreShape::Absent);
 
         // Unusable: >=100 bytes without the SQLite magic.
         write(&db_path, &[0x42; 128]);
         assert_eq!(
-            inspect_store_at(&db_path).class,
+            classify_store_shape(&db_path),
             StoreShape::Unusable(ShapeDefect::BadMagic)
         );
 
@@ -366,20 +313,15 @@ mod tests {
         bad_page[16..18].copy_from_slice(&0u16.to_be_bytes());
         write(&db_path, &bad_page);
         assert_eq!(
-            inspect_store_at(&db_path).class,
+            classify_store_shape(&db_path),
             StoreShape::Unusable(ShapeDefect::BadPageSize)
         );
-
-        // Stale .tshm debris is reported (never removed here) while the class
-        // is still computed from the main DB alone.
-        write(&dir.join("db/core.db-tshm"), &[0u8; 32]);
-        assert!(inspect_store_at(&db_path).has_stale_tshm);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn inspect_store_at_visits_every_store() {
+    fn classify_store_shape_visits_every_store() {
         let dir = std::env::temp_dir().join(format!("wal_guard_all_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // Only the PHYSICAL store files exist on disk: one consolidated domain
@@ -389,13 +331,37 @@ mod tests {
         write(&dir.join("db/core.db"), &valid_header(4096));
         write(&dir.join("db/logs.db"), &valid_header(4096));
         for name in crate::db::store_names() {
-            let s = inspect_store_at(&crate::db::store_db_path(&dir, name));
             assert_eq!(
-                s.class,
+                classify_store_shape(&crate::db::store_db_path(&dir, name)),
                 StoreShape::Present,
                 "fixture store {name} must be present"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stat-only facts the persistent checkpoint-failure report reads: the
+    /// on-disk `-wal` size and the stale `.tshm` flag, both without opening the
+    /// store.
+    #[test]
+    fn store_file_facts_reports_wal_size_and_stale_tshm() {
+        let dir = std::env::temp_dir().join(format!("wal_guard_facts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("db/core.db");
+        write(&db_path, &valid_header(4096));
+        write(&dir.join("db/core.db-wal"), &[0xAA; 512]);
+        write(&dir.join("db/core.db-tshm"), &[0u8; 32]);
+
+        let facts = store_file_facts(&db_path);
+        assert_eq!(facts.wal_size, 512);
+        assert!(facts.has_stale_tshm);
+
+        let _ = std::fs::remove_file(dir.join("db/core.db-wal"));
+        let _ = std::fs::remove_file(dir.join("db/core.db-tshm"));
+        let facts = store_file_facts(&db_path);
+        assert_eq!(facts.wal_size, 0);
+        assert!(!facts.has_stale_tshm);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
