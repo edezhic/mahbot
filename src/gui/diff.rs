@@ -30,7 +30,7 @@ use iced::{Alignment, Color, Element, Length, Task, keyboard};
 
 use iced_fonts::lucide;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::menus::{ContextMenu, MenuItem};
@@ -110,9 +110,13 @@ const RENAME_COLOR: Color = theme::ACCENT_LIGHT;
 
 #[derive(Debug, Clone)]
 pub enum DiffMessage {
-    /// workspace name and optional filesystem path override (used for personal workspaces
-    /// that don't exist in the `workspaces` table).
-    WorkspaceSelected(String, Option<String>),
+    /// The workspace the dashboard resolved for the current selection, as the
+    /// filesystem path every git operation of this view runs against. The diff
+    /// view never resolves a workspace by name; the dashboard sends
+    /// [`DiffMessage::WorkspaceUnresolved`] instead while nothing resolves.
+    WorkspaceSelected(String),
+    /// Nothing is resolved: drop the workspace this view was showing.
+    WorkspaceUnresolved,
     DiffLoaded(u64, Result<Vec<DiffFile>, String>),
     Tick,
     ToggleDir(String),
@@ -139,9 +143,9 @@ pub enum DiffMessage {
     /// Scroll position changed in the tree panel. First element is the
     /// absolute vertical scroll offset, second is the visible viewport height.
     TreeScrolled(f32, f32),
-    /// Navigate to a specific commit diff view.
-    /// (workspace_name, commit_hash)
-    NavigateToCommit(String, String),
+    /// Navigate to a specific commit diff view (`commit_hash`) of the workspace
+    /// this view already resolves, keeping that workspace across the navigation.
+    NavigateToCommit(String),
     /// Return from historical commit view to working tree diff.
     BackToWorkingTree,
     /// Commit message fetched for a historical commit (commit_hash, message).
@@ -230,10 +234,9 @@ fn diff_pane_container<'a>(
 
 pub struct DiffState {
     error: Option<String>,
-    selected_workspace_name: Option<String>,
-    /// Filesystem path when the workspace is a personal workspace
-    /// (not registered in the `workspaces` table). `None` for shared workspaces.
-    personal_workspace_path: Option<String>,
+    /// The filesystem path of the workspace the dashboard resolved for the
+    /// current selection; `None` while nothing is resolved.
+    resolved_workspace_path: Option<PathBuf>,
     generation: u64,
     diff_files: Vec<DiffFile>,
     diff_loading: bool,
@@ -268,8 +271,7 @@ impl DiffState {
     pub fn new() -> Self {
         Self {
             error: None,
-            selected_workspace_name: None,
-            personal_workspace_path: None,
+            resolved_workspace_path: None,
             generation: 0,
             diff_files: Vec::new(),
             diff_loading: false,
@@ -295,9 +297,9 @@ impl DiffState {
     /// Reset all diff view state fields that could render stale data during
     /// the async loading window after a context switch.
     ///
-    /// Handlers that also need to update `selected_workspace_name`,
-    /// `personal_workspace_path`, `diff_loading`, `diff_has_loaded`, or
-    /// `generation` should call this first, then set those fields.
+    /// Handlers that also need to update `resolved_workspace_path`,
+    /// `diff_loading`, `diff_has_loaded`, or `generation` should call this
+    /// first, then set those fields.
     fn clear_diff_state(&mut self) {
         self.error = None;
         self.status_message = None;
@@ -329,7 +331,7 @@ impl DiffState {
 
     pub fn subscription(&self) -> iced::Subscription<DiffMessage> {
         let mut subs: Vec<iced::Subscription<DiffMessage>> = Vec::new();
-        if self.selected_workspace_name.is_some() || self.personal_workspace_path.is_some() {
+        if self.resolved_workspace_path.is_some() {
             subs.push(iced::time::every(Duration::from_secs(5)).map(|_| DiffMessage::Tick));
         }
         // Keyboard: Ctrl+B toggles tree focus; arrow/Enter messages are ignored
@@ -374,12 +376,8 @@ impl DiffState {
         self.diff_loading = true;
         self.generation = self.generation.wrapping_add(1);
         let generation_num = self.generation;
-        let workspace_name = self
-            .selected_workspace_name
-            .clone()
-            .expect("spawn_diff_load called without workspace selected");
-        let ws_path = self.personal_workspace_path.clone();
-        Task::perform(load_diff(workspace_name, ws_path, commit_ref), move |r| {
+        let ws_path = self.resolved_workspace_path.clone();
+        Task::perform(load_diff(ws_path, commit_ref), move |r| {
             DiffMessage::DiffLoaded(generation_num, r)
         })
     }
@@ -387,22 +385,21 @@ impl DiffState {
     #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: DiffMessage) -> Task<DiffMessage> {
         match msg {
-            DiffMessage::WorkspaceSelected(name, path_override) => {
-                // An empty name with no path is the "no workspace selected"
-                // clear. Personal workspaces arrive as a named `personal:{user}`
-                // selection with a path override and are handled as a normal
-                // named selection below.
-                if name.is_empty() && path_override.is_none() {
-                    self.clear_diff_state();
-                    self.selected_workspace_name = None;
-                    self.personal_workspace_path = None;
-                    return Task::none();
-                }
+            DiffMessage::WorkspaceSelected(path) => {
                 self.clear_diff_state();
-                self.selected_workspace_name = Some(name.clone());
-                self.personal_workspace_path.clone_from(&path_override);
+                self.resolved_workspace_path = Some(PathBuf::from(path));
                 self.diff_has_loaded = false;
                 self.spawn_diff_load(None)
+            }
+            DiffMessage::WorkspaceUnresolved => {
+                self.clear_diff_state();
+                self.resolved_workspace_path = None;
+                self.diff_has_loaded = false;
+                self.diff_loading = false;
+                // Invalidate a load still in flight, so its result cannot land
+                // over the workspace that was just cleared.
+                self.generation = self.generation.wrapping_add(1);
+                Task::none()
             }
             DiffMessage::DiffLoaded(generation_num, result) => {
                 if generation_num != self.generation {
@@ -456,17 +453,15 @@ impl DiffState {
                     // Commit diffs are immutable — no auto-refresh needed.
                     return Task::none();
                 }
-                if self.selected_workspace_name.is_some() && !self.diff_loading && !self.committing
+                if self.resolved_workspace_path.is_some() && !self.diff_loading && !self.committing
                 {
                     self.spawn_diff_load(None)
                 } else {
                     Task::none()
                 }
             }
-            DiffMessage::NavigateToCommit(ws_name, hash) => {
+            DiffMessage::NavigateToCommit(hash) => {
                 self.clear_diff_state();
-                self.selected_workspace_name = Some(ws_name.clone());
-                self.personal_workspace_path = None;
                 // clear_diff_state() resets all viewing state (file tree, buffers,
                 // error, etc.) including current_commit_ref. We re-establish
                 // current_commit_ref below; the rest stays cleared for the new
@@ -476,22 +471,18 @@ impl DiffState {
                 self.current_commit_ref = Some(hash.clone());
                 self.diff_has_loaded = false;
 
-                // Load the diff and fetch the commit message in parallel.
-                let msg_ws = ws_name;
+                // Load the diff and fetch the commit message in parallel — both
+                // against the workspace the dashboard resolved, which this view
+                // keeps across the navigation.
+                let msg_path = self.resolved_workspace_path.clone();
                 let msg_hash = hash.clone();
                 let msg_hash_for_git = hash.clone();
                 let msg_task = Task::perform(
                     async move {
-                        let ws_path = resolve_workspace_path(&msg_ws, None).await;
-                        match ws_path {
-                            Ok(path) => crate::git::commands::run_git_commit_message(
-                                &path,
-                                Some(&msg_hash_for_git),
-                            )
+                        let path = msg_path?;
+                        crate::git::commands::run_git_commit_message(&path, Some(&msg_hash_for_git))
                             .await
-                            .ok(),
-                            Err(_) => None,
-                        }
+                            .ok()
                     },
                     move |msg| DiffMessage::CommitMessageFetched(msg_hash, msg),
                 );
@@ -499,7 +490,7 @@ impl DiffState {
                 Task::batch([self.spawn_diff_load(Some(hash)), msg_task])
             }
             DiffMessage::BackToWorkingTree => {
-                if self.selected_workspace_name.is_none() {
+                if self.resolved_workspace_path.is_none() {
                     return Task::none();
                 }
                 // clear_diff_state() sets current_commit_ref to None.
@@ -561,18 +552,14 @@ impl DiffState {
                 if trimmed.is_empty() || self.committing {
                     return Task::none();
                 }
-                self.committing = true;
-                let Some(ws_name) = self.selected_workspace_name.clone() else {
-                    tracing::error!("CommitClicked with no workspace selected");
-                    self.committing = false;
+                let Some(ws_path) = self.resolved_workspace_path.clone() else {
+                    tracing::error!("CommitClicked with no workspace resolved");
                     return Task::none();
                 };
-                let ws_path_for_commit = self.personal_workspace_path.clone();
+                self.committing = true;
                 Task::perform(
                     async move {
-                        let ws_path_buf =
-                            resolve_workspace_path(&ws_name, ws_path_for_commit).await?;
-                        run_git_commit(&ws_path_buf, &trimmed)
+                        run_git_commit(&ws_path, &trimmed)
                             .await
                             .map_err(|e| e.to_string())
                     },
@@ -594,7 +581,7 @@ impl DiffState {
                             (a, r) => format!("Committed {} (+{a}/\u{2212}{r})", info.short_hash()),
                         };
                         // Immediately refresh the diff.
-                        if self.selected_workspace_name.is_some() {
+                        if self.resolved_workspace_path.is_some() {
                             return Task::batch([
                                 Task::done(DiffMessage::CloseModal),
                                 Task::done(DiffMessage::Toast(super::ToastMessage::SuccessMsg(
@@ -623,16 +610,15 @@ impl DiffState {
                 if self.current_commit_ref.is_some() {
                     return Task::none();
                 }
-                let Some(ws_name) = self.selected_workspace_name.clone() else {
+                // Nothing resolved → nothing to discard into.
+                let Some(ws_path) = self.resolved_workspace_path.clone() else {
                     return Task::none();
                 };
-                let ws_path = self.personal_workspace_path.clone();
                 // Mark as loading so the user sees the diff update.
                 self.diff_loading = true;
                 Task::perform(
                     async move {
-                        let ws_path_buf = resolve_workspace_path(&ws_name, ws_path).await?;
-                        run_git_discard(&ws_path_buf, &path, target)
+                        run_git_discard(&ws_path, &path, target)
                             .await
                             .map_err(|e| e.to_string())
                     },
@@ -644,7 +630,7 @@ impl DiffState {
                 match result {
                     Ok(()) => {
                         // Refresh the diff immediately.
-                        if self.selected_workspace_name.is_some() {
+                        if self.resolved_workspace_path.is_some() {
                             return Task::batch([
                                 Task::done(DiffMessage::Toast(super::ToastMessage::SuccessMsg(
                                     "Changes discarded.".to_string(),
@@ -821,7 +807,10 @@ impl DiffState {
             diff_pane_container(text(s).size(theme::TEXT_13).color(theme::TEXT_SECONDARY))
         } else if self.diff_loading && !self.diff_has_loaded {
             diff_pane_container(widgets::loading_text())
-        } else if self.selected_workspace_name.is_none() {
+        } else if self.resolved_workspace_path.is_none() {
+            // Defensive: the modal is gated on a resolution, so this is not
+            // reached in production; it keeps an unresolved view from claiming
+            // a clean working tree.
             diff_pane_container(
                 text("Select a workspace to view its diff.")
                     .size(theme::TEXT_13)
@@ -1251,38 +1240,15 @@ impl DiffState {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/// Resolve a workspace's filesystem path, supporting both DB-registered
-/// shared workspaces and personal workspace path overrides.
-///
-/// This is an **async** helper that queries the workspace database.  For a
-/// synchronous in-memory lookup (dashboard state maps), see
-/// `gui::resolve_dashboard_workspace_path`.
-async fn resolve_workspace_path(
-    ws_name: &str,
-    ws_path_override: Option<String>,
-) -> Result<std::path::PathBuf, String> {
-    if let Some(p) = ws_path_override {
-        Ok(std::path::PathBuf::from(p))
-    } else {
-        let store = crate::workspace::store();
-        let ws = store
-            .get_by_name(ws_name)
-            .await
-            .map_err(|e| format!("Failed to look up workspace: {e}"))?
-            .ok_or_else(|| "Workspace not found.".to_string())?;
-        Ok(ws.as_path().to_path_buf())
-    }
-}
-
 /// Load the diff, compute per-file highlights, and return enhanced DiffFiles.
-/// `ws_path_override` is used for personal workspaces that don't exist in
-/// the `workspaces` table — when provided, it's used directly as the filesystem path.
+/// `ws_path` is the path the dashboard resolved for the selected workspace.
 async fn load_diff(
-    ws_name: String,
-    ws_path_override: Option<String>,
+    ws_path: Option<PathBuf>,
     commit_ref: Option<String>,
 ) -> Result<Vec<DiffFile>, String> {
-    let ws_path = resolve_workspace_path(&ws_name, ws_path_override).await?;
+    let Some(ws_path) = ws_path else {
+        return Err("No workspace resolved.".to_string());
+    };
 
     if !git_is_installed().await {
         return Err("Git is not installed.".to_string());
@@ -1938,6 +1904,12 @@ mod tests {
 
     // ── Discard changes tests ──────────────────────────────────────
 
+    /// Mark `state` as showing the workspace the dashboard resolved — the diff
+    /// view tracks it by its path alone.
+    fn mark_workspace_resolved(state: &mut DiffState) {
+        state.resolved_workspace_path = Some("/tmp/test-ws".into());
+    }
+
     #[test]
     fn test_discard_changes() {
         struct Case {
@@ -1959,28 +1931,26 @@ mod tests {
             },
             Case {
                 name: "discard_path_noop_without_workspace",
-                // Without a selected workspace there's nothing to discard into,
+                // Without a resolved workspace there's nothing to discard into,
                 // so DiscardPath is a no-op.
                 setup: |s| {
-                    s.selected_workspace_name = None;
+                    s.resolved_workspace_path = None;
                 },
                 msg: DiffMessage::DiscardPath("src/main.rs".to_owned(), DiscardTarget::File),
                 check: |s, name| assert!(!s.diff_loading, "case: {name}"),
             },
             Case {
                 name: "discard_path_sets_loading",
-                setup: |s| {
-                    s.selected_workspace_name = Some("test-ws".to_owned());
-                },
+                setup: mark_workspace_resolved,
                 msg: DiffMessage::DiscardPath("src/main.rs".to_owned(), DiscardTarget::File),
                 check: |s, name| assert!(s.diff_loading, "case: {name}"),
             },
             Case {
                 name: "discard_result_success_no_workspace_resets_loading",
-                // Without a selected workspace the success path falls through
+                // Without a resolved workspace the success path falls through
                 // to the no-refresh branch and resets loading.
                 setup: |s| {
-                    s.selected_workspace_name = None;
+                    s.resolved_workspace_path = None;
                     s.diff_loading = true;
                 },
                 msg: DiffMessage::DiscardResult(Ok(())),
@@ -1988,11 +1958,11 @@ mod tests {
             },
             Case {
                 name: "discard_result_success_with_workspace_keeps_loading_for_refresh",
-                // When there IS a selected workspace, a successful discard
+                // When there IS a resolved workspace, a successful discard
                 // triggers an immediate diff refresh — diff_loading stays true
                 // throughout so the UI shows a loading indicator.
                 setup: |s| {
-                    s.selected_workspace_name = Some("test-ws".to_owned());
+                    mark_workspace_resolved(s);
                     s.diff_loading = true;
                 },
                 msg: DiffMessage::DiscardResult(Ok(())),
@@ -2001,7 +1971,7 @@ mod tests {
             Case {
                 name: "discard_result_error_resets_loading",
                 setup: |s| {
-                    s.selected_workspace_name = Some("test-ws".to_owned());
+                    mark_workspace_resolved(s);
                     s.diff_loading = true;
                 },
                 msg: DiffMessage::DiscardResult(Err("something went wrong".to_owned())),
@@ -2009,9 +1979,7 @@ mod tests {
             },
             Case {
                 name: "discard_path_file_target_vs_dir_target",
-                setup: |s| {
-                    s.selected_workspace_name = Some("ws".to_owned());
-                },
+                setup: mark_workspace_resolved,
                 msg: DiffMessage::DiscardPath("src".to_owned(), DiscardTarget::Directory),
                 check: |s, name| assert!(s.diff_loading, "case: {name}"),
             },
@@ -2070,10 +2038,7 @@ mod tests {
     fn test_workspace_switch_resets_auto_expand() {
         let mut state = DiffState::new();
         state.tree_auto_expand_pending = false;
-        let _ = state.update(DiffMessage::WorkspaceSelected(
-            "ws".to_owned(),
-            Some("/tmp/ws".to_owned()),
-        ));
+        let _ = state.update(DiffMessage::WorkspaceSelected("/tmp/ws".to_owned()));
         assert!(state.tree_auto_expand_pending);
         assert!(state.file_tree.expanded_dirs.is_empty());
     }
@@ -2348,44 +2313,42 @@ mod tests {
 
     #[test]
     fn test_context_switches_clear_stale_diff_files() {
-        // Navigating to a commit clears stale working-tree diff state.
+        // Navigating to a commit clears stale working-tree diff state; the
+        // workspace itself is kept, so set one first.
         let mut state = make_state_with_stale_data();
-        let _task = state.update(DiffMessage::NavigateToCommit(
-            "test-ws".into(),
-            "abc123".into(),
-        ));
+        mark_workspace_resolved(&mut state);
+        let _task = state.update(DiffMessage::NavigateToCommit("abc123".into()));
         assert_diff_state_reset(&state);
 
         // Selecting a workspace clears stale diff state.
         let mut state = make_state_with_stale_data();
-        let _task = state.update(DiffMessage::WorkspaceSelected("new-ws".into(), None));
+        let _task = state.update(DiffMessage::WorkspaceSelected("/p/new-ws".into()));
         assert_diff_state_reset(&state);
 
         // Returning to the working tree clears stale commit-view state; the
-        // handler early-returns without a selected workspace, so set one.
+        // handler early-returns without a resolved workspace, so set one.
         let mut state = make_state_with_stale_data();
-        state.selected_workspace_name = Some("test-ws".into());
+        mark_workspace_resolved(&mut state);
         let _task = state.update(DiffMessage::BackToWorkingTree);
         assert_diff_state_reset(&state);
     }
 
     #[test]
-    fn test_workspace_selected_empty_name_clears_stale_diff_files() {
+    fn test_workspace_unresolved_clears_stale_diff_files() {
         let mut state = make_state_with_stale_data();
-        state.selected_workspace_name = Some("old-ws".into());
-        state.personal_workspace_path = Some("/old/path".into());
-        let _task = state.update(DiffMessage::WorkspaceSelected(String::new(), None));
-        // The early-return branch calls clear_diff_state() and also resets
-        // selected_workspace_name / personal_workspace_path, but does NOT set
-        // diff_loading / diff_has_loaded (those are load-specific fields).
+        mark_workspace_resolved(&mut state);
+        let stale_generation = state.generation;
+        let _task = state.update(DiffMessage::WorkspaceUnresolved);
+        // The clear calls clear_diff_state(), drops the resolved workspace and
+        // invalidates any load still in flight.
         assert_clear_diff_state(&state);
         assert!(
-            state.selected_workspace_name.is_none(),
-            "selected_workspace_name should be cleared to prevent stale workspace context"
+            state.resolved_workspace_path.is_none(),
+            "the resolved workspace path should be cleared to prevent stale workspace context"
         );
-        assert!(
-            state.personal_workspace_path.is_none(),
-            "personal_workspace_path should be cleared to prevent stale workspace path"
+        assert_ne!(
+            state.generation, stale_generation,
+            "an in-flight load must not apply its result over the cleared workspace"
         );
     }
 

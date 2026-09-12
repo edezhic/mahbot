@@ -87,9 +87,10 @@ struct WorkspaceShellState {
 pub enum ShellMessage {
     /// Terminal event forwarded from an embedded terminal widget.
     TerminalEvent(iced_term::Event),
-    /// Workspace selected via the footer workspace picker (name,
-    /// optional filesystem path).
-    WorkspaceSelected(String, Option<String>),
+    /// The workspace resolved for the current selection (registered name plus
+    /// filesystem path), pushed only by the dashboard's
+    /// `sync_workspace_surfaces` — never a substitution for an unresolved one.
+    WorkspaceSelected(String, String),
     /// Select a tab by its index in the tab list.
     TabSelected(usize),
     /// Close a tab by its index.
@@ -103,7 +104,8 @@ pub enum ShellMessage {
 }
 
 pub struct ShellState {
-    /// Currently selected workspace name (set by the footer workspace picker).
+    /// The workspace the dashboard resolved for the current selection; `None`
+    /// until one resolves.
     selected_workspace_name: Option<String>,
     /// Tabs grouped by workspace name.
     workspace_states: HashMap<String, WorkspaceShellState>,
@@ -128,21 +130,21 @@ impl ShellState {
 
     /// Ensure a workspace state exists; if not, create one with a single default tab.
     ///
-    /// Note: `working_dir` is only used during initial creation (via
-    /// `entry().or_insert_with()`).  Subsequent calls with different paths
-    /// are silently ignored — in practice workspace paths don't change after
-    /// selection, so this asymmetry is harmless.
-    fn ensure_workspace_state(&mut self, ws_name: &str, working_dir: Option<String>) {
+    /// `working_dir` is the workspace's current filesystem path: an existing
+    /// workspace state adopts a corrected path, so new tabs (via '+' or reopen)
+    /// start in the right directory. A live PTY keeps the directory it was
+    /// spawned with — that cannot be changed.
+    fn ensure_workspace_state(&mut self, ws_name: &str, working_dir: String) {
+        if let Some(ws) = self.workspace_states.get_mut(ws_name) {
+            ws.workspace_path = Some(working_dir);
+            return;
+        }
         let layout_size = self.last_seen_layout_size;
-        self.workspace_states
-            .entry(ws_name.to_string())
-            .or_insert_with(|| {
-                let mut ws = Self::new_workspace_state(&mut self.next_term_id, working_dir);
-                if let Some(tab) = ws.tabs.first_mut() {
-                    Self::replay_layout_size(&mut tab.terminal, layout_size);
-                }
-                ws
-            });
+        let mut ws = Self::new_workspace_state(&mut self.next_term_id, Some(working_dir));
+        if let Some(tab) = ws.tabs.first_mut() {
+            Self::replay_layout_size(&mut tab.terminal, layout_size);
+        }
+        self.workspace_states.insert(ws_name.to_string(), ws);
     }
 
     /// Build a fresh workspace state with one default tab.
@@ -224,12 +226,16 @@ impl ShellState {
 
     // ── View ─────────────────────────────────────────────────────────
 
+    /// Render the shell. The dashboard renders this page only for a resolved
+    /// workspace (it renders its own placeholder otherwise), so this is only
+    /// ever reached for one; the fallback below is defensive — it covers a
+    /// missing tab-state entry and never points the view at another workspace.
     pub fn view(&self) -> Element<'_, ShellMessage> {
-        let Some(ref ws_name) = self.selected_workspace_name else {
-            return Self::placeholder_view("Select a workspace to open a terminal.");
-        };
-
-        let Some(ws_state) = self.workspace_states.get(ws_name) else {
+        let Some(ws_state) = self
+            .selected_workspace_name
+            .as_ref()
+            .and_then(|ws_name| self.workspace_states.get(ws_name))
+        else {
             return Self::placeholder_view("Select a workspace to open a terminal.");
         };
 
@@ -381,10 +387,6 @@ impl ShellState {
     pub fn update(&mut self, msg: ShellMessage) -> Task<ShellMessage> {
         match msg {
             ShellMessage::WorkspaceSelected(name, path) => {
-                if name.is_empty() && path.is_none() {
-                    self.selected_workspace_name = None;
-                    return Task::none();
-                }
                 self.selected_workspace_name = Some(name.clone());
                 self.ensure_workspace_state(&name, path);
                 Task::none()
@@ -539,5 +541,44 @@ impl ShellState {
         } else {
             Subscription::batch(all_tab_subs)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A workspace state with no tabs — enough to exercise the path bookkeeping
+    /// without spawning a PTY.
+    fn tabless_state(working_dir: Option<&str>) -> WorkspaceShellState {
+        WorkspaceShellState {
+            tabs: Vec::new(),
+            active_idx: 0,
+            label_counter: 0,
+            workspace_path: working_dir.map(str::to_string),
+            spawn_error: None,
+        }
+    }
+
+    /// An already-created workspace adopts a corrected path, so its next tab
+    /// starts in the right directory (a live PTY keeps the directory it was
+    /// spawned with).
+    #[test]
+    fn existing_workspace_state_adopts_a_corrected_path() {
+        let mut shell = ShellState::new();
+        shell
+            .workspace_states
+            .insert("ws".to_string(), tabless_state(Some("/old")));
+
+        shell.ensure_workspace_state("ws", "/new".to_string());
+
+        assert_eq!(
+            shell.workspace_states["ws"].workspace_path.as_deref(),
+            Some("/new")
+        );
+        assert!(
+            shell.workspace_states["ws"].tabs.is_empty(),
+            "adopting a path must not touch the workspace's tabs"
+        );
     }
 }

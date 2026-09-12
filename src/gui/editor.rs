@@ -378,9 +378,10 @@ struct SavedTabData {
 #[derive(Debug, Clone)]
 #[expect(private_interfaces)]
 pub enum EditorMessage {
-    /// Workspace selected via the footer workspace picker (name,
-    /// optional filesystem path).
-    WorkspaceSelected(String, Option<String>),
+    /// The workspace resolved for the current selection (registered name plus
+    /// filesystem path), pushed only by the dashboard's
+    /// `sync_workspace_surfaces` — never a substitution for an unresolved one.
+    WorkspaceSelected(String, String),
     /// The editor page became visible or hidden (single source of truth for
     /// whether the editor is the active page). `true` triggers a refresh-on-entry
     /// batch; `false` closes any open modal (modals do not survive a page switch).
@@ -476,16 +477,15 @@ pub enum EditorMessage {
     /// `workspace` is the workspace path the matcher was built for — the
     /// handler drops a matcher whose path differs from the currently-selected
     /// workspace (a matcher built for a previously-selected workspace is
-    /// discarded). `matcher` is `None` for no dimming (no path or build
-    /// fallback).
+    /// discarded). `matcher` is `None` for no dimming (build fallback).
     IgnoreMatcherReady {
         workspace: String,
         matcher: Option<ignore::IncrementalIgnore>,
     },
     /// Per-file git statuses forwarded from the Git state (single owner of
-    /// `git status --porcelain`). `workspace` is the Git state's workspace
-    /// name — `Some("personal:{user}")` for Personal; the handler drops a
-    /// forward whose workspace differs from the currently-selected one.
+    /// `git status --porcelain`). `workspace` is the Git state's resolved
+    /// workspace name; the handler drops a forward whose workspace differs from
+    /// the currently-selected one.
     GitStatusUpdated {
         workspace: Option<String>,
         statuses: HashMap<String, GitFileStatus>,
@@ -1210,8 +1210,8 @@ fn build_hierarchical_tree(
 /// defaults are explicitly disabled: dotfiles are NOT treated as ignored
 /// (`hidden(false)`) and `.ignore` files are NOT read (`ignore(false)`).
 /// `current_dir` lets global git excludes resolve against the workspace.
-/// Returns `None` when there is no workspace path — the safe fallback is
-/// "no dimming", never an error.
+///
+/// `None` (no matcher could be built) means "no dimming" — never an error.
 #[must_use]
 fn build_ignore_matcher(workspace_path: &Path) -> Option<ignore::IncrementalIgnore> {
     let mut builder = ignore::WalkBuilder::new(workspace_path);
@@ -1347,10 +1347,10 @@ async fn run_global_search(
 // ── Editor State ──────────────────────────────────────────────────
 
 pub struct EditorState {
-    /// Currently selected workspace name (set by the footer workspace
-    /// picker).
+    /// The workspace the dashboard resolved for the current selection; `None`
+    /// until one resolves.
     selected_workspace_name: Option<String>,
-    /// Filesystem path for the currently selected workspace.
+    /// Filesystem path of that workspace, pushed with the name.
     selected_workspace_path: Option<String>,
     /// Whether the editor page is the currently visible page (single source of
     /// truth for page-visible gating; set via `PageVisibilityChanged` before any
@@ -1430,8 +1430,9 @@ pub struct EditorState {
     /// touches `.git/index` does not re-trigger the detector.
     git_dirty_mtimes: Option<(Option<SystemTime>, Option<SystemTime>)>,
     /// The in-process gitignore matcher for the current workspace, if one was
-    /// built. `None` means no dimming (no workspace path, or the workspace is
-    /// not in a git repo). Rebuilt on workspace selection and file-tree refresh.
+    /// built. `None` means no dimming (no matcher could be built, or the
+    /// workspace is not in a git repo). Rebuilt on workspace selection and
+    /// file-tree refresh.
     ignore_matcher: Option<ignore::IncrementalIgnore>,
     /// Shared atomic counter used by async save tasks for pre-write staleness
     /// checking.  Written to on every save initiation; read by in-flight tasks
@@ -2229,7 +2230,7 @@ impl EditorState {
     pub fn update(&mut self, msg: EditorMessage) -> Task<EditorMessage> {
         match msg {
             EditorMessage::WorkspaceSelected(ref name, ref path) => {
-                self.workspace_selected(name, path.as_deref())
+                self.workspace_selected(name, path)
             }
 
             EditorMessage::PageVisibilityChanged(visible) => self.page_visibility_changed(visible),
@@ -2466,26 +2467,13 @@ impl EditorState {
 
     // ── Extracted handler methods ────────────────────────────────────
 
-    /// Handle workspace selection — initializes file tree, loads tabs, sets up workspace.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one branch per workspace-selection step; splitting would scatter the generation-counter bookkeeping"
-    )]
-    fn workspace_selected(&mut self, name: &str, path: Option<&str>) -> Task<EditorMessage> {
-        // An empty name with no path is the "no workspace selected" clear.
-        // Personal workspaces arrive as a named `personal:{user}` selection
-        // with a real path and are handled as a normal named selection below.
-        if name.is_empty() && path.is_none() {
-            self.selected_workspace_name = None;
-            self.selected_workspace_path = None;
-            self.clear_workspace_editor_state();
-            return Task::none();
-        }
-
+    /// Adopt a workspace the dashboard resolved: initializes the file tree,
+    /// loads the saved tabs and sets up the git integration.
+    fn workspace_selected(&mut self, name: &str, path: &str) -> Task<EditorMessage> {
         let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
 
         self.selected_workspace_name = Some(name.to_string());
-        self.selected_workspace_path = path.map(std::string::ToString::to_string);
+        self.selected_workspace_path = Some(path.to_string());
 
         // Clear previous state and bump generation counters.
         let r#gen = self.bump_generation();
@@ -2495,10 +2483,7 @@ impl EditorState {
         // Resolve the covering `.git` (dir or worktree file) and reset the
         // mtime latch so the first CheckGitDirty probe re-latches fresh values
         // instead of diffing against the previous workspace's mtimes.
-        self.git_dir = path
-            .filter(|p| !p.is_empty())
-            .map(Path::new)
-            .and_then(find_git_dir);
+        self.git_dir = find_git_dir(Path::new(path));
         self.git_dirty_mtimes = None;
         // GitState eagerly refreshes on workspace switch and will forward the
         // per-file statuses via GitStatusUpdated. Mark the in-flight guard so
@@ -2512,7 +2497,7 @@ impl EditorState {
 
         // ── Task 1: read root directory ───────────────────────
         tasks.push(dir_expanded_task(
-            path.unwrap_or_default().to_string(),
+            path.to_string(),
             String::new(),
             r#gen,
             false,
@@ -2520,7 +2505,7 @@ impl EditorState {
 
         // ── Task 2: load tabs from DB + file contents ────────
         let tab_ws = name.to_string();
-        let tab_path = path.unwrap_or_default().to_string();
+        let tab_path = path.to_string();
         let tab_gen = saved_gen;
         let load_tabs_task = Task::perform(
             async move {
@@ -2535,8 +2520,6 @@ impl EditorState {
                         };
                     }
                 };
-                let ws_path = tab_path;
-
                 let mut loaded: Vec<SavedTabData> = Vec::new();
                 for record in &records {
                     // Belt-and-suspenders: skip tabs with empty file_path —
@@ -2549,14 +2532,10 @@ impl EditorState {
                         );
                         continue;
                     }
-                    let file_path = if ws_path.is_empty() {
-                        record.file_path.clone()
-                    } else {
-                        Path::new(&ws_path)
-                            .join(&record.file_path)
-                            .to_string_lossy()
-                            .to_string()
-                    };
+                    let file_path = Path::new(&tab_path)
+                        .join(&record.file_path)
+                        .to_string_lossy()
+                        .to_string();
 
                     let loaded_text = if let Some(dirty) = record.dirty_content.clone() {
                         Some(dirty)
@@ -2606,9 +2585,7 @@ impl EditorState {
         tasks.push(load_tabs_task);
 
         // ── Task 3: build the gitignore matcher for file tree dimming ──
-        if let Some(ws_path) = path.filter(|p| !p.is_empty()) {
-            tasks.push(Self::spawn_ignore_matcher(ws_path));
-        }
+        tasks.push(Self::spawn_ignore_matcher(path));
 
         Task::batch(tasks)
     }
@@ -4407,9 +4384,9 @@ impl EditorState {
         workspace: Option<&str>,
         statuses: HashMap<String, GitFileStatus>,
     ) -> Task<EditorMessage> {
-        // The forwarded workspace name matches the selected one exactly for
-        // every resolved selection (including `personal:{user}`) — compare
-        // directly and drop forwards from a superseded workspace.
+        // The forwarded workspace name matches the selected one exactly for a
+        // resolved workspace — compare directly and drop forwards from a
+        // superseded workspace.
         if workspace != self.selected_workspace_name.as_deref() {
             return Task::none();
         }
@@ -4655,17 +4632,11 @@ impl EditorState {
         self.file_tree.nav_and_scroll::<EditorMessage>(direction)
     }
 
+    /// Render the editor. The dashboard renders this page only for a resolved
+    /// workspace (it renders its own placeholder otherwise), so this is only
+    /// ever reached for one.
     #[must_use]
     pub fn view(&self, dashboard_modal_open: bool) -> Element<'_, EditorMessage> {
-        // ── No workspace selected — placeholder ──────────────────────
-        if self.selected_workspace_name.is_none() {
-            return widgets::empty_state_placeholder(
-                lucide::folder_open(),
-                "No workspace selected",
-                theme::TEXT_MUTED,
-            );
-        }
-
         // ── Split layout ─────────────────────────────────────────────
         let tree_panel = self.build_tree_panel();
         let editor_panel = self.build_editor_panel(dashboard_modal_open);

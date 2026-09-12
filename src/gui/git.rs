@@ -94,8 +94,7 @@ pub struct GitState {
     /// Workspace name for the currently selected workspace, used to resolve the
     /// per-workspace [`SharedFilePicker`](fff_search::SharedFilePicker) watch
     /// by name (the registry is keyed by workspace name, not path). `Some`
-    /// for every resolved selection, including `personal:{user}` — `None` only
-    /// when no workspace is selected.
+    /// exactly when [`Self::has_filesystem_path`] is.
     workspace_name: Option<String>,
     /// One-shot flag: a [`GitMessage::WorktreeSnapshot`] result was applied for
     /// the current generation (Ok or Err), so [`Self::take_status_forward`]
@@ -278,8 +277,10 @@ impl GitState {
         self.show_branch_modal
     }
 
-    /// Whether a workspace filesystem path is set (i.e. git operations
-    /// can proceed).
+    /// Whether a workspace filesystem path is set, i.e. the dashboard resolved a
+    /// workspace for the current selection: git operations can proceed and the
+    /// footer git status may render. Set and cleared only by
+    /// [`Self::set_workspace_path`], so it tracks the resolution.
     #[must_use]
     pub fn has_filesystem_path(&self) -> bool {
         self.workspace_path.is_some()
@@ -318,9 +319,9 @@ impl GitState {
     /// ready — no retry loop; registration failure is a WARN and the workspace
     /// stays unwatched until the next switch).
     ///
-    /// `name` is `Some` for every resolved selection — including the personal
-    /// `personal:{user}` workspace, which IS watched via its lazily-created
-    /// engine. `None` means no workspace is selected (nothing to watch).
+    /// `name` is `Some` only for a workspace the dashboard resolved; `None`
+    /// means nothing is resolved (the footer git status is hidden then), so
+    /// there is nothing to watch.
     ///
     /// Returns a batch of [`Task`]s that produce [`GitMessage`] results
     /// when the async operations complete.
@@ -362,9 +363,9 @@ impl GitState {
     /// claimed. Returns `Some((workspace_name, statuses))` once, resetting the
     /// one-shot flag; `None` when nothing new is pending.
     ///
-    /// `workspace_name` is `Some` for every resolved selection (including the
-    /// `personal:{user}` workspace) — passed through so the editor can drop a
-    /// forward that no longer matches its selected workspace.
+    /// `workspace_name` is the workspace the snapshot belongs to (`None` while
+    /// nothing is resolved) — passed through so the editor can drop a forward
+    /// that no longer matches its selected workspace.
     pub(crate) fn take_status_forward(
         &mut self,
     ) -> Option<(Option<String>, HashMap<String, GitFileStatus>)> {

@@ -46,7 +46,7 @@ use iced::widget::{
     Column, Row, Space, button, column, container, pick_list, row, rule, text, tooltip,
 };
 use iced::window;
-use iced::{Alignment, Color, Element, Length, Task};
+use iced::{Alignment, Element, Length, Task};
 
 use crate::Role;
 use crate::Workspace;
@@ -141,7 +141,9 @@ pub enum Page {
 }
 
 impl Page {
-    /// Pages in the sidebar top nav (Home, Editor, Shell) — the Cmd+number keyboard map.
+    /// Pages in the sidebar top nav (Home, Editor, Shell) — the Cmd+number
+    /// keyboard map. The top nav renders this list minus the pages
+    /// [`Dashboard::page_available`] excludes; the keyboard map stays fixed.
     const fn sidebar_pages() -> &'static [Page] {
         &[Page::Home, Page::Editor, Page::Shell]
     }
@@ -567,6 +569,11 @@ pub struct Dashboard {
     /// Generation of the latest workspace-map reload, so a slow read cannot
     /// apply its (now stale) outcome over a newer one.
     workspaces_reload_gen: u64,
+    /// The `(name, path)` pair last pushed to the workspace-scoped surfaces;
+    /// `None` while none has been pushed. A workspace-map reload compares
+    /// against it, so a change of *resolvability* alone — the selected name
+    /// staying the same — still re-pushes (see [`Self::sync_workspace_surfaces`]).
+    pushed_workspace: Option<(String, String)>,
     /// Currently selected workspace name. `Some("personal:{user}")` = the
     /// impersonated user's "Personal" workspace; `Some("ws")` = a shared
     /// workspace; `None` = nothing selected.
@@ -636,6 +643,7 @@ impl Dashboard {
             workspaces: HashMap::new(),
             workspaces_error: None,
             workspaces_reload_gen: 0,
+            pushed_workspace: None,
             selected_workspace_name: None,
             selected_user_name: None,
             selected_user_is_admin: false,
@@ -711,6 +719,24 @@ impl Dashboard {
             .and_then(|name| self.workspaces.get(name))
     }
 
+    /// The workspace resolved for the current selection: a registered workspace
+    /// present in the loaded map with a non-empty path. A personal name, a name
+    /// missing from the map and an empty path resolve to nothing.
+    fn resolved_workspace(&self) -> Option<(&str, &str)> {
+        let name = self.selected_workspace_name.as_deref()?;
+        if crate::users::is_personal_workspace(name) {
+            return None;
+        }
+        let path = self.workspaces.get(name)?.path.as_str();
+        (!path.is_empty()).then_some((name, path))
+    }
+
+    /// Whether `page` is offered in the navigation. Only the editor and the
+    /// shell are conditional, on [`Self::resolved_workspace`].
+    fn page_available(&self, page: Page) -> bool {
+        !matches!(page, Page::Editor | Page::Shell) || self.resolved_workspace().is_some()
+    }
+
     /// Whether the selected workspace's pipeline is paused (a strict freeze:
     /// all in-flight work stops and no pipeline stage advances until resume).
     fn paused(&self) -> bool {
@@ -771,7 +797,9 @@ impl Dashboard {
     /// `read_generation` is the reload generation the read was issued under. A
     /// reload that landed while it was in flight read the same table later, so
     /// its map (or its failure) wins and this read's outcome is dropped — the
-    /// rest of the boot path still completes.
+    /// rest of the boot path still completes. The restored selection is applied
+    /// and propagated either way; the workspace-scoped surfaces stay empty until
+    /// it resolves (see [`Self::sync_workspace_surfaces`]).
     fn apply_boot_workspaces(
         &mut self,
         workspaces: Result<HashMap<String, Workspace>, String>,
@@ -1495,7 +1523,12 @@ impl Dashboard {
                     self.selected_workspace_name = (!resolved.is_empty()).then(|| resolved.clone());
                     return self.propagate_workspace_selection(&resolved);
                 }
-                Task::none()
+                // The name is unchanged, but this map can still have changed
+                // whether it resolves to a workspace path: the boot race leaves
+                // the restored selection resolved against the map that was
+                // dropped as stale, so the workspace-scoped surfaces stayed
+                // empty. Re-push them, and only them.
+                self.sync_workspace_surfaces()
             }
             // A users-table / user_channels-table row changed (or the stream
             // lagged) — re-list the Settings users page. Full re-list is its
@@ -1575,7 +1608,13 @@ impl Dashboard {
     ///
     /// When `commit_hash` is `Some`, navigates to that commit; when `None`,
     /// navigates to the working tree (clearing any stale commit state).
+    ///
+    /// The change/diff view is workspace-scoped, so this refuses to open while
+    /// nothing is resolved — including the board's ticket commit link.
     fn open_diff_modal(&mut self, commit_hash: Option<String>) -> Task<Message> {
+        if self.resolved_workspace().is_none() {
+            return Task::none();
+        }
         // Close any board modal
         let close_board = self
             .board_state
@@ -1585,17 +1624,9 @@ impl Dashboard {
         // Close branch modal synchronously if open.
         // CloseModal always returns Task::none() so discarding is safe.
         let _ = self.git_state.update(git::GitMessage::CloseModal);
-        // `selected_workspace_name` is `Some("personal:{user}")` for the
-        // Personal workspace and `Some("ws")` for a shared one; `None` only
-        // when nothing is selected. `unwrap_or_default()` yields an empty
-        // string for the no-selection case, which is safe here: `ws` is only
-        // consumed in the `Some(hash)` branch below — the `None` branch
-        // (working-tree diff, triggered by the git stats button) does not use
-        // it.
-        let ws = self.selected_workspace_name.clone().unwrap_or_default();
         let diff_task = match commit_hash {
             Some(hash) => Task::done(Message::DiffModal(diff::DiffMessage::NavigateToCommit(
-                ws, hash,
+                hash,
             ))),
             None => Task::done(Message::DiffModal(diff::DiffMessage::BackToWorkingTree)),
         };
@@ -1665,12 +1696,10 @@ impl Dashboard {
         Task::batch(std::iter::once(propagate).chain(db_write))
     }
 
-    /// Propagate the global workspace selection to all affected pages.
-    /// Sets workspace state on each page and triggers refreshes via their
-    /// existing `WorkspaceSelected` handlers.
+    /// Propagate the global workspace selection to the board and to the Home
+    /// page, then push the resolved workspace to the workspace-scoped
+    /// surfaces (see [`Self::sync_workspace_surfaces`]).
     fn propagate_workspace_selection(&mut self, name: &str) -> Task<Message> {
-        let ws_path = self.workspaces.get(name).map(|w| w.path.clone());
-
         // Set board's workspace filter directly, then refresh.
         // Clear any active search when switching workspaces so stale results
         // from the previous workspace don't persist.
@@ -1692,73 +1721,81 @@ impl Dashboard {
         self.board_state.delta_removed_ids.clear();
         let board_refresh = self.board_state.refresh().map(Message::Board);
 
-        // Personal workspace name + path for the selected user. The personal
-        // name is the resolved fallback (and the resolution target when `name`
-        // is a `personal:{user}` name); the path is needed by Editor, Shell,
-        // and Diff.
-        let personal_name = self
-            .selected_user_name
-            .as_deref()
-            .map(crate::users::personal_workspace_name);
-        let personal_path = self.selected_user_name.as_ref().map(|u| {
-            crate::users::personal_workspace_path(u)
-                .to_string_lossy()
-                .to_string()
-        });
-
-        // If the path is missing from the map, fall back to the personal
-        // workspace (name + path) so downstream pages stay in a valid
-        // selection. Personal workspaces always get their resolved path.
-        let (page_name, page_path) = resolve_dashboard_workspace_path(
-            name,
-            ws_path.as_deref(),
-            personal_name.as_deref(),
-            personal_path.as_deref(),
-        );
-        let editor_task: Task<Message> = Task::done(editor::EditorMessage::WorkspaceSelected(
-            page_name.clone(),
-            page_path.clone(),
-        ))
-        .map(Message::Editor);
-
-        // Propagate workspace path to git state, triggering eager refresh.
-        // GitState owns the single source of truth for this path and the
-        // workspace name (`personal:{user}` for Personal).
-        let git_name = if page_name.is_empty() {
-            None
-        } else {
-            Some(page_name.clone())
-        };
-        let git_task: Task<Message> = self
-            .git_state
-            .set_workspace_path(git_name, page_path.clone())
-            .map(Message::Git);
-
-        let diff_task: Task<Message> = Task::done(diff::DiffMessage::WorkspaceSelected(
-            page_name.clone(),
-            page_path.clone(),
-        ))
-        .map(Message::DiffModal);
-
-        let shell_task: Task<Message> = Task::done(shell::ShellMessage::WorkspaceSelected(
-            page_name.clone(),
-            page_path,
-        ))
-        .map(Message::Shell);
-
-        // Notify the Home page so it can reload chat history.
-        let home_name = page_name;
+        // Notify the Home page so it can reload chat history. Home is name-keyed
+        // and also serves personal workspaces, so a selection missing from the
+        // loaded map keeps its personal fallback here — the deliberate asymmetry
+        // with the workspace-scoped surfaces (see `sync_workspace_surfaces`),
+        // which follow the resolution instead.
+        let home_name =
+            if self.workspaces.contains_key(name) || crate::users::is_personal_workspace(name) {
+                name.to_string()
+            } else {
+                self.selected_user_name
+                    .as_deref()
+                    .map(crate::users::personal_workspace_name)
+                    .unwrap_or_default()
+            };
         let home_task: Task<Message> =
             Task::done(home::HomeMessage::WorkspaceChanged(Some(home_name))).map(Message::Home);
 
-        Task::batch([
-            board_refresh,
-            editor_task,
-            diff_task,
-            shell_task,
-            home_task,
-            git_task,
-        ])
+        let surfaces = self.sync_workspace_surfaces();
+        Task::batch([board_refresh, home_task, surfaces])
+    }
+
+    /// Push the resolved workspace to the four workspace-scoped surfaces — the
+    /// editor, the shell, the footer git status and the change/diff view — and
+    /// to nothing else. No substitution of any kind happens here: an unresolved
+    /// selection is never shown the personal workspace.
+    ///
+    /// The editor and the shell own per-workspace tab state, so they are only
+    /// ever pushed a real resolution; while nothing is resolved the Dashboard
+    /// hides their pages and drops the editor's subscription instead of tearing
+    /// their tabs down. The footer git status and the change/diff view hold
+    /// derived state only, so they are cleared — that is what drops the
+    /// watcher, the refresh loop and the diff tick of a workspace that is no
+    /// longer selected.
+    ///
+    /// An unchanged resolution is a no-op: the workspace-map reload path calls
+    /// this on every CDC event and the push must not run then.
+    fn sync_workspace_surfaces(&mut self) -> Task<Message> {
+        let resolved = self
+            .resolved_workspace()
+            .map(|(name, path)| (name.to_string(), path.to_string()));
+        // The change/diff view is an overlay of the current page: while nothing
+        // is resolved it is closed rather than left open and empty (it would
+        // keep owning Escape and the diff keyboard shortcuts).
+        if resolved.is_none() {
+            self.show_diff_modal = false;
+        }
+        if resolved == self.pushed_workspace {
+            return Task::none();
+        }
+        self.pushed_workspace.clone_from(&resolved);
+        if let Some((name, path)) = resolved {
+            Task::batch([
+                Task::done(editor::EditorMessage::WorkspaceSelected(
+                    name.clone(),
+                    path.clone(),
+                ))
+                .map(Message::Editor),
+                Task::done(shell::ShellMessage::WorkspaceSelected(
+                    name.clone(),
+                    path.clone(),
+                ))
+                .map(Message::Shell),
+                self.git_state
+                    .set_workspace_path(Some(name.clone()), Some(path.clone()))
+                    .map(Message::Git),
+                Task::done(diff::DiffMessage::WorkspaceSelected(path)).map(Message::DiffModal),
+            ])
+        } else {
+            Task::batch([
+                self.git_state
+                    .set_workspace_path(None, None)
+                    .map(Message::Git),
+                Task::done(diff::DiffMessage::WorkspaceUnresolved).map(Message::DiffModal),
+            ])
+        }
     }
 
     /// Reload the full workspace map from storage (e.g. after add/delete on
@@ -1918,11 +1955,22 @@ impl Dashboard {
             }
             Page::Logs => self.logs_state.view().map(Message::Logs),
             Page::Sessions => self.sessions_state.view().map(Message::Sessions),
-            Page::Shell => self.shell_state.view().map(Message::Shell),
-            Page::Editor => self
-                .editor_state
-                .view(self.overlay_modal_open())
-                .map(Message::Editor),
+            Page::Shell => {
+                if self.page_available(Page::Shell) {
+                    self.shell_state.view().map(Message::Shell)
+                } else {
+                    unresolved_workspace_page(Page::Shell)
+                }
+            }
+            Page::Editor => {
+                if self.page_available(Page::Editor) {
+                    self.editor_state
+                        .view(self.overlay_modal_open())
+                        .map(Message::Editor)
+                } else {
+                    unresolved_workspace_page(Page::Editor)
+                }
+            }
             Page::Settings => self
                 .settings_state
                 .view(
@@ -1989,6 +2037,8 @@ impl Dashboard {
         };
 
         // ── Diff modal overlay ─────────────────────────────────────
+        // `show_diff_modal` is only ever set for a resolved workspace, and
+        // `sync_workspace_surfaces` clears it when the resolution is lost.
         let diff_overlay: Element<'_, Message> = if self.show_diff_modal {
             render_diff_modal(&self.diff_state)
         } else {
@@ -2283,9 +2333,17 @@ impl Dashboard {
             }),
             self.shell_state.subscription().map(Message::Shell),
             self.logs_state.subscription().map(Message::Logs),
-            self.editor_state
-                .subscription(self.overlay_modal_open())
-                .map(Message::Editor),
+            // The editor is a workspace-scoped page: while nothing is resolved
+            // its page is not shown, so it is given no subscription at all — no
+            // tick, no tree ping and no shortcut may act on the workspace it
+            // still holds in memory (its tabs are deliberately kept).
+            if self.page_available(Page::Editor) {
+                self.editor_state
+                    .subscription(self.overlay_modal_open())
+                    .map(Message::Editor)
+            } else {
+                iced::Subscription::none()
+            },
             self.home_state.subscription().map(Message::Home),
             iced::Subscription::run(shutdown_subscription),
             // Git file-change subscription: drives the event-driven local git
@@ -2534,12 +2592,13 @@ fn user_channels_cdc_subscription() -> impl futures_util::Stream<Item = Message>
 
 // ── Navigation sidebar ──────────────────────────────────────────
 
-/// Map a [`Page`] variant to its corresponding Lucide icon element.
+/// Map a [`Page`] variant to its corresponding Lucide icon element, unstyled so
+/// each call site sizes and colors it.
 ///
 /// Exhaustive match — adding a new `Page` variant produces a compile error
 /// until its icon is assigned here.
-fn page_icon(page: Page, size: u32, color: Color) -> Element<'static, Message> {
-    let text = match page {
+fn page_icon(page: Page) -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
+    match page {
         Page::Home => lucide::layout_dashboard::<iced::Theme, iced::Renderer>(),
         Page::Editor => lucide::pencil_line::<iced::Theme, iced::Renderer>(),
         Page::Shell => lucide::terminal::<iced::Theme, iced::Renderer>(),
@@ -2547,38 +2606,18 @@ fn page_icon(page: Page, size: u32, color: Color) -> Element<'static, Message> {
         Page::Logs => lucide::activity::<iced::Theme, iced::Renderer>(),
         Page::Settings => lucide::settings::<iced::Theme, iced::Renderer>(),
         Page::RunningAgents => lucide::radar::<iced::Theme, iced::Renderer>(),
-    };
-    text.size(size).color(color).into()
+    }
 }
 
-/// Shared sidebar toggle wrapper — wraps an icon inside a centered,
-/// full-width button with a tooltip at the given `position`. The generous
-/// vertical padding gives the nav buttons a large hit area within the fixed
-/// 56px rail.
-///
-/// Used by [`Dashboard::sidebar_nav_column`] (the sidebar nav icons).
-fn render_sidebar_toggle<'a>(
-    icon: Element<'a, Message>,
-    tooltip_text: impl text::IntoFragment<'a>,
-    action: Option<Message>,
-    position: tooltip::Position,
-) -> Element<'a, Message> {
-    tooltip(
-        button(
-            container(icon)
-                .width(Length::Fill)
-                .center_x(Length::Fill)
-                .padding([theme::PAD_10, 0.0]),
-        )
-        .width(Length::Fill)
-        .padding(0)
-        .style(theme::button_text)
-        .on_press_maybe(action),
-        text(tooltip_text).size(theme::TEXT_11),
-        position,
+/// Stand-in for a workspace-scoped page while no workspace is resolved. Such a
+/// page is absent from the navigation then, so it is reachable only by a
+/// keyboard shortcut — and it must show no workspace content at all.
+fn unresolved_workspace_page(page: Page) -> Element<'static, Message> {
+    widgets::empty_state_placeholder(
+        page_icon(page),
+        "Select a workspace to open this page",
+        theme::TEXT_MUTED,
     )
-    .style(theme::tooltip_style)
-    .into()
 }
 
 impl Dashboard {
@@ -2596,46 +2635,43 @@ impl Dashboard {
             .into()
     }
 
-    /// Shared nav-icon column for the sidebar top and bottom navs. Each page
-    /// is rendered as a 48px-tall full-width icon button (28px icon); the
-    /// active page is accent-colored, and Editor/Shell are disabled
-    /// (TEXT_FAINT, no press) when no workspace is selectable.
+    /// Shared nav-icon column for the sidebar top and bottom navs. Each page is
+    /// a 48px-tall full-width icon button (28px icon) with the active page
+    /// accent-colored; a page that is not available ([`Self::page_available`]) is
+    /// absent from the column entirely.
     ///
     /// Uses Position::Right — iced snaps Top tooltips into the viewport,
     /// overlapping the topmost sidebar button.
     fn sidebar_nav_column(&self, pages: &[Page]) -> Column<'_, Message> {
         let mut col = Column::new().spacing(theme::SPACE_2);
         for page in pages {
-            let is_active = self.page == *page;
-            // Editor, Shell require any workspace (shared or personal with a user selected).
-            let has_any_workspace =
-                self.selected_workspace_name.is_some() || self.selected_user_name.is_some();
-            let requires_workspace = matches!(*page, Page::Editor | Page::Shell);
-            let disabled = requires_workspace && !has_any_workspace;
-
-            let color = if is_active {
+            if !self.page_available(*page) {
+                continue;
+            }
+            let color = if self.page == *page {
                 theme::ACCENT
-            } else if disabled {
-                theme::TEXT_FAINT
             } else {
                 theme::TEXT_MUTED
             };
-            let tooltip_text = if disabled {
-                format!("Select a workspace to access {}", page.label())
-            } else {
-                page.label().to_string()
-            };
-            let nav_btn = render_sidebar_toggle(
-                page_icon(*page, 28, color),
-                tooltip_text,
-                if disabled {
-                    None
-                } else {
-                    Some(Message::Navigation(*page))
-                },
-                tooltip::Position::Right,
+            // The container's generous vertical padding gives the button a large
+            // hit area within the fixed 56px rail.
+            col = col.push(
+                tooltip(
+                    button(
+                        container(page_icon(*page).size(28).color(color))
+                            .width(Length::Fill)
+                            .center_x(Length::Fill)
+                            .padding([theme::PAD_10, 0.0]),
+                    )
+                    .width(Length::Fill)
+                    .padding(0)
+                    .style(theme::button_text)
+                    .on_press(Message::Navigation(*page)),
+                    text(page.label()).size(theme::TEXT_11),
+                    tooltip::Position::Right,
+                )
+                .style(theme::tooltip_style),
             );
-            col = col.push(nav_btn);
         }
         col
     }
@@ -3002,7 +3038,9 @@ impl Dashboard {
     }
 
     /// Render the git block: divider, branch, sync, and diff stats.
-    /// Returns `None` when the workspace has no filesystem path.
+    ///
+    /// `None` while nothing is resolved: the path that
+    /// [`Self::sync_workspace_surfaces`] owns *is* the resolution.
     fn render_git_block(&self) -> Option<Element<'_, Message>> {
         if !self.git_state.has_filesystem_path() {
             return None;
@@ -3443,49 +3481,6 @@ fn open_url(url: &str) {
     };
 }
 
-/// Resolve a workspace name+path pair from the dashboard's in-memory workspace
-/// map and optional personal workspace name/path.  This is a synchronous lookup —
-/// it does **not** query the database.  For a DB-backed resolution (async),
-/// see `gui::diff::resolve_workspace_path`.
-///
-/// A `personal:{user}` name resolves to its own path directly (derived from the
-/// name's embedded user). A named shared workspace in the map uses its stored
-/// path. A name missing from the map (possible DB inconsistency) warns and
-/// falls back to the personal workspace name/path. An empty `name` with no path
-/// (no selection) returns `("", None)`.
-fn resolve_dashboard_workspace_path(
-    name: &str,
-    ws_path: Option<&str>,
-    personal_name: Option<&str>,
-    personal_path: Option<&str>,
-) -> (String, Option<String>) {
-    if let Some(p) = ws_path {
-        (name.to_string(), Some(p.to_string()))
-    } else if let Some(user) = crate::users::personal_user_name(name) {
-        // Personal workspace — derive its path directly from the name's user.
-        (
-            name.to_string(),
-            Some(
-                crate::users::personal_workspace_path(user)
-                    .to_string_lossy()
-                    .to_string(),
-            ),
-        )
-    } else if let (Some(pn), Some(pp)) = (personal_name, personal_path) {
-        // Unknown name (missing from the map) — fall back to the personal
-        // workspace name/path.
-        (pn.to_string(), Some(pp.to_string()))
-    } else if name.is_empty() {
-        (String::new(), None)
-    } else {
-        tracing::warn!(
-            workspace = name,
-            "Workspace path not found in map and no personal workspace — sending empty selection"
-        );
-        (String::new(), None)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3565,6 +3560,129 @@ mod tests {
         let map = HashMap::from([("mahbot".to_string(), ws("mahbot"))]);
         let _ = dash.update(reloaded(map));
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("mahbot"));
+    }
+
+    /// The boot race: the map read during boot is dropped as stale while the
+    /// restored selection is applied, so the selection is resolved against an
+    /// empty map. The workspace-scoped surfaces must stay empty — never the
+    /// impersonated user's Personal workspace — and must come back by
+    /// themselves once the map arrives, with the selected NAME unchanged
+    /// throughout.
+    #[test]
+    fn boot_without_the_workspace_map_pushes_nothing_then_recovers() {
+        let mut dash = ready_dashboard();
+        dash.selected_user_name = Some("alice".to_string());
+
+        let _ = dash.apply_boot_workspaces(Ok(HashMap::new()), "ws1", 0);
+
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
+        assert_eq!(dash.resolved_workspace(), None);
+        assert_eq!(
+            dash.pushed_workspace, None,
+            "an unresolvable selection must not be substituted with a workspace"
+        );
+
+        let _ = dash.update(reloaded(HashMap::from([("ws1".to_string(), ws("ws1"))])));
+
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
+        assert_eq!(dash.resolved_workspace(), Some(("ws1", "/p/ws1")));
+        assert_eq!(
+            dash.pushed_workspace
+                .as_ref()
+                .map(|(name, path)| (name.as_str(), path.as_str())),
+            Some(("ws1", "/p/ws1")),
+            "the reload that made the unchanged selection resolvable must re-push it"
+        );
+    }
+
+    /// Only a registered workspace present in the loaded map with a usable path
+    /// resolves; everything else — a personal selection however it arose, a
+    /// name missing from the map, an entry without a path, no selection —
+    /// resolves to nothing.
+    #[test]
+    fn only_a_registered_workspace_with_a_path_resolves() {
+        let mut dash = ready_dashboard();
+        dash.selected_user_name = Some("alice".to_string());
+        dash.workspaces = HashMap::from([
+            ("ws1".to_string(), ws("ws1")),
+            (
+                "pathless".to_string(),
+                Workspace {
+                    name: "pathless".to_string(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        dash.selected_workspace_name = Some("personal:alice".to_string());
+        assert_eq!(dash.resolved_workspace(), None);
+        dash.selected_workspace_name = Some("gone".to_string());
+        assert_eq!(dash.resolved_workspace(), None);
+        dash.selected_workspace_name = Some("pathless".to_string());
+        assert_eq!(dash.resolved_workspace(), None);
+        dash.selected_workspace_name = Some(String::new());
+        assert_eq!(dash.resolved_workspace(), None);
+        dash.selected_workspace_name = None;
+        assert_eq!(dash.resolved_workspace(), None);
+
+        dash.selected_workspace_name = Some("ws1".to_string());
+        assert_eq!(dash.resolved_workspace(), Some(("ws1", "/p/ws1")));
+    }
+
+    /// The editor page, the shell page, the footer git status and the diff view
+    /// follow the resolution: hidden while nothing resolves, back by themselves
+    /// once it does. Every step goes through the real selection entry point
+    /// (the single push point for all four), so what the dashboard derives from
+    /// that push is asserted here.
+    #[test]
+    fn unresolved_selection_hides_the_workspace_scoped_surfaces() {
+        let mut dash = ready_dashboard();
+        dash.selected_user_name = Some("alice".to_string());
+        dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
+
+        let _ = dash.apply_workspace_selection("ws1");
+        assert!(dash.render_git_block().is_some());
+
+        // A personal selection never resolves, however it arose.
+        let _ = dash.apply_workspace_selection("personal:alice");
+        assert!(!dash.page_available(Page::Editor));
+        assert!(!dash.page_available(Page::Shell));
+        assert!(
+            dash.page_available(Page::Home),
+            "other pages stay available"
+        );
+        assert!(dash.render_git_block().is_none());
+        let _ = dash.open_diff_modal(None);
+        assert!(!dash.show_diff_modal, "the diff view must not open");
+
+        // Neither does a selected name missing from the loaded map.
+        let _ = dash.apply_workspace_selection("gone");
+        assert!(!dash.page_available(Page::Editor));
+        assert!(dash.render_git_block().is_none());
+
+        let _ = dash.apply_workspace_selection("ws1");
+        assert!(dash.page_available(Page::Editor));
+        assert!(dash.page_available(Page::Shell));
+        assert!(dash.render_git_block().is_some());
+        let _ = dash.open_diff_modal(None);
+        assert!(dash.show_diff_modal);
+    }
+
+    /// An open diff view is closed when the resolution is lost — from then on
+    /// nothing of that workspace may be displayed.
+    #[test]
+    fn losing_the_resolution_closes_the_diff_view() {
+        let mut dash = ready_dashboard();
+        dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
+        let _ = dash.apply_workspace_selection("ws1");
+        let _ = dash.open_diff_modal(None);
+        assert!(dash.show_diff_modal);
+
+        let _ = dash.apply_workspace_selection("personal:alice");
+
+        assert!(!dash.show_diff_modal);
+        assert_eq!(dash.resolved_workspace(), None);
+        assert_eq!(dash.pushed_workspace, None);
     }
 
     /// A workspace switch drops the board failure that described the previous
