@@ -29,11 +29,12 @@
 //! `jobs.mode` discriminator, the `session_metadata.sleep_ended` marker, the
 //! `alarms.command` column, the `chat_history.broadcast_id` column, and the
 //! `tickets.last_transition_actor` / `ticket_chronicle.actor` columns on
-//! one-delta-behind / current databases. Entry `36` is a data migration: it
-//! detaches non-admin users from shared workspaces by clearing
-//! `users.selected_workspace`.
+//! one-delta-behind / current databases. The tail entries are data migrations:
+//! `36` detaches non-admin users from shared workspaces by clearing
+//! `users.selected_workspace`, and `37` rewrites the legacy `DeepSeek`
+//! provider-routing display name to the canonical `deepseek` slug.
 //!
-//! Future schema changes resume the chain at id `37` with monotonically
+//! Future schema changes resume the chain at id `38` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -452,6 +453,15 @@ CREATE INDEX IF NOT EXISTS idx_llm_failures_recorded_at ON llm_failures(recorded
 CREATE INDEX IF NOT EXISTS idx_llm_failures_operation_id ON llm_failures(operation_id);
 CREATE INDEX IF NOT EXISTS idx_llm_failures_failure_class ON llm_failures(failure_class);";
 
+/// One-shot data migration (`37`).
+///
+/// Earlier versions wrote the DeepSeek provider routing value as OpenRouter's
+/// *display name* (`DeepSeek`), which is not the provider slug OpenRouter
+/// resolves, so those pins silently did not apply (and, with
+/// `allow_fallbacks: false`, failed the request). Only that exact value is
+/// rewritten; every other stored order survives verbatim.
+const REWRITE_LEGACY_DEEPSEEK_ROUTING_SLUG: &str = "UPDATE config_model_routing SET provider_order = 'deepseek' WHERE provider_order = 'DeepSeek';";
+
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
 /// Entries `24`–`26` are the consolidated current-shape baseline; entries
@@ -478,6 +488,9 @@ CREATE INDEX IF NOT EXISTS idx_llm_failures_failure_class ON llm_failures(failur
 ///   `ticket_chronicle.actor` columns for phase-transition actor attribution.
 /// - `35` adds the per-attempt `llm_failures` table to the logs store
 ///   (baseline `26` already carries it for fresh installs).
+/// - `36` is the admin-only workspace-membership data migration.
+/// - `37` rewrites the legacy `DeepSeek` provider-routing display name to the
+///   canonical `deepseek` slug (a data migration; a no-op on new installs).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -543,6 +556,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "36",
         target: TargetDb::Core,
         body: MigrationBody::Rust(detach_non_admin_workspaces),
+    },
+    Migration {
+        id: "37",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(REWRITE_LEGACY_DEEPSEEK_ROUTING_SLUG),
     },
 ];
 
@@ -2195,9 +2213,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "32".to_string(),
                 "33".to_string(),
                 "34".to_string(),
-                "36".to_string()
+                "36".to_string(),
+                "37".to_string()
             ],
-            "fresh core applies baseline 24/25/27/28/29/30/31/32/33/34 + data 36 exactly"
+            "fresh core applies baseline 24/25/27/28/29/30/31/32/33/34 + data 36/37 exactly"
         );
     }
 
@@ -2513,12 +2532,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("33".to_string());
         expected_ids.push("34".to_string());
         expected_ids.push("36".to_string());
+        expected_ids.push("37".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34/36"
+            "reopen must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34/36/37"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -2820,12 +2840,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("33".to_string());
         expected_ids.push("34".to_string());
         expected_ids.push("36".to_string());
+        expected_ids.push("37".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34/36"
+            "upgrade must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34/36/37"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -2885,6 +2906,24 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 )
             })
             .collect()
+    }
+
+    /// Model → provider order for every routing row, ordered by model.
+    async fn model_routing_orders(conn: &Connection) -> Vec<(String, String)> {
+        conn.query(
+            "SELECT model, provider_order FROM config_model_routing ORDER BY model",
+            (),
+        )
+        .await
+        .expect("read config_model_routing")
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String>(0).expect("model"),
+                row.get::<String>(1).expect("provider_order"),
+            )
+        })
+        .collect()
     }
 
     /// Behavioral pin for delta `36`: workspace membership is admin-only, so the
@@ -2948,5 +2987,69 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         // Idempotence: re-running matches no rows and changes nothing.
         run_detach_non_admin_workspaces(&conn).await.unwrap();
         assert_eq!(users_selected_workspaces(&conn).await, after);
+    }
+
+    /// Behavioral pin for catalog entry `37`: the legacy DeepSeek routing value
+    /// written by earlier versions (OpenRouter's display name, not the slug it
+    /// resolves) is rewritten, while every other stored provider order — an
+    /// already-canonical one and a genuine user choice — survives verbatim.
+    /// Idempotent: a second execution matches no rows.
+    #[tokio::test]
+    async fn rewrite_legacy_deepseek_routing_slug_rewrites_only_the_display_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        // Catalog front entry 24 (baseline core schema) creates
+        // `config_model_routing`.
+        run_catalog(&conn, TargetDb::Core, &MIGRATIONS[..1])
+            .await
+            .expect("baseline catalog");
+        for (model, order) in [
+            ("deepseek/deepseek-v4-flash", "DeepSeek"),
+            ("deepseek/deepseek-v4.1-flash", "deepseek"),
+            ("qwen/qwen3.8-flash", "GMICloud"),
+        ] {
+            conn.execute(
+                "INSERT INTO config_model_routing (model, provider_order) VALUES (?1, ?2)",
+                params![model, order],
+            )
+            .await
+            .unwrap();
+        }
+
+        let entry_37 = MIGRATIONS
+            .iter()
+            .find(|m| m.id == "37")
+            .expect("entry 37 in the catalog");
+        run_catalog(&conn, TargetDb::Core, std::slice::from_ref(entry_37))
+            .await
+            .expect("apply entry 37");
+        let rewritten = model_routing_orders(&conn).await;
+        assert_eq!(
+            rewritten,
+            vec![
+                (
+                    "deepseek/deepseek-v4-flash".to_string(),
+                    "deepseek".to_string()
+                ),
+                (
+                    "deepseek/deepseek-v4.1-flash".to_string(),
+                    "deepseek".to_string()
+                ),
+                ("qwen/qwen3.8-flash".to_string(), "GMICloud".to_string()),
+            ],
+            "only the legacy display-name value may be rewritten"
+        );
+
+        // The ledger records `37` after the first application, so re-run the SQL
+        // body directly to pin that it matches no rows a second time.
+        conn.execute(REWRITE_LEGACY_DEEPSEEK_ROUTING_SLUG, ())
+            .await
+            .expect("re-run entry 37 body");
+        assert_eq!(model_routing_orders(&conn).await, rewritten);
     }
 }

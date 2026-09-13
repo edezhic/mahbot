@@ -3080,8 +3080,8 @@ impl SettingsState {
                 field: order_field.clone(),
             };
             let order_error = self.field_errors.get(&order_field).map(String::as_str);
-            // Placeholder is a hint only: an empty field always means
-            // auto-routing — the hint can show while routing is auto.
+            // Placeholder is the provider an empty (unset/cleared) field falls
+            // back to — the same value the request will carry.
             let placeholder = crate::config::default_model_routing(model_name).unwrap_or("");
             let order_input: Element<'_, SettingsMessage> = widgets::single_line_editor(
                 &self.field_editor(&order_field).buffer,
@@ -4248,7 +4248,8 @@ mod tests {
         state.resync_field_editors();
 
         // ── Mid-edit window: a raw/partial model name must render its routing
-        // row (empty = auto-routing) instead of panicking on a missing editor.
+        // row (an empty field resolves to the model's default provider)
+        // instead of panicking on a missing editor.
         let _ = state.update(SettingsMessage::ConfigField {
             key: "manager_model",
             value: "custom-model".into(),

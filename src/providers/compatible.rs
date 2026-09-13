@@ -1221,7 +1221,7 @@ mod tests {
     #[test]
     fn provider_routing_block_suppressed_for_custom_endpoint() {
         let mut request = test_request(vec![ChatMessage::user("hello")], None);
-        request.provider_order = Some("DeepSeek".to_string());
+        request.provider_order = Some("deepseek".to_string());
         request.reasoning_effort = Some("xhigh".to_string());
 
         let body = |p: &OpenAiCompatibleProvider| {
@@ -1251,7 +1251,7 @@ mod tests {
             "default endpoint must send the provider block: {or_body}"
         );
         assert!(
-            or_body.contains("DeepSeek"),
+            or_body.contains("\"order\":[\"deepseek\"]"),
             "routing order must be inside the block: {or_body}"
         );
         assert!(

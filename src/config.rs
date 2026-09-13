@@ -68,14 +68,12 @@
 //!
 //! ## Chain 2: Per-model provider routing
 //!
-//! `config_model_routing` table → `None` defaults
+//! `config_model_routing` row (stored override) → [`default_model_routing`]
+//! (model default) → OpenRouter auto-routing
 //!
-//! Stored in [`ConfigData::model_routings`] as a [`Vec<ModelRouting>`][ModelRouting],
-//! loaded at reload time from the `config_model_routing` table. Checked via
-//! [`ConfigReload::model_routing`]. When no entry exists, the returned
-//! [`ModelRouting`] has `provider_order` `None`. The provider layer (in
-//! [`crate::providers`]) resolves this `None` value at request time when
-//! building the OpenAI-compatible chat request.
+//! Stored in [`ConfigData::model_routings`] as a [`Vec<ModelRouting>`][ModelRouting] and
+//! loaded at reload time from the `config_model_routing` table; every chat
+//! request is built through [`ConfigReload::model_routing`].
 //!
 //! # Persistence layer
 //!
@@ -103,8 +101,8 @@
 //!
 //! * [`crate::config_db`] — database persistence for both chains.
 //! * [`crate::agent::role`] — [`crate::agent::role::RoleInfo`] definitions with per-role defaults.
-//! * [`crate::providers::compatible`] — where `None` routing fields are resolved
-//!   at the provider layer.
+//! * [`crate::providers::compatible`] — writes the resolved provider order into
+//!   the OpenRouter request body (`None` sends no provider preference at all).
 
 use crate::Role;
 use crate::util::{UnwrapPoison, is_http_url};
@@ -866,10 +864,11 @@ impl ConfigReload {
 
     /// Find the per-model routing row by model key, if one exists.
     ///
-    /// Unlike [`Self::model_routing`] (which always returns a row, defaulting
-    /// missing entries to all-`None` fields), this returns `None` when no row
-    /// is configured — the settings page uses it to tell "no override" apart
-    /// from "all-None override" when mirroring settled rows.
+    /// Unlike [`Self::model_routing`] (which returns the *effective* routing —
+    /// a stored row, else the model's default provider), this returns the raw
+    /// stored row, and `None` when there is none: the settings page uses it to
+    /// tell "no override" apart from "override cleared" when mirroring settled
+    /// rows.
     pub(crate) fn model_routing_by_key(&self, model: &str) -> Option<ModelRouting> {
         let guard = self.read();
         guard
@@ -879,17 +878,22 @@ impl ConfigReload {
             .cloned()
     }
 
-    /// Look up the provider routing config for a given model.
+    /// Look up the effective provider routing for a model.
     ///
-    /// Returns a [`ModelRouting`] with the model field populated from the lookup
-    /// parameter. When no routing is configured, all fields except `model` are `None`.
+    /// The user's stored order (Settings → Provider Routing) wins when one is
+    /// set; otherwise the model's [`default_model_routing`] applies, so an
+    /// unset/cleared field behaves exactly as if that provider had been set.
     #[must_use]
     pub(crate) fn model_routing(&self, model: &str) -> ModelRouting {
-        self.model_routing_by_key(model)
-            .unwrap_or_else(|| ModelRouting {
-                model: model.to_string(),
-                provider_order: None,
-            })
+        // No stored order → the model's default provider; see `default_model_routing`.
+        let provider_order = self
+            .model_routing_by_key(model)
+            .and_then(|mr| mr.provider_order)
+            .or_else(|| default_model_routing(model).map(str::to_string));
+        ModelRouting {
+            model: model.to_string(),
+            provider_order,
+        }
     }
 
     // ── Role model resolution (two slots) ─────────────────────
@@ -981,17 +985,19 @@ fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
     !crate::db::store_db_path(mahbot_dir, "config").exists()
 }
 
-/// Prefix→provider mapping: `deepseek/*` models route through the DeepSeek
-/// provider, `z-ai/*` models through the z-ai provider; any other model gets
-/// no routing override (OpenRouter auto-routes).
+/// The provider that serves a model unless the user chose one for it: a
+/// DeepSeek-family model (case-insensitive substring match on the model slug)
+/// goes to OpenRouter's canonical lowercase `deepseek` slug; every other model
+/// stays auto-routed.
+///
+/// **DO NOT DELETE, WEAKEN OR "SIMPLIFY" THIS RULE WITHOUT AN EXPLICIT USER
+/// REQUEST.** Which host serves a model decides prompt-cache locality, so
+/// auto-routing a DeepSeek model across hosts is a large billing regression.
 pub(crate) fn default_model_routing(model: &str) -> Option<&'static str> {
-    if model.starts_with("deepseek/") {
-        Some("DeepSeek")
-    } else if model.starts_with("z-ai/") {
-        Some("z-ai")
-    } else {
-        None
-    }
+    model
+        .to_ascii_lowercase()
+        .contains("deepseek")
+        .then_some("deepseek")
 }
 
 /// Seed the fresh-install defaults into a brand-new config database
@@ -1024,11 +1030,10 @@ async fn seed_fresh_install_defaults(
         .set_kv(CONFIG_KEY_VIDEO_MODELS, FRESH_INSTALL_VIDEO_MODELS)
         .await?;
     // Default model slots with a known provider route through it on fresh
-    // installs. The rows are explicit and editable (clearing the field in the
-    // Settings UI returns the model to auto). Derived from the default-model
-    // constants via `default_model_routing` so the seed follows the defaults
-    // if they ever change; the video-transcription default gets no routing
-    // seed — routing applies only to the manager and worker model slots.
+    // installs. The rows duplicate what an empty field resolves to, but are
+    // kept so the Settings routing field renders the value; they are derived
+    // from the default-model constants via `default_model_routing`, and only
+    // the manager/worker slots are seeded.
     // Existing installs receive zero writes — the `fresh` guard above already
     // returned for them.
     for default_model in [DEFAULT_MANAGER_MODEL, DEFAULT_WORKER_MODEL] {
@@ -1039,7 +1044,7 @@ async fn seed_fresh_install_defaults(
         }
     }
     tracing::info!(
-        "Fresh config database: seeded fresh-install defaults (audio transcription off; image/video generation model sets; provider routing for the deepseek/* default models)"
+        "Fresh config database: seeded fresh-install defaults (audio transcription off; image/video generation model sets; provider routing for the default model slots)"
     );
     Ok(())
 }
@@ -1063,8 +1068,9 @@ async fn seed_fresh_install_defaults_from_flag(
 /// model to the current default. Matching is exact on the full
 /// provider-prefixed string, so only rows the user never overrode are
 /// touched; every other key is untouched. A slot rewrite also seeds the
-/// routing row for the new default (so migrated installs behave like fresh
-/// installs). Safe to run on every boot — a no-op once no row matches.
+/// routing row for the new default — the same order `default_model_routing`
+/// resolves for an empty field, written so the Settings routing field renders
+/// it. Safe to run on every boot — a no-op once no row matches.
 async fn migrate_old_default_models(store: &crate::config_db::ConfigStore) -> Result<()> {
     let changed_manager = store
         .migrate_kv_if_equals(
@@ -2068,7 +2074,7 @@ mod tests {
         // passes collapse into a single routing row.
         assert_eq!(
             fresh_store.get_all_model_routings().await.unwrap(),
-            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("DeepSeek"))],
+            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("deepseek"))],
             "a fresh config database must seed routing rows for default models \
              with a known provider (others get none)"
         );
@@ -2169,7 +2175,7 @@ mod tests {
         // Both slots migrated to the same default model: one shared routing row.
         assert_eq!(
             store.get_all_model_routings().await.unwrap(),
-            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("DeepSeek"))],
+            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("deepseek"))],
             "migrating a slot to the new default must upsert its routing row"
         );
 
@@ -2195,7 +2201,7 @@ mod tests {
         );
         assert_eq!(
             store.get_all_model_routings().await.unwrap(),
-            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("DeepSeek"))],
+            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("deepseek"))],
             "re-running the migration must not add or drop the migrated routing row"
         );
     }
@@ -2292,6 +2298,47 @@ mod tests {
         assert!(
             store.get_all_model_routings().await.unwrap().is_empty(),
             "no routing writes may happen when nothing was migrated"
+        );
+    }
+
+    /// Effective routing on a private [`ConfigReload`]: a stored override wins,
+    /// an unset/cleared field falls back to the model's default provider, a
+    /// non-DeepSeek model stays auto-routed.
+    #[test]
+    fn model_routing_applies_the_default_provider_when_unset() {
+        let config = ConfigReload::const_new();
+        let mut data = ConfigData::STRUCT_FIELDS_DEFAULT;
+        data.model_routings = vec![
+            model_routing("deepseek/deepseek-v4.1-flash", Some("GMICloud")),
+            model_routing("deepseek/deepseek-v4-flash-0731", Some("")),
+        ];
+        data.normalize();
+        config.swap(data);
+
+        assert_eq!(
+            config
+                .model_routing("deepseek/deepseek-v4.1-flash")
+                .provider_order
+                .as_deref(),
+            Some("GMICloud"),
+            "an explicitly set provider must win, unchanged"
+        );
+        for model in [
+            "deepseek/deepseek-v4.1-pro",
+            "deepseek-ai/DeepSeek-V3",
+            "deepseek/deepseek-v4-flash-0731",
+        ] {
+            assert_eq!(
+                config.model_routing(model).provider_order.as_deref(),
+                Some("deepseek"),
+                "{model} has no explicit setting and must fall back to the \
+                 canonical DeepSeek slug"
+            );
+        }
+        assert_eq!(
+            config.model_routing("qwen/qwen3.8-flash").provider_order,
+            None,
+            "a non-DeepSeek model must stay auto-routed"
         );
     }
 }

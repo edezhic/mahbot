@@ -181,8 +181,8 @@ impl ConfigStore {
     // Used by the settings page's per-field autosave: each editable row is
     // persisted individually (UPSERT, or DELETE once the order column is
     // `None` — an all-None row is indistinguishable from having no override,
-    // and the provider layer's built-in defaults resolve identically either
-    // way).
+    // and `ConfigReload::model_routing` resolves a missing order to the model's
+    // default provider either way).
 
     /// Save a single `config_model_routing` row: UPSERT, or DELETE when the
     /// `provider_order` column is `None`.
