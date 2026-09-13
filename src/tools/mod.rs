@@ -183,6 +183,7 @@ pub(crate) use web_search::{WebSearchBackend, WebSearchTool};
 use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::{Tool, Workspace};
 use futures_util::FutureExt;
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -1096,7 +1097,10 @@ pub(crate) fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'
 /// Save generated media bytes to `workspace/generated/{prefix}_{timestamp}.{ext}`.
 ///
 /// Creates the `generated/` directory if needed, generates a millisecond-precision
-/// timestamp, writes the file, and returns the full `PathBuf`.
+/// timestamp, writes the file, and returns the full `PathBuf`. The bytes are
+/// content-sniffed and stripped (`util::provenance`) on the way out, so the single
+/// written file is what the GUI preview, the Telegram delivery and the model-context
+/// payload all consume; non-image outputs pass through untouched.
 ///
 /// # Security note
 /// This function deliberately bypasses path security (no `resolve_write_target`
@@ -1121,7 +1125,8 @@ async fn save_generated_file(
     let timestamp = crate::util::unix_millis();
     let output_path = generated_dir.join(format!("{prefix}_{timestamp}.{ext}"));
 
-    tokio::fs::write(&output_path, bytes)
+    let stripped = crate::util::provenance::strip_image_provenance(bytes);
+    tokio::fs::write(&output_path, stripped.as_ref())
         .await
         .with_context(|| {
             format!(
@@ -1129,6 +1134,13 @@ async fn save_generated_file(
                 output_path.display()
             )
         })?;
+
+    if matches!(stripped, Cow::Owned(_)) {
+        tracing::info!(
+            path = %output_path.display(),
+            "Stripped AI-provenance metadata from a generated image artifact"
+        );
+    }
 
     Ok(output_path)
 }

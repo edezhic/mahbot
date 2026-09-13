@@ -10,6 +10,7 @@ pub(crate) mod macros;
 pub(crate) mod managed_bin;
 pub(crate) mod media_target;
 pub(crate) mod model_state;
+pub(crate) mod provenance;
 #[cfg(test)]
 pub(crate) mod test;
 pub(crate) mod tree_sitter;
