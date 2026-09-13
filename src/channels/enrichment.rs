@@ -787,7 +787,7 @@ async fn extracted_text_annotation(
         }
     };
     format!(
-        "[File {name}: the extracted text is too long to inline ({char_count} characters); the full text was saved to {} — read that file.",
+        "[File {name}: the extracted text is too long to inline ({char_count} characters); the full text was saved to {} — read that file.]",
         spill.display()
     )
 }
@@ -1999,12 +1999,6 @@ mod tests {
             "Long text must not be inlined, got: {}",
             msg.content
         );
-        assert!(
-            msg.content
-                .contains(&format!("({} characters)", text.trim().chars().count())),
-            "Annotation must report the extracted length, got: {}",
-            msg.content
-        );
         let uploads_dir = ws_path.join("uploads");
         let mut entries = tokio::fs::read_dir(&uploads_dir).await.unwrap();
         let mut spill = None;
@@ -2018,9 +2012,16 @@ mod tests {
             }
         }
         let spill = spill.expect("an .extracted.txt sidecar must be written");
+        // The note is asserted in full, closing bracket included, so a note
+        // left undelimited cannot pass unnoticed.
         assert!(
-            msg.content.contains(&spill.display().to_string()),
-            "Annotation must name the sidecar, got: {}",
+            msg.content.contains(&format!(
+                "[File long.txt: the extracted text is too long to inline ({} characters); \
+                 the full text was saved to {} — read that file.]",
+                text.trim().chars().count(),
+                spill.display()
+            )),
+            "Annotation must be a delimited note naming the sidecar, got: {}",
             msg.content
         );
         assert_eq!(

@@ -20,8 +20,8 @@
 //!   memory inside a decoder and abort the process (the filter chain inflates
 //!   into an unbounded buffer), and a decoder that panics instead is only
 //!   contained at the caller's blocking boundary (as [`DocOutcome::Unreadable`],
-//!   losing the text pass with it). What this module declares is bounded instead
-//!   (see `embedded_image_jpeg`). Residual risks accepted here.
+//!   losing the text pass with it). The bounds this module declares are its own
+//!   (see `embedded_image_jpeg`), not the decoders'.
 //! - **Content-first detection.** Magic bytes decide the format; the extension
 //!   only disambiguates formats that share a container (a ZIP is a `.docx` only
 //!   when the name says so) or that have no magic (plain text).

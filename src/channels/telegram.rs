@@ -28,11 +28,11 @@ const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 /// only fails at the write. See [`sanitize_attachment_filename`].
 const MAX_ATTACHMENT_FILENAME_BYTES: usize = 180;
 
-/// Per-request timeout for a media upload, overriding the channel client's
-/// one-minute default: [`FILE_MAX_BYTES`] on a slow uplink takes longer than a
-/// minute to send. Still bounded, so a stalled connection cannot hold the send
-/// open forever.
-const MEDIA_UPLOAD_TIMEOUT: Duration = Duration::from_mins(5);
+/// Per-request timeout for a media transfer, overriding the channel client's
+/// one-minute default: [`FILE_MAX_BYTES`] in either direction takes longer than
+/// a minute over a slow link. Still bounded, so a stalled transfer cannot hold
+/// the request open forever.
+const MEDIA_TRANSFER_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Description for the `/clear` command — used in `setMyCommands` API and `/start` welcome message.
 const CLEAR_COMMAND_DESC: &str = "Reset your session";
@@ -814,9 +814,9 @@ fn resolve_file_target(target: &str, file_roots: &[PathBuf]) -> Result<PathBuf, 
 ///
 /// A matched marker is only consumed when the delivery layer can act on it: a
 /// kind whose target is not attachable stays literal, so prose quoting the
-/// syntax never aborts delivery and never silently disappears. Known
-/// limitation: prose naming a real existing file still delivers as an
-/// attachment.
+/// syntax never aborts delivery and never silently disappears. The gate is
+/// structural, so marker-shaped prose naming a real existing file still
+/// delivers as an attachment.
 ///
 /// `[FILE:...]` markers are the exception: they are resolved against
 /// `file_roots` (see [`resolve_file_target`]) and stripped either way — a
@@ -904,6 +904,16 @@ fn telegram_download_limit_reason() -> String {
 const TELEGRAM_TRANSFER_REFUSED_REASON: &str =
     "Telegram refused the transfer (it may exceed what the bot can download)";
 
+/// User-facing reason when the download ran into [`MEDIA_TRANSFER_TIMEOUT`]:
+/// the request was stopped on this side, so it is not described as a refusal by
+/// the transport.
+const ATTACHMENT_DOWNLOAD_TIMEOUT_REASON: &str = "the download took too long and was stopped";
+
+/// User-facing reason when the download got no answer out of Telegram at all —
+/// the connection failed before a response. Like the timeout, that is this
+/// side's failure and not a refusal by the transport.
+const ATTACHMENT_DOWNLOAD_FAILED_REASON: &str = "the connection to Telegram failed";
+
 /// Reported when Telegram did not return a download path for an attachment the
 /// bot is otherwise allowed to fetch — an API or network failure, not a size
 /// refusal.
@@ -947,6 +957,22 @@ fn declared_size_refusal(size: u64) -> Option<String> {
         Some(telegram_download_limit_reason())
     } else {
         None
+    }
+}
+
+/// The user-facing reason for a failed inbound download. Only what Telegram
+/// itself answered — an error status, or a body over the product cap — is a
+/// refusal; a transfer that got no answer at all (a `reqwest` error in the
+/// chain, whether it timed out or the connection failed) is reported as the
+/// failure on this side that it is.
+fn download_failure_reason(error: &anyhow::Error) -> &'static str {
+    match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+    {
+        Some(e) if e.is_timeout() => ATTACHMENT_DOWNLOAD_TIMEOUT_REASON,
+        Some(_) => ATTACHMENT_DOWNLOAD_FAILED_REASON,
+        None => TELEGRAM_TRANSFER_REFUSED_REASON,
     }
 }
 
@@ -1613,11 +1639,14 @@ impl TelegramChannel {
     /// Bounded by [`FILE_MAX_BYTES`] on both sides: a declared `Content-Length`
     /// over the cap is refused before the body is buffered, and the received
     /// body is checked again because the transport does not always declare one.
+    /// The request carries [`MEDIA_TRANSFER_TIMEOUT`]: the cap itself takes
+    /// longer than the client's one-minute default to pull over a slow link.
     async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
         let url = format!("{API_BASE}/file/bot{}/{file_path}", self.bot_token);
         let resp = self
             .http_client()
             .get(&url)
+            .timeout(MEDIA_TRANSFER_TIMEOUT)
             .send()
             .await
             .context("Failed to download Telegram file")?;
@@ -1744,7 +1773,9 @@ impl TelegramChannel {
 
         // Download file from Telegram. The transport does not always report a
         // size, so a transfer failure is the other way the 20 MB limit shows
-        // up — surface it instead of dropping the update.
+        // up — surface it instead of dropping the update. A failure on this side
+        // (a timeout, or a connection that broke) is reported as that, not as a
+        // refusal by the transport.
         let tg_file_path = match self.get_file_path(&attachment.file_id).await {
             Ok(p) => p,
             Err(e) => {
@@ -1775,7 +1806,7 @@ impl TelegramChannel {
                         &attachment,
                         remote_ext,
                         NOT_RECEIVED,
-                        TELEGRAM_TRANSFER_REFUSED_REASON,
+                        download_failure_reason(&e),
                     )
                     .await,
                 );
@@ -1948,8 +1979,8 @@ impl TelegramChannel {
     /// Send one Telegram text message, with optional `parse_mode`. Returns
     /// the Telegram message id on success (`None` when the 2xx body omits it
     /// — the message was still delivered), or the HTTP status and response
-    /// body on failure. Parsing the body for the id is an accepted coupling
-    /// into the shared send path — the `None` case preserves status-only
+    /// body on failure. Parsing the body for the id couples this method to the
+    /// shared send path's response shape; the `None` case preserves status-only
     /// semantics for callers that don't need the id.
     async fn send_message_get_id(
         &self,
@@ -2176,7 +2207,7 @@ impl TelegramChannel {
             .http_client()
             .post(self.api_url(meta.api_method))
             .multipart(form)
-            .timeout(MEDIA_UPLOAD_TIMEOUT);
+            .timeout(MEDIA_TRANSFER_TIMEOUT);
 
         self.send_media(chat_id, meta.api_method, request, file_name)
             .await

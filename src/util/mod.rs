@@ -163,13 +163,10 @@ pub(crate) fn strip_data_uris(text: &str) -> String {
             if kind == MediaMarkerKind::Image && path.starts_with("data:image/") {
                 format!(
                     "[IMAGE:{DATA_URI_OMITTED_PREFIX} ({} bytes)>]",
-                    caps.get(0).expect("group 0 always matches").as_str().len()
+                    caps.get_match().as_str().len()
                 )
             } else {
-                caps.get(0)
-                    .expect("group 0 always matches")
-                    .as_str()
-                    .to_string()
+                caps.get_match().as_str().to_string()
             }
         })
         .into_owned()
