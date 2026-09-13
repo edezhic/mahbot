@@ -118,6 +118,12 @@ crate::columns! {
 /// displayed pipeline state and the input gate for the claim step
 /// (Backlog → Analysis, Queued → InDevelopment) — not a mirror
 /// of a long-lived job.
+///
+/// [`TicketPhase::Failed`] is deliberately NOT a member: a failure awaiting
+/// Manager triage parks new starts through the claim predicate's own
+/// failed-sibling gate, not through this set. Adding it here would also
+/// suppress Manager triage (this set gates in-flight-ticket updates) and Done
+/// notifications.
 const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
     TicketPhase::InDiagnostics,
@@ -186,10 +192,10 @@ fn phase_list_sql_fragment(phases: &[TicketPhase]) -> String {
 /// The claim-candidate eligibility predicate, shared verbatim by the claim
 /// UPDATE and its read-only probe (single source — the two cannot drift).
 /// `source` selects the claim shape: only Backlog→Analysis applies the
-/// [`BACKLOG_CLAIM_GRACE`] cutoff, only Queued→InDevelopment enforces
-/// pipeline occupancy. Placeholders are numbered from `base`: `?{base}` =
-/// source phase, `?{base+1}` = workspace name and, for Backlog,
-/// `?{base+2}` = grace cutoff.
+/// [`BACKLOG_CLAIM_GRACE`] cutoff, only Queued→InDevelopment enforces the
+/// single-pipeline-occupancy and failed-sibling start gates. Placeholders are
+/// numbered from `base`: `?{base}` = source phase, `?{base+1}` = workspace name
+/// and, for Backlog, `?{base+2}` = grace cutoff.
 fn claim_candidate_where(base: usize, source: TicketPhase) -> String {
     let mut parts = vec![
         format!("t1.phase = ?{base}"),
@@ -207,6 +213,19 @@ fn claim_candidate_where(base: usize, source: TicketPhase) -> String {
                 AND t2.is_archived = 0 \
                 AND t2.id != t1.id)",
             phase_list_sql_fragment(PIPELINE_OCCUPIED_PHASES),
+        ));
+        // A failed ticket awaiting Manager triage parks the workspace until it is
+        // cancelled or superseded (both move it out of Failed). Failed is
+        // deliberately NOT in [`PIPELINE_OCCUPIED_PHASES`], so the gate lives
+        // here — on the start decision itself, where the read-only probe inherits
+        // it through this shared builder.
+        parts.push(format!(
+            "NOT EXISTS (SELECT 1 FROM tickets t2 \
+                WHERE t2.workspace_name = t1.workspace_name \
+                AND t2.phase = '{}' \
+                AND t2.is_archived = 0 \
+                AND t2.id != t1.id)",
+            TicketPhase::Failed.as_ref(),
         ));
     }
     parts.push(format!(
@@ -1012,11 +1031,23 @@ impl BoardStore {
     /// Claim a workspace's oldest eligible [`TicketPhase::Queued`] ticket and
     /// transition it to InDevelopment. See [`claim_for_phase`] for the shared
     /// semantics. The Queued shape additionally rejects the claim (returns
-    /// `None`) while any pipeline-occupied ticket ([`PIPELINE_OCCUPIED_PHASES`])
-    /// exists in the same workspace, enforcing a single ticket at a time in the
-    /// dev/review/QA pipeline. The occupancy check's `t2.is_archived = 0` guard
-    /// is a deliberate no-op today — only Done/Cancelled tickets get archived
-    /// and neither is a pipeline phase — but kept for consistency.
+    /// `None`) in two cases, both evaluated against the committed state at the
+    /// claim instant:
+    ///
+    /// - while any pipeline-occupied ticket ([`PIPELINE_OCCUPIED_PHASES`]) exists
+    ///   in the same workspace, enforcing a single ticket at a time in the
+    ///   dev/review/QA pipeline;
+    /// - while any non-archived [`TicketPhase::Failed`] ticket exists in the same
+    ///   workspace — a failure awaiting Manager triage parks the workspace so no
+    ///   new work starts next to the unresolved failure (and its uncommitted
+    ///   state). The park lifts by itself: cancelling or superseding the failed
+    ///   ticket moves it out of Failed. Nothing else is paused — the Manager
+    ///   keeps full triage control.
+    ///
+    /// The two occupancy checks' `t2.is_archived = 0` guard is a deliberate
+    /// no-op for the pipeline phases (only Done/Cancelled tickets get archived
+    /// and neither is a pipeline phase) but load-bearing for `Failed`, which
+    /// stays non-archived until triage.
     pub(crate) async fn claim_queued_for_development(
         &self,
         workspace_name: &str,
@@ -1044,7 +1075,7 @@ impl BoardStore {
     /// actor binds), the same builder the read-only probe uses — so the claim and
     /// its probe cannot drift. Only Backlog carries the `grace_cutoff` bind
     /// (it must be `Some` only for [`TicketPhase::Backlog`]); only Queued
-    /// enforces pipeline occupancy. `now` and `grace_cutoff` are supplied by
+    /// enforces the pipeline-occupancy and failed-sibling start gates. `now` and `grace_cutoff` are supplied by
     /// the caller, computed once per poll round and shared with the probe, so
     /// the probe and the claim can never disagree about the clock or the
     /// cutoff.

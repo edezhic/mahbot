@@ -18,7 +18,9 @@
 //! ([`PHASE_BODIES_RUNNING`]), a runtime-transport guard that stops a second
 //! phase body from being spawned on the same job during the pre-roster window.
 //! A paused workspace skips claims and job creation; current work finishes
-//! normally and the unpause re-drives it.
+//! normally and the unpause re-drives it. A workspace holding a failed ticket
+//! awaiting Manager triage skips the `Queued -> InDevelopment` claim (enforced
+//! inside the claim predicate, not here); every other puller step still runs.
 
 pub mod analysis;
 pub mod board;
@@ -491,7 +493,7 @@ fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_
 }
 
 /// The single prompt-driven claim pipeline: Backlog→Analysis (5s grace) and
-/// Queued→InDevelopment (pipeline-occupied enforced).
+/// Queued→InDevelopment (pipeline-occupancy and failed-sibling gates enforced).
 ///
 /// Each claim is gated on a read-only existence probe over the SAME predicate
 /// as the claim (shared `claim_candidate_where` builder, shared
@@ -1553,7 +1555,14 @@ fn bounce_exhausted(bounce_count: i64) -> bool {
     usize::try_from(bounce_count).unwrap_or(usize::MAX) >= MAX_BOUNCES
 }
 
-/// Move all other Queued tickets in the workspace to Planning.
+/// Move all other Queued tickets in the workspace to Planning after a breaker
+/// trip.
+///
+/// This is the visible half of the post-failure triage step, not the
+/// enforcement: the hard guarantee that the workspace starts no new ticket
+/// while a failed ticket awaits triage lives in the claim predicate
+/// ([`BoardStore::claim_queued_for_development`]) and holds regardless of
+/// whether this drain runs.
 async fn drain_queued_siblings(ticket: &Ticket) {
     match board()
         .drain_queued_to_planning(&ticket.workspace_name, PIPELINE_ACTOR)

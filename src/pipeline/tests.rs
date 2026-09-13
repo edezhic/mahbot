@@ -92,6 +92,94 @@ async fn claim_queued_blocks_on_pipeline_occupancy() {
     );
 }
 
+/// Queued → InDevelopment is parked while a sibling ticket is failed and
+/// awaiting Manager triage. The park is part of the claim predicate itself, so
+/// the read-only probe agrees, and it lifts by itself once the failed ticket is
+/// cancelled (leaves `Failed`).
+#[tokio::test]
+async fn claim_queued_blocked_by_failed_sibling_until_cancelled() {
+    let (store, _dir) = crate::open_test_store!(BoardStore, "board");
+    let ws = ws_named("ws-a");
+
+    let failed = make_ticket(&store, &ws, "Failed", TicketPhase::Failed).await;
+    let queued = make_ticket(&store, &ws, "Queued", TicketPhase::Queued).await;
+
+    let (probe, claimed) = probe_then_claim_queued(&store, &ws).await;
+    assert!(!probe, "a failed sibling must fail the eligibility probe");
+    assert!(claimed.is_none(), "a failed sibling must block the start");
+    assert_eq!(
+        expect_ticket_phase(&store, &queued).await,
+        TicketPhase::Queued,
+        "the blocked ticket must stay Queued",
+    );
+
+    // Manager triage: cancel the failed ticket → the park lifts.
+    store
+        .transition_to(
+            &failed,
+            Some(TicketPhase::Failed),
+            TicketPhase::Cancelled,
+            "test",
+        )
+        .await
+        .unwrap();
+    let (probe, claimed) = probe_then_claim_queued(&store, &ws).await;
+    assert!(
+        probe,
+        "cancelling the failed sibling must unblock the probe"
+    );
+    assert_eq!(
+        claimed
+            .expect("cancelling the failed sibling must unblock the start")
+            .id,
+        queued,
+    );
+}
+
+/// Superseding the failed ticket lifts the park too — the supersede cancels and
+/// archives the old ticket, so the workspace starts new work again with no
+/// manual state to clear.
+#[tokio::test]
+async fn claim_queued_unblocked_by_superseding_failed_sibling() {
+    let (store, _dir) = crate::open_test_store!(BoardStore, "board");
+    let ws = ws_named("ws-a");
+
+    let failed = make_ticket(&store, &ws, "Failed", TicketPhase::Failed).await;
+    let queued = make_ticket(&store, &ws, "Queued", TicketPhase::Queued).await;
+
+    let (probe, claimed) = probe_then_claim_queued(&store, &ws).await;
+    assert!(!probe && claimed.is_none(), "failed sibling must block");
+
+    store
+        .supersede_and_create(
+            &failed,
+            &crate::pipeline::board::TicketParams {
+                title: "Corrected".to_string(),
+                description: "corrected".to_string(),
+                workspace_name: ws.name.clone(),
+                phase: TicketPhase::Queued,
+                prerequisites: Vec::new(),
+                reporter: "manager".to_string(),
+                embedding: None,
+                priority: 1,
+            },
+            "manager",
+        )
+        .await
+        .expect("supersede must succeed");
+
+    let (probe, claimed) = probe_then_claim_queued(&store, &ws).await;
+    assert!(
+        probe,
+        "superseding the failed sibling must unblock the probe"
+    );
+    assert_eq!(
+        claimed.expect("workspace must start again after triage").id,
+        queued,
+        "the older Queued ticket starts again after triage",
+    );
+}
+
 /// Backlog → Analysis claim honors prerequisites: a dependent ticket with an
 /// unmet prereq stays in Backlog; once the prereq reaches an unblocking phase
 /// the dependent is eligible.
