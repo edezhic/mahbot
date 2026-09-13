@@ -1,7 +1,6 @@
 use crate::Tool;
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::Path;
 
 /// Tool for generating videos via OpenRouter's async videos API.
 ///
@@ -45,7 +44,7 @@ impl Tool for VideoGenTool {
                 "images": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Path to a reference/start image for image-to-video generation (single image only)",
+                    "description": "Path to a reference/start image for image-to-video generation (single image only; a local path is accepted only from the workspace uploads dir — received attachments — or the generated dir — previously generated images)",
                     "maxItems": 1
                 },
                 "duration": {
@@ -128,11 +127,9 @@ impl Tool for VideoGenTool {
 
         let mut references: Vec<crate::util::ReferenceImage> = Vec::new();
         if let Some(img_path) = images.first() {
-            let reference = crate::util::load_reference_image(
-                Path::new(img_path),
-                super::MAX_REFERENCE_IMAGE_BYTES,
-            )
-            .await?;
+            let path = super::resolve_local_media_path(img_path, ws, "reference image").await?;
+            let reference =
+                crate::util::load_reference_image(&path, super::MAX_REFERENCE_IMAGE_BYTES).await?;
             references.push(reference);
             body[super::INPUT_REFERENCES_KEY] = super::reference_json(&references);
         }

@@ -36,7 +36,7 @@ impl Tool for ImageGenTool {
                 "images": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Paths to reference images for image-to-image generation"
+                    "description": "Paths to reference images for image-to-image generation (local paths are accepted only from the workspace uploads dir — received attachments — or the generated dir — previously generated images)"
                 },
                 "aspect_ratio": {
                     "type": "string",
@@ -59,6 +59,15 @@ impl Tool for ImageGenTool {
         let size = super::get_opt_str(&args, "size");
         let images: Vec<String> = super::get_str_array(&args, "images")?;
 
+        // Confine every reference before any other filesystem or provider
+        // access: a refused path is never stat'ed or read, and the catalog
+        // lookup below cannot precede the refusal.
+        let mut reference_paths = Vec::with_capacity(images.len());
+        for img_path in &images {
+            reference_paths
+                .push(super::resolve_local_media_path(img_path, ws, "reference image").await?);
+        }
+
         // Capability and parameter decisions come from the catalog. A membership
         // miss forces one catalog refresh before the verdict; a catalog outage
         // degrades to minimal user-provided parameters (fail-open), while a model
@@ -71,43 +80,36 @@ impl Tool for ImageGenTool {
         // The catalog declares the per-model cap; the fail-open path (catalog
         // unavailable) falls back to the universal OpenRouter limit.
         if let Some(info) = info
-            && !images.is_empty()
+            && !reference_paths.is_empty()
         {
-            validate_reference_count(&model, info, images.len())?;
-        } else if images.len() > super::MAX_REFERENCE_IMAGES_PER_REQUEST {
+            validate_reference_count(&model, info, reference_paths.len())?;
+        } else if reference_paths.len() > super::MAX_REFERENCE_IMAGES_PER_REQUEST {
             anyhow::bail!(
                 "Image generation supports at most {} reference image(s), got {}. \
                  Retry with fewer images.",
                 super::MAX_REFERENCE_IMAGES_PER_REQUEST,
-                images.len(),
+                reference_paths.len(),
             );
         }
 
         // Combined-size pre-flight before loading any file: the per-image
         // ceilings don't bound the total, and a pathological multi-reference
         // request must be refused without reading everything into memory first.
-        if !images.is_empty() {
-            crate::util::check_reference_total_input(
-                &images.iter().map(PathBuf::from).collect::<Vec<_>>(),
-            )
-            .await?;
+        if !reference_paths.is_empty() {
+            crate::util::check_reference_total_input(&reference_paths).await?;
         }
 
         // Load reference images so file errors surface deterministically.
-        let mut references = Vec::with_capacity(images.len());
-        for img_path in &images {
+        let mut references = Vec::with_capacity(reference_paths.len());
+        for path in &reference_paths {
             references.push(
-                crate::util::load_reference_image(
-                    Path::new(img_path),
-                    super::MAX_REFERENCE_IMAGE_BYTES,
-                )
-                .await?,
+                crate::util::load_reference_image(path, super::MAX_REFERENCE_IMAGE_BYTES).await?,
             );
         }
 
         // Fail-open sends only an explicitly user-provided aspect ratio.
         let resolved_aspect_ratio = match info {
-            Some(_) => Some(resolve_aspect_ratio(aspect_ratio_arg, &images)),
+            Some(_) => Some(resolve_aspect_ratio(aspect_ratio_arg, &reference_paths)),
             None => aspect_ratio_arg.map(String::from),
         };
 
@@ -581,20 +583,21 @@ static CANONICAL_ASPECT_RATIOS: &[(&str, f64)] = &[
 /// Resolve the effective aspect ratio: the user-provided value, the closest
 /// canonical ratio detected from the first reference image, or the
 /// [`DEFAULT_ASPECT_RATIO`] default.
-fn resolve_aspect_ratio(aspect_ratio: Option<&str>, images: &[String]) -> String {
+fn resolve_aspect_ratio(aspect_ratio: Option<&str>, reference_paths: &[PathBuf]) -> String {
     match aspect_ratio {
         Some(ar) => ar.to_string(),
-        None if !images.is_empty() => {
-            if let Some(ratio) = detect_aspect_ratio_from_image(Path::new(&images[0])) {
+        None if !reference_paths.is_empty() => {
+            let first = &reference_paths[0];
+            if let Some(ratio) = detect_aspect_ratio_from_image(first) {
                 tracing::debug!(
                     "Auto-detected aspect ratio {ratio} from reference image `{}`",
-                    images[0],
+                    first.display(),
                 );
                 ratio.to_string()
             } else {
                 tracing::debug!(
                     "Could not detect aspect ratio from reference image `{}`, falling back to {DEFAULT_ASPECT_RATIO}",
-                    images[0],
+                    first.display(),
                 );
                 DEFAULT_ASPECT_RATIO.to_string()
             }

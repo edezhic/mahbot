@@ -1094,6 +1094,47 @@ pub(crate) fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'
         .map(Box::as_ref)
 }
 
+/// Canonicalize a local media path and confine it to the workspace's
+/// `uploads/` (received attachments) and `generated/` (tool outputs) dirs — the
+/// shared rule for video_edit's local inputs and the generation tools'
+/// reference images. `kind` names the input in the messages.
+///
+/// Callers must run it before any other filesystem access on the path: a
+/// refused path is never stat'ed, opened, or sniffed.
+///
+/// Roots are canonicalized when they exist; a missing directory cannot contain
+/// a canonicalized (existing) file, so it is skipped — which fails closed when
+/// neither exists. A relative input resolves against the process CWD rather
+/// than the workspace, matching video_edit's local inputs.
+pub(crate) async fn resolve_local_media_path(
+    input: &str,
+    ws: &Workspace,
+    kind: &str,
+) -> anyhow::Result<PathBuf> {
+    let canonical = tokio::fs::canonicalize(input)
+        .await
+        .with_context(|| format!("Local {kind} not found: {input}"))?;
+    let roots: Vec<PathBuf> = ["uploads", "generated"]
+        .iter()
+        .map(|d| ws.as_path().join(d))
+        .filter_map(|r| std::fs::canonicalize(&r).ok())
+        .collect();
+    if !path::is_path_under_roots(&canonical, &roots) {
+        tracing::warn!(
+            path = %canonical.display(),
+            "Local {kind} rejected: not inside workspace uploads or generated dirs"
+        );
+        anyhow::bail!(
+            "forbidden: local {kind} must be inside the workspace uploads directory \
+             (received media attachments) or the generated directory (previously \
+             generated media), got: {} — hint: move the file into the workspace \
+             uploads directory and retry",
+            canonical.display()
+        );
+    }
+    Ok(canonical)
+}
+
 /// Save generated media bytes to `workspace/generated/{prefix}_{timestamp}.{ext}`.
 ///
 /// Creates the `generated/` directory if needed, generates a millisecond-precision
@@ -1579,6 +1620,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── resolve_local_media_path tests ─────────────────────────────────────
+
+    /// The rule video_edit's local inputs and the generation tools' reference
+    /// images share: only the workspace's `uploads/` and `generated/` dirs are
+    /// reachable, and anywhere else is refused with the reason.
+    #[tokio::test]
+    async fn resolve_local_media_path_confines_to_uploads_and_generated() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = crate::Workspace::from_path(tmp.path());
+        let write = |name: &str| {
+            let path = tmp.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"media").unwrap();
+            path.to_string_lossy().to_string()
+        };
+
+        // Both media dirs are accepted, including `generated/` when `uploads/`
+        // does not exist yet.
+        assert!(
+            resolve_local_media_path(&write("generated/image_1.png"), &ws, "image")
+                .await
+                .is_ok()
+        );
+        assert!(
+            resolve_local_media_path(&write("uploads/clip.mp4"), &ws, "clip")
+                .await
+                .is_ok()
+        );
+
+        // Anywhere else in the workspace is refused, naming both accepted dirs.
+        let err = resolve_local_media_path(&write("config.toml"), &ws, "clip")
+            .await
+            .expect_err("a file outside uploads/generated must be refused");
+        assert!(
+            err.to_string()
+                .contains("must be inside the workspace uploads directory"),
+            "unexpected error: {err}"
+        );
+
+        // A workspace with neither dir refuses everything — a missing dir
+        // cannot contain a canonicalized file, so the rule fails closed.
+        let bare = TempDir::new().expect("tempdir");
+        let bare_ws = crate::Workspace::from_path(bare.path());
+        let root_file = bare.path().join("clip.mp4");
+        std::fs::write(&root_file, b"media").unwrap();
+        assert!(
+            resolve_local_media_path(&root_file.to_string_lossy(), &bare_ws, "clip")
+                .await
+                .is_err()
+        );
     }
 
     // ── save_generated_file tests ──────────────────────────────────────────

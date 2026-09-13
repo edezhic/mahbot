@@ -241,68 +241,6 @@ fn validate_mode(
     }
 }
 
-/// Validate that a canonicalized local path lives under the workspace
-/// `uploads/` directory (received media attachments) or the `generated/`
-/// directory (outputs of the generation tools). Arbitrary daemon-readable
-/// files must never reach the anonymous upload host.
-fn check_local_containment(
-    canonical: &std::path::Path,
-    ws: &crate::Workspace,
-    kind: &str,
-) -> anyhow::Result<()> {
-    // Roots are canonicalized when they exist; a missing dir simply cannot
-    // contain a canonicalized (existing) file, so it is skipped.
-    let roots: Vec<std::path::PathBuf> = ["uploads", "generated"]
-        .iter()
-        .map(|d| ws.as_path().join(d))
-        .filter_map(|r| std::fs::canonicalize(&r).ok())
-        .collect();
-    if !super::path::is_path_under_roots(canonical, &roots) {
-        tracing::warn!(
-            path = %canonical.display(),
-            "Local {kind} rejected: not inside workspace uploads or generated dirs"
-        );
-        anyhow::bail!(
-            "Local {kind} must be inside the workspace uploads directory \
-             (received media attachments) or the generated directory \
-             (previously generated media), got: {}",
-            canonical.display()
-        );
-    }
-    Ok(())
-}
-
-/// Validate a canonicalized local clip path before upload: it must live under
-/// the workspace `uploads/` directory (received video attachments) or the
-/// `generated/` directory (previously generated clips) and carry a recognized
-/// video extension.
-fn check_local_clip(canonical: &std::path::Path, ws: &crate::Workspace) -> anyhow::Result<()> {
-    check_local_containment(canonical, ws, "clip")?;
-    if !crate::util::is_video_extension(canonical) {
-        anyhow::bail!(
-            "Local clip must have a recognized video extension (mp4, mov, mkv, avi, webm), got: {}",
-            canonical.display()
-        );
-    }
-    Ok(())
-}
-
-/// Validate a canonicalized local image path before upload: it must live under
-/// the workspace `uploads/` directory (received images) or the `generated/`
-/// directory (previously generated images) and carry a recognized image
-/// extension (jpg, jpeg, png, webp, heic, heif).
-fn check_local_image(canonical: &std::path::Path, ws: &crate::Workspace) -> anyhow::Result<()> {
-    check_local_containment(canonical, ws, "image")?;
-    if !crate::util::is_image_extension(canonical) {
-        anyhow::bail!(
-            "Local image must have a recognized image extension \
-             (jpg, jpeg, png, webp, heic, heif), got: {}",
-            canonical.display()
-        );
-    }
-    Ok(())
-}
-
 /// Pre-flight input-duration gate for a local clip, run after containment,
 /// extension, and size validation and before any upload or job submission.
 ///
@@ -530,14 +468,15 @@ async fn resolve_video_source(
     if crate::util::is_http_url(video_url) {
         return Ok(video_url.to_string());
     }
-    // Only clips saved into the workspace uploads dir (received attachments)
-    // or the generated dir (previous generation outputs) may be uploaded —
+    // Only clips already inside the workspace media dirs may be uploaded —
     // arbitrary local files are an exfiltration risk.
-    let path = std::path::Path::new(video_url);
-    let canonical = tokio::fs::canonicalize(path)
-        .await
-        .with_context(|| format!("Local clip not found: {video_url}"))?;
-    check_local_clip(&canonical, ws)?;
+    let canonical = super::resolve_local_media_path(video_url, ws, "clip").await?;
+    if !crate::util::is_video_extension(&canonical) {
+        anyhow::bail!(
+            "Local clip must have a recognized video extension (mp4, mov, mkv, avi, webm), got: {}",
+            canonical.display()
+        );
+    }
     let len = tokio::fs::metadata(&canonical).await?.len();
     if len > MAX_INPUT_BYTES {
         anyhow::bail!("Source clip is limited to 50 MB, got {len} bytes. Trim the clip and retry.");
@@ -564,11 +503,14 @@ async fn resolve_image_input(
             .with_context(|| format!("Failed to validate {label} URL {input}"))?;
         return Ok(input.to_string());
     }
-    let path = std::path::Path::new(input);
-    let canonical = tokio::fs::canonicalize(path)
-        .await
-        .with_context(|| format!("Local {label} not found: {input}"))?;
-    check_local_image(&canonical, ws)?;
+    let canonical = super::resolve_local_media_path(input, ws, label).await?;
+    if !crate::util::is_image_extension(&canonical) {
+        anyhow::bail!(
+            "Local image must have a recognized image extension \
+             (jpg, jpeg, png, webp, heic, heif), got: {}",
+            canonical.display()
+        );
+    }
     let len = tokio::fs::metadata(&canonical).await?.len();
     if len > MAX_IMAGE_BYTES {
         anyhow::bail!(
@@ -928,48 +870,6 @@ mod tests {
         );
         // No mode selected at all.
         assert!(validate_mode(VideoEditModel::Hailuo3, None, &none, None, None).is_err());
-    }
-
-    #[test]
-    fn check_local_media_requires_workspace_uploads_or_generated_containment() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = crate::Workspace::from_path(tmp.path());
-        // A clip inside generated (a previous generation output) passes even
-        // when the uploads dir is absent — the live video-edit failure mode.
-        let generated = tmp.path().join("generated");
-        std::fs::create_dir_all(&generated).unwrap();
-        let gen_clip = generated.join("video_1786201173303.mp4");
-        std::fs::write(&gen_clip, b"clip").unwrap();
-        let canonical_gen = std::fs::canonicalize(&gen_clip).unwrap();
-        assert!(check_local_clip(&canonical_gen, &ws).is_ok());
-        // A clip inside uploads with a video extension passes.
-        let uploads = tmp.path().join("uploads");
-        std::fs::create_dir_all(&uploads).unwrap();
-        let clip = uploads.join("clip.mp4");
-        std::fs::write(&clip, b"clip").unwrap();
-        let canonical = std::fs::canonicalize(&clip).unwrap();
-        assert!(check_local_clip(&canonical, &ws).is_ok());
-        // A file outside uploads/generated is rejected (arbitrary readable file).
-        let outside = tmp.path().join("config.toml");
-        std::fs::write(&outside, b"secret").unwrap();
-        let canonical_outside = std::fs::canonicalize(&outside).unwrap();
-        assert!(check_local_clip(&canonical_outside, &ws).is_err());
-        // A non-video extension is rejected even inside uploads.
-        let txt = uploads.join("notes.txt");
-        std::fs::write(&txt, b"text").unwrap();
-        let canonical_txt = std::fs::canonicalize(&txt).unwrap();
-        assert!(check_local_clip(&canonical_txt, &ws).is_err());
-        // Images: accepted extensions pass, non-image extensions are rejected.
-        let img = uploads.join("photo.heic");
-        std::fs::write(&img, b"image").unwrap();
-        let canonical_img = std::fs::canonicalize(&img).unwrap();
-        assert!(check_local_image(&canonical_img, &ws).is_ok());
-        let gen_img = generated.join("image_1786201173303.png");
-        std::fs::write(&gen_img, b"image").unwrap();
-        let canonical_gen_img = std::fs::canonicalize(&gen_img).unwrap();
-        assert!(check_local_image(&canonical_gen_img, &ws).is_ok());
-        assert!(check_local_image(&canonical_outside, &ws).is_err());
-        assert!(check_local_image(&canonical_txt, &ws).is_err());
     }
 
     // ── Pre-flight input-duration gate ────────────────────────────────
