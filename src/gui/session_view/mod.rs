@@ -87,14 +87,33 @@ fn split_thinking(
     (None, none_if_empty(&content))
 }
 
-/// Decode the native history messages into the flat session ledger. Pure and
-/// deterministic: each assistant message becomes a regular message (with an
-/// optional thinking block) or a tool round, and each tool result attaches to
-/// the first unmatched call of the nearest preceding tool round; stray results
-/// render like a regular message.
+/// [`build_ledger_with_sources`]'s entries alone, for callers that never need
+/// the stored-row mapping.
 pub(crate) fn build_ledger(messages: &[ChatMessage]) -> Vec<SessionEntry> {
+    build_ledger_with_sources(messages).0
+}
+
+/// Decode the native history messages into the flat session ledger, plus a
+/// parallel `sources` vec mapping each entry back to the message row that
+/// CREATED it: the assistant tool-call frame for a [`SessionEntry::ToolRound`],
+/// the message row itself for a [`SessionEntry::Message`].
+///
+/// Pure and deterministic: each assistant message becomes a regular message
+/// (with an optional thinking block) or a tool round, and each tool result
+/// attaches to the first unmatched call of the nearest preceding tool round;
+/// stray results render like a regular message — so `sources` is NOT the
+/// identity.
+///
+/// Contract: `sources` is strictly increasing, and cutting stored rows from
+/// `sources[i]` on removes exactly the entries `i..` — the Sessions page's
+/// truncate relies on both.
+pub(crate) fn build_ledger_with_sources(
+    messages: &[ChatMessage],
+) -> (Vec<SessionEntry>, Vec<usize>) {
     let mut entries: Vec<SessionEntry> = Vec::new();
-    for message in messages {
+    let mut sources: Vec<usize> = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let before = entries.len();
         match decode_native_history_message(message) {
             Some(DecodedNativeHistoryMessage::Assistant {
                 content,
@@ -151,14 +170,21 @@ pub(crate) fn build_ledger(messages: &[ChatMessage]) -> Vec<SessionEntry> {
                     });
                 }
             }
-            _ => entries.push(SessionEntry::Message {
-                role: message.role,
-                content: Some(message.content.clone()),
-                thinking: None,
-            }),
+            _ => {
+                entries.push(SessionEntry::Message {
+                    role: message.role,
+                    content: Some(message.content.clone()),
+                    thinking: None,
+                });
+            }
+        }
+        // A message produces at most one entry, so the delta is that entry's
+        // source row.
+        if entries.len() != before {
+            sources.push(index);
         }
     }
-    entries
+    (entries, sources)
 }
 
 /// Per-entry markdown parse for bubble bodies: Message → its content,
@@ -307,6 +333,20 @@ mod tests {
             }
             other => panic!("expected a single Message entry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ledger_sources_track_the_source_row_of_each_entry() {
+        // The tool result attaches to its round instead of adding an entry, so
+        // the entry→message map is not the identity.
+        let messages = vec![
+            ChatMessage::user("go"),
+            assistant_tool_call(Some("checking"), None),
+            ChatMessage::tool_result("call_1", "result"),
+            ChatMessage::user("next"),
+        ];
+        let (_entries, sources) = build_ledger_with_sources(&messages);
+        assert_eq!(sources, vec![0, 1, 3]);
     }
 
     /// Build an assistant tool-call message with an optional decoded `content`

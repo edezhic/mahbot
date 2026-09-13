@@ -904,6 +904,44 @@ impl SessionStore {
         Ok(deleted > 0)
     }
 
+    /// Delete the `index`-th message row (0-based row ordinal in `id` order —
+    /// the order [`Self::load_checked`] returns) and every later row for
+    /// `agent_id`: the Sessions page's manual truncate. The cut is inclusive;
+    /// an index past the end deletes nothing. Returns the number of rows
+    /// removed.
+    ///
+    /// Deliberately unguarded — no coordination with a running agent. Accepted
+    /// consequences: a cut can leave an in-flight round committing tool results
+    /// without their tool-call frame row, and can leave a tail the dead-session
+    /// recovery poller treats as resumable — `last_activity` is deliberately
+    /// untouched, since bumping it would suppress exactly that recovery.
+    /// `token_length` is left stale: a recount is not free, and summarization
+    /// firing early is intended. `message_count` is adjusted from this DELETE's
+    /// own row count.
+    pub(crate) async fn truncate_from(&self, agent_id: &str, index: usize) -> Result<usize> {
+        let offset = i64::try_from(index).context("truncate index exceeds i64")?;
+        let tx = self.conn.begin_tx().await?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM sessions WHERE agent_id = ?1 AND id >= \
+                 (SELECT id FROM sessions WHERE agent_id = ?1 ORDER BY id ASC LIMIT 1 OFFSET ?2)",
+                params![agent_id, offset],
+            )
+            .await?;
+        if deleted > 0 {
+            let removed = i64::try_from(deleted).context("removed row count exceeds i64")?;
+            tx.execute(
+                "UPDATE session_metadata SET message_count = MAX(message_count - ?2, 0) \
+                 WHERE agent_id = ?1",
+                params![agent_id, removed],
+            )
+            .await?;
+        }
+        let removed = usize::try_from(deleted).context("removed row count exceeds usize")?;
+        tx.commit().await?;
+        Ok(removed)
+    }
+
     /// The full session list, infallible by contract: whatever could be read is
     /// returned (a query error yields an empty list). Kept for readers with no
     /// person in front of them — the exclusion helper's no-prefix case, where an
@@ -1637,6 +1675,44 @@ mod tests {
             .unwrap();
         assert!(store().delete(&k).await.unwrap());
         assert!(!store().delete(&k).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn session_store_truncate_from_cuts_inclusively() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        store()
+            .batch_append(
+                &k,
+                &[
+                    ChatMessage::user("a"),
+                    ChatMessage::assistant("b"),
+                    ChatMessage::user("c"),
+                    ChatMessage::assistant("d"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store().truncate_from(&k, 2).await.unwrap(), 2);
+        let kept: Vec<String> = store()
+            .load(&k)
+            .await
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert_eq!(kept, ["a", "b"]);
+        let meta = store()
+            .list_sessions_with_metadata()
+            .await
+            .into_iter()
+            .find(|s| s.agent_id == k)
+            .expect("session listed");
+        assert_eq!(meta.message_count, 2, "count follows the deleted rows");
+
+        // Past the end: nothing to cut, nothing deleted.
+        assert_eq!(store().truncate_from(&k, 9).await.unwrap(), 0);
+        assert_eq!(store().load(&k).await.len(), 2);
     }
 
     #[tokio::test]

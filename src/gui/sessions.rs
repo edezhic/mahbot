@@ -43,14 +43,16 @@ const CARD_TITLE_MAX_CHARS: usize = 32;
 
 /// Shared transcript render context: the flat session ledger, its per-entry
 /// markdown bodies, the element expansion set, the collapse-measurement
-/// cache, and the single text measurement width (bubble body width, used for
-/// all collapsible-element measurement).
+/// cache, the single text measurement width (bubble body width, used for
+/// all collapsible-element measurement), and whether the ledger can be
+/// truncated (a stored, idle session).
 struct TranscriptCtx<'a> {
     entries: &'a [SessionEntry],
     entry_md: &'a [Option<Vec<markdown::Item>>],
     expanded: &'a HashSet<(usize, usize)>,
     measure_cache: &'a RefCell<HashMap<(usize, usize), MessageMeasure>>,
     text_width: f32,
+    truncatable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +101,17 @@ pub(crate) enum SessionsMessage {
     /// store-reported row deletion (`true` when a real removal happened).
     SessionDeleted(String, bool),
 
+    /// Truncate the selected session (context-menu action): remove the ledger
+    /// entry at this index and every stored message from it on.
+    TruncateSession(usize),
+    /// A session truncate finished: the store removed `deleted` rows from
+    /// `entry` on (`0` = the cut was a no-op).
+    SessionTruncated {
+        key: String,
+        entry: usize,
+        deleted: usize,
+    },
+
     /// Coalesced runtime-change tick (250 ms): refresh list timestamps and
     /// merge the selected session's live transcript when its agent is running.
     RuntimeChanged,
@@ -131,6 +144,14 @@ pub(crate) struct SessionsState {
     /// Per-entry markdown bodies, parallel to `entries` (parsed from the
     /// ledger via `session_view::parse_entry_bodies`).
     entry_md: Vec<Option<Vec<markdown::Item>>>,
+    /// For each entry, the index of the stored `sessions` row it was built from
+    /// (see `session_view::build_ledger_with_sources`). `None` while the ledger
+    /// has no stored-row identity: before the first stored load, and after any
+    /// live merge — those indices are in-memory history positions, and a
+    /// running agent may have rewritten the stored rows since the load. The
+    /// truncate action is offered only while this is `Some` on an idle session,
+    /// and comes back only on re-select, which reloads the stored ledger.
+    entry_rows: Option<Vec<usize>>,
     selected_loading: bool,
     /// Last transcript read failure for the selected session. Rendered in the
     /// transcript pane (instead of the previous/empty transcript) until a
@@ -147,10 +168,11 @@ pub(crate) struct SessionsState {
     /// selection — and a later [`SessionsMessage::ToggleCommit`] applies the
     /// collapse only if the entry survived. Cleared on session switch.
     pending_collapses: HashSet<(usize, usize)>,
-    /// Per-element collapse measurement cache, keyed like `expanded`.
-    /// Session entries are append-only, so an existing entry stays valid and
-    /// only new elements are measured lazily. Mutated during layout (the
-    /// bubble width is only known there), hence `RefCell`.
+    /// Per-element collapse measurement cache, keyed like `expanded`. The
+    /// ledger only appends or drops its tail, so a surviving entry keeps its
+    /// index and its key stays valid — only new elements are measured lazily.
+    /// Mutated during layout (the bubble width is only known there), hence
+    /// `RefCell`.
     measure_cache: RefCell<HashMap<(usize, usize), MessageMeasure>>,
     /// Cached session list display data. Rebuilt when `sessions` changes and
     /// on each runtime-change tick (to refresh relative-time labels).
@@ -173,6 +195,7 @@ impl SessionsState {
             selected_session: None,
             entries: Vec::new(),
             entry_md: Vec::new(),
+            entry_rows: None,
             selected_loading: false,
             selected_error: None,
             expanded: HashSet::new(),
@@ -258,7 +281,9 @@ impl SessionsState {
             }
             SessionsMessage::SessionMessages(key, messages) => {
                 if self.selected_session.as_deref() == Some(&key) {
-                    self.entries = session_view::build_ledger(&messages);
+                    let (entries, rows) = session_view::build_ledger_with_sources(&messages);
+                    self.entries = entries;
+                    self.entry_rows = Some(rows);
                     self.entry_md = session_view::parse_entry_bodies(&self.entries);
                     // Fresh session load: reset the measurement cache (the
                     // previous session's keys are index-stale) and any pending
@@ -340,6 +365,66 @@ impl SessionsState {
                     Task::none()
                 }
             }
+            SessionsMessage::TruncateSession(entry) => {
+                let Some(key) = self.selected_session.clone() else {
+                    return Task::none();
+                };
+                // The stored row the entry was built from; without one the
+                // ledger has no stored-row identity and the cut is a no-op.
+                let Some(row) = self
+                    .entry_rows
+                    .as_ref()
+                    .and_then(|rows| rows.get(entry).copied())
+                else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        let deleted = crate::session::store()
+                            .truncate_from(&key, row)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok::<_, String>((key, entry, deleted))
+                    },
+                    |res| match res {
+                        Ok((key, entry, deleted)) => SessionsMessage::SessionTruncated {
+                            key,
+                            entry,
+                            deleted,
+                        },
+                        Err(e) => SessionsMessage::Toast(ToastMessage::Error(e)),
+                    },
+                )
+            }
+            SessionsMessage::SessionTruncated {
+                key,
+                entry,
+                deleted,
+            } => {
+                // A no-op cut has nothing to drop. A live merge landing between
+                // the click and this reply can at worst prune at a stale index —
+                // cosmetic: the store cut is durable and a re-select corrects
+                // the view.
+                if deleted > 0 && self.selected_session.as_deref() == Some(key.as_str()) {
+                    self.entries.truncate(entry);
+                    self.entry_md.truncate(entry);
+                    if let Some(rows) = self.entry_rows.as_mut() {
+                        rows.truncate(entry);
+                    }
+                    self.expanded.retain(|(i, _)| *i < entry);
+                    self.pending_collapses.retain(|(i, _)| *i < entry);
+                    self.measure_cache
+                        .borrow_mut()
+                        .retain(|(i, _), _| *i < entry);
+                    // The card's count renders from the list snapshot, which
+                    // otherwise refreshes only on page navigation.
+                    if let Some(session) = self.sessions.iter_mut().find(|s| s.agent_id == key) {
+                        session.message_count = session.message_count.saturating_sub(deleted);
+                    }
+                    self.rebuild_session_cache();
+                }
+                Task::none()
+            }
             SessionsMessage::RuntimeChanged => self.on_runtime_changed(),
             SessionsMessage::Toast(_) | SessionsMessage::LinkClicked(_) => Task::none(),
             SessionsMessage::Escape => {
@@ -374,6 +459,7 @@ impl SessionsState {
         self.selected_session = None;
         self.entries.clear();
         self.entry_md.clear();
+        self.entry_rows = None;
         self.selected_loading = false;
         self.selected_error = None;
         self.expanded.clear();
@@ -452,6 +538,9 @@ impl SessionsState {
             .borrow_mut()
             .retain(|(i, _), _| *i < common);
         self.entries = live;
+        // Live history positions, not stored rows: the merged ledger has no
+        // stored-row identity (see `entry_rows`).
+        self.entry_rows = None;
         self.entry_md.truncate(common);
         self.entry_md
             .extend(session_view::parse_entry_bodies(&self.entries[common..]));
@@ -614,6 +703,14 @@ impl SessionsState {
                     .padding(theme::PAD_16)
                     .into()
             } else if self.selected_session.is_some() {
+                // Truncate targets stored rows and is offered only on an idle
+                // session — the same AGENT_REGISTRY membership that marks an
+                // active session with the list spinner above.
+                let truncatable = self.entry_rows.is_some()
+                    && self
+                        .selected_session
+                        .as_deref()
+                        .is_some_and(|key| !crate::agent::registry::AGENT_REGISTRY.contains(key));
                 let entries = &self.entries;
                 let entry_md = &self.entry_md;
                 let expanded = &self.expanded;
@@ -633,6 +730,7 @@ impl SessionsState {
                         expanded,
                         measure_cache,
                         text_width,
+                        truncatable,
                     };
                     container(render_transcript(&ctx, &scrollable_id))
                         .width(Length::Fill)
@@ -699,12 +797,16 @@ fn author_label<'a>(role: crate::ChatRole) -> Element<'a, SessionsMessage> {
 /// Author-labeled chat-bubble row for one ledger entry: the label sits above
 /// the bubble, both aligned to the bubble's side (assistant right, others
 /// left). Same background/typography as the Home chat bubbles.
+///
+/// `menu` wraps the BUBBLE alone — not the label, and not the spacer
+/// `align_bubble` adds beside it, so the menu's hit target is the bubble.
 fn bubble_row(
     role: crate::ChatRole,
     body: Column<'_, SessionsMessage>,
+    menu: Option<MenuItem<SessionsMessage>>,
 ) -> Element<'_, SessionsMessage> {
     let assistant = matches!(role, crate::ChatRole::Assistant);
-    let bubble = container(body)
+    let bubble: Element<'_, SessionsMessage> = container(body)
         .padding(theme::PAD_10)
         .style(theme::bubble_style(
             if assistant {
@@ -714,7 +816,12 @@ fn bubble_row(
             },
             Some(theme::TEXT_PRIMARY),
         ))
-        .width(Length::FillPortion(3));
+        .width(Length::FillPortion(3))
+        .into();
+    let bubble: Element<'_, SessionsMessage> = match menu {
+        Some(item) => ContextMenu::new(bubble, vec![item]).into(),
+        None => bubble,
+    };
     column![
         author_label(role),
         align_bubble(
@@ -1073,7 +1180,7 @@ fn render_tool_round<'a>(
 
     // One bubble for the whole round, same container as assistant text rounds
     // (right-aligned, 75% width, author label above).
-    bubble_row(crate::ChatRole::Assistant, bubble_col)
+    bubble_row(crate::ChatRole::Assistant, bubble_col, None)
 }
 
 /// Render one ledger entry as a chat-bubble row: a `Message` renders its own
@@ -1096,7 +1203,9 @@ fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Element<'a, SessionsMe
                 bubble_col = bubble_col.push(body_block(ctx, (i, 0), content, md, false));
             }
             if thinking.is_some() || content.is_some() {
-                bubble_row(*role, bubble_col)
+                let menu = (ctx.truncatable && matches!(role, crate::ChatRole::User))
+                    .then(|| MenuItem::new("Truncate".into(), SessionsMessage::TruncateSession(i)));
+                bubble_row(*role, bubble_col, menu)
             } else {
                 // Nothing to show but the author.
                 author_label(*role)
