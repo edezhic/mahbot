@@ -2,14 +2,17 @@ use crate::channels::ReplyReference;
 use crate::channels::reply::normalize_reply_text;
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
 use crate::util::media_target::{self, MediaTarget};
-use crate::util::{TELEGRAM_MEDIA_MARKER_RE, UnwrapPoison, is_http_url, parse_media_marker};
+use crate::util::{
+    FILE_MAX_BYTES, MediaMarkerKind, TELEGRAM_MEDIA_MARKER_RE, UnwrapPoison, file_name_or_path,
+    is_http_url, parse_media_marker,
+};
 use crate::{Channel, ChannelMessage, SendMessage};
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Telegram's maximum message length for text messages
@@ -18,6 +21,18 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 29 extra
 /// chars (middle chunk); 30 keeps 4066+29 = 4095 within the 4096 limit.
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
+
+/// Byte budget for a sanitized attachment filename, extension included. Bytes
+/// rather than characters because the filesystem's own per-component limit
+/// (`NAME_MAX`, 255 here) counts bytes: a character cap would admit a name that
+/// only fails at the write. See [`sanitize_attachment_filename`].
+const MAX_ATTACHMENT_FILENAME_BYTES: usize = 180;
+
+/// Per-request timeout for a media upload, overriding the channel client's
+/// one-minute default: [`FILE_MAX_BYTES`] on a slow uplink takes longer than a
+/// minute to send. Still bounded, so a stalled connection cannot hold the send
+/// open forever.
+const MEDIA_UPLOAD_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Description for the `/clear` command — used in `setMyCommands` API and `/start` welcome message.
 const CLEAR_COMMAND_DESC: &str = "Reset your session";
@@ -241,6 +256,17 @@ impl MessageContext {
             reply_reference: self.reply_reference,
             chat_id: (!self.chat_id.is_empty()).then_some(self.chat_id),
             message_id: (self.message_id != 0).then_some(self.message_id),
+            attachment_dirs: Vec::new(),
+        }
+    }
+
+    /// Build the channel message for a downloaded attachment, recording the
+    /// staging directory the bytes were written into as the only path
+    /// enrichment may later read, copy from, and delete.
+    fn into_attachment_message(self, content: String, staging_dir: String) -> ChannelMessage {
+        ChannelMessage {
+            attachment_dirs: vec![staging_dir],
+            ..self.into_channel_message(content, None)
         }
     }
 }
@@ -248,10 +274,22 @@ impl MessageContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TelegramAttachmentKind {
     Image,
+    /// The `[FILE:...]` outbound kind — sent via `sendDocument`. Local image
+    /// files also route through `sendDocument`; see [`Self::file_meta`].
     Document,
     Video,
     Audio,
-    Voice,
+}
+
+impl From<MediaMarkerKind> for TelegramAttachmentKind {
+    fn from(kind: MediaMarkerKind) -> Self {
+        match kind {
+            MediaMarkerKind::Image => Self::Image,
+            MediaMarkerKind::Audio => Self::Audio,
+            MediaMarkerKind::Video => Self::Video,
+            MediaMarkerKind::File => Self::Document,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,21 +306,14 @@ struct AttachmentMeta {
     default_filename: &'static str,
     label: &'static str,
     /// Send `disable_content_type_detection=true` with the multipart form so
-    /// Telegram does not re-classify image uploads as photos (which would
-    /// re-encode them despite the sendDocument path).
+    /// Telegram does not re-classify the upload server-side: an image sent as a
+    /// general file would be re-encoded as a photo despite the sendDocument
+    /// path, and a file the assistant promised to send as a document would come
+    /// back as media.
     disable_content_type_detection: bool,
 }
 
 impl TelegramAttachmentKind {
-    fn from_marker(marker: &str) -> Option<Self> {
-        match marker.trim().to_ascii_uppercase().as_str() {
-            "IMAGE" => Some(Self::Image),
-            "VIDEO" => Some(Self::Video),
-            "AUDIO" => Some(Self::Audio),
-            _ => None,
-        }
-    }
-
     const fn meta(self) -> AttachmentMeta {
         match self {
             Self::Image => AttachmentMeta {
@@ -297,7 +328,7 @@ impl TelegramAttachmentKind {
                 form_field: "document",
                 default_filename: "file",
                 label: "Document",
-                disable_content_type_detection: false,
+                disable_content_type_detection: true,
             },
             Self::Video => AttachmentMeta {
                 api_method: "sendVideo",
@@ -311,13 +342,6 @@ impl TelegramAttachmentKind {
                 form_field: "audio",
                 default_filename: "audio.mp3",
                 label: "Audio",
-                disable_content_type_detection: false,
-            },
-            Self::Voice => AttachmentMeta {
-                api_method: "sendVoice",
-                form_field: "voice",
-                default_filename: "voice.ogg",
-                label: "Voice",
                 disable_content_type_detection: false,
             },
         }
@@ -480,19 +504,16 @@ fn build_reply_reference(message: &serde_json::Value) -> Option<ReplyReference> 
 
 /// Build the user-facing content string for an incoming attachment.
 ///
-/// Photos with a recognized image extension use `[IMAGE:/path]` so
-/// enrichment can convert them to native image parts for the routed role's
-/// model.  When the extension is not recognized the optional `mime_type` is
-/// consulted as a secondary signal (e.g. Document + no extension +
-/// "image/jpeg" → still `[IMAGE:]`).
-/// Videos (native `video`/`video_note`/`animation` messages, or documents
-/// with a video MIME/extension) use `[VIDEO:/path]` so enrichment can copy
-/// them into the workspace uploads and route them into the video-edit flow.
-/// Voice and audio messages use `[AUDIO:/path]`. Other attachment types use
-/// `[Document: name] /path`.
+/// The kind and the file name/MIME type decide the marker: photos with a
+/// recognized image extension (or image MIME type) use `[IMAGE:/path]` so
+/// enrichment can convert them to native image parts; videos (native
+/// `video`/`video_note`/`animation` messages, or documents with a video
+/// MIME/extension) use `[VIDEO:/path]`; voice and audio messages use
+/// `[AUDIO:/path]`. Everything else uses `[FILE:/path]` — after one last check
+/// of the file's own bytes, since a sender can omit both the name and the MIME
+/// type.
 fn format_attachment_content(
     kind: IncomingAttachmentKind,
-    local_filename: &str,
     local_path: &Path,
     mime_type: Option<&str>,
 ) -> String {
@@ -513,7 +534,22 @@ fn format_attachment_content(
             format!("[AUDIO:{}]", local_path.display())
         }
         _ => {
-            format!("[Document: {}] {}", local_filename, local_path.display())
+            // Neither the name nor the declared MIME type classified this
+            // attachment. The bytes still can, through the same decodable-raster
+            // gate enrichment applies to `[IMAGE:...]`, so an image the sender
+            // stripped the name and type from is still fed to the model as an
+            // image instead of being reported as an unconvertible file. That gate
+            // reads and decodes the file, so it is offloaded — this runs on the
+            // Telegram listener task.
+            let target = local_path.to_string_lossy().to_string();
+            if crate::util::with_block_in_place(|| {
+                crate::util::media_target::classify_media_image_target(&target)
+            }) == MediaTarget::LocalImage
+            {
+                format!("[IMAGE:{}]", local_path.display())
+            } else {
+                format!("[FILE:{}]", local_path.display())
+            }
         }
     }
 }
@@ -532,10 +568,14 @@ fn normalize_video_filename(
     let is_video =
         kind == IncomingAttachmentKind::Video || mime_type.is_some_and(|m| m.starts_with("video/"));
     if is_video && !crate::util::is_video_extension(std::path::Path::new(filename)) {
-        let stem = std::path::Path::new(filename)
+        // No stem (`.`, `..`, `""`): nothing to swap, and the sanitizer replaces
+        // the name with the generated fallback either way.
+        let Some(stem) = std::path::Path::new(filename)
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or(filename);
+        else {
+            return filename.to_string();
+        };
         // Derive the extension from the declared MIME when available so a
         // video/webm document isn't mislabeled as mp4.
         let ext = match mime_type {
@@ -549,108 +589,280 @@ fn normalize_video_filename(
     }
 }
 
-fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
-    let normalized = target.split(['?', '#']).next().unwrap();
+/// Make an attachment filename safe to use as a single path component under the
+/// Telegram temp root: only the final path component survives
+/// (`../../etc/passwd` → `passwd`), [`crate::util::neutralized_name`] maps out
+/// the characters that would break a path component or the `[FILE:<path>]`
+/// marker carrying it, and the result fits [`MAX_ATTACHMENT_FILENAME_BYTES`]
+/// bytes on a char boundary. The sender's name is used when it yields one, and
+/// the caller's `fallback` (cleaned the same way) otherwise.
+fn sanitize_attachment_filename(name: &str, fallback: &str) -> String {
+    let mut cleaned = [name, fallback]
+        .into_iter()
+        .find_map(|name| {
+            // `Path::file_name` yields only a normal component, so it is already
+            // `None` for `""`, `.`, `..`, a bare separator and a non-UTF-8 name.
+            let component = Path::new(name).file_name().and_then(|n| n.to_str())?;
+            Some(crate::util::neutralized_name(component))
+        })
+        .unwrap_or_else(|| "file".to_string());
+    // Prefix before truncating so the `_` counts toward the budget too.
+    if cleaned.starts_with('.') {
+        cleaned.insert(0, '_');
+    }
+    if cleaned.len() > MAX_ATTACHMENT_FILENAME_BYTES {
+        // Split off the extension (dot included) so truncating the stem never
+        // eats it; a name with no extension has the whole name as its stem and
+        // truncates wholesale.
+        let stem = crate::util::name_stem(&cleaned);
+        let ext = &cleaned[stem.len()..];
+        // A stem with no room left in the budget leaves a bare extension — a
+        // dotfile — so the whole name truncates instead, as it does when there
+        // is no stem to keep.
+        let truncated = crate::util::truncate_bytes(
+            stem,
+            MAX_ATTACHMENT_FILENAME_BYTES.saturating_sub(ext.len()),
+        );
+        cleaned = if truncated.is_empty() {
+            crate::util::truncate_bytes(cleaned.as_str(), MAX_ATTACHMENT_FILENAME_BYTES).to_string()
+        } else {
+            format!("{truncated}{ext}")
+        };
+    }
+    cleaned
+}
 
-    let extension = Path::new(normalized)
-        .extension()
-        .and_then(|ext| ext.to_str())?
-        .to_ascii_lowercase();
+/// Reduce a `getFile`-supplied extension to an ASCII-alphanumeric token, or
+/// `None` when nothing survives: it is remote input that reaches the user's
+/// filename, so separators, control characters and `]` must not survive into
+/// it.
+fn sanitize_remote_extension(remote_ext: &str) -> Option<String> {
+    let cleaned: String = remote_ext
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
 
-    match extension.as_str() {
-        ext if IMAGE_EXTENSIONS.contains(&ext) => Some(TelegramAttachmentKind::Image),
-        ext if crate::util::VIDEO_EXTENSIONS.contains(&ext) => Some(TelegramAttachmentKind::Video),
-        "mp3" | "m4a" | "wav" | "flac" => Some(TelegramAttachmentKind::Audio),
-        "ogg" | "oga" | "opus" => Some(TelegramAttachmentKind::Voice),
-        "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx" | "xls"
-        | "xlsx" | "ppt" | "pptx" => Some(TelegramAttachmentKind::Document),
-        _ => None,
+/// Resolve the local save name for an inbound attachment: the sender-supplied
+/// `file_name` when Telegram provided one, otherwise a generated
+/// `<kind>_<chat>_<message>.<ext>` fallback from `remote_ext` (the extension
+/// from `getFile`, which is absent before that call). Either way the name goes
+/// through [`sanitize_attachment_filename`], so omitting `file_name` cannot
+/// smuggle a hostile extension past it.
+fn local_attachment_name(
+    attachment: &IncomingAttachment,
+    chat_id: &str,
+    message_id: i64,
+    remote_ext: Option<&str>,
+) -> String {
+    let remote_ext = remote_ext.and_then(sanitize_remote_extension);
+    let ext = remote_ext.as_deref().unwrap_or(match attachment.kind {
+        // video_note has no file_name/mime_type — a ".jpg" default
+        // would misroute it out of the video flow.
+        IncomingAttachmentKind::Video => "mp4",
+        // A document with no name and no MIME type cannot be routed by
+        // `format_attachment_content`, so it takes the generic file path; the
+        // default stays format-neutral rather than claiming "jpg".
+        IncomingAttachmentKind::Document => "bin",
+        _ => "jpg",
+    });
+    let prefix = match attachment.kind {
+        IncomingAttachmentKind::Photo => "photo",
+        IncomingAttachmentKind::Video => "video",
+        IncomingAttachmentKind::Audio => "audio",
+        IncomingAttachmentKind::Document => "file",
+    };
+    let fallback = format!("{prefix}_{chat_id}_{message_id}.{ext}");
+    // The video extension swap runs before sanitizing: it can lengthen the name
+    // (`.bin` → `.webm`), and the sanitizer's byte budget must cover the name
+    // that is actually written.
+    let chosen = normalize_video_filename(
+        attachment.kind,
+        attachment.file_name.as_deref().unwrap_or(&fallback),
+        attachment.mime_type.as_deref(),
+    );
+    sanitize_attachment_filename(&chosen, &fallback)
+}
+
+/// Agent-facing content for a rejected attachment: the caption (when non-empty)
+/// first, then the `[File <name>: <outcome> — <reason>]` note.
+#[must_use]
+fn attachment_rejection_content(
+    display_name: &str,
+    outcome: &str,
+    reason: &str,
+    caption: Option<&str>,
+) -> String {
+    let note = format!("[File {display_name}: {outcome} — {reason}]");
+    match caption.filter(|c| !c.is_empty()) {
+        Some(caption) => format!("{caption}\n\n{note}"),
+        None => note,
     }
 }
 
-/// Attachment-target acceptance gate shared by `parse_path_only_attachment`
-/// and `parse_attachment_markers`: image markers may only attach a real
-/// raster or an http(s) URL (via `media_target::classify_media_image_target`);
-/// every other kind — and an unknown marker kind (`None`) — accepts an
-/// http(s) URL or an existing regular file.
-fn is_attachable_target(kind: Option<TelegramAttachmentKind>, target: &str) -> bool {
+/// Attachment-target acceptance gate used by `parse_attachment_markers`:
+/// image markers may only attach a real raster or an http(s) URL (via
+/// `media_target::classify_media_image_target`); video and audio accept an
+/// http(s) URL or any existing regular file.
+///
+/// Deliberately looser than `[FILE:...]`, which [`resolve_file_target`] resolves
+/// against the authoring workspace roots: only that kind is workspace-confined.
+fn is_attachable_target(kind: TelegramAttachmentKind, target: &str) -> bool {
     match kind {
-        Some(TelegramAttachmentKind::Image) => matches!(
+        TelegramAttachmentKind::Image => matches!(
             media_target::classify_media_image_target(target),
             MediaTarget::LocalImage | MediaTarget::RemoteUrl
         ),
-        _ => is_http_url(target) || Path::new(target).is_file(),
+        TelegramAttachmentKind::Video | TelegramAttachmentKind::Audio => {
+            is_http_url(target) || Path::new(target).is_file()
+        }
+        // Unreachable: only `[FILE:...]` yields a document, and it returns above.
+        // Refused rather than accepted so a new marker route cannot attach one
+        // without the containment this gate does not do.
+        TelegramAttachmentKind::Document => false,
     }
 }
 
-fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
-    let trimmed = message.trim();
-    if trimmed.is_empty() || trimmed.contains('\n') {
-        return None;
+/// Build the user-facing notice for a refused outbound file delivery.
+fn file_refusal(name: &str, reason: &str) -> String {
+    format!("Could not send \"{name}\": {reason}")
+}
+
+/// Resolve an outbound `[FILE:...]` target against the roots that authorize it.
+/// A URL is rejected: the marker is local-only.
+///
+/// The target is canonicalized (a symlink cannot smuggle out a file from
+/// outside a root) and must be inside one of the roots BEFORE the existence,
+/// directory and size checks, so a refusal does not disclose which of those the
+/// target is. The notice names a bounded prefix of the target, which a
+/// malformed marker can make an arbitrary blob. `Err` is that notice.
+fn resolve_file_target(target: &str, file_roots: &[PathBuf]) -> Result<PathBuf, String> {
+    let name = crate::util::truncate(file_name_or_path(target), 60);
+
+    // `[FILE:...]` is a local-only mechanism; a URL belongs to the other kinds.
+    if is_http_url(target) {
+        return Err(file_refusal(
+            &name,
+            "FILE targets are local files, not URLs.",
+        ));
+    }
+    if file_roots.is_empty() {
+        return Err(file_refusal(
+            &name,
+            "no workspace is available for file delivery.",
+        ));
     }
 
-    let candidate = trimmed.trim_matches(|c| matches!(c, '`' | '"' | '\''));
-    if candidate.chars().any(char::is_whitespace) {
-        return None;
+    // Containment compares like with like, so the roots are canonicalized too:
+    // a workspace living under a symlinked path (macOS `/tmp`, `/var`) would
+    // otherwise never contain the canonical target. A root that cannot be
+    // canonicalized is kept as given.
+    let roots: Vec<PathBuf> = file_roots
+        .iter()
+        .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
+        .collect();
+
+    let raw = Path::new(target);
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        // A relative target belongs to whichever root actually has it: relayed
+        // content names a file in the originating workspace, which is the
+        // second root. When no root has it, the first one backs the
+        // "file not found." refusal.
+        roots
+            .iter()
+            .map(|root| root.join(raw))
+            .find(|candidate| candidate.exists())
+            .unwrap_or_else(|| roots[0].join(raw))
+    };
+
+    // Containment comes before the directory and size checks: a path outside
+    // the workspace must not have those disclosed to the end user. (Whether it
+    // exists at all is still visible in the refusal text.)
+    let Ok(canonical) = std::fs::canonicalize(&joined) else {
+        return Err(file_refusal(&name, "file not found."));
+    };
+    if !crate::tools::path::is_path_under_roots(&canonical, &roots) {
+        return Err(file_refusal(&name, "it is outside your workspace."));
     }
 
-    let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
-    let kind = infer_attachment_kind_from_target(candidate)?;
-
-    // Only a real image target may be attached as a photo — a bare path to a
-    // non-image or an existing non-raster file stays plain text, matching the
-    // `[IMAGE:...]` marker gate. Audio/video/document keep their existing
-    // URL-or-existing-regular-file semantics.
-    if !is_attachable_target(Some(kind), candidate) {
-        return None;
+    let Ok(meta) = std::fs::metadata(&canonical) else {
+        return Err(file_refusal(&name, "file not found."));
+    };
+    if meta.is_dir() {
+        return Err(file_refusal(&name, "it is a directory."));
+    }
+    if meta.len() > FILE_MAX_BYTES {
+        return Err(file_refusal(
+            &name,
+            &format!(
+                "it is {} MB, larger than the {} MB limit.",
+                meta.len().div_ceil(1024 * 1024),
+                mb(FILE_MAX_BYTES)
+            ),
+        ));
     }
 
-    Some(TelegramAttachment {
-        kind,
-        target: candidate.to_string(),
-    })
+    Ok(canonical)
 }
 
 /// Parse `[KIND:path]` media markers from a message, returning cleaned text
-/// (with markers removed) and extracted attachments.
+/// (with markers removed), extracted attachments, and user-facing refusal
+/// notices for `[FILE:...]` markers.
 ///
-/// Uses the case-insensitive [`TELEGRAM_MEDIA_MARKER_RE`] to match markers.
-/// Markers whose target is neither an http(s) URL nor an existing regular
-/// file are kept as literal text — prose quoting the syntax never aborts
-/// delivery. Known limitation: prose referencing a real existing file still
-/// delivers as an attachment. Unknown or unrecognized markers are left intact.
-fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) {
+/// A matched marker is only consumed when the delivery layer can act on it: a
+/// kind whose target is not attachable stays literal, so prose quoting the
+/// syntax never aborts delivery and never silently disappears. Known
+/// limitation: prose naming a real existing file still delivers as an
+/// attachment.
+///
+/// `[FILE:...]` markers are the exception: they are resolved against
+/// `file_roots` (see [`resolve_file_target`]) and stripped either way — a
+/// delivered file leaves nothing behind, a refused one is reported in the
+/// notices instead of echoing raw marker syntax at the user.
+fn parse_attachment_markers(
+    message: &str,
+    file_roots: &[PathBuf],
+) -> (String, Vec<TelegramAttachment>, Vec<String>) {
     let mut attachments: Vec<TelegramAttachment> = Vec::new();
+    let mut refusals: Vec<String> = Vec::new();
 
     let cleaned = TELEGRAM_MEDIA_MARKER_RE
         .replace_all(message, |caps: &regex::Captures| {
-            let (kind_str, path) = parse_media_marker(caps);
+            let (marker_kind, path) = parse_media_marker(caps);
             let path = path.trim();
+
+            if marker_kind == MediaMarkerKind::File {
+                match resolve_file_target(path, file_roots) {
+                    Ok(canonical) => attachments.push(TelegramAttachment {
+                        kind: TelegramAttachmentKind::Document,
+                        target: canonical.to_string_lossy().into_owned(),
+                    }),
+                    Err(notice) => refusals.push(notice),
+                }
+                return String::new();
+            }
 
             // Only a valid image target is attached as a photo; everything
             // else — including a data-URI, which the classifier rejects
             // cheaply (no decode, and Telegram cannot send inline data URIs)
-            // — stays as literal text. The kind gate is case-insensitive to
-            // match TELEGRAM_MEDIA_MARKER_RE. Unknown marker kinds fall
-            // through to the loose URL-or-file check: an invalid target keeps
-            // the marker as literal text, a valid one is stripped without
-            // producing an attachment.
-            let k = TelegramAttachmentKind::from_marker(kind_str);
-            if !is_attachable_target(k, path) {
+            // — stays as literal text.
+            let kind = TelegramAttachmentKind::from(marker_kind);
+            if !is_attachable_target(kind, path) {
                 return caps.get_match().as_str().to_string();
             }
 
-            if let Some(kind) = k {
-                attachments.push(TelegramAttachment {
-                    kind,
-                    target: path.to_string(),
-                });
-            }
+            attachments.push(TelegramAttachment {
+                kind,
+                target: path.to_string(),
+            });
             String::new()
         })
         .to_string();
 
-    (cleaned.trim().to_string(), attachments)
+    (cleaned.trim().to_string(), attachments, refusals)
 }
 
 /// Base URL for the Telegram Bot API.
@@ -661,8 +873,82 @@ fn bot_api_url(token: &str, method: &str) -> String {
     format!("{API_BASE}/bot{token}/{method}")
 }
 
-/// Telegram Bot API maximum file download size (20 MB).
+/// Telegram Bot API maximum file download size.
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
+
+/// A byte cap as the whole-MB figure the user-facing notices quote, derived from
+/// the cap itself so the text cannot drift from the number enforced.
+fn mb(bytes: u64) -> u64 {
+    bytes / (1024 * 1024)
+}
+
+/// User-facing reason when a declared attachment size exceeds the
+/// product-level [`FILE_MAX_BYTES`] cap.
+fn file_too_large_reason() -> String {
+    format!("the file exceeds the {} MB limit", mb(FILE_MAX_BYTES))
+}
+
+/// User-facing reason when a declared attachment size exceeds Telegram's own
+/// bot-download limit (which is stricter than [`FILE_MAX_BYTES`]).
+fn telegram_download_limit_reason() -> String {
+    format!(
+        "Telegram only lets the bot download files up to {} MB",
+        mb(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES)
+    )
+}
+
+/// User-facing reason when Telegram declared no size (or one under the limit)
+/// but the `getFile`/download step still failed — in practice the download
+/// limit the transport does not always report. Naming no figure keeps it
+/// independent of [`TELEGRAM_MAX_FILE_DOWNLOAD_BYTES`].
+const TELEGRAM_TRANSFER_REFUSED_REASON: &str =
+    "Telegram refused the transfer (it may exceed what the bot can download)";
+
+/// Reported when Telegram did not return a download path for an attachment the
+/// bot is otherwise allowed to fetch — an API or network failure, not a size
+/// refusal.
+const TELEGRAM_LOOKUP_REFUSED_REASON: &str = "Telegram could not provide the file";
+
+/// What happened to an attachment in the agent-facing note when the transport
+/// never handed it over.
+const NOT_RECEIVED: &str = "not received";
+
+/// What happened to an attachment in the agent-facing note when it arrived but
+/// the daemon could not keep it, so the agent cannot be given it.
+const NOT_STORED: &str = "could not be stored";
+
+/// User-facing reason when the staging directory for a received attachment
+/// could not be created locally — a mahbot-side failure, so it must not be
+/// reported as a transfer refusal.
+const ATTACHMENT_DIR_REFUSED_REASON: &str =
+    "the local temp directory for the file could not be created";
+
+/// User-facing reason when a fully downloaded attachment could not be written
+/// to that directory — also a local failure, reported separately from the
+/// transport's own refusals.
+const ATTACHMENT_SAVE_REFUSED_REASON: &str = "the file could not be saved locally";
+
+/// User-facing reason when the transport failed to deliver a local file that
+/// passed the product-level size check.
+///
+/// Deliberately static: the transport error text embeds the request URL, which
+/// carries the bot token, so it is logged and returned as an `Err` but never
+/// rendered into the user's chat.
+const ATTACHMENT_UPLOAD_FAILED_REASON: &str = "the upload failed";
+
+/// The refusal reason for an attachment whose *declared* size exceeds a limit,
+/// or `None` when it is within both. The product cap is checked first, so a
+/// size over both reports that one.
+#[must_use]
+fn declared_size_refusal(size: u64) -> Option<String> {
+    if size > FILE_MAX_BYTES {
+        Some(file_too_large_reason())
+    } else if size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES {
+        Some(telegram_download_limit_reason())
+    } else {
+        None
+    }
+}
 
 /// Change-detection state for a chat's per-user command menu refresh.
 enum ChatMenuState {
@@ -1323,6 +1609,10 @@ impl TelegramChannel {
     }
 
     /// Download a file from the Telegram CDN.
+    ///
+    /// Bounded by [`FILE_MAX_BYTES`] on both sides: a declared `Content-Length`
+    /// over the cap is refused before the body is buffered, and the received
+    /// body is checked again because the transport does not always declare one.
     async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
         let url = format!("{API_BASE}/file/bot{}/{file_path}", self.bot_token);
         let resp = self
@@ -1336,7 +1626,19 @@ impl TelegramChannel {
             anyhow::bail!("Telegram file download failed: {}", resp.status());
         }
 
-        Ok(resp.bytes().await?.to_vec())
+        anyhow::ensure!(
+            resp.content_length()
+                .is_none_or(|len| len <= FILE_MAX_BYTES),
+            "Telegram file is larger than the {} MB product cap",
+            mb(FILE_MAX_BYTES)
+        );
+        let bytes = resp.bytes().await?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= FILE_MAX_BYTES,
+            "Telegram file is larger than the {} MB product cap",
+            mb(FILE_MAX_BYTES)
+        );
+        Ok(bytes.to_vec())
     }
 
     /// Extract attachment metadata from an incoming Telegram message.
@@ -1409,91 +1711,117 @@ impl TelegramChannel {
 
     /// Attempt to parse a Telegram update as a document/photo attachment.
     ///
-    /// Downloads the file to a system temp directory and returns a
-    /// `ChannelMessage` with the local file path. The file is later moved or
-    /// cleaned up by [`enrich_message`](crate::channels::enrich_message). Returns `None` if the message
-    /// is not an attachment, the sender is not authorized, or the file exceeds
-    /// size limits.
+    /// Downloads the file into this message's own staging directory in the
+    /// Telegram temp root and returns a `ChannelMessage` recording it (see
+    /// [`ChannelMessage::attachment_dirs`]). Returns `None` only when the
+    /// message is not an attachment or the sender is unauthorized: an attachment
+    /// the bot cannot retrieve or store still yields a message, so the caption
+    /// reaches the agent with the failure called out in the content.
     async fn try_parse_attachment_message(
         &self,
         update: &serde_json::Value,
     ) -> Option<ChannelMessage> {
         let message = update.get("message")?;
-        let attachment = Self::parse_attachment_metadata(message)?;
 
-        // Check file size limit
-        if let Some(size) = attachment.file_size
-            && size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
-        {
-            tracing::info!(
-                "Skipping attachment: file size {size} bytes exceeds {} MB limit",
-                TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
-            );
-            return None;
-        }
-
+        // Authorization comes first: an unauthorized sender is ignored
+        // entirely and silently, before any attachment work happens.
         let ctx = self.extract_message_context(message).await?;
 
-        // Save to system temp directory — cleaned up by enrich_message
-        let save_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
-        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
-            tracing::warn!("Failed to create telegram_files directory: {e}");
-            return None;
+        let attachment = Self::parse_attachment_metadata(message)?;
+
+        // Declared-size gate. Telegram reports the size on most attachments,
+        // so reject locally before spending a download; the two limits differ
+        // and the user must be told which one was hit.
+        if let Some(size) = attachment.file_size
+            && let Some(reason) = declared_size_refusal(size)
+        {
+            tracing::info!("Rejecting attachment: declared size {size} bytes ({reason})");
+            return Some(
+                self.reject_attachment(ctx, &attachment, None, NOT_RECEIVED, &reason)
+                    .await,
+            );
         }
 
-        // Download file from Telegram
+        // Download file from Telegram. The transport does not always report a
+        // size, so a transfer failure is the other way the 20 MB limit shows
+        // up — surface it instead of dropping the update.
         let tg_file_path = match self.get_file_path(&attachment.file_id).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to get attachment file path: {e}");
-                return None;
+                return Some(
+                    self.reject_attachment(
+                        ctx,
+                        &attachment,
+                        None,
+                        NOT_RECEIVED,
+                        TELEGRAM_LOOKUP_REFUSED_REASON,
+                    )
+                    .await,
+                );
             }
         };
+        let remote_ext = Path::new(&tg_file_path)
+            .extension()
+            .and_then(|e| e.to_str());
 
         let file_data = match self.download_file(&tg_file_path).await {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("Failed to download attachment: {e}");
-                return None;
+                return Some(
+                    self.reject_attachment(
+                        ctx,
+                        &attachment,
+                        remote_ext,
+                        NOT_RECEIVED,
+                        TELEGRAM_TRANSFER_REFUSED_REASON,
+                    )
+                    .await,
+                );
             }
         };
 
-        // Determine local filename
-        let local_filename = if let Some(name) = &attachment.file_name {
-            name.clone()
-        } else {
-            let ext = Path::new(&tg_file_path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or(match attachment.kind {
-                    // video_note has no file_name/mime_type — a ".jpg" default
-                    // would misroute it out of the video flow.
-                    IncomingAttachmentKind::Video => "mp4",
-                    _ => "jpg",
-                });
-            let prefix = match attachment.kind {
-                IncomingAttachmentKind::Photo => "photo",
-                IncomingAttachmentKind::Video => "video",
-                IncomingAttachmentKind::Audio => "audio",
-                IncomingAttachmentKind::Document => "file",
-            };
-            format!("{prefix}_{}_{}.{ext}", ctx.chat_id, ctx.message_id)
-        };
-        let local_filename = normalize_video_filename(
-            attachment.kind,
-            &local_filename,
-            attachment.mime_type.as_deref(),
-        );
+        // The directory is created only once the bytes are here so a refused
+        // transfer leaves nothing behind.
+        let staging_dir = crate::util::telegram_staging_dir_name(&ctx.chat_id, ctx.message_id);
+        let save_dir = crate::util::telegram_files_root().join(&staging_dir);
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            tracing::warn!("Failed to create telegram attachment directory: {e}");
+            return Some(
+                self.reject_attachment(
+                    ctx,
+                    &attachment,
+                    remote_ext,
+                    NOT_STORED,
+                    ATTACHMENT_DIR_REFUSED_REASON,
+                )
+                .await,
+            );
+        }
 
+        let local_filename =
+            local_attachment_name(&attachment, &ctx.chat_id, ctx.message_id, remote_ext);
         let local_path = save_dir.join(&local_filename);
         if let Err(e) = tokio::fs::write(&local_path, &file_data).await {
             tracing::warn!("Failed to save attachment to {}: {e}", local_path.display());
-            return None;
+            // A partial write must not linger: nothing downstream will ever
+            // reference this per-message directory.
+            let _ = tokio::fs::remove_dir_all(&save_dir).await;
+            return Some(
+                self.reject_attachment(
+                    ctx,
+                    &attachment,
+                    remote_ext,
+                    NOT_STORED,
+                    ATTACHMENT_SAVE_REFUSED_REASON,
+                )
+                .await,
+            );
         }
 
         let mut content = format_attachment_content(
             attachment.kind,
-            &local_filename,
             &local_path,
             attachment.mime_type.as_deref(),
         );
@@ -1505,7 +1833,42 @@ impl TelegramChannel {
 
         let content = Self::prepend_forward_attribution(content, message);
 
-        Some(ctx.into_channel_message(content, None))
+        Some(ctx.into_attachment_message(content, staging_dir))
+    }
+
+    /// Tell the user an attachment could not be taken and return the
+    /// caption-preserving channel message, so an oversized or refused file still
+    /// produces a user-visible reply and an agent turn. `outcome` is
+    /// [`NOT_RECEIVED`] or [`NOT_STORED`] — it decides whether the note may say
+    /// the file never arrived. The name in the note is
+    /// [`local_attachment_name`]'s; the direct Telegram notice is best-effort (a
+    /// send failure is only logged).
+    async fn reject_attachment(
+        &self,
+        ctx: MessageContext,
+        attachment: &IncomingAttachment,
+        remote_ext: Option<&str>,
+        outcome: &str,
+        reason: &str,
+    ) -> ChannelMessage {
+        let display_name =
+            local_attachment_name(attachment, &ctx.chat_id, ctx.message_id, remote_ext);
+        let notice = format!("Could not process the file \"{display_name}\": {reason}.");
+        let (_, thread_id) = parse_recipient(&ctx.reply_target);
+        if let Err(e) = self
+            .send_text_chunks(&notice, &ctx.chat_id, thread_id, None)
+            .await
+        {
+            tracing::warn!("Failed to send attachment-failure notice: {e}");
+        }
+
+        let content = attachment_rejection_content(
+            &display_name,
+            outcome,
+            reason,
+            attachment.caption.as_deref(),
+        );
+        ctx.into_channel_message(content, None)
     }
 
     /// Build a forwarding attribution prefix from Telegram forward fields.
@@ -1779,8 +2142,8 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Send a media file (image-as-file/document/video/audio/voice) to a
-    /// Telegram chat.
+    /// Send a media file (image-as-file/document/video/audio) to a Telegram
+    /// chat.
     async fn send_media_file(
         &self,
         chat_id: &str,
@@ -1812,7 +2175,8 @@ impl TelegramChannel {
         let request = self
             .http_client()
             .post(self.api_url(meta.api_method))
-            .multipart(form);
+            .multipart(form)
+            .timeout(MEDIA_UPLOAD_TIMEOUT);
 
         self.send_media(chat_id, meta.api_method, request, file_name)
             .await
@@ -2030,15 +2394,9 @@ impl TelegramChannel {
 
         // Flush all buffered album groups — combine content with \n separator
         for (_group_id, group_messages) in album_groups.drain() {
-            // Merge messages: use the first message as template, concatenate content
-            let merged = group_messages
-                .into_iter()
-                .reduce(|mut acc, next| {
-                    acc.content.push('\n');
-                    acc.content.push_str(&next.content);
-                    acc
-                })
-                .unwrap();
+            let Some(merged) = merge_album_members(group_messages) else {
+                continue;
+            };
             if tx.send(merged).await.is_err() {
                 return false;
             }
@@ -2046,6 +2404,23 @@ impl TelegramChannel {
 
         true
     }
+}
+
+/// Merge a Telegram album (media group) into the single message the pipeline
+/// processes: members arrive as separate updates, so their contents are
+/// concatenated and every member's inbound staging directory is carried over
+/// (see [`ChannelMessage::attachment_dirs`]); addressing fields come from the
+/// first member. `None` for an empty group (an internal invariant failure that
+/// must not abort the inbound listener).
+fn merge_album_members(members: Vec<ChannelMessage>) -> Option<ChannelMessage> {
+    let mut members = members.into_iter();
+    let mut acc = members.next()?;
+    for next in members {
+        acc.content.push('\n');
+        acc.content.push_str(&next.content);
+        acc.attachment_dirs.extend(next.attachment_dirs);
+    }
+    Some(acc)
 }
 
 #[async_trait]
@@ -2075,38 +2450,71 @@ impl Channel for TelegramChannel {
         // Look for inline attachment markers like [IMAGE:path/to/file.png].
         // Marker parsing now runs the shared classifier, whose local-file branch
         // is a blocking raster decode — offload it so a Tokio worker is not
-        // parked while a local image is decoded for attachment.
-        let (text_without_markers, attachments) =
-            crate::util::with_block_in_place(|| parse_attachment_markers(content));
+        // parked while a local image is decoded for attachment. `[FILE:...]`
+        // markers are resolved (and possibly refused) here too.
+        let (text_without_markers, attachments, refusals) =
+            crate::util::with_block_in_place(|| {
+                parse_attachment_markers(content, &message.file_roots)
+            });
 
-        if !attachments.is_empty() {
-            if !text_without_markers.is_empty() {
-                self.send_text_chunks(
-                    &text_without_markers,
-                    chat_id,
-                    thread_id,
-                    message.reply_markup.clone(),
-                )
-                .await?;
-            }
-
-            for attachment in &attachments {
-                self.send_attachment(chat_id, thread_id, attachment).await?;
-            }
-
-            return Ok(());
+        if attachments.is_empty() && refusals.is_empty() {
+            return self
+                .send_text_chunks(content, chat_id, thread_id, message.reply_markup.clone())
+                .await;
         }
 
-        if let Some(attachment) =
-            crate::util::with_block_in_place(|| parse_path_only_attachment(content))
-        {
-            self.send_attachment(chat_id, thread_id, &attachment)
+        // Refusal notices ride in the same body as the model's remaining text:
+        // a separate best-effort send would lose the file, the marker AND the
+        // explanation on a transient failure, while the body send's `?` makes
+        // it a real delivery error.
+        let body = if refusals.is_empty() {
+            text_without_markers
+        } else {
+            let notices = refusals.join("\n\n");
+            if text_without_markers.is_empty() {
+                notices
+            } else {
+                format!("{text_without_markers}\n\n{notices}")
+            }
+        };
+
+        if !body.is_empty() {
+            self.send_text_chunks(&body, chat_id, thread_id, message.reply_markup.clone())
                 .await?;
-            return Ok(());
         }
 
-        self.send_text_chunks(content, chat_id, thread_id, message.reply_markup.clone())
-            .await
+        // One failed attachment must not cost the user the others; the first
+        // error is returned after the loop so delivery-failure logging still
+        // fires, and every failure is surfaced in-chat.
+        let mut first_error: Option<anyhow::Error> = None;
+        for attachment in &attachments {
+            if let Err(e) = self.send_attachment(chat_id, thread_id, attachment).await {
+                tracing::warn!(
+                    error = %e,
+                    file = %attachment.target,
+                    "Telegram: attachment delivery failed"
+                );
+                let notice = file_refusal(
+                    file_name_or_path(&attachment.target),
+                    ATTACHMENT_UPLOAD_FAILED_REASON,
+                );
+                if let Err(notice_err) = self
+                    .send_text_chunks(&notice, chat_id, thread_id, None)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %notice_err,
+                        "Telegram: failed to report attachment failure to the user"
+                    );
+                }
+                first_error.get_or_insert(e);
+            }
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -2292,6 +2700,7 @@ pub async fn send_direct(
         content,
         recipient: recipient.to_string(),
         reply_markup,
+        file_roots: Vec::new(),
     };
     channel.send(&reply).await
 }
@@ -2324,9 +2733,12 @@ pub async fn send_reply(recipient: &str, content: &str) {
 /// Uses `<blockquote>` HTML tags, which `markdown_to_telegram_html` in the
 /// Telegram channel's `send()` pipeline passes through unchanged. The user's
 /// text retains markdown formatting through the standard inline parser.
-/// Media markers (`[IMAGE:...]`, `[AUDIO:...]`, `[VIDEO:...]`) are stripped
-/// so raw marker syntax does not appear in the quote; purely media-only
-/// messages are skipped entirely. When the message carries a
+/// Media markers of every kind the pattern matches (`[IMAGE:...]`,
+/// `[AUDIO:...]`, `[VIDEO:...]`, `[FILE:...]`) are stripped so raw marker
+/// syntax does not appear in the quote; a marker-shaped word of any other kind
+/// is not a marker and stays literal. Purely media-only messages are skipped
+/// entirely.
+/// When the message carries a
 /// [`ReplyReference`], a `↩ {author}: {snippet}` header line leads the
 /// blockquote (before the user's text), and a media-only message with a
 /// reference still mirrors — the blockquote then holds only the `↩` line.
@@ -2377,7 +2789,9 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
     }
 
     // Strip media markers so users don't see raw `[IMAGE:...]` syntax in the
-    // quote. A reply reference is preserved as a `↩` header line inside the
+    // quote. Every kind the pattern matches is stripped; a marker-shaped word of
+    // an unknown kind is not a marker at all and survives rather than being
+    // deleted. A reply reference is preserved as a `↩` header line inside the
     // blockquote; when a reference is present the media-only guard below is
     // relaxed so a reply to a media message still mirrors the `↩` line.
     let content = TELEGRAM_MEDIA_MARKER_RE
@@ -2410,6 +2824,11 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
             content: quoted.clone(),
             recipient: reply_target.clone(),
             reply_markup: None,
+            // The quote is already marker-free (every mapped kind was stripped
+            // above), so an empty root list cannot turn the user's own text into
+            // a "Could not send ..." refusal; it only states that the mirror
+            // delivers no files.
+            file_roots: Vec::new(),
         };
 
         if let Err(e) = channel.send(&reply).await {

@@ -340,6 +340,7 @@ async fn deliver_alarm_notification(alarm: &Alarm, content: String) -> Result<()
         role: Role::Assistant,
         reply_target: None,
         pending_job_id: None,
+        originating_workspace: None,
     };
     // Persist a durable envelope BEFORE routing so a crash after persisting
     // but before the consumer delivers the message replays the reminder at

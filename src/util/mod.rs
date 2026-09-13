@@ -20,6 +20,7 @@ use regex::Regex;
 use regex::RegexBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use strum::IntoEnumIterator;
 
 use anyhow::{Context as _, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -47,54 +48,152 @@ impl<T> UnwrapPoison for Result<T, std::sync::PoisonError<T>> {
     }
 }
 
-/// The regex pattern for `[KIND:path]` media markers.
+/// The `[KIND:path]` media marker kinds.
 ///
-/// This is the single source of truth for the marker pattern. Both the case-sensitive
-/// [`MEDIA_MARKER_RE`] and the case-insensitive [`TELEGRAM_MEDIA_MARKER_RE`] are built
-/// from this constant, so adding a new marker kind here automatically keeps both in sync.
-const MEDIA_MARKER_PATTERN: &str = r"\[(?P<kind>IMAGE|AUDIO|VIDEO):(?P<path>[^\]\r\n]+)\]";
+/// The single source of the kind set: `MEDIA_MARKER_PATTERN` is generated from
+/// this enum and [`parse_media_marker`] maps the captured token back onto it, so
+/// a capture can only ever name one of these and a new variant is both matchable
+/// and forced onto every dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
+pub(crate) enum MediaMarkerKind {
+    Image,
+    Audio,
+    Video,
+    File,
+}
 
-/// Matches `[IMAGE:path]`, `[AUDIO:path]`, or `[VIDEO:path]` markers in message content.
+impl MediaMarkerKind {
+    /// The uppercase token a marker spells this kind with.
+    pub(crate) const fn token(self) -> &'static str {
+        match self {
+            Self::Image => "IMAGE",
+            Self::Audio => "AUDIO",
+            Self::Video => "VIDEO",
+            Self::File => "FILE",
+        }
+    }
+}
+
+/// The regex pattern for the `[KIND:path]` media markers, generated from
+/// [`MediaMarkerKind`] — the enum is the only source of the kind set, so every
+/// pipeline (enrichment, GUI, Telegram delivery, reply snippets) matches
+/// exactly the kinds the rest of the system knows.
+static MEDIA_MARKER_PATTERN: LazyLock<String> = LazyLock::new(|| {
+    let kinds = MediaMarkerKind::iter()
+        .map(MediaMarkerKind::token)
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(r"\[(?P<kind>{kinds}):(?P<path>[^\]\r\n]+)\]")
+});
+
+/// Matches `[IMAGE:path]`, `[AUDIO:path]`, `[VIDEO:path]`, or `[FILE:path]`
+/// markers in message content, using [`MEDIA_MARKER_PATTERN`].
 ///
-/// **Invariant — marker stripping:** When enriching messages, IMAGE markers
-/// are ALWAYS preserved — they're needed for native image-part integration via
-/// `to_message_content()` — while all non-IMAGE markers (AUDIO, VIDEO, and any
-/// future marker kinds) are stripped from the content by `enrich_message`,
-/// which mirrors the `parse_image_markers()` pattern. Adding a new marker kind
-/// to this regex will cause it to be automatically stripped unless the closure
-/// is explicitly updated to preserve it.
+/// **Invariant — marker stripping:** the pattern decides which kinds the
+/// enrichment and GUI passes can see; `enrich_message` strips only the kinds it
+/// consumes (AUDIO and VIDEO) and passes every other kind — including one added
+/// to this list later — through untouched. IMAGE markers are preserved for
+/// native image-part integration via `to_message_content()`, FILE markers
+/// because they carry a workspace file handle the routed role consumes.
 pub(crate) static MEDIA_MARKER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(MEDIA_MARKER_PATTERN).expect("MEDIA_MARKER_RE must compile"));
+    LazyLock::new(|| Regex::new(&MEDIA_MARKER_PATTERN).expect("MEDIA_MARKER_RE must compile"));
 
-/// Case-insensitive variant of [`MEDIA_MARKER_RE`] used by `telegram.rs` to
-/// accept `[image:...]`, `[Image:...]`, etc. Built from the same
-/// [`MEDIA_MARKER_PATTERN`] constant to stay in sync.
+/// Case-insensitive variant of [`MEDIA_MARKER_RE`], used by the Telegram
+/// delivery parser and the reply-snippet normalizer, which also accept other
+/// casings (`[image:...]`). Same kind set: a marker-shaped word of any other
+/// kind is not a marker and is left as literal text.
 pub(crate) static TELEGRAM_MEDIA_MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    RegexBuilder::new(MEDIA_MARKER_PATTERN)
+    RegexBuilder::new(&MEDIA_MARKER_PATTERN)
         .case_insensitive(true)
         .build()
         .expect("TELEGRAM_MEDIA_MARKER_RE must compile")
 });
 
-/// Extract the `kind` and `path` named groups from a [`MEDIA_MARKER_RE`] / [`TELEGRAM_MEDIA_MARKER_RE`] capture.
+/// Extract the kind and `path` named groups from a [`MEDIA_MARKER_RE`] /
+/// [`TELEGRAM_MEDIA_MARKER_RE`] capture.
 ///
-/// Returns `(kind, path)` as string slices borrowed from the original haystack.
+/// Returns the [`MediaMarkerKind`] and the path slice borrowed from the original
+/// haystack.
 ///
 /// # Panics
 ///
-/// Panics if either named group is missing — this should never happen with the
-/// well-formed regex since the pattern requires both groups to match.
+/// Panics if the `kind` or `path` group is missing, or the captured token names
+/// no kind — this cannot fire because [`MEDIA_MARKER_PATTERN`] is generated from
+/// [`MediaMarkerKind`], so the pattern and the kind list are one source and
+/// cannot drift.
 #[must_use]
-pub(crate) fn parse_media_marker<'h>(caps: &regex::Captures<'h>) -> (&'h str, &'h str) {
-    let kind = caps
+pub(crate) fn parse_media_marker<'h>(caps: &regex::Captures<'h>) -> (MediaMarkerKind, &'h str) {
+    let token = caps
         .name("kind")
         .expect("parse_media_marker: expected 'kind' group")
         .as_str();
+    let kind = MediaMarkerKind::iter()
+        .find(|kind| kind.token().eq_ignore_ascii_case(token))
+        .expect("the pattern is generated from these kinds, so one of them matched");
     let path = caps
         .name("path")
         .expect("parse_media_marker: expected 'path' group")
         .as_str();
     (kind, path)
+}
+
+/// Placeholder that replaces an inline image data URI wherever bounded,
+/// displayable text is persisted (see [`strip_data_uris`]). The GUI marker
+/// renderer (`gui::media_markers`) recognises it by this prefix alone — the
+/// byte count that follows is display-only.
+pub(crate) const DATA_URI_OMITTED_PREFIX: &str = "<data-uri omitted";
+
+/// Strip unbounded data-URI payloads from `[IMAGE:...]` media markers,
+/// replacing them with a byte-count placeholder.
+///
+/// Data URIs are the only unbounded payloads in history, and stripping them is
+/// what keeps compaction dumps under the read tool's file-size cap; a
+/// path-based marker stays verbatim because the file it points at stays
+/// openable, and a non-IMAGE kind carrying a `data:image/` path is a malformed
+/// marker that is left alone.
+///
+/// Called for compaction dumps and, through [`crate::channels::persist_content`],
+/// for the enriched content of a message whose markers name inbound attachments
+/// (document ingestion produces `[IMAGE:data:...]` parts that must not reach
+/// chat history).
+pub(crate) fn strip_data_uris(text: &str) -> String {
+    MEDIA_MARKER_RE
+        .replace_all(text, |caps: &regex::Captures| {
+            let (kind, path) = parse_media_marker(caps);
+            if kind == MediaMarkerKind::Image && path.starts_with("data:image/") {
+                format!(
+                    "[IMAGE:{DATA_URI_OMITTED_PREFIX} ({} bytes)>]",
+                    caps.get(0).expect("group 0 always matches").as_str().len()
+                )
+            } else {
+                caps.get(0)
+                    .expect("group 0 always matches")
+                    .as_str()
+                    .to_string()
+            }
+        })
+        .into_owned()
+}
+
+#[cfg(test)]
+mod data_uri_strip_tests {
+    use super::{DATA_URI_OMITTED_PREFIX, strip_data_uris};
+
+    #[test]
+    fn strips_only_image_data_uris() {
+        // IMAGE + data:image/ → placeholder with byte count.
+        assert_eq!(
+            strip_data_uris("[IMAGE:data:image/jpeg;base64,AAAA]"),
+            format!("[IMAGE:{DATA_URI_OMITTED_PREFIX} (35 bytes)>]")
+        );
+        // Path-based IMAGE markers stay openable.
+        assert_eq!(strip_data_uris("[IMAGE:/tmp/x.png]"), "[IMAGE:/tmp/x.png]");
+        // AUDIO kind with an image data-uri path: not an image marker, kept verbatim.
+        assert_eq!(
+            strip_data_uris("[AUDIO:data:image/png;base64,AAAA]"),
+            "[AUDIO:data:image/png;base64,AAAA]"
+        );
+    }
 }
 
 /// Provenance tag prepended to every synthetic User-role image message the agent
@@ -900,11 +999,43 @@ const TRANSCRIBABLE_VIDEO_EXTENSIONS: &[&str] = &["mp4", "mpeg", "mov", "webm"];
 /// (never locally decoded).
 pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic", "heif"];
 
-/// Daemon-owned subdir under the system temp dir where inbound Telegram
-/// attachments are downloaded before enrichment. Enrichment only copies
-/// video clips from here into workspace uploads — one of the containment
-/// roots for the video-edit flow (the other being `generated/`).
+/// The product-level cap on one file in either direction, enforced by mahbot
+/// itself in both directions; Telegram's own download limit is stricter and
+/// lives in `telegram.rs`.
+pub(crate) const FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+/// The daemon-owned temp root for inbound Telegram attachments, one staging
+/// subdirectory per message.
 pub(crate) const TELEGRAM_FILES_DIR: &str = "mahbot_telegram_files";
+
+/// The temp directory inbound Telegram attachments are downloaded into: the
+/// receive path writes each message's attachments into its own
+/// `telegram_staging_dir_name` subdirectory below this root, and that is the
+/// inbound containment root for reading, copying and deleting.
+///
+/// Under `cfg(test)` this resolves below the process-level test root instead: a
+/// test process can inherit the daemon's pinned `TMPDIR`, and a fixture must
+/// never create or delete inside the directory a running daemon owns.
+#[must_use]
+pub(crate) fn telegram_files_root() -> std::path::PathBuf {
+    #[cfg(test)]
+    {
+        crate::util::test::test_root().join(TELEGRAM_FILES_DIR)
+    }
+    #[cfg(not(test))]
+    {
+        std::env::temp_dir().join(TELEGRAM_FILES_DIR)
+    }
+}
+
+/// Name of the per-message subdirectory of `telegram_files_root` holding one
+/// message's inbound attachments. The receive path names the directory with it
+/// and records it on the message, so the containment check compares against
+/// exactly the name that was created.
+#[must_use]
+pub(crate) fn telegram_staging_dir_name(chat_id: &str, message_id: i64) -> String {
+    format!("msg_{chat_id}_{message_id}")
+}
 
 /// Check whether a path's extension (case-insensitive) belongs to `table`.
 #[must_use]
@@ -968,6 +1099,52 @@ pub(crate) fn file_name_or_path(path: &str) -> &str {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(path)
+}
+
+/// Neutralize a name taken from an untrusted source before reuse: every control
+/// character, both path separators, and the `[`/`]` a media marker is built from
+/// become `_`. The result is safe both as a single path component and inside a
+/// `[KIND:...]` marker.
+#[must_use]
+pub(crate) fn neutralized_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | '[' | ']') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// The stem of a file name: everything up to its last dot, or the whole name
+/// when the dot is leading (`.env`) or absent. Shared by the code that inserts a
+/// suffix before a name's extension.
+#[must_use]
+pub(crate) fn name_stem(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => name,
+    }
+}
+
+/// The collision suffix `_<n>` for the `n`-th attempt at reusing `name`
+/// (`report.pdf` → `report_2.pdf`); `n <= 1` returns `name` unchanged.
+///
+/// Counters rather than timestamps: one document produces several page and
+/// embedded images in the same millisecond, and a time-based suffix would make
+/// those copies collide.
+#[must_use]
+pub(crate) fn suffixed_name(name: &str, n: u32) -> String {
+    if n <= 1 {
+        return name.to_string();
+    }
+    let stem = name_stem(name);
+    match name.strip_prefix(stem) {
+        Some(ext) if !ext.is_empty() => format!("{stem}_{n}{ext}"),
+        _ => format!("{name}_{n}"),
+    }
 }
 
 /// Strip ANSI escape sequences from a string.

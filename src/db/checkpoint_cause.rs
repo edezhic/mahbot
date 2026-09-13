@@ -12,10 +12,11 @@
 //! to another store's call, and attaches it to the checkpoint error instead of
 //! emitting it as a log record of its own.
 //!
-//! That reason carries two duties: it is what the failure record shows the
-//! operator ([`crate::db::failure_record`]), and — through
-//! [`is_blocked_checkpoint`] — the only thing that tells a blocked store, which
-//! never stops the service, from a genuine pager error, which does.
+//! That reason carries two duties: the failure record shows it to the operator
+//! ([`crate::db::failure_record`]), and [`is_blocked_checkpoint`] uses it to tell a
+//! blocked attempt, which never counts towards a stop, from a genuine pager error,
+//! which a persistent failure window turns into the stop
+//! ([`crate::db::checkpoint`]).
 //!
 //! Accepted cost: enabling DEBUG on that engine module enables its other debug
 //! callsites too (notably its once-per-transaction-end event), whose arguments
@@ -62,9 +63,10 @@ tokio::task_local! {
 /// True when the engine's own reason in `e` says the checkpoint was blocked by
 /// another operation rather than genuinely failing. Matched up to a word
 /// boundary, never as a bare `Busy` substring, so the engine's `BusySnapshot`
-/// is not read as a blocked checkpoint. A reason that never arrived is not a
-/// blocked checkpoint: this capture is the only thing that can exempt a store
-/// from the stop, so such a failure stays a genuine one and stops the service.
+/// is not read as a blocked checkpoint. This capture is the only thing that tells a
+/// blocked attempt from a genuine failure, so a reason that never arrived keeps its
+/// round failing: it opens or extends the failure window and counts towards the stop.
+/// A blocked attempt never does: it opens no window and is no failure of its own.
 pub(crate) fn is_blocked_checkpoint(e: &anyhow::Error) -> bool {
     format!("{e:#}")
         .split_once(BLOCKED_REASON)
@@ -183,7 +185,7 @@ mod tests {
     /// The engine's blocked checkpoint and its genuine pager errors arrive as the
     /// same failure row, so the captured reason is the only thing that tells them
     /// apart: the engine's own busy sentence — captured for real here — is the
-    /// blocked answer, and every other reason, including the engine's similarly
+    /// blocked attempt, and every other reason, including the engine's similarly
     /// spelled `BusySnapshot`, is a genuine failure. The sentence is written out
     /// instead of read from [`BLOCKED_REASON`], so the classifier's constant meets
     /// an independently spelled copy; the engine's own rendering is only checkable

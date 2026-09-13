@@ -985,7 +985,10 @@ static RE_HR: LazyLock<regex::Regex> =
 fn preprocess_text(text: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
 
-    let mut s: String = text.nfkd().collect();
+    // Media markers are display/plumbing artifacts, never speech — every kind
+    // goes, so neither a path nor a base64 data URI is read aloud.
+    let text = crate::util::MEDIA_MARKER_RE.replace_all(text, " ");
+    let mut s: String = text.as_ref().nfkd().collect();
     s = strip_markdown(&s);
     s = remove_emojis(&s);
     s = normalize_symbols(&s);

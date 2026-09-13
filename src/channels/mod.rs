@@ -1,9 +1,11 @@
 pub(crate) mod chat_draft;
 pub(crate) mod chat_history;
+mod document;
 mod enrichment;
 pub(crate) mod reply;
 pub mod telegram;
-pub use enrichment::{EnrichmentStrategy, enrich_links, enrich_message, has_only_audio_markers};
+use enrichment::has_inbound_temp_marker;
+pub use enrichment::{EnrichmentStrategy, enrich_links, enrich_message};
 pub use reply::{ReplyReference, apply_reply_marker};
 pub use telegram::mirror_gui_message_to_telegram;
 
@@ -196,12 +198,28 @@ pub(crate) fn broadcast_transient_event(
     );
 }
 
+/// Chat-history content for an inbound message: normally the pre-enrichment
+/// `original` text (which avoids storing the large data URIs image enrichment
+/// produces), but the data-URI-stripped `enriched` content when the original
+/// carried a marker for an inbound attachment — those raw markers name temp
+/// files the daemon deletes right after enrichment and must never be persisted.
+///
+/// A hand-typed audio marker names no inbound attachment, so it is kept as
+/// written rather than replaced by the annotation it enriches to.
+#[must_use]
+pub fn persist_content(original: &str, enriched: &str) -> String {
+    if has_inbound_temp_marker(original) {
+        crate::util::strip_data_uris(enriched)
+    } else {
+        original.to_string()
+    }
+}
+
 /// Broadcast an incoming user message to the GUI and persist it to chat_history,
 /// mirroring it to Telegram in parallel. `broadcast_content` is the enriched text
-/// sent to the GUI (e.g. audio transcriptions, renderable data URIs), while
-/// `persist_content` is stored in chat_history and mirrored to Telegram — the raw
-/// original text (no data-URI bloat), except for audio-only messages which carry
-/// the enriched transcription (icon + text) so no temp file path is persisted.
+/// sent to the GUI (e.g. audio transcriptions, renderable data URIs);
+/// `content_for_history` is what is stored and mirrored — callers derive it with
+/// [`persist_content`].
 /// The GUI bubble is broadcast synchronously before the async persist + mirror
 /// join begins.
 ///
@@ -210,7 +228,7 @@ pub(crate) fn broadcast_transient_event(
 pub async fn broadcast_and_persist_incoming_message(
     msg: &ChannelMessage,
     broadcast_content: &str,
-    persist_content: &str,
+    content_for_history: &str,
 ) {
     let message_id = crate::generate_id();
     let timestamp = db::now();
@@ -237,7 +255,7 @@ pub async fn broadcast_and_persist_incoming_message(
                     message_id,
                     user_name: msg.user_name.clone(),
                     direction: "user".to_string(),
-                    content: persist_content.to_string(),
+                    content: content_for_history.to_string(),
                     agent_role: None,
                     broadcast_id: None,
                     workspace: msg.workspace.clone(),
@@ -248,7 +266,7 @@ pub async fn broadcast_and_persist_incoming_message(
         },
         async {
             let mut mirror_msg = msg.clone();
-            mirror_msg.content = persist_content.to_string();
+            mirror_msg.content = content_for_history.to_string();
             mirror_gui_message_to_telegram(&mirror_msg).await;
         },
     );

@@ -371,12 +371,15 @@ fn parse_image_markers(content: &str) -> (String, Vec<String>) {
             let (kind, path) = crate::util::parse_media_marker(caps);
             let path = path.trim();
 
-            if kind == "IMAGE" && crate::util::media_target::is_native_data_uri(path) {
+            if kind == crate::util::MediaMarkerKind::Image
+                && crate::util::media_target::is_native_data_uri(path)
+            {
                 refs.push(path.to_string());
                 // Native IMAGE payloads are stripped — they become image parts.
                 String::new()
             } else {
-                // AUDIO/VIDEO markers and non-native IMAGE markers stay verbatim.
+                // Non-native IMAGE markers, and every AUDIO/VIDEO/FILE marker,
+                // stay verbatim.
                 caps.get_match().as_str().to_string()
             }
         })

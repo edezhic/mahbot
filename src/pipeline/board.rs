@@ -1628,6 +1628,7 @@ impl BoardStore {
                 role: commenter_role,
                 reply_target: None,
                 pending_job_id: None,
+                originating_workspace: None,
             };
 
             if crate::agent::message_router::try_route(&agent_id, job) {

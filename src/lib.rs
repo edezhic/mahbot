@@ -470,6 +470,12 @@ pub struct ChannelMessage {
     pub chat_id: Option<String>,
     /// Channel-side message id of the originating message (see [`Self::chat_id`]).
     pub message_id: Option<i64>,
+    /// Names of the staging directories this message owns inbound attachments
+    /// for: one for a single message, several for an album merged into one
+    /// message. The receive path downloads each attachment into its own
+    /// directory named by `util::telegram_staging_dir_name`, so this is the set
+    /// of directories the message may read, copy from and delete.
+    pub attachment_dirs: Vec<String>,
 }
 
 /// An outbound message to deliver on a channel.
@@ -489,6 +495,10 @@ pub struct SendMessage {
     pub recipient: String,
     /// Optional inline keyboard markup to attach to the message.
     pub reply_markup: Option<serde_json::Value>,
+    /// Workspace roots that authorize outbound `[FILE:...]` markers: the workspace
+    /// of the agent that authored the message plus, for relayed content, the
+    /// workspace it originated in. Empty = no file delivery on this send.
+    pub file_roots: Vec<std::path::PathBuf>,
 }
 
 #[async_trait]

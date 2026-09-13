@@ -877,8 +877,10 @@ async fn deliver_clear_reply(
             role: effective_role,
             reply_target: Some(msg.reply_target.clone()),
             pending_job_id: None,
+            originating_workspace: None,
         },
         &effective_role,
+        &[],
     )
     .await;
 }
@@ -1297,19 +1299,11 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     mahbot::channels::enrich_message(&mut msg, &strategy).await;
 
     // ── Broadcast, persist, and mirror ─────────────────────────────────
-    // Broadcast enriched content to GUI (audio transcription visible, data
-    // URI images renderable).  Persist original content to chat_history (no
-    // data URI bloat), except audio-only messages which persist the enriched
-    // transcription (icon + text) so the temp file path never reaches chat
-    // history.  Mirror uses the same persist_content (media markers stripped by
-    // the mirror function) — for audio-only messages that is the enriched
-    // transcription (icon + text).
-    let persist_content = if mahbot::channels::has_only_audio_markers(&original_content) {
-        &msg.content
-    } else {
-        &original_content
-    };
-    broadcast_and_persist_incoming_message(&msg, &msg.content, persist_content).await;
+    // `persist_content` decides what reaches chat history: the raw original
+    // text, or the data-URI-stripped enriched content when the markers name
+    // inbound attachments whose temp paths must not be persisted.
+    let content_for_history = mahbot::channels::persist_content(&original_content, &msg.content);
+    broadcast_and_persist_incoming_message(&msg, &msg.content, &content_for_history).await;
 
     // ── Link enrichment (URL summaries for agent context) ─────────────
     // Runs after broadcast so AI-generated summaries don't appear in the

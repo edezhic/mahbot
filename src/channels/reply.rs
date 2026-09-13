@@ -3,8 +3,8 @@
 //! "reply to" quote header on a routed message.
 
 use crate::Role;
-use crate::util::TELEGRAM_MEDIA_MARKER_RE;
 use crate::util::html::decode_html_entities;
+use crate::util::{MediaMarkerKind, TELEGRAM_MEDIA_MARKER_RE, parse_media_marker};
 use regex::Captures;
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +47,7 @@ fn truncate_capped(input: &str, max_chars: usize) -> String {
 /// 3. Remove all `<` / `>` characters.
 /// 4. Collapse `\r\n` and `\n` to single spaces (other whitespace untouched).
 /// 5. Map media markers inline (IMAGE→`[Photo]`, AUDIO→`[Voice message]`,
-///    VIDEO→`[Video]`) via [`TELEGRAM_MEDIA_MARKER_RE`].
+///    VIDEO→`[Video]`, FILE→`[File]`) via [`TELEGRAM_MEDIA_MARKER_RE`].
 /// 6. Cap at [`REPLY_SNIPPET_MAX_CHARS`].
 ///
 /// The mapping operates on the raw message content — callers invoke this
@@ -78,21 +78,13 @@ pub fn normalize_reply_text(raw: &str) -> String {
     // 4. Collapse newlines to single spaces.
     text = text.replace("\r\n", " ").replace('\n', " ");
 
-    // 5. Map media markers inline, preserving surrounding text. The regex
-    //    recognizes only IMAGE|AUDIO|VIDEO, so the match is exhaustive.
+    // 5. Map media markers inline, preserving surrounding text.
     text = TELEGRAM_MEDIA_MARKER_RE
-        .replace_all(&text, |caps: &Captures| {
-            let kind = caps
-                .name("kind")
-                .expect("normalize_reply_text: media marker 'kind' group")
-                .as_str()
-                .to_ascii_uppercase();
-            match kind.as_str() {
-                "IMAGE" => "[Photo]".to_string(),
-                "AUDIO" => "[Voice message]".to_string(),
-                "VIDEO" => "[Video]".to_string(),
-                _ => unreachable!("media marker regex matches only IMAGE|AUDIO|VIDEO"),
-            }
+        .replace_all(&text, |caps: &Captures| match parse_media_marker(caps).0 {
+            MediaMarkerKind::Image => "[Photo]",
+            MediaMarkerKind::Audio => "[Voice message]",
+            MediaMarkerKind::Video => "[Video]",
+            MediaMarkerKind::File => "[File]",
         })
         .into_owned();
 

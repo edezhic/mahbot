@@ -128,7 +128,7 @@ fn render_dump(messages: &[&ChatMessage]) -> String {
                 // Reasoning is deliberately skipped: scratch space, not
                 // conversation content.
                 if let Some(content) = content.filter(|c| !c.is_empty()) {
-                    let _ = writeln!(out, "{}", strip_data_uris(&content));
+                    let _ = writeln!(out, "{}", crate::util::strip_data_uris(&content));
                 }
                 if let Some(calls) = tool_calls {
                     for call in calls {
@@ -137,7 +137,7 @@ fn render_dump(messages: &[&ChatMessage]) -> String {
                             "[tool_call {}] {}: {}",
                             call.id,
                             call.name,
-                            strip_data_uris(&call.arguments.to_string())
+                            crate::util::strip_data_uris(&call.arguments.to_string())
                         );
                     }
                 }
@@ -147,44 +147,16 @@ fn render_dump(messages: &[&ChatMessage]) -> String {
                 content,
             }) => {
                 let _ = writeln!(out, "[result for tool_call {tool_call_id}]");
-                let _ = writeln!(out, "{}", strip_data_uris(&content));
+                let _ = writeln!(out, "{}", crate::util::strip_data_uris(&content));
             }
             // Plain text (never JSON-wrapped): render as-is.
             None => {
-                let _ = writeln!(out, "{}", strip_data_uris(&msg.content));
+                let _ = writeln!(out, "{}", crate::util::strip_data_uris(&msg.content));
             }
         }
         out.push('\n');
     }
     crate::util::scrub_credentials(out.trim_end())
-}
-
-/// Strip unbounded data-URI payloads from `[IMAGE:...]` media markers,
-/// replacing them with a byte-count placeholder.
-///
-/// Data URIs are the only unbounded payloads in history; stripping them keeps
-/// dumps well under the read tool's [`crate::tools::MAX_FILE_SIZE_BYTES`]
-/// (10 MB) file-size cap. Path-based markers are kept verbatim — the files
-/// they point at stay openable. Non-IMAGE kinds with a `data:image/` path are
-/// a malformed marker and are kept as-is (mirrors the image-count prefix
-/// gate's leniency).
-fn strip_data_uris(text: &str) -> String {
-    crate::util::MEDIA_MARKER_RE
-        .replace_all(text, |caps: &regex::Captures| {
-            let (kind, path) = crate::util::parse_media_marker(caps);
-            if kind == "IMAGE" && path.starts_with("data:image/") {
-                format!(
-                    "[IMAGE:<data-uri omitted ({} bytes)>]",
-                    caps.get(0).expect("group 0 always matches").as_str().len()
-                )
-            } else {
-                caps.get(0)
-                    .expect("group 0 always matches")
-                    .as_str()
-                    .to_string()
-            }
-        })
-        .into_owned()
 }
 
 /// Resolve the directory holding compaction dumps for this role.
@@ -298,23 +270,6 @@ mod tests {
         let deleted = deleted_conversation_messages(&history, &retained);
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted[0].content, "answer");
-    }
-
-    #[test]
-    fn strip_data_uris_strips_only_image_data_uris() {
-        // IMAGE + data:image/ → placeholder with byte count.
-        let marker = "[IMAGE:data:image/jpeg;base64,AAAA]";
-        assert_eq!(
-            strip_data_uris(marker),
-            "[IMAGE:<data-uri omitted (35 bytes)>]"
-        );
-        // Path-based IMAGE markers stay openable.
-        assert_eq!(strip_data_uris("[IMAGE:/tmp/x.png]"), "[IMAGE:/tmp/x.png]");
-        // AUDIO kind with an image data-uri path: not an image marker, kept verbatim.
-        assert_eq!(
-            strip_data_uris("[AUDIO:data:image/png;base64,AAAA]"),
-            "[AUDIO:data:image/png;base64,AAAA]"
-        );
     }
 
     #[test]

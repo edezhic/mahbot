@@ -343,46 +343,57 @@ fn parse_attachment_markers_tests() {
     write_test_png(&png);
     std::fs::write(&ogg, b"fake-ogg").unwrap();
     std::fs::write(&vid, b"fake-mp4").unwrap();
+    let roots = vec![dir.path().to_path_buf()];
 
-    // Placeholder/inexistent targets stay as literal text (AC 1).
-    let (cleaned, att) = parse_attachment_markers("use `[IMAGE:path]` or `[VIDEO:...]`");
+    // Placeholder/inexistent targets stay as literal text.
+    let (cleaned, att, _) = parse_attachment_markers("use `[IMAGE:path]` or `[VIDEO:...]`", &roots);
     assert_eq!(cleaned, "use `[IMAGE:path]` or `[VIDEO:...]`");
     assert!(att.is_empty());
     // Directory targets are not regular files → prose.
-    let (cleaned, att) = parse_attachment_markers(&format!("[IMAGE:{}]", dir.path().display()));
+    let (cleaned, att, _) =
+        parse_attachment_markers(&format!("[IMAGE:{}]", dir.path().display()), &roots);
     assert_eq!(cleaned, format!("[IMAGE:{}]", dir.path().display()));
     assert!(att.is_empty());
 
-    // Existing files become attachments (AC 2).
-    let (cleaned, att) = parse_attachment_markers(&format!(
-        "Here are files [IMAGE:{}] and [AUDIO:{}]",
-        png.display(),
-        ogg.display()
-    ));
+    // Existing files become attachments.
+    let (cleaned, att, _) = parse_attachment_markers(
+        &format!(
+            "Here are files [IMAGE:{}] and [AUDIO:{}]",
+            png.display(),
+            ogg.display()
+        ),
+        &roots,
+    );
     assert_eq!(cleaned, "Here are files  and");
     assert_eq!(att.len(), 2);
     assert_eq!(att[0].kind, TelegramAttachmentKind::Image);
     assert_eq!(att[1].kind, TelegramAttachmentKind::Audio);
 
-    // http(s) URLs become attachments (AC 2).
-    let (cleaned, att) = parse_attachment_markers("See [VIDEO:https://example.com/vid.mp4]");
+    // http(s) URLs become attachments.
+    let (cleaned, att, _) =
+        parse_attachment_markers("See [VIDEO:https://example.com/vid.mp4]", &roots);
     assert_eq!(cleaned, "See");
     assert_eq!(att.len(), 1);
     assert_eq!(att[0].kind, TelegramAttachmentKind::Video);
     assert_eq!(att[0].target, "https://example.com/vid.mp4");
 
-    // A bad marker doesn't abort valid ones in the same message (AC 3).
-    let (cleaned, att) =
-        parse_attachment_markers(&format!("[IMAGE:missing.png] ok [VIDEO:{}]", vid.display()));
+    // A bad marker doesn't abort valid ones in the same message.
+    let (cleaned, att, _) = parse_attachment_markers(
+        &format!("[IMAGE:missing.png] ok [VIDEO:{}]", vid.display()),
+        &roots,
+    );
     assert_eq!(cleaned, "[IMAGE:missing.png] ok");
     assert_eq!(att.len(), 1);
     assert_eq!(att[0].kind, TelegramAttachmentKind::Video);
 
-    // Unknown markers kept as text; case-insensitive matching with a real file.
-    let (cleaned, att) = parse_attachment_markers("Report [UNKNOWN:/tmp/a.bin]");
+    // Unknown markers kept as text: a marker-shaped word of a kind outside the
+    // vocabulary is not a marker at all, so the parser leaves the user's text
+    // alone.
+    let (cleaned, att, _) = parse_attachment_markers("Report [UNKNOWN:/tmp/a.bin]", &roots);
     assert_eq!(cleaned, "Report [UNKNOWN:/tmp/a.bin]");
     assert!(att.is_empty());
-    let (cleaned, att) = parse_attachment_markers(&format!("[image:{}]", png.display()));
+    // Case-insensitive matching with a real file.
+    let (cleaned, att, _) = parse_attachment_markers(&format!("[image:{}]", png.display()), &roots);
     assert_eq!(cleaned, "");
     assert_eq!(att.len(), 1);
     assert_eq!(att[0].kind, TelegramAttachmentKind::Image);
@@ -392,7 +403,8 @@ fn parse_attachment_markers_tests() {
     // is_file() path — it stays as inert literal text.
     let nonimg = dir.path().join("note.txt");
     std::fs::write(&nonimg, b"not an image").unwrap();
-    let (cleaned, att) = parse_attachment_markers(&format!("[image:{}]", nonimg.display()));
+    let (cleaned, att, _) =
+        parse_attachment_markers(&format!("[image:{}]", nonimg.display()), &roots);
     assert_eq!(cleaned, format!("[image:{}]", nonimg.display()));
     assert!(
         att.is_empty(),
@@ -400,31 +412,185 @@ fn parse_attachment_markers_tests() {
     );
 }
 
+/// `[FILE:...]` is the one local-only kind: it resolves against the
+/// authorizing workspace roots, carries the CANONICAL path, and turns every
+/// refusal (rather than a literal marker) into a notice naming the file.
 #[test]
-fn parse_path_only_attachment_tests() {
+fn parse_file_markers_resolve_within_workspace_roots() {
     let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let roots = vec![dir.path().to_path_buf()];
+    let escape = outside.path().join("secret.txt");
+    std::fs::write(&escape, b"secret").unwrap();
 
-    // A real 1×1 PNG raster is a valid image target → attached as a photo.
-    let p = dir.path().join("snap.png");
-    write_test_png(&p);
-    let parsed = parse_path_only_attachment(p.to_string_lossy().as_ref()).unwrap();
-    assert_eq!(parsed.kind, TelegramAttachmentKind::Image);
-    assert_eq!(parsed.target, p.to_string_lossy());
+    // Inside the workspace: delivered as a document with the canonical path.
+    let pdf = dir.path().join("specs.pdf");
+    std::fs::write(&pdf, b"fake-pdf").unwrap();
+    let canonical = std::fs::canonicalize(&pdf).unwrap();
+    let (cleaned, att, refusals) =
+        parse_attachment_markers(&format!("Here: [FILE:{}]", pdf.display()), &roots);
+    assert_eq!(cleaned, "Here:");
+    assert!(refusals.is_empty());
+    assert_eq!(att.len(), 1);
+    assert_eq!(att[0].kind, TelegramAttachmentKind::Document);
+    assert_eq!(att[0].target, canonical.to_string_lossy());
 
-    // A non-raster file with an image extension is NOT a valid image target —
-    // it stays plain text, never attached as a photo (matches the marker gate).
-    let bad = dir.path().join("fake.png");
-    std::fs::write(&bad, b"fake-png").unwrap();
-    assert!(parse_path_only_attachment(bad.to_string_lossy().as_ref()).is_none());
+    // A relative target resolves against the first (authoring) root.
+    let (cleaned, att, refusals) = parse_attachment_markers("[FILE:specs.pdf]", &roots);
+    assert_eq!(cleaned, "");
+    assert!(refusals.is_empty());
+    assert_eq!(att.len(), 1);
+    assert_eq!(att[0].target, canonical.to_string_lossy());
 
-    assert!(parse_path_only_attachment("Screenshot saved to /tmp/snap.png").is_none());
+    // A relative target that no earlier root holds resolves against the first
+    // root that does: relayed Manager→Assistant content names a file in the
+    // originating workspace, which is the last root.
+    let other = tempfile::tempdir().unwrap();
+    let relayed = other.path().join("relayed.pdf");
+    std::fs::write(&relayed, b"fake-pdf").unwrap();
+    let (cleaned, att, refusals) = parse_attachment_markers(
+        "[FILE:relayed.pdf]",
+        &[dir.path().to_path_buf(), other.path().to_path_buf()],
+    );
+    assert_eq!(cleaned, "");
+    assert!(refusals.is_empty());
+    assert_eq!(att.len(), 1);
+    assert_eq!(
+        att[0].target,
+        std::fs::canonicalize(&relayed).unwrap().to_string_lossy()
+    );
+
+    // An existing file outside the roots is refused by name.
+    let (cleaned, att, refusals) =
+        parse_attachment_markers(&format!("[FILE:{}]", escape.display()), &roots);
+    assert_eq!(cleaned, "");
+    assert!(att.is_empty());
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"secret.txt\": it is outside your workspace."]
+    );
+
+    // A missing target is refused (no attachment, no literal marker left).
+    let (cleaned, att, refusals) = parse_attachment_markers("[FILE:missing.pdf]", &roots);
+    assert_eq!(cleaned, "");
+    assert!(att.is_empty());
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"missing.pdf\": file not found."]
+    );
+
+    // A directory target is refused.
+    let sub = dir.path().join("reports");
+    std::fs::create_dir(&sub).unwrap();
+    let (_, att, refusals) = parse_attachment_markers(&format!("[FILE:{}]", sub.display()), &roots);
+    assert!(att.is_empty());
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"reports\": it is a directory."]
+    );
+
+    // `[FILE:...]` is local-only — a URL target is not part of the mechanism.
+    let (cleaned, att, refusals) = parse_attachment_markers("[FILE:http://x/y.pdf]", &roots);
+    assert_eq!(cleaned, "");
+    assert!(att.is_empty());
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"y.pdf\": FILE targets are local files, not URLs."]
+    );
+
+    // No roots → no file delivery at all (the plain-text/mirror sends).
+    let (cleaned, att, refusals) =
+        parse_attachment_markers(&format!("[FILE:{}]", pdf.display()), &[]);
+    assert_eq!(cleaned, "");
+    assert!(att.is_empty());
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"specs.pdf\": no workspace is available for file delivery."]
+    );
+
+    // A malformed marker's notice names a bounded prefix of the target rather
+    // than echoing a whole inline payload back at the user.
+    let blob = format!("[FILE:data:application/pdf;base64,{}]", "A".repeat(500));
+    let (cleaned, att, refusals) = parse_attachment_markers(&blob, &roots);
+    assert_eq!(cleaned, "");
+    assert!(att.is_empty());
+    assert_eq!(refusals.len(), 1);
+    assert!(refusals[0].ends_with("file not found."), "{refusals:?}");
+    assert!(
+        refusals[0].len() < 200,
+        "the notice must not echo the whole payload: {} bytes",
+        refusals[0].len()
+    );
+}
+
+/// A symlink inside the workspace pointing outside it is refused: containment
+/// is checked against the CANONICAL target, so the link cannot smuggle a file
+/// out of the workspace.
+#[cfg(unix)]
+#[test]
+fn parse_file_markers_refuse_symlink_out_of_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let escape = outside.path().join("secret.txt");
+    std::fs::write(&escape, b"secret").unwrap();
+    let link = dir.path().join("link.txt");
+    std::os::unix::fs::symlink(&escape, &link).unwrap();
+
+    let (cleaned, att, refusals) = parse_attachment_markers(
+        &format!("[FILE:{}]", link.display()),
+        &[dir.path().to_path_buf()],
+    );
+    assert_eq!(cleaned, "");
+    assert!(att.is_empty());
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"link.txt\": it is outside your workspace."]
+    );
 }
 
 #[test]
-fn infer_attachment_kind_from_target_detects_document_extension() {
+fn bare_path_without_marker_is_plain_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let png = dir.path().join("snap.png");
+    write_test_png(&png);
+
+    // A reply that is exactly an existing file path — but carries no marker —
+    // must be delivered as plain text with no attachment.
+    let path = png.to_string_lossy().to_string();
+    let (cleaned, att, _) = parse_attachment_markers(&path, &[dir.path().to_path_buf()]);
+    assert_eq!(cleaned, path);
+    assert!(att.is_empty());
+}
+
+/// Boundaries of the declared-size gate: exactly at a limit passes, one byte
+/// over trips it, and the between-the-limits band reports Telegram's own limit.
+#[test]
+fn declared_size_refusal_boundaries() {
+    const MIB: u64 = 1024 * 1024;
+    let cases: &[(u64, Option<String>)] = &[
+        (0, None),
+        (20 * MIB, None),
+        (20 * MIB + 1, Some(telegram_download_limit_reason())),
+        (50 * MIB, Some(telegram_download_limit_reason())),
+        (50 * MIB + 1, Some(file_too_large_reason())),
+    ];
+    for (size, expected) in cases {
+        assert_eq!(declared_size_refusal(*size), *expected, "size {size} bytes");
+    }
+}
+
+/// The rejection note is caption-then-note, with an empty caption treated as
+/// absent so no stray blank line reaches the agent.
+#[test]
+fn attachment_rejection_content_shapes() {
+    let reason = telegram_download_limit_reason();
     assert_eq!(
-        infer_attachment_kind_from_target("https://example.com/files/specs.pdf?download=1"),
-        Some(TelegramAttachmentKind::Document)
+        attachment_rejection_content("report.pdf", NOT_RECEIVED, &reason, Some("my report")),
+        format!("my report\n\n[File report.pdf: not received — {reason}]")
+    );
+    assert_eq!(
+        attachment_rejection_content("report.pdf", NOT_STORED, &reason, None),
+        format!("[File report.pdf: could not be stored — {reason}]")
     );
 }
 
@@ -1144,70 +1310,69 @@ fn attachment_content_format_rules() {
     // photo → [IMAGE:]
     let c = format_attachment_content(
         IncomingAttachmentKind::Photo,
-        "photo.jpg",
         std::path::Path::new("/tmp/workspace/photo.jpg"),
         None,
     );
     assert_eq!(c, "[IMAGE:/tmp/workspace/photo.jpg]");
-    // document → [Document: name] /path
+    // document → [FILE:]
     let c = format_attachment_content(
         IncomingAttachmentKind::Document,
-        "report.pdf",
         std::path::Path::new("/tmp/workspace/report.pdf"),
         None,
     );
-    assert_eq!(c, "[Document: report.pdf] /tmp/workspace/report.pdf");
+    assert_eq!(c, "[FILE:/tmp/workspace/report.pdf]");
     assert!(!c.contains("[IMAGE:"));
-    // markdown files never produce [IMAGE:] even when classified as Photo
+    // A nameless, MIME-less image still reaches the model as an image: with
+    // neither the name nor the declared type classifying it, the bytes decide
+    // through the same gate enrichment uses for [IMAGE:...].
+    let dir = tempfile::tempdir().unwrap();
+    let nameless = dir.path().join("file_1_2.bin");
+    write_test_png(&nameless);
+    let c = format_attachment_content(IncomingAttachmentKind::Document, &nameless, None);
+    assert_eq!(c, format!("[IMAGE:{}]", nameless.display()));
+    // A nameless non-image falls through to [FILE:].
+    let blob = dir.path().join("file_1_3.bin");
+    std::fs::write(&blob, b"definitely not a raster").unwrap();
+    let c = format_attachment_content(IncomingAttachmentKind::Document, &blob, None);
+    assert_eq!(c, format!("[FILE:{}]", blob.display()));
     let c = format_attachment_content(
         IncomingAttachmentKind::Photo,
-        "notes.md",
         std::path::Path::new("/tmp/workspace/notes.md"),
         None,
     );
     assert!(!c.contains("[IMAGE:"));
-    assert!(c.starts_with("[Document:"));
-    // non-image files classified as Photo fall back to [Document:]
-    for (filename, path) in [
-        ("file.md", "/tmp/workspace/file.md"),
-        ("file.txt", "/tmp/workspace/file.txt"),
-        ("file.pdf", "/tmp/workspace/file.pdf"),
-        ("file.csv", "/tmp/workspace/file.csv"),
-        ("file.json", "/tmp/workspace/file.json"),
-        ("file.zip", "/tmp/workspace/file.zip"),
-        ("file", "/tmp/workspace/file"),
+    assert!(c.starts_with("[FILE:"));
+    // non-image files classified as Photo fall back to [FILE:]
+    for path in [
+        "/tmp/workspace/file.md",
+        "/tmp/workspace/file.txt",
+        "/tmp/workspace/file.pdf",
+        "/tmp/workspace/file.csv",
+        "/tmp/workspace/file.json",
+        "/tmp/workspace/file.zip",
+        "/tmp/workspace/file",
     ] {
         let c = format_attachment_content(
             IncomingAttachmentKind::Photo,
-            filename,
             std::path::Path::new(path),
             None,
         );
-        assert!(
-            !c.contains("[IMAGE:"),
-            "{filename}: should not get [IMAGE:]"
-        );
-        assert!(
-            c.starts_with("[Document:"),
-            "{filename}: should use [Document:]"
-        );
+        assert!(!c.contains("[IMAGE:"), "{path}: should not get [IMAGE:]");
+        assert!(c.starts_with("[FILE:"), "{path}: should use [FILE:]");
     }
     // image extensions produce [IMAGE:] (PNG/JPEG/WebP only — gif/bmp are
     // deliberately not routed as images)
     for ext in ["png", "jpg", "jpeg", "webp"] {
-        let filename = format!("photo.{ext}");
         let c = format_attachment_content(
             IncomingAttachmentKind::Photo,
-            &filename,
-            std::path::Path::new(&format!("/tmp/workspace/{filename}")),
+            std::path::Path::new(&format!("/tmp/workspace/photo.{ext}")),
             None,
         );
         assert!(c.starts_with("[IMAGE:"), "{ext}: should get [IMAGE:]");
     }
-    // Document kind + .jpg extension → [IMAGE:] (not [Document:])
+    // Document kind + .jpg extension → [IMAGE:] (not [FILE:])
     let c = format_attachment_content(
         IncomingAttachmentKind::Document,
-        "image.jpg",
         std::path::Path::new("/tmp/workspace/image.jpg"),
         None,
     );
@@ -1218,39 +1383,32 @@ fn attachment_content_format_rules() {
     for mime in ["image/jpeg", "image/jpg"] {
         let c = format_attachment_content(
             IncomingAttachmentKind::Document,
-            "image_no_ext",
             std::path::Path::new("/tmp/workspace/image_no_ext"),
             Some(mime),
         );
         assert_eq!(c, "[IMAGE:/tmp/workspace/image_no_ext]", "{mime}");
     }
     // gif/bmp MIME types are NOT routed as images (mime fallback whitelist) —
-    // they fall through to [Document:]. The legacy image/x-ms-bmp alias is
+    // they fall through to [FILE:]. The legacy image/x-ms-bmp alias is
     // excluded too.
     for mime in ["image/gif", "image/bmp", "image/x-ms-bmp"] {
         let c = format_attachment_content(
             IncomingAttachmentKind::Document,
-            "anim_no_ext",
             std::path::Path::new("/tmp/workspace/anim_no_ext"),
             Some(mime),
         );
         assert!(!c.contains("[IMAGE:"), "{mime}: should not get [IMAGE:]");
-        assert!(
-            c.starts_with("[Document:"),
-            "{mime}: should use [Document:]"
-        );
+        assert!(c.starts_with("[FILE:"), "{mime}: should use [FILE:]");
     }
     // Audio kind produces [AUDIO:] marker regardless of extension
     let c = format_attachment_content(
         IncomingAttachmentKind::Audio,
-        "voice.ogg",
         std::path::Path::new("/tmp/workspace/voice.ogg"),
         None,
     );
     assert_eq!(c, "[AUDIO:/tmp/workspace/voice.ogg]");
     let c = format_attachment_content(
         IncomingAttachmentKind::Audio,
-        "song.mp3",
         std::path::Path::new("/tmp/workspace/song.mp3"),
         Some("audio/mpeg"),
     );
@@ -1258,7 +1416,6 @@ fn attachment_content_format_rules() {
     // Video kind produces [VIDEO:] marker
     let c = format_attachment_content(
         IncomingAttachmentKind::Video,
-        "clip.mp4",
         std::path::Path::new("/tmp/workspace/clip.mp4"),
         None,
     );
@@ -1266,7 +1423,6 @@ fn attachment_content_format_rules() {
     // Document kind + video extension → [VIDEO:] (like image extension routing)
     let c = format_attachment_content(
         IncomingAttachmentKind::Document,
-        "clip.mp4",
         std::path::Path::new("/tmp/workspace/clip.mp4"),
         None,
     );
@@ -1274,19 +1430,206 @@ fn attachment_content_format_rules() {
     // Document kind + no extension + mime_type "video/mp4" → [VIDEO:] (mime fallback)
     let c = format_attachment_content(
         IncomingAttachmentKind::Document,
-        "clip_no_ext",
         std::path::Path::new("/tmp/workspace/clip_no_ext"),
         Some("video/mp4"),
     );
     assert_eq!(c, "[VIDEO:/tmp/workspace/clip_no_ext]");
-    // Video kind with a non-video extension falls back to [Document:]
+    // Video kind with a non-video extension falls back to [FILE:]
     let c = format_attachment_content(
         IncomingAttachmentKind::Video,
-        "notes.txt",
         std::path::Path::new("/tmp/workspace/notes.txt"),
         None,
     );
-    assert_eq!(c, "[Document: notes.txt] /tmp/workspace/notes.txt");
+    assert_eq!(c, "[FILE:/tmp/workspace/notes.txt]");
+}
+
+// ── Filename sanitizer tests ─────────────────────────────────────
+
+#[test]
+fn sanitize_attachment_filename_neutralizes_traversal() {
+    let fallback = "file_1_2.pdf";
+    // Only the final component survives, so an absolute path or a `..` climb
+    // can never escape the per-message directory.
+    assert_eq!(
+        sanitize_attachment_filename("../../etc/passwd", fallback),
+        "passwd"
+    );
+    assert_eq!(
+        sanitize_attachment_filename("/etc/passwd", fallback),
+        "passwd"
+    );
+    // No component at all → the generated fallback.
+    for rejected in ["..", ".", "", "/", "a/.."] {
+        assert_eq!(
+            sanitize_attachment_filename(rejected, fallback),
+            fallback,
+            "{rejected:?}"
+        );
+    }
+    // The fallback is cleaned the same way, so the marker invariant does not
+    // depend on the caller having pre-sanitized it.
+    assert_eq!(
+        sanitize_attachment_filename("..", "we]ird[\u{7}name.bin"),
+        "we_ird__name.bin"
+    );
+    // A Windows-style path is one component on unix; both separators are
+    // mapped out so it cannot smuggle one.
+    assert_eq!(
+        sanitize_attachment_filename("C:\\evil\\x.txt", fallback),
+        "C:_evil_x.txt"
+    );
+    // Control characters map to `_`.
+    assert_eq!(
+        sanitize_attachment_filename("a\nb\r\t.txt", fallback),
+        "a_b__.txt"
+    );
+    // Brackets map out too: the emitted `[FILE:<path>]` marker's path group
+    // cannot carry a `]`, and an unsanitized one would truncate the marker.
+    assert_eq!(
+        sanitize_attachment_filename("notes]v2[1].pdf", fallback),
+        "notes_v2_1_.pdf"
+    );
+    // A leading dot is prefixed so no dotfile is created.
+    assert_eq!(
+        sanitize_attachment_filename(".bashrc", fallback),
+        "_.bashrc"
+    );
+    // A pathologically long name is truncated with the extension preserved:
+    // 180 bytes total − 4 for ".pdf".
+    let long = format!("{}.pdf", "x".repeat(500));
+    let sanitized = sanitize_attachment_filename(&long, fallback);
+    assert_eq!(sanitized, format!("{}.pdf", "x".repeat(176)));
+    // A long extension-only name must not become a dotfile either, and the
+    // leading `_` counts toward the budget.
+    let long_ext = format!(".{}", "y".repeat(200));
+    let dotted = sanitize_attachment_filename(&long_ext, fallback);
+    assert!(dotted.starts_with("_."), "{dotted}");
+    assert!(
+        dotted.len() <= MAX_ATTACHMENT_FILENAME_BYTES,
+        "{dotted} is {} bytes",
+        dotted.len()
+    );
+    // The budget is hard: an extension longer than it leaves no stem room, so
+    // the name truncates wholesale instead of appending the full extension.
+    let huge_ext = format!("call.log.{}", "y".repeat(200));
+    let capped = sanitize_attachment_filename(&huge_ext, fallback);
+    assert_eq!(capped.len(), MAX_ATTACHMENT_FILENAME_BYTES);
+    assert!(capped.starts_with("call.log."), "{capped}");
+    // The same budget with a leading character that cannot be cut in two: the
+    // stem keeps nothing, and a bare extension would be a dotfile.
+    let narrow = format!("🙂.{}", "y".repeat(177));
+    let squeezed = sanitize_attachment_filename(&narrow, fallback);
+    assert!(!squeezed.starts_with('.'), "{squeezed}");
+    assert_eq!(squeezed.len(), MAX_ATTACHMENT_FILENAME_BYTES);
+}
+
+#[test]
+fn sanitize_attachment_filename_caps_bytes_not_chars() {
+    let fallback = "file_1_2.bin";
+    // The filesystem's per-component limit is bytes, so a name in a
+    // multi-byte script must be cut by the byte budget: a character cap would
+    // leave 360–480 bytes on a 120-char name and the write would fail. The
+    // stems below fit 176 bytes ("漢" is 3 bytes → 58 whole characters, "🙂" is
+    // 4 → 44) next to the preserved ".png", and truncation must land on a char
+    // boundary.
+    for (unit, stem_len) in [('漢', 58), ('🙂', 44)] {
+        let long = format!("{}.png", unit.to_string().repeat(200));
+        let sanitized = sanitize_attachment_filename(&long, fallback);
+        assert!(
+            sanitized.len() <= MAX_ATTACHMENT_FILENAME_BYTES,
+            "{sanitized} is {} bytes",
+            sanitized.len()
+        );
+        assert_eq!(
+            sanitized,
+            format!("{}.png", unit.to_string().repeat(stem_len)),
+            "{unit}"
+        );
+    }
+}
+
+#[test]
+fn local_attachment_name_uses_sanitized_sender_name_or_fallback() {
+    let attachment = IncomingAttachment {
+        file_id: "f".to_string(),
+        file_name: Some("../../etc/passwd".to_string()),
+        file_size: None,
+        caption: None,
+        kind: IncomingAttachmentKind::Document,
+        mime_type: None,
+    };
+    assert_eq!(local_attachment_name(&attachment, "123", 7, None), "passwd");
+    // Telegram often sends no file_name (photo/video_note/voice) — the
+    // generated name carries the kind and the message ids.
+    let generated = local_attachment_name(
+        &IncomingAttachment {
+            file_name: None,
+            kind: IncomingAttachmentKind::Video,
+            ..attachment.clone()
+        },
+        "123",
+        7,
+        None,
+    );
+    assert_eq!(generated, "video_123_7.mp4");
+    // A degenerate sender name has no stem to carry an extension swap, so it
+    // falls through to the generated name instead of becoming `_...mp4`.
+    for degenerate in ["..", ".", ""] {
+        assert_eq!(
+            local_attachment_name(
+                &IncomingAttachment {
+                    file_name: Some(degenerate.to_string()),
+                    kind: IncomingAttachmentKind::Video,
+                    ..attachment.clone()
+                },
+                "123",
+                7,
+                Some("mp4"),
+            ),
+            "video_123_7.mp4",
+            "name {degenerate:?}"
+        );
+    }
+    // A document gets a format-neutral default: its extension carries no
+    // routing meaning, and the image-shaped "jpg" read oddly in the notice.
+    assert_eq!(
+        local_attachment_name(
+            &IncomingAttachment {
+                file_name: None,
+                ..attachment
+            },
+            "123",
+            7,
+            None
+        ),
+        "file_123_7.bin"
+    );
+}
+
+#[test]
+fn local_attachment_name_sanitizes_remote_extension_fallback() {
+    let attachment = IncomingAttachment {
+        file_id: "f".to_string(),
+        file_name: None,
+        file_size: None,
+        caption: None,
+        kind: IncomingAttachmentKind::Document,
+        mime_type: None,
+    };
+    // Telegram reports no file_name for many kinds, so the fallback's
+    // extension comes from `getFile` — remote input that must not survive
+    // into the emitted `[FILE:<path>]` marker path group.
+    let hostile = "..]x/漢\u{7}evil\u{202e}png";
+    let name = local_attachment_name(&attachment, "123", 7, Some(hostile));
+    assert_eq!(name, "file_123_7.xevilpng");
+    // A remote extension that sanitizes to nothing falls back to the default.
+    let name = local_attachment_name(&attachment, "123", 7, Some("]/漢\u{7}"));
+    assert_eq!(name, "file_123_7.bin");
+    // A pathologically long one is still capped, in bytes.
+    let long_ext = "a".repeat(500);
+    let name = local_attachment_name(&attachment, "123", 7, Some(long_ext.as_str()));
+    assert_eq!(name.len(), MAX_ATTACHMENT_FILENAME_BYTES);
+    assert!(name.starts_with("file_123_7."), "{name}");
 }
 
 #[test]
@@ -1380,6 +1723,43 @@ fn video_filename_normalization() {
             Some("video/webm")
         ),
         "clip.webm"
+    );
+}
+
+// ── Album merge tests ───────────────────────────────────────────
+
+#[test]
+fn merge_album_members_joins_content_and_unions_attachment_dirs() {
+    let first_chat = "-100";
+    let second_chat = "-200";
+    let first = ChannelMessage {
+        message_id: Some(41),
+        chat_id: Some(first_chat.into()),
+        content: "first".into(),
+        attachment_dirs: vec![crate::util::telegram_staging_dir_name(first_chat, 41)],
+        ..test_msg("alice", "", "telegram", "chat")
+    };
+    let second = ChannelMessage {
+        message_id: Some(42),
+        chat_id: Some(second_chat.into()),
+        content: "second".into(),
+        attachment_dirs: vec![
+            crate::util::telegram_staging_dir_name(second_chat, 42),
+            crate::util::telegram_staging_dir_name(second_chat, 43),
+        ],
+        ..test_msg("bob", "", "telegram", "other")
+    };
+
+    let merged = merge_album_members(vec![first, second]).expect("album has a member");
+
+    assert_eq!(merged.content, "first\nsecond");
+    assert_eq!(
+        merged.attachment_dirs,
+        vec![
+            crate::util::telegram_staging_dir_name(first_chat, 41),
+            crate::util::telegram_staging_dir_name(second_chat, 42),
+            crate::util::telegram_staging_dir_name(second_chat, 43),
+        ]
     );
 }
 
@@ -1880,6 +2260,7 @@ fn test_msg(user_name: &str, content: &str, channel: &str, reply_target: &str) -
         reply_reference: None,
         chat_id: None,
         message_id: None,
+        attachment_dirs: Vec::new(),
     }
 }
 
@@ -2141,6 +2522,15 @@ async fn strips_media_markers_from_content() {
         "unique_lowercase",
         "See [image:/tmp/photo.png] and hear [audio:/tmp/sound.mp3]",
         "<blockquote>\nSee  and hear\n</blockquote>",
+    )
+    .await;
+    // A marker-shaped word of an unknown kind is not a marker at all, so only
+    // the four known kinds are deleted from the quote.
+    assert_mirror_strips_markers(
+        "strip_markers",
+        "unique_unmappable",
+        "See [DOCX:/tmp/report.docx] here",
+        "<blockquote>\nSee [DOCX:/tmp/report.docx] here\n</blockquote>",
     )
     .await;
 }

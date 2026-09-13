@@ -169,6 +169,12 @@ pub struct AgentJob {
     /// `run_agent` returns — the at-least-once delivery boundary.
     #[serde(default)]
     pub pending_job_id: Option<String>,
+    /// For relayed jobs ([`MessageKind::ManagerNotify`]) this names the
+    /// workspace the relayed content originated in, so a project-workspace
+    /// `[FILE:...]` marker in that content is not rejected just because the
+    /// relaying Assistant sits in the admin's personal workspace.
+    #[serde(default)]
+    pub originating_workspace: Option<String>,
 }
 
 // ── Global router ─────────────────────────────────────────────────────────
@@ -314,6 +320,7 @@ pub async fn route_user_message(
         role,
         reply_target,
         pending_job_id: None,
+        originating_workspace: None,
     };
 
     // DURABLE kinds = UserMessage (manager-bound), AgentMessage, ManagerNotify,
@@ -384,6 +391,7 @@ fn agent_message_job(content: String, workspace_name: String, user_name: &str) -
         role: Role::Manager,
         reply_target: None,
         pending_job_id: None,
+        originating_workspace: None,
     }
 }
 
@@ -558,6 +566,28 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             }
         };
 
+        // ── Roots authorizing outbound `[FILE:...]` markers ────────────
+        // The job's own workspace, plus the workspace the relayed content
+        // originated in when it differs (a Manager→Assistant relay names it in
+        // `originating_workspace`). A failed lookup only narrows the roots.
+        let mut file_roots = vec![std::path::PathBuf::from(&ws.path)];
+        if let Some(origin) = job.originating_workspace.as_deref()
+            && origin != job.workspace_name
+        {
+            match crate::users::resolve_workspace(origin).await {
+                Ok(Some(origin_ws)) => file_roots.push(std::path::PathBuf::from(&origin_ws.path)),
+                Ok(None) => debug!(
+                    workspace = %origin,
+                    "Message router: originating workspace not found — file delivery roots narrowed",
+                ),
+                Err(e) => debug!(
+                    workspace = %origin,
+                    error = %e,
+                    "Message router: originating workspace lookup failed — file delivery roots narrowed",
+                ),
+            }
+        }
+
         // ── Role is embedded directly in the job ────────────────────────
         // No agent-ID string parsing needed — every caller knows the role.
         let role = job.role;
@@ -659,7 +689,8 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                 && !agent.is_cancelled()
                 && !crate::shutdown::aborting()
             {
-                deliver_unregistered_user_response(AGENT_FAILURE_EMOJI, &job, &role).await;
+                deliver_unregistered_user_response(AGENT_FAILURE_EMOJI, &job, &role, &file_roots)
+                    .await;
             }
             confirm_pending_delivery(&job).await;
             continue;
@@ -684,9 +715,10 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             }
             _ => {
                 if users.is_empty() {
-                    deliver_unregistered_user_response(&response, &job, &role).await;
+                    deliver_unregistered_user_response(&response, &job, &role, &file_roots).await;
                 } else {
-                    deliver_single_user_response(&response, &users[0], &job, &role).await;
+                    deliver_single_user_response(&response, &users[0], &job, &role, &file_roots)
+                        .await;
                 }
             }
         }
@@ -807,6 +839,7 @@ async fn deliver_on_channel(
     user_name: &str,
     reply_target: &str,
     response: &str,
+    file_roots: &[std::path::PathBuf],
 ) -> DeliverOutcome {
     let Some(recipient) = channel.resolve_recipient(user_name, reply_target) else {
         return DeliverOutcome::Unresolvable;
@@ -816,6 +849,7 @@ async fn deliver_on_channel(
             content: response.to_string(),
             recipient,
             reply_markup: None,
+            file_roots: file_roots.to_vec(),
         })
         .await
     {
@@ -865,6 +899,7 @@ async fn route_manager_notify(response: &str, source_workspace: &str) {
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
+            originating_workspace: Some(source_workspace.to_string()),
         };
         let target = crate::jobs::envelope_target(&job);
         stamp_and_route(job, &target, "manager notify envelope").await;
@@ -885,6 +920,7 @@ async fn deliver_response_over_channels(
     users: &[UserRecord],
     role: Role,
     workspace: &str,
+    file_roots: &[std::path::PathBuf],
 ) {
     let channels = crate::channel_registry().list();
     if channels.is_empty() {
@@ -910,7 +946,14 @@ async fn deliver_response_over_channels(
                     continue;
                 }
                 let reply_target = binding.reply_target.as_deref().unwrap_or(&user.name);
-                match deliver_on_channel(channel.as_ref(), &user.name, reply_target, &content).await
+                match deliver_on_channel(
+                    channel.as_ref(),
+                    &user.name,
+                    reply_target,
+                    &content,
+                    file_roots,
+                )
+                .await
                 {
                     DeliverOutcome::Failed(e) => error!(
                         channel = %channel_name,
@@ -954,6 +997,7 @@ async fn deliver_single_user_response(
     user: &UserRecord,
     job: &AgentJob,
     role: &Role,
+    file_roots: &[std::path::PathBuf],
 ) {
     // Broadcast + persist (tagged with the originating channel). A fresh
     // broadcast_id makes every NEW agent-direction row exactly dedupable;
@@ -974,6 +1018,7 @@ async fn deliver_single_user_response(
         std::slice::from_ref(user),
         *role,
         &job.workspace_name,
+        file_roots,
     )
     .await;
 }
@@ -990,7 +1035,16 @@ async fn deliver_single_user_response(
 ///
 /// The response is always broadcast + persisted first (so it appears in the
 /// GUI chat history even if the channel transport delivery fails).
-pub async fn deliver_unregistered_user_response(response: &str, job: &AgentJob, role: &Role) {
+///
+/// `file_roots` authorizes outbound `[FILE:...]` markers exactly as in
+/// [`deliver_single_user_response`]; an empty slice disables file delivery,
+/// which is what the inline-confirmation caller passes.
+pub async fn deliver_unregistered_user_response(
+    response: &str,
+    job: &AgentJob,
+    role: &Role,
+    file_roots: &[std::path::PathBuf],
+) {
     let ch = job.channel.as_str();
 
     // Invariant: never persist/reply under an empty user — seed 'admin'
@@ -1019,7 +1073,7 @@ pub async fn deliver_unregistered_user_response(response: &str, job: &AgentJob, 
     // Use reply_target from the original message when available (e.g. Telegram
     // chat_id), falling back to user_name.
     let reply_target = job.reply_target.as_deref().unwrap_or(user_name);
-    match deliver_on_channel(chan.as_ref(), user_name, reply_target, response).await {
+    match deliver_on_channel(chan.as_ref(), user_name, reply_target, response, file_roots).await {
         DeliverOutcome::Unresolvable => warn!(
             workspace = %job.workspace_name,
             user = %user_name,
@@ -1068,6 +1122,7 @@ mod tests {
             role,
             reply_target: None,
             pending_job_id: None,
+            originating_workspace: None,
         }
     }
 
@@ -1387,11 +1442,17 @@ mod tests {
             role: Role::Assistant,
             reply_target: Some("chat_123".to_string()),
             pending_job_id: None,
+            originating_workspace: None,
         };
 
         // Should complete without panic.
-        deliver_unregistered_user_response("response to unregistered user", &job, &Role::Assistant)
-            .await;
+        deliver_unregistered_user_response(
+            "response to unregistered user",
+            &job,
+            &Role::Assistant,
+            &[],
+        )
+        .await;
     }
 
     /// `deliver_single_user_response` completes without error and broadcasts
@@ -1422,11 +1483,18 @@ mod tests {
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
+            originating_workspace: None,
         };
 
         // Should complete without panic — broadcasts to the "gui" binding.
-        deliver_single_user_response("response to registered user", &user, &job, &Role::Assistant)
-            .await;
+        deliver_single_user_response(
+            "response to registered user",
+            &user,
+            &job,
+            &Role::Assistant,
+            &[],
+        )
+        .await;
     }
 
     /// `deliver_single_user_response` handles the case where the user has NO
@@ -1449,6 +1517,7 @@ mod tests {
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
+            originating_workspace: None,
         };
 
         // Should complete without panic — broadcast+persist runs, transport
@@ -1458,6 +1527,7 @@ mod tests {
             &user,
             &job,
             &Role::Assistant,
+            &[],
         )
         .await;
     }
@@ -1497,10 +1567,17 @@ mod tests {
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
+            originating_workspace: None,
         };
 
-        deliver_single_user_response("broadcast to all bindings", &user, &job, &Role::Assistant)
-            .await;
+        deliver_single_user_response(
+            "broadcast to all bindings",
+            &user,
+            &job,
+            &Role::Assistant,
+            &[],
+        )
+        .await;
 
         let captured = sent.lock().unwrap_poison();
         assert!(
@@ -1580,6 +1657,12 @@ mod tests {
         assert_eq!(deserialized.kind, MessageKind::ManagerNotify);
         assert_eq!(deserialized.workspace_name, "personal:__notify_admin");
         assert_eq!(deserialized.user_name, "__notify_admin");
+        assert_eq!(
+            deserialized.originating_workspace.as_deref(),
+            Some("team_ws"),
+            "the relayed job must name the source workspace so its [FILE:...] \
+             markers stay authorized"
+        );
         assert!(
             deserialized
                 .content
@@ -1595,6 +1678,10 @@ mod tests {
         )
         .expect("legacy ManagerReply row deserializes");
         assert_eq!(legacy.kind, MessageKind::ManagerNotify);
+        assert_eq!(
+            legacy.originating_workspace, None,
+            "a legacy row without the field must default to no originating workspace"
+        );
 
         // The notify call fans out to every admin — including the auto-seeded
         // 'admin' — so clean up ALL rows created by this test, not just the

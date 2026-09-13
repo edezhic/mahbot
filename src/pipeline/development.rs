@@ -146,6 +146,7 @@ fn notify_engineer_pause(ws: &Workspace, failure_details: &str, paused: bool) {
             role: Role::Manager,
             reply_target: None,
             pending_job_id: None,
+            originating_workspace: None,
         },
     );
 }

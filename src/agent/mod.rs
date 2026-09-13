@@ -12,7 +12,9 @@ use crate::tools::{
     ImagePayload, ToolExecutionOutcome, find_tool, format_tool_failure_feedback,
     normalize_tool_call, scrub_tool_output,
 };
-use crate::util::{MEDIA_MARKER_RE, UnwrapPoison, parse_media_marker, scrub_credentials};
+use crate::util::{
+    MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, parse_media_marker, scrub_credentials,
+};
 use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall};
 
 pub(crate) mod extraction;
@@ -179,11 +181,11 @@ fn extract_media_from_outcomes(
         {
             // Derive the regex kind from the marker prefix, e.g. "[IMAGE:" -> "IMAGE".
             // This relies on the documented invariant that media_marker() returns "[KIND:".
-            let kind = &marker_prefix[1..marker_prefix.len() - 1];
+            let marker = &marker_prefix[1..marker_prefix.len() - 1];
             let mut matched = false;
             for caps in MEDIA_MARKER_RE.captures_iter(&outcome.output) {
                 let (captured_kind, path) = parse_media_marker(&caps);
-                if captured_kind == kind {
+                if captured_kind.token() == marker {
                     matched = true;
                     paths.push((marker_prefix, path.to_string()));
                 }
@@ -212,7 +214,7 @@ fn user_image_marker_values(history: &[ChatMessage]) -> impl Iterator<Item = &st
                 .captures_iter(&msg.content)
                 .filter_map(|caps| {
                     let (kind, path) = parse_media_marker(&caps);
-                    (kind == "IMAGE").then_some(path)
+                    (kind == MediaMarkerKind::Image).then_some(path)
                 })
         })
 }
@@ -266,7 +268,7 @@ async fn derive_image_payload_from_marker(output: &str) -> Option<ImagePayload> 
     }
     for caps in MEDIA_MARKER_RE.captures_iter(output) {
         let (kind, path) = parse_media_marker(&caps);
-        if kind != "IMAGE" {
+        if kind != MediaMarkerKind::Image {
             continue;
         }
         let p = Path::new(path);
@@ -3334,6 +3336,7 @@ mod tests {
             role: crate::Role::Manager,
             reply_target: None,
             pending_job_id: None,
+            originating_workspace: None,
         };
         let _ = tx.send(job);
 
@@ -3375,6 +3378,7 @@ mod tests {
             role: crate::Role::Assistant,
             reply_target: None,
             pending_job_id: None,
+            originating_workspace: None,
         };
         let _ = tx.send(job);
 

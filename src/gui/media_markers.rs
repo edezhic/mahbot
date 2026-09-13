@@ -8,6 +8,7 @@
 //!   process-lifetime cached handle; undecodable or oversized payloads degrade
 //!   to the `🖼️ image` placeholder (never raw base64 text, never a blank)
 //! - `[AUDIO:path]` → 🎵 emoji + filename (text)
+//! - `[FILE:path]` → 📄 emoji + filename (text)
 //! - `[VIDEO:path]` → 🎬 emoji + placeholder text
 //! - `[Audio transcription of ...]: text` → 🔊 emoji + transcribed text
 //! - `[Video transcription of ...]: text` → 🎬 emoji + transcribed text
@@ -23,13 +24,14 @@
 //!
 //! # Canonical marker pattern
 //!
-//! The `[KIND:path]` format is defined by `MEDIA_MARKER_PATTERN` in
-//! `src/util/mod.rs`, which is **the single source of truth** for all marker
-//! kinds (`IMAGE`, `AUDIO`, `VIDEO`, and any future additions).  This module
-//! uses the shared [`MEDIA_MARKER_RE`] and [`parse_media_marker`] helper to
-//! stay in sync — adding a new marker kind there automatically propagates
-//! to this module, `enrichment.rs`, `telegram.rs`, `agent.rs`, and
-//! `compatible.rs` without needing per-kind regexes here.
+//! The `[KIND:path]` format is defined by the `MediaMarkerKind` enum in
+//! `src/util/mod.rs`, from which `MEDIA_MARKER_PATTERN` is generated — **the
+//! single source of truth** for all marker kinds (`IMAGE`, `AUDIO`, `VIDEO`,
+//! `FILE`, and any future additions). This module uses the shared
+//! [`MEDIA_MARKER_RE`] and [`parse_media_marker`] helper to stay in sync —
+//! adding a new marker kind there automatically propagates to this module,
+//! `enrichment.rs`, `agent.rs`, and `compatible.rs` without needing per-kind
+//! regexes anywhere.
 
 use iced::advanced::{image as advanced_image, text};
 use iced::widget::{image, markdown};
@@ -38,7 +40,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{LazyLock, Mutex};
 
 use crate::util::media_target;
-use crate::util::{MEDIA_MARKER_RE, UnwrapPoison, file_name_or_path, parse_media_marker};
+use crate::util::{
+    MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, file_name_or_path, parse_media_marker,
+};
 
 /// The `image` crate, aliased because `image` here is iced's widget module.
 use ::image as image_crate;
@@ -75,21 +79,28 @@ fn replace_transcription(s: &str) -> String {
     .to_string()
 }
 
-/// Convert all `[KIND:path]` markers (IMAGE, AUDIO, VIDEO) to their display form
-/// using the canonical [`MEDIA_MARKER_RE`].
+/// Convert all `[KIND:path]` markers (IMAGE, AUDIO, VIDEO, FILE) to their display
+/// form using the canonical [`MEDIA_MARKER_RE`].
 ///
 /// - `[IMAGE:path]` → `![Image](path)` (markdown image syntax — the markdown
 ///   parser will produce `Item::Image` from this)
 /// - `[AUDIO:path]` → 🎵 filename
 /// - `[VIDEO:path]` → 🎬 Video: filename
+/// - `[FILE:path]` → 📄 filename
 fn replace_media_markers(s: &str) -> String {
     MEDIA_MARKER_RE
         .replace_all(s, |caps: &regex::Captures| {
             let (kind, path) = parse_media_marker(caps);
             match kind {
-                "IMAGE" => {
+                MediaMarkerKind::Image => {
                     let p = path.trim();
-                    if p.starts_with("data:") {
+                    if p.starts_with(crate::util::DATA_URI_OMITTED_PREFIX) {
+                        // The byte-count placeholder `util::strip_data_uris` leaves
+                        // in place of an inline data URI is neither a path
+                        // nor a URL: render the same affordance a data URI the
+                        // viewer cannot decode falls back to.
+                        "🖼️ image".to_string()
+                    } else if p.starts_with("data:") {
                         // data-URI: hand off to the viewer, whose cached bounded
                         // decode draws the image or the "🖼️ image" placeholder —
                         // never a broken image. We deliberately do NOT run the
@@ -113,11 +124,18 @@ fn replace_media_markers(s: &str) -> String {
                         caps.get_match().as_str().to_string()
                     }
                 }
-                "AUDIO" => format!("🎵 {}", file_name_or_path(path)),
-                "VIDEO" => format!("🎬 Video: {}", file_name_or_path(path)),
-                // Unreachable for well-formed markers (MEDIA_MARKER_RE only
-                // matches IMAGE|AUDIO|VIDEO), but defend against future changes.
-                _ => caps.get_match().as_str().to_string(),
+                MediaMarkerKind::Audio => format!("🎵 {}", file_name_or_path(path)),
+                MediaMarkerKind::File => {
+                    // A data URI carries no file name: `file_name_or_path` would
+                    // return a chunk of its base64 payload, so name it generically
+                    // instead of dumping the blob into the bubble.
+                    if path.trim().starts_with("data:") {
+                        "📄 file".to_string()
+                    } else {
+                        format!("📄 {}", file_name_or_path(path))
+                    }
+                }
+                MediaMarkerKind::Video => format!("🎬 Video: {}", file_name_or_path(path)),
             }
         })
         .to_string()
@@ -557,6 +575,14 @@ mod tests {
                 format!("Look ![Image]({cleaned_str}) here"),
             ),
             (
+                "renders the omitted-data-URI placeholder as the image affordance, not raw marker text",
+                format!(
+                    "Look [IMAGE:{} (35 bytes)>] here",
+                    crate::util::DATA_URI_OMITTED_PREFIX
+                ),
+                "Look 🖼️ image here".into(),
+            ),
+            (
                 "replaces an audio marker",
                 "Listen [AUDIO:/tmp/recording.ogg]".into(),
                 "Listen 🎵 recording.ogg".into(),
@@ -570,6 +596,16 @@ mod tests {
                 "replaces a video marker",
                 "Watch [VIDEO:/tmp/video.mp4]".into(),
                 "Watch 🎬 Video: video.mp4".into(),
+            ),
+            (
+                "replaces a file marker",
+                "Get [FILE:/tmp/report.pdf]".into(),
+                "Get 📄 report.pdf".into(),
+            ),
+            (
+                "names a data-URI file marker generically instead of dumping its payload",
+                "Get [FILE:data:text/plain;base64,aGVsbG8=]".into(),
+                "Get 📄 file".into(),
             ),
             (
                 "replaces an audio transcription block",

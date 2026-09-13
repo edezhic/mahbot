@@ -117,7 +117,7 @@ pub(crate) fn detect_input_image_rejection(
 fn has_image_marker(content: &str) -> bool {
     crate::util::MEDIA_MARKER_RE
         .captures_iter(content)
-        .any(|caps| crate::util::parse_media_marker(&caps).0 == "IMAGE")
+        .any(|caps| crate::util::parse_media_marker(&caps).0 == crate::util::MediaMarkerKind::Image)
 }
 
 /// Extract the provider's reason from the failure trail, if any.
@@ -178,7 +178,7 @@ pub(crate) fn strip_image_markers(content: &str, reason: Option<&str>) -> String
     let mut last_end = 0usize;
     for caps in crate::util::MEDIA_MARKER_RE.captures_iter(content) {
         let (kind, _) = crate::util::parse_media_marker(&caps);
-        if kind != "IMAGE" {
+        if kind != crate::util::MediaMarkerKind::Image {
             continue;
         }
         let whole = caps.get_match();

@@ -62,13 +62,14 @@ fn normalize_maps_image_marker_inline() {
 }
 
 #[test]
-fn normalize_maps_audio_and_video_markers() {
+fn normalize_maps_audio_video_and_file_markers() {
     assert_eq!(
         normalize_reply_text("[AUDIO:/tmp/a.ogg]"),
         "[Voice message]"
     );
     // Case-insensitive marker recognition.
     assert_eq!(normalize_reply_text("[video:/tmp/v.mp4]"), "[Video]");
+    assert_eq!(normalize_reply_text("[FILE:/tmp/report.pdf]"), "[File]");
 }
 
 #[test]

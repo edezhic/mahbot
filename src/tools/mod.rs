@@ -804,6 +804,7 @@ impl SyncDurableCore {
                         role: caller_role,
                         reply_target: None,
                         pending_job_id: Some(job_id),
+                        originating_workspace: None,
                     }
                 }
             };

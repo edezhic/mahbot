@@ -28,11 +28,43 @@
 //! the auto-checkpoint loop spawned by the binary's background task set).
 //!
 //! A periodic round makes up to three attempts at a store's checkpoint — the
-//! original plus at most two more — for EVERY store, whether or not it carries a
-//! search index. What the engine answers decides the round, arm by arm
-//! ([`periodic_checkpoint_inner`]), and only a genuine failure that no completion
-//! follows stops the service. The exit-time round keeps its single attempt and
-//! never recovers or drains ([`exit_checkpoint`]).
+//! original plus at most two more, spaced by [`CHECKPOINT_RETRY_PAUSE`] — for
+//! EVERY store, whether or not it carries a search index. What the engine answers
+//! decides the round, arm by arm ([`periodic_checkpoint_inner`]). The exit-time
+//! round keeps its single attempt and never recovers or drains
+//! ([`exit_checkpoint`]).
+//!
+//! # A failing round never stops the service by itself
+//!
+//! A genuine failure a completion does not follow opens (or extends) a per-store
+//! *failure window*: the run of consecutive failing rounds the failure has lasted,
+//! with its cumulative attempts and its opening cause. The round warns with the
+//! window's running counts; only a window that has spanned both floors —
+//! [`CHECKPOINT_FAILURE_MIN_ROUNDS`] consecutive rounds AND
+//! [`CHECKPOINT_FAILURE_WINDOW`] of elapsed time — decides the stop, and then once,
+//! filing those cumulative facts in the record. The window is in-memory and bounded,
+//! and its retry pause races the daemon's own shutdown
+//! ([`crate::shutdown::sleep_or_shutdown_or_drain`]), so a round the drain cuts short
+//! decides nothing, and the store that drained the process can leave a sibling store's
+//! open window unfiled.
+//!
+//! The only cure is a completed checkpoint, which closes the window wherever it
+//! happens — first attempt, a retry, or a later round. A round that ends without a
+//! genuine failure closes it too: a blocked or partially folded round is neither a
+//! cure nor a failure, and counting it as failing would let non-consecutive failures
+//! stop the service. The recorded cost of that rule is the mirror case — a store whose
+//! rounds interleave genuine failures with blocked attempts closes its window every
+//! time and keeps serving undecided, since busy-ness keeps its long-standing exemption
+//! from stopping the service.
+//!
+//! Two consequences are deliberate. The classification and the stop rule are
+//! unchanged, so a persistent refusal still exhausts the window and stops the
+//! service: a retry policy cannot tell a transient engine refusal from a persistent
+//! one except by observing whether a later attempt succeeds, and the terminal block
+//! states that limit in as many words. And since no cause and no store is carved out,
+//! EVERY genuine cause — ENOSPC, an I/O error, a removed volume — is served out for
+//! the whole window before the stop: the stop is delayed by the window, never weakened
+//! or dropped.
 //!
 //! The round's only recovery step runs after a first attempt that failed or was
 //! answered busy — whatever held that attempt back, it can be what lets a retry
@@ -44,17 +76,16 @@
 //! attempts: the refusal ends the round, because the gate would refuse another
 //! probe — and what a refusal is and is not is [`crate::db::shrink_gate`]'s to
 //! state. A refusal never stops the service by itself: a round in which nothing
-//! else ran keeps serving, while a genuine failure from an earlier attempt in the
-//! same round still decides that round.
+//! else ran keeps serving and closes any open window, while a genuine failure from
+//! an earlier attempt in the same round still counts that round as a failing one.
 //!
 //! Both rounds and the periodic integrity check record durably: an exit-round
 //! checkpoint failure (which cannot drain or recover) is its own block, and a
 //! failing periodic `quick_check` records a block once per store per process —
 //! every further failing round only warns with the running count, so a persistent
-//! condition cannot append a block every 5 minutes. A checkpoint-failure block is
-//! by contrast filed on every round that reaches it, never deduplicated: such a
-//! round is terminal (it stops the service), so that stop being recorded with its
-//! own cause matters more than a filing rate the drain already bounds.
+//! condition cannot append a block every 5 minutes. The checkpoint block follows
+//! that shape for the same reason: every failing round short of the terminal one
+//! would otherwise file a block 5 minutes apart.
 //!
 //! # Reclaiming checkpoints are gated before they run
 //!
@@ -72,21 +103,24 @@
 //! for a failed checkpoint travels with the checkpoint error — see
 //! [`crate::db::checkpoint_cause`] for how it is obtained and what it costs. The
 //! warn lines print that error's outermost message; the durable record renders the
-//! whole chain. That reason is also the only thing that tells a blocked store —
-//! which never stops the service — from a genuine pager error, which does
+//! whole chain. That reason is also what tells a blocked attempt, which never counts
+//! towards a stop, from a genuine pager error
 //! ([`crate::db::checkpoint_cause::is_blocked_checkpoint`]).
 
 use futures_util::future::{FutureExt, join_all};
+use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::db::failure_record::{self, FailureKind, FailureReport, RoundCounter};
 use crate::db::{
     CheckpointOutcome, Connection, TicketTitleFtsRuntimeRepair, checkpoint_cause, shrink_gate,
 };
+use crate::util::UnwrapPoison;
 
 /// Cap on a store's on-disk `-wal` size (bytes) for the periodic checkpoint
 /// mode. Below the cap the periodic loop runs non-truncating (PASSIVE)
@@ -105,10 +139,23 @@ const DEFAULT_CHECKPOINT_MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;
 /// two more) before it decides, for every store.
 const CHECKPOINT_ATTEMPTS: usize = 3;
 
-/// Pause before retrying a store that answered busy: it could not fold the journal
-/// at that moment, so the retry gives whatever held it back this beat to clear. A
-/// genuine failure is retried immediately — there is nothing to wait for.
-const CHECKPOINT_RETRY_PAUSE: Duration = Duration::from_millis(100);
+/// Real pause before every retry, whichever answer opened it: a retry issued
+/// immediately against the same in-memory engine state is the same attempt again,
+/// so it is worth only what the spacing is worth. Two pauses per round stay far
+/// below the round's 5-minute cadence.
+const CHECKPOINT_RETRY_PAUSE: Duration = Duration::from_secs(1);
+
+/// Consecutive failing rounds a store's failure window must span before a genuine
+/// failure may decide the stop — one failing round never stops a healthy service.
+const CHECKPOINT_FAILURE_MIN_ROUNDS: u64 = 2;
+
+/// Span, since a window's first failure, the window must cover before a genuine
+/// failure may decide the stop: the "several minutes" the rule asks for, made explicit
+/// next to the round count. At the 5-minute cadence [`CHECKPOINT_FAILURE_MIN_ROUNDS`]
+/// alone already spans more than this, so the floor is belt-and-braces — it binds only
+/// for rounds run back to back, which no production path does, and the round's test
+/// seam is where it is exercised.
+const CHECKPOINT_FAILURE_WINDOW: Duration = Duration::from_secs(120);
 
 /// The `record` field's value when the durable block could not be filed: the
 /// whole block already went to stderr (see [`failure_record::record`]).
@@ -462,56 +509,209 @@ async fn exit_checkpoint(
     }
 }
 
-/// The periodic round: the three-attempt loop over the engine's real
-/// checkpoint. `root` is the storage root the failure report is written under.
+/// The periodic round: the attempt loop over the engine's real checkpoint plus
+/// the round's failure-window bookkeeping. `root` is the storage root the failure
+/// report is written under.
 async fn periodic_checkpoint(
     name: &'static str,
     conn: &Connection,
     truncate: bool,
     root: Option<&Path>,
 ) {
-    periodic_checkpoint_inner(name, conn, root, || {
-        checkpoint_attempt(name, conn, truncate, root)
-    })
+    periodic_checkpoint_inner(
+        name,
+        conn,
+        root,
+        CHECKPOINT_RETRY_PAUSE,
+        CHECKPOINT_FAILURE_WINDOW,
+        || checkpoint_attempt(name, conn, truncate, root),
+    )
     .await;
 }
 
-/// The periodic round's attempt loop. Its arms own the round's rule (what each
-/// engine answer means) and [`crate::db::shrink_gate`] owns what a refusal is.
+/// What has accumulated for one store since the failure that opened its window:
+/// the run of consecutive failing rounds a genuine checkpoint failure is decided
+/// on (see the module header). Dropped by the round that closes it.
+#[derive(Clone)]
+struct FailureWindow {
+    /// Consecutive failing rounds counted in this window, the current one
+    /// included.
+    rounds: u64,
+    /// Checkpoint attempts those rounds made, blocked and partial ones included.
+    attempts: u64,
+    /// When the first failure of the window's first round was recorded, for the
+    /// span.
+    since: Instant,
+    /// The engine's own reason for that first failure: the terminal record
+    /// carries the window's cause, not only the deciding round's.
+    first_failure: String,
+}
+
+impl FailureWindow {
+    /// Count one more failing round that made `attempts` attempts.
+    fn extend(&mut self, attempts: u64) {
+        self.rounds += 1;
+        self.attempts += attempts;
+    }
+
+    /// How long the window has been open.
+    fn elapsed(&self) -> Duration {
+        self.since.elapsed()
+    }
+
+    /// True when the window has spanned BOTH floors — the only condition under
+    /// which a genuine failure decides the stop. `span` is the round's span floor.
+    fn exhausted(&self, span: Duration) -> bool {
+        self.rounds >= CHECKPOINT_FAILURE_MIN_ROUNDS && self.elapsed() >= span
+    }
+
+    /// The cumulative facts the terminal record and the terminal log line carry:
+    /// how many attempts the failure took — [`Self::attempts`]'s tally, blocked and
+    /// partial attempts included — and over how long, which is what tells the
+    /// operator a transient condition from a persistent one.
+    fn summary(&self) -> String {
+        format!(
+            "failure window: {} attempts (blocked and partial ones included) over {} consecutive \
+             failing rounds, {:.1}s since the first failure",
+            self.attempts,
+            self.rounds,
+            self.elapsed().as_secs_f64(),
+        )
+    }
+}
+
+/// Open failure windows, keyed by the failing store's own db path: unique per
+/// store file, so two stores — or two tests' temp stores, which share store names
+/// — never share a window.
+static FAILURE_WINDOWS: LazyLock<Mutex<HashMap<PathBuf, FailureWindow>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The window key of the store `conn` has open (see [`FAILURE_WINDOWS`]).
+fn failure_window_key(conn: &Connection) -> PathBuf {
+    conn.db_path().to_path_buf()
+}
+
+/// Count one failing round for `key` and decide it in the same step, under one lock:
+/// the round returns the window's state and whether it is exhausted, so a window can
+/// never be decided while another round is extending it. An exhausted window is spent
+/// and is not put back, so the block it decided is filed once for that window. `key` is
+/// taken by value because it goes back into the map unless the window it decides is
+/// exhausted; `since` and `first_failure` are the round's own first failure, kept only
+/// when this round opens the window; `span` is the round's span floor, so a test can
+/// compress it. Deciding and filing are outside the lock, which only makes two rounds
+/// of the same store race there — and the daemon runs one round per store at a time.
+fn extend_failure_window(
+    key: PathBuf,
+    attempts: u64,
+    since: Instant,
+    first_failure: &str,
+    span: Duration,
+) -> (FailureWindow, bool) {
+    let mut windows = FAILURE_WINDOWS.lock().unwrap_poison();
+    let mut window = windows.remove(&key).unwrap_or_else(|| FailureWindow {
+        rounds: 0,
+        attempts: 0,
+        since,
+        first_failure: first_failure.to_string(),
+    });
+    window.extend(attempts);
+    let exhausted = window.exhausted(span);
+    if !exhausted {
+        windows.insert(key, window.clone());
+    }
+    (window, exhausted)
+}
+
+/// Drop the store's window when a round closes it — a completed checkpoint included
+/// — warning with the cumulative facts it accumulated: a closed window is the whole
+/// trace a failure that did not last leaves (only an exhausted window files a durable
+/// block). Borrows the key, unlike [`extend_failure_window`]: a round that closes never
+/// puts a window back. Returns whether one was open, which is what
+/// [`cure_failure_window`] needs; the round's other closing arms ignore it.
+fn close_failure_window(name: &'static str, key: &Path, reason: &'static str) -> bool {
+    let Some(window) = FAILURE_WINDOWS.lock().unwrap_poison().remove(key) else {
+        return false;
+    };
+    warn!(
+        db = %name,
+        window_attempts = window.attempts,
+        window_rounds = window.rounds,
+        elapsed_ms = window.elapsed().as_millis(),
+        reason,
+        "Checkpoint failure window closed — continuing",
+    );
+    true
+}
+
+/// A completed checkpoint is the cure: close the store's window if one is open and
+/// warn with its cumulative facts. A round that had no window to close still warns
+/// when it recorded genuine failures of its own — the completion is only a DEBUG line
+/// and the log store retains INFO, so this warning is the whole trace a cured round
+/// leaves. A plain healthy completion logs nothing but that DEBUG line.
+fn cure_failure_window(name: &'static str, key: &Path, round_failures: usize) {
+    if !close_failure_window(name, key, "a completed checkpoint") && round_failures > 0 {
+        warn!(
+            db = %name,
+            round_failures,
+            "Checkpoint completed on a retry after a genuine failure — continuing",
+        );
+    }
+}
+
+/// The periodic round's decision table: its arms own what each engine answer means
+/// and [`crate::db::shrink_gate`] owns what a refusal is.
 ///
 /// `attempt` is a parameter because this decision table has to be exercised
 /// without an engine-side failing checkpoint, which is not reproducible
-/// hermetically (see [`crate::db::checkpoint_cause`]): [`periodic_checkpoint`]
-/// is the single caller and always passes the gate + engine attempt. It is the
-/// round's only seam, and nothing outside this module can reach it.
+/// hermetically (see [`crate::db::checkpoint_cause`]): [`periodic_checkpoint`] is
+/// the single caller and always passes the gate + engine attempt. It, and the two
+/// timing parameters — `retry_pause`, the real pause before a retry, and `span`, how
+/// long a store's failure window must have been open — are the round's only seam: the
+/// tests compress both, production passes the two constants. Nothing outside this
+/// module can reach it, which is also where the failure window's whole rule is
+/// verified: that a real failure on a *healthy* store would have been cured by a
+/// later attempt is not end-to-end observable, only that the later attempt is made.
 ///
 /// The attempt future is `Send` because the periodic round runs inside the
 /// process's spawned task set.
+#[expect(clippy::too_many_lines)] // one arm per engine answer, each owning its own window step, reads as one flow
 async fn periodic_checkpoint_inner<'a, Fut>(
     name: &'static str,
     conn: &'a Connection,
     root: Option<&Path>,
+    retry_pause: Duration,
+    span: Duration,
     mut attempt: impl FnMut() -> Fut,
 ) where
     Fut: Future<Output = Attempted> + Send + 'a,
 {
+    let key = failure_window_key(conn);
     let mut failures: Vec<(usize, anyhow::Error)> = Vec::new();
     let mut repair: Option<TicketTitleFtsRuntimeRepair> = None;
+    let mut attempts_made = 0u64;
+    // When this round's first genuine failure was seen (the round has no other use
+    // for it): the instant a window it opens must be dated from, not the round's end.
+    let mut first_failure_at: Option<Instant> = None;
     for attempt_no in 1..=CHECKPOINT_ATTEMPTS {
-        let mut answered_busy = false;
         match attempt().await {
             // A refusal is never an attempt: the gate recorded it and no checkpoint
             // was issued. It never stops the service by itself, so with no genuine
-            // failure the round ends here.
+            // failure the round ends here — and closes the window, because a round
+            // without a failure must not be counted as a failing one.
             Attempted::ShrinkRefused => {
                 if failures.is_empty() {
+                    close_failure_window(
+                        name,
+                        &key,
+                        "round ended on a refused shrink with no failure",
+                    );
                     return;
                 }
                 break;
             }
-            // A completed checkpoint keeps the service serving, on any attempt: this
-            // completion — never the repair's returned outcome — is what cures a
-            // round whose earlier attempts failed.
+            // A completed checkpoint keeps the service serving, on any attempt and in
+            // any round: this completion — never the repair's returned outcome — is
+            // what cures a failure, wherever the failure was recorded.
             Attempted::Ran(Ok(o)) if o.is_complete() => {
                 debug!(
                     db = %name,
@@ -519,22 +719,18 @@ async fn periodic_checkpoint_inner<'a, Fut>(
                     checkpointed = o.checkpointed_frames,
                     "Database WAL checkpointed",
                 );
-                if !failures.is_empty() {
-                    info!(
-                        db = %name,
-                        "Checkpoint completed on a retry after a genuine failure — continuing"
-                    );
-                }
+                cure_failure_window(name, &key, failures.len());
                 return;
             }
             // Not a completion, so a partially folded journal: normal — a reader
             // (this process's own reads included) capped how far the fold could go.
-            // The round does nothing about it: no retry, no record, no warning, just
-            // an INFO line (the level the log store retains). With no genuine failure
-            // pending it ends the round; after one, the retries it opened still run. A
-            // busy flag cannot ride a successful statement — the engine reports a
-            // blocked store as the error below — so this arm is the whole
-            // non-completion case.
+            // The round does nothing about it: no retry, no record, just an INFO line
+            // (the level the log store retains) — and with no genuine failure pending
+            // it ends the round, closing any window an earlier round opened, because a
+            // round that did not fail must not be counted as a failing one. After a
+            // genuine failure the retries it opened still run. A busy flag cannot ride
+            // a successful statement — the engine reports a blocked attempt as the error
+            // below — so this arm is the whole non-completion case.
             Attempted::Ran(Ok(o)) => {
                 info!(
                     db = %name,
@@ -543,51 +739,94 @@ async fn periodic_checkpoint_inner<'a, Fut>(
                     "Checkpoint folded the journal partially",
                 );
                 if failures.is_empty() {
+                    close_failure_window(name, &key, "round folded partially with no failure");
                     return;
                 }
             }
-            // The engine's blocked answer: retried like a busy one, told from a
+            // A blocked attempt: retried like any failure, told from a
             // genuine pager error by the reason it carries (see
             // [`crate::db::checkpoint_cause`]). A store that stays blocked through the
             // budget keeps serving with its journal unfolded — the accepted trade for
             // never stopping on busy-ness — so its WAL keeps growing until it
             // unblocks.
             Attempted::Ran(Err(e)) if checkpoint_cause::is_blocked_checkpoint(&e) => {
-                answered_busy = true;
                 info!(attempt = attempt_no, error = %e, db = %name, "Checkpoint blocked — retrying");
             }
-            // A genuine failure: kept for the report, retried immediately, and — when
-            // nothing completes anywhere in the round — the reason the service stops.
+            // A genuine failure: kept for the report, retried after the pause, and —
+            // when the failure window is exhausted — the reason the service stops.
             Attempted::Ran(Err(e)) => {
                 warn!(attempt = attempt_no, error = %e, db = %name, "Failed to checkpoint database WAL");
+                first_failure_at.get_or_insert_with(Instant::now);
                 failures.push((attempt_no, e));
             }
         }
+        attempts_made += 1;
         // The runtime FTS repair runs here, after a first attempt that failed or was
         // answered busy; its outcome is reported, never used to decide.
         if attempt_no == 1 {
             repair = Some(crate::db::repair_ticket_title_fts_runtime(conn).await);
         }
         // Every iteration that reaches here leads to a retry (a completion and a
-        // lone partial fold return, a refusal breaks); only a busy answer asks for
-        // the pause first.
-        if attempt_no < CHECKPOINT_ATTEMPTS && answered_busy {
-            tokio::time::sleep(CHECKPOINT_RETRY_PAUSE).await;
+        // lone partial fold return, a refusal breaks), and the retry is spaced in
+        // real time — never issued back to back against the same in-memory engine
+        // state. The pause races the daemon's own shutdown, so a round the shutdown
+        // or drain cut short decides nothing: the window is left exactly as it was,
+        // and this round's failures reach no window at all, because a drain means the
+        // process is on its way out and a window is a claim about one that keeps
+        // serving.
+        if attempt_no < CHECKPOINT_ATTEMPTS
+            && !crate::shutdown::sleep_or_shutdown_or_drain(retry_pause).await
+        {
+            warn!(
+                db = %name,
+                round_attempts = attempts_made,
+                "Checkpoint round cut short by the daemon's own shutdown — failure window not decided",
+            );
+            return;
         }
     }
-    // The budget ran out with nothing but busy answers (a partially folded one
-    // returns above): not a failure, nothing to record, nothing to warn about — the
-    // next round tries again.
+    // The budget ran out with nothing but blocked/partial answers (a lone one
+    // returns above): not a failure, nothing to record — the next round tries again,
+    // and any window an earlier round opened closes here, because a round that did
+    // not fail must not count as a failing one.
     if failures.is_empty() {
         info!(db = %name, "Checkpoint round ended without a completion — continuing");
+        close_failure_window(name, &key, "round ended without a failure or a completion");
         return;
     }
-    // No completion anywhere in the round and at least one genuine failure: this is
-    // the stop. The report is written (synchronously) before the drain, and the
-    // round's repair outcome has no say in it. Nothing restarts the process after it
-    // and the app shows no reason of its own for it, so this record and the log line
-    // below are the operator's only trace.
-    let report = build_failure_report(name, &failures, repair.as_ref(), conn).await;
+    // The window records the failure that opened it: this round's first, which the
+    // terminal block also renders as its `checkpoint error:` line.
+    let (_, first) = failures
+        .first()
+        .expect("the window is only extended after a failed attempt");
+    let first_failure = format!("{first:#}");
+    let (window, exhausted) = extend_failure_window(
+        key,
+        attempts_made,
+        first_failure_at.expect("a failed attempt set the round's first failure instant"),
+        &first_failure,
+        span,
+    );
+    // Not yet terminal: one failing round never stops a healthy service. Warnings
+    // only — the durable block is filed once, when the window is exhausted and the
+    // stop is decided.
+    if !exhausted {
+        warn!(
+            db = %name,
+            round_attempts = attempts_made,
+            window_attempts = window.attempts,
+            window_rounds = window.rounds,
+            elapsed_ms = window.elapsed().as_millis(),
+            "Genuine checkpoint failure with no completion — failure window not exhausted, continuing",
+        );
+        return;
+    }
+    // The window is exhausted: this is the stop. The report is written
+    // (synchronously) before the drain, and the round's repair outcome has no say in
+    // it. Nothing restarts the process after it and the app shows no reason of its
+    // own for it, so this record and the log line below are the operator's only
+    // trace.
+    let report = build_failure_report(name, &failures, repair.as_ref(), &window, conn).await;
     let pointer = failure_record::recorded_pointer(
         "checkpoint failure",
         failure_record::record(root, &report.render()),
@@ -595,7 +834,11 @@ async fn periodic_checkpoint_inner<'a, Fut>(
     error!(
         db = %name,
         record = pointer.as_deref().unwrap_or(BLOCK_ON_STDERR),
-        "Genuine checkpoint failure with no completion — recorded, initiating graceful shutdown",
+        window_attempts = window.attempts,
+        window_rounds = window.rounds,
+        elapsed_ms = window.elapsed().as_millis(),
+        "Genuine checkpoint failure with no completion across the failure window — recorded, \
+         initiating graceful shutdown",
     );
     crate::shutdown::drain_begin();
 }
@@ -696,6 +939,7 @@ async fn build_failure_report(
     name: &'static str,
     failures: &[(usize, anyhow::Error)],
     repair: Option<&TicketTitleFtsRuntimeRepair>,
+    window: &FailureWindow,
     conn: &Connection,
 ) -> FailureReport {
     // The checkpoint error is the report's reason, rendered as its own
@@ -708,6 +952,8 @@ async fn build_failure_report(
     // so no number is claimed here.
     let mut report = FailureReport::new(FailureKind::CheckpointFailure)
         .store(name)
+        // The environment note is the deciding round's: its failures are what the
+        // block renders in full, and the window's opening cause is kept as text.
         .environment(
             failures
                 .iter()
@@ -719,10 +965,29 @@ async fn build_failure_report(
     let (_, first) = failures
         .first()
         .expect("a failure report is built only after a failed attempt");
-    report = report.extra(format!("checkpoint error: {first:#}"));
+    let cause = format!("{first:#}");
+    report = report.extra(format!("checkpoint error: {cause}"));
     for (attempt_no, e) in failures.iter().skip(1) {
         report = report.extra(format!("attempt {attempt_no} error: {e:#}"));
     }
+    // The window's own cause and cumulative facts: this block is the only record of
+    // the earlier failing rounds (they warn only), and what tells a reader whether
+    // the failure was transient or persistent. The cause that opened the window is
+    // carried only when it differs from this round's — usually it is the same chain,
+    // and a duplicate buys nothing. The retry policy's stated limit belongs with the
+    // facts, because the stop it decided is otherwise implicit.
+    if window.first_failure != cause {
+        report = report.extra(format!(
+            "window first failure error: {}",
+            window.first_failure
+        ));
+    }
+    report = report.extra(window.summary());
+    report = report.extra(
+        "retry policy: a transient engine refusal cannot be told from a persistent one except by \
+         whether a later attempt succeeds — a persistent refusal exhausts this window and the \
+         service still stops, by design",
+    );
     let repair = repair.expect("the round runs the repair before it can report");
     report = report.extra(format!("repair outcome: {}", repair.summary()));
     report = report.extra(
@@ -791,6 +1056,72 @@ mod tests {
             "engine cause: {}",
             checkpoint_cause::BLOCKED_REASON
         ))
+    }
+
+    /// The retry pause the round's tests use: none, so a round's retries are instant.
+    const TEST_PAUSE: Duration = Duration::ZERO;
+
+    /// Whether the store `conn` has open currently carries an open failure window.
+    fn window_open(conn: &Connection) -> bool {
+        FAILURE_WINDOWS
+            .lock()
+            .unwrap_poison()
+            .contains_key(&failure_window_key(conn))
+    }
+
+    /// [`CHECKPOINT_FAILURE_MIN_ROUNDS`] as the number of failing rounds a test runs
+    /// to exhaust a store's window.
+    fn window_rounds() -> usize {
+        usize::try_from(CHECKPOINT_FAILURE_MIN_ROUNDS)
+            .expect("the failure window's round floor fits a usize")
+    }
+
+    /// Run `rounds` failing periodic rounds for the store — every attempt answered
+    /// with `error` — and return the total attempts made.
+    async fn failing_rounds(
+        name: &'static str,
+        conn: &Connection,
+        root: &Path,
+        rounds: usize,
+        error: &str,
+        retry_pause: Duration,
+        span: Duration,
+    ) -> usize {
+        let error = error.to_string();
+        rounds_with_answers(name, conn, root, rounds, retry_pause, span, move |_| {
+            let error = error.clone();
+            async move { Attempted::Ran(Err(anyhow::anyhow!(error))) }
+        })
+        .await
+    }
+
+    /// Run `rounds` periodic rounds for the store, each attempt answered by
+    /// `answer(attempt_no)` — what every test that varies the engine's answer per
+    /// attempt drives its rounds through — and return the total attempts made.
+    async fn rounds_with_answers<A, Fut>(
+        name: &'static str,
+        conn: &Connection,
+        root: &Path,
+        rounds: usize,
+        retry_pause: Duration,
+        span: Duration,
+        mut answer: A,
+    ) -> usize
+    where
+        A: FnMut(usize) -> Fut,
+        Fut: Future<Output = Attempted> + Send,
+    {
+        let mut attempts = 0usize;
+        for _ in 0..rounds {
+            let mut attempt_no = 0usize;
+            periodic_checkpoint_inner(name, conn, Some(root), retry_pause, span, || {
+                attempt_no += 1;
+                attempts += 1;
+                answer(attempt_no)
+            })
+            .await;
+        }
+        attempts
     }
 
     /// An exit-round checkpoint failure is recorded durably — the exit path can
@@ -938,8 +1269,8 @@ mod tests {
     /// A checkpoint failure on a store whose title FTS index was corrupted is
     /// recovered: the FTS index is rebuilt (from the known DDL) and the next
     /// attempt completes a checkpoint, so the service continues serving — the
-    /// completion is the cure, and the rebuild merely happens to be what made one
-    /// possible.
+    /// completion is the cure (it also closes the store's failure window, were one
+    /// open), and the rebuild merely happens to be what made one possible.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn failed_checkpoint_with_broken_fts_repairs_and_retries() {
@@ -958,18 +1289,25 @@ mod tests {
         // The first attempt fails; the repair runs between it and the second,
         // which is a real checkpoint (TRUNCATE, single-writer test env).
         let mut attempt_no = 0;
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
-            attempt_no += 1;
-            let n = attempt_no;
-            let conn = conn.clone();
-            async move {
-                Attempted::Ran(if n == 1 {
-                    Err(anyhow::anyhow!("injected checkpoint failure"))
-                } else {
-                    conn.checkpoint_ungated().await
-                })
-            }
-        })
+        periodic_checkpoint_inner(
+            "core",
+            &conn,
+            Some(tmp.path()),
+            TEST_PAUSE,
+            Duration::ZERO,
+            || {
+                attempt_no += 1;
+                let n = attempt_no;
+                let conn = conn.clone();
+                async move {
+                    Attempted::Ran(if n == 1 {
+                        Err(anyhow::anyhow!("injected checkpoint failure"))
+                    } else {
+                        conn.checkpoint_ungated().await
+                    })
+                }
+            },
+        )
         .await;
         assert_eq!(
             attempt_no, 2,
@@ -1010,34 +1348,42 @@ mod tests {
         );
     }
 
-    /// The repair rebuilt the index and every attempt still failed: the failure
-    /// report is written to error.log with its real cause, and the service stops
-    /// — a rebuilt index does not exempt the round, because no attempt completed
-    /// a checkpoint.
+    /// The repair rebuilt the index and every attempt of every failing round still
+    /// failed: once the window is exhausted the report is written to error.log with
+    /// its real cause, and the service stops — a rebuilt index does not exempt the
+    /// store, because no attempt completed a checkpoint.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn a_rebuilt_index_does_not_exempt_a_persistently_failing_round() {
         crate::shutdown::drain_clear();
         let tmp = tempfile::TempDir::new().unwrap();
         let conn = a_store_with_a_corrupt_fts_index(tmp.path()).await;
+        let store = &conn;
 
-        let mut attempt_no = 0;
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
-            attempt_no += 1;
-            let n = attempt_no;
-            async move {
-                let message = if n == 1 {
-                    "injected checkpoint failure"
-                } else {
-                    "injected persistent failure"
-                };
-                Attempted::Ran(Err(anyhow::anyhow!(message)))
-            }
-        })
+        let rounds = window_rounds();
+        let total_attempts = rounds_with_answers(
+            "core",
+            store,
+            tmp.path(),
+            rounds,
+            TEST_PAUSE,
+            Duration::ZERO,
+            |attempt_no| async move {
+                // Each round's first attempt corrupts the index again: the round's own
+                // repair is what rebuilds it, so the deciding round repairs a corrupted
+                // index exactly as its predecessors did.
+                if attempt_no == 1 {
+                    store.execute_batch(&fts_corruption_ddl()).await.unwrap();
+                    return Attempted::Ran(Err(anyhow::anyhow!("injected checkpoint failure")));
+                }
+                Attempted::Ran(Err(anyhow::anyhow!("injected persistent failure")))
+            },
+        )
         .await;
         assert_eq!(
-            attempt_no, CHECKPOINT_ATTEMPTS,
-            "a persistent failure must run every attempt before the round decides"
+            total_attempts,
+            CHECKPOINT_ATTEMPTS * rounds,
+            "a persistent failure must run every attempt of every round before the window decides"
         );
 
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
@@ -1060,10 +1406,11 @@ mod tests {
         crate::shutdown::drain_clear();
     }
 
-    /// A genuine failure, a repair that rebuilt the index, and attempts that
-    /// follow it folding the journal only part of the way: the round still stops —
-    /// a partially folded journal is not a completion, it does not cut the
-    /// failure's budget short, and the repair's outcome decides nothing.
+    /// A genuine failure, the round's repair on a store whose title FTS index was
+    /// corrupted, and attempts that follow it folding the journal only part of the
+    /// way: the round still counts as a failing one, and consecutive failing rounds
+    /// stop the service — a partially folded attempt is not a completion, it does
+    /// not cut the round's budget short, and the repair's outcome decides nothing.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn a_rebuilt_index_does_not_exempt_a_partial_retry() {
@@ -1071,27 +1418,34 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let conn = a_store_with_a_corrupt_fts_index(tmp.path()).await;
 
-        let mut attempt_no = 0;
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
-            attempt_no += 1;
-            let n = attempt_no;
-            async move {
-                if n == 1 {
+        let rounds = window_rounds();
+        let total_attempts = rounds_with_answers(
+            "core",
+            &conn,
+            tmp.path(),
+            rounds,
+            TEST_PAUSE,
+            Duration::ZERO,
+            |attempt_no| {
+                let answer = if attempt_no == 1 {
                     Attempted::Ran(Err(anyhow::anyhow!("injected checkpoint failure")))
                 } else {
+                    // A partially folded journal: not a completion, not a failure.
                     Attempted::Ran(Ok(CheckpointOutcome {
                         busy: false,
                         log_frames: 5,
                         checkpointed_frames: 1,
                     }))
-                }
-            }
-        })
+                };
+                async move { answer }
+            },
+        )
         .await;
 
         assert_eq!(
-            attempt_no, CHECKPOINT_ATTEMPTS,
-            "a partially folded attempt must not cut the failure's budget short"
+            total_attempts,
+            CHECKPOINT_ATTEMPTS * rounds,
+            "a partially folded attempt must not cut a failing round's budget short"
         );
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
         assert!(
@@ -1107,10 +1461,12 @@ mod tests {
 
     /// The round both repair variants below are run through: failing attempts and a
     /// completion on the last one. The service must serve and nothing may be filed —
-    /// whatever the round's repair returned.
+    /// the cure is the completion itself, since no failure window is open here (only a
+    /// round that ends with a failure opens one) — whatever the round's repair
+    /// returned.
     async fn a_round_cured_by_its_last_attempt(conn: &Connection, root: &Path) {
         let mut attempt_no = 0;
-        periodic_checkpoint_inner("core", conn, Some(root), || {
+        periodic_checkpoint_inner("core", conn, Some(root), TEST_PAUSE, Duration::ZERO, || {
             attempt_no += 1;
             let n = attempt_no;
             async move {
@@ -1190,24 +1546,31 @@ mod tests {
         a_round_cured_by_its_last_attempt(&conn, tmp.path()).await;
     }
 
-    /// A store with no ticket-title FTS index (repair is NotApplicable) still
-    /// gets all three attempts, writes error.log and begins the drain; an
-    /// environment-caused checkpoint error is marked as such in the record.
+    /// A store with no ticket-title FTS index (repair is NotApplicable) still gets
+    /// all three attempts on every failing round, and once the window is exhausted
+    /// it writes error.log and begins the drain; an environment-caused checkpoint
+    /// error is marked as such in the record.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn checkpoint_failure_without_fts_store_writes_error_log_and_drains() {
         crate::shutdown::drain_clear();
         let (tmp, conn) = temp_store("core").await;
 
-        let mut attempts = 0usize;
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
-            attempts += 1;
-            async { Attempted::Ran(Err(anyhow::anyhow!("no space left on device"))) }
-        })
+        let rounds = window_rounds();
+        let attempts = failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            rounds,
+            "no space left on device",
+            TEST_PAUSE,
+            Duration::ZERO,
+        )
         .await;
         assert_eq!(
-            attempts, CHECKPOINT_ATTEMPTS,
-            "every store gets all three attempts, indexed or not"
+            attempts,
+            CHECKPOINT_ATTEMPTS * rounds,
+            "every store gets all three attempts of every failing round, indexed or not"
         );
 
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
@@ -1227,8 +1590,9 @@ mod tests {
     }
 
     /// A store whose ticket-title index is present and healthy still gets all
-    /// three attempts, and a persistent failure still stops the service: the
-    /// attempts are never gated on what the repair applies or what it returns.
+    /// three attempts on every failing round, and a persistent failure still stops
+    /// the service once the window is exhausted: the attempts are never gated on
+    /// what the repair applies or what it returns.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn a_healthy_index_store_gets_all_three_attempts_and_stops() {
@@ -1239,15 +1603,21 @@ mod tests {
             .expect("open the consolidated store");
         insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
 
-        let mut attempts = 0usize;
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
-            attempts += 1;
-            async { Attempted::Ran(Err(anyhow::anyhow!("injected checkpoint failure"))) }
-        })
+        let rounds = window_rounds();
+        let attempts = failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            rounds,
+            "injected checkpoint failure",
+            TEST_PAUSE,
+            Duration::ZERO,
+        )
         .await;
         assert_eq!(
-            attempts, CHECKPOINT_ATTEMPTS,
-            "an indexed store gets every attempt too",
+            attempts,
+            CHECKPOINT_ATTEMPTS * rounds,
+            "an indexed store gets every attempt of every failing round too",
         );
 
         let body = std::fs::read_to_string(tmp.path().join("error.log")).expect("error.log");
@@ -1271,16 +1641,23 @@ mod tests {
         let (tmp, conn) = temp_store("core").await;
 
         let mut attempts = 0usize;
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
-            attempts += 1;
-            async {
-                Attempted::Ran(Ok(CheckpointOutcome {
-                    busy: false,
-                    log_frames: 5,
-                    checkpointed_frames: 1,
-                }))
-            }
-        })
+        periodic_checkpoint_inner(
+            "core",
+            &conn,
+            Some(tmp.path()),
+            TEST_PAUSE,
+            Duration::ZERO,
+            || {
+                attempts += 1;
+                async {
+                    Attempted::Ran(Ok(CheckpointOutcome {
+                        busy: false,
+                        log_frames: 5,
+                        checkpointed_frames: 1,
+                    }))
+                }
+            },
+        )
         .await;
 
         assert_eq!(
@@ -1307,10 +1684,17 @@ mod tests {
         let (tmp, conn) = temp_store("core").await;
 
         let mut attempts = 0usize;
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
-            attempts += 1;
-            async { Attempted::Ran(Err(blocked_checkpoint_error())) }
-        })
+        periodic_checkpoint_inner(
+            "core",
+            &conn,
+            Some(tmp.path()),
+            TEST_PAUSE,
+            Duration::ZERO,
+            || {
+                attempts += 1;
+                async { Attempted::Ran(Err(blocked_checkpoint_error())) }
+            },
+        )
         .await;
 
         assert_eq!(
@@ -1330,25 +1714,30 @@ mod tests {
     /// A round whose first genuine failure comes after a busy attempt records it on
     /// the long-standing `checkpoint error:` line with no number on it — a busy
     /// attempt leaves no line of its own — while the failures that follow keep their
-    /// own `attempt N error:` lines.
+    /// own `attempt N error:` lines. Every failing round repeats the pattern until
+    /// the window is exhausted.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn a_busy_attempt_before_a_failure_leaves_the_cause_line_unmarked() {
         crate::shutdown::drain_clear();
         let (tmp, conn) = temp_store("core").await;
 
-        let mut attempt_no = 0usize;
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
-            attempt_no += 1;
-            let n = attempt_no;
-            async move {
-                if n == 1 {
+        rounds_with_answers(
+            "core",
+            &conn,
+            tmp.path(),
+            window_rounds(),
+            TEST_PAUSE,
+            Duration::ZERO,
+            |attempt_no| {
+                let answer = if attempt_no == 1 {
                     Attempted::Ran(Err(blocked_checkpoint_error()))
                 } else {
                     Attempted::Ran(Err(anyhow::anyhow!("injected checkpoint failure")))
-                }
-            }
-        })
+                };
+                async move { answer }
+            },
+        )
         .await;
 
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
@@ -1368,33 +1757,41 @@ mod tests {
         crate::shutdown::drain_clear();
     }
 
-    /// A genuine failure followed by attempts the engine answers busy still stops:
-    /// busy is not a completion, the failure's budget runs to its end, and the
-    /// round's failure is the record's cause. Busy-ness never stops the service by
-    /// itself, but it does not erase a genuine failure either.
+    /// A genuine failure followed by attempts the engine answers busy still counts
+    /// the round as failing: busy is not a completion, the round's budget runs to
+    /// its end, and once the window is exhausted the round's failure is the record's
+    /// cause and the service stops. Busy-ness never stops the service by itself, but
+    /// it does not erase a genuine failure either.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn a_failure_followed_by_busy_attempts_still_stops() {
         crate::shutdown::drain_clear();
         let (tmp, conn) = temp_store("core").await;
 
-        let mut attempt_no = 0usize;
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
-            attempt_no += 1;
-            let n = attempt_no;
-            async move {
-                if n == 1 {
+        let rounds = window_rounds();
+        let attempts = rounds_with_answers(
+            "core",
+            &conn,
+            tmp.path(),
+            rounds,
+            TEST_PAUSE,
+            Duration::ZERO,
+            |attempt_no| {
+                let answer = if attempt_no == 1 {
                     Attempted::Ran(Err(anyhow::anyhow!("injected checkpoint failure")))
                 } else {
                     Attempted::Ran(Err(blocked_checkpoint_error()))
-                }
-            }
-        })
+                };
+                async move { answer }
+            },
+        )
         .await;
 
         assert_eq!(
-            attempt_no, CHECKPOINT_ATTEMPTS,
-            "a busy attempt must not cut a genuine failure's budget short"
+            attempts,
+            CHECKPOINT_ATTEMPTS * rounds,
+            "a busy attempt must not cut a genuine failure's budget short — every attempt of every \
+             failing round must run"
         );
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
         assert!(
@@ -1411,25 +1808,30 @@ mod tests {
     /// A round with a gap — a busy attempt between two failures — still records the
     /// failures it has: the first keeps the long-standing unmarked `checkpoint
     /// error:` line, the later ones carry their own attempt number, and the attempt
-    /// that produced no error contributes no line.
+    /// that produced no error contributes no line. Every failing round repeats the
+    /// pattern until the window is exhausted.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn the_report_numbers_each_failure_after_the_first() {
         crate::shutdown::drain_clear();
         let (tmp, conn) = temp_store("core").await;
 
-        let mut attempt_no = 0usize;
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
-            attempt_no += 1;
-            let n = attempt_no;
-            async move {
-                match n {
+        rounds_with_answers(
+            "core",
+            &conn,
+            tmp.path(),
+            window_rounds(),
+            TEST_PAUSE,
+            Duration::ZERO,
+            |attempt_no| {
+                let answer = match attempt_no {
                     1 => Attempted::Ran(Err(anyhow::anyhow!("injected first failure"))),
                     2 => Attempted::Ran(Err(blocked_checkpoint_error())),
                     _ => Attempted::Ran(Err(anyhow::anyhow!("injected third failure"))),
-                }
-            }
-        })
+                };
+                async move { answer }
+            },
+        )
         .await;
 
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
@@ -1453,25 +1855,32 @@ mod tests {
         crate::shutdown::drain_clear();
     }
 
-    /// A panicking attempt is a failed attempt: the round makes all three
-    /// attempts, files the panic as the reason, and drains.
+    /// A panicking attempt is a failed attempt: every round makes all three
+    /// attempts, files the panic as the reason, and once the window is exhausted the
+    /// service drains.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
-    async fn a_panicking_attempt_is_a_failed_attempt_and_stops_after_three() {
+    async fn a_panicking_attempt_is_a_failed_attempt_and_stops_after_the_window() {
         crate::shutdown::drain_clear();
         let (tmp, conn) = temp_store("core").await;
 
-        let mut attempts = 0usize;
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
-            attempts += 1;
-            async {
+        let rounds = window_rounds();
+        let attempts = rounds_with_answers(
+            "core",
+            &conn,
+            tmp.path(),
+            rounds,
+            TEST_PAUSE,
+            Duration::ZERO,
+            |_| async {
                 Attempted::Ran(guarded_checkpoint(async { panic!("injected attempt panic") }).await)
-            }
-        })
+            },
+        )
         .await;
         assert_eq!(
-            attempts, CHECKPOINT_ATTEMPTS,
-            "a panic is a failed attempt, so every attempt must run"
+            attempts,
+            CHECKPOINT_ATTEMPTS * rounds,
+            "a panic is a failed attempt, so every attempt of every round must run"
         );
         assert!(
             crate::shutdown::is_draining(),
@@ -1511,7 +1920,7 @@ mod tests {
         let conn_ref = &conn;
 
         let mut attempts = 0usize;
-        periodic_checkpoint_inner(name, &conn, Some(path), || {
+        periodic_checkpoint_inner(name, &conn, Some(path), TEST_PAUSE, Duration::ZERO, || {
             attempts += 1;
             checkpoint_attempt(name, conn_ref, true, Some(path))
         })
@@ -1577,30 +1986,38 @@ mod tests {
     }
 
     /// A refusal on a retry is not an attempt and never the reason the service
-    /// stops — but the genuine failure of an earlier attempt in the same round
-    /// still stops it, so the stop rule is not weakened.
+    /// stops — but the genuine failure of an earlier attempt in the same round still
+    /// counts that round as failing, and consecutive failing rounds stop the
+    /// service, so the stop rule is not weakened.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn a_refusal_on_a_retry_still_stops_on_the_rounds_real_failure() {
         crate::shutdown::drain_clear();
         let (tmp, conn) = temp_store("core").await;
 
-        let mut attempt_no = 0usize;
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), || {
-            attempt_no += 1;
-            let n = attempt_no;
-            async move {
-                if n == 1 {
+        let rounds = window_rounds();
+        let attempts = rounds_with_answers(
+            "core",
+            &conn,
+            tmp.path(),
+            rounds,
+            TEST_PAUSE,
+            Duration::ZERO,
+            |attempt_no| {
+                let answer = if attempt_no == 1 {
                     Attempted::Ran(Err(anyhow::anyhow!("injected checkpoint failure")))
                 } else {
                     Attempted::ShrinkRefused
-                }
-            }
-        })
+                };
+                async move { answer }
+            },
+        )
         .await;
         assert_eq!(
-            attempt_no, 2,
-            "the round stops at the refusal instead of retrying forever"
+            attempts,
+            2 * rounds,
+            "every failing round must stop at the refusal instead of retrying forever — the total \
+             is the failure and the refusal of each round"
         );
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
         assert!(
@@ -1615,6 +2032,404 @@ mod tests {
         assert!(
             crate::shutdown::is_draining(),
             "the round's real failure must still stop the service"
+        );
+        crate::shutdown::drain_clear();
+    }
+
+    /// One failing round warns and never stops the service: it makes its whole
+    /// attempt budget, leaves the store's window open, and files nothing — a single
+    /// failing round is not evidence enough to stop a healthy service.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn a_single_failing_round_warns_and_never_stops() {
+        crate::shutdown::drain_clear();
+        let (tmp, conn) = temp_store("core").await;
+
+        let attempts = failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            1,
+            "injected checkpoint failure",
+            TEST_PAUSE,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(
+            attempts, CHECKPOINT_ATTEMPTS,
+            "one failing round must still make its whole attempt budget"
+        );
+        assert!(
+            !crate::shutdown::is_draining(),
+            "one failing round must never stop the service"
+        );
+        assert!(
+            window_open(&conn),
+            "one failing round must open the store's failure window"
+        );
+        assert!(
+            !tmp.path().join("error.log").exists(),
+            "a window that is not exhausted must file no failure block"
+        );
+    }
+
+    /// The second consecutive failing round exhausts the window (the fixture's span
+    /// is zero) and stops the service with the window's cumulative facts: the
+    /// deciding round's failures and the attempts and rounds the whole window took.
+    /// The round's cause is the one that opened the window, so the record does not
+    /// repeat it as the window's opening cause.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn the_second_consecutive_failing_round_stops_with_the_windows_cumulative_facts() {
+        crate::shutdown::drain_clear();
+        let (tmp, conn) = temp_store("core").await;
+
+        let rounds = window_rounds();
+        let attempts = failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            rounds,
+            "injected checkpoint failure",
+            TEST_PAUSE,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(
+            attempts,
+            CHECKPOINT_ATTEMPTS * rounds,
+            "a persistent failure must run every attempt of every round before the window decides"
+        );
+        assert!(
+            crate::shutdown::is_draining(),
+            "an exhausted window must stop the service"
+        );
+
+        let body = std::fs::read_to_string(tmp.path().join("error.log")).expect("error.log");
+        for needle in [
+            "MahBot checkpoint failure",
+            "checkpoint error: injected checkpoint failure",
+            "retry policy:",
+        ] {
+            assert!(
+                body.contains(needle),
+                "error.log must contain {needle:?}: {body}"
+            );
+        }
+        assert!(
+            !body.contains("window first failure error:"),
+            "the opening cause is not repeated when it is the deciding round's own: {body}"
+        );
+        let summary = format!(
+            "failure window: {} attempts (blocked and partial ones included) over {} consecutive \
+             failing rounds",
+            CHECKPOINT_ATTEMPTS * rounds,
+            rounds,
+        );
+        assert!(
+            body.contains(&summary),
+            "the record must carry the window's cumulative attempts and rounds — {summary:?}: {body}"
+        );
+        assert!(
+            !window_open(&conn),
+            "the exhausted window is spent: it must not be left for a later round to re-file"
+        );
+        crate::shutdown::drain_clear();
+    }
+
+    /// The terminal record carries the failure that opened the window when it is not
+    /// the deciding round's own cause: the earlier failing rounds warn only, so this
+    /// line is the only durable trace of what started the window.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn the_window_records_the_cause_that_opened_it() {
+        crate::shutdown::drain_clear();
+        let (tmp, conn) = temp_store("core").await;
+        let (retry_pause, span) = (TEST_PAUSE, Duration::ZERO);
+
+        // The first round opens the window with its own cause; the second exhausts it
+        // with a different one.
+        failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            1,
+            "injected first failure",
+            retry_pause,
+            span,
+        )
+        .await;
+        failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            1,
+            "injected second failure",
+            retry_pause,
+            span,
+        )
+        .await;
+
+        assert!(
+            crate::shutdown::is_draining(),
+            "the exhausted window must stop the service"
+        );
+        let body = std::fs::read_to_string(tmp.path().join("error.log")).expect("error.log");
+        for needle in [
+            "checkpoint error: injected second failure",
+            "window first failure error: injected first failure",
+        ] {
+            assert!(
+                body.contains(needle),
+                "error.log must contain {needle:?}: {body}"
+            );
+        }
+        crate::shutdown::drain_clear();
+    }
+
+    /// A completed checkpoint closes the store's failure window wherever it happens,
+    /// and the next failing round opens a fresh one: that fresh window is one failing
+    /// round, so the service keeps serving and files nothing.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn a_completed_checkpoint_closes_the_window_and_the_next_failure_starts_a_new_one() {
+        crate::shutdown::drain_clear();
+        let (tmp, conn) = temp_store("core").await;
+        let (retry_pause, span) = (TEST_PAUSE, Duration::ZERO);
+
+        failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            1,
+            "injected checkpoint failure",
+            retry_pause,
+            span,
+        )
+        .await;
+        assert!(
+            window_open(&conn),
+            "the failing round must open the store's window"
+        );
+
+        // A round whose first attempt is a real, completing checkpoint: the completion
+        // is what closes the window, not a retry.
+        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), retry_pause, span, || {
+            let conn = conn.clone();
+            async move { Attempted::Ran(conn.checkpoint_ungated().await) }
+        })
+        .await;
+        assert!(
+            !window_open(&conn),
+            "a completed checkpoint must close the window"
+        );
+        assert!(
+            !crate::shutdown::is_draining(),
+            "a completion must keep the service serving"
+        );
+        assert!(
+            !tmp.path().join("error.log").exists(),
+            "a completion must not file a failure block"
+        );
+
+        failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            1,
+            "injected checkpoint failure",
+            retry_pause,
+            span,
+        )
+        .await;
+        assert!(
+            window_open(&conn),
+            "the next failure must open a fresh window"
+        );
+        assert!(
+            !crate::shutdown::is_draining(),
+            "a fresh window is one failing round, so the service must keep serving"
+        );
+        assert!(
+            !tmp.path().join("error.log").exists(),
+            "a fresh, unexhausted window must file no failure block"
+        );
+    }
+
+    /// A round that ended without a genuine failure closes the store's window:
+    /// failing rounds separated by a round the engine answered busy are not
+    /// consecutive, so the service keeps serving.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn a_round_that_did_not_fail_closes_the_window() {
+        crate::shutdown::drain_clear();
+        let (tmp, conn) = temp_store("core").await;
+        let (retry_pause, span) = (TEST_PAUSE, Duration::ZERO);
+
+        failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            1,
+            "injected checkpoint failure",
+            retry_pause,
+            span,
+        )
+        .await;
+        assert!(
+            window_open(&conn),
+            "the failing round must open the store's window"
+        );
+
+        periodic_checkpoint_inner(
+            "core",
+            &conn,
+            Some(tmp.path()),
+            retry_pause,
+            span,
+            || async { Attempted::Ran(Err(blocked_checkpoint_error())) },
+        )
+        .await;
+        assert!(
+            !window_open(&conn),
+            "a round that ended without a genuine failure must close the window"
+        );
+
+        failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            1,
+            "injected checkpoint failure",
+            retry_pause,
+            span,
+        )
+        .await;
+        assert!(
+            !crate::shutdown::is_draining(),
+            "failing rounds separated by a round that did not fail are not consecutive, so the \
+             fresh window must not stop the service"
+        );
+        assert!(
+            !tmp.path().join("error.log").exists(),
+            "an unexhausted window must file no failure block"
+        );
+    }
+
+    /// The span floor alone blocks a stop the round floor would decide: rounds past
+    /// the round floor but inside a span that has not elapsed keep the service
+    /// serving, with the window still open and nothing filed.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn the_span_floor_alone_blocks_the_stop_the_round_floor_would_decide() {
+        crate::shutdown::drain_clear();
+        let (tmp, conn) = temp_store("core").await;
+        let rounds = window_rounds() + 1;
+
+        failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            rounds,
+            "injected checkpoint failure",
+            TEST_PAUSE,
+            Duration::from_secs(3600),
+        )
+        .await;
+
+        assert!(
+            !crate::shutdown::is_draining(),
+            "rounds past the round floor inside an unelapsed span must keep the service serving"
+        );
+        assert!(
+            window_open(&conn),
+            "the window must stay open until it has spanned both floors"
+        );
+        assert!(
+            !tmp.path().join("error.log").exists(),
+            "a window that has not spanned both floors must file no failure block"
+        );
+    }
+
+    /// A window that outlives its span stops on the next failing round: the span
+    /// floor is real elapsed time, not a round count.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn a_window_that_outlives_its_span_stops_on_the_next_failing_round() {
+        crate::shutdown::drain_clear();
+        let (tmp, conn) = temp_store("core").await;
+        let (retry_pause, span) = (TEST_PAUSE, Duration::from_millis(100));
+
+        failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            1,
+            "injected checkpoint failure",
+            retry_pause,
+            span,
+        )
+        .await;
+        assert!(
+            !crate::shutdown::is_draining(),
+            "one failing round must never stop the service, whatever the span"
+        );
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            1,
+            "injected checkpoint failure",
+            retry_pause,
+            span,
+        )
+        .await;
+        assert!(
+            crate::shutdown::is_draining(),
+            "the window spans both floors once the span has really elapsed"
+        );
+        crate::shutdown::drain_clear();
+    }
+
+    /// A round the daemon's own drain cuts short decides nothing: the spaced retry is
+    /// abandoned, so the round makes its first attempt only, leaves the store's
+    /// window untouched — an interrupted round is not a failing one — and files
+    /// nothing.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn a_round_cut_short_by_a_drain_decides_nothing() {
+        crate::shutdown::drain_clear();
+        let (tmp, conn) = temp_store("core").await;
+        let (retry_pause, span) = (Duration::from_millis(10), Duration::ZERO);
+
+        crate::shutdown::drain_begin();
+        let attempts = failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            1,
+            "injected checkpoint failure",
+            retry_pause,
+            span,
+        )
+        .await;
+
+        assert_eq!(
+            attempts, 1,
+            "the drain must cut the spaced retry short after the round's first attempt"
+        );
+        assert!(
+            !window_open(&conn),
+            "an interrupted round is not a failing one, so the window must stay untouched"
+        );
+        assert!(
+            !tmp.path().join("error.log").exists(),
+            "a round that decided nothing must file no failure block"
         );
         crate::shutdown::drain_clear();
     }

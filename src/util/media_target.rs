@@ -55,12 +55,15 @@ pub(crate) const MAX_DATA_URI_ENCODED_BYTES: usize = 20 * 1024 * 1024;
 /// Shared raster-decode allocation budget (provider data-URI gate, classifier
 /// local-file decode, and the GUI render downscale). Bounded so a header-bomb
 /// target is refused, but generous enough that a legitimate tall screenshot
-/// still decodes.
-const CLASSIFY_DECODE_MAX_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
+/// still decodes. Together with [`RASTER_DECODE_MAX_DIMENSION_PX`] this is the
+/// one raster envelope the inbound pipeline decodes under — including the
+/// document converter's embedded-image guard, which checks a declared PDF
+/// image's geometry against both.
+pub(crate) const RASTER_DECODE_MAX_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Longest side (px) the shared raster decode will accept — rejects a dimension
 /// bomb from the header before any pixel buffer is allocated.
-const CLASSIFY_DECODE_MAX_DIMENSION_PX: u32 = 16384;
+pub(crate) const RASTER_DECODE_MAX_DIMENSION_PX: u32 = 16384;
 
 /// The shared generous raster-decode [`image::Limits`]: a dimension and alloc
 /// cap so a header bomb is refused before any pixel buffer, while a legitimate
@@ -71,9 +74,9 @@ const CLASSIFY_DECODE_MAX_DIMENSION_PX: u32 = 16384;
 #[must_use]
 pub(crate) fn raster_decode_limits() -> image::Limits {
     let mut limits = image::Limits::default();
-    limits.max_alloc = Some(CLASSIFY_DECODE_MAX_ALLOC_BYTES);
-    limits.max_image_width = Some(CLASSIFY_DECODE_MAX_DIMENSION_PX);
-    limits.max_image_height = Some(CLASSIFY_DECODE_MAX_DIMENSION_PX);
+    limits.max_alloc = Some(RASTER_DECODE_MAX_ALLOC_BYTES);
+    limits.max_image_width = Some(RASTER_DECODE_MAX_DIMENSION_PX);
+    limits.max_image_height = Some(RASTER_DECODE_MAX_DIMENSION_PX);
     limits
 }
 
