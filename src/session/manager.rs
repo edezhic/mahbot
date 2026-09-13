@@ -592,6 +592,8 @@ impl Session {
     /// alarms                 — Assistant only, when the user has active alarms
     /// personal_files         — Assistant only, when the personal workspace has files
     /// workspaces             — full-access Assistant only, when workspaces are registered
+    /// custom_tools           — Assistant only, always (the catalogue, or the
+    ///                          brief "nothing available" form)
     /// board_context          — Manager role only, when active tickets exist
     /// ticket_block           — when a ticket is assigned to this session
     /// ```
@@ -695,17 +697,20 @@ impl Session {
             msgs.push(ChatMessage::system(skills::skills_to_prompt(&skills, ws)));
         }
         // Assistant sessions carry the user's alarm snapshot, the personal
-        // workspace file listing and, for a full-access Assistant, the
-        // registered workspace list — the same snapshot-at-session-start
-        // contract as the board block below.
+        // workspace file listing, the registered workspace list (full-access
+        // only) and the custom-tool catalogue — the same snapshot-at-session-
+        // start contract as the board block below.
         if matches!(role, Role::Assistant) {
-            let (alarms, workspaces, personal_files) =
-                fetch_assistant_context(user_name, full_access).await;
+            let ((alarms, workspaces, personal_files), custom_tools) = tokio::join!(
+                fetch_assistant_context(user_name, full_access),
+                crate::tools::custom::context_block(user_name, full_access),
+            );
             for block in assistant_context_blocks(
                 full_access,
                 &alarms,
                 &workspaces,
                 personal_files.as_deref(),
+                &custom_tools,
             ) {
                 msgs.push(ChatMessage::system(&block));
             }
@@ -723,7 +728,7 @@ impl Session {
     /// current turn.
     /// Returns messages: [role_description, onboarding_guide?, active_models_opts?,
     /// workspace_boilerplate, skills?, alarms?, personal_files?, workspaces?,
-    /// board_context?, ticket_block?, user_msg]
+    /// custom_tools, board_context?, ticket_block?, user_msg]
     /// plus the rendered active-models snapshot (Assistant only; `Default` when
     /// no block injected).
     ///
@@ -906,7 +911,7 @@ async fn build_board_context(ws: &Workspace, role: &Role) -> Option<String> {
     Some(output)
 }
 
-// ── Assistant context blocks (alarms + personal files + workspaces) ─────
+// ── Assistant context blocks (alarms + files + workspaces + custom tools) ──
 
 /// Upper char bound for a workspace's collapsed discovery-summary line.
 const MAX_WORKSPACE_SUMMARY_CHARS: usize = 1000;
@@ -963,13 +968,17 @@ async fn fetch_assistant_context(
 /// Pure and fail-open: each block is omitted entirely when its content is
 /// empty, the personal-files listing is supplied pre-rendered (`None` when
 /// the workspace is empty or unlistable), and the workspace list appears only
-/// for a full-access Assistant. Order: alarms → personal files → workspaces.
-/// The caller gates on `role == Assistant` (before fetching).
+/// for a full-access Assistant. Order: alarms → personal files → workspaces →
+/// custom tools — the last being the one an Assistant always gets, because
+/// [`crate::tools::custom::context_block`] renders the brief "nothing
+/// available" form rather than nothing. The caller gates on `role == Assistant`
+/// (before fetching).
 fn assistant_context_blocks(
     full_access: bool,
     alarms: &[Alarm],
     workspaces: &[(Workspace, Option<String>)],
     personal_files: Option<&str>,
+    custom_tools: &str,
 ) -> Vec<String> {
     let mut blocks = Vec::new();
     if let Some(lines) = render_alarm_lines(alarms) {
@@ -989,6 +998,9 @@ fn assistant_context_blocks(
             &load_prompt("context/workspaces.md"),
             &[("{{workspaces}}", &lines)],
         ));
+    }
+    if !custom_tools.is_empty() {
+        blocks.push(custom_tools.to_string());
     }
     blocks
 }
@@ -1687,10 +1699,12 @@ mod tests {
     }
 
     /// Pure gating of the Assistant context blocks: a plain Assistant gets
-    /// the alarms and personal-files blocks (the workspace list is
-    /// full-access only); a full-access Assistant gets all three in
-    /// alarms → personal files → workspaces order; empty data omits all.
-    /// (Role gating lives at the call site.)
+    /// the alarms, personal-files and custom-tool blocks (the workspace list is
+    /// full-access only); a full-access Assistant gets the first three in
+    /// alarms → personal files → workspaces order plus the custom-tool block
+    /// last; empty data omits the conditional blocks, while the custom-tool
+    /// block is always present (its "nothing available" form is rendered
+    /// upstream). (Role gating lives at the call site.)
     #[test]
     fn assistant_blocks_gating() {
         let alarm = Alarm {
@@ -1708,25 +1722,43 @@ mod tests {
             Some("summary".to_string()),
         )];
         let files = Some("MEMORY.md\nnotes/projects.md");
+        let custom = "<custom-tools>\n- weather\n</custom-tools>";
 
-        // Plain Assistant: alarms + personal files, no workspace list.
-        let blocks =
-            assistant_context_blocks(false, std::slice::from_ref(&alarm), &workspaces, files);
-        assert_eq!(blocks.len(), 2);
-        assert!(blocks[0].contains("<user-alarms>"));
-        assert!(blocks[1].contains("<personal-files>"));
-        assert!(!blocks[1].contains("<registered-workspaces>"));
-
-        // Full-access Assistant: all three blocks, alarms → files → workspaces.
-        let blocks =
-            assistant_context_blocks(true, std::slice::from_ref(&alarm), &workspaces, files);
+        // Plain Assistant: alarms + personal files + custom tools, no
+        // workspace list.
+        let blocks = assistant_context_blocks(
+            false,
+            std::slice::from_ref(&alarm),
+            &workspaces,
+            files,
+            custom,
+        );
         assert_eq!(blocks.len(), 3);
         assert!(blocks[0].contains("<user-alarms>"));
         assert!(blocks[1].contains("<personal-files>"));
-        assert!(blocks[2].contains("<registered-workspaces>"));
+        assert!(!blocks[1].contains("<registered-workspaces>"));
+        assert_eq!(blocks[2], custom);
 
-        // Empty data omits all blocks.
-        assert!(assistant_context_blocks(true, &[], &[], None).is_empty());
+        // Full-access Assistant: the workspace list joins them, and the
+        // custom-tool block stays last.
+        let blocks = assistant_context_blocks(
+            true,
+            std::slice::from_ref(&alarm),
+            &workspaces,
+            files,
+            custom,
+        );
+        assert_eq!(blocks.len(), 4);
+        assert!(blocks[0].contains("<user-alarms>"));
+        assert!(blocks[1].contains("<personal-files>"));
+        assert!(blocks[2].contains("<registered-workspaces>"));
+        assert_eq!(blocks[3], custom);
+
+        // Empty data omits the conditional blocks but never the custom tools.
+        assert_eq!(
+            assistant_context_blocks(true, &[], &[], None, custom),
+            vec![custom.to_string()]
+        );
     }
 
     /// Personal-files walk: hidden entries and `generated/` / `uploads/`

@@ -1,7 +1,8 @@
 //! Per-user identity, permissions, workspace and role preferences, and channel bindings.
 //!
 //! Two tables in the consolidated domain database (`core.db`):
-//! - `users` — canonical user identity: `name`, `permissions`, `selected_workspace`, `selected_role`.
+//! - `users` — canonical user identity: `name`, `permissions`, `selected_workspace`,
+//!   `selected_role`, `granted_tools` (the per-user custom-tool grants).
 //! - `user_channels` — channel bindings: maps a channel+identifier (e.g. Telegram @username)
 //!   to a user. The `reply_target` is stored here (per-channel routing address).
 //!
@@ -61,13 +62,14 @@ crate::define_store! {
 
 // ── Column index constants ──────────────────────────────────
 
-// users table (4-column SELECT: name, permissions, selected_workspace, selected_role)
+// users table (5-column SELECT: name, permissions, selected_workspace, selected_role, granted_tools)
 crate::columns! {
     USERS_COLUMNS [USERS] {
         NAME                => "name",
         PERMISSIONS         => "permissions",
         SELECTED_WORKSPACE  => "selected_workspace",
         SELECTED_ROLE       => "selected_role",
+        GRANTED_TOOLS       => "granted_tools",
     }
 }
 
@@ -330,6 +332,7 @@ impl UserStore {
                 permissions,
                 selected_workspace: row.get::<Option<String>>(COL_USERS_SELECTED_WORKSPACE)?,
                 selected_role: row.get::<Option<String>>(COL_USERS_SELECTED_ROLE)?,
+                granted_tools: parse_grants(row.get::<Option<String>>(COL_USERS_GRANTED_TOOLS)?),
                 roles: roles.iter().map(|r| r.as_str().to_string()).collect(),
                 channels,
             },
@@ -417,6 +420,116 @@ impl UserStore {
         tx.commit().await?;
         Ok(())
     }
+
+    // ── Custom tool grants ────────────────────────────────────
+
+    /// The custom tools granted to `user_name`, byte-sorted; empty when the
+    /// user has no grants or no row.
+    pub(crate) async fn get_grants(&self, user_name: &str) -> Result<Vec<String>> {
+        Ok(parse_grants(
+            self.user_column("granted_tools", user_name).await?,
+        ))
+    }
+
+    /// Grant the custom tool `tool` to `user_name`. Returns whether the user row
+    /// exists — granting is idempotent, and a grant never inserts a users row (a
+    /// ghost user would appear in the GUI), so the caller reports the missing
+    /// user itself.
+    pub(crate) async fn add_grant(&self, user_name: &str, tool: &str) -> Result<bool> {
+        self.update_grants(user_name, |grants| {
+            if grants.iter().any(|g| g == tool) {
+                return false;
+            }
+            grants.push(tool.to_string());
+            true
+        })
+        .await
+    }
+
+    /// Revoke the custom tool `tool` from `user_name`. Idempotent: an absent
+    /// grant is a silent no-op. Returns whether the user row exists, so the
+    /// caller can report a missing user instead of a false confirmation — a
+    /// revoke never inserts one either.
+    pub(crate) async fn remove_grant(&self, user_name: &str, tool: &str) -> Result<bool> {
+        self.update_grants(user_name, |grants| {
+            let before = grants.len();
+            grants.retain(|g| g != tool);
+            grants.len() != before
+        })
+        .await
+    }
+
+    /// Every user with at least one granted custom tool, ordered by user name.
+    /// The empty-list filter runs in Rust rather than SQL: `[]` and an
+    /// unparseable value are both empty sets, and the users table is tiny.
+    pub(crate) async fn list_grants(&self) -> Result<Vec<(String, Vec<String>)>> {
+        let rows = self
+            .conn
+            .query_map_strict(
+                "SELECT name, granted_tools FROM users ORDER BY name",
+                db::params![],
+                |row| -> Result<(String, Vec<String>)> {
+                    Ok((
+                        row.get::<String>(0)?,
+                        parse_grants(row.get::<Option<String>>(1)?),
+                    ))
+                },
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, grants)| !grants.is_empty())
+            .collect())
+    }
+
+    /// Read-modify-write the `users.granted_tools` set for `user_name` in one
+    /// transaction. `mutate` edits the parsed, sorted set; returning `false`
+    /// skips the write (the caller's idempotent no-op). Returns whether the
+    /// user row exists: a missing row is left untouched, never inserted.
+    async fn update_grants(
+        &self,
+        user_name: &str,
+        mutate: impl FnOnce(&mut Vec<String>) -> bool,
+    ) -> Result<bool> {
+        let tx = self.conn.begin_tx().await?;
+        let rows = tx
+            .query(
+                "SELECT granted_tools FROM users WHERE name = ?1",
+                db::params![user_name],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let mut grants = parse_grants(row.get::<Option<String>>(0)?);
+        if !mutate(&mut grants) {
+            tx.rollback().await?;
+            return Ok(true);
+        }
+        // The closures only add or remove one name, so a push is the one thing
+        // that can break the parsed set's sorted order.
+        grants.sort();
+        tx.execute(
+            "UPDATE users SET granted_tools = ?1 WHERE name = ?2",
+            db::params![serde_json::to_string(&grants)?, user_name],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
+/// Parse the `users.granted_tools` JSON array column. A NULL, empty or
+/// unparseable value yields an empty list (fail-closed: unknown grants are
+/// no grants).
+fn parse_grants(raw: Option<String>) -> Vec<String> {
+    let mut grants = raw
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default();
+    grants.sort();
+    grants.dedup();
+    grants
 }
 
 /// Represents an optional update to a user column.
@@ -470,6 +583,12 @@ pub struct UserRecord {
     /// Selected active role, NULL = pool-dependent default (the first pool
     /// role). Empty pool → no routing.
     pub selected_role: Option<String>,
+    /// The custom tools granted to this user (the `users.granted_tools` JSON
+    /// array column), byte-sorted; empty when none. A grant recorded for the
+    /// admin is carried and listed like any other; only the user-management
+    /// card omits it, since the whole catalogue is implicitly available to the
+    /// admin.
+    pub granted_tools: Vec<String>,
     /// The role pool — the roles the user is allowed to use. The user-facing
     /// pool is the constant single Assistant for every user (the Support role
     /// was removed); this is not read from a `user_roles` table.
@@ -972,6 +1091,31 @@ pub async fn is_admin(user_name: &str) -> bool {
     }
 }
 
+/// The custom tools granted to `user_name`, byte-sorted. A read that fails
+/// yields no grants, which fails every access decision closed.
+pub(crate) async fn granted_tools(user_name: &str) -> Vec<String> {
+    match USER_STORE.get() {
+        Some(store) => match store.get_grants(user_name).await {
+            Ok(grants) => grants,
+            Err(e) => {
+                tracing::warn!(error = %e, user_name, "Failed to read granted custom tools");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    }
+}
+
+/// Render a custom-tool grant list for display: `a, b`, or `none` when empty.
+#[must_use]
+pub(crate) fn format_grants(grants: &[String]) -> String {
+    if grants.is_empty() {
+        "none".to_string()
+    } else {
+        grants.join(", ")
+    }
+}
+
 /// Update reply_target for a channel binding (called on every incoming message).
 pub async fn update_channel_contact(
     channel: &str,
@@ -1132,6 +1276,97 @@ mod tests {
         assert!(
             store.find_by_name("doomed").await.unwrap().is_none(),
             "the user row must be deleted"
+        );
+    }
+
+    /// Custom-tool grants round-trip through the `users.granted_tools` JSON
+    /// column: byte-sorted, deduped, idempotent, and never a reason to insert a
+    /// user row.
+    #[tokio::test]
+    async fn grant_storage_round_trip() {
+        crate::util::test::init_test_stores().await;
+        let store = store();
+        let user = "grant_round_trip";
+        store.add_user(user, None, Role::Assistant).await.unwrap();
+        assert!(
+            store.get_grants(user).await.unwrap().is_empty(),
+            "a fresh user has no grants"
+        );
+
+        // Out-of-order grants land byte-sorted in the row's JSON column.
+        store.add_grant(user, "zeta").await.unwrap();
+        store.add_grant(user, "alpha").await.unwrap();
+        let stored: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT granted_tools FROM users WHERE name = ?1",
+                db::params![user],
+                |row| row.get(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(r#"["alpha","zeta"]"#));
+
+        // Granting twice is a no-op; the parsed record carries the grants.
+        store.add_grant(user, "alpha").await.unwrap();
+        assert_eq!(
+            store.get_grants(user).await.unwrap(),
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
+        assert_eq!(
+            store
+                .find_by_name(user)
+                .await
+                .unwrap()
+                .unwrap()
+                .granted_tools,
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
+
+        // Revoking an absent grant — or revoking from a user without a row —
+        // is a silent no-op.
+        assert!(store.remove_grant(user, "absent").await.unwrap());
+        assert!(
+            !store
+                .remove_grant("grant_no_such_user", "alpha")
+                .await
+                .unwrap(),
+            "revoking from a missing user reports that no row exists"
+        );
+        assert_eq!(
+            store.get_grants(user).await.unwrap(),
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
+
+        // Granting to a user without a row reports the missing row instead of
+        // creating one.
+        assert!(
+            !store.add_grant("grant_ghost_user", "alpha").await.unwrap(),
+            "granting to an unknown user must report that no row exists"
+        );
+        assert!(
+            store
+                .find_by_name("grant_ghost_user")
+                .await
+                .unwrap()
+                .is_none(),
+            "a failed grant must not leave a ghost user row"
+        );
+
+        // list_grants lists every user with grants, ordered by user name — the
+        // store is process-wide, so this asserts this user's own entry rather
+        // than the list being exactly it.
+        let listed = store.list_grants().await.unwrap();
+        assert!(
+            listed.contains(&(
+                user.to_string(),
+                vec!["alpha".to_string(), "zeta".to_string()]
+            )),
+            "got: {listed:?}"
+        );
+        assert!(
+            listed.iter().all(|(_, grants)| !grants.is_empty()),
+            "a user with no grants must not be listed: {listed:?}"
         );
     }
 

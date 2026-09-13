@@ -22,19 +22,20 @@
 //! a fresh file), and the id-only applied check makes their recorded ids
 //! `1`–`23` harmless no-ops. The baseline (`24`–`26`) creates the exact
 //! current shape on fresh installs and is a strict no-op on existing ones,
-//! except entries `25`/`27`–`34`, which genuinely upfill the retired delta
+//! except entries `25`/`27`–`34`/`38`, which genuinely upfill the retired delta
 //! `23`'s `chat_history` reply columns, the `workspaces.maintainer_recommendations`
 //! and `jobs.caller_agent_id` / `session_metadata.created_at` columns, the
 //! per-user `image_gen_model` / `video_model` columns, the backfilled
 //! `jobs.mode` discriminator, the `session_metadata.sleep_ended` marker, the
-//! `alarms.command` column, the `chat_history.broadcast_id` column, and the
-//! `tickets.last_transition_actor` / `ticket_chronicle.actor` columns on
-//! one-delta-behind / current databases. The tail entries are data migrations:
-//! `36` detaches non-admin users from shared workspaces by clearing
-//! `users.selected_workspace`, and `37` rewrites the legacy `DeepSeek`
+//! `alarms.command` column, the `chat_history.broadcast_id` column, the
+//! `tickets.last_transition_actor` / `ticket_chronicle.actor` columns, and the
+//! nullable `users.granted_tools` column on one-delta-behind / current
+//! databases. The tail's data migrations are
+//! `36`, which detaches non-admin users from shared workspaces by clearing
+//! `users.selected_workspace`, and `37`, which rewrites the legacy `DeepSeek`
 //! provider-routing display name to the canonical `deepseek` slug.
 //!
-//! Future schema changes resume the chain at id `38` with monotonically
+//! Future schema changes resume the chain at id `39` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -237,7 +238,8 @@ CREATE TABLE IF NOT EXISTS users (
     selected_workspace  TEXT,
     selected_role       TEXT,
     image_gen_model     TEXT,
-    video_model         TEXT
+    video_model         TEXT,
+    granted_tools       TEXT
 );
 CREATE TABLE IF NOT EXISTS user_channels (
     user_name   TEXT NOT NULL REFERENCES users(name),
@@ -491,6 +493,7 @@ const REWRITE_LEGACY_DEEPSEEK_ROUTING_SLUG: &str = "UPDATE config_model_routing 
 /// - `36` is the admin-only workspace-membership data migration.
 /// - `37` rewrites the legacy `DeepSeek` provider-routing display name to the
 ///   canonical `deepseek` slug (a data migration; a no-op on new installs).
+/// - `38` adds the nullable `users.granted_tools` column.
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -561,6 +564,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "37",
         target: TargetDb::Core,
         body: MigrationBody::Sql(REWRITE_LEGACY_DEEPSEEK_ROUTING_SLUG),
+    },
+    Migration {
+        id: "38",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_users_granted_tools),
     },
 ];
 
@@ -873,6 +881,20 @@ async fn run_detach_non_admin_workspaces(conn: &Connection) -> anyhow::Result<()
     Ok(())
 }
 
+fn add_users_granted_tools(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_users_granted_tools(conn))
+}
+
+/// Upfill the nullable `users.granted_tools` column for databases created
+/// before delta `38`. Fresh installs get the column from entry `24`'s
+/// `CREATE TABLE`, so the probe makes this a no-op there. Guarded by
+/// [`add_column_if_missing`], so this body is idempotent (non-transactional
+/// like every Rust body, re-runnable until recorded). Holds the JSON array of
+/// custom tool names granted to the user; NULL/empty means no grants.
+async fn run_add_users_granted_tools(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "users", "granted_tools").await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1160,6 +1182,7 @@ mod tests {
                 "selected_role",
                 "image_gen_model",
                 "video_model",
+                "granted_tools",
             ],
         ),
         (
@@ -2214,9 +2237,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "33".to_string(),
                 "34".to_string(),
                 "36".to_string(),
-                "37".to_string()
+                "37".to_string(),
+                "38".to_string()
             ],
-            "fresh core applies baseline 24/25/27/28/29/30/31/32/33/34 + data 36/37 exactly"
+            "fresh core applies the 24–34 baseline + the 36/37/38 tail exactly"
         );
     }
 
@@ -2483,20 +2507,21 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`/`28`/`29`/`30`/`31`/`32`/`33`/`36`) as a
+    /// the new baseline (`24`/`25`/`27`–`34`/`36`/`37`/`38`) as a
     /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
     /// column upfill, the delta-28 `jobs.caller_agent_id` /
     /// `session_metadata.created_at` column upfills (plus the delta-28
-    /// `idx_jobs_caller_agent` index), the delta-29 per-user model columns, and
-    /// the delta-30 `jobs.mode` column upfill + backfill, the delta-31
+    /// `idx_jobs_caller_agent` index), the delta-29 per-user model columns, the
+    /// delta-30 `jobs.mode` column upfill + backfill, the delta-31
     /// `sleep_ended` column upfill, the delta-32 `alarms.command` column
-    /// upfill, and the delta-33 `chat_history.broadcast_id` column upfill, and
-    /// the delta-34 `tickets.last_transition_actor` /
-    /// `ticket_chronicle.actor` column upfill — plus the delta-36 data
-    /// rewrite, which detaches the seeded non-admin from `users.selected_workspace`
-    /// (row counts unchanged; the snapshot compares only counts, chat content
-    /// and tickets). All asserted explicitly. This also proves
-    /// Turso honors `IF NOT EXISTS` on the FTS index when the baseline re-runs it.
+    /// upfill, the delta-33 `chat_history.broadcast_id` column upfill, the
+    /// delta-34 `tickets.last_transition_actor` / `ticket_chronicle.actor`
+    /// column upfill, and the delta-38 `users.granted_tools` column upfill —
+    /// plus the delta-36 data rewrite, which detaches the seeded non-admin from
+    /// `users.selected_workspace` (row counts unchanged; the snapshot compares
+    /// only counts, chat content and tickets). All asserted explicitly. This
+    /// also proves Turso honors `IF NOT EXISTS` on the FTS index when the
+    /// baseline re-runs it.
     #[tokio::test]
     #[expect(clippy::too_many_lines)]
     async fn old_catalog_current_db_reopens_as_noop() {
@@ -2533,23 +2558,25 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("34".to_string());
         expected_ids.push("36".to_string());
         expected_ids.push("37".to_string());
+        expected_ids.push("38".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34/36/37"
+            "reopen must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34/36/37/38"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
-        // jobs/session_metadata (delta 28), users (delta 29), jobs.mode
+        // jobs/session_metadata (delta 28), users (deltas 29/38), jobs.mode
         // (delta 30), session_metadata.sleep_ended (delta 31),
-        // alarms.command (delta 32) and chat_history.broadcast_id (delta 33)
-        // gain their columns, appended at the end by the ALTER, and the
-        // delta-28 `idx_jobs_caller_agent` index is added. Delta `36` rewrites
-        // `users.selected_workspace` data (detaching the seeded non-admin),
-        // which leaves row counts unchanged — the snapshot compares only
-        // counts, chat content and tickets, so the no-op assertions still hold.
+        // alarms.command (delta 32), chat_history.broadcast_id (delta 33) and
+        // tickets/ticket_chronicle (delta 34) gain their columns, appended at
+        // the end by the ALTER, and the delta-28 `idx_jobs_caller_agent` index
+        // is added. Delta `36` rewrites `users.selected_workspace` data
+        // (detaching the seeded non-admin), which leaves row counts unchanged —
+        // the snapshot compares only counts, chat content and tickets, so the
+        // no-op assertions still hold.
         assert_core_catalog_unchanged(
             &conn,
             &before,
@@ -2593,9 +2620,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_users_cols = before.cols["users"].clone();
         expected_users_cols.push("image_gen_model".to_string());
         expected_users_cols.push("video_model".to_string());
+        expected_users_cols.push("granted_tools".to_string());
         assert_eq!(
             after_users_cols["users"], expected_users_cols,
-            "reopen must append exactly image_gen_model/video_model to users columns"
+            "reopen must append exactly image_gen_model/video_model/granted_tools to users columns"
         );
         let after_alarms_cols = column_sets(&conn, &["alarms"]).await;
         let mut expected_alarms_cols = before.cols["alarms"].clone();
@@ -2723,13 +2751,15 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// baseline entry `25` upfills exactly those two columns, entry `27` adds
     /// `workspaces.maintainer_recommendations`, entry `28` adds
     /// `jobs.caller_agent_id` / `session_metadata.created_at` (plus its
-    /// partial index), entry `30` adds `jobs.mode`, entry `31` adds
+    /// partial index), entry `29` adds the per-user `image_gen_model` /
+    /// `video_model` columns, entry `30` adds `jobs.mode`, entry `31` adds
     /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
     /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
-    /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. Entry `36`
-    /// is a data migration (detaching non-admins from shared workspaces), so
-    /// the recorded ids grow by `36`; every other row and table's schema is
-    /// untouched.
+    /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
+    /// entries `36`–`38`: two data migrations (detaching non-admins from
+    /// shared workspaces, and rewriting the legacy `DeepSeek` routing slug)
+    /// and the `users.granted_tools` column; every other row and table's
+    /// schema is untouched.
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
@@ -2841,12 +2871,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("34".to_string());
         expected_ids.push("36".to_string());
         expected_ids.push("37".to_string());
+        expected_ids.push("38".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34/36/37"
+            "upgrade must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34/36/37/38"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -2857,6 +2888,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         assert!(
             after_users_cols.contains(&"video_model".to_string()),
             "video_model must be added to users"
+        );
+        assert!(
+            after_users_cols.contains(&"granted_tools".to_string()),
+            "granted_tools must be added to users"
         );
         let after_alarms_cols = column_names(&conn, "alarms").await;
         assert!(
@@ -2883,7 +2918,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             column_sets(&conn, &untouched_tables).await,
             before_other,
             "only chat_history (delta 25/33), workspaces (delta 27), \
-             jobs/session_metadata (delta 28), users (delta 29), jobs.mode \
+             jobs/session_metadata (delta 28), users (deltas 29/38), jobs.mode \
              (delta 30), session_metadata.sleep_ended (delta 31), \
              alarms.command (delta 32) and tickets/ticket_chronicle (delta 34) \
              columns may change on the 0.5.0 upgrade"

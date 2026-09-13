@@ -254,21 +254,41 @@ use crate::Workspace;
 use crate::config::CONFIG;
 use crate::tools::{
     AddAlarmTool, AddCommentTool, AnalyzeTool, ChromeTool, ComputerTool, CreateTicketTool,
-    DispatchMode, EditTool, GetTicketTool, ImageGenTool, ImplementTool, ListAlarmsTool,
+    CustomTool, DispatchMode, EditTool, GetTicketTool, ImageGenTool, ImplementTool, ListAlarmsTool,
     ListTicketsTool, MahbotConfigTool, MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool,
     SearchArchivedTicketsTool, SearchTool, SendMessageToManagerTool, ShellMode, ShellTool,
     SleepTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
 };
 
 impl Role {
-    /// Core read/search/read-only-shell tools for inspector-style roles
-    /// (Analyst, QA, Reviewer, Discovery, Maintainer).
-    fn readonly_core_tools() -> Vec<Box<dyn Tool>> {
-        vec![
-            Box::new(ReadTool::general()),
-            Box::new(SearchTool),
-            Box::new(ShellTool::new(ShellMode::ReadOnly)),
-        ]
+    /// Core read/search tools — plus the read-only shell when `shell` is set —
+    /// for inspector-style roles (Analyst, QA, Reviewer, Discovery, Maintainer).
+    fn readonly_core_tools(shell: bool) -> Vec<Box<dyn Tool>> {
+        let mut tools: Vec<Box<dyn Tool>> =
+            vec![Box::new(ReadTool::general()), Box::new(SearchTool)];
+        if shell {
+            tools.push(Box::new(ShellTool::new(ShellMode::ReadOnly)));
+        }
+        tools
+    }
+
+    /// Whether an Analyst running in `ws` keeps its read-only shell.
+    ///
+    /// Analysts are built with no identity of their own (an empty user name and
+    /// `full_access = false`), so the workspace they inherit from the summoning
+    /// session is the only carrier of who called — and it is re-read from
+    /// durable state on every construction, so the rule holds across restarts.
+    /// A non-admin's Assistant is pinned to `personal:<user>`, so its analysts
+    /// must lose the shell: that shell has no reading restriction and would be
+    /// a direct route into the admin's `shared` folder the per-user grants
+    /// exist to gate. Anything else — a project workspace (the pipeline's own
+    /// analysts), or the admin's own personal workspace — keeps it; an
+    /// unrecognised `personal:` name falls to the stricter side.
+    fn analyst_shell_allowed(ws: &Workspace) -> bool {
+        match crate::users::personal_user_name(&ws.name) {
+            Some(user) => user == crate::users::ADMIN_USER_NAME,
+            None => true,
+        }
     }
 
     /// Core full-shell/read/edit/search tools for full-access roles
@@ -288,10 +308,11 @@ impl Role {
     /// operations are confined to that workspace.
     ///
     /// `full_access` is the triggering user's `permissions='full'` (admin)
-    /// flag. It only widens the Assistant's toolset (adding `shell`,
-    /// `implement`, `research`, `computer`, and the Assistant↔Manager chat
-    /// tools); every other role's toolset is byte-identical regardless of its
-    /// value.
+    /// flag. It only widens the Assistant's toolset: `shell`, `implement`,
+    /// `research`, `computer`, `mahbot_config`, `mahbot_debug` and the
+    /// Assistant↔Manager chat tools are added, and `add_alarm` gains its
+    /// command form. Every other role's toolset is byte-identical regardless
+    /// of its value.
     ///
     /// `chrome_sessions` is the run-scoped chrome session tracker shared with
     /// the agent's `ChromeTool` so every session the run opens is closed at
@@ -333,12 +354,12 @@ impl Role {
                 ]
             }
             Role::Analyst => {
-                let mut t = Self::readonly_core_tools();
+                let mut t = Self::readonly_core_tools(Self::analyst_shell_allowed(ws));
                 t.push(Box::new(ChromeTool::new(chrome_sessions)));
                 t
             }
             Role::Coder => Self::full_core_tools(),
-            Role::Qa | Role::Reviewer | Role::Discovery => Self::readonly_core_tools(),
+            Role::Qa | Role::Reviewer | Role::Discovery => Self::readonly_core_tools(true),
             Role::Sanitation => {
                 // Sanitation deliberately has NO search tools (local `search`
                 // or `web_search`): the role inspects and cleans specific
@@ -353,7 +374,7 @@ impl Role {
                 ]
             }
             Role::Maintainer => {
-                let mut t = Self::readonly_core_tools();
+                let mut t = Self::readonly_core_tools(true);
                 t.push(Box::new(AnalyzeTool::new(
                     DispatchMode::Sync,
                     Role::Maintainer,
@@ -377,6 +398,10 @@ impl Role {
                     Box::new(VideoGenTool),
                     Box::new(VideoEditTool),
                 ];
+                // The grant-gated forwarding tool: every Assistant can call
+                // admin-authored scripts; the grant (or admin rights) decides
+                // what each call may reach.
+                t.push(Box::new(CustomTool));
                 // Base Assistant read access is workspace-bounded; full-access
                 // retains the general ReadTool so it can also read dependency
                 // sources / temp files. (Media tools write only into the
@@ -652,6 +677,61 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_tool_is_advertised_by_both_assistants_only() {
+        // Acceptance pin: the single forwarding tool goes to every Assistant —
+        // base and full alike, since the grants (not the toolset) decide what
+        // each call may reach — and to no other role.
+        let ws = crate::workspace::test_ws("test");
+        for role in Role::iter() {
+            for full_access in [false, true] {
+                let has = role
+                    .tools(&ws, full_access, test_sessions())
+                    .iter()
+                    .any(|t| t.name() == "custom");
+                assert_eq!(
+                    has,
+                    role == crate::Role::Assistant,
+                    "{}{} custom-tool availability",
+                    role.as_str(),
+                    if full_access { " (full)" } else { "" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn analyst_shell_follows_the_summoning_session() {
+        // The pipeline's own analysts (project workspaces) and the owner
+        // admin's Assistant keep the read-only shell; every other user's
+        // Assistant summons shell-less analysts, including an unresolvable
+        // personal name (fail closed).
+        for name in ["proj", "personal:admin"] {
+            let ws = crate::workspace::test_ws_named("/tmp/proj", name);
+            let has = Role::Analyst
+                .tools(&ws, false, test_sessions())
+                .iter()
+                .any(|t| t.name() == "shell");
+            assert!(has, "analysts in {name} must keep the shell");
+        }
+        for name in ["personal:lyuba", "personal:"] {
+            let ws = crate::workspace::test_ws_named("/tmp/personal", name);
+            let names: Vec<&str> = Role::Analyst
+                .tools(&ws, false, test_sessions())
+                .iter()
+                .map(|t| t.name())
+                .collect();
+            assert!(
+                !names.contains(&"shell"),
+                "analysts in {name} must not get a shell, got {names:?}"
+            );
+            // Everything else about them is unchanged.
+            for expected in ["read", "search", "chrome"] {
+                assert!(names.contains(&expected), "{name} keeps {expected}");
             }
         }
     }

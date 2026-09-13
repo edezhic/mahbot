@@ -137,6 +137,10 @@ pub(crate) fn apply_safe_env(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Windows: create the child without a console window.
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Build a [`tokio::process::Command`] for executing a shell command in the
 /// workspace root. The environment is cleared and re-populated from
 /// [`SAFE_ENV_VARS`] only — no parent-process environment is inherited. This
@@ -169,17 +173,42 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
 
     #[cfg(target_os = "windows")]
     let mut process = {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-
         let mut p = tokio::process::Command::new("cmd.exe");
         p.arg("/C").arg(command).creation_flags(CREATE_NO_WINDOW);
         p
     };
 
-    // Shared setup: set working directory and sanitize the environment.
-    process.current_dir(workspace_root);
-    apply_safe_env(&mut process);
+    finalize_command(&mut process, workspace_root);
     process
+}
+
+/// Build a [`tokio::process::Command`] that runs `program` with `args` as
+/// argv — no shell in between, so no argument can ever be reinterpreted as
+/// shell syntax (unlike [`build_shell_command`], whose string is parsed by
+/// `sh -c`). Containment is otherwise identical: the workspace root as cwd,
+/// a cleared environment re-populated from [`SAFE_ENV_VARS`], and (Unix) the
+/// child leading its own process group.
+fn build_program_command(
+    program: &Path,
+    args: &[String],
+    workspace_root: &Path,
+) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new(program);
+    process.args(args);
+    #[cfg(unix)]
+    {
+        process.process_group(0);
+    }
+    #[cfg(target_os = "windows")]
+    process.creation_flags(CREATE_NO_WINDOW);
+    finalize_command(&mut process, workspace_root);
+    process
+}
+
+/// Shared command setup: working directory + sanitized environment.
+fn finalize_command(process: &mut tokio::process::Command, workspace_root: &Path) {
+    process.current_dir(workspace_root);
+    apply_safe_env(process);
 }
 
 /// Outcome of a timed shell subprocess run.
@@ -648,6 +677,101 @@ pub(crate) async fn run_raw_command(ws: &Workspace, command: &str) -> RawCommand
     }
 }
 
+/// Run `program` with `args` (argv — never a shell command string) in `ws`,
+/// under the shell's containment and its standard bounds: the sanitized
+/// environment, the default command timeout (process-group kill on unix), the
+/// per-pipe output cap and the post-exit drain bound.
+///
+/// `label` names what the caller asked to run and is what the failure prose
+/// talks about, so the model reads back the thing it called rather than the
+/// interpreter's path. Program and argv are taken explicitly rather than
+/// specialised to the script convention so that the argv contract — nothing in
+/// an argument is ever parsed as shell syntax — can be exercised without the
+/// managed runtime.
+///
+/// Returns the run's combined output, annotated the way the shell annotates a
+/// failure: the `[exit status: …]` note is appended as its own paragraph for
+/// anything but a clean exit. `Err` is a run that could not complete — spawn
+/// failure, timeout or drain overrun — never a non-zero exit, so a script's
+/// own failure stays the script's output.
+pub(crate) async fn run_program_with_timeout(
+    ws: &Workspace,
+    program: &Path,
+    args: &[String],
+    label: &str,
+) -> anyhow::Result<String> {
+    let timeout = Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS);
+    let mut cmd = build_program_command(program, args, ws.as_path());
+
+    match run_command_with_timeout(&mut cmd, timeout, output_drain_timeout()).await {
+        ShellRunResult::Completed {
+            stdout,
+            stderr,
+            status,
+            ..
+        } => {
+            let code = status.code();
+            let output = decode_raw_streams(&stdout, &stderr);
+            if code == Some(0) {
+                return Ok(output);
+            }
+            Ok(with_note(&output, &format_exit_status_note(code)))
+        }
+        // The same error class as the shell tool's timeout (a run that could
+        // not complete), but a typed one-liner carrying the output tail rather
+        // than the shell's structured block: a direct run has no per-call knob
+        // to raise, so nothing here may advertise the `timeout_secs` escape
+        // hatch. The kill is not called a process-group one: only unix puts the
+        // child in its own group.
+        ShellRunResult::TimedOut {
+            stdout,
+            stderr,
+            elapsed,
+            ..
+        } => Err(anyhow::anyhow!(
+            "timeout: {label} did not finish within {}s and was killed\n{}",
+            timeout.as_secs(),
+            program_error_tail(elapsed, &stdout, &stderr),
+        )),
+        ShellRunResult::DrainTimedOut {
+            stdout,
+            stderr,
+            elapsed,
+            ..
+        } => Err(anyhow::anyhow!(
+            "timeout: {label} exited but a leftover process kept its output pipes open \
+             past the drain limit — hint: keep any process the script launches inside its \
+             own lifetime\n{}",
+            program_error_tail(elapsed, &stdout, &stderr),
+        )),
+        ShellRunResult::SpawnFailed(e) => Err(anyhow::anyhow!(
+            "io: cannot run {label}: {e} — hint: the program must exist and be executable"
+        )),
+    }
+}
+
+/// Append a bracketed note (`[exit status: 3]`, `[ignored arguments: x]`) under
+/// `text` as its own paragraph: the text's trailing whitespace is trimmed so
+/// the note is never preceded by a blank gap, and a run that produced nothing
+/// is left as just the note.
+pub(crate) fn with_note(text: &str, note: &str) -> String {
+    let mut out = text.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(note);
+    out
+}
+
+/// Elapsed time plus the scrubbed tails of both streams, for a program run
+/// that did not complete.
+fn program_error_tail(elapsed: Duration, stdout: &[u8], stderr: &[u8]) -> String {
+    let mut msg = format!("elapsed: {:.1}s", elapsed.as_secs_f64());
+    append_output_tail(&mut msg, "stdout", stdout);
+    append_output_tail(&mut msg, "stderr", stderr);
+    msg
+}
+
 /// Decode both raw streams (lossy UTF-8 + ANSI strip) and combine stderr onto
 /// its own line when non-blank (never a leading blank line when stdout is
 /// empty). Output is NOT credential-scrubbed here — the caller scrubs the
@@ -1096,11 +1220,11 @@ impl ShellTool {
                     exit_code.unwrap_or(-1),
                     elapsed,
                 );
-                let mut combined = processed;
-                if exit_code != Some(0) {
-                    combined.push_str("\n\n");
-                    combined.push_str(&exit_note);
-                }
+                let combined = if exit_code == Some(0) {
+                    processed
+                } else {
+                    with_note(&processed, &exit_note)
+                };
                 Ok((combined, exit_code))
             }
             ShellRunResult::TimedOut {
@@ -3384,6 +3508,38 @@ mod tests {
         );
     }
 
+    /// A direct program run takes its arguments as argv: nothing in them is
+    /// parsed as shell syntax, a non-zero exit is a completed run (reported with
+    /// the standard note), and the output is decoded like the shell's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_program_with_timeout_passes_argv_and_annotates_exit() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = crate::workspace::test_ws(tmp.path());
+        let output = run_program_with_timeout(
+            &ws,
+            Path::new("/bin/sh"),
+            &[
+                "-c".to_string(),
+                // `$0` is the placeholder below; `$1` is the hostile-looking
+                // value, which must arrive verbatim rather than be executed.
+                "printf '%s' \"$1\"; exit 3".to_string(),
+                "sh".to_string(),
+                "a; echo pwned".to_string(),
+            ],
+            "the test program",
+        )
+        .await
+        .expect("a completed run");
+
+        // The hostile-looking argument arrives verbatim as the only output
+        // line; the status note follows it as its own paragraph.
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            ["a; echo pwned", "", "[exit status: 3]"]
+        );
+    }
+
     #[tokio::test]
     async fn run_raw_command_reports_success_output_and_failure() {
         let tmp = TempDir::new().expect("tempdir");
@@ -3641,8 +3797,8 @@ mod tests {
     #[test]
     fn full_description_and_schema_cover_background_capability() {
         // The Full variant gets its own prompt asset and extended argument
-        // schema describing the background capability (ReadOnly byte-identity
-        // is left to reviewer/QA verification per the ticket).
+        // schema describing the background capability; ReadOnly keeps the
+        // read-only prompt byte-identical.
         let full = ShellTool::new(ShellMode::Full);
         let description = full.description();
         assert!(
@@ -4258,8 +4414,7 @@ mod tests {
             ("cat <<EOF\n$(touch ws)\nEOF", &["cat", "$(touch ws)"]),
             // Double-quoted substitutions stay whole too: a `;` inside
             // `"$(...)"` is part of the substitution, not a separator, and
-            // bash executes the body, so segmentation must not fragment it
-            // (QA round: double-quoted substitution bypass fix).
+            // bash executes the body, so segmentation must not fragment it.
             (
                 "echo \"$(echo hi; touch x)\"",
                 &["echo \"$(echo hi; touch x)\""],

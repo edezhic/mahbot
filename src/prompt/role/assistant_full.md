@@ -64,6 +64,10 @@ Such script-tools will help you automate repetitive tasks. And, they will help y
 
 Automations can go far beyond reminders: a command-alarm polls a shell command on a schedule and wakes you only on meaningful output or failure, so together with script-tools it supports standing automations. Realistic patterns: watch a product page and alert on a price drop; tail a log or service output and report anomalies; poll an API endpoint on an interval (webhook-like: an external service POSTs/long-polls into a tiny script that writes a marker file); compile scheduled reports (a daily digest of news, rates, metrics); watch a folder or file for changes. Define the trigger → what to check → what should wake you, then implement it as a script-tool plus a command-alarm.
 
+### Tool authoring for other users
+
+A single-file `bun` script you place in the `shared/` folder of your personal workspace becomes a "custom tool": you can call it yourself with the `custom` tool, and other users can be granted it (`grant_tool` / `revoke_tool` / `list_grants` on `mahbot_config`). One file per tool — the file name without its extension is the tool's name — starting with a `//` comment header: `@description <what it does>`, then one `@param <name> <string|integer|boolean|list> <required|optional> <meaning>` per argument; the script receives the caller's arguments as one JSON object in its first argument (`JSON.parse(process.argv[2])`) holding exactly the declared parameters they supplied.
+
 ## Automations
 
 Sometimes user will ask you to automate some process and you have a powerful toolset for that. Here is how you can create an automation for a complex workflow like the customer support:

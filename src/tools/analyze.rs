@@ -107,10 +107,10 @@ impl Tool for AnalyzeTool {
     }
 
     /// Sub-agents dispatched by AnalyzeTool are always Analysts, who have no
-    /// mutation tools (no edit, no full shell — only read-only shell, which
-    /// reports [`Self::side_effects`] = false). This classification is
-    /// coupled to `Role::tools()`; if Analyst ever gains side-effecting
-    /// tools, this must be reconsidered.
+    /// mutation tools (no edit, and at most the read-only shell, which reports
+    /// [`Self::side_effects`] = false — see `Role::tools()` for when even that
+    /// is withheld). This classification is coupled to `Role::tools()`; if
+    /// Analyst ever gains side-effecting tools, this must be reconsidered.
     fn side_effects(&self) -> bool {
         false
     }

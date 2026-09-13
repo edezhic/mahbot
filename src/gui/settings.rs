@@ -2156,7 +2156,24 @@ impl SettingsState {
                     segment =
                         segment.push(text(p).size(theme::TEXT_12).color(theme::TEXT_SECONDARY));
                 }
-                let user_row = container(segment.push(telegram_elem))
+
+                let mut card_body = Column::new()
+                    .spacing(theme::SPACE_2)
+                    .push(segment.push(telegram_elem));
+                // Admins hold the whole tool catalogue implicitly, so a grant
+                // line on their card would misstate what they can call.
+                if !is_admin {
+                    card_body = card_body.push(
+                        text(format!(
+                            "Custom tools: {}",
+                            crate::users::format_grants(&user.granted_tools)
+                        ))
+                        .size(theme::TEXT_12)
+                        .color(theme::TEXT_SECONDARY),
+                    );
+                }
+
+                let user_row = container(card_body)
                     .width(Length::Fill)
                     .align_x(Alignment::Start)
                     .align_y(Alignment::Center)

@@ -1,13 +1,14 @@
 //! Merged admin config tool — one `mahbot_config` action dispatcher for the
 //! five setup actions previously exposed as separate Support tools
 //! (`setup_telegram_bot`, `bind_telegram`, `add_workspace`, `add_user`,
-//! `setup_web_search`). It is now the full-access Assistant's sole
-//! configuration surface (the Support role is gone).
+//! `setup_web_search`) plus the per-user custom-tool grants
+//! (`grant_tool` / `revoke_tool` / `list_grants`). It is now the full-access
+//! Assistant's sole configuration surface (the Support role is gone).
 use crate::config::{
     CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
     CONFIG_KEY_WEB_SEARCH_PROVIDER,
 };
-use crate::users::FieldUpdate;
+use crate::users::{FieldUpdate, format_grants};
 use crate::{Role, Tool, Workspace};
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
@@ -45,6 +46,9 @@ impl Tool for MahbotConfigTool {
                         "add_workspace",
                         "add_user",
                         "setup_web_search",
+                        "grant_tool",
+                        "revoke_tool",
+                        "list_grants",
                     ],
                     "description": "Which configuration action to perform."
                 },
@@ -59,6 +63,14 @@ impl Tool for MahbotConfigTool {
                 "name": {
                     "type": "string",
                     "description": "(add_workspace / add_user) A short unique name for the workspace (used in ticket ids and the GUI), or the new user's display name."
+                },
+                "user": {
+                    "type": "string",
+                    "description": "(grant_tool / revoke_tool / list_grants) The target user's name. Optional for list_grants — omit it to list every user's grants."
+                },
+                "tool": {
+                    "type": "string",
+                    "description": "(grant_tool / revoke_tool) The custom tool's name — the file name without its extension of a script in the `shared` folder of the admin's personal workspace."
                 },
                 "path": {
                     "type": "string",
@@ -97,9 +109,12 @@ impl Tool for MahbotConfigTool {
             "add_workspace" => self.exec_add_workspace(ws, args).await,
             "add_user" => self.exec_add_user(args).await,
             "setup_web_search" => self.exec_setup_web_search(args).await,
+            "grant_tool" => self.exec_grant_tool(args).await,
+            "revoke_tool" => self.exec_revoke_tool(args).await,
+            "list_grants" => self.exec_list_grants(args).await,
             other => Err(err(format!(
                 "unknown action '{other}' — expected one of: setup_telegram_bot, bind_telegram, \
-                 add_workspace, add_user, setup_web_search"
+                 add_workspace, add_user, setup_web_search, grant_tool, revoke_tool, list_grants"
             ))),
         }
     }
@@ -270,6 +285,87 @@ impl MahbotConfigTool {
             "Web-search backend registered: {provider}. Agents can now use `web_search`."
         ))
     }
+
+    async fn exec_grant_tool(&self, args: serde_json::Value) -> anyhow::Result<String> {
+        let user = super::get_str(&args, "user")?;
+        let tool = super::get_str(&args, "tool")?;
+        // A grant is recorded whatever the catalogue holds — it does not depend
+        // on the file — but a name that could never be a tool name (a path, a
+        // dot-file, empty) is a typo worth reporting now rather than storing a
+        // grant that shows on the user's card and can never resolve.
+        if !crate::tools::custom::is_tool_name(tool) {
+            return Err(err(format!(
+                "usage: '{tool}' cannot be a custom tool name — hint: a tool's name is its \
+                 file name without the extension, with no path separators or leading dot"
+            )));
+        }
+
+        let store = crate::users::store();
+        if !store.add_grant(user, tool).await? {
+            return Err(err(format!(
+                "not-found: no user '{user}' — hint: grants need an existing user; create \
+                 them first"
+            )));
+        }
+        let grants = store.get_grants(user).await?;
+        Ok(format!(
+            "Granted custom tool '{tool}' to '{user}'. Their custom tools are now: {}.",
+            format_grants(&grants)
+        ))
+    }
+
+    async fn exec_revoke_tool(&self, args: serde_json::Value) -> anyhow::Result<String> {
+        let user = super::get_str(&args, "user")?;
+        let tool = super::get_str(&args, "tool")?;
+
+        let store = crate::users::store();
+        if !store.remove_grant(user, tool).await? {
+            // A missing user is not an error, but reporting a revoke that
+            // touched nothing would be a false confirmation.
+            return Ok(format!("No user '{user}' — nothing was revoked."));
+        }
+        let grants = store.get_grants(user).await?;
+        Ok(format!(
+            "Revoked custom tool '{tool}' from '{user}'. Their custom tools are now: {}.",
+            format_grants(&grants)
+        ))
+    }
+
+    async fn exec_list_grants(&self, args: serde_json::Value) -> anyhow::Result<String> {
+        let user = match args.get("user") {
+            None | Some(serde_json::Value::Null) => None,
+            // `get_opt_str` is deliberately silent, so a wrong-typed user would
+            // masquerade as "every user" — reject it here, before the store is
+            // touched, like the other argument checks.
+            Some(v) => Some(
+                v.as_str()
+                    .ok_or_else(|| super::wrong_type("user", "a string", v))?,
+            ),
+        };
+        let store = crate::users::store();
+        let Some(user) = user else {
+            let all = store.list_grants().await?;
+            if all.is_empty() {
+                return Ok("No custom tools are granted to any user.".to_string());
+            }
+            return Ok(all
+                .iter()
+                .map(|(user, grants)| format!("{user}: {}", format_grants(grants)))
+                .collect::<Vec<String>>()
+                .join("\n"));
+        };
+        let grants = store.get_grants(user).await?;
+        if grants.is_empty() {
+            // "No grants" and "no such user" read the same out of the store,
+            // and reporting the first for a name that does not exist would be a
+            // false confirmation — as `revoke_tool` avoids too.
+            if !store.user_exists(user).await? {
+                return Ok(format!("No user '{user}' — nothing to list."));
+            }
+            return Ok(format!("No custom tools are granted to {user}."));
+        }
+        Ok(format!("{user}: {}", format_grants(&grants)))
+    }
 }
 
 #[cfg(test)]
@@ -287,12 +383,17 @@ mod tests {
         let tool = MahbotConfigTool;
         let ws = test_ws("/tmp/test_ws");
 
+        // `list_grants` is absent: it has no required field, so it would
+        // legitimately succeed with these args — its name is pinned by the
+        // unknown-action message asserted below instead.
         for action in [
             "setup_telegram_bot",
             "bind_telegram",
             "add_workspace",
             "add_user",
             "setup_web_search",
+            "grant_tool",
+            "revoke_tool",
         ] {
             let args = json!({ "action": action });
             // Each action reports its own missing required field, proving the
@@ -303,6 +404,28 @@ mod tests {
                 "action '{action}' should report a missing field, got: {err}"
             );
         }
+
+        // A present but wrong-typed `user` must not silently read as "every
+        // user" — the one argument check `list_grants` performs before touching
+        // any store.
+        let err = tool
+            .execute(&ws, json!({ "action": "list_grants", "user": 5 }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be a string"), "got: {err}");
+
+        // A grant names a tool the way a call does: a name that could never be
+        // one is rejected instead of being recorded.
+        let err = tool
+            .execute(
+                &ws,
+                json!({ "action": "grant_tool", "user": "someone", "tool": "a/b" }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be a custom tool name"), "got: {err}");
 
         let err = tool
             .execute(&ws, json!({ "action": "bogus_action" }))
@@ -318,7 +441,10 @@ mod tests {
                 && err.contains("bind_telegram")
                 && err.contains("add_workspace")
                 && err.contains("add_user")
-                && err.contains("setup_web_search"),
+                && err.contains("setup_web_search")
+                && err.contains("grant_tool")
+                && err.contains("revoke_tool")
+                && err.contains("list_grants"),
             "unknown-action error must list the valid actions, got: {err}"
         );
     }
@@ -344,6 +470,10 @@ mod tests {
                 json!({ "action": "setup_web_search", "provider": "exa" }),
                 "key",
             ),
+            (json!({ "action": "grant_tool" }), "user"),
+            (json!({ "action": "grant_tool", "user": "alice" }), "tool"),
+            (json!({ "action": "revoke_tool" }), "user"),
+            (json!({ "action": "revoke_tool", "user": "alice" }), "tool"),
         ];
 
         for (args, field) in cases {
