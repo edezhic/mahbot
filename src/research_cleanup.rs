@@ -6,8 +6,8 @@
 //! Every deep-research run gets a per-run folder under
 //! `<temp_dir()>/mahbot-research/{job_id}` — inside the readonly-shell's
 //! allowed temp roots, so analysts can write scratch files there. The folder
-//! is created idempotently at dispatch AND boot resume (a resume after an OS
-//! temp cleanup recreates it; lost prototypes are fail-open). The run's
+//! is created idempotently at dispatch AND boot resume (a resume recreates it
+//! when it is gone; lost prototypes are fail-open). The run's
 //! ephemeral search tracker also lives inside the folder (see
 //! `crate::search_engine`), so everything temporary dies with it.
 //!
@@ -17,11 +17,12 @@
 //! sweep ([`crate::research_cancel::sweep_cancelled_run`]) for folders with
 //! NO cleanup intent. A folder WITH a command dump is normally released by
 //! the cleanup tail; the only other way it goes away is orphaning — e.g. a
-//! failed cleanup dispatch — to the OS temp sweep. There is no periodic or
-//! scan-based run-folder sweep anywhere in the daemon, so folders of crashed
-//! runs are likewise left for the OS temp sweep (see `crate::temp` — the
-//! temp-dir cleaner protects research run folders only by prompt
-//! instruction, never programmatically).
+//! failed cleanup dispatch — after which the periodic temp cleaner reclaims it
+//! once it is older than 24 hours. There is no scan-based run-folder sweep in
+//! the run machinery itself: orphaned folders of crashed runs are reclaimed the
+//! same way, by the cleaner's blunt age rule (see `crate::temp` — live,
+//! in-flight run folders are protected by the cleaner's prompt instruction,
+//! never programmatically).
 //!
 //! ## Command dump + Sanitation cleanup
 //!
@@ -102,7 +103,8 @@ pub(crate) async fn ensure_run_root(job_id: &str) -> PathBuf {
 ///
 /// Fail-closed by design (`unwrap_or(false)`): a transient IO error on the
 /// replay path skips row recreation, so a crash-window cleanup never runs and
-/// its outside-folder scratch leaks to the OS temp sweep — the safe direction.
+/// its outside-folder scratch leaks to the periodic temp cleaner — the safe
+/// direction.
 /// The alternative (fail-open on error) would re-dispatch a cleanup LLM round
 /// for a run that ALREADY completed, per boot, until the envelope is delivered
 /// — an avoidable, unbounded-until-delivery cost for a transient read error
@@ -115,7 +117,7 @@ async fn run_folder_exists(job_id: &str) -> bool {
 
 /// Does the run folder hold its command dump (the cleanup intent)? The
 /// cancel-sweep folder-release guard: a folder with a dump must survive for
-/// the cleanup tail / OS sweep.
+/// the cleanup tail / periodic temp cleaner.
 ///
 /// Errors resolve to `true` (`unwrap_or(true)`), the OPPOSITE default of
 /// [`run_folder_exists`]: a transient IO error assumes the dump IS present,
@@ -140,8 +142,8 @@ pub(crate) async fn command_dump_exists(job_id: &str) -> bool {
 /// ([`crate::research_cancel::sweep_cancelled_run`]) only for folders with NO
 /// command dump (dump-guarded upstream in [`command_dump_exists`]); a folder
 /// WITH a dump is normally released by the cleanup tail — though a failed
-/// cleanup dispatch (see `crate::tools::research`) orphans it to the OS temp
-/// sweep, like a crashed run. The cleanup jobs row is NOT touched here:
+/// cleanup dispatch (see `crate::tools::research`) orphans it, exactly like a
+/// crashed run (module header). The cleanup jobs row is NOT touched here:
 /// callers own row removal.
 ///
 /// Removal failure is swallowed (the folder is "left for the OS") and the row
@@ -149,7 +151,8 @@ pub(crate) async fn command_dump_exists(job_id: &str) -> bool {
 /// self-heals: if the completion envelope stayed undelivered, the next boot's
 /// replay sees the surviving folder and re-dispatches the cleanup, which
 /// retries the removal; if the envelope was delivered, the folder leaks to the
-/// OS temp sweep only (the accepted crash-class edge — no retry machinery).
+/// periodic temp cleaner only — the accepted crash-class edge, no retry
+/// machinery).
 pub(crate) async fn release_run_folder(job_id: &str) {
     if crate::search_engine::registry_initialized() {
         crate::search_engine::remove_engine(job_id);
@@ -438,7 +441,7 @@ pub(crate) async fn dispatch_cleanup_for_pending_envelope(
 /// transient-prefix invariant test in session/mod.rs asserts against it, so a
 /// format change is caught by tests instead of silently leaking sessions.
 /// Shared by ALL transient `cleanup_` Sanitation agents: the research-run
-/// cleanup AND the periodic temp-dir cleaner (`crate::temp`), so the
+/// cleanup AND the periodic temp cleaner (`crate::temp`), so the
 /// transient-prefix invariant test covers both.
 #[must_use]
 pub(crate) fn cleanup_agent_id(job_id: &str) -> String {
@@ -466,9 +469,9 @@ async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Result<Option<S
     // `ensure_run_root` is idempotent (create_dir_all), so on the replay path
     // — where `dispatch_cleanup_for_pending_envelope` just verified the folder
     // exists — this is a no-op. It stays as a defensive recreate for the
-    // fresh path: an OS temp sweep between research terminalization and the
-    // cleanup dispatch would otherwise hand the agent a prompt pointing at a
-    // missing folder.
+    // fresh path: the periodic temp cleaner between research terminalization
+    // and the cleanup dispatch would otherwise hand the agent a prompt pointing
+    // at a missing folder.
     let dump_path = run_root.join(COMMAND_DUMP_FILE);
     let prompt = build_cleanup_prompt(job_id, &run_root, &dump_path, ws);
 
@@ -646,7 +649,7 @@ pub(crate) async fn resume_research_cleanup(job_id: &str, ws: &Workspace) {
         // None = drain abort (the row STAYS — the folder stays held for the
         // next boot) or a gone row (explicit abandon — the abandon's cancel
         // sweeps the rows, and its dump-guarded release leaves a dump-holding
-        // folder for the OS sweep; nothing left to release here).
+        // folder for the periodic temp cleaner; nothing left to release here).
         return;
     };
     let prompt = caller.task.clone();

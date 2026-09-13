@@ -707,7 +707,7 @@ async fn terminalize_research(
         tracing::warn!(
             job = %job_id,
             error = %e,
-            "Research cleanup dispatch failed — run folder left for the OS temp sweep"
+            "Research cleanup dispatch failed — run folder left for the periodic temp cleaner"
         );
     }
     Some(envelope)

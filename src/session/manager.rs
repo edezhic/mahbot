@@ -499,8 +499,8 @@ impl Session {
         let retained = crate::session::select_retention_window(&self.history);
         // Dump what this compaction deletes BEFORE persisting, so the path
         // rides inside the persisted summary message; a persist failure then
-        // orphans the dump (accepted: dumps are never GC'd). A dump failure
-        // fails open.
+        // orphans the dump (accepted: an orphan is dead weight — its lifecycle
+        // is in `compaction_dump`). A dump failure fails open.
         let dump_path = super::compaction_dump::dump_deleted_messages(
             agent_id,
             &self.history,

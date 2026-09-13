@@ -1548,10 +1548,10 @@ impl Tool for ShellTool {
 
 /// Get the shared temp directory for spill/full output logs.
 ///
-/// NO startup purge here: crash-leftover `.agent` files are left for the OS
-/// temp sweep (the daemon builds no startup reclamation — crash leftovers are
-/// the operating system's job). Within a run, owner-deletes-at-end removes
-/// what the agent created.
+/// NO startup purge here: crash-leftover `.agent` files are reclaimed by the
+/// periodic temp cleaner (see [`crate::temp`]) or the OS temp sweep — the
+/// daemon builds no startup reclamation. Within a run, owner-deletes-at-end
+/// removes what the agent created.
 pub(crate) fn agent_temp_dir() -> Option<std::path::PathBuf> {
     let dir = std::env::temp_dir().join(".agent");
     std::fs::create_dir_all(&dir).ok()?;
@@ -1561,8 +1561,8 @@ pub(crate) fn agent_temp_dir() -> Option<std::path::PathBuf> {
 /// Spill files created during agent runs, keyed by the owning agent id.
 /// Owner-deletes-at-end: [`cleanup_agent_spills`] removes them when the agent
 /// run ends. Entries for a dead agent id are removed on cleanup; a daemon
-/// crash leaves the files behind for the OS temp sweep (the daemon performs
-/// no startup purge).
+/// crash leaves the files behind for the OS temp sweep and the periodic
+/// temp cleaner (the daemon performs no startup purge).
 static SPILL_OWNERS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<std::path::PathBuf>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));

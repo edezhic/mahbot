@@ -308,10 +308,10 @@ pub(crate) enum SpawnChild {
     /// name) so the row holds the run folder until the cleanup completes —
     /// the folder is released by the cleanup tail (folder first, row last).
     ResearchCleanup,
-    /// A periodic OS temp-dir cleaner Sanitation agent (fire-and-forget, see
-    /// `crate::temp`). No child row: the jobs row's `task` holds the
-    /// cleanup prompt. Leftover rows are terminalized at boot (never
-    /// resumed) — the cleaner's ephemeral workspace is never registered.
+    /// A periodic temp cleaner Sanitation agent (see `crate::temp`).
+    /// No child row: the jobs row's `task` holds the cleanup prompt. Leftover
+    /// rows are terminalized at boot (never resumed) — the cleaner's
+    /// ephemeral workspace is never registered.
     TempCleanup,
     /// A per-phase ticket job: `jobs.kind` = `phase.as_ref()` (the single
     /// state-machine authority), `jobs.ticket_id` = the ticket. One short-lived
@@ -1690,7 +1690,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
             // crash. Resume it like any other durable job. The folder stays
             // held until the resumed tail releases it; a row removed by the
             // dump-guarded cancel sweep deliberately leaves a dump-holding
-            // folder for the cleanup tail / OS sweep.
+            // folder for the cleanup tail / periodic temp cleaner.
             if workspace_unresolvable(job).await {
                 continue;
             }
@@ -1701,17 +1701,16 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
             });
             resumed_other += 1;
         } else if job.kind == "temp_cleanup" {
-            // A periodic OS temp-dir cleaner interrupted by a crash.
-            // Fire-and-forget: the cleanup is best-effort and the next
-            // scheduled pass re-runs it, so a leftover row is
-            // terminalized (never resumed). The cleaner's workspace is a
-            // synthetic ephemeral name that is never registered in
-            // the `workspaces` table — resuming would hit run_management's
+            // A periodic temp cleaner interrupted by a crash. The
+            // cleanup is best-effort and the next due pass re-runs it, so a
+            // leftover row is terminalized (never resumed). The cleaner's
+            // workspace is a synthetic ephemeral name that is never registered
+            // in the `workspaces` table — resuming would hit run_management's
             // unresolvable-workspace path; terminalizing here keeps that
             // explicit and skips the catch-all warning.
             info!(
                 job = %job.id,
-                "Temp-dir cleanup row left over from a previous lifetime — terminalizing (fire-and-forget, no resume)",
+                "Temp cleaner row left over from a previous lifetime — terminalizing (no resume)",
             );
             let _ = terminalize_job(conn, &job.id).await;
         } else {

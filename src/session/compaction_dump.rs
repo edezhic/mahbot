@@ -1,20 +1,22 @@
-//! Compaction spill-dump: durable recovery artifact of the conversation
-//! messages a summarization compaction deletes.
+//! Compaction spill-dump: recovery artifact of the conversation messages a
+//! summarization compaction deletes.
 //!
 //! When [`crate::session::Session::apply_summary`] rebuilds history it keeps
 //! only a fresh system prompt, the summary, and the latest retention window
 //! (see [`crate::session::select_retention_window`]) — everything else is
 //! dropped from the session permanently. This module writes the dropped
 //! messages to a readable `.md` dump and returns its path so the persisted
-//! summary message can point the agent at it: earlier context stays
-//! recoverable with the read tool for the session's whole lifetime.
+//! summary message can point the agent at it.
 //!
 //! Lifecycle: the dump is NOT registered for owner-delete-at-run-end cleanup
-//! (unlike the `spill_*` shell spill files) and is never GC'd — the daemon
-//! builds no startup purge, so crash leftovers are the OS temp sweep's job.
-//! A compaction whose persist fails orphans its dump; that is accepted —
-//! orphan dumps are dead weight, not a correctness problem, and deleting a
-//! dump that a concurrently-retried persist might reference would be worse.
+//! (unlike the `spill_*` shell spill files), and the daemon builds no startup
+//! purge. For every role except the Assistant the dump lives under the pinned
+//! temp root, so the periodic temp cleaner sweeps it once it is older than
+//! 24 hours (see [`crate::temp`]); the Assistant's dump lives in its personal
+//! workspace, outside the cleaner's scope. A compaction whose persist fails
+//! orphans its dump; that is accepted — orphan dumps are dead weight, not a
+//! correctness problem, and deleting a dump that a concurrently-retried
+//! persist might reference would be worse.
 //!
 //! Cross-references: media-marker handling in [`crate::util`] (data-URI
 //! stripping) and the read tool's `MAX_FILE_SIZE_BYTES` cap (the reason data
@@ -32,13 +34,11 @@ use crate::{ChatMessage, ChatRole, Role};
 /// keep it out of listings.
 const DUMP_DIR_NAME: &str = ".compaction";
 
-/// Dump the messages this compaction deletes to a durable `.md` file.
+/// Dump the messages this compaction deletes to a `.md` file.
 ///
-/// This is a session-lifetime recovery artifact: the messages it contains are
-/// removed from the session by the caller's persist, and this dump is the
-/// only place they survive. NOT registered for owner-delete-at-run-end
-/// cleanup (unlike the shell `spill_*` files) and never GC'd — orphan dumps
-/// from failed compaction persists are accepted.
+/// The messages it contains are removed from the session by the caller's
+/// persist, so this dump is the only copy of them. Lifecycle (retention,
+/// cleanup, orphaned dumps) is described in the module header.
 ///
 /// Fail-open: any filesystem failure logs a warning and returns `None` — a
 /// dump failure never blocks compaction.
@@ -113,8 +113,8 @@ fn deleted_conversation_messages<'a>(
 
 /// Render the deleted messages as a plain readable transcript. The whole
 /// output runs through [`crate::util::scrub_credentials`] — the same
-/// scrubbing tool output gets — because dumps outlive the session and may be
-/// read by any agent with a read tool.
+/// scrubbing tool output gets — because any agent with a read tool can open a
+/// dump, just as it can read tool output.
 fn render_dump(messages: &[&ChatMessage]) -> String {
     let mut out = String::new();
     for msg in messages {
@@ -168,8 +168,8 @@ fn render_dump(messages: &[&ChatMessage]) -> String {
 /// - Every other role has the general read tool, and the whole pinned temp
 ///   root is already inside its allowlist, so the dump goes to
 ///   `<agent_temp_dir>/compaction`. It deliberately does NOT use the
-///   `spill_*` filename shape and is NOT registered in `SPILL_OWNERS` —
-///   dumps outlive the run.
+///   `spill_*` filename shape and is NOT registered in `SPILL_OWNERS` — a dump
+///   outlives the run that wrote it.
 ///
 /// Fail-open: `None` when validation fails or the directory cannot be
 /// created.
@@ -190,7 +190,7 @@ async fn dump_dir(role: &Role, user_name: &str) -> Option<PathBuf> {
 ///
 /// `seq` is per-session monotonic, derived by counting existing files whose
 /// name starts with `compaction-{sanitized}-` (start at 1). The unix-millis
-/// suffix keeps names unique even if the OS temp sweep removed earlier dumps
+/// suffix keeps names unique even if an earlier dump was already reclaimed
 /// (a plain counter would then reuse a name whose file is gone — harmless,
 /// but a fresh name avoids any ambiguity). Fail-open: `None` on `read_dir`
 /// failure.

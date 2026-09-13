@@ -1,2 +1,2 @@
 Messages dropped by this compaction were saved to: {{path}}
-Read that file with the read tool when earlier conversation context is needed.
+Read that file with the read tool when earlier conversation context is needed — it is not part of the session history, so read it promptly rather than relying on it later.

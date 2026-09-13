@@ -161,7 +161,7 @@ pub(crate) async fn cancel_research_run(job_id: &str) {
 ///   deleted by the completion boundary before the cleanup row is created).
 /// - the run folder ONLY when it has NO command dump: a folder holding a
 ///   `commands.dump` is the run's cleanup intent, which must survive for the
-///   cleanup tail (or the OS temp sweep). See [`command_dump_exists`].
+///   cleanup tail (or the periodic temp cleaner). See [`command_dump_exists`].
 /// - the results.md archive (no archive file).
 ///
 /// Idempotent and safe to run concurrently — every statement is a no-op on
@@ -183,7 +183,7 @@ pub(crate) async fn sweep_cancelled_run(job_id: &str) -> Result<(), String> {
     if crate::research_cleanup::command_dump_exists(job_id).await {
         tracing::warn!(
             job = %job_id,
-            "run folder has a command dump — cleanup intent present, folder NOT released (left for the cleanup tail / OS sweep)"
+            "run folder has a command dump — cleanup intent present, folder NOT released (left for the cleanup tail / periodic temp cleaner)"
         );
     } else {
         crate::research_cleanup::release_run_folder(job_id).await;
@@ -249,7 +249,7 @@ async fn hand_off_rows(job_id: &str, ws: &Workspace) -> Result<Option<String>, S
         return Ok(None);
     }
     // Canonical run root — NEVER ensure_run_root: a manual cancel must not
-    // resurrect a folder the OS temp sweep (or a prior release) already removed.
+    // resurrect a folder the periodic temp cleaner (or a prior release) already removed.
     let run_root = tokio::fs::canonicalize(crate::research_cleanup::run_root_path(job_id))
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -431,7 +431,7 @@ mod tests {
 
     /// A folder WITH a command dump is the run's cleanup intent: the sweep
     /// removes the jobs/pending rows and the archive, but the folder AND the
-    /// dump survive (the cleanup tail / OS sweep owns their release). The warn
+    /// dump survive (the cleanup tail / periodic temp cleaner owns their release). The warn
     /// log is not asserted.
     #[tokio::test]
     async fn sweep_never_releases_folder_with_command_dump() {

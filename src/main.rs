@@ -196,8 +196,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
                 // transient, so keep-evidence is live regardless of ordering.
                 // (Research run folders are NOT swept here — `release_run_folder`
                 // is the single release point, invoked per-job by completion,
-                // the cancel sweep, and boot resume; crash leftovers are the
-                // OS's job.)
+                // the cancel sweep, and boot resume; crash leftovers are the OS
+                // temp sweep's or the periodic temp cleaner's job.)
                 let media = mahbot::research_cleanup::sweep_media().await?;
                 Ok(purged + cleaned + media)
             },
@@ -252,14 +252,22 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
 
     // Nightly workspace re-analysis: checks for new git commits and
     // triggers rediscover during the 2-3 AM local time window, gated to
-    // at most one pass per 7 days (rolling, recorded at pass start); each
-    // allowed pass also dispatches the fire-and-forget temp-dir cleaner
-    // (Sanitation).
+    // at most one pass per 7 days (rolling, recorded at pass start).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
         "nightly-check",
         mahbot::workspace::run_nightly_check_loop(),
+    );
+
+    // Periodic temp cleaner (Sanitation): reclaims the product's agents'
+    // abandoned temp artifacts. Its own loop, decoupled from workspace work,
+    // with a free-space-adaptive cadence (see `mahbot::temp`).
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "temp-cleanup",
+        mahbot::temp::run_temp_cleanup_loop(),
     );
 
     // Debug IPC query endpoint: `mahbot debug` connects to this local socket

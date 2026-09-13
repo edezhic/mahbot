@@ -172,19 +172,10 @@ fn checkpoint_min_free_bytes() -> u64 {
 /// Free bytes on the filesystem backing `path` (0 when unavailable).
 #[cfg(unix)]
 fn available_free_bytes(path: &Path) -> u64 {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return 0;
-    };
-    let mut stats = unsafe { std::mem::zeroed::<libc::statvfs>() };
-    if unsafe { libc::statvfs(c_path.as_ptr(), std::ptr::addr_of_mut!(stats)) } != 0 {
-        return 0;
-    }
-    u64::from(stats.f_bavail).saturating_mul(stats.f_frsize)
+    crate::util::disk::free_and_capacity(path).map_or(0, |(free, _)| free)
 }
 
-/// Free bytes on the filesystem backing `path` (0 when unavailable; Windows
-/// has no direct free-space query via libc — the gate simply never trips).
+/// Windows has no direct free-space query via libc — the gate simply never trips.
 #[cfg(not(unix))]
 fn available_free_bytes(_path: &Path) -> u64 {
     u64::MAX

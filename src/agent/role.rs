@@ -364,7 +364,7 @@ impl Role {
                 // Sanitation deliberately has NO search tools (local `search`
                 // or `web_search`): the role inspects and cleans specific
                 // filesystem artifacts and never needs to index the temp tree
-                // or hit the web — for the periodic temp-dir cleaner a
+                // or hit the web — for the periodic temp cleaner a
                 // `search` over the whole temp folder would index junk and
                 // start filesystem watchers. Read + read-only shell cover
                 // inspection and temp-root mutation.
