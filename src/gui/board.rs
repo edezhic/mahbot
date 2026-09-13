@@ -210,8 +210,6 @@ pub struct BoardState {
     /// acts as "blur" instead of "close". A second Escape always closes the
     /// modal, which is acceptable UX for Iced 0.14's widget focus API limits.
     comment_focused: bool,
-    /// Current user name used for comment attribution (`"user:{name}"`).
-    pub(crate) current_user_name: Option<String>,
     /// Monotonic counter incremented when the modal context changes
     /// (modal close via `reset_modal()`, or ticket switch via
     /// `TicketDetails`). Captured in `SendComment` and verified in
@@ -262,7 +260,6 @@ impl BoardState {
             ),
             sending_comment: false,
             comment_focused: false,
-            current_user_name: None,
             comment_generation: 0,
             undo_stack: super::common::UndoStack::new(),
             search_query: super::common::SingleLineEditorState::new(""),
@@ -1141,17 +1138,11 @@ impl BoardState {
                         Err(task) => return task,
                     };
 
-                let Some(ref user_name) = self.current_user_name else {
-                    return Task::done(BoardMessage::Toast(super::ToastMessage::Warning(
-                        "No user selected — cannot add comment.".into(),
-                    )));
-                };
-
                 let Some(ticket_id) = self.selected_ticket.as_ref().map(|t| t.id.clone()) else {
                     return Task::none();
                 };
 
-                let role = format!("user:{user_name}");
+                let role = format!("user:{}", crate::users::ADMIN_USER_NAME);
                 let now = crate::db::now();
                 let content = trimmed;
 
@@ -2180,7 +2171,6 @@ mod tests {
 
     fn make_board_state() -> BoardState {
         let mut state = BoardState::new();
-        state.current_user_name = Some("admin".into());
         state.selected_ticket = Some(TicketFixture::new("T-1", TicketPhase::Backlog).build());
         state
     }
@@ -2211,20 +2201,6 @@ mod tests {
             1,
             "comment should be optimistically pushed to the selected ticket"
         );
-    }
-
-    // ── SendComment: missing user ─────────────────────────────────
-
-    #[test]
-    fn test_comment_no_user_returns_warning() {
-        let mut state = make_board_state();
-        state.current_user_name = None;
-        state.comment_input = EditorBuffer::with_text("hello", Some(HighlightLanguage::Markdown));
-        let _task = state.update(BoardMessage::SendComment);
-
-        // Editor should NOT be cleared — message was rejected.
-        assert_eq!(state.comment_input.text(), "hello");
-        assert!(!state.sending_comment);
     }
 
     // ── SendComment: no ticket selected ───────────────────────────

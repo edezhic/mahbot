@@ -207,26 +207,15 @@ impl SessionsState {
         }
     }
 
-    /// Refresh the session list. When `hide_shared_workspaces` is set, sessions
-    /// whose `workspace_name` is a shared (non-personal, non-empty) workspace
-    /// are filtered out — shared-workspace membership is admin-only, so a
-    /// non-admin only sees personal-workspace sessions.
-    pub(crate) fn refresh(hide_shared_workspaces: bool) -> Task<SessionsMessage> {
+    /// Refresh the session list.
+    pub(crate) fn refresh() -> Task<SessionsMessage> {
         Task::perform(
             async move {
                 let store = crate::session::store();
-                let mut list = store
+                store
                     .list_sessions_with_metadata_checked()
                     .await
-                    .map_err(|e| e.to_string())?;
-                if hide_shared_workspaces {
-                    list.retain(|s| {
-                        s.workspace_name.as_deref().is_none_or(|ws| {
-                            ws.is_empty() || crate::users::is_personal_workspace(ws)
-                        })
-                    });
-                }
-                Ok::<_, String>(list)
+                    .map_err(|e| e.to_string())
             },
             |res| match res {
                 Ok(sessions) => SessionsMessage::Refreshed(sessions),

@@ -1,4 +1,5 @@
-//! Users dashboard page — manage user preferences.
+//! Settings Users section state — user list, delete confirmation, and Telegram
+//! channel binding.
 
 use crate::users::{FieldUpdate, UserRecordEntry, UserStore};
 
@@ -39,10 +40,7 @@ pub enum UsersMessage {
     DeleteUser(String),
     ConfirmDelete(String),
     CancelDelete,
-    DeleteResult(Result<(), String>, String),
-
-    /// Switch active user to this one (icon button on users page).
-    SwitchUser(String),
+    DeleteResult(Result<(), String>),
 
     /// Open the inline Telegram binding input for a user.
     OpenBindInput(String),
@@ -130,14 +128,12 @@ impl UsersState {
             UsersMessage::ConfirmDelete(sender) => {
                 self.delete_target = None;
                 self.deleting = true;
-                let s = sender;
-                let s_clone = s.clone();
                 Task::perform(
                     async move {
                         let store = user_store()?;
-                        store.delete_user(&s).await.map_err(|e| e.to_string())
+                        store.delete_user(&sender).await.map_err(|e| e.to_string())
                     },
-                    move |res| UsersMessage::DeleteResult(res, s_clone),
+                    UsersMessage::DeleteResult,
                 )
             }
             UsersMessage::CancelDelete | UsersMessage::Escape => {
@@ -147,21 +143,17 @@ impl UsersState {
                 self.bind_error = None;
                 Task::none()
             }
-            UsersMessage::DeleteResult(Ok(()), _deleted_user) => {
+            UsersMessage::DeleteResult(Ok(())) => {
                 self.deleting = false;
                 self.load_state.clear_error();
                 self.refresh()
             }
-            UsersMessage::DeleteResult(Err(e), _deleted_user) => {
+            UsersMessage::DeleteResult(Err(e)) => {
                 self.deleting = false;
                 self.load_state.fail(e.clone());
                 Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))
             }
             UsersMessage::Toast(_) => Task::none(),
-            UsersMessage::SwitchUser(_) => {
-                // Intercepted by Dashboard — no-op in UsersState.
-                Task::none()
-            }
             UsersMessage::OpenBindInput(user_name) => {
                 self.bind_target = Some(user_name);
                 self.bind_input.clear();

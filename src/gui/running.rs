@@ -132,15 +132,10 @@ pub(crate) enum RunningMessage {
 /// (agent_id, generation). Stale keys are pruned by the dashboard's
 /// `RuntimeChanged` handler against the freshly-listed agents; rendering here
 /// only reads the set.
-///
-/// `active_is_admin` gates shared-workspace visibility: a non-admin never sees
-/// shared-workspace sections (membership is admin-only), so only personal and
-/// empty-name sections remain.
 pub(crate) fn view(
     workspaces: &HashMap<String, Workspace>,
     pending_cancel: Option<&str>,
     expanded: &HashSet<(String, u64)>,
-    active_is_admin: bool,
 ) -> Element<'static, Message> {
     let agents = crate::agent::registry::AGENT_REGISTRY.list();
     let calls = crate::agent::registry::NON_AGENT_CALLS.list();
@@ -149,16 +144,6 @@ pub(crate) fn view(
     // sorted by kind (tickets → analyze rounds → research runs →
     // singletons → unattributed), sections alphabetically by name.
     let sections = build_sections(build_groups(&agents, &calls), workspaces);
-    // Admin-only workspace membership (fail-closed): a non-admin sees no
-    // shared-workspace sections at all.
-    let sections: Vec<WorkspaceSection> = if active_is_admin {
-        sections
-    } else {
-        sections
-            .into_iter()
-            .filter(|s| s.workspace.is_empty() || crate::users::is_personal_workspace(&s.workspace))
-            .collect()
-    };
 
     let body: Element<'_, RunningMessage> = if sections.is_empty() {
         // Shared empty-state pattern: large radar glyph (the page's nav

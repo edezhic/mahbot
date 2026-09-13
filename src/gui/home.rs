@@ -1,8 +1,8 @@
-//! Home page — native GUI chat interface with user impersonation.
+//! Home page — native GUI chat interface for the app's own admin identity.
 //!
-//! Users pick an identity from the user picker, select a workspace via the
-//! footer workspace picker, and chat with MahBot agents in real time
-//! with full markdown rendering and typing indicators.
+//! The page acts as the seeded admin, selects a workspace via the footer
+//! workspace picker, and chats with MahBot agents in real time with full
+//! markdown rendering and typing indicators.
 
 use crate::ChatDirection;
 use crate::Role;
@@ -21,7 +21,7 @@ use super::ToastMessage;
 use super::common::MAX_INPUT_CHARS;
 use super::menus::{ContextMenu, MenuItem};
 use super::theme;
-use super::widgets::{BubbleSide, PickOption, align_bubble};
+use super::widgets::{BubbleSide, align_bubble};
 
 /// Dedup-set prune trigger: when `seen_ids` grows past this many IDs, it is
 /// pruned down to the most recent [`DEDUP_RETAIN`] IDs.
@@ -152,19 +152,18 @@ fn broadcast_gui_transient(
 }
 
 /// Derive the [`ReplyReference`] captured for a reply-to action. User messages
-/// resolve to the selected user's canonical name; agent messages use the shared
-/// author-label derivation. Author and snippet both get angle brackets
-/// stripped (the snippet via [`normalize_reply_text`], which also HTML-decodes,
-/// collapses newlines, maps media markers, and caps the text).
+/// are the admin's own, so they resolve to the admin's canonical name; agent
+/// messages use the shared author-label derivation. Author and snippet both get
+/// angle brackets stripped (the snippet via [`normalize_reply_text`], which also
+/// HTML-decodes, collapses newlines, maps media markers, and caps the text).
 #[must_use]
 fn reply_reference_for(
     direction: ChatDirection,
     agent_role: Option<&str>,
     content: &str,
-    user_name: &str,
 ) -> ReplyReference {
     let author = if direction == ChatDirection::User {
-        user_name.to_string()
+        crate::users::ADMIN_USER_NAME.to_string()
     } else {
         agent_author_label(agent_role)
     };
@@ -224,21 +223,8 @@ fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
     .into()
 }
 
-/// The transcript a chat-history read belongs to: the selected user and the
-/// visible chat's primary workspace. A result (entries or failure) carrying a key
-/// that no longer matches the current selection belongs to a transcript the page
-/// has left and must not be applied. Its fields are private, so only this module
-/// builds one — a key cannot be assembled with the wrong meaning.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoryReadKey {
-    user: String,
-    workspace: String,
-}
-
 #[derive(Debug, Clone)]
 pub enum HomeMessage {
-    /// User selected (from picker, Users page icon, or auto-selected at boot).
-    UserSelected(String),
     /// Workspace changed (from the footer workspace picker — propagated via Dashboard).
     WorkspaceChanged(Option<String>),
     /// Text editor content changed.
@@ -246,18 +232,18 @@ pub enum HomeMessage {
     /// Send button pressed or Enter key in editor.
     SendMessage,
     /// Chat history loaded from the store (entries, has_more), carrying the
-    /// [`HistoryReadKey`] the read was issued under: a successful read for a
+    /// transcript's primary workspace as the read key: a successful read for a
     /// transcript the page has since left must not replace the current one (nor
     /// clear the failure of the one it left behind).
     HistoryLoaded {
         entries: Vec<ChatHistoryEntry>,
         has_more: bool,
-        key: HistoryReadKey,
+        key: String,
     },
-    /// History load failed. Carries the key (selected user, primary workspace)
-    /// the read was issued under, so a failure for a transcript the page has
-    /// since left is dropped.
-    HistoryLoadError { key: HistoryReadKey, error: String },
+    /// History load failed. Carries the key (primary workspace) the read was
+    /// issued under, so a failure for a transcript the page has since left is
+    /// dropped.
+    HistoryLoadError { key: String, error: String },
     /// Live chat event from CHAT_BROADCAST subscription.
     ChatEvent(crate::ChatEvent),
     /// Stream lagged — resync needed.
@@ -270,31 +256,11 @@ pub enum HomeMessage {
     OlderHistoryLoaded(Vec<ChatHistoryEntry>, bool, u64),
     /// Older history load failed (error, pagination_gen for staleness check).
     OlderHistoryLoadError(String, u64),
-    /// User list loaded for the picker.
-    UsersLoaded(Vec<PickOption>),
-    /// User list load failed (store read error or uninitialized store).
-    UsersLoadError(String),
     /// Markdown link was clicked.
     LinkClicked(String),
-    /// Request a workspace change at the Dashboard level (reverse sync:
-    /// DB-stored workspace differs from sidebar). Intercepted by Dashboard;
-    /// never reaches Home's own update handler.
-    RequestWorkspaceChange(String),
-    /// Internal signal: reverse-sync check completed. Carries the user
-    /// (staleness guard for fast user switches), the sidebar workspace to
-    /// show (the user's DB-stored workspace, normalized — empty means
-    /// Personal) and the user's DB-selected project workspace (the merge
-    /// partner for the Personal-picker chat view; `None` when unset or
-    /// personal). Proceeds with a normal history refresh for the selected user.
-    ResolveUserSelected {
-        user: String,
-        sidebar_ws: Option<String>,
-        project_ws: Option<String>,
-    },
-    /// Refreshed DB-selected project workspace for a user (re-read on
-    /// workspace change so the Personal-picker merge partner never goes
-    /// stale). Carries `(user, project_workspace)`.
-    ProjectWorkspaceRefreshed(String, Option<String>),
+    /// Refreshed DB-selected project workspace (re-read on workspace change so
+    /// the Personal-picker merge partner never goes stale).
+    ProjectWorkspaceRefreshed(Option<String>),
     /// Reset session button pressed — reset session and display.
     ClearChat,
     /// Copy a chat message's raw markdown content to the clipboard.
@@ -349,17 +315,15 @@ pub enum HomeMessage {
 }
 
 pub struct HomeState {
-    /// Currently selected user (sender identifier).
-    pub(crate) selected_user: Option<String>,
     /// Currently selected workspace name (synced from the footer workspace
-    /// picker). `Some("personal:{user}")` = the user's "Personal" workspace;
-    /// `Some("ws")` = a shared workspace. Resolved to `personal:<user_name>`
+    /// picker). `Some("personal:admin")` = the admin's "Personal" workspace;
+    /// `Some("ws")` = a shared workspace. Resolved to `personal:admin`
     /// before querying chat_history or sessions.
     selected_workspace: Option<String>,
-    /// The selected user's DB-stored project workspace (None when unset or
+    /// The admin's DB-stored project workspace (None when unset or
     /// personal). The merge partner for the Personal-picker chat view: at
     /// the Personal picker the chat shows this workspace alongside the
-    /// user's personal workspace.
+    /// admin's personal workspace.
     user_project_workspace: Option<String>,
     /// Displayed chat messages.
     messages: Vec<DisplayMessage>,
@@ -373,16 +337,13 @@ pub struct HomeState {
     typing: bool,
     /// Typing animation dot cycle state: 0=".", 1="..", 2="...".
     typing_tick_state: u8,
-    /// Whether the initial history load has happened for the current user+workspace.
+    /// Whether the initial history load has happened for the current workspace.
     history_loaded: bool,
     /// Whether the Phase-1 scripted onboarding scenario is active (shown while
     /// `provider_configured() == false`).
     onboarding_script_active: bool,
     /// Generation counter for stale sending timeout detection.
     sending_gen: u64,
-    /// True when WorkspaceChanged arrived before a user was selected — the
-    /// deferred `refresh_history()` will be triggered by `ResolveUserSelected`.
-    pending_workspace_refresh: bool,
     /// Whether auto-scroll is enabled (user is scrolled to the bottom).
     auto_scroll_enabled: bool,
     /// The database ID of the oldest loaded message, if any.
@@ -400,44 +361,37 @@ pub struct HomeState {
     undo_stack: super::common::UndoStack,
     /// Captured {author, snippet} of the message being replied to. `Some`
     /// while a reply preview is shown above the composer; cleared on send,
-    /// cancel, chat clear, or user/workspace switch.
+    /// cancel, chat clear, or workspace switch.
     pending_reply: Option<ReplyReference>,
     /// Persisted composer-draft store (draft text + pending reply per user
     /// and resolved send-target workspace).
     drafts: Arc<crate::channels::chat_draft::DraftStore>,
     /// Debounce state for the asynchronous draft persistence.
     draft_save: super::common::DebounceState,
-    /// True between a user switch and its workspace resolution completing —
-    /// draft capture is suppressed so it cannot land on the stale key;
-    /// restore runs at the completing cascade instead.
-    context_resolving: bool,
     /// Persistent failure of the last chat-history read for the current
     /// context. Rendered in place of the empty-chat hint so a failed read is
     /// never mistaken for a legitimately empty history; cleared on the next
     /// successful load.
     history_error: Option<String>,
-    /// Persistent failure of the last user-list read. Rendered in place of
-    /// the "no user selected" hint; cleared on the next successful load.
-    users_error: Option<String>,
     /// Persistent failure of the last "load older messages" read. Rendered
     /// above the transcript so a failed read is never mistaken for "nothing
     /// older exists"; cleared on the next successful load.
     older_history_error: Option<String>,
 }
 
-/// The chat view for the selected user: two workspaces — the picker-resolved
+/// The chat view for the admin: two workspaces — the picker-resolved
 /// one plus a merge partner. Symmetric visibility: the picker only selects
 /// the recipient, it never filters the view (personal Assistant
-/// messages show at any picker, and the user's project chat shows at the
+/// messages show at any picker, and the admin's project chat shows at the
 /// Personal picker).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VisibleChat {
     /// The picker-resolved workspace: the selected workspace, or
-    /// `personal:{user}` at the Personal picker.
+    /// `personal:admin` at the Personal picker.
     primary: String,
-    /// The merge partner: `personal:{user}` at a project picker, or the
-    /// user's DB-selected project workspace at the Personal picker. `None`
-    /// only when the primary is the personal workspace and the user has no
+    /// The merge partner: `personal:admin` at a project picker, or the
+    /// admin's DB-selected project workspace at the Personal picker. `None`
+    /// only when the primary is the personal workspace and the admin has no
     /// project workspace (deduplicated).
     merge: Option<String>,
 }
@@ -453,7 +407,6 @@ impl HomeState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            selected_user: None,
             selected_workspace: None,
             user_project_workspace: None,
             messages: Vec::new(),
@@ -468,7 +421,6 @@ impl HomeState {
             history_loaded: false,
             onboarding_script_active: false,
             sending_gen: 0,
-            pending_workspace_refresh: false,
             auto_scroll_enabled: true,
             oldest_loaded_id: None,
             has_more: false,
@@ -478,181 +430,89 @@ impl HomeState {
             pending_reply: None,
             drafts: crate::channels::chat_draft::DraftStore::global().clone(),
             draft_save: super::common::DebounceState::new(),
-            context_resolving: false,
             history_error: None,
-            users_error: None,
             older_history_error: None,
         }
     }
 
-    /// Load users for the user picker.
-    #[allow(clippy::unused_self)]
-    pub fn load_users(&self) -> Task<HomeMessage> {
-        Task::perform(
-            async {
-                let Some(store) = crate::users::USER_STORE.get() else {
-                    return Err("user store is not initialized".to_string());
-                };
-                store.list_users().await.map_err(|e| e.to_string())
-            },
-            |result| match result {
-                Ok(users) => HomeMessage::UsersLoaded(
-                    users
-                        .iter()
-                        .map(|entry| PickOption {
-                            value: entry.record.name.clone(),
-                            label: entry.record.name.clone(),
-                        })
-                        .collect(),
-                ),
-                Err(e) => HomeMessage::UsersLoadError(e),
-            },
-        )
+    /// Resolve the workspace name for chat history and session queries.
+    /// A `personal:{user}` name is used as-is; no selection yet → the admin's
+    /// personal workspace. Non-personal names are the workspace name as-is.
+    fn resolve_workspace_name(&self) -> String {
+        match &self.selected_workspace {
+            Some(w) => w.clone(),
+            None => crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+        }
     }
 
-    /// Resolve the workspace name for chat history and session queries.
-    /// A `personal:{user}` name is used as-is; `None` or an empty string (a
-    /// legacy/edge sentinel) → `personal:<user_name>`. Non-personal names are
-    /// the workspace name as-is.
-    fn resolve_workspace_name(&self) -> Option<String> {
-        match &self.selected_workspace {
-            Some(w) if !w.is_empty() => Some(w.clone()),
-            _ => {
-                let user = self.selected_user.as_ref()?;
-                Some(crate::users::personal_workspace_name(user))
+    /// Whether `workspace` is the admin's personal workspace
+    /// (`personal:admin`) — the Assistant chat shown at any picker.
+    fn is_admin_personal_workspace(workspace: &str) -> bool {
+        crate::users::personal_user_name(workspace) == Some(crate::users::ADMIN_USER_NAME)
+    }
+
+    /// The visible chat set for the admin (see [`VisibleChat`]).
+    fn visible_workspaces(&self) -> VisibleChat {
+        let personal = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
+        let sel = self.resolve_workspace_name();
+        if Self::is_admin_personal_workspace(&sel) {
+            VisibleChat {
+                primary: personal,
+                merge: self.user_project_workspace.clone(),
+            }
+        } else {
+            VisibleChat {
+                primary: sel,
+                merge: Some(personal),
             }
         }
     }
 
-    /// Whether `workspace` is the selected user's personal workspace
-    /// (`personal:{user}`) — the Assistant chat shown at any picker.
-    fn is_selected_user_personal_workspace(&self, workspace: &str) -> bool {
-        self.selected_user
-            .as_deref()
-            .is_some_and(|user| crate::users::personal_user_name(workspace) == Some(user))
-    }
-
-    /// The visible chat set for the selected user (see [`VisibleChat`]), or
-    /// `None` when no user is selected.
-    fn visible_workspaces(&self) -> Option<VisibleChat> {
-        let user = self.selected_user.as_ref()?;
-        let personal = crate::users::personal_workspace_name(user);
-        let chat = match self.resolve_workspace_name() {
-            Some(sel) if !self.is_selected_user_personal_workspace(&sel) => VisibleChat {
-                primary: sel,
-                merge: Some(personal),
-            },
-            _ => VisibleChat {
-                primary: personal,
-                merge: self.user_project_workspace.clone(),
-            },
-        };
-        Some(chat)
-    }
-
-    /// The selected user, the visible chat, and the [`HistoryReadKey`] a history
-    /// read is issued under — one definition, so the dispatch and the staleness
-    /// checks cannot disagree about what a read belongs to.
-    fn history_read_context(&self) -> Option<(String, VisibleChat, HistoryReadKey)> {
-        let user = self.selected_user.clone()?;
-        let chat = self.visible_workspaces()?;
-        let key = HistoryReadKey {
-            user: user.clone(),
-            workspace: chat.primary.clone(),
-        };
-        Some((user, chat, key))
-    }
-
-    /// The key a chat-history read is issued under: the selected user and the
-    /// transcript's primary workspace. A result whose key no longer matches the
-    /// current selection belongs to a transcript the page has left.
-    fn history_read_key(&self) -> Option<HistoryReadKey> {
-        self.history_read_context().map(|(_, _, key)| key)
+    /// The key a chat-history read is issued under: the transcript's primary
+    /// workspace. A result whose key no longer matches the current selection
+    /// belongs to a transcript the page has left.
+    fn history_read_key(&self) -> String {
+        self.visible_workspaces().primary
     }
 
     /// Whether a message or typing event in `workspace` belongs to the
-    /// selected user's visible chat (see [`VisibleChat::contains`]).
+    /// admin's visible chat (see [`VisibleChat::contains`]).
     fn workspace_visible(&self, workspace: &str) -> bool {
-        self.visible_workspaces()
-            .is_some_and(|chat| chat.contains(workspace))
+        self.visible_workspaces().contains(workspace)
     }
 
-    /// Whether the picker selects the selected user's personal workspace —
+    /// Whether the picker selects the admin's personal workspace —
     /// projected from [`Self::visible_workspaces`] (its `primary` is the
     /// personal workspace only at the Personal picker), so the merge-partner
     /// decision keeps a single shape across the refresh paths.
     fn at_personal_picker(&self) -> bool {
-        self.visible_workspaces()
-            .is_some_and(|chat| self.is_selected_user_personal_workspace(&chat.primary))
+        Self::is_admin_personal_workspace(&self.visible_workspaces().primary)
     }
 
-    /// Reverse-sync the DB-stored workspace preference for a user.
-    ///
-    /// Returns [`ResolveUserSelected`] carrying the sidebar workspace to show
-    /// and the user's DB-selected project workspace. Home's handler emits
-    /// [`RequestWorkspaceChange`] when the sidebar must move (Dashboard-level
-    /// change cascading to [`WorkspaceChanged`] → `refresh_history`);
-    /// otherwise it refreshes history directly.
-    ///
-    /// Membership is admin-only: [`crate::users::resolve_selected_workspace_name`]
-    /// clamps a non-admin to their personal workspace, so a shared workspace is
-    /// never surfaced in the sidebar for them. `None` (missing row / read
-    /// failure) leaves the current sidebar selection untouched.
-    ///
-    /// NOTE: The Dashboard-level switch emitted here writes the same value back
-    /// to the user's DB record via `select_workspace` — idempotent by design,
-    /// since the DB is the single source of truth for the selection.
-    async fn resolve_user_workspace_sync(user: String, current_ws: Option<String>) -> HomeMessage {
-        match crate::users::resolve_selected_workspace_name(&user).await {
-            Some(ws_name) => {
-                // The primitive already normalized a personal value to the
-                // GUI-wide `personal:{user}` name; a shared value is kept.
-                let (sidebar_ws, project_ws) = if crate::users::is_personal_workspace(&ws_name) {
-                    (crate::users::personal_workspace_name(&user), None)
-                } else {
-                    (ws_name.clone(), Some(ws_name))
-                };
-                HomeMessage::ResolveUserSelected {
-                    user,
-                    sidebar_ws: Some(sidebar_ws),
-                    project_ws,
-                }
-            }
-            None => {
-                // Missing row / read failure — keep current sidebar selection.
-                HomeMessage::ResolveUserSelected {
-                    user,
-                    sidebar_ws: current_ws.clone(),
-                    project_ws: None,
-                }
-            }
-        }
-    }
-
-    /// The user's DB-selected project workspace (None when unset or
+    /// The admin's DB-selected project workspace (None when unset or
     /// personal). The Personal-picker merge partner — re-read on workspace
     /// changes so it never goes stale (Users-page edits flow through
-    /// [`WorkspaceChanged`]). Because membership is admin-only, a non-admin
-    /// always resolves to their personal workspace, so this returns `None`
-    /// for them — their prior shared-workspace chat history simply becomes
-    /// invisible.
-    async fn project_workspace_for(user: String) -> Option<String> {
-        crate::users::resolve_selected_workspace_name(&user)
+    /// [`WorkspaceChanged`]).
+    async fn project_workspace_for() -> Option<String> {
+        crate::users::resolve_selected_workspace_name(crate::users::ADMIN_USER_NAME)
             .await
             .filter(|ws| !crate::users::is_personal_workspace(ws))
     }
 
-    /// Refresh chat history from the store for the current user's visible
-    /// workspaces (the selected workspace plus the user's personal workspace).
+    /// Refresh chat history from the store for the admin's visible
+    /// workspaces (the selected workspace plus the admin's personal workspace).
     fn refresh_history(&self) -> Task<HomeMessage> {
-        let Some((user_name, chat, key)) = self.history_read_context() else {
-            return Task::none();
-        };
+        let chat = self.visible_workspaces();
+        let key = chat.primary.clone();
         Task::perform(
             async move {
                 let store = crate::channels::chat_history::store();
                 store
-                    .load_for_user_workspaces(&user_name, &chat.primary, chat.merge.as_deref())
+                    .load_for_user_workspaces(
+                        crate::users::ADMIN_USER_NAME,
+                        &chat.primary,
+                        chat.merge.as_deref(),
+                    )
                     .await
                     .map_err(|e| e.to_string())
             },
@@ -675,7 +535,7 @@ impl HomeState {
     }
 
     /// Reset pagination and auto-scroll state. Called at all cleanup sites
-    /// (user change, workspace change, clear, stream lag).
+    /// (workspace change, clear, stream lag).
     fn reset_pagination_state(&mut self) {
         self.oldest_loaded_id = None;
         self.has_more = false;
@@ -697,15 +557,6 @@ impl HomeState {
         self.history_error = None;
         self.reset_pagination_state();
     }
-    /// Resolve the draft key: `(selected_user, resolved send-target
-    /// workspace)` — the visible-chat workspace exactly as chat history and
-    /// session queries resolve it.
-    fn draft_key(&self) -> Option<(String, String)> {
-        let user = self.selected_user.clone()?;
-        let ws = self.resolve_workspace_name()?;
-        Some((user, ws))
-    }
-
     /// Snapshot the current composer state (text + pending reply) into the
     /// draft store and schedule a debounced persist after `delay_ms`.
     ///
@@ -713,18 +564,14 @@ impl HomeState {
     /// file write lags behind the debounce, so the in-memory map is always
     /// current.
     fn capture_draft(&mut self, delay_ms: u64) -> Task<HomeMessage> {
-        // While a user switch is still resolving, the sidebar workspace is
-        // stale and the key would land on the wrong context. The completing
-        // cascade (`WorkspaceChanged`/`ResolveUserSelected`) restores instead.
-        if self.onboarding_script_active || self.context_resolving {
+        if self.onboarding_script_active {
             return Task::none();
         }
-        let Some((user, ws)) = self.draft_key() else {
-            return Task::none();
-        };
+        let ws = self.resolve_workspace_name();
         let text = self.editor_content.text();
         let reply = self.pending_reply.clone();
-        self.drafts.set(&user, &ws, text, reply);
+        self.drafts
+            .set(crate::users::ADMIN_USER_NAME, &ws, text, reply);
         self.draft_save
             .trigger(delay_ms)
             .map(|generation| HomeMessage::DraftSaveSettled { generation })
@@ -733,10 +580,8 @@ impl HomeState {
     /// Restore the persisted composer draft for the current context, or clear
     /// the composer when none exists (per-context swap, not leak).
     fn restore_chat_draft(&mut self) {
-        let Some((user, ws)) = self.draft_key() else {
-            return;
-        };
-        let entry = self.drafts.get(&user, &ws);
+        let ws = self.resolve_workspace_name();
+        let entry = self.drafts.get(crate::users::ADMIN_USER_NAME, &ws);
         self.editor_content
             .set_text(entry.as_ref().map_or("", |e| e.text.as_str()));
         self.undo_stack.clear();
@@ -746,10 +591,9 @@ impl HomeState {
     /// Remove the persisted draft for the current context and schedule a
     /// persist — used on send, after the composer has been cleared.
     fn drop_current_draft(&mut self) {
-        if let Some((user, ws)) = self.draft_key() {
-            self.drafts.remove(&user, &ws);
-            self.drafts.clone().persist_async();
-        }
+        let ws = self.resolve_workspace_name();
+        self.drafts.remove(crate::users::ADMIN_USER_NAME, &ws);
+        self.drafts.clone().persist_async();
     }
 
     /// Produce a snap-to-end task if auto-scroll is enabled.
@@ -763,33 +607,19 @@ impl HomeState {
 
     /// Start the Phase-1 scripted onboarding (no provider) or fire the Phase-2
     /// Assistant kickoff (provider configured, state Init). Called after the first
-    /// history load for a selected user. No-op when the scenario is already active.
+    /// history load. No-op when the scenario is already active.
     fn maybe_start_onboarding(&mut self) -> Task<HomeMessage> {
-        if self.selected_user.is_none() {
-            return Task::none();
-        }
-        // NOTE: the Phase-1 provider-setup script is intentionally NOT gated on
-        // the selected user being the admin — the onboarding flow is admin-only,
-        // but a non-admin created via the Settings bypass before a provider is
-        // set would see it and could set the global provider. That edge is out of
-        // scope; only the Phase-2 `kickoff_onboarding` is admin-gated (an explicit
-        // admin-permission check on the triggering user) so a non-admin never
-        // consumes the state.
         if !crate::config::provider_configured() {
             if self.onboarding_script_active {
                 return Task::none();
             }
-            let user = self.selected_user.clone().unwrap_or_default();
-            let workspace = match self.visible_workspaces() {
-                Some(chat) => chat.primary.clone(),
-                None => return Task::none(),
-            };
+            let workspace = self.visible_workspaces().primary;
             // Only arm the scenario once a workspace is confirmed visible, so an
             // empty picker can't strand `onboarding_script_active` with no script.
             self.onboarding_script_active = true;
             for (i, msg) in crate::onboarding::intro_messages().into_iter().enumerate() {
                 broadcast_gui_transient(
-                    &user,
+                    crate::users::ADMIN_USER_NAME,
                     &workspace,
                     &format!("onboarding-intro-{i}"),
                     msg,
@@ -801,10 +631,10 @@ impl HomeState {
             Task::none()
         } else if crate::config::CONFIG.onboarding_stage() == crate::config::OnboardingState::Init {
             self.onboarding_script_active = false;
-            let user = self.selected_user.clone().unwrap_or_default();
-            let user_for_task = user.clone();
             Task::perform(
-                async move { crate::onboarding::kickoff_onboarding(&user_for_task).await },
+                async {
+                    crate::onboarding::kickoff_onboarding(crate::users::ADMIN_USER_NAME).await
+                },
                 |_res| HomeMessage::OnboardingKickoffDone,
             )
         } else {
@@ -890,13 +720,13 @@ impl HomeState {
 
     /// Update typing/sending state based on message direction and sender.
     ///
-    /// * **Agent** responses for the selected user → clear both `typing`
+    /// * **Agent** responses for the admin → clear both `typing`
     ///   and `sending` (the agent has replied).
-    /// * **User** message echo for the selected user → clear `sending`
+    /// * **User** message echo for the admin → clear `sending`
     ///   only (re-enables the send button). Does **not** clear `typing`
     ///   — the typing indicator persists until an agent response arrives.
     ///
-    /// Does nothing when `workspace` is not visible for the selected user
+    /// Does nothing when `workspace` is not visible for the admin
     /// (see [`Self::workspace_visible`]) — this prevents an agent response
     /// from an unrelated workspace from clearing the typing/sending
     /// indicators for the visible chat.
@@ -904,7 +734,7 @@ impl HomeState {
         if !self.workspace_visible(workspace) {
             return;
         }
-        if Some(user_name) != self.selected_user.as_deref() {
+        if user_name != crate::users::ADMIN_USER_NAME {
             return;
         }
 
@@ -914,10 +744,10 @@ impl HomeState {
         }
     }
 
-    /// Append a chat message if it belongs to the selected user's visible
-    /// chat (selected workspace or the user's personal workspace).
+    /// Append a chat message if it belongs to the admin's visible
+    /// chat (selected workspace or the admin's personal workspace).
     ///
-    /// Does nothing when `user_name` is not the selected user, or when
+    /// Does nothing when `user_name` is not the admin, or when
     /// `workspace` is not visible (see [`Self::workspace_visible`]).
     /// Takes ownership of the message fields so the caller avoids extra
     /// clones on the common (append) path.
@@ -937,7 +767,7 @@ impl HomeState {
         timestamp: Option<String>,
         reply_reference: Option<ReplyReference>,
     ) {
-        if Some(user_name) != self.selected_user.as_deref() {
+        if user_name != crate::users::ADMIN_USER_NAME {
             return;
         }
         if !self.workspace_visible(workspace) {
@@ -960,9 +790,7 @@ impl HomeState {
     pub fn view(&self, draining: bool) -> Element<'_, HomeMessage> {
         // ── Chat message area ────────────────────────────────────
         let chat_area = if self.messages.is_empty() {
-            let empty_hint = if self.selected_user.is_none() {
-                "No user selected. Create users via the Users page."
-            } else if self.selected_workspace.is_none() {
+            let empty_hint = if self.selected_workspace.is_none() {
                 "No workspace selected."
             } else {
                 "No messages yet. Type something below to start."
@@ -972,14 +800,6 @@ impl HomeState {
             // not enough.
             let body: Element<'_, HomeMessage> = if let Some(err) = &self.history_error {
                 super::widgets::error_banner(err)
-            } else if self.selected_user.is_none() {
-                match &self.users_error {
-                    Some(err) => super::widgets::error_banner(err),
-                    None => text(empty_hint)
-                        .color(theme::TEXT_SECONDARY)
-                        .size(theme::TEXT_13)
-                        .into(),
-                }
             } else {
                 text(empty_hint)
                     .color(theme::TEXT_SECONDARY)
@@ -1270,8 +1090,7 @@ impl HomeState {
                     theme::TEXT_SECONDARY
                 }),
             mic_tooltip,
-            (self.selected_user.is_some() && !recording_unavailable)
-                .then_some(HomeMessage::StartVoiceRecording),
+            (!recording_unavailable).then_some(HomeMessage::StartVoiceRecording),
             theme::PAD_3,
             theme::icon_button_style(recording_unavailable),
             tooltip::Position::Top,
@@ -1388,59 +1207,25 @@ impl HomeState {
     #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: HomeMessage) -> Task<HomeMessage> {
         match msg {
-            HomeMessage::UserSelected(user) => {
-                if self.selected_user.as_deref() == Some(&user) {
-                    return Task::none();
-                }
-                self.selected_user = Some(user.clone());
-                // Suppress draft capture until the workspace resolution
-                // completes (`context_resolving`); reset_chat_state
-                // intentionally does not restore here — the stale sidebar
-                // workspace would restore the wrong context.
-                self.context_resolving = true;
-                self.reset_chat_state();
-                self.user_project_workspace = None; // re-resolved below
-
-                Task::perform(
-                    Self::resolve_user_workspace_sync(user, self.selected_workspace.clone()),
-                    |msg| msg,
-                )
-            }
             HomeMessage::WorkspaceChanged(ws_name) => {
                 self.selected_workspace.clone_from(&ws_name);
                 self.reset_chat_state();
-
-                // When a user is already selected, refresh history immediately.
-                // Otherwise defer — `ResolveUserSelected` will pick it up once
-                // a user is chosen (e.g. first boot before UsersLoaded fires).
-                let Some(user) = self.selected_user.clone() else {
-                    self.pending_workspace_refresh = true;
-                    return Task::none();
-                };
-                // The workspace is final — a user switch (if any) is resolved.
-                self.context_resolving = false;
                 self.restore_chat_draft();
-                self.pending_workspace_refresh = false;
-                // At the Personal picker the view merges the user's DB-selected
+                // At the Personal picker the view merges the admin's DB-selected
                 // project workspace — re-read it so Users-page edits (which
                 // flow through WorkspaceChanged) are reflected, then load in
                 // one shot. At a project picker the merge partner is the
                 // selected workspace itself, so a direct refresh suffices.
                 if self.at_personal_picker() {
-                    let read_user = user.clone();
-                    Task::perform(Self::project_workspace_for(read_user), move |project| {
-                        HomeMessage::ProjectWorkspaceRefreshed(user, project)
-                    })
+                    Task::perform(
+                        Self::project_workspace_for(),
+                        HomeMessage::ProjectWorkspaceRefreshed,
+                    )
                 } else {
                     self.refresh_history()
                 }
             }
-            HomeMessage::ProjectWorkspaceRefreshed(user, project) => {
-                // Stale resolve (user switched while reading) — the newer
-                // selection owns its own resolution.
-                if self.selected_user.as_deref() != Some(&user) {
-                    return Task::none();
-                }
+            HomeMessage::ProjectWorkspaceRefreshed(project) => {
                 let at_personal_picker = self.at_personal_picker();
                 self.user_project_workspace = project;
                 // Re-load only while the merge partner is part of the view; a
@@ -1464,46 +1249,6 @@ impl HomeState {
                     Task::none()
                 }
             }
-            HomeMessage::ResolveUserSelected {
-                user,
-                sidebar_ws,
-                project_ws,
-            } => {
-                // Stale resolve (user switched while reading) — the newer
-                // selection owns its own resolution.
-                if self.selected_user.as_deref() != Some(&user) {
-                    return Task::none();
-                }
-                // The user's DB-selected project workspace is the merge
-                // partner for the Personal-picker chat view.
-                self.user_project_workspace = project_ws;
-                if sidebar_ws != self.selected_workspace {
-                    // Sidebar must move to the user's DB workspace — the
-                    // Dashboard intercepts RequestWorkspaceChange and cascades
-                    // a WorkspaceChanged refresh.
-                    return Task::done(HomeMessage::RequestWorkspaceChange(
-                        sidebar_ws.unwrap_or_default(),
-                    ));
-                }
-                // Reverse-sync check completed: either the user's DB workspace
-                // matches the sidebar (no disagreement), or no DB workspace
-                // exists for this user.
-                self.selected_workspace = sidebar_ws;
-                //
-                // If WorkspaceChanged arrived before a user was selected
-                // (boot timing), it deferred the refresh via the flag.
-                // Clear stale state now before loading history.
-                if self.pending_workspace_refresh {
-                    self.pending_workspace_refresh = false;
-                    self.reset_chat_state();
-                }
-                // The workspace is final — the user switch is resolved. (The
-                // cascade branch above leaves it to the cascaded
-                // `WorkspaceChanged`.)
-                self.context_resolving = false;
-                self.restore_chat_draft();
-                self.refresh_history()
-            }
             HomeMessage::SendMessage => self.send_message(),
             HomeMessage::HistoryLoaded {
                 entries,
@@ -1513,7 +1258,7 @@ impl HomeState {
                 // A read issued for a transcript the page has since left must not
                 // replace the current one — nor clear the failure of the one it
                 // left behind.
-                if self.history_read_key().as_ref() != Some(&key) {
+                if self.history_read_key() != key {
                     return Task::none();
                 }
                 self.history_error = None;
@@ -1532,34 +1277,12 @@ impl HomeState {
                 Task::batch([self.maybe_snap(), onboarding])
             }
             HomeMessage::HistoryLoadError { key, error } => {
-                // A read issued for a user/workspace the page has since left must
+                // A read issued for a workspace the page has since left must
                 // not paint its failure over the current transcript.
                 tracing::warn!(error = %error, "Home: failed to load chat history");
-                if self.history_read_key().as_ref() == Some(&key) {
+                if self.history_read_key() == key {
                     self.history_error = Some(error);
                 }
-                Task::none()
-            }
-            HomeMessage::UsersLoaded(options) => {
-                self.users_error = None;
-                // If no user is selected, auto-select the first one (admin at boot).
-                if self.selected_user.is_none() && !options.is_empty() {
-                    let first = options[0].value.clone();
-                    return Task::done(HomeMessage::UserSelected(first));
-                }
-                // If the selected user no longer exists in the loaded list
-                // (deleted from another session), auto-select the first user.
-                if let Some(ref user) = self.selected_user {
-                    if !options.iter().any(|opt| opt.value == *user) && !options.is_empty() {
-                        let first = options[0].value.clone();
-                        return Task::done(HomeMessage::UserSelected(first));
-                    }
-                }
-                Task::none()
-            }
-            HomeMessage::UsersLoadError(e) => {
-                tracing::warn!(error = %e, "Home: failed to load users");
-                self.users_error = Some(e);
                 Task::none()
             }
             HomeMessage::ClearChat => {
@@ -1580,20 +1303,17 @@ impl HomeState {
                 // visible when the clear was requested.
                 let draft = self.capture_draft(DRAFT_SETTLE_MS);
                 // Build agent ID and schedule async cleanup.
-                let sender = match &self.selected_user {
-                    Some(s) => s.clone(),
-                    None => return draft,
-                };
+                let sender = crate::users::ADMIN_USER_NAME.to_string();
                 let clear_task = Task::perform(
                     async move {
-                        // Clear the session the user actually talks to — the
+                        // Clear the session the admin actually talks to — the
                         // same (role, workspace) resolution as routing and
                         // Telegram /clear (see
                         // [`crate::users::resolve_session_target`]): the
-                        // starting role/workspace resolve from the user's DB
+                        // starting role/workspace resolve from the admin's DB
                         // record, never the GUI picker position, and the
                         // resolvable role (Assistant) is pinned —
-                        // so the cleared session is always the user's
+                        // so the cleared session is always the admin's
                         // personal-workspace session.
                         let (effective_role, ws) =
                             crate::users::resolve_session_target(&sender).await;
@@ -1655,14 +1375,10 @@ impl HomeState {
                 agent_role,
                 content,
             } => {
-                let Some(user_name) = self.selected_user.clone() else {
-                    return Task::none();
-                };
                 self.pending_reply = Some(reply_reference_for(
                     direction,
                     agent_role.as_deref(),
                     &content,
-                    &user_name,
                 ));
                 let draft = self.capture_draft(DRAFT_SETTLE_MS);
                 // Refocus the composer so the user can type the reply
@@ -1721,7 +1437,7 @@ impl HomeState {
                     // 3. Clear sending/typing state based on direction, sender, and workspace.
                     self.update_sending_state(direction, &user_name, &workspace);
 
-                    // 4. Append the message (filtered by selected user + workspace).
+                    // 4. Append the message (filtered by acting user + workspace).
                     self.append_message(
                         &user_name,
                         &workspace,
@@ -1741,8 +1457,8 @@ impl HomeState {
                     workspace,
                 } => {
                     // Apply user + workspace filter — only show typing indicator
-                    // for the selected user in a visible workspace.
-                    if Some(&user_name) == self.selected_user.as_ref()
+                    // for the admin in a visible workspace.
+                    if user_name == crate::users::ADMIN_USER_NAME
                         && self.workspace_visible(&workspace)
                     {
                         self.typing = is_typing;
@@ -1784,13 +1500,8 @@ impl HomeState {
                     return Task::none();
                 }
                 self.loading_older = true;
-                let sender = match &self.selected_user {
-                    Some(s) => s.clone(),
-                    None => return Task::none(),
-                };
-                let Some(chat) = self.visible_workspaces() else {
-                    return Task::none();
-                };
+                let sender = crate::users::ADMIN_USER_NAME.to_string();
+                let chat = self.visible_workspaces();
                 let Some(before_id) = self.oldest_loaded_id else {
                     self.loading_older = false;
                     return Task::none();
@@ -1857,9 +1568,9 @@ impl HomeState {
                 self.older_history_error = Some(msg);
                 Task::none()
             }
-            HomeMessage::Toast(_) | HomeMessage::RequestWorkspaceChange(_) => {
-                // Intercepted by the Dashboard (Toast → toast stack,
-                // RequestWorkspaceChange → sidebar switch). No-op fallback.
+            HomeMessage::Toast(_) => {
+                // Intercepted by the Dashboard (Toast → toast stack). No-op
+                // fallback.
                 Task::none()
             }
             HomeMessage::LinkClicked(url) => {
@@ -1932,10 +1643,7 @@ impl HomeState {
 
         let content = trimmed.to_string();
 
-        let sender = match &self.selected_user {
-            Some(s) => s.clone(),
-            None => return Task::none(),
-        };
+        let sender = crate::users::ADMIN_USER_NAME.to_string();
 
         // Guard against sending without a selected workspace.
         if self.selected_workspace.is_none() {
@@ -2061,20 +1769,14 @@ impl HomeState {
         content: String,
         optimistic_id: Option<String>,
     ) -> Task<HomeMessage> {
-        let user = match &self.selected_user {
-            Some(u) => u.clone(),
-            None => return Task::none(),
-        };
-        let workspace = match self.visible_workspaces() {
-            Some(chat) => chat.primary.clone(),
-            None => return Task::none(),
-        };
+        let user = crate::users::ADMIN_USER_NAME;
+        let workspace = self.visible_workspaces().primary;
         let send_task = Task::perform(
             async move {
                 let parsed = crate::onboarding::parse_provider_input(&content);
                 // Replace the optimistic bubble with the user's transient message.
                 broadcast_gui_transient(
-                    &user,
+                    user,
                     &workspace,
                     &crate::generate_id(),
                     &content,
@@ -2085,7 +1787,7 @@ impl HomeState {
                 let outcome: Result<(), String> = match parsed {
                     crate::onboarding::ProviderInput::Invalid => {
                         broadcast_gui_transient(
-                            &user,
+                            user,
                             &workspace,
                             &crate::generate_id(),
                             crate::onboarding::invalid_message(),
@@ -2098,7 +1800,7 @@ impl HomeState {
                     valid => match crate::onboarding::persist_provider_input(&valid).await {
                         Ok(()) => {
                             broadcast_gui_transient(
-                                &user,
+                                user,
                                 &workspace,
                                 &crate::generate_id(),
                                 crate::onboarding::success_message(),
@@ -2110,7 +1812,7 @@ impl HomeState {
                         }
                         Err(e) => {
                             broadcast_gui_transient(
-                                &user,
+                                user,
                                 &workspace,
                                 &crate::generate_id(),
                                 &format!("Couldn't save that: {e:#}"),
@@ -2171,12 +1873,11 @@ mod tests {
     // Helpers
     // ------------------------------------------------------------------
 
-    fn make_home_state(user: &str, workspace: &str) -> HomeState {
+    fn make_home_state(workspace: &str) -> HomeState {
         let mut state = HomeState::new();
         // Hermetic draft store bound to a throwaway temp dir so tests never
         // touch the real `~/.mahbot/chat-draft.json`.
         state.drafts = hermetic_draft_store();
-        state.selected_user = Some(user.to_string());
         state.selected_workspace = Some(workspace.to_string());
         state
     }
@@ -2194,37 +1895,30 @@ mod tests {
     }
 
     #[test]
-    fn draft_capture_and_context_swap() {
-        let mut state = make_home_state("alice", "ws1");
+    fn draft_capture_and_workspace_swap() {
+        let mut state = make_home_state("ws1");
+        let admin = crate::users::ADMIN_USER_NAME;
 
         // Typing captures synchronously into the store under the current key.
         let _ = state.update(HomeMessage::InputChanged(EditorAction::Insert('h')));
         assert_eq!(
-            state.drafts.get("alice", "ws1").map(|e| e.text).as_deref(),
+            state.drafts.get(admin, "ws1").map(|e| e.text).as_deref(),
             Some("h")
         );
 
-        // While the user switch is resolving, capture is suppressed: nothing
-        // may land under the stale (bob, ws1) key.
-        let _ = state.update(HomeMessage::UserSelected("bob".to_string()));
-        let _ = state.update(HomeMessage::InputChanged(EditorAction::Insert('x')));
-        assert_eq!(state.drafts.get("bob", "ws1"), None);
-
-        // Resolution completes: the incoming context restores — no entry means
-        // the composer is cleared (per-context swap, not leak).
+        // The workspace swap moves the context: the incoming context restores —
+        // no entry means the composer is cleared (per-context swap, not leak).
         let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws2".to_string())));
         assert_eq!(state.editor_content.text(), "");
-        assert!(!state.context_resolving);
 
         // The resolved context captures under its own key...
         let _ = state.update(HomeMessage::InputChanged(EditorAction::Insert('b')));
         assert_eq!(
-            state.drafts.get("bob", "ws2").map(|e| e.text).as_deref(),
+            state.drafts.get(admin, "ws2").map(|e| e.text).as_deref(),
             Some("b")
         );
 
-        // ...and switching back swaps again, restoring alice's draft.
-        let _ = state.update(HomeMessage::UserSelected("alice".to_string()));
+        // ...and switching back swaps again, restoring the first draft.
         let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws1".to_string())));
         assert_eq!(state.editor_content.text(), "h");
     }
@@ -2232,12 +1926,9 @@ mod tests {
     #[test]
     fn failed_reads_stay_set_until_a_successful_load() {
         let mut state = HomeState::new();
-        state.selected_user = Some("alice".to_string());
 
         // A failed history read is retained; a successful load clears it.
-        let key = state
-            .history_read_key()
-            .expect("a selected user resolves a read key");
+        let key = state.history_read_key();
         let _ = state.update(HomeMessage::HistoryLoadError {
             key: key.clone(),
             error: "db down".to_string(),
@@ -2246,10 +1937,7 @@ mod tests {
 
         // A failure whose key no longer matches the current selection belongs to
         // a transcript the page has left: it must not overwrite the current one.
-        let stale_key = HistoryReadKey {
-            user: "bob".to_string(),
-            workspace: "personal:bob".to_string(),
-        };
+        let stale_key = "personal:bob".to_string();
         let _ = state.update(HomeMessage::HistoryLoadError {
             key: stale_key.clone(),
             error: "stale".to_string(),
@@ -2293,12 +1981,6 @@ mod tests {
         let _ = state.update(HomeMessage::ClearChat);
         assert!(state.history_error.is_none());
 
-        // Same for the user list: the failure survives until a load succeeds.
-        let _ = state.update(HomeMessage::UsersLoadError("db down".to_string()));
-        assert_eq!(state.users_error.as_deref(), Some("db down"));
-        let _ = state.update(HomeMessage::UsersLoaded(Vec::new()));
-        assert!(state.users_error.is_none());
-
         // Same for the older-messages read: the failure survives until a load
         // succeeds.
         let generation = state.pagination_gen;
@@ -2331,9 +2013,7 @@ mod tests {
         let _ = state.update(HomeMessage::HistoryLoaded {
             entries: Vec::new(),
             has_more: false,
-            key: state
-                .history_read_key()
-                .expect("a selected user resolves a key"),
+            key: state.history_read_key(),
         });
         assert!(state.older_history_error.is_none());
     }
@@ -2364,7 +2044,7 @@ mod tests {
 
     #[test]
     fn test_replace_optimistic_found() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         state.messages.push(make_msg(
             "opt-1",
             "(placeholder)",
@@ -2398,7 +2078,7 @@ mod tests {
 
     #[test]
     fn test_replace_optimistic_not_found() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         state.messages.push(make_msg(
             "opt-1",
             "(placeholder)",
@@ -2428,7 +2108,7 @@ mod tests {
 
     #[test]
     fn test_replace_optimistic_no_opt_id() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
 
         let task = state.replace_optimistic(
             None,
@@ -2449,21 +2129,21 @@ mod tests {
 
     #[test]
     fn test_try_dedup_fresh() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         assert!(!state.try_dedup("msg-1"), "fresh ID should return false");
         assert!(state.seen_ids.contains("msg-1"), "fresh ID should be added");
     }
 
     #[test]
     fn test_try_dedup_duplicate() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         state.seen_ids.insert("msg-1".to_string());
         assert!(state.try_dedup("msg-1"), "duplicate should return true");
     }
 
     #[test]
     fn test_try_dedup_pruning() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         // Add 500 IDs.
         for i in 0..DEDUP_PRUNE_THRESHOLD {
             state.seen_ids.insert(format!("old-{i}"));
@@ -2505,7 +2185,7 @@ mod tests {
             (
                 "agent match",
                 ChatDirection::Agent,
-                "alice",
+                crate::users::ADMIN_USER_NAME,
                 "ws1",
                 false,
                 false,
@@ -2513,7 +2193,7 @@ mod tests {
             (
                 "user match",
                 ChatDirection::User,
-                "alice",
+                crate::users::ADMIN_USER_NAME,
                 "ws1",
                 false,
                 true,
@@ -2522,14 +2202,14 @@ mod tests {
             (
                 "wrong workspace",
                 ChatDirection::Agent,
-                "alice",
+                crate::users::ADMIN_USER_NAME,
                 "ws2",
                 true,
                 true,
             ),
         ];
         for (name, direction, user, workspace, exp_sending, exp_typing) in cases {
-            let mut state = make_home_state("alice", "ws1");
+            let mut state = make_home_state("ws1");
             state.sending = true;
             state.typing = true;
             state.update_sending_state(direction, user, workspace);
@@ -2544,11 +2224,11 @@ mod tests {
 
     #[test]
     fn test_append_message_match() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         assert_eq!(state.messages.len(), 0);
 
         state.append_message(
-            "alice",
+            crate::users::ADMIN_USER_NAME,
             "ws1",
             "msg-1".to_string(),
             "Hello!".to_string(),
@@ -2565,7 +2245,7 @@ mod tests {
 
     #[test]
     fn test_append_message_no_match_user() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
 
         state.append_message(
             "bob",
@@ -2587,10 +2267,10 @@ mod tests {
 
     #[test]
     fn test_append_message_no_match_workspace() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
 
         state.append_message(
-            "alice",
+            crate::users::ADMIN_USER_NAME,
             "ws2",
             "msg-1".to_string(),
             "Hello!".to_string(),
@@ -2609,10 +2289,10 @@ mod tests {
 
     #[test]
     fn test_append_message_agent_response() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
 
         state.append_message(
-            "alice",
+            crate::users::ADMIN_USER_NAME,
             "ws1",
             "msg-agent".to_string(),
             "Agent answer".to_string(),
@@ -2633,18 +2313,21 @@ mod tests {
 
     #[test]
     fn test_visible_chat_symmetric_at_any_picker() {
+        let admin = crate::users::ADMIN_USER_NAME;
+        let personal_name = crate::users::personal_workspace_name(admin);
+
         // Project picker: project + personal visible; unrelated stays hidden.
-        let project = make_home_state("alice", "ws1");
+        let project = make_home_state("ws1");
         assert_eq!(
             project.visible_workspaces(),
-            Some(VisibleChat {
+            VisibleChat {
                 primary: "ws1".to_string(),
-                merge: Some("personal:alice".to_string()),
-            })
+                merge: Some(personal_name.clone()),
+            }
         );
         assert!(project.workspace_visible("ws1"));
         assert!(
-            project.workspace_visible("personal:alice"),
+            project.workspace_visible(&personal_name),
             "personal Assistant messages must be visible at any picker"
         );
         assert!(!project.workspace_visible("ws2"));
@@ -2653,24 +2336,24 @@ mod tests {
             "another user's personal workspace is not visible"
         );
 
-        // Personal picker: personal + the user's DB project workspace visible
+        // Personal picker: personal + the admin's DB project workspace visible
         // (symmetric — the picker selects the recipient, not the view).
-        let mut personal = make_home_state("alice", "");
+        let mut personal = make_home_state(&personal_name);
         personal.user_project_workspace = Some("ws1".to_string());
         assert_eq!(
-            personal.resolve_workspace_name().as_deref(),
-            Some("personal:alice"),
-            "empty picker selection resolves to the personal workspace"
+            personal.resolve_workspace_name(),
+            personal_name,
+            "a personal picker selection resolves to the personal workspace"
         );
         assert_eq!(
             personal.visible_workspaces(),
-            Some(VisibleChat {
-                primary: "personal:alice".to_string(),
+            VisibleChat {
+                primary: personal_name.clone(),
                 merge: Some("ws1".to_string()),
-            }),
-            "personal picker merges the user's project workspace"
+            },
+            "personal picker merges the admin's project workspace"
         );
-        assert!(personal.workspace_visible("personal:alice"));
+        assert!(personal.workspace_visible(&personal_name));
         assert!(
             personal.workspace_visible("ws1"),
             "project messages must be visible at the personal picker"
@@ -2680,53 +2363,47 @@ mod tests {
             "a non-selected project workspace stays hidden at the personal picker"
         );
 
-        // No DB project workspace → personal-only view; no user → no chat.
-        let personal_only = make_home_state("alice", "");
+        // No DB project workspace → personal-only view.
+        let personal_only = make_home_state(&personal_name);
         assert_eq!(
             personal_only.visible_workspaces(),
-            Some(VisibleChat {
-                primary: "personal:alice".to_string(),
+            VisibleChat {
+                primary: personal_name,
                 merge: None,
-            }),
+            },
             "personal picker without a project workspace shows only the personal chat"
         );
         assert!(!personal_only.workspace_visible("ws1"));
-        let mut state = HomeState::new();
-        // Hermetic store: `HomeState::new()` binds the global store first, so
-        // swap in a throwaway one before anything can use it. (The global
-        // bind itself only ever reads the real file, fail-open.)
-        state.drafts = hermetic_draft_store();
-        assert_eq!(state.visible_workspaces(), None);
     }
 
     #[test]
     fn test_workspace_changed_at_personal_picker_resets_and_defers() {
         // Switching to the Personal picker resets the chat and re-reads the
-        // user's DB project workspace (completion via ProjectWorkspaceRefreshed
+        // admin's DB project workspace (completion via ProjectWorkspaceRefreshed
         // is covered by test_project_workspace_refreshed_updates_merge_partner).
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         state.user_project_workspace = Some("ws1".to_string());
         state
             .messages
             .push(make_msg("m1", "hi", ChatDirection::User, None, false));
 
         let _task = state.update(HomeMessage::WorkspaceChanged(Some(
-            "personal:alice".to_string(),
+            "personal:admin".to_string(),
         )));
-        assert_eq!(state.selected_workspace.as_deref(), Some("personal:alice"));
+        assert_eq!(state.selected_workspace.as_deref(), Some("personal:admin"));
         assert!(
             state.messages.is_empty(),
             "chat state resets on workspace change"
         );
         assert_eq!(
-            state.resolve_workspace_name().as_deref(),
-            Some("personal:alice"),
+            state.resolve_workspace_name(),
+            "personal:admin",
             "personal picker selection resolves to the personal workspace"
         );
 
         // A project-picker change refreshes history directly and keeps the
         // merge partner untouched (it only matters at the Personal picker).
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         state.user_project_workspace = Some("ws1".to_string());
         let _task = state.update(HomeMessage::WorkspaceChanged(Some("ws2".to_string())));
         assert_eq!(state.selected_workspace.as_deref(), Some("ws2"));
@@ -2738,169 +2415,83 @@ mod tests {
         // At the Personal picker the refreshed DB project workspace drives
         // the view (the wiring that keeps the merge partner fresh after a
         // Users-page workspace edit).
-        let mut state = make_home_state("alice", "");
+        let mut state = make_home_state("personal:admin");
         state.user_project_workspace = Some("ws1".to_string());
 
-        // A stale read for a different user is ignored.
-        let _ = state.update(HomeMessage::ProjectWorkspaceRefreshed(
-            "bob".to_string(),
-            Some("ws9".to_string()),
-        ));
-        assert_eq!(state.user_project_workspace.as_deref(), Some("ws1"));
-
-        // The current user's refreshed value applies and the view follows.
-        let _ = state.update(HomeMessage::ProjectWorkspaceRefreshed(
-            "alice".to_string(),
-            Some("ws2".to_string()),
-        ));
+        let _ = state.update(HomeMessage::ProjectWorkspaceRefreshed(Some(
+            "ws2".to_string(),
+        )));
         assert_eq!(state.user_project_workspace.as_deref(), Some("ws2"));
         assert!(state.workspace_visible("ws2"));
         assert!(!state.workspace_visible("ws1"));
         assert_eq!(
             state.visible_workspaces(),
-            Some(VisibleChat {
-                primary: "personal:alice".to_string(),
+            VisibleChat {
+                primary: "personal:admin".to_string(),
                 merge: Some("ws2".to_string()),
-            })
+            }
         );
 
         // At a project picker the refreshed value is stored but the view is
         // the selected workspace (no reload needed there).
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         state.user_project_workspace = Some("ws1".to_string());
-        let _ = state.update(HomeMessage::ProjectWorkspaceRefreshed(
-            "alice".to_string(),
-            Some("ws2".to_string()),
-        ));
+        let _ = state.update(HomeMessage::ProjectWorkspaceRefreshed(Some(
+            "ws2".to_string(),
+        )));
         assert_eq!(state.user_project_workspace.as_deref(), Some("ws2"));
         assert_eq!(
             state.visible_workspaces(),
-            Some(VisibleChat {
+            VisibleChat {
                 primary: "ws1".to_string(),
-                merge: Some("personal:alice".to_string()),
-            })
+                merge: Some("personal:admin".to_string()),
+            }
         );
-    }
-
-    #[test]
-    fn test_resolve_user_selected_stale_user_guard() {
-        // A resolve for a user that is no longer selected must not apply
-        // (fast user switch while the DB read was in flight) — same guard as
-        // ProjectWorkspaceRefreshed.
-        let mut state = make_home_state("alice", "");
-        let _ = state.update(HomeMessage::ResolveUserSelected {
-            user: "bob".to_string(),
-            sidebar_ws: Some("ws_bob".to_string()),
-            project_ws: Some("ws_bob".to_string()),
-        });
-        assert_eq!(state.selected_user.as_deref(), Some("alice"));
-        assert_eq!(state.selected_workspace.as_deref(), Some(""));
-        assert_eq!(state.user_project_workspace, None);
-
-        // The current user's resolve applies the merge partner.
-        let _ = state.update(HomeMessage::ResolveUserSelected {
-            user: "alice".to_string(),
-            sidebar_ws: Some("ws1".to_string()),
-            project_ws: Some("ws1".to_string()),
-        });
-        assert_eq!(state.user_project_workspace.as_deref(), Some("ws1"));
     }
 
     #[tokio::test]
+    #[serial_test::serial(gui_admin_workspace)] // both mutation sites write the shared seeded admin row
     async fn test_project_workspace_for_reads_db_normalized() {
         crate::util::test::init_test_stores().await;
-        let user = "home_project_workspace_for";
         let store = crate::users::USER_STORE
             .get()
             .expect("users store initialized");
-        store
-            .add_user(user, Some("full"), Role::Assistant)
+        let previous = crate::users::get_raw_selected_workspace(crate::users::ADMIN_USER_NAME)
             .await
-            .expect("add user");
+            .expect("read admin selected_workspace");
+        let set_selected = async |selected: Option<&str>| {
+            store
+                .conn
+                .execute(
+                    "UPDATE users SET selected_workspace = ?1 WHERE name = ?2",
+                    crate::db::params![selected, crate::users::ADMIN_USER_NAME],
+                )
+                .await
+                .expect("update admin selected_workspace");
+        };
 
-        // Unset → None.
-        assert_eq!(
-            HomeState::project_workspace_for(user.to_string()).await,
-            None
-        );
+        // NULL → None.
+        set_selected(None).await;
+        assert_eq!(HomeState::project_workspace_for().await, None);
 
         // Personal DB workspace → None.
-        store
-            .update_user(
-                user,
-                crate::users::FieldUpdate::Unchanged,
-                crate::users::FieldUpdate::Set("personal:home_project_workspace_for"),
-                crate::users::FieldUpdate::Unchanged,
-            )
-            .await
-            .expect("set personal workspace");
-        assert_eq!(
-            HomeState::project_workspace_for(user.to_string()).await,
-            None
-        );
+        set_selected(Some("personal:home_project_workspace_for")).await;
+        assert_eq!(HomeState::project_workspace_for().await, None);
 
-        // Project DB workspace → Some(ws).
+        // Shared DB workspace → Some(ws).
         crate::util::test::create_test_workspace(
             "/tmp/home_project_workspace_for_ws",
             "ws_home_project_workspace_for",
         )
         .await;
-        store
-            .update_user(
-                user,
-                crate::users::FieldUpdate::Unchanged,
-                crate::users::FieldUpdate::Set("ws_home_project_workspace_for"),
-                crate::users::FieldUpdate::Unchanged,
-            )
-            .await
-            .expect("set project workspace");
+        set_selected(Some("ws_home_project_workspace_for")).await;
         assert_eq!(
-            HomeState::project_workspace_for(user.to_string())
-                .await
-                .as_deref(),
+            HomeState::project_workspace_for().await.as_deref(),
             Some("ws_home_project_workspace_for")
         );
-    }
 
-    #[tokio::test]
-    async fn project_workspace_for_is_admin_gated() {
-        crate::util::test::init_test_stores().await;
-        let store = crate::users::USER_STORE
-            .get()
-            .expect("users store initialized");
-        // Seed an admin and a non-admin with the same shared selected_workspace
-        // directly (bypassing add_user's personal-workspace side effects so the
-        // test controls the exact stored state).
-        store
-            .conn
-            .execute(
-                "INSERT OR REPLACE INTO users (name, permissions, selected_workspace) \
-                 VALUES (?1, ?2, ?3)",
-                crate::db::params!["adm_merge_gui", Some("full"), Some("ws_merge_gui")],
-            )
-            .await
-            .expect("seed admin");
-        store
-            .conn
-            .execute(
-                "INSERT OR REPLACE INTO users (name, permissions, selected_workspace) \
-                 VALUES (?1, ?2, ?3)",
-                crate::db::params!["nonadm_merge_gui", None::<&str>, Some("ws_merge_gui")],
-            )
-            .await
-            .expect("seed non-admin");
-
-        // An admin keeps the shared workspace as their merge partner...
-        assert_eq!(
-            HomeState::project_workspace_for("adm_merge_gui".to_string()).await,
-            Some("ws_merge_gui".to_string())
-        );
-        // ...while a non-admin is clamped off it (membership is admin-only),
-        // making their prior shared-workspace chat history simply invisible.
-        assert_eq!(
-            HomeState::project_workspace_for("nonadm_merge_gui".to_string()).await,
-            None
-        );
+        // Leave the shared seeded admin row as it was found.
+        set_selected(previous.as_deref()).await;
     }
 
     #[test]
@@ -2908,16 +2499,21 @@ mod tests {
         // (picker, message workspace, agent role, content) — both directions:
         // at the project picker personal Assistant messages append and
         // clear sending/typing; at the personal picker Assistant messages
-        // still append into the user's DB project workspace (the merge partner).
+        // still append into the admin's DB project workspace (the merge partner).
         let cases = [
-            ("ws1", "personal:alice", "assistant", "Assistant reply"),
-            ("", "ws1", "assistant", "Assistant reply in project"),
+            ("ws1", "personal:admin", "assistant", "Assistant reply"),
+            (
+                "personal:admin",
+                "ws1",
+                "assistant",
+                "Assistant reply in project",
+            ),
         ];
         for (picker, msg_ws, role, content) in cases {
-            let mut state = make_home_state("alice", picker);
+            let mut state = make_home_state(picker);
             state.user_project_workspace = Some("ws1".to_string());
             state.append_message(
-                "alice",
+                crate::users::ADMIN_USER_NAME,
                 msg_ws,
                 "msg".to_string(),
                 content.to_string(),
@@ -2930,17 +2526,17 @@ mod tests {
             assert_eq!(state.messages[0].content, content);
             state.sending = true;
             state.typing = true;
-            state.update_sending_state(ChatDirection::Agent, "alice", msg_ws);
+            state.update_sending_state(ChatDirection::Agent, crate::users::ADMIN_USER_NAME, msg_ws);
             assert!(!state.sending);
             assert!(!state.typing);
         }
 
-        // A project workspace that is not the user's own stays hidden at the
+        // A project workspace that is not the admin's own stays hidden at the
         // personal picker.
-        let mut state = make_home_state("alice", "");
+        let mut state = make_home_state("personal:admin");
         state.user_project_workspace = Some("ws1".to_string());
         state.append_message(
-            "alice",
+            crate::users::ADMIN_USER_NAME,
             "ws2",
             "msg-other".to_string(),
             "other".to_string(),
@@ -3037,20 +2633,16 @@ mod tests {
 
     #[test]
     fn test_reply_reference_for_user_message() {
-        // Angle brackets in the (nominally canonical) user name are stripped
-        // from the author, matching the snippet's own stripping.
         let reply = reply_reference_for(
             ChatDirection::User,
             None,
             "Hello <world>\n\nwith [IMAGE:/tmp/photo.png]",
-            "al<i>ce",
         );
 
-        // User direction resolves to the selected user's canonical name; the
-        // snippet is normalized (angle brackets stripped, newlines collapsed —
-        // each `\n` becomes a single space, so `\n\n` yields two — media marker
-        // mapped).
-        assert_eq!(reply.author, "alice");
+        // A user message is the admin's own; the snippet is normalized (angle
+        // brackets stripped, newlines collapsed — each `\n` becomes a single
+        // space, so `\n\n` yields two — media marker mapped).
+        assert_eq!(reply.author, crate::users::ADMIN_USER_NAME);
         assert_eq!(reply.snippet, "Hello world  with [Photo]");
     }
 
@@ -3060,7 +2652,6 @@ mod tests {
             ChatDirection::Agent,
             Some("analyst_3"),
             "line one\n<line two> [IMAGE:/tmp/x.png] and a long tail",
-            "alice",
         );
 
         // Agent direction uses the shared author-label derivation (suffix
@@ -3072,7 +2663,7 @@ mod tests {
     #[test]
     fn test_reply_reference_snippet_caps_at_100() {
         let long = "a".repeat(150);
-        let reply = reply_reference_for(ChatDirection::User, None, &long, "alice");
+        let reply = reply_reference_for(ChatDirection::User, None, &long);
 
         assert!(
             reply.snippet.chars().count() <= crate::channels::reply::REPLY_SNIPPET_MAX_CHARS,
@@ -3089,7 +2680,7 @@ mod tests {
     fn test_replace_optimistic_reply_reference_fallback() {
         // A confirmed event carrying no reference falls back to the target
         // optimistic bubble's own reference.
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         state.messages.push(DisplayMessage {
             id: None,
             message_id: "opt-9".to_string(),
@@ -3123,7 +2714,7 @@ mod tests {
         );
 
         // A confirmed reference wins over the optimistic one.
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         state.messages.push(make_msg(
             "opt-10",
             "(placeholder)",
@@ -3157,7 +2748,7 @@ mod tests {
 
     #[test]
     fn test_select_to_creates_selection() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         state.editor_content =
             EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
 
@@ -3191,7 +2782,7 @@ mod tests {
 
     #[test]
     fn test_send_message_empty_is_noop() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         // Empty content — should return Task::none() and not change state.
         state.editor_content.clear();
         let _task = state.send_message();
@@ -3206,7 +2797,7 @@ mod tests {
 
     #[test]
     fn test_send_message_within_limit_clears_editor() {
-        let mut state = make_home_state("alice", "ws1");
+        let mut state = make_home_state("ws1");
         state.editor_content =
             EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
         let _task = state.send_message();

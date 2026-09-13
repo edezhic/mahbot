@@ -1581,17 +1581,13 @@ impl SettingsState {
 
     pub fn view<'a>(
         &'a self,
-        active_user: Option<&str>,
-        active_is_admin: bool,
         workspace_map_error: Option<&'a str>,
     ) -> Element<'a, SettingsMessage> {
-        // Workspace management section (right column). The workspace list &
-        // add form are gated on the active user's admin status (shared
-        // membership is admin-only).
-        let ws_section = self.workspaces_section(active_is_admin, workspace_map_error);
+        // Workspace management section (right column).
+        let ws_section = self.workspaces_section(workspace_map_error);
 
         // User management section (right column, below workspaces)
-        let us_section = self.users_section(active_user);
+        let us_section = self.users_section();
 
         // Existing config sections (left column)
         let config_sections = Column::new()
@@ -1658,33 +1654,15 @@ impl SettingsState {
     /// Render the workspaces section for the Settings page. No inner
     /// scrollable — rows expand the outer Settings scrollable naturally.
     ///
-    /// Shared-workspace membership is admin-only: when the active user is not
-    /// an admin, the row list and the add-workspace form are hidden entirely
-    /// and a single muted explanatory line is rendered instead (the error
-    /// banner, if present, is still shown).
-    ///
     /// `map_error` is the Dashboard's workspace-map read failure, passed in so
     /// the footer picker and this list render one state bit rather than two
     /// copies of it.
     #[expect(clippy::too_many_lines)]
     fn workspaces_section<'a>(
         &'a self,
-        active_is_admin: bool,
         map_error: Option<&'a str>,
     ) -> Element<'a, SettingsMessage> {
         let ws = &self.workspaces_state;
-
-        if !active_is_admin {
-            let mut rows = Column::new().spacing(theme::SPACE_4);
-            rows = widgets::push_error_banner(rows, ws.load_state.error());
-            rows = widgets::push_error_banner(rows, map_error);
-            rows = rows.push(
-                text("Shared workspaces are available to admin users only.")
-                    .size(theme::TEXT_12)
-                    .color(theme::TEXT_MUTED),
-            );
-            return section_impl("Workspaces", None, rows);
-        }
 
         let mut rows = Column::new().spacing(theme::SPACE_4);
         rows = widgets::push_error_banner(rows, ws.load_state.error());
@@ -2030,7 +2008,7 @@ impl SettingsState {
 
     /// Render the users section for the Settings page.
     #[expect(clippy::too_many_lines)]
-    fn users_section(&self, active_user: Option<&str>) -> Element<'_, SettingsMessage> {
+    fn users_section(&self) -> Element<'_, SettingsMessage> {
         let us = &self.users_state;
 
         let mut rows = Column::new().spacing(theme::SPACE_4);
@@ -2051,35 +2029,6 @@ impl SettingsState {
             for entry in &us.users {
                 let user = &entry.record;
                 let is_admin = user.is_admin();
-                let is_active = active_user == Some(user.name.as_str());
-
-                // Switch-user icon column: clickable when not the active user
-                let switch_icon: Element<'_, SettingsMessage> = if is_active {
-                    container(
-                        lucide::user_check::<iced::Theme, iced::Renderer>()
-                            .size(theme::TEXT_18)
-                            .color(theme::ACCENT),
-                    )
-                    .width(Length::Fixed(28.0))
-                    .align_x(iced::alignment::Horizontal::Center)
-                    .into()
-                } else {
-                    container(widgets::icon_tooltip_button(
-                        lucide::log_in::<iced::Theme, iced::Renderer>()
-                            .size(theme::TEXT_18)
-                            .color(theme::TEXT_MUTED),
-                        "Switch active user",
-                        Some(SettingsMessage::UserMsg(users::UsersMessage::SwitchUser(
-                            user.name.clone(),
-                        ))),
-                        0,
-                        theme::button_text,
-                        tooltip::Position::Top,
-                    ))
-                    .width(Length::Fixed(28.0))
-                    .align_x(iced::alignment::Horizontal::Center)
-                    .into()
-                };
 
                 let telegram_binding = user.channels.iter().find(|c| c.channel == "telegram");
                 let telegram_elem: Element<'_, SettingsMessage> =
@@ -2196,42 +2145,23 @@ impl SettingsState {
                         .into()
                     };
 
-                let user_row = container(
-                    row![
-                        // Name + permissions + Telegram (FillPortion: 40)
-                        {
-                            let mut segment = row![
-                                text(&user.name)
-                                    .size(theme::TEXT_14)
-                                    .color(theme::TEXT_PRIMARY)
-                            ]
-                            .spacing(theme::SPACE_8)
-                            .align_y(Alignment::Center);
-                            if let Some(p) = user.permissions.as_deref().filter(|p| !p.is_empty()) {
-                                segment = segment.push(
-                                    text(p).size(theme::TEXT_12).color(theme::TEXT_SECONDARY),
-                                );
-                            }
-                            container(segment.push(telegram_elem))
-                                .width(Length::FillPortion(40))
-                                .align_x(Alignment::Start)
-                                .align_y(Alignment::Center)
-                        },
-                        // Actions column (FillPortion: 12) — switch icon
-                        container({
-                            let mut actions = Row::new().align_y(Alignment::Center);
-                            actions = actions.push(switch_icon);
-                            actions
-                        })
-                        .width(Length::FillPortion(12))
-                        .align_x(Alignment::End)
-                        .align_y(Alignment::Center),
-                    ]
-                    .align_y(Alignment::Center),
-                )
-                .width(Length::Fill)
-                .padding(theme::PAD_8)
-                .style(theme::surface_card_style);
+                let mut segment = row![
+                    text(&user.name)
+                        .size(theme::TEXT_14)
+                        .color(theme::TEXT_PRIMARY)
+                ]
+                .spacing(theme::SPACE_8)
+                .align_y(Alignment::Center);
+                if let Some(p) = user.permissions.as_deref().filter(|p| !p.is_empty()) {
+                    segment =
+                        segment.push(text(p).size(theme::TEXT_12).color(theme::TEXT_SECONDARY));
+                }
+                let user_row = container(segment.push(telegram_elem))
+                    .width(Length::Fill)
+                    .align_x(Alignment::Start)
+                    .align_y(Alignment::Center)
+                    .padding(theme::PAD_8)
+                    .style(theme::surface_card_style);
 
                 // Right-click context menu (Delete). The card's own controls
                 // still work: ContextMenu forwards all events to the underlay

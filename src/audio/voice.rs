@@ -17,14 +17,14 @@
 //!    (speaker-blind, immediate-fire).
 //! 5. **Command recording** — record speech until silence or 10 min cap
 //! 6. **Transcription** — via the shared Qwen3-ASR local transcriber
-//! 7. **Routing** — transcribed text is routed to the user's active role via
-//!    [`route_to_agent`] (falls back to the seeded admin's default pool role
-//!    if no active user is determined).
+//! 7. **Routing** — transcribed text is routed to the admin's active role via
+//!    [`route_to_agent`] (the desktop GUI has a single acting identity, the
+//!    seeded admin account).
 //!
 //! The pipeline runs unconditionally as a boot background task. It does NOT
 //! use an LLM agent loop.
-//! Transcribed commands are routed to the user's currently active role (resolved
-//! via [`route_to_agent`]) as if the user typed them.
+//! Transcribed commands are routed to the admin's currently active role
+//! (resolved via [`route_to_agent`]) as if the admin typed them.
 //!
 //! # Model sharing
 //!
@@ -683,25 +683,6 @@ pub struct UtteranceQuality {
 
 static VOICE_PIPELINE: OnceLock<RwLock<VoicePipelineState>> = OnceLock::new();
 
-/// The name of the currently active user, updated by the GUI when the
-/// selected user changes. Used by [`route_to_agent`] to route transcribed
-/// voice commands to the correct user's active role.
-static LAST_ACTIVE_USER: OnceLock<RwLock<String>> = OnceLock::new();
-
-/// Set the currently active user name (called from GUI on user switch).
-pub fn set_active_user_name(name: &str) {
-    if let Some(state) = LAST_ACTIVE_USER.get() {
-        *state.write().unwrap_poison() = name.to_string();
-    }
-}
-
-fn active_user_name() -> String {
-    LAST_ACTIVE_USER
-        .get()
-        .map(|s| s.read().unwrap_poison().clone())
-        .unwrap_or_default()
-}
-
 struct VoicePipelineState {
     enabled: bool,
     status: VoiceStatus,
@@ -776,7 +757,7 @@ pub enum VoiceCommand {
     /// Pauses wake-word listening for the duration of the recording.
     StartRecording,
     /// Stop the mic-button recording, transcribe it, and route the
-    /// transcript to the user's active role agent.
+    /// transcript to the admin's active role agent.
     StopRecordingSend,
     /// Stop the mic-button recording and discard the captured audio.
     StopRecordingDiscard,
@@ -794,10 +775,6 @@ fn voice_state() -> &'static RwLock<VoicePipelineState> {
 /// Initialize the voice pipeline state. Called during startup.
 pub fn init_global() -> Result<()> {
     VAD_DETECTOR.get_or_init(|| std::sync::Mutex::new(earshot::Detector::default()));
-
-    LAST_ACTIVE_USER
-        .set(RwLock::new(String::new()))
-        .map_err(|_| anyhow!("LAST_ACTIVE_USER already initialized"))?;
 
     VOICE_PIPELINE
         .set(RwLock::new(VoicePipelineState {
@@ -1577,8 +1554,7 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
     // pipeline — exactly the GUI text path — so the transcription reaches
     // Telegram with the same bindings and format. Voice is a strictly local
     // source, so the mirror cannot echo (see `mirror_gui_message_to_telegram`).
-    // Callers always pass a non-empty user name (the active user, or "admin"
-    // for the no-active-user fallback) — the "no empty user" invariant.
+    // Callers always pass a non-empty user name — the "no empty user" invariant.
     let msg = crate::ChannelMessage {
         user_name: user_name.to_string(),
         content: transcript.to_string(),
@@ -1591,45 +1567,30 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
 
 /// Route a transcribed voice command to the appropriate agent.
 ///
-/// Resolves the active user's role and workspace from the user's DB record,
-/// then routes through the agent-ID message router.
-///
-/// Falls back to the admin user's role (Assistant — the sole pool role) if
-/// no active user can be determined.
+/// The desktop GUI has a single acting identity — the seeded admin — so the
+/// transcript is routed to the admin user's role and workspace from their DB
+/// record, then through the agent-ID message router.
 async fn route_to_agent(text: String) {
-    // Try active user first (set by GUI on user switch)
-    let user_name = active_user_name();
-    if !user_name.is_empty() {
-        let pool = crate::users::role_pool();
-        let Some(role) = crate::users::resolve_active_role_from_pool(&user_name, &pool).await
-        else {
-            // A failed selected-role store read (fail-closed) — no role is
-            // allowed to answer.
-            info!("Voice command dropped (no active role) (user: {user_name}): {text}");
-            return;
-        };
-        let ws = crate::users::resolve_workspace_for_user_name(&user_name).await;
-        route_voice_to_role(text, &user_name, role, ws).await;
+    let user_name = crate::users::ADMIN_USER_NAME;
+    let Some(role) = crate::users::resolve_active_role(user_name).await else {
+        // A failed selected-role store read (fail-closed) — no role is
+        // allowed to answer.
+        info!("Voice command dropped (no active role) (user: {user_name}): {text}");
         return;
-    }
-
-    // No active user: fall back to the admin user's DB workspace (same
-    // warning + personal fallback as the active-user path). The role pool is
-    // the constant single Assistant.
-    let ws = crate::users::resolve_workspace_for_user_name("admin").await;
-    route_voice_to_role(text, "admin", crate::Role::Assistant, ws).await;
+    };
+    let ws = crate::users::resolve_workspace_for_user_name(user_name).await;
+    route_voice_to_role(text, user_name, role, ws).await;
 }
 
 /// Shared tail of [`route_to_agent`]: pin the pool-selected role to its
 /// effective workspace, log, broadcast the transcript, and hand off to
 /// the message router.
 ///
-/// Pool-gating applies to both callers: the routed role stays inside the
-/// pool — with Assistant pinning to the personal workspace, atomically.
+/// Pool-gating applies: the routed role stays inside the pool — with Assistant
+/// pinning to the personal workspace, atomically.
 ///
-/// The routed user_name is the active user, or "admin" (the seeded admin
-/// identity) for the no-active-user fallback — an empty name would produce
-/// a broken `personal:` path and a malformed bare "_ws_role" session key.
+/// The routed user_name is never empty — an empty name would produce a broken
+/// `personal:` path and a malformed bare "_ws_role" session key.
 async fn route_voice_to_role(
     text: String,
     user_name: &str,
@@ -2337,23 +2298,20 @@ impl PipelineCtx {
         Self::should_send_rate_limited(self.last_voice_notice_time)
     }
 
-    /// Broadcast a chat message to the active user's voice workspace.
+    /// Broadcast a chat message to the admin's voice workspace.
     async fn broadcast_voice_message(&mut self, msg: &str) {
-        let user_name = active_user_name();
-        if user_name.is_empty() {
-            return;
-        }
-        let role = crate::users::resolve_active_role(&user_name).await;
-        let ws = crate::users::resolve_workspace_for_user_name(&user_name).await;
-        // Assistant conversations live in the user's personal workspace;
+        let user_name = crate::users::ADMIN_USER_NAME;
+        let role = crate::users::resolve_active_role(user_name).await;
+        let ws = crate::users::resolve_workspace_for_user_name(user_name).await;
+        // Assistant conversations live in the admin's personal workspace;
         // a None role (empty pool or store failure) fails closed to the
         // resolved workspace — the notice stays visible in the current view.
         let ws = match role {
-            Some(role) => crate::users::effective_workspace_for_role(role, ws, &user_name),
+            Some(role) => crate::users::effective_workspace_for_role(role, ws, user_name),
             None => ws,
         };
         crate::channels::broadcast_and_persist_agent_response(
-            &user_name,
+            user_name,
             "voice",
             msg,
             Some("voice".to_string()),
@@ -2707,7 +2665,7 @@ impl PipelineCtx {
     }
 
     /// Transcribe a completed manual-recording buffer and route it to the
-    /// user's active role agent (same broadcast+routing path as wake-word
+    /// admin's active role agent (same broadcast+routing path as wake-word
     /// commands), then restore wake-word listening state.
     async fn finalize_manual_recording(&mut self, cmd_buf: Vec<f32>) {
         set_status(VoiceStatus::Transcribing);

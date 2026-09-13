@@ -275,7 +275,6 @@ pub const TEXT_12: f32 = 12.0;
 pub const TEXT_13: f32 = 13.0;
 pub const TEXT_14: f32 = 14.0;
 pub const TEXT_16: f32 = 16.0;
-pub const TEXT_18: f32 = 18.0;
 pub const TEXT_24: f32 = 24.0;
 
 // ── De-facto 2px spacing grid (px) ───────────────────────────────

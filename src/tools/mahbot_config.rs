@@ -18,7 +18,7 @@ use serde_json::json;
 /// personal workspace, so this resolves to the admin without a separate
 /// identity lookup.
 fn acting_user(ws: &Workspace) -> &str {
-    crate::users::personal_user_name(&ws.name).unwrap_or("admin")
+    crate::users::personal_user_name(&ws.name).unwrap_or(crate::users::ADMIN_USER_NAME)
 }
 
 fn err(msg: impl Into<String>) -> anyhow::Error {
@@ -118,11 +118,11 @@ impl MahbotConfigTool {
     }
 
     async fn exec_bind_telegram(&self, args: serde_json::Value) -> anyhow::Result<String> {
-        // bind_telegram always targets the `admin` user: this is a single-admin
+        // bind_telegram always targets the admin user: this is a single-admin
         // model, and the config agent only runs for the admin, so the personal
         // workspace it operates in resolves to the same identity. Never the
         // operating full-permissions user.
-        let user = "admin";
+        let user = crate::users::ADMIN_USER_NAME;
         let handle = super::get_str(&args, "handle")?;
 
         let store = crate::users::store();

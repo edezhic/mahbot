@@ -317,8 +317,8 @@ pub enum Message {
     UpdateResult(Result<String, String>),
     /// Toggle the selected workspace's pipeline pause or maintainer state.
     Toggle(ToggleKind),
-    /// Footer workspace picker: switch the active user's workspace (shared
-    /// workspaces only; admin-gated at render).
+    /// Footer workspace picker: switch the admin's workspace (shared
+    /// workspaces only).
     WorkspacePick(String),
     /// Result of a per-workspace toggle DB write. Carries (kind, result, workspace_name, intended_state).
     /// On success, the workspace map is reloaded from the store; on error an error toast is shown.
@@ -329,9 +329,9 @@ pub enum Message {
     /// Workspace info and restored selection loaded during boot. The read
     /// result is carried as-is so a failed boot read surfaces in the picker
     /// and Settings list instead of silently rendering as "no workspaces".
-    /// The selection is the resolved name ("" = "Personal" default). The
-    /// generation is the reload generation the read was issued under, so a
-    /// reload that answered while it was in flight wins.
+    /// The selection is the resolved name. The generation is the reload
+    /// generation the read was issued under, so a reload that answered while
+    /// it was in flight wins.
     BootWorkspaces {
         workspaces: Result<HashMap<String, Workspace>, String>,
         restored_name: String,
@@ -339,10 +339,10 @@ pub enum Message {
     },
     /// Full workspace map reloaded from the store (CDC workspaces event,
     /// stream lag, toggle completion, or a settings add/delete). The handler
-    /// re-resolves the live selection against this fresh map — "" = "Personal"
-    /// default when the selected workspace vanished or none was set. The
-    /// generation is the reload it answers, so a slow read cannot overwrite a
-    /// newer one.
+    /// re-resolves the live selection against this fresh map — falling back to
+    /// the "Personal" default when the selected workspace vanished or none was
+    /// set. The generation is the reload it answers, so a slow read cannot
+    /// overwrite a newer one.
     WorkspacesReloaded {
         workspaces: HashMap<String, Workspace>,
         generation: u64,
@@ -375,13 +375,6 @@ pub enum Message {
     OpenDiffModal(Option<String>),
     /// Close the diff modal.
     CloseDiffModal,
-    /// Set the selected user's admin flag, fetched in a single task. Kept
-    /// separate from the removed role-switcher cache: the Settings lists and
-    /// the Sessions page are filtered by admin status, so they must re-sync
-    /// once it settles.
-    AdminLoaded {
-        is_admin: bool,
-    },
     /// TTS model download progress event.
     TtsDownloadEvent(crate::audio::tts::TtsDownloadEvent),
 }
@@ -574,16 +567,10 @@ pub struct Dashboard {
     /// against it, so a change of *resolvability* alone — the selected name
     /// staying the same — still re-pushes (see [`Self::sync_workspace_surfaces`]).
     pushed_workspace: Option<(String, String)>,
-    /// Currently selected workspace name. `Some("personal:{user}")` = the
-    /// impersonated user's "Personal" workspace; `Some("ws")` = a shared
-    /// workspace; `None` = nothing selected.
+    /// Currently selected workspace name. `Some("personal:admin")` = the
+    /// admin's "Personal" workspace; `Some("ws")` = a shared workspace;
+    /// `None` = nothing selected.
     selected_workspace_name: Option<String>,
-    /// Currently selected user name (for impersonation). Persisted in window state.
-    selected_user_name: Option<String>,
-    /// Cached admin status for the current user — the single reliable source
-    /// of the active user's admin flag, used to gate shared-workspace
-    /// membership across all GUI surfaces. Fail-closed: `false` until loaded.
-    selected_user_is_admin: bool,
     /// True when a genuine window close was requested while the update was in
     /// its finalizing window (daemon shut down; checkpoint + spawn + exit
     /// pending). Only a user close (`CloseRequested`) sets this — the update's
@@ -645,8 +632,6 @@ impl Dashboard {
             workspaces_reload_gen: 0,
             pushed_workspace: None,
             selected_workspace_name: None,
-            selected_user_name: None,
-            selected_user_is_admin: false,
             exit_requested_during_update: false,
             draining: false,
             show_update_confirm: false,
@@ -678,14 +663,8 @@ impl Dashboard {
                 let refresh_logs = self.logs_state.refresh(&log_store);
                 let refresh_board = self.board_state.refresh();
                 self.log_store = Some(log_store);
-                let prev = read_window_state();
-                self.selected_user_name = prev.selected_user;
-                self.board_state.current_user_name = self.selected_user_name.clone();
                 let boot_workspaces = Task::perform(
-                    load_workspace_options(
-                        self.selected_user_name.clone(),
-                        self.workspaces_reload_gen,
-                    ),
+                    load_workspace_options(self.workspaces_reload_gen),
                     std::convert::identity,
                 );
 
@@ -753,14 +732,10 @@ impl Dashboard {
         iced::Theme::Dark
     }
 
-    /// Persist the current window position, size, and selected user to
+    /// Persist the current window position and size to
     /// `~/.mahbot/window-state.json`.
     fn persist_window_state(&self) {
-        save_window_state(
-            self.last_position,
-            self.last_size,
-            self.selected_user_name.as_deref(),
-        );
+        save_window_state(self.last_position, self.last_size);
     }
 
     fn save_and_exit(&self) -> Task<Message> {
@@ -809,35 +784,11 @@ impl Dashboard {
         if read_generation == self.workspaces_reload_gen {
             self.apply_boot_workspace_map(workspaces);
         }
-        // Pre-set Home's selected_user from persisted window state
-        // so UsersLoaded doesn't auto-select the first user when
-        // a previous user was saved.
-        if let Some(ref user_name) = self.selected_user_name {
-            self.home_state.selected_user = Some(user_name.clone());
-            crate::audio::voice::set_active_user_name(user_name);
-        }
-        // Load the selected user's admin status for the Settings/Sessions
-        // gating.
-        let admin_cache = self.refresh_selected_user_admin_cache();
 
-        let load_users = self.home_state.load_users().map(Message::Home);
-
-        // A resolved selection always has a name (`personal:{user}` for the
-        // Personal workspace). An empty string means no user/workspace is
-        // selected yet (boot without a persisted user) — treated as "no
-        // selection".
-        let ws_name = if restored_name.is_empty() {
-            self.selected_workspace_name = None;
-            String::new()
-        } else {
-            self.selected_workspace_name = Some(restored_name.to_owned());
-            restored_name.to_owned()
-        };
-        Task::batch([
-            admin_cache,
-            self.propagate_workspace_selection(&ws_name),
-            load_users,
-        ])
+        // The boot read always yields a name — a shared workspace or the
+        // admin's `personal:admin` fallback.
+        self.selected_workspace_name = Some(restored_name.to_owned());
+        self.propagate_workspace_selection(restored_name)
     }
 
     /// Navigate to a page, refreshing page-specific state as needed.
@@ -858,13 +809,11 @@ impl Dashboard {
             // reads the live registries at render time.
             Page::Logs | Page::Shell | Page::Editor | Page::RunningAgents => Task::none(),
             Page::Home => {
-                let load_users = self.home_state.load_users().map(Message::Home);
                 let snap = iced::widget::operation::snap_to_end::<Message>(home::CHAT_SCROLL_ID);
                 let board_refresh = self.board_state.refresh().map(Message::Board);
-                Task::batch([load_users, snap, board_refresh])
+                Task::batch([snap, board_refresh])
             }
-            Page::Sessions => sessions::SessionsState::refresh(!self.selected_user_is_admin)
-                .map(Message::Sessions),
+            Page::Sessions => sessions::SessionsState::refresh().map(Message::Sessions),
             Page::Settings => {
                 self.settings_state.refresh();
                 // Workspace list comes from the shared map; only the users
@@ -889,18 +838,9 @@ impl Dashboard {
     /// Sync the Settings workspaces section list from the shared workspace map
     /// (sorted by name, matching the store's `ORDER BY name`). No DB read — the
     /// map is the single source of truth.
-    ///
-    /// Shared-workspace membership is admin-only: when the active user is not
-    /// an admin, the Workspaces settings list is emptied (every `workspaces`
-    /// table row is a shared workspace; personal workspaces never live in the
-    /// map).
     fn sync_settings_workspaces_from_map(&mut self) {
         let mut list: Vec<Workspace> = self.workspaces.values().cloned().collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
-        if !self.selected_user_is_admin {
-            // Fail-closed: hide all shared workspaces from a non-admin.
-            list.clear();
-        }
         self.settings_state.workspaces_state.workspaces = list;
     }
 
@@ -1024,57 +964,9 @@ impl Dashboard {
         }
     }
 
-    /// Load the selected user's admin status into the cached admin flag used
-    /// to gate shared-workspace membership across the Settings lists and the
-    /// Sessions page. Called at boot and on user switch.
-    fn refresh_selected_user_admin_cache(&self) -> Task<Message> {
-        let Some(ref user) = self.selected_user_name else {
-            return Task::none();
-        };
-        let user = user.clone();
-        // Single task: the admin flag from a permissions read.
-        Task::perform(
-            async move {
-                let is_admin = crate::users::is_admin(&user).await;
-                Message::AdminLoaded { is_admin }
-            },
-            std::convert::identity,
-        )
-    }
-
-    /// Process a Settings message, intercepting user-related messages for
-    /// cross-page side effects (user switching, deletion recovery) and
-    /// optionally reloading the workspace map when workspaces are added or
-    /// deleted.
+    /// Process a Settings message, optionally reloading the workspace map when
+    /// workspaces are added or deleted.
     fn process_settings_message(&mut self, msg: settings::SettingsMessage) -> Task<Message> {
-        // Capture cross-page side effects for intercepted UserMsg
-        // variants. These batch alongside the delegation call below.
-        let mut intercept_task: Option<Task<Message>> = None;
-
-        if let settings::SettingsMessage::UserMsg(ref inner) = msg {
-            match inner {
-                users::UsersMessage::SwitchUser(user) => {
-                    // SwitchUser is a documented no-op in UsersState,
-                    // so unconditional delegation below is safe.
-                    intercept_task = Some(
-                        Task::done(home::HomeMessage::UserSelected(user.clone()))
-                            .map(Message::Home),
-                    );
-                }
-                users::UsersMessage::DeleteResult(Ok(()), deleted_user)
-                    if self.selected_user_name.as_deref() == Some(deleted_user.as_str()) =>
-                {
-                    self.selected_user_name = Some("admin".to_string());
-                    self.persist_window_state();
-                    intercept_task = Some(
-                        Task::done(home::HomeMessage::UserSelected("admin".to_string()))
-                            .map(Message::Home),
-                    );
-                }
-                _ => {}
-            }
-        }
-
         // Any successful Settings-side workspace mutation (add, delete,
         // reanalyze, diagnostics/notes edits) refreshes the shared
         // workspace map from one full DB read — the map is the single source
@@ -1095,17 +987,11 @@ impl Dashboard {
 
         let settings_task = self.settings_state.update(msg).map(Message::Settings);
 
-        // Stack-allocated batch: only Some tasks are included via
-        // flatten. Avoids Vec heap allocation for the common
-        // no-intercept no-reload path.
-        let reload = if needs_global_reload {
-            Some(self.reload_workspace_map())
+        if needs_global_reload {
+            Task::batch([settings_task, self.reload_workspace_map()])
         } else {
-            None
-        };
-        let tasks = [intercept_task, Some(settings_task), reload];
-
-        Task::batch(tasks.into_iter().flatten())
+            settings_task
+        }
     }
 
     /// Process a Running Agents page message — the manual research-run
@@ -1280,34 +1166,7 @@ impl Dashboard {
                     Task::none()
                 }
             }
-            Message::Home(msg) => {
-                // Intercept RequestWorkspaceChange: the Home page detected
-                // that the selected user's DB workspace differs from the
-                // sidebar selection.  Perform a Dashboard-level workspace
-                // switch so the sidebar and all pages stay consistent; the
-                // switch also writes the same value back to the user's
-                // `users.selected_workspace` (idempotent — it is the value
-                // just read from the DB).
-                if let home::HomeMessage::RequestWorkspaceChange(ref name) = msg {
-                    return self.select_workspace(name);
-                }
-                // Intercept UserSelected: user changed (from picker, Users page
-                // icon, or auto-selected at boot) — sync the Dashboard's
-                // selected_user_name and persist to window state.
-                if let home::HomeMessage::UserSelected(ref user) = msg {
-                    self.selected_user_name = Some(user.clone());
-                    self.board_state.current_user_name = Some(user.clone());
-                    self.selected_user_is_admin = false; // fail-closed until loaded
-                    crate::audio::voice::set_active_user_name(user);
-                    self.persist_window_state();
-                    let admin_cache = self.refresh_selected_user_admin_cache();
-                    return Task::batch([
-                        admin_cache,
-                        self.home_state.update(msg.clone()).map(Message::Home),
-                    ]);
-                }
-                self.home_state.update(msg).map(Message::Home)
-            }
+            Message::Home(msg) => self.home_state.update(msg).map(Message::Home),
             Message::Shell(msg) => self.shell_state.update(msg).map(Message::Shell),
             Message::Logs(msg) => self
                 .logs_state
@@ -1508,11 +1367,8 @@ impl Dashboard {
                 // Propagate only on an actual fallback — propagate is heavy
                 // (board refresh + home reload) and must not run on every CDC
                 // event.
-                let personal_name = self
-                    .selected_user_name
-                    .as_deref()
-                    .map(crate::users::personal_workspace_name)
-                    .unwrap_or_default();
+                let personal_name =
+                    crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
                 let resolved = resolve_workspace_selection(
                     &self.workspaces,
                     self.selected_workspace_name.as_deref(),
@@ -1520,7 +1376,7 @@ impl Dashboard {
                 );
                 let current = self.selected_workspace_name.as_deref().unwrap_or_default();
                 if current != resolved.as_str() {
-                    self.selected_workspace_name = (!resolved.is_empty()).then(|| resolved.clone());
+                    self.selected_workspace_name = Some(resolved.clone());
                     return self.propagate_workspace_selection(&resolved);
                 }
                 // The name is unchanged, but this map can still have changed
@@ -1547,22 +1403,6 @@ impl Dashboard {
                 Task::none()
             }
             Message::Nop => Task::none(),
-            Message::AdminLoaded { is_admin } => {
-                let admin_changed = self.selected_user_is_admin != is_admin;
-                self.selected_user_is_admin = is_admin;
-                // The Settings lists and the Sessions page are filtered by
-                // the active user's admin status, so they must re-sync once
-                // it settles (a change toggles whether shared workspaces
-                // appear). Running Agents reads the flag at render time and
-                // needs no refresh.
-                if admin_changed {
-                    self.sync_settings_workspaces_from_map();
-                    if self.page == Page::Sessions {
-                        return sessions::SessionsState::refresh(!is_admin).map(Message::Sessions);
-                    }
-                }
-                Task::none()
-            }
             Message::TtsDownloadEvent(event) => self.handle_tts_download_event(event),
         }
     }
@@ -1639,60 +1479,38 @@ impl Dashboard {
     fn apply_workspace_selection(&mut self, name: &str) -> Task<Message> {
         // Git state is cleared and eagerly refreshed below via
         // propagate_workspace_selection → set_workspace_path.
-        self.selected_workspace_name = if name.is_empty() {
-            None
-        } else {
-            Some(name.to_string())
-        };
+        self.selected_workspace_name = Some(name.to_string());
         self.propagate_workspace_selection(name)
     }
 
-    /// Canonical entry point for workspace switching throughout the dashboard:
-    /// applies the selection in memory and persists it as the impersonated
-    /// user's `users.selected_workspace` (the DB is the single source of truth;
-    /// a personal selection stores NULL). The DB write is best-effort —
-    /// failures are logged, the GUI selection still applies.
+    /// Canonical entry point for workspace switching in the dashboard: applies
+    /// the selection in memory and persists it as the admin's
+    /// `users.selected_workspace` (the DB is the single source of truth; a
+    /// personal selection stores NULL). The DB write is best-effort — failures
+    /// are logged, the GUI selection still applies.
     ///
-    /// A name missing from the workspace map is never persisted: the
-    /// reverse-sync path can surface a legacy dangling
-    /// `users.selected_workspace` value, and re-asserting it would keep the
-    /// DB dangling. Personal names are always persisted (as NULL). The
+    /// A name missing from the workspace map is never persisted: the picker
+    /// renders from the map, so a reload that dropped the picked name between
+    /// render and click must not write a dangling value into the DB. The
     /// in-memory selection still applies; a subsequent
     /// [`Message::WorkspacesReloaded`] re-resolves it to "Personal".
-    ///
-    /// No admin clamp is applied here: every producer of a selection is
-    /// already admin-aware (the Home reverse-sync resolves through
-    /// [`crate::users::resolve_selected_workspace_name`], the footer
-    /// workspace picker is admin-gated), so a
-    /// non-admin can never request a shared workspace — and clamping against
-    /// the async-loaded `selected_user_is_admin` cache would race a user
-    /// switch and wrongly detach an admin from their shared workspace.
-    ///
-    /// Residual edge (accepted): if the user-store read fails mid-switch to
-    /// a non-admin, the reverse-sync keeps the previous user's shared
-    /// in-memory selection and a map reload preserves it — a display-only
-    /// stale view that self-corrects on the next successful reverse-sync
-    /// (routing always re-resolves from the DB per message, so agents never
-    /// route by it).
     fn select_workspace(&mut self, name: &str) -> Task<Message> {
         let propagate = self.apply_workspace_selection(name);
-        let known = name.is_empty()
-            || crate::users::is_personal_workspace(name)
-            || self.workspaces.contains_key(name);
-        let db_write = known
-            .then(|| self.selected_user_name.clone())
-            .flatten()
-            .map(|user| {
-                let ws = name.to_string();
-                Task::perform(
-                    async move {
-                        if let Err(e) = users::update_user_field(user.clone(), ws).await {
-                            tracing::warn!(error = %e, user = %user, "Failed to persist workspace selection");
-                        }
-                    },
-                    |()| Message::Nop,
-                )
-            });
+        let known = crate::users::is_personal_workspace(name) || self.workspaces.contains_key(name);
+        let db_write = known.then(|| {
+            let ws = name.to_string();
+            Task::perform(
+                async move {
+                    if let Err(e) =
+                        users::update_user_field(crate::users::ADMIN_USER_NAME.to_string(), ws)
+                            .await
+                    {
+                        tracing::warn!(error = %e, "Failed to persist workspace selection");
+                    }
+                },
+                |()| Message::Nop,
+            )
+        });
         Task::batch(std::iter::once(propagate).chain(db_write))
     }
 
@@ -1730,10 +1548,7 @@ impl Dashboard {
             if self.workspaces.contains_key(name) || crate::users::is_personal_workspace(name) {
                 name.to_string()
             } else {
-                self.selected_user_name
-                    .as_deref()
-                    .map(crate::users::personal_workspace_name)
-                    .unwrap_or_default()
+                crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME)
             };
         let home_task: Task<Message> =
             Task::done(home::HomeMessage::WorkspaceChanged(Some(home_name))).map(Message::Home);
@@ -1973,17 +1788,12 @@ impl Dashboard {
             }
             Page::Settings => self
                 .settings_state
-                .view(
-                    self.selected_user_name.as_deref(),
-                    self.selected_user_is_admin,
-                    self.workspaces_error.as_deref(),
-                )
+                .view(self.workspaces_error.as_deref())
                 .map(Message::Settings),
             Page::RunningAgents => running::view(
                 &self.workspaces,
                 self.pending_research_cancel.as_deref(),
                 &self.running_expanded,
-                self.selected_user_is_admin,
             ),
         };
 
@@ -2755,20 +2565,15 @@ impl Dashboard {
         }
     }
 
-    /// Footer workspace picker: shared workspaces only, admin-gated, persists
-    /// via [`Self::select_workspace`]. With a single shared workspace the
+    /// Footer workspace picker: shared workspaces only, persists via
+    /// [`Self::select_workspace`]. With a single shared workspace the
     /// dropdown degrades to a static label (that workspace's display name,
     /// or the "Select workspace" placeholder when nothing is selected —
     /// including a Personal/unset selection). When a failed workspace-map read
     /// leaves nothing to pick, a static, non-selectable "Workspaces
     /// unavailable" pill replaces it in the same footprint. Returns `None` for
-    /// the no-user, non-admin, and zero-shared-workspaces states — the admin
-    /// flag is fail-closed `false` until loaded, so the picker is hidden at
-    /// boot (intended).
+    /// the zero-shared-workspaces state.
     fn render_workspace_picker(&self) -> Option<Element<'_, Message>> {
-        if self.selected_user_name.is_none() || !self.selected_user_is_admin {
-            return None;
-        }
         // Nothing left to pick: the failed read renders a static, non-selectable
         // failure pill in the picker's footprint. The error text lives only in
         // the tooltip — it must never become an option of the dropdown.
@@ -3275,15 +3080,13 @@ fn footer_status_label(label: String) -> Element<'static, Message> {
     .into()
 }
 
-/// Persisted window geometry and selected user.
-#[derive(serde::Serialize, serde::Deserialize)]
+/// Persisted window geometry.
+#[derive(serde::Deserialize)]
 pub struct WindowState {
     pub width: f32,
     pub height: f32,
     pub x: i32,
     pub y: i32,
-    #[serde(default)]
-    pub selected_user: Option<String>,
 }
 
 impl WindowState {
@@ -3302,7 +3105,6 @@ impl Default for WindowState {
             height: 800.0,
             x: -1,
             y: -1,
-            selected_user: None,
         }
     }
 }
@@ -3321,18 +3123,15 @@ pub fn read_window_state() -> WindowState {
         .unwrap_or_default()
 }
 
-/// Save current window geometry and selected user to `~/.mahbot/window-state.json`.
+/// Save current window geometry to `~/.mahbot/window-state.json`.
 #[expect(clippy::cast_possible_truncation)]
-fn save_window_state(pos: iced::Point, size: iced::Size, selected_user: Option<&str>) {
-    let mut state = serde_json::json!({
+fn save_window_state(pos: iced::Point, size: iced::Size) {
+    let state = serde_json::json!({
         "width": size.width,
         "height": size.height,
         "x": pos.x as i32,
         "y": pos.y as i32,
     });
-    if let Some(user) = selected_user {
-        state["selected_user"] = serde_json::Value::String(user.to_string());
-    }
     if let Ok(dir) = std::env::var("HOME") {
         let path = std::path::PathBuf::from(dir)
             .join(".mahbot")
@@ -3389,8 +3188,8 @@ async fn read_workspace_map() -> anyhow::Result<HashMap<String, Workspace>> {
 /// Resolve the restored workspace selection against a freshly loaded map:
 /// the previous selection is kept when it still exists (a `personal:{user}`
 /// name is never in the map, so it always falls through to the personal
-/// default); anything else falls back to the "Personal" default (the
-/// impersonated user's `personal:{user}` name).
+/// default); anything else falls back to the "Personal" default (the admin's
+/// `personal:{user}` name).
 #[must_use]
 fn resolve_workspace_selection(
     map: &HashMap<String, Workspace>,
@@ -3398,20 +3197,18 @@ fn resolve_workspace_selection(
     personal_name: &str,
 ) -> String {
     match prev_selection {
-        Some(name) if !name.is_empty() && map.contains_key(name) => name.to_string(),
+        Some(name) if map.contains_key(name) => name.to_string(),
         _ => personal_name.to_string(),
     }
 }
 
 /// Load the full workspace map during boot and resolve the selected
-/// workspace from the DB (`users.selected_workspace` for the impersonated
-/// user — the single source of truth) via the admin-aware
+/// workspace from the DB (`users.selected_workspace` for the admin — the
+/// single source of truth) via the admin-aware
 /// [`crate::users::resolve_selected_workspace_name`] primitive. Degrades to
-/// the "Personal" default (`personal:{user}`) when no user is selected, the
-/// stored value is NULL/personal, the read fails, or the stored workspace is
-/// missing from the map (the boot path must complete). Because membership is
-/// admin-only, a non-admin's shared selection is clamped to their personal
-/// workspace by the primitive before this resolver ever sees it.
+/// the "Personal" default (`personal:admin`) when the stored value is
+/// NULL/personal, the read fails, or the stored workspace is missing from the
+/// map (the boot path must complete).
 ///
 /// The read result travels to [`Dashboard::apply_boot_workspaces`] as-is: a
 /// failed boot read still completes with an empty map, but the failure is
@@ -3420,17 +3217,11 @@ fn resolve_workspace_selection(
 ///
 /// `generation` is captured when the read is dispatched and travels back with
 /// it, so a reload that answered meanwhile supersedes this read.
-async fn load_workspace_options(user: Option<String>, generation: u64) -> Message {
-    let prev = match user.as_deref() {
-        Some(user) => crate::users::resolve_selected_workspace_name(user).await,
-        None => None,
-    };
-    // The personal default is the impersonated user's `personal:{user}` name
-    // (empty when no user is selected — no personal workspace exists yet).
-    let personal_name = user
-        .as_deref()
-        .map(crate::users::personal_workspace_name)
-        .unwrap_or_default();
+async fn load_workspace_options(generation: u64) -> Message {
+    let user = crate::users::ADMIN_USER_NAME;
+    let prev = crate::users::resolve_selected_workspace_name(user).await;
+    // The personal default is the admin's `personal:{user}` name.
+    let personal_name = crate::users::personal_workspace_name(user);
     let (workspaces, restored) = match read_workspace_map().await {
         Ok(map) => {
             let restored = resolve_workspace_selection(&map, prev.as_deref(), &personal_name);
@@ -3534,7 +3325,10 @@ mod tests {
             ("ws3".to_string(), ws("ws3")),
         ]);
         let _ = dash.update(reloaded(new_map));
-        assert_eq!(dash.selected_workspace_name, None);
+        assert_eq!(
+            dash.selected_workspace_name.as_deref(),
+            Some("personal:admin")
+        );
         assert!(dash.workspaces.contains_key("ws1"));
         assert!(dash.workspaces.contains_key("ws3"));
         assert!(!dash.workspaces.contains_key("ws2"));
@@ -3565,13 +3359,12 @@ mod tests {
     /// The boot race: the map read during boot is dropped as stale while the
     /// restored selection is applied, so the selection is resolved against an
     /// empty map. The workspace-scoped surfaces must stay empty — never the
-    /// impersonated user's Personal workspace — and must come back by
+    /// admin's Personal workspace — and must come back by
     /// themselves once the map arrives, with the selected NAME unchanged
     /// throughout.
     #[test]
     fn boot_without_the_workspace_map_pushes_nothing_then_recovers() {
         let mut dash = ready_dashboard();
-        dash.selected_user_name = Some("alice".to_string());
 
         let _ = dash.apply_boot_workspaces(Ok(HashMap::new()), "ws1", 0);
 
@@ -3602,7 +3395,6 @@ mod tests {
     #[test]
     fn only_a_registered_workspace_with_a_path_resolves() {
         let mut dash = ready_dashboard();
-        dash.selected_user_name = Some("alice".to_string());
         dash.workspaces = HashMap::from([
             ("ws1".to_string(), ws("ws1")),
             (
@@ -3614,7 +3406,7 @@ mod tests {
             ),
         ]);
 
-        dash.selected_workspace_name = Some("personal:alice".to_string());
+        dash.selected_workspace_name = Some("personal:admin".to_string());
         assert_eq!(dash.resolved_workspace(), None);
         dash.selected_workspace_name = Some("gone".to_string());
         assert_eq!(dash.resolved_workspace(), None);
@@ -3637,14 +3429,13 @@ mod tests {
     #[test]
     fn unresolved_selection_hides_the_workspace_scoped_surfaces() {
         let mut dash = ready_dashboard();
-        dash.selected_user_name = Some("alice".to_string());
         dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
 
         let _ = dash.apply_workspace_selection("ws1");
         assert!(dash.render_git_block().is_some());
 
-        // A personal selection never resolves, however it arose.
-        let _ = dash.apply_workspace_selection("personal:alice");
+        // A personal selection never resolves.
+        let _ = dash.apply_workspace_selection("personal:admin");
         assert!(!dash.page_available(Page::Editor));
         assert!(!dash.page_available(Page::Shell));
         assert!(
@@ -3678,7 +3469,7 @@ mod tests {
         let _ = dash.open_diff_modal(None);
         assert!(dash.show_diff_modal);
 
-        let _ = dash.apply_workspace_selection("personal:alice");
+        let _ = dash.apply_workspace_selection("personal:admin");
 
         assert!(!dash.show_diff_modal);
         assert_eq!(dash.resolved_workspace(), None);
@@ -3738,10 +3529,6 @@ mod tests {
             resolve_workspace_selection(&map, Some("gone"), personal),
             personal
         );
-        assert_eq!(
-            resolve_workspace_selection(&map, Some(""), personal),
-            personal
-        );
         assert_eq!(resolve_workspace_selection(&map, None, personal), personal);
     }
 
@@ -3752,9 +3539,7 @@ mod tests {
             ("beta".to_string(), ws("beta")),
             ("alpha".to_string(), ws("alpha")),
         ]);
-        // Admin active (shared membership): the shared workspace list appears.
-        dash.selected_user_is_admin = true;
-        let _ = dash.update(reloaded(map.clone()));
+        let _ = dash.update(reloaded(map));
 
         // Settings workspace list = map values sorted by name.
         let ws_names: Vec<&str> = dash
@@ -3765,11 +3550,6 @@ mod tests {
             .map(|w| w.name.as_str())
             .collect();
         assert_eq!(ws_names, vec!["alpha", "beta"]);
-
-        // Non-admin active (fail-closed): the shared workspace list is emptied.
-        dash.selected_user_is_admin = false;
-        let _ = dash.update(reloaded(map));
-        assert!(dash.settings_state.workspaces_state.workspaces.is_empty());
     }
 
     /// A failed workspace-map read is a persistent, visible state: the current
@@ -3778,7 +3558,6 @@ mod tests {
     #[test]
     fn workspaces_reload_failure_sets_and_clears_error() {
         let mut dash = ready_dashboard();
-        dash.selected_user_is_admin = true;
         dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
 
         let _ = dash.update(reload_failed("db down"));
@@ -3806,7 +3585,8 @@ mod tests {
     fn boot_workspace_read_failure_completes_with_error_state() {
         let mut dash = Dashboard::loading();
 
-        let _ = dash.apply_boot_workspaces(Err("boot read failed".to_string()), "", 0);
+        let _ =
+            dash.apply_boot_workspaces(Err("boot read failed".to_string()), "personal:admin", 0);
 
         assert_eq!(dash.workspaces_error.as_deref(), Some("boot read failed"));
         assert!(dash.workspaces.is_empty());
@@ -3827,8 +3607,11 @@ mod tests {
         dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
         dash.workspaces_reload_gen = read_generation + 1; // a reload answered
 
-        let _ =
-            dash.apply_boot_workspaces(Err("boot read failed".to_string()), "", read_generation);
+        let _ = dash.apply_boot_workspaces(
+            Err("boot read failed".to_string()),
+            "personal:admin",
+            read_generation,
+        );
 
         assert!(
             dash.workspaces_error.is_none(),
@@ -3840,13 +3623,11 @@ mod tests {
         );
     }
 
-    /// The DB-sourced boot resolution: an admin (permissions='full') with a
-    /// shared stored workspace present in the map restores it; non-admins
-    /// (permissions NULL) with shared, personal, stale, and NULL stored values
-    /// (and no user at all) all resolve to the "Personal" default — a shared
-    /// stored value is clamped to the user's personal workspace because
-    /// membership is admin-only.
+    /// The DB-sourced boot resolution: the seeded admin with a shared stored
+    /// workspace present in the map restores it; a stored value missing from
+    /// the map falls back to the "Personal" default.
     #[tokio::test]
+    #[serial_test::serial(gui_admin_workspace)] // both mutation sites write the shared seeded admin row
     async fn boot_workspace_options_resolve_from_db() {
         crate::util::test::init_test_stores().await;
         crate::workspace::store()
@@ -3859,68 +3640,42 @@ mod tests {
             )
             .await
             .expect("seed workspace");
-        for (name, permissions, selected) in [
-            ("boot_admin_gui", Some("full"), Some("boot_ws_gui")),
-            ("boot_alice_gui", None, Some("boot_ws_gui")),
-            ("boot_bob_gui", None, Some("personal:bob_gui")),
-            ("boot_carol_gui", None, Some("gone_ws_gui")),
-            ("boot_dave_gui", None, None),
-        ] {
+
+        let set_admin_workspace = async |selected: Option<&str>| {
             crate::users::store()
                 .conn
                 .execute(
-                    "INSERT OR IGNORE INTO users (name, permissions, selected_workspace) \
-                     VALUES (?1, ?2, ?3)",
-                    crate::db::params![name, permissions, selected],
+                    "UPDATE users SET selected_workspace = ?1 WHERE name = ?2",
+                    crate::db::params![selected, crate::users::ADMIN_USER_NAME],
                 )
                 .await
-                .expect("seed user");
-        }
+                .expect("update admin selected_workspace");
+        };
+        let previous = crate::users::get_raw_selected_workspace(crate::users::ADMIN_USER_NAME)
+            .await
+            .expect("read admin selected_workspace");
 
-        // Admin with a shared stored workspace present in the map → restored.
+        // A shared stored workspace present in the map → restored.
+        set_admin_workspace(Some("boot_ws_gui")).await;
         let Message::BootWorkspaces {
             workspaces: Ok(map),
             restored_name,
             ..
-        } = load_workspace_options(Some("boot_admin_gui".to_string()), 0).await
+        } = load_workspace_options(0).await
         else {
             panic!("expected BootWorkspaces with a loaded map");
         };
         assert!(map.contains_key("boot_ws_gui"));
         assert_eq!(restored_name, "boot_ws_gui");
 
-        for (user, why, expected) in [
-            (
-                Some("boot_alice_gui".to_string()),
-                "non-admin with a shared stored value — clamped",
-                "personal:boot_alice_gui",
-            ),
-            (
-                Some("boot_bob_gui".to_string()),
-                "personal stored value",
-                "personal:boot_bob_gui",
-            ),
-            (
-                Some("boot_carol_gui".to_string()),
-                "stored value missing from the map",
-                "personal:boot_carol_gui",
-            ),
-            (
-                Some("boot_dave_gui".to_string()),
-                "NULL stored value",
-                "personal:boot_dave_gui",
-            ),
-            (None, "no user selected", ""),
-        ] {
-            let Message::BootWorkspaces { restored_name, .. } =
-                load_workspace_options(user, 0).await
-            else {
-                panic!("expected BootWorkspaces");
-            };
-            assert_eq!(
-                restored_name, expected,
-                "{why} must resolve to the Personal default"
-            );
-        }
+        // A stored value missing from the map → the Personal default.
+        set_admin_workspace(Some("gone_ws_gui")).await;
+        let Message::BootWorkspaces { restored_name, .. } = load_workspace_options(0).await else {
+            panic!("expected BootWorkspaces");
+        };
+        assert_eq!(restored_name, "personal:admin");
+
+        // Leave the shared seeded admin row as it was found.
+        set_admin_workspace(previous.as_deref()).await;
     }
 }

@@ -1265,7 +1265,7 @@ pub(crate) fn normalize_user_name<'a>(user_name: &'a str, context: &str) -> &'a 
             context = %context,
             "empty user_name — falling back to seeded 'admin'",
         );
-        "admin"
+        crate::users::ADMIN_USER_NAME
     } else {
         user_name
     }

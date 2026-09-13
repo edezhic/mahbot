@@ -32,6 +32,10 @@ use tracing::warn;
 /// username-less sender as its owner.
 pub(crate) const TELEGRAM_UNKNOWN_SENTINEL: &str = "unknown";
 
+/// The app's own admin account — the single owner identity the desktop GUI
+/// always acts as. Seeded idempotently by [`UserStore::ensure_admin_user`].
+pub(crate) const ADMIN_USER_NAME: &str = "admin";
+
 /// Normalize a Telegram handle for binding: trim surrounding whitespace and
 /// strip one leading `@`, then trim again. Rejects an empty handle and the
 /// reserved `TELEGRAM_UNKNOWN_SENTINEL` (matched case-sensitively — a real
@@ -82,10 +86,10 @@ impl UserStore {
     /// Runs idempotently from both [`crate::db::init_all_stores`] (production,
     /// on the shared consolidated connection) and each isolated user store open.
     pub(crate) async fn ensure_admin_user(&self) -> Result<()> {
-        if !self.user_exists("admin").await? {
+        if !self.user_exists(ADMIN_USER_NAME).await? {
             // Fresh admin: full permissions + selected_role=Assistant (the first
             // pool role).
-            self.add_user("admin", Some("full"), Role::Assistant)
+            self.add_user(ADMIN_USER_NAME, Some("full"), Role::Assistant)
                 .await?;
         }
         Ok(())
@@ -867,8 +871,8 @@ pub(crate) fn enforce_personal_pinning(
 /// generated-media writes) the personal workspace's filesystem path. Other
 /// roles pass through unchanged.
 /// An empty `user_name` disables pinning (no personal identity to pin to),
-/// so callers must pass a resolvable user (the voice admin fallback passes
-/// "admin").
+/// so callers must pass a resolvable user (the voice path passes
+/// [`ADMIN_USER_NAME`]).
 /// Accepted user decision (no migration): media written before pinning to a
 /// project workspace's `uploads/`/`generated/` stays there and is no longer
 /// reachable by Assistant tools (e.g. video_edit path confinement).
