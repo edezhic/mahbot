@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use strum::IntoEnumIterator;
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
@@ -1068,8 +1069,57 @@ async fn resolve_authorized_sender(
     Some((canonical_user, chat_id, reply_target))
 }
 
+/// Parse a Markdown link `[label](url)` starting at byte offset `i`, which must
+/// point at the `[`. Returns the label, the URL, and the offset just past the
+/// closing `)`. `None` when there is no http(s) link here or the label names a
+/// media marker rather than prose (see [`is_marker_label`]).
+fn parse_markdown_link(text: &str, i: usize) -> Option<(&str, &str, usize)> {
+    let after_open = text.get(i..)?.strip_prefix('[')?;
+    let bracket_end = after_open.find(']')?;
+    let label = &after_open[..bracket_end];
+    let after_bracket = i + bracket_end + 2;
+    let after_url_open = text.get(after_bracket..)?.strip_prefix('(')?;
+    let url = &after_url_open[..after_url_open.find(')')?];
+    if !is_http_url(url) || is_marker_label(label) {
+        return None;
+    }
+    Some((label, url, after_bracket + url.len() + 2))
+}
+
+/// True when a bracketed label names a media marker rather than prose: a known
+/// [`MediaMarkerKind`], in any casing (`[FILE:…]`, `[image:…]`).
+///
+/// [`parse_attachment_markers`] keeps an unattachable marker verbatim in the
+/// outgoing text, and such a marker immediately followed by a parenthesised URL
+/// is delivery scaffolding: an anchor labelled with the marker's text would
+/// fabricate a link out of it.
+fn is_marker_label(label: &str) -> bool {
+    let Some((kind, _)) = label.split_once(':') else {
+        return false;
+    };
+    MediaMarkerKind::iter().any(|marker| marker.token().eq_ignore_ascii_case(kind))
+}
+
+/// Prefix of the anchor `render_inline` emits for a markdown link, shared with
+/// the [`render_if_link`] probe so the two cannot drift.
+const ANCHOR_PREFIX: &str = "<a href=\"";
+
+/// Render `text` for Telegram HTML, or `None` when the rendering carries no
+/// link, probed via [`ANCHOR_PREFIX`]. The `Some` arm means an enclosing
+/// formatting span has to give way to the top-level anchor (see
+/// [`markdown_to_telegram_html`]); inline code renders no anchor, so a span that
+/// only wraps code keeps its formatting.
+fn render_if_link(text: &str) -> Option<String> {
+    let rendered = render_inline(text);
+    rendered.contains(ANCHOR_PREFIX).then_some(rendered)
+}
+
 /// If the text at position `i` starts with `delim`, finds the matching closing
-/// `delim`, HTML-escapes the content, and wraps it in `<tag>...</tag>`.
+/// `delim`, renders the content, and wraps it in `<tag>...</tag>`.
+///
+/// With `linkify`, a span whose content renders a link yields to it: the span's
+/// formatting is dropped and its content is rendered by [`render_inline`]
+/// instead (see [`markdown_to_telegram_html`]).
 ///
 /// On success, advances `i` past the closing delimiter and returns `true`.
 /// Returns `false` if `delim` is not found or when the content between
@@ -1082,19 +1132,84 @@ async fn resolve_authorized_sender(
 /// character is the same (e.g. the second `*` of `**` for italic, or the
 /// second `` ` `` of ` `` ` for inline code) must apply that guard before
 /// calling this helper.
-fn try_format_inline(text: &str, i: &mut usize, out: &mut String, delim: &str, tag: &str) -> bool {
+fn try_format_inline(
+    text: &str,
+    i: &mut usize,
+    out: &mut String,
+    delim: &str,
+    tag: &str,
+    linkify: bool,
+) -> bool {
     if text[*i..].starts_with(delim) {
         let content_start = *i + delim.len();
         if let Some(end) = text[content_start..].find(delim)
             && end > 0
         {
-            let inner = escape_html(&text[content_start..content_start + end]);
-            let _ = write!(out, "<{tag}>{inner}</{tag}>");
+            let inner = &text[content_start..content_start + end];
+            if linkify && let Some(rendered) = render_if_link(inner) {
+                out.push_str(&rendered);
+            } else {
+                let _ = write!(out, "<{tag}>{}</{tag}>", escape_html(inner));
+            }
             *i += delim.len() * 2 + end;
             return true;
         }
     }
     false
+}
+
+/// Render one line of Markdown as Telegram HTML: bold (`**`, `__`), italic
+/// (`*`), inline code (`` ` ``), strikethrough (`~~`), and links (`[text](url)`).
+fn render_inline(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // Bold: **text**
+        if try_format_inline(text, &mut i, &mut out, "**", "b", true) {
+            continue;
+        }
+        // Bold: __text__
+        if try_format_inline(text, &mut i, &mut out, "__", "b", true) {
+            continue;
+        }
+        // Italic: *text* — guard against matching second `*` of `**`
+        if (i == 0 || bytes[i - 1] != b'*')
+            && try_format_inline(text, &mut i, &mut out, "*", "i", true)
+        {
+            continue;
+        }
+        // Inline code: `code` — guard against matching second `` ` `` of ` `` `
+        // and never linkify: a URL inside code is code, not a link.
+        if (i == 0 || bytes[i - 1] != b'`')
+            && try_format_inline(text, &mut i, &mut out, "`", "code", false)
+        {
+            continue;
+        }
+        // Markdown link: [text](url)
+        if bytes[i] == b'['
+            && let Some((label, url, next)) = parse_markdown_link(text, i)
+        {
+            let _ = write!(
+                out,
+                "{ANCHOR_PREFIX}{}\">{}</a>",
+                escape_html(url),
+                escape_html(label)
+            );
+            i = next;
+            continue;
+        }
+        // Strikethrough: ~~text~~
+        if try_format_inline(text, &mut i, &mut out, "~~", "s", true) {
+            continue;
+        }
+        // Default: escape HTML entities
+        let ch = text[i..].chars().next().unwrap();
+        push_escaped(ch, &mut out);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// Convert a subset of Markdown to Telegram's HTML parse_mode format.
@@ -1103,6 +1218,11 @@ fn try_format_inline(text: &str, i: &mut usize, out: &mut String, delim: &str, t
 /// Supported: headers (`# …`, `## …`), bold (`**…**`, `__…__`), italic (`*…*`),
 /// inline code (`` `…` ``), links (`[…](url)`), strikethrough (`~~…~~`),
 /// fenced code blocks (` ``` … ``` `), and `<blockquote>` pass-through.
+///
+/// A formatting span (including a heading) whose content renders a link drops
+/// its formatting and emits the anchor at the top level instead of nesting it:
+/// the anchor is what carries clickability, not the span. Code content is never
+/// linkified.
 ///
 /// Code block fences are detected first so inline formatting inside them is
 /// never interpreted (single-pass with code-block tracking).
@@ -1144,68 +1264,23 @@ fn markdown_to_telegram_html(text: &str) -> String {
         let stripped = line.trim_start_matches('#');
         let header_level = line.len() - stripped.len();
         if header_level > 0 && stripped.starts_with(' ') {
-            let title = escape_html(stripped.trim());
-            let _ = writeln!(out, "<b>{title}</b>");
+            let title = stripped.trim();
+            // A heading is a formatting span too: it yields to a link in its
+            // content, which would otherwise be delivered as literal text.
+            match render_if_link(title) {
+                Some(rendered) => {
+                    let _ = writeln!(out, "{rendered}");
+                }
+                None => {
+                    let _ = writeln!(out, "<b>{}</b>", escape_html(title));
+                }
+            }
             continue;
         }
 
         // ── Inline formatting per line ────────────────────────
-        let mut line_out = String::new();
-        let bytes = line.as_bytes();
-        let len = bytes.len();
-        let mut i = 0;
-        while i < len {
-            // Bold: **text**
-            if try_format_inline(line, &mut i, &mut line_out, "**", "b") {
-                continue;
-            }
-            // Bold: __text__
-            if try_format_inline(line, &mut i, &mut line_out, "__", "b") {
-                continue;
-            }
-            // Italic: *text* — guard against matching second `*` of `**`
-            if (i == 0 || bytes[i - 1] != b'*')
-                && try_format_inline(line, &mut i, &mut line_out, "*", "i")
-            {
-                continue;
-            }
-            // Inline code: `code` — guard against matching second `` ` `` of ` `` `
-            if (i == 0 || bytes[i - 1] != b'`')
-                && try_format_inline(line, &mut i, &mut line_out, "`", "code")
-            {
-                continue;
-            }
-            // Markdown link: [text](url)
-            if bytes[i] == b'['
-                && let Some(bracket_end) = line[i + 1..].find(']')
-            {
-                let text_part = &line[i + 1..i + 1 + bracket_end];
-                let after_bracket = i + 1 + bracket_end + 1;
-                if after_bracket < len
-                    && bytes[after_bracket] == b'('
-                    && let Some(paren_end) = line[after_bracket + 1..].find(')')
-                {
-                    let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
-                    if is_http_url(url) {
-                        let text_html = escape_html(text_part);
-                        let url_html = escape_html(url);
-                        let _ = write!(line_out, "<a href=\"{url_html}\">{text_html}</a>");
-                        i = after_bracket + 1 + paren_end + 1;
-                        continue;
-                    }
-                }
-            }
-            // Strikethrough: ~~text~~
-            if try_format_inline(line, &mut i, &mut line_out, "~~", "s") {
-                continue;
-            }
-            // Default: escape HTML entities
-            let ch = line[i..].chars().next().unwrap();
-            push_escaped(ch, &mut line_out);
-            i += ch.len_utf8();
-        }
-        line_out.push('\n');
-        out.push_str(&line_out);
+        out.push_str(&render_inline(line));
+        out.push('\n');
     }
 
     // Unclosed code block at EOF — emit what we have.
@@ -2001,6 +2076,10 @@ impl TelegramChannel {
         if let Some(markup) = reply_markup {
             body["reply_markup"] = markup;
         }
+        // Telegram attaches a web-page preview to the first URL unless the send
+        // disables it: Bot API 7.0 replaced `disable_web_page_preview` with
+        // `link_preview_options`, whose object form requires `is_disabled`.
+        body["link_preview_options"] = serde_json::json!({ "is_disabled": true });
 
         let resp = self
             .post_telegram_json("sendMessage", body, "sendMessage error")

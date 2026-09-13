@@ -156,6 +156,10 @@ fn test_markdown_to_telegram_html() {
     // Tag with trailing space inside: <blockquote > should NOT pass through
     let r = markdown_to_telegram_html("<blockquote >");
     assert_eq!(r, "&lt;blockquote &gt;");
+
+    // A heading with a link drops its bold so the link stays clickable.
+    let r = markdown_to_telegram_html("## [docs](https://example.com)");
+    assert_eq!(r, "<a href=\"https://example.com\">docs</a>");
 }
 
 /// The `/board` listing formats each ticket via [`format_board_line`] and
@@ -212,6 +216,7 @@ fn board_listing_isolates_hostile_titles() {
 // ── Inline formatting tests ──────────────────────────────────────
 
 #[test]
+#[expect(clippy::too_many_lines)] // one cohesive table of inline-formatting cases
 fn test_inline_formatting() {
     struct Case {
         name: &'static str,
@@ -301,6 +306,54 @@ fn test_inline_formatting() {
             name: "bold and italic overlap",
             input: "***bold**",
             expected: "<b>*bold</b>",
+        },
+        // A formatting span whose content holds a markdown link drops its
+        // formatting — the anchor is emitted at the top level, not nested.
+        Case {
+            name: "bold span with link",
+            input: "**see [docs](https://example.com) now**",
+            expected: "see <a href=\"https://example.com\">docs</a> now",
+        },
+        Case {
+            name: "italic and strikethrough spans with link",
+            input: "*[a](https://a.example)* and ~~[b](https://b.example)~~",
+            expected: "<a href=\"https://a.example\">a</a> and <a href=\"https://b.example\">b</a>",
+        },
+        Case {
+            name: "nested spans with link",
+            input: "**bold *inner [docs](https://example.com)* tail**",
+            expected: "bold inner <a href=\"https://example.com\">docs</a> tail",
+        },
+        // No link in the span, so the formatting stays.
+        Case {
+            name: "bold span without link",
+            input: "**hello [not a link]**",
+            expected: "<b>hello [not a link]</b>",
+        },
+        // Link syntax in code renders no anchor, so the bold around it stays
+        // (span content is never re-parsed for formatting without a link).
+        Case {
+            name: "bold span around code with link syntax",
+            input: "**bold `[docs](https://example.com)` tail**",
+            expected: "<b>bold `[docs](https://example.com)` tail</b>",
+        },
+        // An unattachable media marker is kept verbatim in the outgoing text:
+        // followed by a parenthesised URL it is scaffolding, not a link label.
+        Case {
+            name: "marker label is not a link",
+            input: "[IMAGE:data:image/png;base64,AAAA](https://example.com)",
+            expected: "[IMAGE:data:image/png;base64,AAAA](https://example.com)",
+        },
+        Case {
+            name: "lowercase marker label is not a link",
+            input: "[image:/tmp/x.txt](https://example.com)",
+            expected: "[image:/tmp/x.txt](https://example.com)",
+        },
+        // Any other bracketed word is prose, however it is spelled.
+        Case {
+            name: "uppercase prose label stays a link",
+            input: "[NOTE:42](https://example.com)",
+            expected: "<a href=\"https://example.com\">NOTE:42</a>",
         },
     ];
     for case in cases {
