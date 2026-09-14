@@ -1683,9 +1683,9 @@ mod tests {
     fn injected_image_user_message_does_not_reset_group() {
         let history = vec![
             assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
-            ChatMessage::user(crate::util::injected_image_user_message(
-                "data:image/png;base64,xxx",
-            )),
+            ChatMessage::user(crate::util::injected_image_user_message(&[
+                "data:image/png;base64,xxx".to_string(),
+            ])),
             assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
         ];
         let groups = derive_trace_groups(&build_ledger(&history));
@@ -1823,9 +1823,9 @@ mod tests {
     fn injected_image_and_empty_user_do_not_start_a_turn() {
         let history = vec![
             assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
-            ChatMessage::user(crate::util::injected_image_user_message(
-                "data:image/png;base64,xxx",
-            )),
+            ChatMessage::user(crate::util::injected_image_user_message(&[
+                "data:image/png;base64,xxx".to_string(),
+            ])),
             ChatMessage::user(""),
             assistant_tool_call("", &[("edit", serde_json::json!({"path": "b.rs"}))]),
         ];

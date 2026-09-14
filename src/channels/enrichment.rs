@@ -34,7 +34,7 @@
 //! while image compression is role-dependent.
 
 use crate::ChannelMessage;
-use crate::channels::document::{DocOutcome, INLINE_TEXT_MAX_CHARS, convert_document};
+use crate::document::{DocOutcome, INLINE_TEXT_MAX_CHARS, convert_document_file};
 use crate::tools::chrome::ChromeTool;
 use crate::util::media_target::{self, MediaTarget};
 use crate::util::{
@@ -62,14 +62,6 @@ static LINK_ENRICHER_SEQ: AtomicU64 = AtomicU64::new(0);
 /// the transcription-failure fallback and as the annotation for out-of-scope
 /// `[AUDIO:...]` markers that must never be read or deleted.
 const AUDIO_ICON: &str = "🔊✍️";
-
-/// Reason reported for an inbound attachment whose bytes could not be read or
-/// whose conversion panicked.
-const UNREADABLE_REASON: &str = "could not be read";
-/// Bound on concurrently converting inbound documents: each conversion holds the
-/// whole attachment plus its decoded rasters, and every message runs on its own
-/// task, so a burst would otherwise multiply peak memory.
-static DOCUMENT_CONVERSIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 /// Transcribe an audio file referenced by a `[AUDIO:...]` marker and return
 /// the content to embed in the message: the audio-transcription icon combo
@@ -587,7 +579,11 @@ async fn handle_file(
         None => format!("[File {name}: received, not saved to the workspace]"),
     };
 
-    match convert_inbound(path_obj, name).await {
+    // Extracted pages go into the attachment's own per-message directory, so
+    // they stay inside the directory the inbound IMAGE containment accepts.
+    // A file (checked above) always has a parent directory.
+    let out_dir = path_obj.parent().unwrap_or(path_obj);
+    match convert_document_file(path_obj, name, out_dir).await {
         DocOutcome::Text {
             text,
             images,
@@ -692,47 +688,6 @@ async fn create_unique_upload(
     }
 }
 
-/// Convert an inbound attachment into text and images, off the async worker.
-///
-/// `pdf-extract` panics on malformed input, so the conversion runs on a
-/// blocking thread and its panic is contained at that boundary: a
-/// [`tokio::task::JoinError`] degrades to an unreadable document instead of
-/// taking down the enrichment (and the user's message) with it. `out_dir` is
-/// the attachment's own per-message directory, so extracted pages stay inside
-/// the directory the inbound IMAGE containment accepts.
-async fn convert_inbound(path_obj: &std::path::Path, file_name: &str) -> DocOutcome {
-    // Held across the read and the conversion, covering the attachment bytes and
-    // the conversion's rasters (encoding the extracted pages into data URIs
-    // happens later, outside this bound). The semaphore is never closed, so
-    // acquisition cannot fail.
-    let _permit = DOCUMENT_CONVERSIONS.acquire().await;
-    let bytes = match tokio::fs::read(path_obj).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(
-                path = %path_obj.display(),
-                error = %e,
-                "Failed to read the inbound attachment"
-            );
-            return DocOutcome::Unreadable {
-                reason: UNREADABLE_REASON.to_string(),
-            };
-        }
-    };
-    // A file (checked by the caller) always has a parent directory.
-    let out_dir = path_obj.parent().unwrap_or(path_obj).to_path_buf();
-    let name = file_name.to_string();
-    match tokio::task::spawn_blocking(move || convert_document(&bytes, &name, &out_dir)).await {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            tracing::warn!(error = %e, "Document conversion failed");
-            DocOutcome::Unreadable {
-                reason: UNREADABLE_REASON.to_string(),
-            }
-        }
-    }
-}
-
 /// Annotation block for a document's extracted text.
 ///
 /// Short text is inlined; longer text is spilled to
@@ -748,9 +703,9 @@ async fn extracted_text_annotation(
     let text = text.trim();
     if text.is_empty() {
         return if has_images {
-            format!("[File {name}: no text could be extracted — the pages were provided as images]")
+            format!("[File {name}: {}]", crate::document::NO_TEXT_LAYER_NOTE)
         } else {
-            format!("[File {name}: no text could be extracted]")
+            format!("[File {name}: {}]", crate::document::NO_TEXT_NOTE)
         };
     }
     let char_count = text.chars().count();
@@ -787,8 +742,8 @@ async fn extracted_text_annotation(
         }
     };
     format!(
-        "[File {name}: the extracted text is too long to inline ({char_count} characters); the full text was saved to {} — read that file.]",
-        spill.display()
+        "[File {name}: {}]",
+        crate::document::spilled_text_note(char_count, &spill)
     )
 }
 

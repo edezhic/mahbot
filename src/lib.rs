@@ -21,6 +21,7 @@ pub mod config;
 pub mod config_db;
 pub(crate) mod consensus;
 pub mod db;
+pub(crate) mod document;
 pub(crate) mod embedder;
 pub(crate) mod git;
 pub mod gui;
@@ -1168,9 +1169,14 @@ pub(crate) trait Tool: Send + Sync {
     /// Whether this tool has side effects that would conflict with parallel
     /// execution of other tools.
     ///
-    /// Returns `true` by default (conservative — assume mutating). Override to
-    /// `false` for read-only tools (read, search, web_search, etc.) so they can
-    /// be grouped for parallel execution within a single LLM turn.
+    /// Returns `true` by default (conservative — assume mutating). Return
+    /// `false` only when a sibling running at the same time can neither change
+    /// what this call observes nor target what it writes: inspection tools (read,
+    /// search, web_search, ...) qualify, even when they write artifacts of their
+    /// own while reading (a shell spill, the read tool's converted-document
+    /// files) — each goes to a path unique to the call, so no sibling conflicts
+    /// with it. `false` groups the tool for parallel execution within a single
+    /// LLM turn.
     fn side_effects(&self) -> bool {
         true
     }
@@ -1243,16 +1249,18 @@ pub(crate) trait Tool: Send + Sync {
         }
     }
 
-    /// Build an optional per-call image payload to be injected as a synthetic
-    /// User-role message after this tool's result block, so a vision-capable
-    /// model can see an on-disk image as a native image part.
+    /// Build the image payload to be injected as a synthetic User-role message
+    /// after this tool's result block, so a vision-capable model can see an
+    /// on-disk image as a native image part.
     ///
-    /// Default `None` — most tools produce no image. The read tool overrides
-    /// this to re-encode a raster (PNG/JPEG/WebP) file into a bounded JPEG
-    /// data-URI. It is the single decoder for native images — `execute` only
-    /// cheap-sniffs magic bytes, so the decode happens here, once, guarded by
-    /// a robust file-magic check rather than the annotation wording. Safety:
-    /// the path must obey the same workspace-boundary validation as
+    /// Default `None` — most tools produce no image. Overridden by the read tool
+    /// (a raster read) and by chrome and computer (screenshots), each re-encoding
+    /// an on-disk raster (PNG/JPEG/WebP) into a bounded JPEG data-URI. For the
+    /// read tool this is the only decode of a NATIVE image file: `execute` only
+    /// cheap-sniffs magic bytes, so the decode happens here, once, guarded by a
+    /// robust file-magic check rather than by the annotation wording. A converted
+    /// document's rasters are not this path — they are decoded as it produces
+    /// them. Safety: the path must obey the same workspace-boundary validation as
     /// [`Tool::execute`] — an arbitrary `[IMAGE:/path]` reference embedded in
     /// model text is never resolved here.
     async fn image_payload(
@@ -1261,6 +1269,22 @@ pub(crate) trait Tool: Send + Sync {
         _args: &serde_json::Value,
     ) -> Option<crate::tools::ImagePayload> {
         None
+    }
+
+    /// Execute this tool and return its text together with any images it
+    /// produced — the agent loop's single entry point for a tool call.
+    ///
+    /// The default runs [`Tool::execute`] and then pairs the text with
+    /// [`Tool::image_payload`] (see [`crate::tools::with_image_payload`]). A tool
+    /// whose images are a by-product of its own execution overrides this, so one
+    /// execution yields both.
+    async fn execute_with_payloads(
+        &self,
+        ws: &crate::Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<crate::tools::ToolOutput> {
+        let text = self.execute(ws, args.clone()).await?;
+        Ok(crate::tools::with_image_payload(self, text, ws, &args).await)
     }
 }
 

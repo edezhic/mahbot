@@ -201,12 +201,24 @@ mod data_uri_strip_tests {
 /// path so a stripped message reads cleanly.
 pub(crate) const INJECTED_IMAGE_TAG: &str = "<injected-tool-result-image>";
 
-/// Compose the synthetic User-role message carrying a tool-injected image: the
-/// provenance tag followed by the `[IMAGE:{data_uri}]` marker the provider layer
-/// turns into a native image part.
+/// Compose the synthetic User-role message carrying the images one tool round
+/// injected: the provenance tag followed by one `[IMAGE:{data_uri}]` marker per
+/// image.
+///
+/// One message per round, not per image: the provider-input-image strip rewrites
+/// only the most recent User-role message, so batching keeps every image of the
+/// round clearable when the provider rejects one of them — deliberately
+/// including images the provider did not object to, since the request carrying
+/// them is the one that failed.
 #[must_use]
-pub(crate) fn injected_image_user_message(data_uri: &str) -> String {
-    format!("{INJECTED_IMAGE_TAG}\n[IMAGE:{data_uri}]")
+pub(crate) fn injected_image_user_message(data_uris: &[String]) -> String {
+    let mut message = String::from(INJECTED_IMAGE_TAG);
+    for data_uri in data_uris {
+        message.push_str("\n[IMAGE:");
+        message.push_str(data_uri);
+        message.push(']');
+    }
+    message
 }
 
 /// Truncate a string to `max_chars` Unicode characters, appending "…" if truncated.

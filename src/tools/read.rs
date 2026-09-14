@@ -102,7 +102,8 @@ enum SniffedImage {
 /// (SVG, text, arbitrary binary) so those keep the text/lossy path. Only
 /// PNG/JPEG/WebP are treatable as native; any other recognised format (GIF,
 /// BMP, ...) is reported as unsupported. No decode is performed here — the
-/// decode is deferred to [`ReadTool::image_payload`], the single decoder.
+/// decode is deferred to [`ReadTool::image_payload`], the only decoder of a
+/// native image file.
 #[must_use]
 fn sniff_read_image(bytes: &[u8]) -> Option<SniffedImage> {
     let format = image::guess_format(bytes).ok()?;
@@ -177,10 +178,8 @@ fn sniff_guard(resolved_path: &Path, bytes: &[u8]) -> Option<String> {
 }
 
 /// Candidate paths for a literal `path` that `resolve_read_target` could not
-/// resolve (a typo/missing path). Queried by filename, as
-/// [`recover_missing_path`] does. This is the
-/// single recovery-search source shared by the read-annotation path and
-/// `image_payload`'s resolve path, so the two can never drift apart.
+/// resolve (a typo/missing path), queried by filename. Its only caller is
+/// [`resolve_content_read`].
 async fn find_recovery_candidates(ws: &Workspace, path: &str) -> Vec<String> {
     let hint = std::path::Path::new(path)
         .file_name()
@@ -202,41 +201,73 @@ fn recovery_note(path: &str, recovered: &str) -> String {
 
 /// Outcome of resolving a content-read `path`: the canonical path to read, plus
 /// the recovery note when the literal path was recovered to a unique match.
-struct ResolvedRead {
-    path: PathBuf,
-    recovery_note: Option<String>,
+pub(super) struct ResolvedRead {
+    pub(super) path: PathBuf,
+    pub(super) recovery_note: Option<String>,
 }
 
-/// Resolve a content-read `path` to a readable file path, mirroring the
-/// recovery that `execute` applies via `recover_missing_path`: if the literal
-/// path does not exist (and only then), a single high-confidence filename match
-/// is used so a recovered raster can still be attached by `image_payload`
-/// (which receives the original, possibly typo'd, `path`). Returns `None` when
-/// the path is missing and no unique match exists, and when it does not resolve
-/// at all.
-async fn resolve_for_read(ws: &Workspace, path: &str, strict: bool) -> Option<ResolvedRead> {
+/// Resolve a content-read `path` to a file the read should open — the one
+/// resolution every content read goes through, whatever it ends up doing with
+/// the file. When the literal path does not exist (and only then) a single
+/// high-confidence filename match is recovered, so a typo'd raster is still
+/// attached by `image_payload` and a typo'd document is still converted by
+/// [`super::read_document::read_document`]; both receive the original `path`,
+/// hence the note travelling with the result.
+///
+/// The error is the one `execute` shows: the resolution failure, with the
+/// `Did you mean:` candidates appended when the search found several.
+pub(super) async fn resolve_content_read(
+    ws: &Workspace,
+    path: &str,
+    strict: bool,
+) -> anyhow::Result<ResolvedRead> {
     match super::path::resolve_read_target(ws.as_path(), path, strict).await {
-        Ok(resolved) => {
-            return Some(ResolvedRead {
-                path: resolved,
-                recovery_note: None,
-            });
+        Ok(resolved) => Ok(ResolvedRead {
+            path: resolved,
+            recovery_note: None,
+        }),
+        Err(e) if !e.to_string().contains("File not found") => Err(e),
+        Err(e) => {
+            let matches = find_recovery_candidates(ws, path).await;
+            match matches.len() {
+                1 => {
+                    let recovered = &matches[0];
+                    let resolved =
+                        super::path::resolve_read_target(ws.as_path(), recovered, strict).await?;
+                    Ok(ResolvedRead {
+                        path: resolved,
+                        recovery_note: Some(recovery_note(path, recovered)),
+                    })
+                }
+                0 => Err(e),
+                _ => Err(anyhow::anyhow!(
+                    "{e}\nDid you mean:\n  {}",
+                    matches.join("\n  ")
+                )),
+            }
         }
-        Err(e) if !e.to_string().contains("File not found") => return None,
-        Err(_) => {}
     }
-    let matches = find_recovery_candidates(ws, path).await;
-    if matches.len() != 1 {
-        return None;
+}
+
+/// The reader a read's `mode` argument selects — the one classification the
+/// content gates, [`read_resolved`]'s dispatch and the advertised enum all refer
+/// to, so none of them can disagree about the same call.
+#[derive(PartialEq, Eq)]
+enum ReadMode {
+    Content,
+    Symbols,
+    Zoom,
+}
+
+/// Classify `args`'s `mode`: the default, and anything that is not one of the two
+/// modes with a reader of their own, is a content read.
+#[must_use]
+fn read_mode(args: &serde_json::Value) -> ReadMode {
+    match super::get_opt_str(args, "mode") {
+        Some("symbols") => ReadMode::Symbols,
+        Some("zoom") => ReadMode::Zoom,
+        _ => ReadMode::Content,
     }
-    let recovered = &matches[0];
-    let resolved = super::path::resolve_read_target(ws.as_path(), recovered, strict)
-        .await
-        .ok()?;
-    Some(ResolvedRead {
-        path: resolved,
-        recovery_note: Some(recovery_note(path, recovered)),
-    })
 }
 
 /// Build the read tool's parameter schema. `path_desc` describes the path
@@ -252,7 +283,7 @@ fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
             "mode": {
                 "type": "string",
                 "enum": ["content", "symbols", "zoom"],
-                "description": "Read mode. 'content' (default): line-numbered file read — large outputs are truncated to a ~5 KB budget — or, for a raster image (PNG, JPEG, WebP), attaches it to the conversation as a native image rather than reading text. 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name. 'symbols'/'zoom' work for supported code formats only.",
+                "description": "Read mode. 'content' (default): line-numbered file read — large outputs are truncated to a ~5 KB budget — or, for a raster image (PNG, JPEG, WebP), attaches it to the conversation as a native image instead; a PDF or Word document is converted the way an inbound chat attachment is — extracted text, plus text-free pages and embedded images attached as native images; over 5 of them, all are reported as paths instead (or, if that listing would not fit, as the folder holding them). 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name. 'symbols'/'zoom' work for supported code formats only.",
                 "default": "content"
             },
             "symbol": {
@@ -262,13 +293,13 @@ fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
             },
             "offset": {
                 "type": "integer",
-                "description": "Starting line number (1-based, default: 1)",
+                "description": "Starting line number (1-based, default: 1). Not used for a converted document (see 'mode').",
                 "default": 1,
                 "minimum": 1
             },
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of lines to return (default: all)",
+                "description": "Maximum number of lines to return (default: all). Not used for a converted document (see 'mode').",
                 "minimum": 1
             }
         }),
@@ -298,6 +329,9 @@ impl Tool for ReadTool {
         })
     }
 
+    /// The raw-text read. Documents are converted by
+    /// [`Tool::execute_with_payloads`] (their pages need images), so a direct
+    /// `execute` call gets the lossy path — the agent loop always uses the hook.
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         execute_read(ws, args, self.strict).await
     }
@@ -354,6 +388,41 @@ impl Tool for ReadTool {
         crate::util::truncate_tool_output(output)
     }
 
+    /// A document conversion is a by-product of this execution, so the read tool
+    /// overrides the combined hook: one resolution feeds both the document
+    /// decision and the ordinary read, and a document is converted — images
+    /// encoded included — in that single pass.
+    async fn execute_with_payloads(
+        &self,
+        ws: &Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<crate::tools::ToolOutput> {
+        // Only a content read of a literal path can be a document: symbols/zoom
+        // run tree-sitter on source files, and a wildcard path is a listing.
+        // Everything else takes the ordinary read below.
+        if read_mode(&args) == ReadMode::Content
+            && let Ok(path) = super::get_str(&args, "path")
+            && !super::path::contains_glob(path, true)
+        {
+            let res = resolve_content_read(ws, path, self.strict).await?;
+            // A read that is not a document has paid one extra metadata + 16-byte
+            // head read for the sniff; sharing the converter's own detection
+            // (rather than an extension pre-filter that could drift from it) is
+            // what that buys. The raster `image_payload` below still resolves the
+            // path for itself, as it always did.
+            if let Some(out) = super::read_document::read_document(ws, &res, self.strict).await? {
+                return Ok(out);
+            }
+            let text = read_resolved(ws, &res, &args).await?;
+            return Ok(super::with_image_payload(self, text, ws, &args).await);
+        }
+        // The ordinary read, and the payload the default hook pairs with it —
+        // one shared site ([`crate::tools::with_image_payload`]) so an override
+        // that produced its text here cannot drift from the default flow.
+        let text = Tool::execute(self, ws, args.clone()).await?;
+        Ok(super::with_image_payload(self, text, ws, &args).await)
+    }
+
     async fn image_payload(
         &self,
         ws: &Workspace,
@@ -377,7 +446,7 @@ async fn read_image_payload(
     // a 64-byte sniff — but never a full read/decode of the file.
     let path = super::get_str(args, "path").ok()?.to_string();
     // Image behaviour is content-mode only (symbols/zoom run tree-sitter).
-    if super::get_opt_str(args, "mode").unwrap_or("content") != "content" {
+    if read_mode(args) != ReadMode::Content {
         return None;
     }
     if super::path::contains_glob(&path, true) {
@@ -386,7 +455,7 @@ async fn read_image_payload(
     // Resolve the literal path, or — for a typo'd path that `execute`
     // already recovered to a unique match — the recovered path, so a
     // recovered raster is attached rather than only annotated.
-    let res = resolve_for_read(ws, &path, strict).await?;
+    let res = resolve_content_read(ws, &path, strict).await.ok()?;
     if !is_native_image_file(&res.path).await {
         return None;
     }
@@ -405,6 +474,8 @@ async fn read_image_payload(
 }
 
 /// Scrub a file-read's output when the *resolved* file is credential-bearing.
+/// (A converted document scrubs unconditionally instead: this path-based rule
+/// sees only the container's path, never the text extracted from it.)
 ///
 /// Deciding here rather than from `should_scrub_output` is what makes the
 /// tier correct: `resolved_path` is canonical, so it already accounts for
@@ -421,29 +492,30 @@ fn scrub_if_sensitive(resolved_path: &Path, body: String) -> String {
     }
 }
 
-/// Shared tail of [`read_resolved`]: scrub the body when the resolved file is
+/// The tail a read's body goes through: scrub it when the resolved file is
 /// credential-bearing, then prefix the typo-recovery note, if any.
 fn finish_read_body(resolved_path: &Path, body: String, recovery_note: Option<&str>) -> String {
     let body = scrub_if_sensitive(resolved_path, body);
-    match recovery_note {
-        Some(note) => format!("{note}\n{body}"),
-        None => body,
-    }
+    super::with_recovery_note(recovery_note, body)
 }
 
-/// Read a resolved file path (content, symbols, or zoom mode).
+/// Read a resolved file path (content, symbols, or zoom mode) — the shared tail
+/// of a non-document read: [`execute_read`] and the document hook both return
+/// through it for a file the converter did not take, so a step added to one
+/// reaches the other.
 async fn read_resolved(
     ws: &Workspace,
-    resolved_path: &Path,
-    recovery_note: Option<&str>,
+    res: &ResolvedRead,
     args: &serde_json::Value,
 ) -> anyhow::Result<String> {
+    let resolved_path = res.path.as_path();
+    let recovery_note = res.recovery_note.as_deref();
     match tokio::fs::metadata(resolved_path).await {
         Ok(meta) => {
             if meta.is_dir() {
                 return list_directory(resolved_path, ws).await;
             }
-            super::check_file_size(&meta)?;
+            super::check_size_within(&meta, super::MAX_FILE_SIZE_BYTES, "File too large")?;
             // FIFOs are streams, not seekable files — read them with a
             // bounded non-blocking wait so a missing writer cannot hang
             // the tool (see read_fifo). Other modes (symbols/zoom) make no
@@ -472,12 +544,10 @@ async fn read_resolved(
         },
     }
 
-    let mode = super::get_opt_str(args, "mode").unwrap_or("content");
-
-    let body = match mode {
-        "symbols" => execute_symbols(resolved_path).await?,
-        "zoom" => execute_zoom(resolved_path, args).await?,
-        _ => execute_content(resolved_path, args).await?,
+    let body = match read_mode(args) {
+        ReadMode::Symbols => execute_symbols(resolved_path).await?,
+        ReadMode::Zoom => execute_zoom(resolved_path, args).await?,
+        ReadMode::Content => execute_content(resolved_path, args).await?,
     };
 
     Ok(finish_read_body(resolved_path, body, recovery_note))
@@ -504,29 +574,6 @@ async fn recover_wildcard_path(ws: &Workspace, path: &str) -> anyhow::Result<Str
         output.push('\n');
     }
     Ok(output)
-}
-
-/// Missing literal path: suggest matches or auto-read a single high-confidence hit.
-async fn recover_missing_path(
-    ws: &Workspace,
-    path: &str,
-    args: &serde_json::Value,
-    original_err: &str,
-    strict: bool,
-) -> anyhow::Result<String> {
-    let matches = find_recovery_candidates(ws, path).await;
-    if matches.is_empty() {
-        anyhow::bail!("{original_err}");
-    }
-
-    if matches.len() == 1 {
-        let recovered = &matches[0];
-        let resolved = super::path::resolve_read_target(ws.as_path(), recovered, strict).await?;
-        let note = recovery_note(path, recovered);
-        return read_resolved(ws, &resolved, Some(&note), args).await;
-    }
-
-    anyhow::bail!("{original_err}\nDid you mean:\n  {}", matches.join("\n  "))
 }
 
 /// Execute the standard content read mode.
@@ -685,9 +732,10 @@ fn symbol_suggestions(ps: &ParsedSource, query: &Query, wanted: &str) -> Vec<Str
     names
 }
 
-/// Shared entry point for the read tool, workspace-strict or not. `strict`
-/// controls whether [`super::path::resolve_read_target`] permits
-/// `EXTRA_READ_ALLOWED` paths (spill files, dependency caches).
+/// The read tool's raw-text read, reached through `Tool::execute`: a wildcard
+/// listing, or a file the document hook did not take. `strict` controls whether
+/// [`super::path::resolve_read_target`] permits `EXTRA_READ_ALLOWED` paths
+/// (spill files, dependency caches).
 async fn execute_read(
     ws: &Workspace,
     args: serde_json::Value,
@@ -699,18 +747,8 @@ async fn execute_read(
         return recover_wildcard_path(ws, &path).await;
     }
 
-    let resolved_path = match super::path::resolve_read_target(ws.as_path(), &path, strict).await {
-        Ok(p) => p,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("File not found") {
-                return recover_missing_path(ws, &path, &args, &msg, strict).await;
-            }
-            return Err(e);
-        }
-    };
-
-    read_resolved(ws, &resolved_path, None, &args).await
+    let res = resolve_content_read(ws, &path, strict).await?;
+    read_resolved(ws, &res, &args).await
 }
 
 /// Format file contents for content-mode output (line numbering + offset/limit).
@@ -1760,10 +1798,10 @@ mod tests {
         assert!(payload.is_none());
     }
 
-    /// End-to-end pipeline regression: `execute` produces a claim-neutral
-    /// base, then `image_payload` (the single decoder) produces the payload
-    /// that the agent loop would inject — validated without passing the
-    /// annotation wording to the gate.
+    /// End-to-end pipeline regression: `execute` produces the dims-less base
+    /// annotation, then `image_payload` (the only decoder of a native image file)
+    /// produces the payload that the agent loop would inject — validated without
+    /// passing the annotation wording to the gate.
     #[tokio::test]
     async fn execute_then_payload_attaches_native_image() {
         let dir = TempDir::new().unwrap();
@@ -1782,7 +1820,7 @@ mod tests {
         assert!(result.contains("PNG"), "got: {result}");
         assert!(
             !result.contains("attached to the conversation"),
-            "execute output must stay claim-neutral, got: {result}"
+            "execute output must carry no attachment claim, got: {result}"
         );
 
         let payload = tool()
@@ -1796,9 +1834,10 @@ mod tests {
 
     /// Regression: a typo'd image path that `execute` recovers to a unique
     /// match is actually attached by `image_payload` (not just annotated), and
-    /// the payload carries the `[Recovered path: ...]` note. Pins the symmetry
-    /// between `recover_missing_path` and `resolve_for_read` so the recovery
-    /// logic cannot drift back into the 'annotated but not attached' gap.
+    /// the payload carries the `[Recovered path: ...]` note. Pins the fact that
+    /// both go through the one resolution
+    /// ([`resolve_content_read`]) so the recovery logic cannot drift back into
+    /// the 'annotated but not attached' gap.
     #[tokio::test]
     async fn recovered_image_path_is_attached() {
         // The fuzzy search needs the global search-engine registry plus a

@@ -1558,7 +1558,8 @@ pub(crate) fn agent_temp_dir() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// Spill files created during agent runs, keyed by the owning agent id.
+/// Spill paths created during agent runs, keyed by the owning agent id: spill
+/// files plus the read tool's per-call document-conversion directories.
 /// Owner-deletes-at-end: [`cleanup_agent_spills`] removes them when the agent
 /// run ends. Entries for a dead agent id are removed on cleanup; a daemon
 /// crash leaves the files behind for the OS temp sweep and the periodic
@@ -1567,12 +1568,13 @@ static SPILL_OWNERS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<std::path::PathBuf>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Record a spill file under the current tool's owning agent id (set during
-/// agent tool execution). Outside an agent run (diagnostics runner, tests)
-/// the file is recorded under [`crate::agent::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`)
-/// so the diagnostics runner can clean up what it created. Agent ids are always
-/// prefixed (`ticket_*`, `manager_*`, etc.) and never equal bare `"diagnostics"`
-/// so no collision. Tests outside an agent also bucket there (acceptable).
+/// Record a spill path (file or the read tool's conversion directory) under the
+/// current tool's owning agent id (set during agent tool execution). Outside an
+/// agent run (diagnostics runner, tests) it is recorded under
+/// [`crate::agent::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`) so the diagnostics
+/// runner can clean up what it created. Agent ids are always prefixed
+/// (`ticket_*`, `manager_*`, etc.) and never equal bare `"diagnostics"` so no
+/// collision. Tests outside an agent also bucket there (acceptable).
 pub(crate) fn record_spill_owner(path: std::path::PathBuf) {
     let agent = crate::agent::CURRENT_TOOL_AGENT_ID
         .try_with(Clone::clone)
@@ -1589,18 +1591,25 @@ pub(crate) fn record_spill_owner(path: std::path::PathBuf) {
     map.entry(key).or_default().push(path);
 }
 
-/// Delete the spill files recorded for `agent_id` (owner-deletes-at-end).
-/// Also clears the registry entry so a later run of the same agent id starts
-/// fresh. Callers: the agent run end hook (`run_agent`) and the diagnostics
-/// runner (which passes [`crate::agent::role::DIAGNOSTICS_ROLE`]) — the diagnostics
-/// spill owner is [`crate::agent::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`).
+/// Delete the spill paths recorded for `agent_id` (owner-deletes-at-end): a
+/// path that is a directory (the read tool's per-call document-conversion
+/// artifacts) is removed whole with [`std::fs::remove_dir_all`], a spill file
+/// with [`std::fs::remove_file`]. Also clears the registry entry so a later run
+/// of the same agent id starts fresh. Callers: the agent run end hook
+/// (`run_agent`) and the diagnostics runner (which passes
+/// [`crate::agent::role::DIAGNOSTICS_ROLE`]) — the diagnostics spill owner is
+/// [`crate::agent::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`).
 pub(crate) fn cleanup_agent_spills(agent_id: &str) {
     let mut map = SPILL_OWNERS.lock().unwrap_poison();
     let Some(paths) = map.remove(agent_id) else {
         return;
     };
     for p in paths {
-        let _ = std::fs::remove_file(&p);
+        let _ = if p.is_dir() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
     }
 }
 

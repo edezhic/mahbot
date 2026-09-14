@@ -201,12 +201,13 @@ tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 
 # Managed bun runtime release archive extraction (zip, DEFLATE-compressed).
 # Promoted from candle's transitive dep (the exact major is already in the lock).
-# Also the container format for inbound `.docx` ingestion.
+# Also the container format for `.docx` ingestion.
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
-# Inbound document ingestion ([FILE:...] markers): pure-Rust text extraction and
-# page rasterization for .pdf, plus a small XML read for .docx. No native/OS
-# PDF stack is linked (single self-contained binary, identical on macOS/Linux).
+# Document ingestion (inbound [FILE:...] markers and documents opened with the
+# read tool): pure-Rust text extraction and page rasterization for .pdf, plus a
+# small XML read for .docx. No native/OS PDF stack is linked (single
+# self-contained binary, identical on macOS/Linux).
 #   pdf-extract — PDF text layer only (MIT); panics on malformed input, so the
 #                 pass it drives is caught and treated as a failed extraction.
 #   hayro       — PDF structure walk, filter chain and page rasterizer

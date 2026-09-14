@@ -290,55 +290,95 @@ async fn derive_image_payload_from_marker(output: &str) -> Option<ImagePayload> 
     None
 }
 
-/// Format a tool's raw output for persistence and derive any fresh image
-/// payload — the shared "outcome → content" step used by both
+/// Format a tool's outcome for persistence and derive any fresh image payloads —
+/// the shared "outcome → content" step used by both
 /// [`Agent::commit_tool_results`] and resume-completion re-execution.
 ///
-/// Mirrors the commit path exactly: `format_output` (or the truncation
-/// fallback), then the outcome's own image payload takes precedence over a
-/// payload derived from a real on-disk `[IMAGE:path]` marker in a successful
-/// tool output. When a payload applies, the dedup key `seen` (computed lazily
-/// from `history` on first use) decides fresh/attached; the returned
-/// `Option<ImagePayload>` is `Some` only for a FRESH attachment (the caller
-/// injects it as a synthetic user message).
+/// Reading [`ToolExecutionOutcome::text_is_content`]: content keeps the
+/// annotations as an appendix and its own markers literal; a claim is replaced
+/// by them.
+///
+/// `format_output` (or the truncation fallback) first, then the outcome's own
+/// image payloads take precedence over a payload derived from a real on-disk
+/// `[IMAGE:path]` marker in a successful tool output. When payloads apply, the
+/// dedup key `seen` (computed lazily from `history` on first use) decides
+/// fresh/attached per payload; the returned vec holds every FRESH attachment,
+/// which the caller injects as ONE synthetic user message
+/// ([`crate::util::injected_image_user_message`]). The outcome's payloads are
+/// taken rather than copied — they carry base64 data URIs, and this runs once
+/// per outcome.
 async fn tool_result_content(
     tools: &[Box<dyn Tool>],
     call_name: &str,
-    raw_output: &str,
-    outcome_payload: Option<&ImagePayload>,
-    success: bool,
+    outcome: ToolExecutionOutcome,
     seen: &mut Option<std::collections::HashSet<String>>,
     history: &[ChatMessage],
-) -> (String, Option<ImagePayload>) {
-    let output = match find_tool(tools, call_name) {
-        Some(t) => t.format_output(raw_output),
-        None => crate::util::truncate_tool_output(raw_output),
+) -> (String, Vec<ImagePayload>) {
+    let formatted = match find_tool(tools, call_name) {
+        Some(t) => t.format_output(&outcome.output),
+        None => crate::util::truncate_tool_output(&outcome.output),
     };
 
-    // The outcome's own payload (read tool) takes precedence; otherwise derive
+    // The outcome's own payloads (read tool) take precedence; otherwise derive
     // an injected image from a real on-disk `[IMAGE:path]` marker in a
     // successful tool output (image_gen) so a tool-produced image reaches the
-    // agent's own context. Derivation fails open: a non-rasterizable path
-    // (e.g. SVG) yields no payload while the marker stays in the raw output.
-    let derived_payload = if outcome_payload.is_none() && success {
-        derive_image_payload_from_marker(raw_output).await
-    } else {
-        None
-    };
-    let payload = outcome_payload.or(derived_payload.as_ref());
-
-    if let Some(payload) = payload {
-        let seen = seen.get_or_insert_with(|| existing_image_marker_values(history));
-        if seen.insert(payload.data_uri.clone()) {
-            let output = payload.attached_annotation();
-            (output, Some(payload.clone()))
-        } else {
-            let output = payload.already_attached_annotation();
-            (output, None)
-        }
-    } else {
-        (output, None)
+    // agent's own context. Only a text that is a claim about its images can be
+    // the source of such a claim — in content (a converted document's extracted
+    // text) a marker is text, so nothing is derived from it. Derivation fails
+    // open: a non-rasterizable path (e.g. SVG) yields no payload while the
+    // marker stays in the raw output.
+    let mut payloads: Vec<ImagePayload> = outcome.image_payloads;
+    if payloads.is_empty() && !outcome.text_is_content && outcome.success {
+        payloads.extend(derive_image_payload_from_marker(&outcome.output).await);
     }
+    if payloads.is_empty() {
+        return (formatted, Vec::new());
+    }
+
+    let seen = seen.get_or_insert_with(|| existing_image_marker_values(history));
+    let mut fresh = Vec::with_capacity(payloads.len());
+    let mut annotations = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        if seen.insert(payload.data_uri.clone()) {
+            annotations.push(payload.attached_annotation());
+            fresh.push(payload);
+        } else {
+            annotations.push(payload.already_attached_annotation());
+        }
+    }
+    let annotation_block = annotations.join("\n");
+    let output = if outcome.text_is_content {
+        format!("{formatted}\n{annotation_block}")
+    } else {
+        annotation_block
+    };
+    (output, fresh)
+}
+
+/// The single synthetic User-role message carrying a round's fresh tool images;
+/// `None` when the round attached nothing. Why one message per round rather than
+/// one per image or per call: [`crate::util::injected_image_user_message`].
+fn injected_images_message(
+    agent_id: &str,
+    role: crate::Role,
+    payloads: Vec<ImagePayload>,
+) -> Option<ChatMessage> {
+    if payloads.is_empty() {
+        return None;
+    }
+    let mut data_uris = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        tracing::debug!(
+            agent_id,
+            %role,
+            path = %payload.path,
+            "Injecting tool image as a synthetic user message"
+        );
+        data_uris.push(payload.data_uri);
+    }
+    Some(ChatMessage::user(crate::util::injected_image_user_message(
+        &data_uris,
+    )))
 }
 
 /// One-pass derivation of a role's advertised tools and their specs — the
@@ -888,6 +928,9 @@ impl Agent {
             let mut pairs: Vec<(String, String)> = Vec::with_capacity(calls.len());
             let mut follow_up: Vec<ChatMessage> = Vec::new();
             let mut terminalize: Vec<String> = Vec::new();
+            // Fresh image payloads of the whole resumed round — injected as ONE
+            // synthetic user message after the loop, like the commit path.
+            let mut fresh_images: Vec<ImagePayload> = Vec::new();
             // Shared dedup key for fresh-image injection across the re-executed
             // calls (computed lazily on first image payload).
             let mut seen_data_uris: Option<std::collections::HashSet<String>> = None;
@@ -996,26 +1039,26 @@ impl Agent {
                         return Ok(false);
                     }
                     // Format through the tool exactly like the commit path and
-                    // capture any freshly-derived image payload (injected as a
-                    // synthetic user message after the tool-result block).
-                    let (formatted, fresh_payload) = tool_result_content(
+                    // capture any freshly-derived image payloads. The payloads
+                    // are collected across the whole resumed round and injected
+                    // as ONE message after the loop, like the commit path.
+                    let (formatted, fresh_payloads) = tool_result_content(
                         &self.tools,
                         &call.name,
-                        &outcome.output,
-                        outcome.image_payload.as_ref(),
-                        outcome.success,
+                        outcome,
                         &mut seen_data_uris,
                         self.session.history(),
                     )
                     .await;
-                    if let Some(payload) = fresh_payload {
-                        follow_up.push(ChatMessage::user(
-                            crate::util::injected_image_user_message(&payload.data_uri),
-                        ));
-                    }
+                    fresh_images.extend(fresh_payloads);
                     formatted
                 };
                 pairs.push((call.id, formatted));
+            }
+
+            if let Some(message) = injected_images_message(&self.agent_id, self.role, fresh_images)
+            {
+                follow_up.push(message);
             }
 
             // Settle + terminalize in ONE transaction: the settle rewrites the
@@ -1201,13 +1244,16 @@ impl Agent {
                     &all_outcomes,
                 ));
 
-                self.commit_tool_results(&tool_calls, &all_outcomes).await?;
+                // Read before the commit, which consumes the outcomes' payloads.
+                let sleep_ended = all_outcomes.iter().any(|o| o.success && o.ends_turn);
+
+                self.commit_tool_results(&tool_calls, all_outcomes).await?;
 
                 // Sleep stop: a successful `sleep` call ends the run gracefully AFTER
                 // this round — every tool result above is already committed, nothing
                 // is lost. Ordered before the loop-top MAX_TOOL_ROUNDS guard: the
                 // return happens before the next iteration is even evaluated.
-                if all_outcomes.iter().any(|o| o.success && o.ends_turn) {
+                if sleep_ended {
                     self.sleep_ended = true;
                     if let Err(e) = crate::session::store().set_sleep_ended(&self.agent_id, true).await {
                         tracing::warn!(
@@ -1403,7 +1449,9 @@ impl Agent {
             ToolExecutionOutcome {
                 output: format_tool_failure_feedback(call_name, call_arguments, &reason),
                 success: false,
-                image_payload: None,
+                // No payloads and no derivation on a failure: the flag is unread.
+                image_payloads: Vec::new(),
+                text_is_content: false,
                 suspended: false,
                 ends_turn: false,
             },
@@ -1483,27 +1531,28 @@ impl Agent {
                 Self::failure_outcome(&tool_name, &tool_arguments, &reason)
             }
             Some(tool) => {
-                let exec_result = tool.execute(&self.workspace, tool_arguments.clone()).await;
+                let exec_result = tool
+                    .execute_with_payloads(&self.workspace, tool_arguments.clone())
+                    .await;
                 let duration = start.elapsed();
                 match exec_result {
-                    Ok(output) => {
-                        let output_text = if output.is_empty() {
+                    Ok(result) => {
+                        let output_text = if result.text.is_empty() {
                             String::from("(no output)")
                         } else {
-                            output
+                            result.text
                         };
                         tracing::debug!(
                             tool = %tool_name,
                             duration_ms = duration.as_millis(),
                             "Tool execution completed"
                         );
-                        let image_payload =
-                            tool.image_payload(&self.workspace, &tool_arguments).await;
                         (
                             ToolExecutionOutcome {
                                 output: scrub_tool_output(tool, &tool_arguments, &output_text),
                                 success: true,
-                                image_payload,
+                                image_payloads: result.image_payloads,
+                                text_is_content: result.text_is_content,
                                 suspended: false,
                                 ends_turn: tool.ends_turn_on_success(),
                             },
@@ -1532,7 +1581,8 @@ impl Agent {
                                     // outcomes before reading their output.
                                     output: String::new(),
                                     success: false,
-                                    image_payload: None,
+                                    image_payloads: Vec::new(),
+                                    text_is_content: false,
                                     suspended: true,
                                     ends_turn: false,
                                 },
@@ -1936,10 +1986,13 @@ impl Agent {
     /// SKIPPED — no row is written, the call stays dangling, and the universal
     /// resume-completion step settles it later. Returns early with no DB write
     /// when every outcome is suspended (nothing to settle this round).
+    ///
+    /// Takes `outcomes` by value because each one's `image_payloads` are MOVED
+    /// into the injected image message (they carry base64 data URIs).
     async fn commit_tool_results(
         &mut self,
         tool_calls: &[ToolCall],
-        outcomes: &[ToolExecutionOutcome],
+        outcomes: Vec<ToolExecutionOutcome>,
     ) -> anyhow::Result<()> {
         let tools = &self.tools;
 
@@ -1956,43 +2009,33 @@ impl Agent {
         let mut fresh_image_payloads: Vec<ImagePayload> = Vec::new();
 
         let mut db_messages = Vec::with_capacity(outcomes.len());
-        for (call, outcome) in tool_calls.iter().zip(outcomes.iter()) {
+        for (call, outcome) in tool_calls.iter().zip(outcomes) {
             // A suspended outcome has no result to commit — the frame is already
             // durable and the durable work is left launched for the universal
             // resume-completion step. Skip it entirely.
             if outcome.suspended {
                 continue;
             }
-            let (output, fresh_payload) = tool_result_content(
+            let (output, fresh_payloads) = tool_result_content(
                 tools,
                 &call.name,
-                &outcome.output,
-                outcome.image_payload.as_ref(),
-                outcome.success,
+                outcome,
                 &mut seen_data_uris,
                 self.session.history(),
             )
             .await;
-            if let Some(payload) = fresh_payload {
-                fresh_image_payloads.push(payload);
-            }
+            fresh_image_payloads.extend(fresh_payloads);
 
             db_messages.push(ChatMessage::tool_result(&call.id, &output));
         }
 
-        // Inject all fresh image user messages AFTER the round's tool-result
-        // block, each carrying the provenance tag so the model can tell a
+        // Inject every fresh image of the round as ONE synthetic user message
+        // after the round's tool-result block, tagged so the model can tell a
         // tool-injected image apart from a user-uploaded one.
-        for payload in fresh_image_payloads {
-            tracing::debug!(
-                agent_id = %self.agent_id,
-                role = %self.role,
-                path = %payload.path,
-                "Injecting tool image as a synthetic user message"
-            );
-            db_messages.push(ChatMessage::user(crate::util::injected_image_user_message(
-                &payload.data_uri,
-            )));
+        if let Some(message) =
+            injected_images_message(&self.agent_id, self.role, fresh_image_payloads)
+        {
+            db_messages.push(message);
         }
 
         // Nothing to commit (all outcomes suspended — no results, no derived
@@ -3206,7 +3249,8 @@ mod tests {
                 .map(|o| ToolExecutionOutcome {
                     output: o.output.to_string(),
                     success: o.success,
-                    image_payload: None,
+                    image_payloads: Vec::new(),
+                    text_is_content: false,
                     suspended: false,
                     ends_turn: false,
                 })
@@ -5083,7 +5127,7 @@ mod tests {
             ToolExecutionOutcome {
                 output: "Read image file /a.png (1x1, PNG).".into(),
                 success: true,
-                image_payload: Some(ImagePayload {
+                image_payloads: vec![ImagePayload {
                     path: "/a.png".into(),
                     data_uri: "data:image/jpeg;base64,prior".into(),
                     width: 1,
@@ -5091,14 +5135,15 @@ mod tests {
                     format: "PNG".into(),
                     recovery_note: None,
                     source: crate::tools::ImagePayloadSource::Read,
-                }),
+                }],
+                text_is_content: false,
                 suspended: false,
                 ends_turn: false,
             },
             ToolExecutionOutcome {
                 output: "Read image file /b.png (1x1, PNG).".into(),
                 success: true,
-                image_payload: Some(ImagePayload {
+                image_payloads: vec![ImagePayload {
                     path: "/b.png".into(),
                     data_uri: "data:image/jpeg;base64,fresh".into(),
                     width: 1,
@@ -5106,14 +5151,15 @@ mod tests {
                     format: "PNG".into(),
                     recovery_note: None,
                     source: crate::tools::ImagePayloadSource::Read,
-                }),
+                }],
+                text_is_content: false,
                 suspended: false,
                 ends_turn: false,
             },
         ];
 
         agent
-            .commit_tool_results(&tool_calls, &outcomes)
+            .commit_tool_results(&tool_calls, outcomes)
             .await
             .expect("commit_tool_results must succeed");
 
@@ -5220,7 +5266,7 @@ mod tests {
             ToolExecutionOutcome {
                 output: "Read image file /a.png (PNG).".into(),
                 success: true,
-                image_payload: Some(ImagePayload {
+                image_payloads: vec![ImagePayload {
                     path: "/a.png".into(),
                     data_uri: "data:image/jpeg;base64,same".into(),
                     width: 1,
@@ -5228,14 +5274,15 @@ mod tests {
                     format: "PNG".into(),
                     recovery_note: None,
                     source: crate::tools::ImagePayloadSource::Read,
-                }),
+                }],
+                text_is_content: false,
                 suspended: false,
                 ends_turn: false,
             },
             ToolExecutionOutcome {
                 output: "Read image file /a.png (PNG).".into(),
                 success: true,
-                image_payload: Some(ImagePayload {
+                image_payloads: vec![ImagePayload {
                     path: "/a.png".into(),
                     data_uri: "data:image/jpeg;base64,same".into(),
                     width: 1,
@@ -5243,14 +5290,15 @@ mod tests {
                     format: "PNG".into(),
                     recovery_note: None,
                     source: crate::tools::ImagePayloadSource::Read,
-                }),
+                }],
+                text_is_content: false,
                 suspended: false,
                 ends_turn: false,
             },
         ];
 
         agent
-            .commit_tool_results(&tool_calls, &outcomes)
+            .commit_tool_results(&tool_calls, outcomes)
             .await
             .expect("commit_tool_results must succeed");
 
@@ -5294,6 +5342,205 @@ mod tests {
         );
     }
 
+    /// Every fresh image of one round lands in a SINGLE synthetic user message,
+    /// so a rejected page from any call of the round is clearable —
+    /// [`crate::util::injected_image_user_message`].
+    #[tokio::test]
+    async fn commit_tool_results_injects_one_image_message_per_round() {
+        crate::util::test::init_test_stores().await;
+
+        let mut agent = make_agent(vec![]);
+        let tool_calls = vec![
+            ToolCall {
+                id: "callA".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "a.pdf"}),
+            },
+            ToolCall {
+                id: "callB".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "b.pdf"}),
+            },
+        ];
+        let payload = |suffix: &str| ImagePayload {
+            path: format!("/tmp/{suffix}.jpg"),
+            data_uri: format!("data:image/jpeg;base64,{suffix}"),
+            width: 1,
+            height: 1,
+            format: "JPEG".into(),
+            recovery_note: None,
+            source: crate::tools::ImagePayloadSource::Read,
+        };
+        let outcomes = vec![
+            ToolExecutionOutcome {
+                output: "Read image file /tmp/a.jpg.".into(),
+                success: true,
+                image_payloads: vec![payload("a1"), payload("a2")],
+                text_is_content: false,
+                suspended: false,
+                ends_turn: false,
+            },
+            ToolExecutionOutcome {
+                output: "Read image file /tmp/b.jpg.".into(),
+                success: true,
+                image_payloads: vec![payload("b1")],
+                text_is_content: false,
+                suspended: false,
+                ends_turn: false,
+            },
+        ];
+
+        agent
+            .commit_tool_results(&tool_calls, outcomes)
+            .await
+            .expect("commit_tool_results must succeed");
+
+        let history = agent.session.history();
+        let image_messages: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role == crate::ChatRole::User && m.content.contains("[IMAGE:"))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            image_messages.len(),
+            1,
+            "one message for the whole round, got: {image_messages:?}"
+        );
+        let message = image_messages[0];
+        assert!(
+            message.starts_with("<injected-tool-result-image>"),
+            "the batch keeps the provenance tag: {message:?}"
+        );
+        for suffix in ["a1", "a2", "b1"] {
+            assert!(
+                message.contains(&format!("[IMAGE:data:image/jpeg;base64,{suffix}]")),
+                "every fresh image of the round is in the batch: {message:?}"
+            );
+        }
+    }
+
+    /// The content side of the same invariant: a result whose flag says its text
+    /// is content — a converted document's extracted text — is neither replaced
+    /// by an annotation nor read as a claim, so an `[IMAGE:path]` marker inside
+    /// it stays literal text and injects nothing.
+    #[tokio::test]
+    async fn commit_tool_results_leaves_a_marker_in_content_text_alone() {
+        crate::util::test::init_test_stores().await;
+
+        // A real on-disk raster, so derivation would succeed if it were allowed.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let png_path = dir.path().join("page.png");
+        std::fs::write(&png_path, crate::util::test::noisy_png(4, 4)).expect("write png");
+        let abs = std::fs::canonicalize(&png_path).expect("canonicalize");
+
+        let mut agent = make_agent(vec![]);
+        let marker = format!("[IMAGE:{}]", abs.display());
+        let body = format!("[scan.pdf: extracted text follows]\n\nsee {marker} in the report");
+        let tool_calls = vec![ToolCall {
+            id: "call1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "scan.pdf"}),
+        }];
+        let outcomes = vec![ToolExecutionOutcome {
+            output: body.clone(),
+            success: true,
+            image_payloads: Vec::new(),
+            text_is_content: true,
+            suspended: false,
+            ends_turn: false,
+        }];
+
+        agent
+            .commit_tool_results(&tool_calls, outcomes)
+            .await
+            .expect("commit_tool_results must succeed");
+
+        let history = agent.session.history();
+        let tool_result = history
+            .iter()
+            .find(|m| m.role == crate::ChatRole::Tool)
+            .map(|m| {
+                let v: serde_json::Value =
+                    serde_json::from_str(&m.content).expect("tool result is valid JSON");
+                crate::util::json::get_str(&v, "content")
+                    .expect("tool result has content")
+                    .to_string()
+            })
+            .expect("the tool result is persisted");
+        assert!(
+            tool_result.contains(&marker),
+            "a marker inside content text stays literal: {tool_result:?}"
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|m| m.role == crate::ChatRole::User && m.content.contains("[IMAGE:")),
+            "nothing is derived from a marker in content text: {history:?}"
+        );
+    }
+
+    /// A converted document's images SUPPLEMENT its text: the annotations are
+    /// appended to the tool result, so the extracted text (and the converter's
+    /// notes) survive into the persisted round.
+    #[tokio::test]
+    async fn commit_tool_results_appends_annotations_for_content_text() {
+        crate::util::test::init_test_stores().await;
+
+        let mut agent = make_agent(vec![]);
+        let tool_calls = vec![ToolCall {
+            id: "call1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "scan.pdf"}),
+        }];
+        let outcomes = vec![ToolExecutionOutcome {
+            output: "[scan.pdf: no text could be extracted — the pages were provided as images]"
+                .into(),
+            success: true,
+            image_payloads: vec![ImagePayload {
+                path: "/tmp/read_1/page_1.jpg".into(),
+                data_uri: "data:image/jpeg;base64,page1".into(),
+                width: 800,
+                height: 1000,
+                format: "JPEG".into(),
+                recovery_note: None,
+                source: crate::tools::ImagePayloadSource::Generated,
+            }],
+            text_is_content: true,
+            suspended: false,
+            ends_turn: false,
+        }];
+
+        agent
+            .commit_tool_results(&tool_calls, outcomes)
+            .await
+            .expect("commit_tool_results must succeed");
+
+        let history = agent.session.history();
+        let tool_result = history
+            .iter()
+            .find(|m| m.role == crate::ChatRole::Tool)
+            .map(|m| {
+                let v: serde_json::Value =
+                    serde_json::from_str(&m.content).expect("tool result is valid JSON");
+                crate::util::json::get_str(&v, "content")
+                    .expect("tool result has content")
+                    .to_string()
+            })
+            .expect("the tool result is persisted");
+        assert_eq!(
+            tool_result,
+            "[scan.pdf: no text could be extracted — the pages were provided as images]\n\
+             Generated image file /tmp/read_1/page_1.jpg (800x1000, JPEG). Image content attached \
+             to the conversation as a native image.",
+            "the answer keeps its text and gains the image annotation: {tool_result:?}"
+        );
+        assert!(
+            history.iter().any(|m| m.role == crate::ChatRole::User
+                && m.content.contains("[IMAGE:data:image/jpeg;base64,page1]")),
+            "the page is injected as a synthetic user message"
+        );
+    }
+
     #[tokio::test]
     async fn commit_tool_results_derives_generated_image_and_tags_it() {
         crate::util::test::init_test_stores().await;
@@ -5316,16 +5563,29 @@ mod tests {
             name: "image_gen".into(),
             arguments: serde_json::json!({}),
         }];
+        // `MediaTestTool` does not override the hook, so this round takes the
+        // trait default: a media tool's marker line is a claim about its image,
+        // not content.
         let outcomes = vec![ToolExecutionOutcome {
             output: marker.clone(),
             success: true,
-            image_payload: None,
+            image_payloads: Vec::new(),
+            text_is_content: false,
             suspended: false,
             ends_turn: false,
         }];
 
+        // User delivery via the marker in the raw output is preserved — read
+        // before the commit, which consumes the outcomes.
+        let media = extract_media_from_outcomes(&agent.tools, &tool_calls, &outcomes);
+        assert_eq!(
+            media,
+            vec![("[IMAGE:", abs.display().to_string())],
+            "marker preserved for user delivery: {media:?}"
+        );
+
         agent
-            .commit_tool_results(&tool_calls, &outcomes)
+            .commit_tool_results(&tool_calls, outcomes)
             .await
             .expect("commit_tool_results must succeed");
 
@@ -5371,17 +5631,84 @@ mod tests {
             !tool_results[0].starts_with("Read image file"),
             "must not be a Read annotation: {tool_results:?}"
         );
-
-        // User delivery via the marker in the raw output is preserved.
-        let media = extract_media_from_outcomes(&agent.tools, &tool_calls, &outcomes);
-        assert_eq!(
-            media,
-            vec![("[IMAGE:", abs.display().to_string())],
-            "marker preserved for user delivery: {media:?}"
-        );
     }
 
     // ── Universal resume-completion ──────────────────────────────────────
+
+    /// The resume-completion path batches a re-executed round exactly like the
+    /// commit path: two calls that each produce images still inject ONE
+    /// synthetic user message, so the provider-rejection recovery — which
+    /// rewrites only the most recent message — can clear every image the
+    /// rejected request carried.
+    #[tokio::test]
+    async fn complete_pending_tool_calls_injects_one_image_message_per_round() {
+        crate::util::test::init_test_stores().await;
+        let dir = tempfile::tempdir().unwrap();
+        // Different sizes, so the two pages hash to different data URIs and
+        // neither is deduped away as an already-attached image.
+        for (page, size) in [("page-a.png", 4), ("page-b.png", 5)] {
+            std::fs::write(
+                dir.path().join(page),
+                crate::util::test::noisy_png(size, size),
+            )
+            .unwrap();
+        }
+        let ws = crate::Workspace::from_path(dir.path());
+
+        let calls: Vec<crate::ToolCall> = ["page-a.png", "page-b.png"]
+            .iter()
+            .enumerate()
+            .map(|(index, page)| crate::ToolCall {
+                id: format!("call_img_{index}"),
+                name: "read".to_string(),
+                arguments: serde_json::json!({ "path": page }),
+            })
+            .collect();
+        let frame = crate::providers::reasoning::assistant_replay_payload(Some(""), &calls, None)
+            .to_string();
+        let mut session = Session::default();
+        session
+            .persist_messages(
+                "test-resume-image-batch",
+                &[
+                    ChatMessage::user("read both images"),
+                    ChatMessage::assistant(frame),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let mut agent = make_agent_on(
+            vec![Box::new(crate::tools::ReadTool::general())],
+            "test-resume-image-batch",
+            ws,
+        );
+        agent.session = session;
+        assert!(
+            agent.complete_pending_tool_calls().await.unwrap(),
+            "both dangling calls settle a result"
+        );
+
+        let history = agent.session.history();
+        let image_messages: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role == crate::ChatRole::User && m.content.contains("[IMAGE:"))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            image_messages.len(),
+            1,
+            "one message for the whole re-executed round, got: {image_messages:?}"
+        );
+        assert_eq!(
+            image_messages[0]
+                .matches("[IMAGE:data:image/jpeg;base64,")
+                .count(),
+            2,
+            "both pages of the round are in the batch: {:?}",
+            image_messages[0]
+        );
+    }
 
     /// (c) `complete_pending_tool_calls` re-executes a non-durable dangling call
     /// and settles the real output as its tool result with the ORIGINAL call id,

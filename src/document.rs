@@ -1,16 +1,17 @@
-//! Inbound-document conversion: turn a document's bytes into the text and image
-//! files an agent can read, and report a short user-facing reason when it
-//! cannot.
+//! Document conversion: turn a document's bytes into the text and image files
+//! an agent can read, and report a short user-facing reason when it cannot.
 //!
-//! Wired into the channel enrichment flow by [`crate::channels`], which runs it
-//! on a blocking thread; nothing here touches channel state, the database, or
-//! the network.
+//! Shared by the inbound attachment flow ([`crate::channels::enrichment`]) and
+//! by the read tool ([`crate::tools`]); nothing here touches channel state, the
+//! database, or the network. [`convert_document_file`] is the bounded async
+//! entry point both go through, and [`needs_extraction`] tells the read tool
+//! whether a file is one of the containers this module extracts from.
 //!
 //! # Invariants
 //!
-//! - **Pure and CPU-bound.** No global state; the only I/O is reading the input
-//!   bytes and writing artifacts. The entry point is synchronous on purpose: a
-//!   slow rasterization never stalls an async task.
+//! - **Pure and CPU-bound.** No state but the shared conversion semaphore; the
+//!   only I/O is reading the input bytes and writing artifacts. Conversion is
+//!   synchronous on purpose: a slow rasterization never stalls an async task.
 //! - **No panics of its own**, for any input including empty or truncated
 //!   bytes: every fallible step degrades to a skipped artifact, a user-facing
 //!   note, or [`DocOutcome::Unreadable`]. The structure parse and the
@@ -93,7 +94,38 @@ const PLAIN_TEXT_EXTENSIONS: &[&str] = &[
     "log",
 ];
 
-/// The result of converting one inbound document.
+/// Reason reported for a document whose bytes could not be read or whose
+/// conversion panicked.
+const UNREADABLE_REASON: &str = "could not be read";
+/// Bound on concurrently converting documents: each conversion holds the whole
+/// document plus its decoded rasters, and every caller runs on its own task, so
+/// a burst would otherwise multiply peak memory.
+static DOCUMENT_CONVERSIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+// ── Delivery notes shared by both callers ───────────────────────
+//
+// The inbound attachment path and the read tool each wrap these bodies in their
+// own `[<source>: ...]` prefix (a file name and a path respectively), so the
+// sentence a model reads for the same situation cannot drift between them.
+
+/// Body of the note shown when a document produced images but no text.
+pub(crate) const NO_TEXT_LAYER_NOTE: &str =
+    "no text could be extracted — the pages were provided as images";
+
+/// Body of the note shown when a document produced neither text nor images.
+pub(crate) const NO_TEXT_NOTE: &str = "no text could be extracted";
+
+/// Body of the note pointing at the file `path` holding extracted text that was
+/// too long to inline.
+#[must_use]
+pub(crate) fn spilled_text_note(chars: usize, path: &Path) -> String {
+    format!(
+        "the extracted text is too long to inline ({chars} characters); the full text was saved to {} — read that file.",
+        path.display()
+    )
+}
+
+/// The result of converting one document.
 #[derive(Debug)]
 pub(crate) enum DocOutcome {
     /// Text was extracted. `text` may be empty when the document has no text
@@ -112,15 +144,25 @@ pub(crate) enum DocOutcome {
     Unsupported,
 }
 
-/// Convert `bytes` named `file_name`, writing extracted page/embedded images
-/// into `out_dir` (created if missing). Synchronous and CPU-bound — callers run
-/// it on a blocking thread. Format detection is content-first (magic bytes),
-/// with the file extension as a secondary signal.
-#[must_use]
-pub(crate) fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome {
-    let path = Path::new(file_name);
+/// What [`convert_document`] found in `bytes`: the format whose container the
+/// magic marks, or the extension's verdict where the container is shared.
+enum DocumentKind {
+    Pdf,
+    Docx,
+    /// An encrypted OOXML package: a CFB container, which needs a password
+    /// rather than a conversion.
+    EncryptedOoxml,
+    PlainText,
+    Unsupported,
+}
+
+/// Classify `bytes` named `path`: magic bytes first, the extension only where
+/// the container is shared (a ZIP is a `.docx` only when the name says so) or
+/// absent (plain text). The single dispatch behind [`convert_document`] and
+/// [`needs_extraction`], so detection cannot drift between them.
+fn classify(bytes: &[u8], path: &Path) -> DocumentKind {
     if bytes.starts_with(PDF_MAGIC) {
-        return convert_pdf(bytes, out_dir);
+        return DocumentKind::Pdf;
     }
     // Checked before the ZIP attempt: an encrypted OOXML package is a CFB
     // container, and its bytes would otherwise look like corruption. Only a
@@ -128,32 +170,108 @@ pub(crate) fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) ->
     // legacy .doc/.xls/.ppt is, and those are not a format this converts.
     if bytes.starts_with(CFB_MAGIC) {
         return if crate::util::has_extension(path, DOCX_EXTENSIONS) {
-            DocOutcome::Unreadable {
-                reason: "password-protected".to_string(),
-            }
+            DocumentKind::EncryptedOoxml
         } else {
-            DocOutcome::Unsupported
+            DocumentKind::Unsupported
         };
     }
     if bytes.starts_with(ZIP_MAGIC) {
         // ZIP magic alone is shared by xlsx/pptx/plain archives; only the name
         // can tell a Word package apart.
         return if crate::util::has_extension(path, DOCX_EXTENSIONS) {
-            convert_docx(bytes, out_dir)
+            DocumentKind::Docx
         } else {
-            DocOutcome::Unsupported
+            DocumentKind::Unsupported
         };
     }
     // A known text extension is decoded lossily; anything else must look like
     // text (valid UTF-8, no NUL) to qualify.
     if crate::util::has_extension(path, PLAIN_TEXT_EXTENSIONS) || is_plain_utf8(bytes) {
-        return DocOutcome::Text {
+        return DocumentKind::PlainText;
+    }
+    DocumentKind::Unsupported
+}
+
+/// Whether a document's leading bytes mark one of the containers this module
+/// extracts text and images from — the kinds that must be converted rather
+/// than read as bytes. Only the head is needed: every extraction arm is
+/// magic-local, and the text arm (plain UTF-8 / known text extension) is
+/// exactly the "no extraction needed" case.
+#[must_use]
+pub(crate) fn needs_extraction(head: &[u8], file_name: &str) -> bool {
+    matches!(
+        classify(head, Path::new(file_name)),
+        DocumentKind::Pdf | DocumentKind::Docx | DocumentKind::EncryptedOoxml
+    )
+}
+
+/// Convert `bytes` named `file_name`, writing extracted page/embedded images
+/// into `out_dir` (created if missing). Synchronous and CPU-bound — callers run
+/// it on a blocking thread. Format detection is content-first (magic bytes),
+/// with the file extension as a secondary signal.
+#[must_use]
+fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome {
+    match classify(bytes, Path::new(file_name)) {
+        DocumentKind::Pdf => convert_pdf(bytes, out_dir),
+        DocumentKind::EncryptedOoxml => DocOutcome::Unreadable {
+            reason: "password-protected".to_string(),
+        },
+        DocumentKind::Docx => convert_docx(bytes, out_dir),
+        DocumentKind::PlainText => DocOutcome::Text {
             text: String::from_utf8_lossy(bytes).into_owned(),
             images: Vec::new(),
             notes: Vec::new(),
-        };
+        },
+        DocumentKind::Unsupported => DocOutcome::Unsupported,
     }
-    DocOutcome::Unsupported
+}
+
+/// Convert the document at `path`, named `file_name`, into text and images,
+/// writing extracted rasters into `out_dir`. The single bounded entry point
+/// shared by the inbound attachment path and the read tool.
+///
+/// `pdf-extract` panics on malformed input, so the conversion runs on a
+/// blocking thread and its panic is contained at that boundary: a
+/// [`tokio::task::JoinError`] degrades to an unreadable document instead of
+/// taking the caller's turn down with it. The conversion semaphore is
+/// deliberately shared by both callers, so peak conversion concurrency stays at
+/// two daemon-wide and a local read can queue behind a busy inbound
+/// conversion — the accepted trade-off, since both hold whole documents plus
+/// their decoded rasters in memory.
+pub(crate) async fn convert_document_file(
+    path: &Path,
+    file_name: &str,
+    out_dir: &Path,
+) -> DocOutcome {
+    // Held across the read and the conversion, covering the document bytes and
+    // the conversion's rasters (encoding the extracted pages into data URIs
+    // happens later, outside this bound). The semaphore is never closed, so
+    // acquisition cannot fail.
+    let _permit = DOCUMENT_CONVERSIONS.acquire().await;
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to read the document"
+            );
+            return DocOutcome::Unreadable {
+                reason: UNREADABLE_REASON.to_string(),
+            };
+        }
+    };
+    let name = file_name.to_string();
+    let out_dir = out_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || convert_document(&bytes, &name, &out_dir)).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            tracing::warn!(error = %e, "Document conversion failed");
+            DocOutcome::Unreadable {
+                reason: UNREADABLE_REASON.to_string(),
+            }
+        }
+    }
 }
 
 /// Extract text, page rasters and embedded images from a PDF: a page with a
@@ -1198,16 +1316,19 @@ fn is_plain_utf8(bytes: &[u8]) -> bool {
     !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
 }
 
+/// Builders shared by this module's tests and the read tool's document tests
+/// ([`crate::tools::read_document`]), so both sides convert the very same
+/// fixtures.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_fixtures {
     use super::*;
     use std::io::Write;
 
-    const DOCX_BODY: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    pub(crate) const DOCX_BODY: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>First paragraph</w:t></w:r></w:p><w:p><w:r><w:t>Second paragraph</w:t></w:r></w:p></w:body></w:document>"#;
 
     /// Build a ZIP archive in memory from `(entry path, contents)` pairs.
-    fn zip_fixture(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn zip_fixture(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
@@ -1220,7 +1341,7 @@ mod tests {
 
     /// Assemble numbered objects into a PDF with a valid xref table, computing
     /// offsets as it writes.
-    fn assemble_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
+    pub(crate) fn assemble_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
         for (index, object) in objects.iter().enumerate() {
@@ -1244,6 +1365,13 @@ mod tests {
         );
         pdf
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_fixtures::*;
+    use super::*;
+    use std::io::Write;
 
     /// One embedded image XObject for [`pdf_fixture`]: dictionary entries are
     /// written verbatim so a test can pick the filter chain and the colour space,

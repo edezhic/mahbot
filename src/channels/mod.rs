@@ -1,6 +1,5 @@
 pub(crate) mod chat_draft;
 pub(crate) mod chat_history;
-mod document;
 mod enrichment;
 pub(crate) mod reply;
 pub mod telegram;

@@ -18,6 +18,7 @@ pub(crate) mod manager_chat;
 pub mod media_catalog;
 pub(crate) mod path;
 pub(crate) mod read;
+pub(crate) mod read_document;
 pub(crate) mod research;
 pub(crate) mod search;
 pub(crate) mod search_archived_tickets;
@@ -28,10 +29,13 @@ pub(crate) mod video_edit;
 pub(crate) mod video_gen;
 pub(crate) mod web_search;
 
-/// Maximum file size allowed for read, edit, search tool operations, and the dashboard editor (10 MB).
-/// Guards against OOM when agents or the GUI attempt to read very large files.
-/// Used by ReadTool and EditTool via `check_file_size()`;
-/// SearchTool and the Iced Editor use `MAX_FILE_SIZE_BYTES` directly.
+/// Maximum file size for edit and search tool operations and the dashboard editor
+/// (10 MB), and the read tool's cap for any read that is not a document container;
+/// a container it accepts up to `FILE_MAX_BYTES` (50 MB), like an inbound
+/// attachment. Guards against OOM when agents or the GUI attempt to read very large
+/// files. ReadTool/EditTool enforce it via `check_size_within()` (the read tool's
+/// FIFO arm bounds its own accumulation); SearchTool and the Iced Editor use it
+/// directly.
 pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Maximum size for a single reference image in bytes. The 2 MB figure is a
@@ -68,15 +72,13 @@ pub(crate) const MAX_REFERENCE_IMAGES_PER_REQUEST: usize = 16;
 /// `"path"` parameter are unaffected — unknown keys are discarded downstream.
 const PATH_ALIAS_KEYS: &[&str] = &["file", "filename"];
 
-/// Check that a file's size is within the allowed limit.
-/// Returns `Ok(())` or bails with a descriptive error.
-fn check_file_size(meta: &std::fs::Metadata) -> anyhow::Result<()> {
-    if meta.len() > MAX_FILE_SIZE_BYTES {
-        anyhow::bail!(
-            "File too large: {} bytes (limit: {} bytes)",
-            meta.len(),
-            MAX_FILE_SIZE_BYTES
-        );
+/// Check that a file's size is within `limit` bytes, naming `label` in the
+/// error. The shared gate for the file-reading paths, whose limits differ: the
+/// read/edit cap above, and [`crate::util::FILE_MAX_BYTES`] for a converted
+/// document container.
+fn check_size_within(meta: &std::fs::Metadata, limit: u64, label: &str) -> anyhow::Result<()> {
+    if meta.len() > limit {
+        anyhow::bail!("{label}: {} bytes (limit: {limit} bytes)", meta.len());
     }
     Ok(())
 }
@@ -838,17 +840,59 @@ pub(crate) fn build_async_result_envelope(
     }
 }
 
+/// A tool call's textual result together with the images it produced — what
+/// [`crate::Tool::execute_with_payloads`] returns.
+#[derive(Debug)]
+pub(crate) struct ToolOutput {
+    /// The tool's textual result.
+    pub text: String,
+    /// Images produced by this call, injected by the agent loop as native
+    /// image parts after the round's tool-result block.
+    pub image_payloads: Vec<ImagePayload>,
+    /// Whether `text` is real content the model must keep, rather than a claim
+    /// ABOUT the images this call produced. The single flag behind both
+    /// decisions the agent loop makes from a result: with content, image
+    /// annotations are APPENDED and any `[IMAGE:path]` marker inside it is
+    /// literal text; without it, the annotations REPLACE `text` and such a
+    /// marker is a claim that may be turned into an injected image. `true` only
+    /// for the read tool's converted-document answer — extracted text, or the
+    /// note standing in for what a document could not yield.
+    pub text_is_content: bool,
+}
+
+/// Pair a textual result with the image payload of the tool's
+/// [`Tool::image_payload`] hook — the tail of the default
+/// [`Tool::execute_with_payloads`], shared with the read tool's override so the
+/// two can never drift.
+///
+/// The text is flagged as a claim about the image (not content) whether or not a
+/// payload comes back, which is what every tool routed here has always meant by
+/// its result: a media tool names the file it wrote, the read tool the file it
+/// read. Only the read tool's converted-document answer, text the model must
+/// keep, bypasses this helper.
+pub(crate) async fn with_image_payload<T: Tool + ?Sized>(
+    tool: &T,
+    text: String,
+    ws: &Workspace,
+    args: &serde_json::Value,
+) -> ToolOutput {
+    ToolOutput {
+        text,
+        image_payloads: tool.image_payload(ws, args).await.into_iter().collect(),
+        text_is_content: false,
+    }
+}
+
 /// Outcome for a tool execution.
+#[expect(clippy::struct_excessive_bools)] // independent per-call flags, not states
 #[derive(Debug)]
 pub(crate) struct ToolExecutionOutcome {
     pub output: String,
     pub success: bool,
-    /// Optional per-call image payload: a compressed JPEG data-URI that the
-    /// agent loop injects as a synthetic User-role message AFTER the round's
-    /// tool-result block, so a vision-capable model sees the on-disk image as a
-    /// native image part. Never rides inside `output` (the shared 5 KB tool-output
-    /// budget would truncate it).
-    pub image_payload: Option<ImagePayload>,
+    /// Images produced by this call, injected after the round's tool-result block.
+    pub image_payloads: Vec<ImagePayload>,
+    /// The tool's own [`ToolOutput::text_is_content`], carried through unchanged.
+    pub text_is_content: bool,
     /// `true` when the tool's durable work was drain-cut and its result is
     /// intentionally absent (the call's frame is already durably persisted at
     /// emission time; the result settles on the next resume-completion). Such
@@ -869,8 +913,9 @@ pub(crate) struct ToolExecutionOutcome {
 pub(crate) enum ImagePayloadSource {
     /// On-disk raster read by the read tool.
     Read,
-    /// Tool-produced image (e.g. image_gen), or one derived by the agent loop
-    /// from a tool's `[IMAGE:path]` marker.
+    /// Tool-produced image (e.g. image_gen, or a page rasterized or extracted
+    /// from a converted document), or one derived by the agent loop from a tool's
+    /// `[IMAGE:path]` marker.
     Generated,
     /// Screenshot captured by the chrome tool (injected as a native image for
     /// the agent's own visual analysis).
@@ -929,6 +974,18 @@ pub(crate) struct ImagePayload {
     pub source: ImagePayloadSource,
 }
 
+/// Prefix `body` with a read's typo-recovery note, when there is one — the one
+/// place the `[Recovered path: ...]` line is put in front of a read's answer, so
+/// a recovered text read, a recovered raster's annotation and a converted
+/// document's answer word it identically.
+#[must_use]
+pub(crate) fn with_recovery_note(note: Option<&str>, body: String) -> String {
+    match note {
+        Some(note) => format!("{note}\n{body}"),
+        None => body,
+    }
+}
+
 impl ImagePayload {
     /// Tool-result annotation for a FRESH attachment (the image is injected as a
     /// new synthetic user message).
@@ -942,7 +999,7 @@ impl ImagePayload {
             self.height,
             self.format
         );
-        self.with_recovery_note(base)
+        with_recovery_note(self.recovery_note.as_deref(), base)
     }
 
     /// Tool-result annotation for a DEDUPED repeat read (image already attached;
@@ -957,18 +1014,7 @@ impl ImagePayload {
             self.height,
             self.format
         );
-        self.with_recovery_note(base)
-    }
-
-    /// Prepend the read's recovery note (when the path was recovered) to the
-    /// annotation so recovered image reads keep the same `[Recovered path: ...]`
-    /// context that recovered text reads already show.
-    #[must_use]
-    fn with_recovery_note(&self, base: String) -> String {
-        match &self.recovery_note {
-            Some(note) => format!("{note}\n{base}"),
-            None => base,
-        }
+        with_recovery_note(self.recovery_note.as_deref(), base)
     }
 
     /// Build an [`ImagePayload`] from a post-decode [`crate::util::CompressedImageMeta`]

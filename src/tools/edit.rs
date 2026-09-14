@@ -127,7 +127,7 @@ impl EditTool {
         // ── 2. Size guard: reject oversized files before read_to_string ──
         match tokio::fs::metadata(&resolved_target).await {
             Ok(meta) => {
-                super::check_file_size(&meta)?;
+                super::check_size_within(&meta, super::MAX_FILE_SIZE_BYTES, "File too large")?;
             }
             Err(e) => anyhow::bail!("Cannot access file {path}: {e}"),
         }
