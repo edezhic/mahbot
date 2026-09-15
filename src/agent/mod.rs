@@ -150,6 +150,13 @@ const MAX_STATS_ARG_LENGTH: usize = 500;
 /// cosmetic-only (typed classification uses `RetryExhausted`).
 pub(crate) const RETRY_EXHAUSTION_MARKER: &str = "exhausted retry budget";
 
+/// Attempts allowed for the summarization call when the model answers with a
+/// tool call instead of a summary — the request is re-sent verbatim, so the
+/// attempts are byte-identical (prompt-prefix cache preserved) and the tool
+/// call is never executed. Bounded on purpose: on exhaustion the compaction is
+/// abandoned exactly as before (full history kept, owner not disturbed).
+const SUMMARIZE_ATTEMPTS: u32 = 3;
+
 /// Boxed future returned by [`Agent::complete_pending_tool_calls`] — a pinned
 /// box so the caller (`Agent::work`) awaits a `dyn Future` instead of a concrete
 /// opaque type. Naming the boxed future breaks the async opaque-type Send cycle
@@ -2283,43 +2290,59 @@ impl Agent {
 
     /// Summarise the agent's session history.
     ///
-    /// KV-cache requirements: see [`Self::build_chat_request`].
+    /// KV-cache requirements: see [`Self::build_chat_request`]. The request is
+    /// built once and re-sent verbatim, so every attempt is byte-identical —
+    /// same messages, same tool set, same parameters.
+    ///
+    /// A tool call is not a summary: it carries no summary text, so it is
+    /// re-asked (`SUMMARIZE_ATTEMPTS` in total, each attempt a successful
+    /// `summarize` request of its own) and never executed. An answer carrying
+    /// both text and a tool call needs no re-ask — the text is the summary and
+    /// the tool call is discarded as always. Exhaustion raises the
+    /// empty-response error as before, so [`Self::maybe_summarize`] fails open
+    /// with the full history.
     pub(crate) async fn summarize(&self) -> anyhow::Result<String> {
         let _activity = self.activity_guard("summarizing");
         let mut history = self.session.history().to_vec();
         history.push(crate::ChatMessage::user(self.role.summary_prompt()));
 
+        let request = self.build_chat_request(history.clone(), "summarize");
         let policy = crate::retry::RetryPolicy::current();
-        let chat_resp = crate::retry::agent_chat(
-            self.build_chat_request(history.clone(), "summarize"),
-            &policy,
-        )
-        .await
-        .with_context(|| format!("summarization LLM call {RETRY_EXHAUSTION_MARKER}"))?;
 
-        // Reasoning-only stop: the same bounded continuation as the agent loop
-        // (leak-safety invariants on `recover_if_reasoning_only_stop`). On
-        // exhaustion, fail open below — the empty-response error path warns
-        // and continues with the full history.
-        let chat_resp = self
-            .recover_if_reasoning_only_stop(history, chat_resp, Self::SUMMARIZE_REASONING_RECOVERY)
-            .await?;
+        for _ in 1..=SUMMARIZE_ATTEMPTS {
+            let chat_resp = crate::retry::agent_chat(request.clone(), &policy)
+                .await
+                .with_context(|| format!("summarization LLM call {RETRY_EXHAUSTION_MARKER}"))?;
 
-        if let Some(ref u) = chat_resp.usage {
-            tracing::debug!(
-                input_tokens = u.input_tokens,
-                cached_input_tokens = u.cached_input_tokens,
-                output_tokens = u.output_tokens,
-                "Summarization token usage",
-            );
+            // Reasoning-only stop: the same bounded continuation as the agent
+            // loop (leak-safety invariants on `recover_if_reasoning_only_stop`).
+            // On exhaustion, fail open below — the empty-response error path
+            // warns and continues with the full history.
+            let chat_resp = self
+                .recover_if_reasoning_only_stop(
+                    history.clone(),
+                    chat_resp,
+                    Self::SUMMARIZE_REASONING_RECOVERY,
+                )
+                .await?;
+
+            if let Some(ref u) = chat_resp.usage {
+                tracing::debug!(
+                    input_tokens = u.input_tokens,
+                    cached_input_tokens = u.cached_input_tokens,
+                    output_tokens = u.output_tokens,
+                    "Summarization token usage",
+                );
+            }
+
+            if let Some(summary_text) = chat_resp.text.filter(|t| !t.trim().is_empty()) {
+                return Ok(crate::util::truncate(&summary_text, 32_000));
+            }
+            // No summary text — a tool-call answer. Re-ask (or leave the loop
+            // with the error when the budget is spent).
         }
 
-        let summary_text = chat_resp
-            .text
-            .filter(|t| !t.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("summarization produced empty response"))?;
-
-        Ok(crate::util::truncate(&summary_text, 32_000))
+        anyhow::bail!("summarization produced empty response")
     }
 
     /// Check the session against the summarization triggers and summarise if
@@ -4747,6 +4770,63 @@ mod tests {
         assert!(
             !rendered.contains("summary thinking"),
             "the thinking must never leak into the summarization error"
+        );
+    }
+
+    /// A summarisation answer that is a tool call carries no summary text: it
+    /// is re-asked byte-identically (the request is re-sent verbatim, tool set
+    /// included) instead of being accepted as the summary.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn summarize_reasks_a_tool_call_answer_byte_identically() {
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(FakeProvider::new().ok_tool_call("read").ok("the summary"));
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let agent = make_agent(vec![]);
+        let summary = agent.summarize().await.expect("the re-ask must resolve");
+        assert_eq!(summary, "the summary");
+
+        let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
+        assert_eq!(fingerprints.len(), 2, "tool-call answer + one re-ask");
+        assert_eq!(
+            fingerprints[0], fingerprints[1],
+            "the re-ask must re-send the identical request"
+        );
+    }
+
+    /// Tool-call answers exhaust the bounded re-ask budget at
+    /// [`SUMMARIZE_ATTEMPTS`] attempts without changing today's outcome: the
+    /// empty-response error fires (fail-open in `maybe_summarize`).
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn summarize_tool_call_exhaustion_keeps_the_empty_response_error() {
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok_tool_call("read")
+                .ok_tool_call("read")
+                .ok_tool_call("read"),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let agent = make_agent(vec![]);
+        let err = agent
+            .summarize()
+            .await
+            .expect_err("the budget must exhaust");
+        assert!(
+            format!("{err:#}").contains("summarization produced empty response"),
+            "the fail-open error is unchanged: {err:#}"
+        );
+        assert_eq!(
+            fake.request_fingerprints.lock().unwrap().len(),
+            SUMMARIZE_ATTEMPTS as usize,
+            "the re-ask must stop at the attempt bound"
         );
     }
 

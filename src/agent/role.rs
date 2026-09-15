@@ -869,7 +869,10 @@ mod tests {
 
     #[test]
     fn all_roles_have_summary_prompt() {
-        // Guards against an empty or unsubstituted summary prompt file.
+        // Guards against an empty or unsubstituted summary prompt file, and
+        // against a role losing the no-tools / summary-only instruction the
+        // summarisation request depends on (its tool set is sent, so the
+        // model must be told not to use it).
         for role in Role::iter() {
             let prompt = role.summary_prompt();
             assert!(
@@ -880,6 +883,11 @@ mod tests {
             assert!(
                 !crate::prompt::TEMPLATE_RE.is_match(&prompt),
                 "{}: summary prompt must not contain unsubstituted template keys",
+                role.as_str()
+            );
+            assert!(
+                prompt.contains("DO NOT USE ANY TOOLS. ONLY RESPOND WITH THE SUMMARY."),
+                "{}: summary prompt must forbid tools and allow only the summary",
                 role.as_str()
             );
         }
