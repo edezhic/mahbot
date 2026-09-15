@@ -4,7 +4,7 @@
 //! The Assistant addresses the Manager on the user's behalf via an internal
 //! agent message (wrapped in an `<assistant-message>` envelope). The send is
 //! fully internal: nothing reaches the workspace users' chat history or
-//! channel bindings. The tool is gated to the full-access Assistant (see
+//! channel bindings. The tool is gated to the admin's Assistant (see
 //! `Role::Assistant` toolset).
 
 use anyhow::Result;
@@ -98,8 +98,8 @@ mod tests {
     /// `<assistant-message>` envelope still routes to the workspace Manager
     /// (live route + durable pending_jobs copy), while NOTHING is mirrored
     /// into the workspace users' chat_history or their channel bindings.
-    /// The admin user is attached to the workspace with a live spy-channel
-    /// binding — exactly the setup the removed mirroring delivered to.
+    /// A workspace member is attached with a live spy-channel binding —
+    /// exactly the setup the removed mirroring delivered to.
     #[tokio::test]
     #[serial_test::serial(channel_registry, drain)] // serializes the process-global channel registry + shutdown drain flag
     async fn manager_send_stays_internal() {
@@ -108,21 +108,13 @@ mod tests {
         let ws =
             crate::util::test::create_test_workspace("/tmp/mahbot/ws_mirror", "ws_mirror").await;
 
-        // An admin workspace member bound to a spy channel — the removed
+        // A workspace member bound to a spy channel — the removed
         // mirroring would have persisted + transport-delivered for exactly
         // this user.
         let store = crate::users::store();
+        store.add_user("mirror_user").await.unwrap();
         store
-            .add_user("mirror_user", Some("full"), crate::Role::Assistant)
-            .await
-            .unwrap();
-        store
-            .update_user(
-                "mirror_user",
-                crate::users::FieldUpdate::Unchanged,
-                crate::users::FieldUpdate::Set(&ws.name),
-                crate::users::FieldUpdate::Unchanged,
-            )
+            .set_selected_workspace("mirror_user", Some(&ws.name))
             .await
             .unwrap();
         store

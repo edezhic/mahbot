@@ -2,22 +2,21 @@
 //! five setup actions previously exposed as separate Support tools
 //! (`setup_telegram_bot`, `bind_telegram`, `add_workspace`, `add_user`,
 //! `setup_web_search`) plus the per-user custom-tool grants
-//! (`grant_tool` / `revoke_tool` / `list_grants`). It is now the full-access
+//! (`grant_tool` / `revoke_tool` / `list_grants`). It is now the admin's
 //! Assistant's sole configuration surface (the Support role is gone).
 use crate::config::{
     CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
     CONFIG_KEY_WEB_SEARCH_PROVIDER,
 };
-use crate::users::{FieldUpdate, format_grants};
-use crate::{Role, Tool, Workspace};
-use anyhow::{Context, anyhow};
+use crate::users::format_grants;
+use crate::{Tool, Workspace};
+use anyhow::anyhow;
 use async_trait::async_trait;
 use serde_json::json;
 
 /// The user configuration operates as, derived from the personal workspace it
-/// runs in (`personal:<user>`). The full-access Assistant always operates in a
-/// personal workspace, so this resolves to the admin without a separate
-/// identity lookup.
+/// runs in (`personal:<user>`). The Assistant always operates in a personal
+/// workspace, so this resolves to the admin without a separate identity lookup.
 fn acting_user(ws: &Workspace) -> &str {
     crate::users::personal_user_name(&ws.name).unwrap_or(crate::users::ADMIN_USER_NAME)
 }
@@ -26,7 +25,7 @@ fn err(msg: impl Into<String>) -> anyhow::Error {
     anyhow!(msg.into())
 }
 
-/// Dispatch a single configuration action for the admin user.
+/// Dispatch a single configuration action for the admin.
 pub(crate) struct MahbotConfigTool;
 
 #[async_trait]
@@ -80,10 +79,6 @@ impl Tool for MahbotConfigTool {
                     "type": "string",
                     "description": "(add_user) The new user's Telegram @username (with or without the leading @)."
                 },
-                "default_agent": {
-                    "type": "string",
-                    "description": "(add_user) The default agent for this user: 'assistant'."
-                },
                 "provider": {
                     "type": "string",
                     "description": "(setup_web_search) The web-search provider: 'firecrawl' or 'exa'."
@@ -133,10 +128,9 @@ impl MahbotConfigTool {
     }
 
     async fn exec_bind_telegram(&self, args: serde_json::Value) -> anyhow::Result<String> {
-        // bind_telegram always targets the admin user: this is a single-admin
+        // bind_telegram always targets the admin: this is a single-admin
         // model, and the config agent only runs for the admin, so the personal
-        // workspace it operates in resolves to the same identity. Never the
-        // operating full-permissions user.
+        // workspace it operates in resolves to the same identity.
         let user = crate::users::ADMIN_USER_NAME;
         let handle = super::get_str(&args, "handle")?;
 
@@ -165,12 +159,7 @@ impl MahbotConfigTool {
         store.add(name, path).await?;
 
         crate::users::store()
-            .update_user(
-                acting_user(ws),
-                FieldUpdate::Unchanged,
-                FieldUpdate::Set(name),
-                FieldUpdate::Unchanged,
-            )
+            .set_selected_workspace(acting_user(ws), Some(name))
             .await?;
 
         Ok(format!(
@@ -184,19 +173,13 @@ impl MahbotConfigTool {
         let name = super::get_str(&args, "name")?;
         let handle = super::get_str(&args, "telegram")?;
 
-        // default_agent is required (as the original tool had it); the only
-        // valid value is Assistant — the single user-facing role. Checked before
-        // any store access so required-field errors stay store-free.
-        let agent: Role = super::get_str(&args, "default_agent")?
-            .parse::<Role>()
-            .context("default_agent must be 'assistant'")?;
-        if agent != Role::Assistant {
-            return Err(err("default_agent must be 'assistant'"));
-        }
+        // The name IS the admin marker, so the reserved admin name is refused
+        // before any store access.
+        crate::users::validate_new_user_name(name)?;
 
         let store = crate::users::store();
         // Normalize + guard the handle (reserved sentinel, anti-steal) before
-        // the duplicate/admin checks so a rejected handle wins over e.g.
+        // the duplicate check so a rejected handle wins over e.g.
         // "user already exists".
         let handle = store.validate_telegram_bind(name, handle).await?;
 
@@ -216,46 +199,20 @@ impl MahbotConfigTool {
             if bound {
                 return Err(err(format!("A user named '{name}' already exists")));
             }
-            // add_user only creates regular users — never mutate a full-permissions
-            // row (the single 'admin' installer), which must not be re-rolable or
-            // misreported as a regular user.
-            if store.get_permissions(name).await?.as_deref() == Some("full") {
-                return Err(err(format!(
-                    "'{name}' is an admin — add_user only creates regular (non-admin) users"
-                )));
-            }
             existing_unbound = true;
         }
 
-        if existing_unbound {
-            // Restore the intended default agent since `add_user` won't update an
-            // existing row.
-            store
-                .update_user(
-                    name,
-                    FieldUpdate::Set(agent.as_str()),
-                    FieldUpdate::Unchanged,
-                    FieldUpdate::Unchanged,
-                )
-                .await?;
-        }
-
-        store.add_user(name, None, agent).await?;
+        store.add_user(name).await?;
         store.bind_channel(name, "telegram", &handle).await?;
 
-        let role_note = "They are a regular (non-admin) user: they can chat with the \
-                         Assistant agent only.";
+        let guest_note = "They are a guest — they chat with the Assistant agent only.";
         if existing_unbound {
             Ok(format!(
-                "Bound @{handle} to the existing user '{name}' and set their default agent to \
-                 '{}'. {role_note}",
-                agent.as_str()
+                "Bound @{handle} to the existing user '{name}'. {guest_note}"
             ))
         } else {
             Ok(format!(
-                "Created user '{name}' with default agent '{}' and bound @{handle} to them. \
-                 {role_note}",
-                agent.as_str()
+                "Created guest account '{name}' and bound @{handle} to them. {guest_note}"
             ))
         }
     }
@@ -376,8 +333,7 @@ mod tests {
 
     /// The merged tool's error paths that fire before any store/persist access
     /// (action dispatch, unknown action, and per-action required-field and
-    /// provider validation — including `add_user`'s `default_agent`, validated
-    /// ahead of the user store) are pure and cheaply testable.
+    /// provider validation) are pure and cheaply testable.
     #[tokio::test]
     async fn action_dispatch_and_unknown_action() {
         let tool = MahbotConfigTool;
@@ -461,10 +417,6 @@ mod tests {
             (json!({ "action": "add_workspace", "path": "/x" }), "name"),
             (json!({ "action": "add_user", "telegram": "@a" }), "name"),
             (json!({ "action": "add_user", "name": "x" }), "telegram"),
-            (
-                json!({ "action": "add_user", "name": "x", "telegram": "@a" }),
-                "default_agent",
-            ),
             (json!({ "action": "setup_web_search" }), "provider"),
             (
                 json!({ "action": "setup_web_search", "provider": "exa" }),
@@ -502,6 +454,28 @@ mod tests {
         assert!(
             err.contains("provider must be 'firecrawl' or 'exa'"),
             "rejected provider must be reported, got: {err}"
+        );
+    }
+
+    /// The name IS the admin marker, so `add_user` refuses the reserved admin
+    /// name — this path only ever mints guest accounts.
+    #[tokio::test]
+    async fn add_user_refuses_the_admin_name() {
+        crate::util::test::init_test_stores().await;
+        let tool = MahbotConfigTool;
+        let ws = test_ws("/tmp/test_ws");
+
+        let err = tool
+            .execute(
+                &ws,
+                json!({ "action": "add_user", "name": "admin", "telegram": "@a" }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("only guest accounts can be created"),
+            "the reserved admin name must be refused, got: {err}"
         );
     }
 }

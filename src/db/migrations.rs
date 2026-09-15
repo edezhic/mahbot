@@ -31,11 +31,14 @@
 //! `tickets.last_transition_actor` / `ticket_chronicle.actor` columns, and the
 //! nullable `users.granted_tools` column on one-delta-behind / current
 //! databases. The tail's data migrations are
-//! `36`, which detaches non-admin users from shared workspaces by clearing
+//! `36`, which detaches guests from shared workspaces by clearing
 //! `users.selected_workspace`, and `37`, which rewrites the legacy `DeepSeek`
-//! provider-routing display name to the canonical `deepseek` slug.
+//! provider-routing display name to the canonical `deepseek` slug. The tail's
+//! drops are `39`/`40`, which remove `users.permissions` and
+//! `users.selected_role` — account kind is the admin's name and no account
+//! stores an agent role.
 //!
-//! Future schema changes resume the chain at id `39` with monotonically
+//! Future schema changes resume the chain at id `41` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -234,9 +237,7 @@ CREATE TABLE IF NOT EXISTS editor_tabs (
 -- ── Users / channels ───────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS users (
     name                TEXT PRIMARY KEY,
-    permissions         TEXT,
     selected_workspace  TEXT,
-    selected_role       TEXT,
     image_gen_model     TEXT,
     video_model         TEXT,
     granted_tools       TEXT
@@ -494,6 +495,10 @@ const REWRITE_LEGACY_DEEPSEEK_ROUTING_SLUG: &str = "UPDATE config_model_routing 
 /// - `37` rewrites the legacy `DeepSeek` provider-routing display name to the
 ///   canonical `deepseek` slug (a data migration; a no-op on new installs).
 /// - `38` adds the nullable `users.granted_tools` column.
+/// - `39`/`40` drop the `users.permissions` and `users.selected_role` columns —
+///   account kind is the admin's name, and no account stores an agent role.
+///   Two entries, never one, so each drop keeps its own body (see
+///   [`drop_column_if_missing`]).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -558,7 +563,7 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "36",
         target: TargetDb::Core,
-        body: MigrationBody::Rust(detach_non_admin_workspaces),
+        body: MigrationBody::Rust(detach_guest_workspaces),
     },
     Migration {
         id: "37",
@@ -569,6 +574,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "38",
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_users_granted_tools),
+    },
+    Migration {
+        id: "39",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(drop_users_permissions),
+    },
+    Migration {
+        id: "40",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(drop_users_selected_role),
     },
 ];
 
@@ -645,9 +660,10 @@ async fn run_catalog(conn: &Connection, db: TargetDb, catalog: &[Migration]) -> 
                 // Unlike an SQL entry, a Rust body and its tracking row are not
                 // recorded atomically (the body runs without a transaction). This
                 // is safe because every Rust body — the `chat_history` reply-column
-                // upfill, which probes before altering — is idempotent and
-                // re-runnable, so a crash between body success and id recording
-                // re-runs the body without corruption on the next boot.
+                // upfill and the `users` column drops, which probe before
+                // altering — is idempotent and re-runnable, so a crash between
+                // body success and id recording re-runs the body without
+                // corruption on the next boot.
                 run(conn)
                     .await
                     .with_context(|| format!("Migration '{}' failed", migration.id))?;
@@ -761,6 +777,29 @@ async fn add_column_if_missing(conn: &Connection, table: &str, column: &str) -> 
     Ok(())
 }
 
+/// Drop `table.column` when it still exists. Turso has no
+/// `DROP COLUMN IF [NOT] EXISTS`, and a baseline `CREATE TABLE` already omits
+/// a dropped column on fresh installs, so the probe is what makes a drop body
+/// idempotent (non-transactional like every Rust body, re-runnable until
+/// recorded).
+///
+/// The table is rewritten by the drop, so a drop body holds exactly one
+/// statement. Dropping is one-way: an older binary whose queries still name the
+/// dropped column finds no such column, which the catalog treats as a hard
+/// failure — a column drop has no downgrade path.
+async fn drop_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<()> {
+    if column_exists(conn, table, column).await? {
+        conn.execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"), ())
+            .await
+            .with_context(|| format!("Failed to drop {table}.{column}"))?;
+    }
+    Ok(())
+}
+
 fn add_jobs_caller_agent_and_session_created_at(
     conn: &Connection,
 ) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -856,28 +895,31 @@ async fn run_add_alarms_command(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "alarms", "command").await
 }
 
-fn detach_non_admin_workspaces(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
-    Box::pin(run_detach_non_admin_workspaces(conn))
+fn detach_guest_workspaces(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_detach_guest_workspaces(conn))
 }
 
 /// Data migration: workspace membership becomes admin-only.
 ///
-/// Detaches every non-admin user from shared workspaces by clearing
-/// `users.selected_workspace` (NULL = the user's personal workspace). The
-/// admin predicate is exactly `permissions = 'full'` — the same single
+/// Detaches every guest from shared workspaces by clearing
+/// `users.selected_workspace` (NULL = the account's personal workspace).
+///
+/// The admin predicate is exactly the account-name test — the same single
 /// predicate the runtime guards use, so migration and runtime can never
-/// disagree. Users, chat history, personal workspaces and alarms are
-/// preserved — detach, not deletion. Idempotent: re-running matches no rows
+/// disagree. A body naming the legacy account-kind token would not parse on a
+/// fresh install: entry `24`'s baseline never creates it, and entries `39`/`40`
+/// drop it on every existing install.
+/// Accounts, chat history, personal workspaces and alarms are preserved —
+/// detach, not deletion. Idempotent: re-running matches no rows
 /// (non-transactional like every Rust body, re-runnable until recorded).
-async fn run_detach_non_admin_workspaces(conn: &Connection) -> anyhow::Result<()> {
+async fn run_detach_guest_workspaces(conn: &Connection) -> anyhow::Result<()> {
     conn.execute(
         "UPDATE users SET selected_workspace = NULL \
-         WHERE selected_workspace IS NOT NULL \
-         AND (permissions IS NULL OR permissions <> 'full')",
-        (),
+         WHERE selected_workspace IS NOT NULL AND name <> ?1",
+        params![crate::users::ADMIN_USER_NAME],
     )
     .await
-    .with_context(|| "Failed to detach non-admin users from shared workspaces")?;
+    .with_context(|| "Failed to detach guests from shared workspaces")?;
     Ok(())
 }
 
@@ -893,6 +935,34 @@ fn add_users_granted_tools(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()
 /// custom tool names granted to the user; NULL/empty means no grants.
 async fn run_add_users_granted_tools(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "users", "granted_tools").await
+}
+
+fn drop_users_permissions(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_drop_users_permissions(conn))
+}
+
+/// Drop `users.permissions` for databases created before delta `39`.
+///
+/// The column held the account-kind token (`'full'` = admin, nothing = guest),
+/// duplicating what the account's name already says; the admin's name is the
+/// only account-kind marker now. An account that held `'full'` under a name
+/// other than the admin's becomes a guest and keeps its stored workspace
+/// selection, which the runtime clamp resolves to its personal workspace — the
+/// clamp is the enforcement point, this body does not rewrite the selection.
+async fn run_drop_users_permissions(conn: &Connection) -> anyhow::Result<()> {
+    drop_column_if_missing(conn, "users", "permissions").await
+}
+
+fn drop_users_selected_role(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_drop_users_selected_role(conn))
+}
+
+/// Drop `users.selected_role` for databases created before delta `40`.
+///
+/// The column stored a per-account agent-role selection that always resolved
+/// to the single Assistant and therefore decided nothing.
+async fn run_drop_users_selected_role(conn: &Connection) -> anyhow::Result<()> {
+    drop_column_if_missing(conn, "users", "selected_role").await
 }
 
 #[cfg(test)]
@@ -1177,9 +1247,7 @@ mod tests {
             "users",
             &[
                 "name",
-                "permissions",
                 "selected_workspace",
-                "selected_role",
                 "image_gen_model",
                 "video_model",
                 "granted_tools",
@@ -1897,9 +1965,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 let needs_default = sel.is_empty() || {
                     // 'artist' stays accepted here: this migration body already
                     // ran on older stores, and re-running it on a mid-chain
-                    // upgrade must not clobber legacy 'artist' rows — the
-                    // runtime pool clamp resolves them instead (admin → first
-                    // pool role). New writes can never produce 'artist'.
+                    // upgrade must not clobber legacy 'artist' rows. New writes
+                    // can never produce 'artist'.
                     let in_pool = if permissions.as_deref() == Some("full") {
                         matches!(sel.as_str(), "support" | "assistant" | "manager" | "artist")
                     } else {
@@ -2201,11 +2268,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     // ── Tests ──────────────────────────────────────────────────────────
 
-    /// A fresh install runs the baseline (`24`–`31`) and converges to the
-    /// exact current core shape: the table set (which also proves the required
-    /// absences of `user_roles` / `config_role` / `ticket_jobs` /
-    /// `ticket_stage_jobs`) and the per-table column sets (which prove the
-    /// absences of `assigned_to` / `pipeline_reservation` / `paused_frozen`).
+    /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`
+    /// upfills and the `36`–`40` tail, and converges to the exact current core
+    /// shape: the table set (which also proves the required absences of
+    /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
+    /// the per-table column sets (which prove the absences of `assigned_to` /
+    /// `pipeline_reservation` / `paused_frozen` and of the account-kind
+    /// `users.permissions` / `users.selected_role`).
     #[tokio::test]
     async fn fresh_install_converges_to_expected_shape() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2225,22 +2294,12 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         applied.sort();
         assert_eq!(
             applied,
-            vec![
-                "24".to_string(),
-                "25".to_string(),
-                "27".to_string(),
-                "28".to_string(),
-                "29".to_string(),
-                "30".to_string(),
-                "31".to_string(),
-                "32".to_string(),
-                "33".to_string(),
-                "34".to_string(),
-                "36".to_string(),
-                "37".to_string(),
-                "38".to_string()
-            ],
-            "fresh core applies the 24–34 baseline + the 36/37/38 tail exactly"
+            [
+                "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
+                "40"
+            ]
+            .map(String::from),
+            "fresh core applies the 24–34 baseline + the 36–40 tail exactly"
         );
     }
 
@@ -2368,8 +2427,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO users (name, permissions, selected_workspace, selected_role) \
-             VALUES ('bob', NULL, 'ws', 'assistant')",
+            "INSERT INTO users (name, selected_workspace) VALUES ('bob', 'ws')",
             (),
         )
         .await
@@ -2507,7 +2565,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`–`34`/`36`/`37`/`38`) as a
+    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`40`) as a
     /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
     /// column upfill, the delta-28 `jobs.caller_agent_id` /
     /// `session_metadata.created_at` column upfills (plus the delta-28
@@ -2516,8 +2574,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `sleep_ended` column upfill, the delta-32 `alarms.command` column
     /// upfill, the delta-33 `chat_history.broadcast_id` column upfill, the
     /// delta-34 `tickets.last_transition_actor` / `ticket_chronicle.actor`
-    /// column upfill, and the delta-38 `users.granted_tools` column upfill —
-    /// plus the delta-36 data rewrite, which detaches the seeded non-admin from
+    /// column upfill, the delta-38 `users.granted_tools` column upfill, and the
+    /// delta-39/40 `users` column drops —
+    /// plus the delta-36 data rewrite, which detaches the seeded guest from
     /// `users.selected_workspace` (row counts unchanged; the snapshot compares
     /// only counts, chat content and tickets). All asserted explicitly. This
     /// also proves Turso honors `IF NOT EXISTS` on the FTS index when the
@@ -2546,37 +2605,29 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             .expect("new catalog");
 
         let mut expected_ids = before_ids.clone();
-        expected_ids.push("24".to_string());
-        expected_ids.push("25".to_string());
-        expected_ids.push("27".to_string());
-        expected_ids.push("28".to_string());
-        expected_ids.push("29".to_string());
-        expected_ids.push("30".to_string());
-        expected_ids.push("31".to_string());
-        expected_ids.push("32".to_string());
-        expected_ids.push("33".to_string());
-        expected_ids.push("34".to_string());
-        expected_ids.push("36".to_string());
-        expected_ids.push("37".to_string());
-        expected_ids.push("38".to_string());
+        for id in [
+            "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
+            "40",
+        ] {
+            expected_ids.push(id.to_string());
+        }
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34/36/37/38"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..40"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
-        // jobs/session_metadata (delta 28), users (deltas 29/38), jobs.mode
-        // (delta 30), session_metadata.sleep_ended (delta 31),
+        // jobs/session_metadata (delta 28), users (deltas 29/38/39/40),
+        // jobs.mode (delta 30), session_metadata.sleep_ended (delta 31),
         // alarms.command (delta 32), chat_history.broadcast_id (delta 33) and
-        // tickets/ticket_chronicle (delta 34) gain their columns, appended at
-        // the end by the ALTER, and the delta-28 `idx_jobs_caller_agent` index
-        // is added. Delta `36` rewrites `users.selected_workspace` data
-        // (detaching the seeded non-admin), which leaves row counts unchanged —
-        // the snapshot compares only counts, chat content and tickets, so the
-        // no-op assertions still hold.
+        // tickets/ticket_chronicle (delta 34) change in shape and the delta-28
+        // `idx_jobs_caller_agent` index is added. Delta `36` rewrites
+        // `users.selected_workspace` data (detaching the seeded guest),
+        // which leaves row counts unchanged — the snapshot compares only
+        // counts, chat content and tickets, so the no-op assertions still hold.
         assert_core_catalog_unchanged(
             &conn,
             &before,
@@ -2618,12 +2669,14 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         );
         let after_users_cols = column_sets(&conn, &["users"]).await;
         let mut expected_users_cols = before.cols["users"].clone();
+        expected_users_cols.retain(|c| c != "permissions" && c != "selected_role");
         expected_users_cols.push("image_gen_model".to_string());
         expected_users_cols.push("video_model".to_string());
         expected_users_cols.push("granted_tools".to_string());
         assert_eq!(
             after_users_cols["users"], expected_users_cols,
-            "reopen must append exactly image_gen_model/video_model/granted_tools to users columns"
+            "reopen must append exactly image_gen_model/video_model/granted_tools \
+             and drop permissions/selected_role from users columns"
         );
         let after_alarms_cols = column_sets(&conn, &["alarms"]).await;
         let mut expected_alarms_cols = before.cols["alarms"].clone();
@@ -2756,10 +2809,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
     /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
     /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
-    /// entries `36`–`38`: two data migrations (detaching non-admins from
-    /// shared workspaces, and rewriting the legacy `DeepSeek` routing slug)
-    /// and the `users.granted_tools` column; every other row and table's
-    /// schema is untouched.
+    /// entries `36`–`40`: two data migrations (detaching guests from
+    /// shared workspaces, and rewriting the legacy `DeepSeek` routing slug),
+    /// the `users.granted_tools` column and the drops of the account-kind
+    /// `users.permissions` / `users.selected_role` columns.
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
@@ -2859,25 +2912,18 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         assert_eq!(contents, vec!["hello".to_string(), "hi alice".to_string()]);
 
         let mut expected_ids = before_ids.clone();
-        expected_ids.push("24".to_string());
-        expected_ids.push("25".to_string());
-        expected_ids.push("27".to_string());
-        expected_ids.push("28".to_string());
-        expected_ids.push("29".to_string());
-        expected_ids.push("30".to_string());
-        expected_ids.push("31".to_string());
-        expected_ids.push("32".to_string());
-        expected_ids.push("33".to_string());
-        expected_ids.push("34".to_string());
-        expected_ids.push("36".to_string());
-        expected_ids.push("37".to_string());
-        expected_ids.push("38".to_string());
+        for id in [
+            "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
+            "40",
+        ] {
+            expected_ids.push(id.to_string());
+        }
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34/36/37/38"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..40"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -2892,6 +2938,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         assert!(
             after_users_cols.contains(&"granted_tools".to_string()),
             "granted_tools must be added to users"
+        );
+        assert!(
+            !after_users_cols.contains(&"permissions".to_string())
+                && !after_users_cols.contains(&"selected_role".to_string()),
+            "the account-kind columns must be dropped from users"
         );
         let after_alarms_cols = column_names(&conn, "alarms").await;
         assert!(
@@ -2962,11 +3013,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     }
 
     /// Behavioral pin for delta `36`: workspace membership is admin-only, so the
-    /// migration detaches every non-admin from shared workspaces (clearing
-    /// `selected_workspace` → NULL) while leaving admins attached. Idempotent:
-    /// re-running matches no rows and changes nothing.
+    /// migration detaches every guest from shared workspaces (clearing
+    /// `selected_workspace` → NULL) while leaving the admin attached.
+    /// Idempotent: re-running matches no rows and changes nothing.
     #[tokio::test]
-    async fn detach_non_admin_workspaces_clears_only_non_admins() {
+    async fn detach_guest_workspaces_clears_only_guests() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let conn = crate::db::open_with_schema(
@@ -2981,47 +3032,134 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             .await
             .expect("baseline catalog");
 
-        // Admin with a shared workspace, a non-admin sharing it, and a non-admin
+        // The admin with a shared workspace, a guest sharing it, and a guest
         // already on their personal workspace (NULL).
         conn.execute(
-            "INSERT INTO users (name, permissions, selected_workspace) \
-             VALUES ('admin_user', 'full', 'shared_ws')",
+            "INSERT INTO users (name, selected_workspace) VALUES ('admin', 'shared_ws')",
             (),
         )
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO users (name, permissions, selected_workspace) \
-             VALUES ('non_admin_shared', NULL, 'shared_ws')",
+            "INSERT INTO users (name, selected_workspace) VALUES ('guest_shared', 'shared_ws')",
             (),
         )
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO users (name, permissions, selected_workspace) \
-             VALUES ('non_admin_null', NULL, NULL)",
+            "INSERT INTO users (name, selected_workspace) VALUES ('guest_null', NULL)",
             (),
         )
         .await
         .unwrap();
 
-        run_detach_non_admin_workspaces(&conn).await.unwrap();
+        run_detach_guest_workspaces(&conn).await.unwrap();
 
         let after = users_selected_workspaces(&conn).await;
         assert_eq!(
-            after["admin_user"],
+            after["admin"],
             Some("shared_ws".to_string()),
-            "admins keep their shared workspace"
+            "the admin keeps their shared workspace"
         );
         assert_eq!(
-            after["non_admin_shared"], None,
-            "non-admins are detached from shared workspaces"
+            after["guest_shared"], None,
+            "guests are detached from shared workspaces"
         );
-        assert_eq!(after["non_admin_null"], None, "already-personal stays NULL");
+        assert_eq!(after["guest_null"], None, "already-personal stays NULL");
 
         // Idempotence: re-running matches no rows and changes nothing.
-        run_detach_non_admin_workspaces(&conn).await.unwrap();
+        run_detach_guest_workspaces(&conn).await.unwrap();
         assert_eq!(users_selected_workspaces(&conn).await, after);
+    }
+
+    /// Behavioral pin for catalog entries `39`/`40`: dropping
+    /// `users.permissions` and `users.selected_role` rewrites the populated
+    /// table, so every other account column must come through intact, a second
+    /// execution must be a no-op (the bodies probe for their column).
+    #[tokio::test]
+    async fn drop_account_kind_columns_preserves_row_data() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        conn.execute(
+            "CREATE TABLE users (\
+             name TEXT PRIMARY KEY, permissions TEXT, selected_workspace TEXT, \
+             selected_role TEXT, image_gen_model TEXT, video_model TEXT, granted_tools TEXT\
+             )",
+            (),
+        )
+        .await
+        .expect("create pre-39 users table");
+        conn.execute(
+            "INSERT INTO users \
+             (name, permissions, selected_workspace, selected_role, image_gen_model, \
+              video_model, granted_tools) \
+             VALUES ('admin', 'full', 'proj', 'assistant', 'img-model', 'vid-model', '[\"t\"]')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO users (name, permissions, selected_workspace, selected_role) \
+             VALUES ('guest', NULL, NULL, 'engineer')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        run_drop_users_permissions(&conn).await.unwrap();
+        run_drop_users_selected_role(&conn).await.unwrap();
+
+        let expected_columns: Vec<String> = [
+            "name",
+            "selected_workspace",
+            "image_gen_model",
+            "video_model",
+            "granted_tools",
+        ]
+        .iter()
+        .map(|c| (*c).to_string())
+        .collect();
+        assert_eq!(column_names(&conn, "users").await, expected_columns);
+        let rows = conn
+            .query(
+                "SELECT name, selected_workspace, image_gen_model, video_model, granted_tools \
+                 FROM users ORDER BY name",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get::<String>(0).unwrap(), "admin");
+        assert_eq!(
+            rows[0].get::<Option<String>>(1).unwrap(),
+            Some("proj".to_string()),
+            "the admin's selected workspace must survive the table rewrite"
+        );
+        assert_eq!(
+            rows[0].get::<Option<String>>(2).unwrap(),
+            Some("img-model".to_string())
+        );
+        assert_eq!(
+            rows[0].get::<Option<String>>(3).unwrap(),
+            Some("vid-model".to_string())
+        );
+        assert_eq!(
+            rows[0].get::<Option<String>>(4).unwrap(),
+            Some("[\"t\"]".to_string())
+        );
+        assert_eq!(rows[1].get::<String>(0).unwrap(), "guest");
+        assert_eq!(rows[1].get::<Option<String>>(1).unwrap(), None);
+        assert_eq!(rows[1].get::<Option<String>>(4).unwrap(), None);
+
+        // Idempotence: both bodies probe for their column.
+        run_drop_users_permissions(&conn).await.unwrap();
+        run_drop_users_selected_role(&conn).await.unwrap();
+        assert_eq!(column_names(&conn, "users").await, expected_columns);
     }
 
     /// Behavioral pin for catalog entry `37`: the legacy DeepSeek routing value

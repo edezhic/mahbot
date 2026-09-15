@@ -31,11 +31,11 @@ static KICKOFF_FIRED: AtomicBool = AtomicBool::new(false);
 /// (the greeting crosses many channel hops; the persist is a single fast
 /// config_kv upsert), so `Session::build_context_messages` cannot rely on
 /// `onboarding_stage() != Finished` alone to inject the onboarding guide.
-/// The kickoff arms this flag; the first full-access Assistant session built
+/// The kickoff arms this flag; the first Assistant session built for the admin
 /// afterwards consumes it and gets the guide — in practice the greeting
-/// session, since nothing else builds an admin Assistant session during the
-/// kickoff window. If the greeting send fails, the next admin Assistant
-/// session receives the guide instead (a reasonable fallback).
+/// session, since nothing else builds one during the kickoff window. If the
+/// greeting send fails, the next admin Assistant session receives the guide
+/// instead (a reasonable fallback).
 static GREETING_GUIDE_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Arm the pending-guide bridge (see [`GREETING_GUIDE_PENDING`]).
@@ -180,7 +180,7 @@ pub fn invalid_message() -> &'static str {
 /// Onboarding is strictly one-shot: the `== Init` gate plus the `KICKOFF_FIRED`
 /// CAS make re-trigger impossible, even after a provider reconnection or a
 /// second workspace — the state can only move `Init` → `Finished` and only this
-/// route moves it. Non-admin users NEVER trigger onboarding (none is planned
+/// route moves it. A guest NEVER triggers onboarding (none is planned
 /// for them): the `is_admin` gate fails closed.
 pub async fn kickoff_onboarding(user_name: &str) -> anyhow::Result<()> {
     use crate::config::OnboardingState;
@@ -192,7 +192,7 @@ pub async fn kickoff_onboarding(user_name: &str) -> anyhow::Result<()> {
     }
     // The onboarding flow is admin-only: bail before touching the
     // global state when the triggering user is not an admin (fails closed).
-    // This keeps a non-admin (created via the Settings bypass pre-provider)
+    // This keeps a guest (created via the Settings bypass pre-provider)
     // from consuming the onboarding state or emitting the auto-message.
     if !crate::users::is_admin(user_name).await {
         return Ok(());

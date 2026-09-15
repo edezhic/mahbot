@@ -267,9 +267,8 @@ pub struct ConfigData {
     /// Set to `"true"` to enable voice mode.
     pub voice_enabled: Option<String>,
     /// Enable text-to-speech for agent responses (default: `"false"`).
-    /// Set to `"true"` to enable. When enabled, agent responses are spoken
-    /// aloud via the OS-native audio player when the responding role matches
-    /// the user's active GUI role.
+    /// Set to `"true"` to enable. When enabled, the Assistant's agent responses
+    /// are spoken aloud via the OS-native audio player.
     pub tts_enabled: Option<String>,
     /// Language tag for TTS synthesis (default: `"na"` — language-agnostic).
     /// Supported codes: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr,

@@ -30,16 +30,16 @@ fn identity() -> Result<AssistantIdentity> {
     })
 }
 
-/// The `add_alarm` tool. `admin` (full-access Assistant) unlocks the
+/// The `add_alarm` tool. The admin's Assistant unlocks the
 /// optional `command` parameter — command-armed alarms that wake the
 /// Assistant only when the command produces output or fails.
 pub struct AddAlarmTool {
-    admin: bool,
+    is_admin: bool,
 }
 
 impl AddAlarmTool {
-    pub(crate) const fn new(admin: bool) -> Self {
-        Self { admin }
+    pub(crate) const fn new(is_admin: bool) -> Self {
+        Self { is_admin }
     }
 }
 
@@ -51,7 +51,7 @@ impl Tool for AddAlarmTool {
 
     fn description(&self) -> String {
         let base = crate::prompt::load_prompt("tool/add_alarm.md");
-        if self.admin {
+        if self.is_admin {
             format!(
                 "{base}\n\n{}",
                 crate::prompt::load_prompt("tool/add_alarm_command.md")
@@ -84,7 +84,7 @@ impl Tool for AddAlarmTool {
                 "description": "Periodic interval in seconds (minimum 10). Exactly one of fire_at or interval_seconds must be provided."
             }),
         );
-        if self.admin {
+        if self.is_admin {
             properties.insert(
                 "command".to_string(),
                 json!({
@@ -97,12 +97,12 @@ impl Tool for AddAlarmTool {
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        // Reject BEFORE reading anything else: a non-admin must never get a
+        // Reject BEFORE reading anything else: a guest must never get a
         // silently-degraded plain alarm when it asked for a command-armed one.
         // Explicit null is treated as absent, matching the admin path below.
-        if !self.admin && args.get("command").is_some_and(|v| !v.is_null()) {
+        if !self.is_admin && args.get("command").is_some_and(|v| !v.is_null()) {
             anyhow::bail!(
-                "The `command` parameter is only available in full-access (admin) sessions."
+                "forbidden: the `command` parameter is only available in the admin's sessions — hint: use a time-only reminder, or ask the admin to arm the command"
             );
         }
         // An admin passing a non-string `command` is a caller error, never a

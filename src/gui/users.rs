@@ -1,7 +1,7 @@
 //! Settings Users section state — user list, delete confirmation, and Telegram
 //! channel binding.
 
-use crate::users::{FieldUpdate, UserRecordEntry, UserStore};
+use crate::users::{UserRecordEntry, UserStore};
 
 use iced::Task;
 
@@ -15,20 +15,23 @@ pub(crate) fn user_store() -> Result<&'static UserStore, String> {
         .ok_or_else(|| "User store not initialized".to_string())
 }
 
-/// Run a single-field `update_user`, mapping an empty value (or a `personal:{user}`
-/// workspace name) to [`FieldUpdate::Clear`] — the personal workspace is stored
-/// as NULL and computed on the fly. Updates the workspace column.
-pub(crate) async fn update_user_field(sender: String, workspace: String) -> Result<(), String> {
+/// Run a single-field `set_selected_workspace`, mapping an empty value (or a
+/// `personal:{user}` workspace name) to `None` — the personal workspace is
+/// stored as NULL and computed on the fly. Updates the workspace column.
+pub(crate) async fn set_selected_workspace_field(
+    sender: String,
+    workspace: String,
+) -> Result<(), String> {
     let store = user_store()?;
     // Empty and personal-workspace values both mean "no shared workspace
     // selected" → NULL.
     let val = if workspace.is_empty() || crate::users::is_personal_workspace(&workspace) {
-        FieldUpdate::Clear
+        None
     } else {
-        FieldUpdate::Set(&workspace)
+        Some(workspace.as_str())
     };
     store
-        .update_user(&sender, FieldUpdate::Unchanged, val, FieldUpdate::Unchanged)
+        .set_selected_workspace(&sender, val)
         .await
         .map_err(|e| e.to_string())
 }

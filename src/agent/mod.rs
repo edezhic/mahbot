@@ -391,11 +391,11 @@ fn injected_images_message(
 pub(crate) fn role_tools_and_specs(
     role: crate::Role,
     ws: &crate::Workspace,
-    full_access: bool,
+    is_admin: bool,
     chrome_sessions: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
 ) -> (Vec<Box<dyn Tool>>, Vec<crate::ToolSpec>) {
     let tools: Vec<Box<dyn Tool>> = role
-        .tools(ws, full_access, chrome_sessions)
+        .tools(ws, is_admin, chrome_sessions)
         .into_iter()
         .filter(|t| t.is_advertised())
         .collect();
@@ -411,12 +411,12 @@ pub(crate) fn role_tools_and_specs(
 pub(crate) fn role_tool_specs(
     role: crate::Role,
     ws: &crate::Workspace,
-    full_access: bool,
+    is_admin: bool,
 ) -> Vec<crate::ToolSpec> {
     role_tools_and_specs(
         role,
         ws,
-        full_access,
+        is_admin,
         std::sync::Arc::new(crate::tools::chrome::ChromeRunSessions::default()),
     )
     .1
@@ -511,17 +511,13 @@ impl Agent {
         ticket: Option<crate::pipeline::board::Ticket>,
         user_name: String,
         channel: String,
-        full_access: bool,
+        is_admin: bool,
         parent_key: Option<crate::agent::registry::ParentKey>,
         parent_label: Option<String>,
     ) -> Self {
         let chrome_sessions = crate::tools::chrome::ChromeRunSessions::for_run(&agent_id);
-        let (tools, tool_specs) = role_tools_and_specs(
-            role,
-            ws,
-            full_access,
-            std::sync::Arc::clone(&chrome_sessions),
-        );
+        let (tools, tool_specs) =
+            role_tools_and_specs(role, ws, is_admin, std::sync::Arc::clone(&chrome_sessions));
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let pause_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -588,7 +584,7 @@ impl Agent {
             tool_stats: std::sync::Mutex::new(Vec::new()),
             user_name,
             channel,
-            full_access,
+            is_admin,
             parent_key,
             parent_label,
             incoming_rx: None,
@@ -845,7 +841,7 @@ impl Agent {
                     &self.channel,
                     &self.user_name,
                     self.round_ts.as_deref(),
-                    self.full_access,
+                    self.is_admin,
                 )
                 .await?;
         }
@@ -2370,7 +2366,7 @@ impl Agent {
                         &self.workspace,
                         &self.role,
                         self.ticket.as_ref(),
-                        self.full_access,
+                        self.is_admin,
                         &self.user_name,
                     )
                     .await;
@@ -2706,7 +2702,7 @@ pub(crate) async fn run_agent(
     message: &str,
     user_name: String,
     channel: String,
-    full_access: bool,
+    is_admin: bool,
     incoming_rx: Option<
         tokio::sync::mpsc::UnboundedReceiver<crate::agent::message_router::AgentJob>,
     >,
@@ -2737,7 +2733,7 @@ pub(crate) async fn run_agent(
         ticket.cloned(),
         user_name,
         channel,
-        full_access,
+        is_admin,
         parent_key,
         parent_label,
     );
@@ -2964,7 +2960,7 @@ mod tests {
             tool_stats: std::sync::Mutex::new(Vec::new()),
             user_name: String::new(),
             channel: String::new(),
-            full_access: false,
+            is_admin: false,
             parent_key: None,
             parent_label: None,
             incoming_rx: None,

@@ -1,13 +1,13 @@
 //! Channel message enrichment: media marker processing, link enrichment, file
-//! operations, and per-role media handling.
+//! operations, and media handling.
 //!
 //! This module transforms [`ChannelMessage`] content before it reaches the
 //! agent pipeline. It handles:
 //! - **Media markers** (`[IMAGE: ...]`, `[AUDIO: ...]`, `[VIDEO: ...]`,
-//!   `[FILE: ...]`) → inbound local images become native data-URI parts for
-//!   EVERY role (byte-identical for Assistant, bounded-JPEG compressed for all
-//!   others); audio is transcribed to text; video handling is workspace copy +
-//!   transcription for every role (no role split); an inbound document is
+//!   `[FILE: ...]`) → inbound local images become native data-URI parts
+//!   carrying the original bytes, re-encoded to a bounded JPEG only when they
+//!   would exceed the encoded-payload cap; audio is transcribed to text; video
+//!   handling is workspace copy + transcription; an inbound document is
 //!   copied into the workspace and converted to text plus images
 //! - **Link enrichment** → prepends webpage summaries for URLs in the message
 //! - **File operations** → saving media to workspace, cleaning up temporary
@@ -28,10 +28,9 @@
 //! The entry points are [`enrich_message`] and [`enrich_links`], re-exported
 //! from [`crate::channels`], and [`has_inbound_temp_marker`], which
 //! [`crate::channels::persist_content`] calls directly to decide what content is
-//! persisted to chat history. The [`EnrichmentStrategy`] struct carries the
-//! per-role knobs: image and video handling are unconditional (native data-URI
-//! parts for images, workspace copy + transcription for videos — every role),
-//! while image compression is role-dependent.
+//! persisted to chat history. [`enrich_message`] also takes the workspace whose
+//! `uploads/` dir receives saved full-resolution media copies (`None` disables
+//! copies) — that uploads path is what makes video transcription possible.
 
 use crate::ChannelMessage;
 use crate::document::{DocOutcome, INLINE_TEXT_MAX_CHARS, convert_document_file};
@@ -193,21 +192,6 @@ async fn copy_to_uploads(
     Some(path)
 }
 
-/// Per-message media-enrichment behavior, decided at the channel boundary for
-/// the routed role. Image handling is unconditional (native data-URI parts for
-/// every role) and video handling is unconditional too (workspace copy +
-/// transcription for every role); only image compression is role-dependent.
-#[derive(Debug, Clone)]
-pub struct EnrichmentStrategy {
-    /// Workspace uploads dir for saved full-resolution media copies (`None`
-    /// disables copies).
-    pub workspace_path: Option<std::path::PathBuf>,
-    /// Downscale/compress inbound local images to a bounded JPEG before they
-    /// enter the session — every role EXCEPT Assistant. Assistant passes
-    /// through full-resolution byte-identical.
-    pub compress_images: bool,
-}
-
 /// Outcome of processing an IMAGE marker.
 enum ImageAction {
     /// Keep the marker unchanged (e.g. HTTP/HTTPS URL).
@@ -245,31 +229,15 @@ impl ImageAction {
 
 /// Produce a data-URI for a confirmed-decodable local raster that is guaranteed
 /// under the shared encoded-payload cap the provider accepts, so an image is
-/// never silently dropped downstream. When `compress` is set the primary encode
-/// is a bounded JPEG; a compression failure (the only non-validity error left
-/// after the classifier gate) falls back to the original bytes. Any over-cap
-/// result is re-encoded to a bounded JPEG, and a degenerate over-cap result even
-/// after that re-encode fails closed.
-async fn bounded_image_data_uri(path: &std::path::Path, compress: bool) -> anyhow::Result<String> {
-    let primary = if compress {
-        match crate::util::local_image_to_compressed_data_uri(path).await {
-            Ok(uri) => Ok(uri),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "Image compression failed — passing the original bytes through");
-                crate::util::local_image_to_data_uri(path).await
-            }
-        }
-    } else {
-        crate::util::local_image_to_data_uri(path).await
-    };
-    match primary {
+/// never silently dropped downstream. The primary encode passes the original
+/// bytes through; any over-cap result is re-encoded to a bounded JPEG, and a
+/// degenerate over-cap result even after that re-encode fails closed.
+async fn bounded_image_data_uri(path: &std::path::Path) -> anyhow::Result<String> {
+    match crate::util::local_image_to_data_uri(path).await {
         Ok(uri) if uri.len() <= media_target::MAX_DATA_URI_ENCODED_BYTES => Ok(uri),
         Ok(_) => {
-            // Over-cap: fall back to a bounded JPEG re-encode. On the compress
-            // path the primary is the byte-identical fallback (a compress-succeeded
-            // JPEG is always under cap), so re-running the compressor may recover
-            // the image; if it is still over-cap it fails closed rather than forward
-            // an over-cap payload.
+            // Over-cap: fall back to a bounded JPEG re-encode. If it is still
+            // over-cap it fails closed rather than forward an over-cap payload.
             tracing::warn!(path = %path.display(), "image data-URI exceeds the encoded-payload cap — re-encoding to a bounded JPEG");
             let reencoded = crate::util::local_image_to_compressed_data_uri(path).await?;
             if reencoded.len() <= media_target::MAX_DATA_URI_ENCODED_BYTES {
@@ -286,16 +254,15 @@ async fn bounded_image_data_uri(path: &std::path::Path, compress: bool) -> anyho
 
 /// Handle an IMAGE marker — convert to a data URI, an [`ImageAction::Invalid`]
 /// target, or (for out-of-scope paths) a plain-text annotation. Saves a
-/// workspace copy if `uploads_dir` is available. When `compress` is set the
-/// data URI is a bounded-JPEG re-encode (non-Assistant roles); otherwise the
-/// original bytes pass through byte-identical (Assistant). The returned
-/// action's `delete_temp` tells the caller whether the source temp file was
-/// consumed from this message's inbound attachments and may be cleaned up.
+/// workspace copy if `uploads_dir` is available. The data URI carries the
+/// original bytes, re-encoded to a bounded JPEG only when it would exceed the
+/// encoded-payload cap. The returned action's `delete_temp` tells the caller
+/// whether the source temp file was consumed from this message's inbound
+/// attachments and may be cleaned up.
 async fn handle_image(
     path: &str,
     path_obj: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
-    compress: bool,
     staging_dirs: &[String],
 ) -> ImageAction {
     // Only a well-formed http(s) URL is sent as-is; a malformed one falls
@@ -334,12 +301,11 @@ async fn handle_image(
     }
 
     // Convert to data URI for the API request. The classifier above already
-    // established the file is a decodable native raster, so a compression
-    // failure is a bounded re-encode issue — not a validity one — and the
-    // helper falls back to the original bytes (fail-open) rather than a second
-    // decode. It is never a junk data-URI, because the authoritative classifier
-    // gate already rejected any corrupt-but-magic-valid file.
-    let data_uri = bounded_image_data_uri(path_obj, compress).await;
+    // established the file is a decodable native raster, so the only failure
+    // left is an image too large even after the bounded re-encode — never a
+    // junk data-URI, because the authoritative classifier gate already rejected
+    // any corrupt-but-magic-valid file.
+    let data_uri = bounded_image_data_uri(path_obj).await;
 
     // Save a workspace copy only once the image actually converts, so a dead /
     // corrupt file never leaves a junk upload copy plus a "[Saved image: ...]"
@@ -491,9 +457,9 @@ async fn handle_video(
             transcription,
         };
     }
-    // Copy failed (or no uploads dir — e.g. a no-role message): annotate
-    // without transcription, but the in-scope temp file is still a pure
-    // intermediate artifact and is cleaned up. `is_inbound_attachment` was
+    // Copy failed (or no uploads dir — e.g. a message with no workspace):
+    // annotate without transcription, but the in-scope temp file is still a
+    // pure intermediate artifact and is cleaned up. `is_inbound_attachment` was
     // verified above, so the delete stays inside the containment boundary.
     VideoAction {
         replacement: format!("[Video: {} attached]", file_name_or_path(path)),
@@ -502,7 +468,7 @@ async fn handle_video(
     }
 }
 
-/// Transcribe a saved workspace video copy for the routed role, returning the
+/// Transcribe a saved workspace video copy for the Assistant, returning the
 /// "[Video transcription of <name>]: <text>" annotation (using the original
 /// source `file_name`). Fail-open: returns `None` (plain annotation) when the
 /// transcription fails (unavailable transcriber, unsupported format, upload
@@ -533,7 +499,6 @@ async fn handle_file(
     path: &str,
     path_obj: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
-    compress_images: bool,
     staging_dirs: &[String],
     batch: &mut EnrichmentBatch,
 ) -> Option<String> {
@@ -563,8 +528,8 @@ async fn handle_file(
         ));
     }
     let Some(uploads_dir) = uploads_dir else {
-        // No-role message (broadcast but never routed): there is no workspace
-        // to copy into and no agent to convert for.
+        // No workspace path: nowhere to copy the file into and no agent to
+        // convert it for.
         return Some(format!(
             "[File {name}: received, not saved to the workspace]"
         ));
@@ -602,15 +567,7 @@ async fn handle_file(
             let mut unreadable_pages = 0usize;
             for image in images {
                 let image_path = image.to_string_lossy().to_string();
-                match handle_image(
-                    &image_path,
-                    &image,
-                    Some(uploads_dir),
-                    compress_images,
-                    staging_dirs,
-                )
-                .await
-                {
+                match handle_image(&image_path, &image, Some(uploads_dir), staging_dirs).await {
                     ImageAction::Keep => {}
                     ImageAction::Invalid { delete_temp } => {
                         // The page is a temp artifact written by this pass into
@@ -809,7 +766,7 @@ impl EnrichmentBatch {
 
         // ── Marker stripping and annotation prepending ──
         // Strip only the kinds this pass consumed (AUDIO, VIDEO): IMAGE carries
-        // the native parts the routed role's model consumes, FILE is the
+        // the native parts the Assistant's model consumes, FILE is the
         // workspace handle the agent opens itself, and anything else is the
         // user's own words.
         let cleaned = MEDIA_MARKER_RE
@@ -843,29 +800,31 @@ impl EnrichmentBatch {
 }
 
 /// Process all media markers (`[IMAGE:...]`, `[AUDIO:...]`, `[VIDEO:...]`,
-/// `[FILE:...]`) in a single pass. Each marker kind is handled according to the
-/// strategy:
+/// `[FILE:...]`) in a single pass:
 ///
 /// | Kind | Behavior |
 /// |------|----------|
-/// | IMAGE | data URI conversion (byte-identical for Assistant, bounded-JPEG compression for every other role) + workspace copy when in scope |
-/// | AUDIO | transcription (unchanged for all roles) |
-/// | VIDEO | workspace copy + `[Saved video: path]` + transcription (every role) |
-/// | FILE | workspace copy under the sender's name + extracted text and pages (every role); out-of-scope markers stay verbatim |
+/// | IMAGE | data URI conversion (original bytes, re-encoded to a bounded JPEG only when over the encoded-payload cap) + workspace copy when in scope |
+/// | AUDIO | transcription |
+/// | VIDEO | workspace copy + `[Saved video: path]` + transcription |
+/// | FILE | workspace copy under the sender's name + extracted text and pages; out-of-scope markers stay verbatim |
 ///
 /// After processing, the markers this pass consumed (AUDIO, VIDEO) are stripped
 /// from the content, every other kind is preserved (IMAGE is the native image
-/// parts and FILE the workspace handle the routed role's model consumes), and
+/// parts and FILE the workspace handle the Assistant's model consumes), and
 /// annotations are prepended. Temp files are cleaned up after processing,
 /// scoped to this message's own per-message directories — out-of-scope marker
 /// paths are never read, copied, or deleted: IMAGE/AUDIO/VIDEO degrade to plain
 /// annotations and an out-of-scope `[FILE:...]` is left verbatim.
+///
+/// `workspace_path` is the workspace whose `uploads/` dir receives saved media
+/// copies; `None` disables copies.
 // Marker dispatch hub (4 kinds, per-kind handling is extracted into the
 // handler functions above, keeping this loop flat on purpose).
-pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrategy) {
+pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&std::path::Path>) {
     let mut batch = EnrichmentBatch::default();
     let mut result = msg.content.clone();
-    let uploads_dir = strategy.workspace_path.as_ref().map(|p| p.join("uploads"));
+    let uploads_dir = workspace_path.map(|p| p.join("uploads"));
     // The staging directories the receive path created for this message; empty
     // for an off-chat (gui/voice) message, which owns no attachments.
     let staging_dirs = msg.attachment_dirs.clone();
@@ -884,7 +843,6 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                     path,
                     path_obj,
                     uploads_dir.as_deref(),
-                    strategy.compress_images,
                     &staging_dirs,
                     &mut batch,
                 )
@@ -894,14 +852,8 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                 }
             }
             MediaMarkerKind::Image => {
-                let action = handle_image(
-                    path,
-                    path_obj,
-                    uploads_dir.as_deref(),
-                    strategy.compress_images,
-                    &staging_dirs,
-                )
-                .await;
+                let action =
+                    handle_image(path, path_obj, uploads_dir.as_deref(), &staging_dirs).await;
                 let delete_temp = action.delete_temp();
                 match action {
                     ImageAction::Keep => {
@@ -1128,7 +1080,7 @@ mod tests {
         assert_eq!(result.as_ref(), content);
     }
 
-    // ── Enrichment strategy tests ─────────────────────────────────────
+    // ── enrich_message tests ──────────────────────────────────────────
 
     /// The chat id every inbound fixture belongs to: the test messages carry it
     /// and the fixture directories are named after it.
@@ -1275,34 +1227,10 @@ mod tests {
         bytes
     }
 
-    /// Extract the image payload embedded in a `[IMAGE:...]` data URI inside
-    /// `content` and decode it, returning the decoded image dimensions.
-    fn embedded_image_dimensions(content: &str) -> (u32, u32) {
-        use image::GenericImageView;
-        let data_uri = content
-            .split("[IMAGE:")
-            .nth(1)
-            .expect("data URI marker must be present")
-            .split(']')
-            .next()
-            .expect("data URI marker must be closed");
-        let b64 = data_uri
-            .split(',')
-            .nth(1)
-            .expect("data URI must carry a base64 payload");
-        let bytes = STANDARD.decode(b64).expect("data URI base64 must decode");
-        let img = image::load_from_memory(&bytes).expect("embedded image must decode");
-        img.dimensions()
-    }
-
     #[tokio::test]
     async fn enrich_image_http_url_passthrough() {
         let mut msg = test_msg("Check this [IMAGE:https://example.com/img.png] out");
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, None).await;
         assert_eq!(
             msg.content,
             "Check this [IMAGE:https://example.com/img.png] out"
@@ -1312,11 +1240,7 @@ mod tests {
     #[tokio::test]
     async fn enrich_image_file_not_found() {
         let mut msg = test_msg("Here is [IMAGE:/tmp/nonexistent_xyz_img.png] an image");
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, None).await;
         assert!(
             msg.content
                 .contains("[Invalid image reference: /tmp/nonexistent_xyz_img.png]")
@@ -1326,11 +1250,7 @@ mod tests {
     #[tokio::test]
     async fn enrich_audio_annotation_and_strip() {
         let mut msg = test_msg("Listen [AUDIO:/tmp/audio_xyz.mp3] to this");
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, None).await;
         // AUDIO marker stripped; annotation prepended (icon-only fallback since
         // no audio transcriber is configured in the test environment)
         assert!(
@@ -1362,11 +1282,7 @@ mod tests {
         let path_str = tmp.to_string_lossy().to_string();
 
         let mut msg = inbound_msg(7001, &format!("Image: [IMAGE:{path_str}]"));
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, None).await;
 
         // Marker replaced with data URI
         assert!(
@@ -1400,11 +1316,7 @@ mod tests {
         let img_path_str = tmp_img.to_string_lossy().to_string();
 
         let mut msg = inbound_msg(7002, &format!("Image: [IMAGE:{img_path_str}]"));
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         // Data URI present and upload annotation added
         assert!(msg.content.contains("[IMAGE:data:image/png;base64,"));
@@ -1438,11 +1350,7 @@ mod tests {
         let video_path_str = tmp_video.to_string_lossy().to_string();
 
         let mut msg = inbound_msg(7003, &format!("Edit this clip: [VIDEO:{video_path_str}]"));
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         // Marker replaced with a [Saved video: ...] annotation pointing at the
         // workspace uploads copy so the agent can feed it to video_edit.
@@ -1485,11 +1393,7 @@ mod tests {
         let marker = format!("Look at [IMAGE:{}]", arbitrary.display());
 
         let mut msg = test_msg(&marker);
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         assert!(
             msg.content.contains("[Image: secret.png attached]"),
@@ -1522,11 +1426,7 @@ mod tests {
     #[tokio::test]
     async fn enrich_video_http_url_kept_as_plain_text() {
         let mut msg = test_msg("Edit [VIDEO:https://example.com/clip.mp4] this");
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, None).await;
         // HTTP URL video reference is preserved as plain text (no marker strip)
         assert!(
             msg.content
@@ -1539,19 +1439,14 @@ mod tests {
 
     #[tokio::test]
     async fn enrich_video_without_workspace_deletes_in_scope_temp() {
-        // No workspace path (e.g. a no-role user's message): the video gets a
-        // plain annotation, no transcription, but the in-scope inbound
-        // attachment is still a pure intermediate artifact and must be cleaned
-        // up — a regression guard for the no-role gating in main.rs.
+        // No workspace path: the video gets a plain annotation and no
+        // transcription, but the in-scope inbound attachment is still a pure
+        // intermediate artifact and must be cleaned up.
         let (_msg_dir, tmp_video) = inbound_attachment_fixture(7004, "clip.mp4", b"fake mp4").await;
         let video_path_str = tmp_video.to_string_lossy().to_string();
 
         let mut msg = inbound_msg(7004, &format!("Watch [VIDEO:{video_path_str}] this clip"));
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: true,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, None).await;
 
         assert!(
             msg.content.contains(&format!(
@@ -1586,11 +1481,7 @@ mod tests {
         let marker = format!("Watch [VIDEO:{}]", arbitrary.display());
 
         let mut msg = test_msg(&marker);
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: true,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         assert!(
             msg.content.contains("[Video: secret.mp4 attached]"),
@@ -1616,75 +1507,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_non_assistant_image_compressed_to_jpeg_data_uri() {
-        // Real 1100x800 PNG: the longest side exceeds the 1024 px cap, so the
-        // ingestion-time re-encode must downscale it to a bounded JPEG while
-        // the workspace copy stays the full-resolution original.
-        let source_bytes = real_png(1100, 800);
-        let (_msg_dir, tmp) = inbound_attachment_fixture(7005, "photo.png", &source_bytes).await;
-        let path_str = tmp.to_string_lossy().to_string();
-
-        let tmp_root = crate::util::test::test_root().join("test_enrich_compress_ws");
-        let ws_path = tmp_root.join("myworkspace");
-        tokio::fs::create_dir_all(&ws_path).await.unwrap();
-
-        let mut msg = inbound_msg(7005, &format!("Photo: [IMAGE:{path_str}]"));
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: true,
-        };
-        enrich_message(&mut msg, &strategy).await;
-
-        assert!(
-            msg.content.contains("[IMAGE:data:image/jpeg;base64,"),
-            "Compressed JPEG data URI expected, got: {}",
-            msg.content
-        );
-        assert!(
-            !msg.content.contains("data:image/png"),
-            "Original PNG data URI must not appear, got: {}",
-            msg.content
-        );
-        let (dw, dh) = embedded_image_dimensions(&msg.content);
-        assert!(
-            dw.max(dh) <= crate::util::INBOUND_IMAGE_MAX_SIDE,
-            "Compressed image longest side {} must be ≤ 1024",
-            dw.max(dh)
-        );
-        // The workspace copy is the full-resolution original, byte-identical.
-        let uploads_dir = ws_path.join("uploads");
-        let mut entries = tokio::fs::read_dir(&uploads_dir).await.unwrap();
-        let entry = entries
-            .next_entry()
-            .await
-            .unwrap()
-            .expect("one upload copy");
-        let copy_bytes = tokio::fs::read(entry.path()).await.unwrap();
-        assert_eq!(
-            copy_bytes, source_bytes,
-            "Workspace copy must be byte-identical to the source PNG"
-        );
-        // Temp file deleted
-        assert!(
-            !tmp.exists(),
-            "Temp image file must be deleted after enrichment"
-        );
-        // Cleanup
-        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
-    }
-
-    #[tokio::test]
-    async fn enrich_assistant_image_byte_identical_data_uri() {
+    async fn enrich_image_bytes_pass_through_byte_identical() {
         let source_bytes = real_png(64, 48);
         let (_msg_dir, tmp) = inbound_attachment_fixture(7006, "art.png", &source_bytes).await;
         let path_str = tmp.to_string_lossy().to_string();
 
         let mut msg = inbound_msg(7006, &format!("Art: [IMAGE:{path_str}]"));
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, None).await;
 
         let expected = format!(
             "[IMAGE:data:image/png;base64,{}]",
@@ -1692,7 +1521,7 @@ mod tests {
         );
         assert!(
             msg.content.contains(&expected),
-            "Assistant data URI must be byte-identical to the source, got: {}",
+            "Image data URI must be byte-identical to the source, got: {}",
             msg.content
         );
         // Temp file deleted
@@ -1714,11 +1543,7 @@ mod tests {
         let path_str = tmp.to_string_lossy().to_string();
 
         let mut msg = inbound_msg(7007, &format!("Photo: [IMAGE:{path_str}]"));
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: true,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, None).await;
 
         assert!(
             msg.content
@@ -1745,9 +1570,9 @@ mod tests {
     async fn enrich_image_corrupt_raster_does_not_fail_open_to_junk_data_uri() {
         // A file whose leading bytes sniff as PNG (valid magic + IHDR) but whose
         // payload is truncated passes the structural classifier gate but is NOT
-        // decodable. Compression fails, and the fail-open fallback must NOT
-        // base64-encode the corrupt bytes into a junk data-URI — it degrades to
-        // an invalid reference instead.
+        // decodable. The primary encode sends the original bytes untouched, and
+        // it must not base64-encode the corrupt bytes into a junk data-URI — the
+        // marker degrades to an invalid reference instead.
         let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
         let mut buf = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
@@ -1757,51 +1582,12 @@ mod tests {
         let path_str = tmp.to_string_lossy().to_string();
 
         let mut msg = inbound_msg(7008, &format!("Photo: [IMAGE:{path_str}]"));
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: true,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, None).await;
 
         assert!(
             msg.content
                 .contains(&format!("[Invalid image reference: {path_str}]")),
             "Corrupt-but-magic-valid in-scope file must degrade to an invalid reference, got: {}",
-            msg.content
-        );
-        assert!(
-            !msg.content.contains("[IMAGE:data:"),
-            "No junk data URI may be produced for a corrupt file, got: {}",
-            msg.content
-        );
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
-
-    #[tokio::test]
-    async fn enrich_image_corrupt_raster_byte_identical_does_not_fail_open() {
-        // The Assistant (compress=false) path sends the original bytes untouched;
-        // a corrupt-but-magic-valid file that passed the structural gate must not
-        // be base64-encoded into a junk data URI — it degrades to an invalid
-        // reference instead.
-        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
-        let mut buf = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-            .unwrap();
-        let truncated = &buf[..buf.len().min(24)];
-        let (_msg_dir, tmp) = inbound_attachment_fixture(7009, "photo.png", truncated).await;
-        let path_str = tmp.to_string_lossy().to_string();
-
-        let mut msg = inbound_msg(7009, &format!("Photo: [IMAGE:{path_str}]"));
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
-
-        assert!(
-            msg.content
-                .contains(&format!("[Invalid image reference: {path_str}]")),
-            "Corrupt-but-magic-valid in-scope file (byte-identical) must degrade to an invalid reference, got: {}",
             msg.content
         );
         assert!(
@@ -1821,11 +1607,7 @@ mod tests {
         let path_str = tmp.to_string_lossy().to_string();
 
         let mut msg = inbound_msg(7010, &format!("Audio: [AUDIO:{path_str}]"));
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, None).await;
 
         // Temp file must be deleted even when transcription fails — the audio
         // file is a pure intermediate artifact (no transcriber in tests).
@@ -1841,11 +1623,7 @@ mod tests {
     async fn enrich_combined_image_preserved_audio_annotated() {
         let msg_content = "Here [IMAGE:https://example.com/img.png] and [AUDIO:/tmp/sound_xyz.mp3]";
         let mut msg = test_msg(msg_content);
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, None).await;
 
         // IMAGE http URL kept
         assert!(
@@ -1864,23 +1642,16 @@ mod tests {
         );
     }
 
-    async fn assert_no_markers_unchanged(strategy: EnrichmentStrategy, content: &str) {
+    async fn assert_no_markers_unchanged(workspace_path: Option<&std::path::Path>, content: &str) {
         let mut msg = test_msg(content);
         let original = msg.content.clone();
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, workspace_path).await;
         assert_eq!(msg.content, original, "No markers = no changes");
     }
 
     #[tokio::test]
     async fn enrich_no_annotations_when_no_markers() {
-        assert_no_markers_unchanged(
-            EnrichmentStrategy {
-                workspace_path: None,
-                compress_images: false,
-            },
-            "Just a plain message with no markers",
-        )
-        .await;
+        assert_no_markers_unchanged(None, "Just a plain message with no markers").await;
     }
 
     // ── FILE marker tests ─────────────────────────────────────────────
@@ -1894,11 +1665,7 @@ mod tests {
         let marker = format!("Read [FILE:{}] please", attachment.display());
 
         let mut msg = inbound_msg(7011, &marker);
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         // The marker becomes the workspace handle and the text is inlined.
         let copy = ws_path.join("uploads").join("notes.md");
@@ -1942,11 +1709,7 @@ mod tests {
         let marker = format!("Read [FILE:{}]", attachment.display());
 
         let mut msg = inbound_msg(7012, &marker);
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         // No inline body — the text goes to a sidecar the message names.
         assert!(
@@ -1997,11 +1760,7 @@ mod tests {
         let marker = format!("Look at [FILE:{}]", arbitrary.display());
 
         let mut msg = test_msg(&marker);
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         assert_eq!(
             msg.content, marker,
@@ -2035,11 +1794,6 @@ mod tests {
             telegram_attachment_fixture("12", 7015, "secret.md", b"# chat 12").await;
         let (sibling_msg_dir, sibling_attachment) =
             telegram_attachment_fixture(TEST_CHAT_ID, 7016, "secret.md", b"# sibling").await;
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: false,
-        };
-
         for attachment in [
             &other_attachment,
             &longer_id_attachment,
@@ -2047,7 +1801,7 @@ mod tests {
         ] {
             let marker = format!("Look at [FILE:{}]", attachment.display());
             let mut msg = inbound_msg(7014, &marker);
-            enrich_message(&mut msg, &strategy).await;
+            enrich_message(&mut msg, Some(ws_path.as_path())).await;
             assert_eq!(msg.content, marker, "Another message's attachment is inert");
         }
 
@@ -2088,11 +1842,7 @@ mod tests {
         );
 
         let mut msg = inbound_album_msg(&[7017, 7018], &marker);
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         let uploads_dir = ws_path.join("uploads");
         for (name, bytes) in [
@@ -2138,11 +1888,7 @@ mod tests {
         let marker = format!("Read [FILE:{}]", attachment.display());
 
         let mut msg = inbound_msg(7020, &marker);
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         assert!(
             msg.content.contains(
@@ -2174,11 +1920,7 @@ mod tests {
         let marker = format!("Look at [IMAGE:{}]", attachment.display());
 
         let mut msg = inbound_msg(7022, &marker);
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path),
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         assert!(
             msg.content.contains("[Invalid image reference:"),
@@ -2205,11 +1947,7 @@ mod tests {
         let marker = format!("Look at [FILE:{}]", msg_dir.display());
 
         let mut msg = inbound_msg(7021, &marker);
-        let strategy = EnrichmentStrategy {
-            workspace_path: None,
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, None).await;
 
         assert!(
             msg.content
@@ -2240,11 +1978,7 @@ mod tests {
         let marker = format!("Look at [FILE:{}]", link.display());
 
         let mut msg = inbound_msg(7019, &marker);
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         assert_eq!(msg.content, marker, "A symlinked marker must stay verbatim");
         assert_eq!(
@@ -2280,11 +2014,7 @@ mod tests {
         let marker = format!("Attached [FILE:{}]", attachment.display());
 
         let mut msg = inbound_msg(7013, &marker);
-        let strategy = EnrichmentStrategy {
-            workspace_path: Some(ws_path.clone()),
-            compress_images: false,
-        };
-        enrich_message(&mut msg, &strategy).await;
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         let copy = ws_path.join("uploads").join("blob.bin");
         assert!(

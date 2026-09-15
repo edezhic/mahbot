@@ -17,14 +17,14 @@
 //!    (speaker-blind, immediate-fire).
 //! 5. **Command recording** — record speech until silence or 10 min cap
 //! 6. **Transcription** — via the shared Qwen3-ASR local transcriber
-//! 7. **Routing** — transcribed text is routed to the admin's active role via
+//! 7. **Routing** — transcribed text is routed to the admin's Assistant via
 //!    [`route_to_agent`] (the desktop GUI has a single acting identity, the
 //!    seeded admin account).
 //!
 //! The pipeline runs unconditionally as a boot background task. It does NOT
 //! use an LLM agent loop.
-//! Transcribed commands are routed to the admin's currently active role
-//! (resolved via [`route_to_agent`]) as if the admin typed them.
+//! Transcribed commands are routed to the admin's Assistant (resolved via
+//! [`route_to_agent`]) as if the admin typed them.
 //!
 //! # Model sharing
 //!
@@ -757,7 +757,7 @@ pub enum VoiceCommand {
     /// Pauses wake-word listening for the duration of the recording.
     StartRecording,
     /// Stop the mic-button recording, transcribe it, and route the
-    /// transcript to the admin's active role agent.
+    /// transcript to the admin's Assistant.
     StopRecordingSend,
     /// Stop the mic-button recording and discard the captured audio.
     StopRecordingDiscard,
@@ -1565,38 +1565,17 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
     crate::channels::broadcast_and_persist_incoming_message(&msg, transcript, transcript).await;
 }
 
-/// Route a transcribed voice command to the appropriate agent.
+/// Route a transcribed voice command to the admin's Assistant.
 ///
 /// The desktop GUI has a single acting identity — the seeded admin — so the
-/// transcript is routed to the admin user's role and workspace from their DB
-/// record, then through the agent-ID message router.
+/// transcript goes to the admin's Assistant session and workspace, then through
+/// the agent-ID message router. Assistant pinning happens here, before the
+/// broadcast, so the transcript is announced in the workspace the agent
+/// actually runs in.
 async fn route_to_agent(text: String) {
     let user_name = crate::users::ADMIN_USER_NAME;
-    let Some(role) = crate::users::resolve_active_role(user_name).await else {
-        // A failed selected-role store read (fail-closed) — no role is
-        // allowed to answer.
-        info!("Voice command dropped (no active role) (user: {user_name}): {text}");
-        return;
-    };
+    let role = crate::Role::Assistant;
     let ws = crate::users::resolve_workspace_for_user_name(user_name).await;
-    route_voice_to_role(text, user_name, role, ws).await;
-}
-
-/// Shared tail of [`route_to_agent`]: pin the pool-selected role to its
-/// effective workspace, log, broadcast the transcript, and hand off to
-/// the message router.
-///
-/// Pool-gating applies: the routed role stays inside the pool — with Assistant
-/// pinning to the personal workspace, atomically.
-///
-/// The routed user_name is never empty — an empty name would produce a broken
-/// `personal:` path and a malformed bare "_ws_role" session key.
-async fn route_voice_to_role(
-    text: String,
-    user_name: &str,
-    role: crate::Role,
-    ws: crate::Workspace,
-) {
     let ws = crate::users::effective_workspace_for_role(role, ws, user_name);
 
     info!(
@@ -2301,15 +2280,9 @@ impl PipelineCtx {
     /// Broadcast a chat message to the admin's voice workspace.
     async fn broadcast_voice_message(&mut self, msg: &str) {
         let user_name = crate::users::ADMIN_USER_NAME;
-        let role = crate::users::resolve_active_role(user_name).await;
         let ws = crate::users::resolve_workspace_for_user_name(user_name).await;
-        // Assistant conversations live in the admin's personal workspace;
-        // a None role (empty pool or store failure) fails closed to the
-        // resolved workspace — the notice stays visible in the current view.
-        let ws = match role {
-            Some(role) => crate::users::effective_workspace_for_role(role, ws, user_name),
-            None => ws,
-        };
+        // Assistant conversations live in the admin's personal workspace.
+        let ws = crate::users::effective_workspace_for_role(crate::Role::Assistant, ws, user_name);
         crate::channels::broadcast_and_persist_agent_response(
             user_name,
             "voice",
@@ -2665,7 +2638,7 @@ impl PipelineCtx {
     }
 
     /// Transcribe a completed manual-recording buffer and route it to the
-    /// admin's active role agent (same broadcast+routing path as wake-word
+    /// admin's Assistant (same broadcast+routing path as wake-word
     /// commands), then restore wake-word listening state.
     async fn finalize_manual_recording(&mut self, cmd_buf: Vec<f32>) {
         set_status(VoiceStatus::Transcribing);

@@ -50,8 +50,7 @@ pub(crate) const SYSTEM_ROLE: &str = "system";
 /// `src/prompt/summarize/{name}.md` (and optionally
 /// `src/prompt/discovery/{name}.md` if `has_discovery` is true),
 /// adding an arm in this match, the [`Role::tools()`] method,
-/// the `theme::role_icon()` match, and the exhaustive `telegram_role_emoji`
-/// match in `agent/message_router.rs`.
+/// and the `theme::role_icon()` match.
 /// The compiler will catch missing arms in exhaustive matches, but it
 /// cannot catch an arm that returns an empty tool set or silently uses
 /// struct update defaults — the tests in this module guard against those:
@@ -208,16 +207,15 @@ impl Role {
         crate::prompt::load_prompt(&format!("role/{}.md", self.as_str()))
     }
 
-    /// Role description for this role, optionally widened for a full-access
-    /// (admin) Assistant.
+    /// Role description for this role, widened for the admin's Assistant.
     ///
-    /// Only the Assistant has a separate description when the triggering user
-    /// has `permissions='full'`; every other role returns its canonical
-    /// [`Role::role_description`] regardless of `full_access`.
+    /// Only the Assistant has a separate description when the triggering
+    /// account is the admin; every other role returns its canonical
+    /// [`Role::role_description`] regardless of `is_admin`.
     #[must_use]
-    pub fn role_description_for(&self, full_access: bool) -> String {
-        if *self == Role::Assistant && full_access {
-            crate::prompt::load_prompt("role/assistant_full.md")
+    pub fn role_description_for(&self, is_admin: bool) -> String {
+        if *self == Role::Assistant && is_admin {
+            crate::prompt::load_prompt("role/assistant_admin.md")
         } else {
             self.role_description()
         }
@@ -275,10 +273,10 @@ impl Role {
     /// Whether an Analyst running in `ws` keeps its read-only shell.
     ///
     /// Analysts are built with no identity of their own (an empty user name and
-    /// `full_access = false`), so the workspace they inherit from the summoning
+    /// `is_admin = false`), so the workspace they inherit from the summoning
     /// session is the only carrier of who called — and it is re-read from
     /// durable state on every construction, so the rule holds across restarts.
-    /// A non-admin's Assistant is pinned to `personal:<user>`, so its analysts
+    /// A guest's Assistant is pinned to `personal:<user>`, so its analysts
     /// must lose the shell: that shell has no reading restriction and would be
     /// a direct route into the admin's `shared` folder the per-user grants
     /// exist to gate. Anything else — a project workspace (the pipeline's own
@@ -286,12 +284,12 @@ impl Role {
     /// unrecognised `personal:` name falls to the stricter side.
     fn analyst_shell_allowed(ws: &Workspace) -> bool {
         match crate::users::personal_user_name(&ws.name) {
-            Some(user) => user == crate::users::ADMIN_USER_NAME,
+            Some(user) => crate::users::is_admin_name(user),
             None => true,
         }
     }
 
-    /// Core full-shell/read/edit/search tools for full-access roles
+    /// Core full-shell/read/edit/search tools for the build roles
     /// (Engineer, Coder).
     fn full_core_tools() -> Vec<Box<dyn Tool>> {
         vec![
@@ -307,8 +305,8 @@ impl Role {
     /// Ticket tools are bound to `ws` at construction time — all their
     /// operations are confined to that workspace.
     ///
-    /// `full_access` is the triggering user's `permissions='full'` (admin)
-    /// flag. It only widens the Assistant's toolset: `shell`, `implement`,
+    /// `is_admin` says whether the triggering account is the admin. It only
+    /// widens the Assistant's toolset: `shell`, `implement`,
     /// `research`, `computer`, `mahbot_config`, `mahbot_debug` and the
     /// Assistant↔Manager chat tools are added, and `add_alarm` gains its
     /// command form. Every other role's toolset is byte-identical regardless
@@ -321,7 +319,7 @@ impl Role {
     pub(crate) fn tools(
         self,
         ws: &Workspace,
-        full_access: bool,
+        is_admin: bool,
         chrome_sessions: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
     ) -> Vec<Box<dyn Tool>> {
         let mut tools: Vec<Box<dyn Tool>> = match self {
@@ -385,15 +383,15 @@ impl Role {
             Role::Assistant => {
                 let mut t: Vec<Box<dyn Tool>> = vec![
                     Box::new(AnalyzeTool::new(DispatchMode::Async, Role::Assistant)),
-                    Box::new(AddAlarmTool::new(full_access)),
+                    Box::new(AddAlarmTool::new(is_admin)),
                     Box::new(ListAlarmsTool),
                     Box::new(RemoveAlarmTool),
                     Box::new(EditTool),
                     Box::new(SearchTool),
                     Box::new(SleepTool),
-                    // Media tools serve every Assistant (base and full-access
-                    // alike): the media models they use resolve per-user, so
-                    // no access-level gate applies.
+                    // Media tools serve every Assistant alike: the media
+                    // models they use resolve per-user, so no access-level
+                    // gate applies.
                     Box::new(ImageGenTool),
                     Box::new(VideoGenTool),
                     Box::new(VideoEditTool),
@@ -402,34 +400,34 @@ impl Role {
                 // admin-authored scripts; the grant (or admin rights) decides
                 // what each call may reach.
                 t.push(Box::new(CustomTool));
-                // Base Assistant read access is workspace-bounded; full-access
-                // retains the general ReadTool so it can also read dependency
-                // sources / temp files. (Media tools write only into the
-                // workspace's generated/ tree in both modes.)
-                if full_access {
+                // A guest's Assistant read access is workspace-bounded; the
+                // admin's retains the general ReadTool so it can also read
+                // dependency sources / temp files. (Media tools write only into
+                // the workspace's generated/ tree in both cases.)
+                if is_admin {
                     t.push(Box::new(ReadTool::general()));
                 } else {
                     t.push(Box::new(ReadTool::workspace_only()));
                 }
-                if full_access {
+                if is_admin {
                     t.push(Box::new(ShellTool::new(ShellMode::Full)));
                     t.push(Box::new(ImplementTool::new(
                         DispatchMode::Async,
                         Role::Assistant,
                     )));
                     t.push(Box::new(ResearchTool::new(Role::Assistant)));
-                    // Full access implies a trusted local session, so the
+                    // The admin's session is a trusted local session, so the
                     // Assistant can also observe/act on the local GUI directly
                     // (gated per-run by the accessibility grant at agent
                     // construction). No structural authorization gate beyond
-                    // `full_access`, matching the full shell widening.
+                    // `is_admin`, matching the full shell widening.
                     t.push(Box::new(ComputerTool));
-                    // Assistant→Manager channel (admin/full-access only):
+                    // Assistant→Manager channel (the admin's Assistant only):
                     // address the Manager of a project workspace. The
                     // Manager's messages auto-deliver back (see message_router).
                     t.push(Box::new(SendMessageToManagerTool));
                     // The admin config surface: the merged `mahbot_config`
-                    // setup tool and the read-only DB query tool. Full-access
+                    // setup tool and the read-only DB query tool. The admin's
                     // Assistant is now the single user-facing role, so these
                     // migrated over from the removed Support role.
                     t.push(Box::new(MahbotConfigTool));
@@ -598,8 +596,8 @@ mod tests {
     #[test]
     fn manager_does_not_advertise_research() {
         // Acceptance pin: the Manager has no `research` grant — deep research
-        // runs are dispatched by the full-permission Assistant only (pinned
-        // in `assistant_toolset_gates_full_access_tools`). The Manager's
+        // runs are dispatched by the admin's Assistant only (pinned
+        // in `assistant_toolset_gates_admin_tools`). The Manager's
         // single delegation path is `analyze`.
         let tools =
             crate::Role::Manager.tools(&crate::workspace::test_ws("test"), false, test_sessions());
@@ -610,70 +608,71 @@ mod tests {
     }
 
     #[test]
-    fn assistant_toolset_gates_full_access_tools() {
-        // The Assistant toolset must differ by the triggering user's
-        // full-access (admin) flag: base mode has no shell/implement/research/
-        // computer, full mode does. Base gets the workspace-only read
-        // (`ReadTool::workspace_only()`); full keeps the general read (which
-        // also permits dependency sources).
+    fn assistant_toolset_gates_admin_tools() {
+        // The Assistant toolset must differ by whether the triggering account
+        // is the admin: a guest's Assistant has no shell/implement/research/
+        // computer, the admin's does. A guest gets the workspace-only read
+        // (`ReadTool::workspace_only()`); the admin keeps the general read
+        // (which also permits dependency sources).
         let ws = crate::workspace::test_ws("test");
-        let base = crate::Role::Assistant.tools(&ws, false, test_sessions());
-        let full = crate::Role::Assistant.tools(&ws, true, test_sessions());
+        let guest = crate::Role::Assistant.tools(&ws, false, test_sessions());
+        let admin = crate::Role::Assistant.tools(&ws, true, test_sessions());
 
         for name in ["shell", "implement", "research", "computer"] {
             assert!(
-                !base.iter().any(|t| t.name() == name),
-                "base Assistant toolset must not contain '{name}'"
+                !guest.iter().any(|t| t.name() == name),
+                "a guest's Assistant toolset must not contain '{name}'"
             );
             assert!(
-                full.iter().any(|t| t.name() == name),
-                "full Assistant toolset must contain '{name}'"
+                admin.iter().any(|t| t.name() == name),
+                "the admin's Assistant toolset must contain '{name}'"
             );
         }
-        // The read boundary is what the model is told: base (restricted) only
-        // advertises the personal workspace; full keeps the general allowlist.
-        let base_read = base.iter().find(|t| t.name() == "read");
-        let base_path_desc = base_read
+        // The read boundary is what the model is told: a guest (restricted)
+        // only advertises the personal workspace; the admin keeps the general
+        // allowlist.
+        let guest_read = guest.iter().find(|t| t.name() == "read");
+        let guest_path_desc = guest_read
             .map(|t| t.parameters_schema()["properties"]["path"]["description"].to_string())
             .unwrap_or_default();
         assert!(
-            base_path_desc.contains("Only the workspace is accessible"),
-            "base Assistant read must advertise the workspace-only boundary, got: {base_path_desc}"
+            guest_path_desc.contains("Only the workspace is accessible"),
+            "a guest's Assistant read must advertise the workspace-only boundary, got: {guest_path_desc}"
         );
-        let full_read = full.iter().find(|t| t.name() == "read");
-        let full_path_desc = full_read
+        let admin_read = admin.iter().find(|t| t.name() == "read");
+        let admin_path_desc = admin_read
             .map(|t| t.parameters_schema()["properties"]["path"]["description"].to_string())
             .unwrap_or_default();
         assert!(
-            full_path_desc.contains("policy allowlist"),
-            "full Assistant read must advertise the general allowlist boundary, got: {full_path_desc}"
+            admin_path_desc.contains("policy allowlist"),
+            "the admin's Assistant read must advertise the general allowlist boundary, got: {admin_path_desc}"
         );
     }
 
     #[test]
-    fn config_and_debug_tools_only_in_full_access_assistant() {
+    fn config_and_debug_tools_only_in_admin_assistant() {
         // Acceptance pin: the merged `mahbot_config` setup tool and the
-        // read-only `mahbot_debug` query tool are granted ONLY to the
-        // full-access Assistant. The base Assistant and every other role must
-        // never advertise either.
+        // read-only `mahbot_debug` query tool are granted ONLY to the admin's
+        // Assistant. A guest's Assistant and every other role must never
+        // advertise either.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
-            for full_access in [false, true] {
+            for is_admin in [false, true] {
                 let names: Vec<&str> = role
-                    .tools(&ws, full_access, test_sessions())
+                    .tools(&ws, is_admin, test_sessions())
                     .iter()
                     .map(|t| t.name())
                     .collect();
                 for name in ["mahbot_config", "mahbot_debug"] {
                     let has = names.contains(&name);
-                    if role == crate::Role::Assistant && full_access {
-                        assert!(has, "full-access Assistant must advertise `{name}`");
+                    if role == crate::Role::Assistant && is_admin {
+                        assert!(has, "the admin's Assistant must advertise `{name}`");
                     } else {
                         assert!(
                             !has,
                             "{}{} must not advertise `{name}`",
                             role.as_str(),
-                            if full_access { " (full)" } else { "" }
+                            if is_admin { " (admin)" } else { "" }
                         );
                     }
                 }
@@ -682,15 +681,15 @@ mod tests {
     }
 
     #[test]
-    fn custom_tool_is_advertised_by_both_assistants_only() {
+    fn custom_tool_is_advertised_by_every_assistant_only() {
         // Acceptance pin: the single forwarding tool goes to every Assistant —
-        // base and full alike, since the grants (not the toolset) decide what
-        // each call may reach — and to no other role.
+        // the admin's and a guest's alike, since the grants (not the toolset)
+        // decide what each call may reach — and to no other role.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
-            for full_access in [false, true] {
+            for is_admin in [false, true] {
                 let has = role
-                    .tools(&ws, full_access, test_sessions())
+                    .tools(&ws, is_admin, test_sessions())
                     .iter()
                     .any(|t| t.name() == "custom");
                 assert_eq!(
@@ -698,7 +697,7 @@ mod tests {
                     role == crate::Role::Assistant,
                     "{}{} custom-tool availability",
                     role.as_str(),
-                    if full_access { " (full)" } else { "" }
+                    if is_admin { " (admin)" } else { "" }
                 );
             }
         }
@@ -737,26 +736,26 @@ mod tests {
     }
 
     #[test]
-    fn computer_tool_only_in_full_access_assistant() {
-        // Acceptance pin: `computer` is granted ONLY to the full-access
-        // Assistant. Every other role (base or full) and the base Assistant
-        // rely on delegation (chrome/analyze/shell) rather than direct local
+    fn computer_tool_only_in_admin_assistant() {
+        // Acceptance pin: `computer` is granted ONLY to the admin's
+        // Assistant. Every other role (and a guest's Assistant) relies on
+        // delegation (chrome/analyze/shell) rather than direct local
         // GUI access, so the tool must never leak into their toolset.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
-            for full_access in [false, true] {
+            for is_admin in [false, true] {
                 let has = role
-                    .tools(&ws, full_access, test_sessions())
+                    .tools(&ws, is_admin, test_sessions())
                     .iter()
                     .any(|t| t.name() == "computer");
-                if role == crate::Role::Assistant && full_access {
-                    assert!(has, "full-access Assistant must advertise `computer`");
+                if role == crate::Role::Assistant && is_admin {
+                    assert!(has, "the admin's Assistant must advertise `computer`");
                 } else {
                     assert!(
                         !has,
                         "{}{} must not advertise `computer`",
                         role.as_str(),
-                        if full_access { " (full)" } else { "" }
+                        if is_admin { " (admin)" } else { "" }
                     );
                 }
             }
@@ -764,28 +763,28 @@ mod tests {
     }
 
     #[test]
-    fn manager_chat_tools_only_in_full_access_assistant() {
+    fn manager_chat_tools_only_in_admin_assistant() {
         // Acceptance pin: the Assistant→Manager send tool is granted ONLY
-        // to the full-access Assistant. Every other role (base or full) and
-        // the base Assistant never communicate with a Manager directly.
+        // to the admin's Assistant. Every other role (and a guest's Assistant)
+        // never communicates with a Manager directly.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
-            for full_access in [false, true] {
+            for is_admin in [false, true] {
                 let names: Vec<&str> = role
-                    .tools(&ws, full_access, test_sessions())
+                    .tools(&ws, is_admin, test_sessions())
                     .iter()
                     .map(|t| t.name())
                     .collect();
                 let name = "send_message_to_manager";
                 let has = names.contains(&name);
-                if role == crate::Role::Assistant && full_access {
-                    assert!(has, "full-access Assistant must advertise `{name}`");
+                if role == crate::Role::Assistant && is_admin {
+                    assert!(has, "the admin's Assistant must advertise `{name}`");
                 } else {
                     assert!(
                         !has,
                         "{}{} must not advertise `{name}`",
                         role.as_str(),
-                        if full_access { " (full)" } else { "" }
+                        if is_admin { " (admin)" } else { "" }
                     );
                 }
             }
@@ -794,20 +793,20 @@ mod tests {
 
     #[test]
     fn sleep_tool_only_in_assistant_and_manager_toolsets() {
-        // Acceptance pin: `sleep` is granted ONLY to the Assistant (base and
-        // full-access) and the Manager. Other roles always have pending work
+        // Acceptance pin: `sleep` is granted ONLY to the Assistant (the admin's
+        // and a guest's) and the Manager. Other roles always have pending work
         // to do and must not end their turn.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
-            for full_access in [false, true] {
+            for is_admin in [false, true] {
                 let has = role
-                    .tools(&ws, full_access, test_sessions())
+                    .tools(&ws, is_admin, test_sessions())
                     .iter()
                     .any(|t| t.name() == "sleep");
                 if matches!(role, crate::Role::Assistant | crate::Role::Manager) {
                     assert!(
                         has,
-                        "{} (full_access={full_access}) must advertise `sleep`",
+                        "{} (is_admin={is_admin}) must advertise `sleep`",
                         role.as_str()
                     );
                 } else {
@@ -815,7 +814,7 @@ mod tests {
                         !has,
                         "{}{} must not advertise `sleep`",
                         role.as_str(),
-                        if full_access { " (full)" } else { "" }
+                        if is_admin { " (admin)" } else { "" }
                     );
                 }
             }
@@ -825,8 +824,8 @@ mod tests {
     #[test]
     fn add_alarm_command_param_is_admin_only() {
         // Acceptance pin: `add_alarm`'s `command` parameter is granted ONLY to
-        // the full-access Assistant. Every other combination — including the
-        // base Assistant and every non-Assistant role — must neither advertise
+        // the admin's Assistant. Every other combination — including a guest's
+        // Assistant and every non-Assistant role — must neither advertise
         // the property in the schema nor append the command capability doc to
         // the description. The description check is structural (base vs
         // base + `tool/add_alarm_command.md`) so prompt rewording cannot
@@ -839,9 +838,9 @@ mod tests {
             "add_alarm_command.md must document the `command` parameter"
         );
         for role in Role::iter() {
-            for full_access in [false, true] {
+            for is_admin in [false, true] {
                 let has_tool = role
-                    .tools(&ws, full_access, test_sessions())
+                    .tools(&ws, is_admin, test_sessions())
                     .into_iter()
                     .find(|t| t.name() == "add_alarm");
                 let Some(tool) = has_tool else {
@@ -853,28 +852,28 @@ mod tests {
                     .get("command")
                     .is_some();
                 let appends_doc = tool.description().contains(&command_doc);
-                if role == crate::Role::Assistant && full_access {
+                if role == crate::Role::Assistant && is_admin {
                     assert!(
                         has_command,
-                        "full-access Assistant must advertise `add_alarm.command`"
+                        "the admin's Assistant must advertise `add_alarm.command`"
                     );
                     assert!(
                         appends_doc,
-                        "full-access Assistant description must append the command doc"
+                        "the admin's Assistant description must append the command doc"
                     );
                 } else {
                     assert!(
                         !has_command,
                         "{}{} must not advertise `add_alarm.command`",
                         role.as_str(),
-                        if full_access { " (full)" } else { "" }
+                        if is_admin { " (admin)" } else { "" }
                     );
                     assert_eq!(
                         tool.description(),
                         base_desc,
                         "{}{} must not append the command doc",
                         role.as_str(),
-                        if full_access { " (full)" } else { "" }
+                        if is_admin { " (admin)" } else { "" }
                     );
                 }
             }
@@ -883,10 +882,11 @@ mod tests {
 
     #[test]
     fn assistant_role_descriptions_are_populated() {
-        // Both Assistant descriptions (base + full) must be non-empty, free of
-        // unsubstituted template keys, and carry the alarm-notification marker.
-        for full_access in [false, true] {
-            let desc = crate::Role::Assistant.role_description_for(full_access);
+        // Both Assistant descriptions (a guest's + the admin's) must be
+        // non-empty, free of unsubstituted template keys, and carry the
+        // alarm-notification marker.
+        for is_admin in [false, true] {
+            let desc = crate::Role::Assistant.role_description_for(is_admin);
             assert!(
                 !desc.trim().is_empty(),
                 "Assistant role description must not be empty"

@@ -1,4 +1,4 @@
-//! Computer (GUI observe/act) tool for the full-access Assistant.
+//! Computer (GUI observe/act) tool for the admin's Assistant.
 //!
 //! The platform-agnostic core (types, coordinate math, ref lifecycle, backend
 //! trait) lives in [`core`]; [`macos`]/[`linux`]/[`stub`] implement the backend

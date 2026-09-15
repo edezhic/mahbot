@@ -12,7 +12,8 @@
 //! responses when:
 //!
 //! 1. The response is delivered to the GUI dashboard.
-//! 2. The responding agent's role matches the user's currently-selected role.
+//! 2. The responding agent is the Assistant — the only role any account routes
+//!    to.
 //! 3. TTS is enabled in config.
 //! 4. The Supertonic 3 model files are cached and loaded.
 //!
@@ -527,7 +528,8 @@ pub fn init_global() -> Result<()> {
 /// The listener checks:
 /// 1. The event is an agent message (`direction == Agent`)
 /// 2. TTS is globally enabled and models are loaded
-/// 3. The agent's role matches the user's currently-active GUI role
+/// 3. The responding agent is the Assistant — the only role any account routes
+///    to
 ///
 /// Must be called **after** [`crate::CHAT_BROADCAST`] has been initialized
 /// (i.e. after `init_message_pipeline`).
@@ -546,17 +548,15 @@ pub fn init_listener() {
                 Ok(ChatEvent::Message {
                     direction: ChatDirection::Agent,
                     channel: _,
-                    user_name,
                     agent_role: Some(ref role_name),
                     content,
                     transient,
                     ..
-                }) if is_enabled() && !transient => {
-                    if let Some(active_role) = crate::users::resolve_active_role(&user_name).await
-                        && active_role.as_str() == role_name.as_str()
-                    {
-                        speak(&content);
-                    }
+                }) if is_enabled()
+                    && !transient
+                    && role_name == crate::Role::Assistant.as_str() =>
+                {
+                    speak(&content);
                 }
                 Ok(_) => {
                     // Not an agent GUI message — ignore
@@ -2288,12 +2288,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(tts)]
     async fn test_init_listener_dispatches_speak() {
-        // Initialize test stores and give the broadcast user an Assistant
-        // active role: `add_user` writes `selected_role='assistant'` on
-        // insert, which is what the listener matches below.
+        // Initialize test stores so the broadcast user exists.
         crate::util::test::init_test_stores().await;
         crate::users::store()
-            .add_user("testuser", None, crate::Role::Assistant)
+            .add_user("testuser")
             .await
             .expect("add_user");
 

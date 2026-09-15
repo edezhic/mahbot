@@ -159,22 +159,15 @@ impl Session {
         channel: &str,
         user_name: &str,
         round_ts: Option<&str>,
-        full_access: bool,
+        is_admin: bool,
     ) -> Result<()> {
         if !msg.is_empty() {
             let is_new = self.history.is_empty();
 
             if is_new {
-                let (msgs, snapshot) = Self::build_turn_messages(
-                    msg,
-                    ws,
-                    role,
-                    ticket,
-                    round_ts,
-                    full_access,
-                    user_name,
-                )
-                .await;
+                let (msgs, snapshot) =
+                    Self::build_turn_messages(msg, ws, role, ticket, round_ts, is_admin, user_name)
+                        .await;
 
                 // Batch-write all messages + session context atomically.
                 crate::session::store()
@@ -485,12 +478,12 @@ impl Session {
         ws: &Workspace,
         role: &Role,
         ticket: Option<&crate::pipeline::board::Ticket>,
-        full_access: bool,
+        is_admin: bool,
         user_name: &str,
     ) {
         // Build fresh system prompt (may have changed since session start).
         let (mut compacted, snapshot) =
-            Self::build_context_messages(ws, role, ticket, full_access, user_name).await;
+            Self::build_context_messages(ws, role, ticket, is_admin, user_name).await;
 
         // Append conversation summary, then the retained latest turns in
         // chronological order. The in-flight user message is already among
@@ -583,7 +576,7 @@ impl Session {
     ///
     /// ```text
     /// role_description       — from src/prompt/role/{role}.md (always)
-    /// onboarding_guide       — full-access Assistant only, while onboarding
+    /// onboarding_guide       — the admin's Assistant only, while onboarding
     ///                          state is Init (or via the greeting kickoff's
     ///                          pending-guide bridge)
     /// active_models_opts     — Assistant only, when the catalogs are available
@@ -591,7 +584,7 @@ impl Session {
     /// skills                 — if any skills exist in the workspace
     /// alarms                 — Assistant only, when the user has active alarms
     /// personal_files         — Assistant only, when the personal workspace has files
-    /// workspaces             — full-access Assistant only, when workspaces are registered
+    /// workspaces             — the admin's Assistant only, when workspaces are registered
     /// custom_tools           — Assistant only, always (the catalogue, or the
     ///                          brief "nothing available" form)
     /// board_context          — Manager role only, when active tickets exist
@@ -608,7 +601,7 @@ impl Session {
         ws: &Workspace,
         role: &Role,
         ticket: Option<&crate::pipeline::board::Ticket>,
-        full_access: bool,
+        is_admin: bool,
         user_name: &str,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
         let (stored_context, board_context) = tokio::join!(
@@ -652,24 +645,24 @@ impl Session {
             ],
         );
 
-        let role_description = role.role_description_for(full_access);
+        let role_description = role.role_description_for(is_admin);
         let skills = skills::load_skills(ws).await;
 
         let mut msgs = Vec::with_capacity(7);
         msgs.push(ChatMessage::system(&role_description));
 
-        // Onboarding guide (full-access Assistant only, while onboarding is
+        // Onboarding guide (the admin's Assistant only, while onboarding is
         // live). One-shot / no-re-onboarding contract: the guide disappears
         // once state is `Finished`. The greeting kickoff persists `Finished`
         // BEFORE the pipeline builds the greeting's session (many async hops
         // vs a single fast config_kv upsert), so the state check alone would
         // deterministically miss the guide — the kickoff also arms a
-        // process-local pending flag that the first full-access Assistant
+        // process-local pending flag that the admin Assistant
         // build consumes here (see `GREETING_GUIDE_PENDING`). After that
         // single consumption nothing re-arms it and the state can only move
         // `Init` → `Finished`. Audience is global state and admin-only:
-        // non-admin users receive no onboarding and none is planned.
-        if matches!(role, Role::Assistant) && full_access {
+        // guests receive no onboarding and none is planned.
+        if matches!(role, Role::Assistant) && is_admin {
             let live = crate::config::CONFIG.onboarding_stage()
                 != crate::config::OnboardingState::Finished;
             if live || crate::onboarding::take_greeting_guide_pending() {
@@ -697,16 +690,16 @@ impl Session {
             msgs.push(ChatMessage::system(skills::skills_to_prompt(&skills, ws)));
         }
         // Assistant sessions carry the user's alarm snapshot, the personal
-        // workspace file listing, the registered workspace list (full-access
-        // only) and the custom-tool catalogue — the same snapshot-at-session-
-        // start contract as the board block below.
+        // workspace file listing, the registered workspace list (the admin's
+        // Assistant only) and the custom-tool catalogue — the same snapshot-at-
+        // session-start contract as the board block below.
         if matches!(role, Role::Assistant) {
             let ((alarms, workspaces, personal_files), custom_tools) = tokio::join!(
-                fetch_assistant_context(user_name, full_access),
-                crate::tools::custom::context_block(user_name, full_access),
+                fetch_assistant_context(user_name, is_admin),
+                crate::tools::custom::context_block(user_name, is_admin),
             );
             for block in assistant_context_blocks(
-                full_access,
+                is_admin,
                 &alarms,
                 &workspaces,
                 personal_files.as_deref(),
@@ -747,11 +740,11 @@ impl Session {
         role: &Role,
         ticket: Option<&crate::pipeline::board::Ticket>,
         round_ts: Option<&str>,
-        full_access: bool,
+        is_admin: bool,
         user_name: &str,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
         let (mut msgs, snapshot) =
-            Self::build_context_messages(ws, role, ticket, full_access, user_name).await;
+            Self::build_context_messages(ws, role, ticket, is_admin, user_name).await;
         msgs.push(crate::session::user_msg_with_ts(msg, round_ts));
         (msgs, snapshot)
     }
@@ -924,7 +917,7 @@ const MAX_WORKSPACE_SUMMARY_CHARS: usize = 1000;
 /// per-workspace general-context reads are batched via `join_all`.
 async fn fetch_assistant_context(
     user_name: &str,
-    full_access: bool,
+    is_admin: bool,
 ) -> (Vec<Alarm>, Vec<(Workspace, Option<String>)>, Option<String>) {
     let alarms = async {
         if crate::alarms::ALARMS.get().is_none() {
@@ -935,7 +928,7 @@ async fn fetch_assistant_context(
             .unwrap_or_default()
     };
     let workspaces = async {
-        if !full_access {
+        if !is_admin {
             return Vec::new();
         }
         let Some(workspaces) = WORKSPACES.get() else {
@@ -968,13 +961,13 @@ async fn fetch_assistant_context(
 /// Pure and fail-open: each block is omitted entirely when its content is
 /// empty, the personal-files listing is supplied pre-rendered (`None` when
 /// the workspace is empty or unlistable), and the workspace list appears only
-/// for a full-access Assistant. Order: alarms → personal files → workspaces →
+/// for the admin's Assistant. Order: alarms → personal files → workspaces →
 /// custom tools — the last being the one an Assistant always gets, because
 /// [`crate::tools::custom::context_block`] renders the brief "nothing
 /// available" form rather than nothing. The caller gates on `role == Assistant`
 /// (before fetching).
 fn assistant_context_blocks(
-    full_access: bool,
+    is_admin: bool,
     alarms: &[Alarm],
     workspaces: &[(Workspace, Option<String>)],
     personal_files: Option<&str>,
@@ -993,7 +986,7 @@ fn assistant_context_blocks(
             &[("{{files}}", lines)],
         ));
     }
-    if full_access && let Some(lines) = render_workspace_lines(workspaces) {
+    if is_admin && let Some(lines) = render_workspace_lines(workspaces) {
         blocks.push(substitute(
             &load_prompt("context/workspaces.md"),
             &[("{{workspaces}}", &lines)],
@@ -1698,9 +1691,9 @@ mod tests {
         assert_eq!(b_payload.content, "result b", "captured sibling verbatim");
     }
 
-    /// Pure gating of the Assistant context blocks: a plain Assistant gets
+    /// Pure gating of the Assistant context blocks: a guest's Assistant gets
     /// the alarms, personal-files and custom-tool blocks (the workspace list is
-    /// full-access only); a full-access Assistant gets the first three in
+    /// the admin's only); the admin's Assistant gets the first three in
     /// alarms → personal files → workspaces order plus the custom-tool block
     /// last; empty data omits the conditional blocks, while the custom-tool
     /// block is always present (its "nothing available" form is rendered
@@ -1724,7 +1717,7 @@ mod tests {
         let files = Some("MEMORY.md\nnotes/projects.md");
         let custom = "<custom-tools>\n- weather\n</custom-tools>";
 
-        // Plain Assistant: alarms + personal files + custom tools, no
+        // Guest's Assistant: alarms + personal files + custom tools, no
         // workspace list.
         let blocks = assistant_context_blocks(
             false,
@@ -1739,7 +1732,7 @@ mod tests {
         assert!(!blocks[1].contains("<registered-workspaces>"));
         assert_eq!(blocks[2], custom);
 
-        // Full-access Assistant: the workspace list joins them, and the
+        // The admin's Assistant: the workspace list joins them, and the
         // custom-tool block stays last.
         let blocks = assistant_context_blocks(
             true,

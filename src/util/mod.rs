@@ -536,9 +536,12 @@ pub(crate) async fn local_image_to_data_uri(path: &std::path::Path) -> anyhow::R
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(&bytes)))
 }
 
-/// Inbound-photo compression bounds for non-Assistant roles: the
-/// longest-side cap and JPEG quality of the single ingestion-time re-encode.
-pub(crate) const INBOUND_IMAGE_MAX_SIDE: u32 = 1024;
+/// Longest-side cap for each bounded-JPEG re-encode in this module: the shared
+/// re-encode behind [`local_image_to_compressed_data_uri_with_meta`] (used by
+/// every ingestion path — the `read` tool, chrome/computer screenshots,
+/// document page images, inbound channel media) scales the longest side down to
+/// this many pixels, aspect-preserving.
+const INBOUND_IMAGE_MAX_SIDE: u32 = 1024;
 const INBOUND_IMAGE_JPEG_QUALITY: u8 = 85;
 
 /// Input-size ceiling for the inbound-photo decode, aligned with the

@@ -800,15 +800,15 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
         BotCommand::ImageModels | BotCommand::VideoModels => {
             handle_models_command(msg, cmd == BotCommand::ImageModels).await;
         }
-        // `/agents` replies that there is nothing to switch (the pool is the
-        // constant single Assistant).
+        // `/agents` replies that there is nothing to switch (the Assistant is
+        // every account's only role).
         BotCommand::Agents => handle_agents_command(msg).await,
         // Global admin command: `/update` has its own dispatch path (it is
         // workspace-independent and must not go through `handle_admin_command`,
         // which requires a selected shared workspace). The handler applies its
         // own admin gate + availability pre-check.
         BotCommand::Update => mahbot::self_update::handle_update_command(msg).await,
-        // Admin-gated commands: denial for non-admin users.
+        // Admin-gated commands: denial for guests.
         BotCommand::Board
         | BotCommand::Archive
         | BotCommand::Pause
@@ -832,8 +832,8 @@ async fn send_telegram_reply(msg: &ChannelMessage, content: String) {
     mahbot::channels::telegram::send_reply(&msg.reply_target, &content).await;
 }
 
-/// Handle `/agents` — reply that there is nothing to switch: the role pool
-/// is the constant single Assistant for every user.
+/// Handle `/agents` — reply that there is nothing to switch: the Assistant is
+/// every account's only role.
 async fn handle_agents_command(msg: &ChannelMessage) {
     send_telegram_reply(
         msg,
@@ -843,7 +843,7 @@ async fn handle_agents_command(msg: &ChannelMessage) {
 }
 
 /// Handle `/start` command for Telegram — sends a per-user welcome message
-/// listing the commands available to the current role/admin state (no inline
+/// listing the commands available to the current admin state (no inline
 /// keyboard).
 async fn handle_start_command(msg: &ChannelMessage) {
     let mut lines = vec![
@@ -860,8 +860,8 @@ async fn handle_start_command(msg: &ChannelMessage) {
 /// deletes the current session and confirms via the canonical delivery path.
 async fn handle_clear_session(msg: &ChannelMessage) {
     // Clear the session the user actually talks to: the same (role, workspace)
-    // resolution as routing — DB-selected workspace, pool-clamped active role
-    // with Assistant fallback, and Assistant pinning.
+    // resolution as routing — DB-selected workspace, the single Assistant role,
+    // and Assistant pinning.
     let (effective_role, ws) = mahbot::users::resolve_session_target(&msg.user_name).await;
     let reply = match clear_session(&msg.user_name, effective_role.as_str(), &ws.name).await {
         Ok(reply) => reply,
@@ -875,8 +875,8 @@ async fn handle_clear_session(msg: &ChannelMessage) {
 
 /// Deliver a session-clear confirmation via the router's raw `reply_target`
 /// path (broadcast + persist + transport). The caller passes the already
-/// effective role (pool-clamped, Assistant pinning applied) so the
-/// confirmation bubble matches agent responses.
+/// effective role (Assistant pinning applied) so the confirmation bubble
+/// matches agent responses.
 async fn deliver_clear_reply(
     reply: &str,
     msg: &ChannelMessage,
@@ -1055,7 +1055,7 @@ async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
         (BotCommand::MaintenanceOn, _) => toggle_workspace_state(msg, &ws_name, true, true).await,
         (BotCommand::MaintenanceOff, _) => toggle_workspace_state(msg, &ws_name, false, true).await,
         // Impossible: invalid /maintenance args returned early above, and the
-        // non-admin commands never reach this handler.
+        // admin-gated commands never reach this handler.
         _ => unreachable!(),
     }
 }
@@ -1273,20 +1273,14 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     );
 
     let ws = mahbot::users::resolve_workspace_for_user_name(&msg.user_name).await;
-    let pool = mahbot::users::role_pool();
-    let role = mahbot::users::resolve_active_role_from_pool(&msg.user_name, &pool).await;
 
-    // The Assistant always works in the user's personal workspace
-    // regardless of the selected workspace — resolved before enrichment and
-    // before `msg.workspace` is set so uploads, broadcast, persist and
-    // chat_history stay consistent with the routed workspace.
-    let (effective_role, ws) = match role {
-        Some(role) => {
-            let ws = mahbot::users::effective_workspace_for_role(role, ws, &msg.user_name);
-            (Some(role), ws)
-        }
-        None => (None, ws),
-    };
+    // Every account routes to the single Assistant role, and the Assistant
+    // always works in the user's personal workspace regardless of the selected
+    // workspace — resolved before enrichment and before `msg.workspace` is set
+    // so uploads, broadcast, persist and chat_history stay consistent with the
+    // routed workspace.
+    let ws =
+        mahbot::users::effective_workspace_for_role(mahbot::Role::Assistant, ws, &msg.user_name);
 
     // Populate workspace on the message so downstream broadcasts and
     // chat_history writes carry the correct (effective) workspace.
@@ -1299,21 +1293,16 @@ async fn process_channel_message(mut msg: ChannelMessage) {
 
     // ── Media-marker enrichment (audio transcription, image processing) ──
     // Runs BEFORE broadcast so the GUI receives transcription text instead
-    // of raw `[AUDIO:path]` markers.  Media-marker enrichment handles images
-    // for all roles (native data-URI parts, compressed for every role except
-    // Assistant) and videos for all roles (workspace copy + transcription).
-    // Link enrichment runs separately AFTER broadcast to avoid showing
-    // AI-generated URL summaries in the user's own message bubble.
-    let is_assistant = matches!(effective_role, Some(mahbot::Role::Assistant));
-    let strategy = mahbot::channels::EnrichmentStrategy {
-        // Only attach a workspace path when an agent will actually see the
-        // message: a no-role user's message is broadcast but never routed, so
-        // workspace copies and the video transcription they trigger would be
-        // discarded work (the transcription is an LLM call).
-        workspace_path: effective_role.is_some().then(|| ws.as_path().to_path_buf()),
-        compress_images: !is_assistant,
-    };
-    mahbot::channels::enrich_message(&mut msg, &strategy).await;
+    // of raw `[AUDIO:path]` markers.  Media-marker enrichment turns images
+    // into native data-URI parts carrying the original bytes (re-encoded to a
+    // bounded JPEG only when they would exceed the encoded-payload cap) and
+    // videos into a workspace copy + transcription. Link enrichment runs
+    // separately AFTER broadcast to avoid showing AI-generated URL summaries in
+    // the user's own message bubble.
+    // Every routed turn is the Assistant's, so a workspace path is always
+    // attached: workspace copies and the video transcription it triggers
+    // are always seen.
+    mahbot::channels::enrich_message(&mut msg, Some(ws.as_path())).await;
 
     // ── Broadcast, persist, and mirror ─────────────────────────────────
     // `persist_content` decides what reaches chat history: the raw original
@@ -1344,23 +1333,17 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     }
 
     // ── Route through the agent-ID message router ─────────────────
-    // A failed selected-role store read (fail-closed) drops the message — it
-    // was still broadcast/persisted above, but no agent answers. The operator
-    // warn is already logged; the pool is the constant single Assistant (never
-    // empty), so no 'no roles' notice is needed.
-    let Some(effective_role) = effective_role else {
-        return;
-    };
-
-    // Every message resolves to a deterministic agent ID and routes
-    // through the per-agent consumer loop.  Different agent IDs get
-    // different consumer loops = true parallelism.
+    // Every account routes to the single Assistant, so there is no role to
+    // resolve — and no role-store read that could fail closed — before routing.
+    // Every message resolves to a deterministic agent ID and routes through the
+    // per-agent consumer loop: different agent IDs get different consumer
+    // loops = true parallelism.
     message_router::route_user_message(
         msg.content,
         ws.name,
         msg.user_name,
         msg.channel,
-        effective_role,
+        mahbot::Role::Assistant,
         Some(msg.reply_target),
     )
     .await;

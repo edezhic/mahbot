@@ -20,7 +20,7 @@
 //!
 //! # Response delivery
 //!
-//! - [`Role::Manager`] responses relay to every admin user's Assistant via
+//! - [`Role::Manager`] responses relay to the admin's Assistant via
 //!   the durable `<manager-message>` envelope ([`route_manager_notify`]) —
 //!   there is no direct user delivery.
 //! - Other roles deliver to the triggering user's channel bindings (with an
@@ -28,7 +28,6 @@
 
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
 use tokio::sync::mpsc;
@@ -56,45 +55,6 @@ use crate::{Channel, ChatEvent, Role, SendMessage};
 /// - Voice channel: TTS speaks this as "robot warning retry" (acceptable for now).
 /// - Emoji rendering varies across terminals and clients.
 const AGENT_FAILURE_EMOJI: &str = "🤖⚠️🔄";
-
-/// Per-role attribution emoji for Telegram deliveries — mirrors the GUI role
-/// icons ([`crate::gui::theme::role_icon`]) per the product spec.
-fn telegram_role_emoji(role: Role) -> &'static str {
-    match role {
-        Role::Manager => "🤖",
-        Role::Engineer => "🔧",
-        Role::Analyst => "🔍",
-        Role::Coder => "💻",
-        Role::Qa => "🔨",
-        Role::Reviewer => "✅",
-        Role::Discovery => "🔎",
-        Role::Maintainer => "⚙️",
-        Role::Sanitation => "🧼",
-        Role::Assistant => "💬",
-    }
-}
-
-/// Telegram agent responses carry a first-line role attribution
-/// (`"{emoji} {label}:\n"`) when the recipient can switch between multiple
-/// roles. Other channels pass the response through unchanged (borrowed, no
-/// allocation).
-#[must_use]
-fn telegram_delivery_content<'a>(
-    channel: &str,
-    role: Role,
-    recipient_roles: &[String],
-    response: &'a str,
-) -> Cow<'a, str> {
-    if channel != "telegram" || recipient_roles.len() < 2 {
-        return Cow::Borrowed(response);
-    }
-    Cow::Owned(format!(
-        "{} {}:\n{}",
-        telegram_role_emoji(role),
-        crate::agent::role::role_info(&role).display_label,
-        response
-    ))
-}
 
 /// Semantic category of a queue job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,8 +90,8 @@ pub enum MessageKind {
     /// distinct from `UserMessage` so the failure-emoji gate (`== UserMessage`)
     /// structurally excludes it.
     AgentMessage,
-    /// Durable auto-delivery copy of a Manager's response, routed into every
-    /// admin (full-access) user's Assistant session (`<manager-message>`
+    /// Durable auto-delivery copy of a Manager's response, routed into the
+    /// single admin's Assistant session (`<manager-message>`
     /// envelope; the job's workspace is the admin's personal one, the source
     /// workspace travels only in the envelope's `workspace` attribute).
     /// Appended to the session like other result kinds; never
@@ -303,7 +263,7 @@ pub async fn route_user_message(
     reply_target: Option<String>,
 ) {
     // Invariant: the routed user identity is never an empty string. A real
-    // admin user is always seeded. Normalize defensively so no path can create
+    // admin account is always seeded. Normalize defensively so no path can create
     // a malformed identity (bare "_ws_role" key) or persist/reply under an
     // empty user. (direct_agent_id also normalizes the ID key; this layer
     // normalizes the delivery payload.)
@@ -397,7 +357,7 @@ fn agent_message_job(content: String, workspace_name: String, user_name: &str) -
 
 /// Route a message from an assistant agent into the workspace Manager's
 /// session (`MessageKind::AgentMessage`). No addressed reply leg anymore — the
-/// Manager's response auto-delivers to admin assistants via
+/// Manager's response auto-delivers to the admin's Assistant via
 /// [`route_manager_notify`].
 pub async fn route_agent_message_to_manager(
     content: String,
@@ -595,7 +555,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         // ── Resolve users for response delivery ───────────────────────
         // Non-Manager roles deliver to the specific triggering user. The
         // Manager has no direct user delivery: its responses relay to the
-        // admin Assistants via the ManagerNotify envelope below.
+        // admin's Assistant via the ManagerNotify envelope below.
         let users: Vec<UserRecord> = if role == Role::Manager {
             Vec::new()
         } else {
@@ -642,11 +602,13 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         };
 
         // ── Run the agent ─────────────────────────────────────────────
-        // Full-access (admin) users get the Assistant's full-permission toolset
-        // and role prompt; everyone else runs the base Assistant. Manager jobs
-        // resolve no users, so `full_access` is always false there — inert for
-        // this role (nothing in the Manager toolset or prompt gates on it).
-        let full_access = users.first().is_some_and(UserRecord::is_admin);
+        // The admin gets the Assistant's widened toolset and role prompt;
+        // everyone else runs the guest Assistant. Manager jobs resolve no
+        // users, so `is_admin` is always false there — inert for this role
+        // (nothing in the Manager toolset or prompt gates on it).
+        let is_admin = users
+            .first()
+            .is_some_and(|user| crate::users::is_admin_name(&user.name));
         let (agent, response) = crate::agent::run_agent(
             agent_id.clone(),
             role,
@@ -655,7 +617,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             &message,
             job.user_name.clone(),
             job.channel.clone(),
-            full_access,
+            is_admin,
             None,
             false,
             None,
@@ -706,7 +668,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
 
         // ── Response delivery ─────────────────────────────────────────
         // Manager: the sole delivery path is the durable <manager-message>
-        // envelope into each admin's personal Assistant.
+        // envelope into the admin's personal Assistant.
         // Other roles: broadcast to all of the triggering user's channel
         // bindings (or use fallback for unregistered users).
         match role {
@@ -859,27 +821,18 @@ async fn deliver_on_channel(
 }
 
 /// Auto-delivery hook: EVERY Manager response is additionally routed as a
-/// durable `<manager-message>` envelope into each admin (full-access) user's
-/// Assistant session — the only manager→assistant delivery path. The job
-/// targets the admin's personal workspace so addressed routing resolves the
-/// admin's real assistant session; the SOURCE workspace travels only inside
-/// the envelope's `workspace` attribute. Empty responses deliver nothing
+/// durable `<manager-message>` envelope into the admin's Assistant session —
+/// the only manager→assistant delivery path. It always targets the single
+/// admin: the recipient is that constant identity rather than a lookup, so no
+/// account-store hiccup can silently drop a manager response. The job targets
+/// the admin's personal workspace so addressed routing resolves the admin's
+/// real assistant session; the SOURCE workspace travels only inside the
+/// envelope's `workspace` attribute. Empty responses deliver nothing
 /// (sleep-ended/failed turns never reach the delivery branch at all).
 async fn route_manager_notify(response: &str, source_workspace: &str) {
     if response.is_empty() {
         return;
     }
-    let Some(store) = crate::users::USER_STORE.get() else {
-        warn!("Message router [manager]: user store unavailable — admin notify leg skipped");
-        return;
-    };
-    let admins = match store.find_admins().await {
-        Ok(admins) => admins,
-        Err(e) => {
-            warn!(error = %e, "Message router [manager]: admin lookup failed — notify leg skipped");
-            return;
-        }
-    };
     let content = crate::prompt::substitute(
         &crate::prompt::load_prompt("manager_message.md"),
         &[
@@ -887,34 +840,29 @@ async fn route_manager_notify(response: &str, source_workspace: &str) {
             ("{{message}}", response),
         ],
     );
-    for admin in admins {
-        let job = AgentJob {
-            content: content.clone(),
-            // The admin's own personal workspace; the consumer loop re-validates
-            // the pinning invariant, so no re-pinning is needed here.
-            workspace_name: crate::users::personal_workspace_name(&admin.name),
-            user_name: admin.name.clone(),
-            channel: "gui".to_string(),
-            kind: MessageKind::ManagerNotify,
-            role: Role::Assistant,
-            reply_target: None,
-            pending_job_id: None,
-            originating_workspace: Some(source_workspace.to_string()),
-        };
-        let target = crate::jobs::envelope_target(&job);
-        stamp_and_route(job, &target, "manager notify envelope").await;
-    }
+    let job = AgentJob {
+        content,
+        // The admin's own personal workspace; the consumer loop re-validates
+        // the pinning invariant, so no re-pinning is needed here.
+        workspace_name: crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+        user_name: crate::users::ADMIN_USER_NAME.to_string(),
+        channel: "gui".to_string(),
+        kind: MessageKind::ManagerNotify,
+        role: Role::Assistant,
+        reply_target: None,
+        pending_job_id: None,
+        originating_workspace: Some(source_workspace.to_string()),
+    };
+    let target = crate::jobs::envelope_target(&job);
+    stamp_and_route(job, &target, "manager notify envelope").await;
 }
 
 /// Transport-deliver `response` to every channel binding of `users`
-/// (broadcast + chat_history persistence happen at the call sites). Telegram
-/// deliveries carry the per-role attribution prefix only for multi-role
-/// recipients — under the constant single-Assistant pool the prefix is
-/// effectively never applied. Logs both diagnostics per reachable binding: an
-/// unresolvable recipient (warn — the response is persisted but not
-/// transport-delivered) and a transport failure (error). `workspace` names
-/// the workspace in the no-channels diagnostic (which also names the affected
-/// users).
+/// (broadcast + chat_history persistence happen at the call sites). Logs both
+/// diagnostics per reachable binding: an unresolvable recipient (warn — the
+/// response is persisted but not transport-delivered) and a transport failure
+/// (error). `workspace` names the workspace in the no-channels diagnostic
+/// (which also names the affected users).
 async fn deliver_response_over_channels(
     response: &str,
     users: &[UserRecord],
@@ -940,7 +888,6 @@ async fn deliver_response_over_channels(
 
     for (channel_name, channel) in &channels {
         for user in users {
-            let content = telegram_delivery_content(channel_name, role, &user.roles, response);
             for binding in &user.channels {
                 if binding.channel != *channel_name {
                     continue;
@@ -950,7 +897,7 @@ async fn deliver_response_over_channels(
                     channel.as_ref(),
                     &user.name,
                     reply_target,
-                    &content,
+                    response,
                     file_roots,
                 )
                 .await
@@ -1409,9 +1356,9 @@ mod tests {
     async fn test_resolve_single_user_found() {
         setup_response_test_infra().await;
 
-        // The admin user is auto-created by ensure_admin_user.
+        // The admin is auto-created by ensure_admin_user.
         let user = resolve_single_user("admin").await;
-        assert!(user.is_some(), "admin user should exist after store init");
+        assert!(user.is_some(), "the admin should exist after store init");
         assert_eq!(user.as_ref().unwrap().name, "admin");
     }
 
@@ -1464,7 +1411,7 @@ mod tests {
     async fn test_deliver_single_user_response() {
         setup_response_test_infra().await;
 
-        // Give the admin user a "gui" channel binding so the delivery
+        // Give the admin a "gui" channel binding so the delivery
         // function can find it.
         let store = crate::users::USER_STORE.get().unwrap();
         store
@@ -1505,7 +1452,7 @@ mod tests {
     async fn test_deliver_single_user_no_bindings() {
         setup_response_test_infra().await;
 
-        // Admin user exists but has no "gui" channel binding.
+        // The admin exists but has no "gui" channel binding.
         let user = resolve_single_user("admin").await.unwrap();
 
         let job = AgentJob {
@@ -1603,26 +1550,19 @@ mod tests {
     }
 
     /// Auto-delivery round trip: a Manager response persists one durable
-    /// `<manager-message>` envelope per admin, addressed to the admin's
+    /// `<manager-message>` envelope for the admin, addressed to the admin's
     /// personal Assistant session, carrying the FULL untruncated response and
     /// the source workspace only in the envelope attribute. Empty responses
-    /// persist nothing. Cleans up its rows/user so other tests' boot-replay
-    /// paths never see them.
+    /// persist nothing. Cleans up the row it created so other tests'
+    /// boot-replay paths never see it.
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn manager_notify_delivers_to_admin_assistant() {
         setup_response_test_infra().await;
-        let store = crate::users::USER_STORE
-            .get()
-            .expect("user store initialized");
-        store
-            .add_user("__notify_admin", Some("full"), Role::Assistant)
-            .await
-            .expect("add admin user");
         let target = crate::session::resolve_agent_id(
-            "__notify_admin",
+            crate::users::ADMIN_USER_NAME,
             "assistant",
-            "personal:__notify_admin",
+            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
         );
 
         // Snapshot existing rows so cleanup removes ONLY rows this test created.
@@ -1655,8 +1595,11 @@ mod tests {
         let deserialized: AgentJob =
             serde_json::from_str(&matching[0].envelope).expect("envelope deserializes to AgentJob");
         assert_eq!(deserialized.kind, MessageKind::ManagerNotify);
-        assert_eq!(deserialized.workspace_name, "personal:__notify_admin");
-        assert_eq!(deserialized.user_name, "__notify_admin");
+        assert_eq!(
+            deserialized.workspace_name,
+            crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME)
+        );
+        assert_eq!(deserialized.user_name, crate::users::ADMIN_USER_NAME);
         assert_eq!(
             deserialized.originating_workspace.as_deref(),
             Some("team_ws"),
@@ -1683,18 +1626,11 @@ mod tests {
             "a legacy row without the field must default to no originating workspace"
         );
 
-        // The notify call fans out to every admin — including the auto-seeded
-        // 'admin' — so clean up ALL rows created by this test, not just the
-        // asserted one.
         for row in pending.iter().filter(|r| !before.contains(&r.id)) {
             crate::jobs::delete_pending_job(conn, &row.id)
                 .await
                 .expect("delete pending row");
         }
-        store
-            .delete_user("__notify_admin")
-            .await
-            .expect("delete user");
     }
 
     // ── register_agent / unregister_agent / try_route tests ────────────
@@ -1821,57 +1757,7 @@ mod tests {
         );
     }
 
-    // ── Telegram role attribution tests ──────────────────────────────────
-
-    /// The attribution prefix fires only for Telegram + 2+ role pools, and
-    /// pins the concrete emoji/label table from the spec.
-    #[test]
-    fn test_telegram_delivery_content() {
-        let response = "plain answer";
-
-        // 0-1 roles → response passed through unchanged (borrowed, no prefix).
-        let content = telegram_delivery_content("telegram", Role::Manager, &[], response);
-        assert_eq!(content, "plain answer");
-        assert!(
-            matches!(content, Cow::Borrowed(_)),
-            "no-prefix deliveries must not allocate"
-        );
-        let content = telegram_delivery_content(
-            "telegram",
-            Role::Manager,
-            &["manager".to_string()],
-            response,
-        );
-        assert_eq!(content, "plain answer");
-        assert!(
-            matches!(content, Cow::Borrowed(_)),
-            "no-prefix deliveries must not allocate"
-        );
-
-        // Non-Telegram channels never get a prefix, even with 2+ roles.
-        let multi = ["manager".to_string(), "assistant".to_string()];
-        let content = telegram_delivery_content("gui", Role::Manager, &multi, response);
-        assert_eq!(content, "plain answer");
-        assert!(
-            matches!(content, Cow::Borrowed(_)),
-            "gui/voice deliveries must not allocate"
-        );
-
-        // 2+ roles on Telegram → first-line attribution pins the spec table.
-        assert_eq!(
-            telegram_delivery_content("telegram", Role::Manager, &multi, response),
-            "🤖 Manager:\nplain answer"
-        );
-        assert_eq!(
-            telegram_delivery_content(
-                "telegram",
-                Role::Qa,
-                &["qa".to_string(), "coder".to_string()],
-                response,
-            ),
-            "🔨 QA:\nplain answer"
-        );
-    }
+    // ── Structural message-kind invariants ───────────────────────────────
 
     /// `RecoveryRetry` is intentionally NOT `UserMessage`.  The emoji gate in
     /// `consumer_loop` uses `job.kind == MessageKind::UserMessage` to decide whether

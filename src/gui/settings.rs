@@ -1433,15 +1433,14 @@ impl SettingsState {
                 if self.add_user_sender.text().is_empty() {
                     return Task::none();
                 }
-                // The constant single-Assistant role pool stores no per-user
-                // roles; the manual Settings bypass always assigns the
-                // Assistant as the single default agent.
-                let default_role = Role::Assistant;
                 self.add_user_adding = true;
                 let sender = self.add_user_sender.text();
                 Task::perform(
                     async move {
                         let store = users::user_store()?;
+                        // The name IS the admin marker, so a guest-creation path
+                        // can never mint the admin's name.
+                        crate::users::validate_new_user_name(&sender).map_err(|e| e.to_string())?;
                         // Reject a duplicate name here too: the Settings bypass has no
                         // way to complete a leftover unbound row, so a duplicate would
                         // silently no-op (INSERT OR IGNORE) while reporting success.
@@ -1452,10 +1451,7 @@ impl SettingsState {
                         {
                             return Err(format!("A user named '{sender}' already exists"));
                         }
-                        store
-                            .add_user(&sender, None, default_role)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        store.add_user(&sender).await.map_err(|e| e.to_string())?;
                         Ok(())
                     },
                     SettingsMessage::AddUserResult,
@@ -2028,7 +2024,7 @@ impl SettingsState {
         } else {
             for entry in &us.users {
                 let user = &entry.record;
-                let is_admin = user.is_admin();
+                let is_admin = crate::users::is_admin_name(&user.name);
 
                 let telegram_binding = user.channels.iter().find(|c| c.channel == "telegram");
                 let telegram_elem: Element<'_, SettingsMessage> =
@@ -2152,16 +2148,19 @@ impl SettingsState {
                 ]
                 .spacing(theme::SPACE_8)
                 .align_y(Alignment::Center);
-                if let Some(p) = user.permissions.as_deref().filter(|p| !p.is_empty()) {
-                    segment =
-                        segment.push(text(p).size(theme::TEXT_12).color(theme::TEXT_SECONDARY));
-                }
+                // The account kind, derived from the name — the name is the only
+                // admin marker the product stores.
+                segment = segment.push(
+                    text(if is_admin { "admin" } else { "guest" })
+                        .size(theme::TEXT_12)
+                        .color(theme::TEXT_SECONDARY),
+                );
 
                 let mut card_body = Column::new()
                     .spacing(theme::SPACE_2)
                     .push(segment.push(telegram_elem));
-                // Admins hold the whole tool catalogue implicitly, so a grant
-                // line on their card would misstate what they can call.
+                // The admin holds the whole tool catalogue implicitly, so a
+                // grant line on the card would misstate what they can call.
                 if !is_admin {
                     card_body = card_body.push(
                         text(format!(
@@ -2182,8 +2181,8 @@ impl SettingsState {
 
                 // Right-click context menu (Delete). The card's own controls
                 // still work: ContextMenu forwards all events to the underlay
-                // first; only right-clicks open the menu. Admins are exempt —
-                // no context menu at all (an empty menu would render a hollow
+                // first; only right-clicks open the menu. The admin is exempt
+                // — no context menu at all (an empty menu would render a hollow
                 // box).
                 let user_row: Element<'_, SettingsMessage> = if is_admin {
                     user_row.into()

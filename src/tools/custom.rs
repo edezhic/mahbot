@@ -22,7 +22,7 @@
 //! its own personal workspace, so a custom call always runs in the caller's
 //! `userspaces/<user>` directory.
 //!
-//! Availability is per user: an admin may call anything, everyone else only
+//! Availability is per user: the admin may call anything, a guest only
 //! what is granted to them (`users.granted_tools`). The `<custom-tools>`
 //! context block is the model-facing catalogue and follows the same split.
 
@@ -357,35 +357,35 @@ fn render_lines(tools: &[&ScriptTool]) -> String {
 /// The `<custom-tools>` context block for an Assistant session.
 ///
 /// Unlike the other assistant blocks this one is emitted even when there is
-/// nothing to list — a user with no grants (and a full-access caller with no
+/// nothing to list — a guest with no grants (and the admin's Assistant with no
 /// tools yet) still learns the feature exists.
-pub(crate) async fn context_block(user_name: &str, full_access: bool) -> String {
-    let granted = if full_access {
+pub(crate) async fn context_block(user_name: &str, is_admin: bool) -> String {
+    let granted = if is_admin {
         Vec::new()
     } else {
         crate::users::granted_tools(user_name).await
     };
     // A caller with no grants can only receive the no-grants form, so the
     // folder is not read for them at all.
-    let catalogue = if full_access || !granted.is_empty() {
+    let catalogue = if is_admin || !granted.is_empty() {
         catalogue().await
     } else {
         Vec::new()
     };
-    block_for(&catalogue, &granted, full_access)
+    block_for(&catalogue, &granted, is_admin)
 }
 
-/// Render the block for a loaded catalogue: every tool for a full-access
-/// (admin) caller, only the granted ones for anyone else — the same split the
-/// call itself enforces. A grant that matches no usable file contributes
-/// nothing, and an empty listing falls back to the matching brief form.
-fn block_for(catalogue: &[ScriptTool], granted: &[String], full_access: bool) -> String {
+/// Render the block for a loaded catalogue: every tool for the admin, only the
+/// granted ones for a guest — the same split the call itself enforces. A grant
+/// that matches no usable file contributes nothing, and an empty listing falls
+/// back to the matching brief form.
+fn block_for(catalogue: &[ScriptTool], granted: &[String], is_admin: bool) -> String {
     let tools: Vec<&ScriptTool> = catalogue
         .iter()
-        .filter(|t| full_access || granted.iter().any(|g| g == &t.name))
+        .filter(|t| is_admin || granted.iter().any(|g| g == &t.name))
         .collect();
     if tools.is_empty() {
-        return load_prompt(if full_access {
+        return load_prompt(if is_admin {
             "context/custom_tools_none.md"
         } else {
             "context/custom_tools_no_grants.md"
@@ -502,8 +502,8 @@ fn ignored_arguments(tool: &ScriptTool, supplied: &Map<String, Value>) -> Vec<St
 }
 
 /// The single native tool that forwards a call to one admin-authored script.
-/// Available to every Assistant (admin and non-admin alike); the grant decides
-/// what each call may reach.
+/// Available to every Assistant (the admin's and a guest's alike); the grant
+/// decides what each call may reach.
 pub(crate) struct CustomTool;
 
 #[async_trait]
@@ -549,7 +549,7 @@ impl Tool for CustomTool {
             Some(other) => return Err(super::wrong_type("args", "an object", other)),
         };
 
-        // An admin may call anything; everyone else only what is granted to
+        // The admin may call anything; a guest only what is granted to
         // them. The refusal names no way to retry successfully, and it comes
         // before the catalogue is read so a refusal cannot probe which tools
         // exist — nor leak anything about their declared parameters.
@@ -777,7 +777,7 @@ mod tests {
     }
 
     /// The block's listing split is what keeps a guest from being told about
-    /// tools it cannot call: the whole catalogue for a full-access caller, the
+    /// tools it cannot call: the whole catalogue for the admin, the
     /// granted subset otherwise, and the matching brief form when nothing is
     /// left.
     #[test]
@@ -790,10 +790,10 @@ mod tests {
         };
         let catalogue = [script("alpha"), script("beta")];
 
-        let full = block_for(&catalogue, &[], true);
+        let admin = block_for(&catalogue, &[], true);
         assert!(
-            full.contains("alpha") && full.contains("beta"),
-            "got: {full}"
+            admin.contains("alpha") && admin.contains("beta"),
+            "got: {admin}"
         );
 
         let granted = block_for(&catalogue, &["beta".to_string()], false);
@@ -837,7 +837,7 @@ mod tests {
         // An ungranted caller is refused before the tool's existence is
         // consulted, so the refusal is not an existence oracle. The name is
         // unique to this test: every test in the process shares one users
-        // store, so a common name could carry another test's permissions.
+        // store, so a common name could carry another test's grants.
         let err = as_user("custom_gate_guest", json!({ "tool": "ghost" }))
             .await
             .unwrap_err()

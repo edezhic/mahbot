@@ -2273,7 +2273,7 @@ async fn setup_user_with_telegram_binding(user_name: &str, reply_target: &str, c
     use crate::users::store;
     let store = store();
     store
-        .add_user(user_name, Some("full"), crate::Role::Assistant)
+        .add_user(user_name)
         .await
         .unwrap_or_else(|e| panic!("{ctx}: add_user: {e}"));
     store
@@ -2374,14 +2374,14 @@ async fn assert_mirror_skips(setup: MirrorSkipSetup, msg: &ChannelMessage, reaso
         }
         MirrorSkipSetup::Unbound(u) => {
             let s = crate::users::store();
-            s.add_user(u, None, crate::Role::Assistant)
+            s.add_user(u)
                 .await
                 .unwrap_or_else(|e| panic!("case {reason}: add_user: {e}"));
             (u, u)
         }
         MirrorSkipSetup::BoundNoTarget(u) => {
             let s = crate::users::store();
-            s.add_user(u, None, crate::Role::Assistant)
+            s.add_user(u)
                 .await
                 .unwrap_or_else(|e| panic!("case {reason}: add_user: {e}"));
             s.bind_channel(u, "telegram", u)
@@ -2506,10 +2506,7 @@ async fn mirrors_voice_transcript_to_telegram() {
 async fn sends_to_multiple_telegram_bindings() {
     let (sent, _lock) = setup_mirror_test_env().await;
     let store = crate::users::store();
-    store
-        .add_user("multi_user", None, crate::Role::Assistant)
-        .await
-        .expect("add_user");
+    store.add_user("multi_user").await.expect("add_user");
     // Bind two Telegram accounts with unique recipients.
     store
         .bind_channel("multi_user", "telegram", "multi_user_1")
@@ -2634,101 +2631,100 @@ async fn mirrors_media_only_with_reply_reference() {
 }
 
 #[tokio::test]
+#[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
 async fn user_command_entries_reflect_admin_state() {
     // Serialized with the sibling mirror tests: this test mutates the
-    // shared user/workspace stores (alice's workspace + menu_ws state), so it
-    // must not run concurrently with other store users.
+    // shared user/workspace stores (the admin's workspace + menu_ws state), so
+    // it must not run concurrently with other store users.
     let _lock = acquire_mirror_lock().await;
     crate::users::test_util::init_test_store().await;
     let store = crate::users::store();
+    let admin = crate::users::ADMIN_USER_NAME;
 
-    // Give alice a shared workspace so state-aware admin entries appear.
+    // Give the admin a shared workspace so state-aware admin entries appear.
     crate::util::test::create_test_workspace("/tmp/mahbot_test_ws_menu", "menu_ws").await;
-    store
-        .update_user(
-            "alice",
-            crate::users::FieldUpdate::Unchanged,
-            crate::users::FieldUpdate::Set("menu_ws"),
-            crate::users::FieldUpdate::Unchanged,
-        )
-        .await
-        .unwrap();
+    // The guard restores the shared seeded admin row even when an assertion
+    // below panics.
+    crate::users::test_util::with_admin_workspace_restored(async {
+        store
+            .set_selected_workspace(admin, Some("menu_ws"))
+            .await
+            .unwrap();
 
-    // alice: admin (full permissions), pool = single Assistant role →
-    // no role-switch entry, just unconditional model commands and
-    // state-aware admin commands. In the (LocalCheckout) test environment
-    // the shared availability cache seeds `available = true`, so `/update`
-    // is present for the admin.
-    let alice = user_command_entries("alice").await;
-    let cmds: Vec<&str> = alice.iter().map(|(c, _)| c.as_str()).collect();
-    assert!(cmds.contains(&"board"));
-    assert!(cmds.contains(&"update"));
-    // State-aware pairs reflect the workspace state: not paused →
-    // /pause, maintenance disabled → /maintenance_on.
-    assert!(cmds.contains(&"pause"));
-    assert!(!cmds.contains(&"unpause"));
-    assert!(cmds.contains(&"maintenance_on"));
-    assert!(!cmds.contains(&"maintenance_off"));
-    // Per-role switch commands are removed entirely — the role pool is the
-    // constant single Assistant, so nothing to switch.
-    for cmd in ["manager", "assistant", "engineer"] {
-        assert!(!cmds.contains(&cmd));
-    }
-    // Model commands are unconditional (every user has the Assistant role).
-    assert!(cmds.contains(&"image_models"));
-    assert!(cmds.contains(&"video_models"));
-    // Menu order: board/admin (+ /update), then workspace-state pairs,
-    // then model commands, with /clear last. The role-switch entry
-    // (/agents) is removed entirely.
-    assert_eq!(cmds.last(), Some(&"clear"));
-    let pos = |cmd: &str| cmds.iter().position(|c| *c == cmd).unwrap();
-    assert!(pos("board") < pos("update"));
-    assert!(pos("update") < pos("image_models"));
-    assert!(pos("image_models") < pos("clear"));
+        // The admin: single Assistant role →
+        // no role-switch entry, just unconditional model commands and
+        // state-aware admin commands. In the (LocalCheckout) test environment
+        // the shared availability cache seeds `available = true`, so `/update`
+        // is present for the admin.
+        let admin_entries = user_command_entries(admin).await;
+        let cmds: Vec<&str> = admin_entries.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(cmds.contains(&"board"));
+        assert!(cmds.contains(&"update"));
+        // State-aware pairs reflect the workspace state: not paused →
+        // /pause, maintenance disabled → /maintenance_on.
+        assert!(cmds.contains(&"pause"));
+        assert!(!cmds.contains(&"unpause"));
+        assert!(cmds.contains(&"maintenance_on"));
+        assert!(!cmds.contains(&"maintenance_off"));
+        // Per-role switch commands are removed entirely — the Assistant is every
+        // account's only role, so nothing to switch.
+        for cmd in ["manager", "assistant", "engineer"] {
+            assert!(!cmds.contains(&cmd));
+        }
+        // Model commands are unconditional (every user has the Assistant role).
+        assert!(cmds.contains(&"image_models"));
+        assert!(cmds.contains(&"video_models"));
+        // Menu order: board/admin (+ /update), then workspace-state pairs,
+        // then model commands, with /clear last. The role-switch entry
+        // (/agents) is removed entirely.
+        assert_eq!(cmds.last(), Some(&"clear"));
+        let pos = |cmd: &str| cmds.iter().position(|c| *c == cmd).unwrap();
+        assert!(pos("board") < pos("update"));
+        assert!(pos("update") < pos("image_models"));
+        assert!(pos("image_models") < pos("clear"));
 
-    // Flipping the workspace state reverses the pairs (the ticket's
-    // headline criterion): paused → /unpause, maintenance on →
-    // /maintenance_off.
-    crate::workspace::store()
-        .set_paused("menu_ws", true)
-        .await
-        .unwrap();
-    crate::workspace::store()
-        .set_maintenance_enabled("menu_ws", true)
-        .await
-        .unwrap();
-    let flipped = user_command_entries("alice").await;
-    let flipped_cmds: Vec<&str> = flipped.iter().map(|(c, _)| c.as_str()).collect();
-    assert!(flipped_cmds.contains(&"unpause"));
-    assert!(!flipped_cmds.contains(&"pause"));
-    assert!(flipped_cmds.contains(&"maintenance_off"));
-    assert!(!flipped_cmds.contains(&"maintenance_on"));
+        // Flipping the workspace state reverses the pairs (the ticket's
+        // headline criterion): paused → /unpause, maintenance on →
+        // /maintenance_off.
+        crate::workspace::store()
+            .set_paused("menu_ws", true)
+            .await
+            .unwrap();
+        crate::workspace::store()
+            .set_maintenance_enabled("menu_ws", true)
+            .await
+            .unwrap();
+        let flipped = user_command_entries(admin).await;
+        let flipped_cmds: Vec<&str> = flipped.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(flipped_cmds.contains(&"unpause"));
+        assert!(!flipped_cmds.contains(&"pause"));
+        assert!(flipped_cmds.contains(&"maintenance_off"));
+        assert!(!flipped_cmds.contains(&"maintenance_on"));
 
-    // Registry-hidden branch: no available update → `/update` is absent even
-    // for the admin (the cache is a process-local single source of truth). The
-    // RAII guard restores the LocalCheckout default on drop.
-    {
-        let _guard = crate::self_update::set_update_cache_for_test(false, false);
-        let hidden = user_command_entries("alice").await;
-        let hidden_cmds: Vec<&str> = hidden.iter().map(|(c, _)| c.as_str()).collect();
-        assert!(!hidden_cmds.contains(&"update"));
-    }
+        // Registry-hidden branch: no available update → `/update` is absent even
+        // for the admin (the cache is a process-local single source of truth). The
+        // RAII guard restores the LocalCheckout default on drop.
+        {
+            let _guard = crate::self_update::set_update_cache_for_test(false, false);
+            let hidden = user_command_entries(admin).await;
+            let hidden_cmds: Vec<&str> = hidden.iter().map(|(c, _)| c.as_str()).collect();
+            assert!(!hidden_cmds.contains(&"update"));
+        }
 
-    // bob: restricted user — no admin commands and, with a single-role pool
-    // ([Assistant]), no role-switch entry either. Model commands remain
-    // available.
-    let bob = user_command_entries("bob").await;
-    let cmds: Vec<&str> = bob.iter().map(|(c, _)| c.as_str()).collect();
-    assert!(!cmds.contains(&"agents"));
-    assert!(!cmds.contains(&"board"));
-    assert!(!cmds.contains(&"update"));
-    assert!(!cmds.contains(&"pause"));
-    assert!(!cmds.contains(&"unpause"));
-    // Restricted user: pool is [Assistant] — per-role switch commands are
-    // absent entirely, but model commands are unconditional.
-    assert!(!cmds.contains(&"assistant"));
-    assert!(!cmds.contains(&"manager"));
-    assert!(cmds.contains(&"image_models"));
-    assert!(cmds.contains(&"video_models"));
-    assert_eq!(cmds[0], "image_models");
+        // bob: a guest — no admin commands and, with the Assistant as the only
+        // role, no role-switch entry either. Model commands remain available.
+        let bob = user_command_entries("bob").await;
+        let cmds: Vec<&str> = bob.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(!cmds.contains(&"agents"));
+        assert!(!cmds.contains(&"board"));
+        assert!(!cmds.contains(&"update"));
+        assert!(!cmds.contains(&"pause"));
+        assert!(!cmds.contains(&"unpause"));
+        assert!(!cmds.contains(&"assistant"));
+        assert!(!cmds.contains(&"manager"));
+        assert!(cmds.contains(&"image_models"));
+        assert!(cmds.contains(&"video_models"));
+        assert_eq!(cmds[0], "image_models");
+    })
+    .await;
 }

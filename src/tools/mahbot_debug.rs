@@ -1,7 +1,7 @@
-//! In-process read-only SQL query tool for the full-access Assistant — wraps
+//! In-process read-only SQL query tool for the admin's Assistant — wraps
 //! the `mahbot debug` read-only query mechanism against the daemon's own live
 //! connections (the consolidated `core.db` via [`crate::db::DOMAIN_CONN`], the
-//! `logs.db` via [`crate::logs::LOG_STORE`]) so a trusted admin Assistant can
+//! `logs.db` via [`crate::logs::LOG_STORE`]) so the admin's Assistant can
 //! query them without a subprocess or a second store instance.
 
 use crate::db::Value;

@@ -299,7 +299,7 @@ pub enum HomeMessage {
     /// auto-clear it. Carries the generation counter to prevent stale
     /// timeouts from interfering with a fresh send.
     SendingTimeout(u64),
-    /// Mic button clicked — start a voice message recording to the active role.
+    /// Mic button clicked — start a voice message recording to the Assistant.
     StartVoiceRecording,
     /// Recording popup: stop recording, transcribe, and send the voice message.
     StopVoiceRecordingSend,
@@ -448,7 +448,7 @@ impl HomeState {
     /// Whether `workspace` is the admin's personal workspace
     /// (`personal:admin`) — the Assistant chat shown at any picker.
     fn is_admin_personal_workspace(workspace: &str) -> bool {
-        crate::users::personal_user_name(workspace) == Some(crate::users::ADMIN_USER_NAME)
+        crate::users::personal_user_name(workspace).is_some_and(crate::users::is_admin_name)
     }
 
     /// The visible chat set for the admin (see [`VisibleChat`]).
@@ -734,7 +734,7 @@ impl HomeState {
         if !self.workspace_visible(workspace) {
             return;
         }
-        if user_name != crate::users::ADMIN_USER_NAME {
+        if !crate::users::is_admin_name(user_name) {
             return;
         }
 
@@ -767,7 +767,7 @@ impl HomeState {
         timestamp: Option<String>,
         reply_reference: Option<ReplyReference>,
     ) {
-        if user_name != crate::users::ADMIN_USER_NAME {
+        if !crate::users::is_admin_name(user_name) {
             return;
         }
         if !self.workspace_visible(workspace) {
@@ -1307,14 +1307,12 @@ impl HomeState {
                 let clear_task = Task::perform(
                     async move {
                         // Clear the session the admin actually talks to — the
-                        // same (role, workspace) resolution as routing and
-                        // Telegram /clear (see
+                        // same resolution as routing and Telegram /clear (see
                         // [`crate::users::resolve_session_target`]): the
-                        // starting role/workspace resolve from the admin's DB
-                        // record, never the GUI picker position, and the
-                        // resolvable role (Assistant) is pinned —
-                        // so the cleared session is always the admin's
-                        // personal-workspace session.
+                        // workspace resolves from the admin's DB record, never
+                        // from the GUI picker position, and the Assistant is
+                        // pinned to it — so the cleared session is always the
+                        // admin's personal-workspace session.
                         let (effective_role, ws) =
                             crate::users::resolve_session_target(&sender).await;
                         // Fail-closed: a failed abandon aborts the clear — the
@@ -1458,8 +1456,7 @@ impl HomeState {
                 } => {
                     // Apply user + workspace filter — only show typing indicator
                     // for the admin in a visible workspace.
-                    if user_name == crate::users::ADMIN_USER_NAME
-                        && self.workspace_visible(&workspace)
+                    if crate::users::is_admin_name(&user_name) && self.workspace_visible(&workspace)
                     {
                         self.typing = is_typing;
                         if is_typing {
@@ -2450,48 +2447,52 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(gui_admin_workspace)] // both mutation sites write the shared seeded admin row
+    #[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
     async fn test_project_workspace_for_reads_db_normalized() {
         crate::util::test::init_test_stores().await;
         let store = crate::users::USER_STORE
             .get()
             .expect("users store initialized");
-        let previous = crate::users::get_raw_selected_workspace(crate::users::ADMIN_USER_NAME)
-            .await
-            .expect("read admin selected_workspace");
-        let set_selected = async |selected: Option<&str>| {
+
+        // The guard restores the shared seeded admin row even when an assertion
+        // below panics.
+        crate::users::test_util::with_admin_workspace_restored(async {
+            // NULL → None.
             store
-                .conn
-                .execute(
-                    "UPDATE users SET selected_workspace = ?1 WHERE name = ?2",
-                    crate::db::params![selected, crate::users::ADMIN_USER_NAME],
+                .set_selected_workspace(crate::users::ADMIN_USER_NAME, None)
+                .await
+                .expect("update admin selected_workspace");
+            assert_eq!(HomeState::project_workspace_for().await, None);
+
+            // Personal DB workspace → None.
+            store
+                .set_selected_workspace(
+                    crate::users::ADMIN_USER_NAME,
+                    Some("personal:home_project_workspace_for"),
                 )
                 .await
                 .expect("update admin selected_workspace");
-        };
+            assert_eq!(HomeState::project_workspace_for().await, None);
 
-        // NULL → None.
-        set_selected(None).await;
-        assert_eq!(HomeState::project_workspace_for().await, None);
-
-        // Personal DB workspace → None.
-        set_selected(Some("personal:home_project_workspace_for")).await;
-        assert_eq!(HomeState::project_workspace_for().await, None);
-
-        // Shared DB workspace → Some(ws).
-        crate::util::test::create_test_workspace(
-            "/tmp/home_project_workspace_for_ws",
-            "ws_home_project_workspace_for",
-        )
+            // Shared DB workspace → Some(ws).
+            crate::util::test::create_test_workspace(
+                "/tmp/home_project_workspace_for_ws",
+                "ws_home_project_workspace_for",
+            )
+            .await;
+            store
+                .set_selected_workspace(
+                    crate::users::ADMIN_USER_NAME,
+                    Some("ws_home_project_workspace_for"),
+                )
+                .await
+                .expect("update admin selected_workspace");
+            assert_eq!(
+                HomeState::project_workspace_for().await.as_deref(),
+                Some("ws_home_project_workspace_for")
+            );
+        })
         .await;
-        set_selected(Some("ws_home_project_workspace_for")).await;
-        assert_eq!(
-            HomeState::project_workspace_for().await.as_deref(),
-            Some("ws_home_project_workspace_for")
-        );
-
-        // Leave the shared seeded admin row as it was found.
-        set_selected(previous.as_deref()).await;
     }
 
     #[test]

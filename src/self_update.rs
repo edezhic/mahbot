@@ -670,7 +670,7 @@ async fn verify_cargo_on_path(action: &str) -> Result<()> {
 
 /// Resolve the admin Telegram reply target for update notifications, logging
 /// the rationale (info/warn) when notifications cannot be sent. Resolution is
-/// per-call — a DB round trip to find the admin user and its channel bindings.
+/// per-call — a DB round trip to find the admin and its channel bindings.
 /// Shared by both update modes.
 async fn resolve_update_admin_target() -> Option<String> {
     let admin_target = resolve_admin_telegram_target().await;
@@ -680,9 +680,9 @@ async fn resolve_update_admin_target() -> Option<String> {
             info!("No Telegram bot token configured — skipping update notifications");
         } else {
             warn!(
-                "Admin user 'admin' has no Telegram channel binding with a reply_target. \
+                "Admin account 'admin' has no Telegram channel binding with a reply_target. \
                  Update notifications will be skipped. \
-                 Bind a Telegram channel to the admin user to receive update notifications."
+                 Bind a Telegram channel to the admin to receive update notifications."
             );
         }
     }
@@ -1109,25 +1109,26 @@ async fn run_cargo_with_timeout(
     }
 }
 
-/// Look up an admin user's Telegram reply target.
+/// Look up the admin's Telegram reply target.
 ///
-/// Returns `Some(reply_target)` if an admin user (permissions == "full") has
-/// a Telegram channel binding with a non-null `reply_target` and a bot token
-/// is configured. Returns `None` otherwise. With multiple admins, the first
-/// bound one wins.
+/// Returns `Some(reply_target)` if the admin account has a Telegram channel
+/// binding with a non-null `reply_target` and a bot token is configured.
+/// Returns `None` otherwise.
 pub async fn resolve_admin_telegram_target() -> Option<String> {
     let _ = crate::config::CONFIG.telegram_bot_token()?;
 
     let store = crate::users::store();
-    let admin = store.find_admin().await.ok()??;
-    let bindings = store.get_user_channels(&admin.name).await.ok()?;
+    let bindings = store
+        .get_user_channels(crate::users::ADMIN_USER_NAME)
+        .await
+        .ok()?;
     bindings
         .into_iter()
         .find(|b| b.channel == "telegram" && b.reply_target.is_some())
         .and_then(|b| b.reply_target)
 }
 
-/// Send a notification to the admin user via Telegram.
+/// Send a notification to the admin via Telegram.
 pub async fn notify_admin(message: &str, target: Option<&str>) {
     let Some(recipient) = target else {
         return;
@@ -1145,10 +1146,10 @@ pub async fn notify_admin(message: &str, target: Option<&str>) {
     }
 }
 
-/// Reply used when a command requires full (admin) permissions. Used by both
+/// Reply used when a command requires the admin. Used by both
 /// the Telegram command dispatch (binary) and the `/update` handler (library)
 /// so the denial wording stays consistent.
-pub const ADMIN_ONLY_CMD_MSG: &str = "This command is only available to admin users.";
+pub const ADMIN_ONLY_CMD_MSG: &str = "This command is only available to the admin.";
 
 /// Reply for concurrent `/update` attempts — used both in the fast pre-check
 /// and the atomic claim below, and as the `execute_update` contention error.
@@ -1161,8 +1162,9 @@ const UPDATE_IN_PROGRESS_MSG: &str =
 /// synchronous reply for the early-failure cases (not an admin / already in
 /// progress / no update / cargo not on PATH). The actual update runs as a
 /// spawned async task so it does not block the Telegram message dispatch loop.
-/// Progress notifications route via the normal update notification path (first
-/// bound admin); a failure is also reported directly to the invoking admin.
+/// Progress notifications route via the normal update notification path (the
+/// admin's Telegram binding); a failure is also reported directly to the
+/// invoking admin.
 /// There is NO confirmation modal — an admin invoking `/update` from Telegram
 /// is itself sufficient confirmation.
 pub async fn handle_update_command(msg: &ChannelMessage) {
@@ -1222,12 +1224,12 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
 
     // Fire-and-forget: the build/install (10–60 min) must not block the
     // dispatch loop. Progress notifications route via the normal update
-    // notification path (first bound admin); on failure the invoking admin is
+    // notification path (the admin's bound Telegram target); on failure the invoking admin is
     // also told directly so a non-primary invoker isn't left guessing.
     let invoker_target = msg.reply_target.clone();
     tokio::spawn(async move {
         if let Err(e) = execute_update().await {
-            // Single failure report: the first bound admin (the normal update
+            // Single failure report: the admin's bound Telegram target (the normal update
             // notification path), plus the invoking admin when they differ.
             let failure = format!("❌ Update failed:\n{e:#}");
             let admin_target = resolve_update_admin_target().await;

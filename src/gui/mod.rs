@@ -1299,7 +1299,7 @@ impl Dashboard {
                             match crate::self_update::execute_update().await {
                                 Ok(()) => Ok("ok".to_string()),
                                 Err(e) => {
-                                    // Report to the first admin (Telegram) as well as
+                                    // Report to the admin (Telegram) as well as
                                     // the GUI toast, preserving the prior behavior
                                     // where the update path notified on failure.
                                     // `execute_update` no longer notifies; each caller
@@ -1501,9 +1501,11 @@ impl Dashboard {
             let ws = name.to_string();
             Task::perform(
                 async move {
-                    if let Err(e) =
-                        users::update_user_field(crate::users::ADMIN_USER_NAME.to_string(), ws)
-                            .await
+                    if let Err(e) = users::set_selected_workspace_field(
+                        crate::users::ADMIN_USER_NAME.to_string(),
+                        ws,
+                    )
+                    .await
                     {
                         tracing::warn!(error = %e, "Failed to persist workspace selection");
                     }
@@ -3627,7 +3629,7 @@ mod tests {
     /// workspace present in the map restores it; a stored value missing from
     /// the map falls back to the "Personal" default.
     #[tokio::test]
-    #[serial_test::serial(gui_admin_workspace)] // both mutation sites write the shared seeded admin row
+    #[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
     async fn boot_workspace_options_resolve_from_db() {
         crate::util::test::init_test_stores().await;
         crate::workspace::store()
@@ -3641,41 +3643,37 @@ mod tests {
             .await
             .expect("seed workspace");
 
-        let set_admin_workspace = async |selected: Option<&str>| {
-            crate::users::store()
-                .conn
-                .execute(
-                    "UPDATE users SET selected_workspace = ?1 WHERE name = ?2",
-                    crate::db::params![selected, crate::users::ADMIN_USER_NAME],
-                )
+        let store = crate::users::store();
+        // The guard restores the shared seeded admin row even when an assertion
+        // below panics.
+        crate::users::test_util::with_admin_workspace_restored(async {
+            // A shared stored workspace present in the map → restored.
+            store
+                .set_selected_workspace(crate::users::ADMIN_USER_NAME, Some("boot_ws_gui"))
                 .await
                 .expect("update admin selected_workspace");
-        };
-        let previous = crate::users::get_raw_selected_workspace(crate::users::ADMIN_USER_NAME)
-            .await
-            .expect("read admin selected_workspace");
+            let Message::BootWorkspaces {
+                workspaces: Ok(map),
+                restored_name,
+                ..
+            } = load_workspace_options(0).await
+            else {
+                panic!("expected BootWorkspaces with a loaded map");
+            };
+            assert!(map.contains_key("boot_ws_gui"));
+            assert_eq!(restored_name, "boot_ws_gui");
 
-        // A shared stored workspace present in the map → restored.
-        set_admin_workspace(Some("boot_ws_gui")).await;
-        let Message::BootWorkspaces {
-            workspaces: Ok(map),
-            restored_name,
-            ..
-        } = load_workspace_options(0).await
-        else {
-            panic!("expected BootWorkspaces with a loaded map");
-        };
-        assert!(map.contains_key("boot_ws_gui"));
-        assert_eq!(restored_name, "boot_ws_gui");
-
-        // A stored value missing from the map → the Personal default.
-        set_admin_workspace(Some("gone_ws_gui")).await;
-        let Message::BootWorkspaces { restored_name, .. } = load_workspace_options(0).await else {
-            panic!("expected BootWorkspaces");
-        };
-        assert_eq!(restored_name, "personal:admin");
-
-        // Leave the shared seeded admin row as it was found.
-        set_admin_workspace(previous.as_deref()).await;
+            // A stored value missing from the map → the Personal default.
+            store
+                .set_selected_workspace(crate::users::ADMIN_USER_NAME, Some("gone_ws_gui"))
+                .await
+                .expect("update admin selected_workspace");
+            let Message::BootWorkspaces { restored_name, .. } = load_workspace_options(0).await
+            else {
+                panic!("expected BootWorkspaces");
+            };
+            assert_eq!(restored_name, "personal:admin");
+        })
+        .await;
     }
 }

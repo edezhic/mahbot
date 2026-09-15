@@ -1,18 +1,24 @@
-//! Per-user identity, permissions, workspace and role preferences, and channel bindings.
+//! Per-account identity, workspace preference, and channel bindings.
 //!
 //! Two tables in the consolidated domain database (`core.db`):
-//! - `users` — canonical user identity: `name`, `permissions`, `selected_workspace`,
-//!   `selected_role`, `granted_tools` (the per-user custom-tool grants).
+//! - `users` — canonical account identity: `name`, `selected_workspace`,
+//!   `granted_tools` (the per-account custom-tool grants).
 //! - `user_channels` — channel bindings: maps a channel+identifier (e.g. Telegram @username)
-//!   to a user. The `reply_target` is stored here (per-channel routing address).
+//!   to an account. The `reply_target` is stored here (per-channel routing address).
 //!
-//! User identity is independent of any external channel. Changing a Telegram
-//! `@username` does not affect the user's identity. Users are created via the
-//! GUI dashboard, and channels are bound explicitly.
+//! Account identity is independent of any external channel. Changing a Telegram
+//! `@username` does not affect the account's identity. Accounts are created via
+//! the GUI dashboard, and channels are bound explicitly.
+//!
+//! ## Accounts
+//!
+//! The admin is the one account named [`ADMIN_USER_NAME`] ([`is_admin_name`]);
+//! every other account is a guest. Every account routes to the single
+//! Assistant, so no account stores an agent-role selection.
 //!
 //! ## Personal workspaces
 //!
-//! When `selected_workspace` is NULL, the user has a personal workspace at
+//! When `selected_workspace` is NULL, the account has a personal workspace at
 //! `~/.mahbot/userspaces/<name>/`. It is NOT registered in the `workspaces` table —
 //! computed on the fly. Personal workspaces have no board pipeline, no
 //! maintainer, no diagnostics discovery.
@@ -23,7 +29,6 @@ use crate::WorkspaceStatus;
 use crate::db::{self, TxGuard};
 use crate::git::commands::run_git_output;
 use anyhow::Result;
-use serde::Serialize;
 use std::path::PathBuf;
 use tracing::warn;
 
@@ -54,7 +59,7 @@ fn normalize_telegram_handle(handle: &str) -> anyhow::Result<String> {
 }
 
 crate::define_store! {
-    /// Global user store.
+    /// Global account store.
     pub static USER_STORE: UserStore,
     post_open = ensure_admin_user,
     expect = "USER_STORE not initialized — call init_all_stores() first",
@@ -62,13 +67,11 @@ crate::define_store! {
 
 // ── Column index constants ──────────────────────────────────
 
-// users table (5-column SELECT: name, permissions, selected_workspace, selected_role, granted_tools)
+// users table (3-column SELECT: name, selected_workspace, granted_tools)
 crate::columns! {
     USERS_COLUMNS [USERS] {
         NAME                => "name",
-        PERMISSIONS         => "permissions",
         SELECTED_WORKSPACE  => "selected_workspace",
-        SELECTED_ROLE       => "selected_role",
         GRANTED_TOOLS       => "granted_tools",
     }
 }
@@ -83,61 +86,41 @@ crate::columns! {
 }
 
 impl UserStore {
-    /// Auto-create the admin user if this is a fresh database.
+    /// Auto-create the admin account if this is a fresh database.
     ///
     /// Runs idempotently from both [`crate::db::init_all_stores`] (production,
     /// on the shared consolidated connection) and each isolated user store open.
+    /// This is the ONLY path that may create the reserved admin name; every
+    /// user-facing path refuses it ([`validate_new_user_name`]).
     pub(crate) async fn ensure_admin_user(&self) -> Result<()> {
         if !self.user_exists(ADMIN_USER_NAME).await? {
-            // Fresh admin: full permissions + selected_role=Assistant (the first
-            // pool role).
-            self.add_user(ADMIN_USER_NAME, Some("full"), Role::Assistant)
-                .await?;
+            self.add_user(ADMIN_USER_NAME).await?;
         }
         Ok(())
     }
 
-    // ── User CRUD ─────────────────────────────────────────────
+    // ── Account CRUD ─────────────────────────────────────────────
 
-    /// Create a new user with the given active role. The role pool is the
-    /// constant single Assistant (no per-user role rows) — `default_role` is
-    /// the persisted active role, only applied on a fresh insert. Also creates
-    /// their personal workspace directory under
-    /// `~/.mahbot/userspaces/<name>/` with `git init` (non-fatal on failure).
-    /// Idempotent — re-adding an existing user preserves their stored
-    /// preferences.
-    pub async fn add_user(
-        &self,
-        name: &str,
-        permissions: Option<&str>,
-        default_role: Role,
-    ) -> Result<()> {
-        let inserted = self
-            .conn
+    /// Create an account: the seeding path for the admin, and the path
+    /// user-facing callers use for guests — those must refuse the reserved
+    /// admin name first ([`validate_new_user_name`]). Also creates the personal
+    /// workspace directory under `~/.mahbot/userspaces/<name>/` with `git init`
+    /// (non-fatal on failure). Idempotent — re-adding an existing account
+    /// preserves its stored preferences.
+    pub async fn add_user(&self, name: &str) -> Result<()> {
+        self.conn
             .execute(
-                "INSERT OR IGNORE INTO users (name, permissions) \
-                 VALUES (?1, ?2)",
-                db::params![name, permissions],
+                "INSERT OR IGNORE INTO users (name) VALUES (?1)",
+                db::params![name],
             )
             .await?;
-        let tx = self.conn.begin_tx().await?;
-        if inserted > 0 {
-            tx.execute(
-                "UPDATE users SET selected_role = ?1 WHERE name = ?2",
-                db::params![default_role.as_str(), name],
-            )
-            .await?;
-        }
-        tx.commit().await?;
-
         ensure_personal_workspace(name).await;
-
         Ok(())
     }
 
-    /// Delete a user and all their child rows (channel bindings). The
-    /// constant single-Assistant role pool carries no per-user rows, so there
-    /// is nothing else to remove.
+    /// Delete an account and all their child rows (channel bindings). Channel
+    /// bindings are an account's only child rows, so nothing else needs a
+    /// cascade.
     pub async fn delete_user(&self, name: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         tx.execute(
@@ -151,7 +134,7 @@ impl UserStore {
         Ok(())
     }
 
-    /// Fetch a single nullable column from the user's row, if the user exists.
+    /// Fetch a single nullable column from the account's row, if it exists.
     ///
     /// A NULL column and a missing row both yield `None`.
     async fn user_column(&self, column: &str, user_name: &str) -> Result<Option<String>> {
@@ -165,39 +148,12 @@ impl UserStore {
             .map(Option::flatten)
     }
 
-    /// Get the selected workspace name for a user, if any.
+    /// Get the selected workspace name for an account, if any.
     async fn get_selected_workspace_name(&self, user_name: &str) -> Result<Option<String>> {
         self.user_column("selected_workspace", user_name).await
     }
 
-    /// Read the user's `(selected_workspace, permissions)` pair in one query.
-    /// `None` when no user row exists.
-    async fn get_selected_workspace_and_permissions(
-        &self,
-        user_name: &str,
-    ) -> Result<Option<(Option<String>, Option<String>)>> {
-        self.conn
-            .query_optional(
-                "SELECT selected_workspace, permissions FROM users WHERE name = ?1",
-                db::params![user_name],
-                |row| -> turso::Result<(Option<String>, Option<String>)> {
-                    Ok((row.get::<Option<String>>(0)?, row.get::<Option<String>>(1)?))
-                },
-            )
-            .await
-    }
-
-    /// Get the active role for a user, if any.
-    async fn get_active_role(&self, user_name: &str) -> Result<Option<String>> {
-        self.user_column("selected_role", user_name).await
-    }
-
-    /// Get the permissions value for a user (NULL = restricted, "full" = admin).
-    pub async fn get_permissions(&self, user_name: &str) -> Result<Option<String>> {
-        self.user_column("permissions", user_name).await
-    }
-
-    /// Whether a user row with this name exists.
+    /// Whether an account row with this name exists.
     pub async fn user_exists(&self, name: &str) -> Result<bool> {
         let rows = self
             .conn
@@ -317,8 +273,6 @@ impl UserStore {
     /// bindings.
     async fn user_entry_from_row(&self, row: &db::Row) -> Result<UserRecordEntry> {
         let name: String = row.get(COL_USERS_NAME)?;
-        let permissions = row.get::<Option<String>>(COL_USERS_PERMISSIONS)?;
-        let roles = role_pool();
         // A failed channel read must not render as "no binding": carry the
         // failure beside the record so the GUI can surface it instead of
         // offering to bind.
@@ -329,11 +283,8 @@ impl UserStore {
         Ok(UserRecordEntry {
             record: UserRecord {
                 name,
-                permissions,
                 selected_workspace: row.get::<Option<String>>(COL_USERS_SELECTED_WORKSPACE)?,
-                selected_role: row.get::<Option<String>>(COL_USERS_SELECTED_ROLE)?,
                 granted_tools: parse_grants(row.get::<Option<String>>(COL_USERS_GRANTED_TOOLS)?),
-                roles: roles.iter().map(|r| r.as_str().to_string()).collect(),
                 channels,
             },
             channels_error,
@@ -358,47 +309,30 @@ impl UserStore {
         Ok(users)
     }
 
-    /// Find a single user by exact name, returning their full record with channel bindings.
-    /// Returns `None` if no such user exists.
+    /// Find a single account by exact name, returning their full record with
+    /// channel bindings. Returns `None` if no such account exists.
     pub async fn find_by_name(&self, user_name: &str) -> Result<Option<UserRecord>> {
         self.list_users_where("WHERE name = ?1", db::params![user_name])
             .await
             .map(|users| users.into_iter().next().map(|entry| entry.record))
     }
 
-    /// List all users with the outcome of each user's channel-binding read.
+    /// List every account with the outcome of each account's channel-binding read.
     pub async fn list_users(&self) -> Result<Vec<UserRecordEntry>> {
         self.list_users_where("", db::params![]).await
     }
 
-    /// Find all users with admin (full) permissions.
-    pub async fn find_admins(&self) -> Result<Vec<UserRecord>> {
-        self.list_users_where("WHERE permissions = ?1", db::params!["full"])
-            .await
-            .map(|entries| entries.into_iter().map(|entry| entry.record).collect())
-    }
-
-    /// Find the user with admin (full) permissions, if any.
-    pub async fn find_admin(&self) -> Result<Option<UserRecord>> {
-        Ok(self.find_admins().await?.into_iter().next())
-    }
-
-    /// Atomically update user preferences (role, workspace, permissions) in a single
-    /// transaction. Use [`FieldUpdate::Unchanged`] to leave a column as-is or
-    /// [`FieldUpdate::Clear`] to explicitly clear it to NULL.
-    pub async fn update_user(
+    /// Set the account's selected shared workspace, beside
+    /// [`Self::set_image_gen_model`] / [`Self::set_video_model`]. `None` clears
+    /// the column — the account's personal workspace (computed on the fly);
+    /// `Some(name)` selects that shared workspace.
+    pub(crate) async fn set_selected_workspace(
         &self,
         name: &str,
-        role_name: FieldUpdate<'_>,
-        workspace_name: FieldUpdate<'_>,
-        permissions: FieldUpdate<'_>,
+        workspace_name: Option<&str>,
     ) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
-
-        upsert_user_column(&tx, name, "selected_role", role_name).await?;
         upsert_user_column(&tx, name, "selected_workspace", workspace_name).await?;
-        upsert_user_column(&tx, name, "permissions", permissions).await?;
-
         tx.commit().await?;
         Ok(())
     }
@@ -407,7 +341,7 @@ impl UserStore {
     /// choice). An empty/whitespace value resolves to the default at read time.
     pub async fn set_image_gen_model(&self, name: &str, model: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
-        upsert_user_column(&tx, name, "image_gen_model", FieldUpdate::Set(model)).await?;
+        upsert_user_column(&tx, name, "image_gen_model", Some(model)).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -416,7 +350,7 @@ impl UserStore {
     /// An empty/whitespace value resolves to the default at read time.
     pub async fn set_video_model(&self, name: &str, model: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
-        upsert_user_column(&tx, name, "video_model", FieldUpdate::Set(model)).await?;
+        upsert_user_column(&tx, name, "video_model", Some(model)).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -532,21 +466,6 @@ fn parse_grants(raw: Option<String>) -> Vec<String> {
     grants
 }
 
-/// Represents an optional update to a user column.
-///
-/// Used by [`UserStore::update_user`] to express whether a column should be
-/// left alone, set to NULL, or updated to a specific value — replacing the
-/// confusing `Option<Option<&str>>` tri-state with a self-documenting enum.
-#[derive(Debug, Clone, Copy)]
-pub enum FieldUpdate<'a> {
-    /// Leave the column unchanged (no SQL update).
-    Unchanged,
-    /// Set the column to NULL.
-    Clear,
-    /// Set the column to the given value.
-    Set(&'a str),
-}
-
 /// Upsert a single user column within an existing transaction.
 ///
 /// The `field` parameter MUST be a compile-time string literal to prevent SQL injection.
@@ -554,51 +473,38 @@ async fn upsert_user_column(
     tx: &TxGuard<'_>,
     name: &str,
     field: &str,
-    value: FieldUpdate<'_>,
+    value: Option<&str>,
 ) -> Result<()> {
-    let val: Option<&str> = match value {
-        FieldUpdate::Unchanged => return Ok(()),
-        FieldUpdate::Clear => None,
-        FieldUpdate::Set(v) => Some(v),
-    };
     let sql = format!(
         "INSERT INTO users (name, {field}) VALUES (?1, ?2) \
          ON CONFLICT(name) DO UPDATE SET {field} = excluded.{field}"
     );
-    tx.execute(&sql, db::params![name, val]).await?;
+    tx.execute(&sql, db::params![name, value]).await?;
     Ok(())
 }
 
 // ── UserRecord ────────────────────────────────────────────────
 
-/// A full user row, e.g. returned by [`UserStore::find_by_name`].
-#[derive(Debug, Clone, Serialize)]
+/// A full account row, e.g. returned by [`UserStore::find_by_name`].
+#[derive(Debug, Clone)]
 pub struct UserRecord {
-    /// The canonical user name.
+    /// The canonical account name. When it is [`ADMIN_USER_NAME`], this is the
+    /// admin account.
     pub name: String,
-    /// Permissions: NULL (restricted) or "full" (admin).
-    pub permissions: Option<String>,
     /// Selected shared workspace name, NULL = personal workspace.
     pub selected_workspace: Option<String>,
-    /// Selected active role, NULL = pool-dependent default (the first pool
-    /// role). Empty pool → no routing.
-    pub selected_role: Option<String>,
-    /// The custom tools granted to this user (the `users.granted_tools` JSON
+    /// The custom tools granted to this account (the `users.granted_tools` JSON
     /// array column), byte-sorted; empty when none. A grant recorded for the
-    /// admin is carried and listed like any other; only the user-management
+    /// admin is carried and listed like any other; only the account-management
     /// card omits it, since the whole catalogue is implicitly available to the
     /// admin.
     pub granted_tools: Vec<String>,
-    /// The role pool — the roles the user is allowed to use. The user-facing
-    /// pool is the constant single Assistant for every user (the Support role
-    /// was removed); this is not read from a `user_roles` table.
-    pub roles: Vec<String>,
-    /// Channel bindings for this user (Telegram, etc.).
+    /// Channel bindings for this account (Telegram, etc.).
     pub channels: Vec<ChannelBinding>,
 }
 
 /// One `users` row together with the outcome of its channel-binding read. The
-/// domain [`UserRecord`] is channel-empty both when the user has no bindings
+/// domain [`UserRecord`] is channel-empty both when the account has no bindings
 /// and when the read failed, so a surface that renders bindings needs the
 /// outcome to tell the two apart; it travels beside the record, not inside it.
 #[derive(Debug, Clone)]
@@ -609,30 +515,29 @@ pub struct UserRecordEntry {
     pub channels_error: Option<String>,
 }
 
-impl UserRecord {
-    /// Whether this user has admin (full) permissions.
-    #[must_use]
-    pub fn is_admin(&self) -> bool {
-        is_admin_permissions(self.permissions.as_deref())
+/// The one admin test: an account is the admin exactly when its name is
+/// [`ADMIN_USER_NAME`] — no stored token, flag or kind ever marks one. Callers
+/// in a sync context (GUI state) apply it to a name they already hold; a bare,
+/// untrusted name goes through [`is_admin`], which backs the same test with the
+/// account's row.
+#[must_use]
+pub(crate) fn is_admin_name(name: &str) -> bool {
+    name == ADMIN_USER_NAME
+}
+
+/// Refuse the reserved admin name on a user-facing account-creation path: only
+/// [`UserStore::ensure_admin_user`] may create the admin account.
+pub(crate) fn validate_new_user_name(name: &str) -> Result<()> {
+    if is_admin_name(name) {
+        anyhow::bail!(
+            "'{ADMIN_USER_NAME}' is the admin account — only guest accounts can be created"
+        );
     }
+    Ok(())
 }
 
-/// Whether a permissions value grants admin rights (`"full"`).
-#[must_use]
-fn is_admin_permissions(permissions: Option<&str>) -> bool {
-    permissions == Some("full")
-}
-
-/// The user-facing role pool — a single Assistant for every user since the
-/// Support role was removed. The Assistant is both the default and the
-/// fallback; it is the only role any user can route to.
-#[must_use]
-pub fn role_pool() -> Vec<Role> {
-    vec![Role::Assistant]
-}
-
-/// A single channel binding for a user.
-#[derive(Debug, Clone, Serialize)]
+/// A single channel binding for an account.
+#[derive(Debug, Clone)]
 pub struct ChannelBinding {
     /// The channel type (e.g. "telegram").
     pub channel: String,
@@ -789,51 +694,49 @@ async fn resolve_user_model_column(user_name: &str, column: &str) -> Option<Stri
     }
 }
 
-/// Resolve the user's admin-aware selected workspace name — THE single
+/// Resolve the account's admin-aware selected workspace name — THE single
 /// admin-aware resolution primitive, shared by message routing and the GUI
 /// (boot restore, reverse-sync, merge partner).
 ///
-/// Workspace membership is admin-only: an admin (permissions = "full") gets
-/// their stored selection (a legacy stored personal value normalizes to the
-/// canonical `personal:{user}` name); a non-admin ALWAYS yields their
-/// `personal:{user}` name, never a shared workspace (a shared selection is
-/// clamped, with a warning — defense in depth against rogue re-attachment).
-/// A NULL `selected_workspace` also yields `personal:{user}`; `None` means
-/// no user row or a read failure (warned) — the caller applies its own
-/// personal default. The admin predicate is exactly `permissions = "full"`,
-/// the same one the data migration uses.
+/// Workspace membership is admin-only: the admin gets their stored selection
+/// (a legacy stored personal value normalizes to the canonical
+/// `personal:{user}` name); a guest ALWAYS yields their `personal:{user}`
+/// name, never a shared workspace (a shared selection is clamped, with a
+/// warning — defense in depth against rogue re-attachment). A NULL
+/// `selected_workspace` and a missing account row both yield the canonical
+/// `personal:{user}` name; `None` is reserved for a failed read (warned) — the
+/// caller then applies its own personal default.
 pub(crate) async fn resolve_selected_workspace_name(user_name: &str) -> Option<String> {
-    match store()
-        .get_selected_workspace_and_permissions(user_name)
-        .await
-    {
-        Ok(Some((ws, perms))) if is_admin_permissions(perms.as_deref()) => Some(match ws {
-            Some(ws) if !is_personal_workspace(&ws) => ws,
-            _ => personal_workspace_name(user_name),
-        }),
-        Ok(Some((Some(ws), _))) if !is_personal_workspace(&ws) => {
-            warn!(
-                user_name = %user_name,
-                workspace = %ws,
-                "non-admin has a shared selected_workspace — clamping to their personal workspace"
-            );
-            Some(personal_workspace_name(user_name))
-        }
-        Ok(Some(_)) => Some(personal_workspace_name(user_name)),
-        Ok(None) => None,
+    let stored = match store().get_selected_workspace_name(user_name).await {
+        Ok(stored) => stored,
         Err(e) => {
             warn!(user_name = %user_name, error = %e, "Failed to read selected workspace");
-            None
+            return None;
         }
+    };
+    if is_admin_name(user_name) {
+        return Some(match stored {
+            Some(ws) if !is_personal_workspace(&ws) => ws,
+            _ => personal_workspace_name(user_name),
+        });
     }
+    if let Some(ws) = stored
+        && !is_personal_workspace(&ws)
+    {
+        warn!(
+            user_name = %user_name,
+            workspace = %ws,
+            "guest has a shared selected_workspace — clamping to their personal workspace"
+        );
+    }
+    Some(personal_workspace_name(user_name))
 }
 
-/// Get the current active workspace for a user, admin-aware.
+/// Get the current active workspace for an account, admin-aware.
 ///
-/// Resolves through [`resolve_selected_workspace_name`]: admins get their
-/// stored workspace (shared or personal), non-admins always resolve to their
-/// personal workspace. `None` (missing row / read failure) yields the
-/// personal workspace.
+/// Resolves through [`resolve_selected_workspace_name`]: the admin gets their
+/// stored workspace (shared or personal), a guest always resolves to their
+/// personal workspace. `None` (a read failure) yields the personal workspace.
 async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
     match resolve_selected_workspace_name(user_name).await {
         Some(ws_name) => resolve_workspace(&ws_name).await,
@@ -910,51 +813,7 @@ pub async fn resolve_workspace_for_user_name(user_name: &str) -> Workspace {
     }
 }
 
-/// Resolve the active role for a user from their role pool.
-///
-/// Returns `None` when the `selected_role` store read fails (fail-closed) —
-/// the caller must not route messages to any agent.
-///
-/// A stored selection is honoured when it is still in the pool; a selection
-/// outside the pool falls back to the first pool role. Without a stored
-/// selection, the first pool role is used (Assistant for every user — admins
-/// and non-admins alike).
-pub async fn resolve_active_role(user_name: &str) -> Option<Role> {
-    let pool = role_pool();
-    resolve_active_role_from_pool(user_name, &pool).await
-}
-
-/// Resolve the active role from an already-fetched pool. Fails closed on a
-/// `selected_role` read error (warn + no routing) — callers that already
-/// have the pool pass it here rather than re-reading the (now constant)
-/// pool via [`role_pool`].
-///
-/// Deliberate (do not "fix"): a persisted `selected_role='support'` is now
-/// out of pool — the Support variant is gone — so it fails pool-membership
-/// resolution and falls back to the first pool role (Assistant). Re-adding
-/// Support would resurrect the removed role; the fallback is intended.
-pub async fn resolve_active_role_from_pool(user_name: &str, pool: &[Role]) -> Option<Role> {
-    if pool.is_empty() {
-        return None;
-    }
-    let selected = match store().get_active_role(user_name).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, user_name, "Failed to read selected role");
-            return None;
-        }
-    };
-    match selected {
-        Some(name) => name
-            .parse::<Role>()
-            .ok()
-            .filter(|r| pool.contains(r))
-            .or_else(|| pool.first().copied()),
-        None => pool.first().copied(),
-    }
-}
-
-/// The user-facing role pinned to the user's personal workspace.
+/// The user-facing role pinned to the account's personal workspace.
 #[must_use]
 fn is_pinned_role(role: Role) -> bool {
     matches!(role, Role::Assistant)
@@ -1017,19 +876,17 @@ pub fn effective_workspace_for_role(role: Role, ws: Workspace, user_name: &str) 
     personal_workspace_struct(user_name)
 }
 
-/// Resolve the (role, workspace) a user's messages route to and their
+/// Resolve the (role, workspace) an account's messages route to and their
 /// session lives in — the same resolution as routing, so ClearChat and
-/// Telegram /clear always clear the actual recipient: the DB-selected
-/// workspace, the pool-clamped active role (Assistant — the sole pool role),
-/// and Assistant pinning.
+/// Telegram /clear always clear the actual recipient: the account's selected
+/// workspace with Assistant pinning applied, and the Assistant role, every
+/// account's only role, which the session-key builders consume alongside it.
 pub async fn resolve_session_target(user_name: &str) -> (Role, Workspace) {
     let ws = resolve_workspace_for_user_name(user_name).await;
-    let pool = role_pool();
-    let role = resolve_active_role_from_pool(user_name, &pool)
-        .await
-        .unwrap_or(Role::Assistant);
-    let ws = effective_workspace_for_role(role, ws, user_name);
-    (role, ws)
+    (
+        Role::Assistant,
+        effective_workspace_for_role(Role::Assistant, ws, user_name),
+    )
 }
 
 /// Resolve a channel+identifier pair to the canonical user name.
@@ -1076,19 +933,27 @@ pub async fn resolve_user_by_reply_target(channel: &str, target: &str) -> Option
         })
 }
 
-/// Whether the named user has admin (full) permissions. Users without a row
-/// or with NULL permissions are not admins.
-pub async fn is_admin(user_name: &str) -> bool {
-    match USER_STORE.get() {
-        Some(store) => match store.get_permissions(user_name).await {
-            Ok(perms) => is_admin_permissions(perms.as_deref()),
-            Err(e) => {
-                tracing::warn!(error = %e, user_name, "Failed to read permissions");
-                false
-            }
-        },
-        None => false,
+/// The admin test backed by an account store: `user_name` is the admin exactly
+/// when it is the admin's name ([`is_admin_name`]) AND `store` holds its row.
+/// `None` (no store) and a failed row read both answer false, so the answer
+/// never defaults to admin rights.
+async fn is_admin_in(store: Option<&UserStore>, user_name: &str) -> bool {
+    if !is_admin_name(user_name) {
+        return false;
     }
+    let Some(store) = store else {
+        return false;
+    };
+    store.user_exists(user_name).await.unwrap_or_else(|e| {
+        warn!(error = %e, user_name, "Failed to read the admin account");
+        false
+    })
+}
+
+/// Whether `user_name` is the admin account — [`is_admin_in`] bound to the
+/// process-global account store.
+pub async fn is_admin(user_name: &str) -> bool {
+    is_admin_in(USER_STORE.get(), user_name).await
 }
 
 /// The custom tools granted to `user_name`, byte-sorted. A read that fails
@@ -1145,24 +1010,24 @@ pub fn is_personal_workspace(workspace_name: &str) -> bool {
 pub(crate) mod test_util {
     use super::*;
 
-    /// Initialize a test user store with known users and channel bindings.
+    /// Initialize a test account store with known accounts and channel bindings.
     /// Safe to call multiple times — delegates to [`init_test_stores`] to
     /// ensure all global stores are initialized, then supplements
-    /// USER_STORE with telegram-specific users and channel bindings.
+    /// USER_STORE with telegram-specific accounts and channel bindings.
     pub(crate) async fn init_test_store() {
         // Ensure all global stores are initialized (idempotent OnceCell).
         crate::util::test::init_test_stores().await;
 
-        // Supplement USER_STORE with telegram-specific test users and
+        // Supplement USER_STORE with telegram-specific test accounts and
         // bindings.  Both `add_user` (INSERT OR IGNORE) and `bind_channel`
         // (INSERT OR REPLACE) are idempotent.
         if let Some(store) = USER_STORE.get() {
             store
-                .add_user("alice", Some("full"), Role::Assistant)
+                .add_user("alice")
                 .await
                 .expect("failed to add alice to test USER_STORE");
             store
-                .add_user("bob", None, Role::Assistant)
+                .add_user("bob")
                 .await
                 .expect("failed to add bob to test USER_STORE");
             store
@@ -1175,76 +1040,64 @@ pub(crate) mod test_util {
                 .expect("failed to bind bob telegram");
         }
     }
+
+    /// Run `body`, restoring the shared seeded admin row's `selected_workspace`
+    /// to the value it had on entry — including when `body` panics, so a failed
+    /// assertion cannot leak a test-only workspace into the sibling tests
+    /// serialized on `gui_admin_workspace`, which read this shared row.
+    ///
+    /// Unwinding by hand rather than with a `Drop` guard: the restore awaits the
+    /// store, which no destructor can do.
+    pub(crate) async fn with_admin_workspace_restored<F>(body: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use futures_util::FutureExt as _;
+
+        let store = store();
+        let previous = get_raw_selected_workspace(ADMIN_USER_NAME)
+            .await
+            .expect("read admin selected_workspace");
+        let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+        store
+            .set_selected_workspace(ADMIN_USER_NAME, previous.as_deref())
+            .await
+            .expect("restore admin selected_workspace");
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn role_pool_returns_single_assistant() {
-        // Every user routes to a single Assistant role: Support is gone and
-        // no other user-facing role exists.
-        assert_eq!(role_pool(), vec![Role::Assistant]);
-    }
-
+    /// The admin test is the account's name, backed by the account's own row:
+    /// a guest name, a name with no row, and a missing store are never the
+    /// admin.
     #[tokio::test]
-    async fn role_pool_lifecycle() {
-        crate::util::test::init_test_stores().await;
-        let store = store();
-
-        // add_user persists the default active role; the pool is the constant
-        // single Assistant (no user_roles rows).
-        store
-            .add_user("pool_user", None, Role::Assistant)
-            .await
-            .unwrap();
-        // The pool is the constant [Assistant]; the persisted default role
-        // resolves as active.
-        assert_eq!(role_pool(), vec![Role::Assistant]);
-        assert_eq!(
-            resolve_active_role("pool_user").await,
-            Some(Role::Assistant)
+    async fn admin_test_is_the_account_name_backed_by_its_row() {
+        let (store, _dir) = crate::open_test_store!(UserStore, "user");
+        assert!(
+            is_admin_in(Some(&store), ADMIN_USER_NAME).await,
+            "the seeded admin account is the admin"
         );
 
-        // A selection outside the pool (defensive) falls back to the first
-        // pool role instead of routing to an unallowed role.
-        store
-            .update_user(
-                "pool_user",
-                FieldUpdate::Set("engineer"),
-                FieldUpdate::Unchanged,
-                FieldUpdate::Unchanged,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            resolve_active_role("pool_user").await,
-            Some(Role::Assistant)
+        store.add_user("guest").await.unwrap();
+        assert!(
+            !is_admin_in(Some(&store), "guest").await,
+            "a guest account is not the admin"
         );
 
-        // Admin: pool defaults to Assistant (the first pool role); a stored
-        // 'manager' (out-of-pool, e.g. from before this change) clamps back.
-        store
-            .add_user("admin_pool_user", Some("full"), Role::Assistant)
-            .await
-            .unwrap();
-        assert_eq!(
-            resolve_active_role("admin_pool_user").await,
-            Some(Role::Assistant)
+        store.delete_user(ADMIN_USER_NAME).await.unwrap();
+        assert!(
+            !is_admin_in(Some(&store), ADMIN_USER_NAME).await,
+            "the admin's name without an account row is not the admin"
         );
-        store
-            .update_user(
-                "admin_pool_user",
-                FieldUpdate::Set("manager"),
-                FieldUpdate::Unchanged,
-                FieldUpdate::Unchanged,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            resolve_active_role("admin_pool_user").await,
-            Some(Role::Assistant)
+        assert!(
+            !is_admin_in(None, ADMIN_USER_NAME).await,
+            "a missing account store is not the admin"
         );
     }
 
@@ -1253,13 +1106,9 @@ mod tests {
         crate::util::test::init_test_stores().await;
         let store = store();
 
-        // add_user creates the user; deleting it removes the channel bindings
-        // and the user row. The role pool is the constant single Assistant
-        // (no per-user pool rows), so nothing else needs a cascade.
-        store
-            .add_user("doomed", None, Role::Assistant)
-            .await
-            .unwrap();
+        // add_user creates the account; deleting it removes the channel
+        // bindings and the account row — the only child rows an account has.
+        store.add_user("doomed").await.unwrap();
         store.delete_user("doomed").await.unwrap();
         assert!(
             store
@@ -1287,7 +1136,7 @@ mod tests {
         crate::util::test::init_test_stores().await;
         let store = store();
         let user = "grant_round_trip";
-        store.add_user(user, None, Role::Assistant).await.unwrap();
+        store.add_user(user).await.unwrap();
         assert!(
             store.get_grants(user).await.unwrap().is_empty(),
             "a fresh user has no grants"
@@ -1388,10 +1237,7 @@ mod tests {
     async fn validate_telegram_bind_guards() {
         crate::util::test::init_test_stores().await;
         let store = store();
-        store
-            .add_user("bind_guard_owner", None, Role::Assistant)
-            .await
-            .unwrap();
+        store.add_user("bind_guard_owner").await.unwrap();
         store
             .bind_channel("bind_guard_owner", "telegram", "guard_handle")
             .await
@@ -1485,129 +1331,109 @@ mod tests {
         crate::util::test::init_test_stores().await;
         let user = "home_clear_target";
         let store = store();
-        store
-            .add_user(user, Some("full"), Role::Assistant)
-            .await
-            .unwrap();
+        store.add_user(user).await.unwrap();
         crate::util::test::create_test_workspace(
             "/tmp/home_clear_target_ws",
             "ws_home_clear_target",
         )
         .await;
 
-        // Stored 'manager' (out-of-pool, e.g. a pre-existing admin) clamps to
-        // the pool default (Assistant), which is then pinned to the personal
-        // workspace — even when the DB workspace is set to a project.
+        // Every account routes to the single Assistant, which is pinned to the
+        // personal workspace — even when the stored workspace is a project.
         store
-            .update_user(
-                user,
-                FieldUpdate::Set("manager"),
-                FieldUpdate::Set("ws_home_clear_target"),
-                FieldUpdate::Unchanged,
-            )
+            .set_selected_workspace(user, Some("ws_home_clear_target"))
             .await
             .unwrap();
         let (role, ws) = resolve_session_target(user).await;
         assert_eq!(role, Role::Assistant);
         assert_eq!(ws.name, "personal:home_clear_target");
-
-        // Assistant active → pinned to the personal workspace regardless of
-        // the DB workspace.
-        store
-            .update_user(
-                user,
-                FieldUpdate::Set("assistant"),
-                FieldUpdate::Unchanged,
-                FieldUpdate::Unchanged,
-            )
-            .await
-            .unwrap();
-        let (role, ws) = resolve_session_target(user).await;
-        assert_eq!(role, Role::Assistant);
-        assert_eq!(ws.name, "personal:home_clear_target");
-    }
-
-    /// Seed a `users` row directly via SQL with explicit permissions and a
-    /// selected workspace (bypassing `add_user`'s personal-workspace side
-    /// effects so the test controls the exact stored state).
-    async fn seed_user(
-        store: &UserStore,
-        name: &str,
-        permissions: Option<&str>,
-        workspace: Option<&str>,
-    ) {
-        store
-            .conn
-            .execute(
-                "INSERT OR REPLACE INTO users (name, permissions, selected_workspace) \
-                 VALUES (?1, ?2, ?3)",
-                db::params![name, permissions, workspace],
-            )
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
+    #[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
     async fn resolve_selected_workspace_name_is_admin_aware() {
         crate::util::test::init_test_stores().await;
         let store = store();
 
-        // Admin (full) + shared selection → keeps the shared workspace.
-        seed_user(store, "adm_shared", Some("full"), Some("ws_shared")).await;
-        assert_eq!(
-            resolve_selected_workspace_name("adm_shared").await,
-            Some("ws_shared".to_string())
-        );
-        // Admin + stored personal value → normalized to the canonical personal name.
-        seed_user(
-            store,
-            "adm_personal",
-            Some("full"),
-            Some("personal:adm_personal"),
-        )
+        crate::users::test_util::with_admin_workspace_restored(async {
+            // The admin + a shared selection → keeps the shared workspace.
+            store
+                .set_selected_workspace(ADMIN_USER_NAME, Some("ws_shared"))
+                .await
+                .unwrap();
+            assert_eq!(
+                resolve_selected_workspace_name(ADMIN_USER_NAME).await,
+                Some("ws_shared".to_string())
+            );
+            // The admin + a stored personal value → normalized to the canonical name.
+            store
+                .set_selected_workspace(ADMIN_USER_NAME, Some("personal:admin"))
+                .await
+                .unwrap();
+            assert_eq!(
+                resolve_selected_workspace_name(ADMIN_USER_NAME).await,
+                Some("personal:admin".to_string())
+            );
+            // The admin + NULL selection → personal.
+            store
+                .set_selected_workspace(ADMIN_USER_NAME, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                resolve_selected_workspace_name(ADMIN_USER_NAME).await,
+                Some("personal:admin".to_string())
+            );
+        })
         .await;
-        assert_eq!(
-            resolve_selected_workspace_name("adm_personal").await,
-            Some("personal:adm_personal".to_string())
-        );
-        // Admin + NULL selection → personal.
-        seed_user(store, "adm_null", Some("full"), None).await;
-        assert_eq!(
-            resolve_selected_workspace_name("adm_null").await,
-            Some("personal:adm_null".to_string())
-        );
-        // Non-admin (NULL permissions) + shared selection → clamped to personal.
-        seed_user(store, "u_shared", None, Some("ws_shared")).await;
+
+        // A guest + a shared selection → clamped to personal.
+        store
+            .set_selected_workspace("u_shared", Some("ws_shared"))
+            .await
+            .unwrap();
         assert_eq!(
             resolve_selected_workspace_name("u_shared").await,
             Some("personal:u_shared".to_string())
         );
-        // Non-admin + NULL selection → personal.
-        seed_user(store, "u_null", None, None).await;
+        // A guest + NULL selection → personal.
+        store.set_selected_workspace("u_null", None).await.unwrap();
         assert_eq!(
             resolve_selected_workspace_name("u_null").await,
             Some("personal:u_null".to_string())
         );
-        // Missing user → None.
-        assert_eq!(resolve_selected_workspace_name("no_such_user").await, None);
+        // An account with no row resolves to the same personal default.
+        assert_eq!(
+            resolve_selected_workspace_name("no_such_account").await,
+            Some("personal:no_such_account".to_string())
+        );
     }
 
     #[tokio::test]
+    #[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
     async fn resolve_workspace_for_user_name_is_admin_aware() {
         crate::util::test::init_test_stores().await;
         let store = store();
         crate::util::test::create_test_workspace("/tmp/resolve_admin_aware_ws", "ws_admin_aware")
             .await;
 
-        // Non-admin with a shared selection that exists in the table is still
+        // A guest with a shared selection that exists in the table is still
         // clamped to the personal workspace (never a shared one).
-        seed_user(store, "u_shared", None, Some("ws_admin_aware")).await;
+        store
+            .set_selected_workspace("u_shared", Some("ws_admin_aware"))
+            .await
+            .unwrap();
         let ws = resolve_workspace_for_user_name("u_shared").await;
         assert_eq!(ws.name, "personal:u_shared");
 
-        // Admin with a shared selection that exists keeps the shared workspace.
-        seed_user(store, "adm_shared", Some("full"), Some("ws_admin_aware")).await;
-        let ws = resolve_workspace_for_user_name("adm_shared").await;
-        assert_eq!(ws.name, "ws_admin_aware");
+        // The admin with a shared selection that exists keeps the shared workspace.
+        crate::users::test_util::with_admin_workspace_restored(async {
+            store
+                .set_selected_workspace(ADMIN_USER_NAME, Some("ws_admin_aware"))
+                .await
+                .unwrap();
+            let ws = resolve_workspace_for_user_name(ADMIN_USER_NAME).await;
+            assert_eq!(ws.name, "ws_admin_aware");
+        })
+        .await;
     }
 }

@@ -923,11 +923,12 @@ mod tests {
     async fn fire_alarm_executes_command_and_delivers_output_for_admin_owner() {
         crate::util::test::init_test_stores().await;
         let _ = crate::agent::message_router::init_global();
-        let owner = "alarm-admin-it";
+        // The command form is admin-only, so the owner must be the admin account.
+        let owner = crate::users::ADMIN_USER_NAME;
         crate::users::USER_STORE
             .get()
             .expect("user store initialized")
-            .add_user(owner, Some("full"), crate::Role::Assistant)
+            .add_user(owner)
             .await
             .unwrap();
         let mut rx = crate::agent::message_router::register_agent("assistant:alarm-admin-it");
@@ -975,11 +976,12 @@ mod tests {
     async fn fire_alarm_deletes_alarm_and_notifies_on_command_failure() {
         crate::util::test::init_test_stores().await;
         let _ = crate::agent::message_router::init_global();
-        let owner = "alarm-admin-fail";
+        // The command form is admin-only, so the owner must be the admin account.
+        let owner = crate::users::ADMIN_USER_NAME;
         crate::users::USER_STORE
             .get()
             .expect("user store initialized")
-            .add_user(owner, Some("full"), crate::Role::Assistant)
+            .add_user(owner)
             .await
             .unwrap();
         let mut rx = crate::agent::message_router::register_agent("assistant:alarm-admin-fail");

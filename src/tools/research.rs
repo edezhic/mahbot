@@ -1,5 +1,5 @@
 //! ResearchTool — deep multi-round research orchestrator used by the
-//! Assistant in full-permission mode.
+//! admin's Assistant.
 //!
 //! Unlike [`AnalyzeTool`](super::analyze::AnalyzeTool) (one round of parallel analysts
 //! for quick clarification), the pipeline is: round 0 decomposes the question
@@ -396,8 +396,8 @@ impl ResearchBudget {
 // ── Tool ─────────────────────────────────────────────────────────────────
 
 pub struct ResearchTool {
-    /// The role of the calling agent (Assistant in full-permission mode) —
-    /// set via [`ResearchTool::new`].
+    /// The role of the calling agent (the admin's Assistant) — set via
+    /// [`ResearchTool::new`].
     caller_role: Role,
 }
 
@@ -433,9 +433,8 @@ impl Tool for ResearchTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        // Used by the Assistant in full-permission mode — `caller_role` is
-        // threaded through so the single result envelope routes back to the
-        // correct caller session.
+        // Used by the admin's Assistant — `caller_role` is threaded through so
+        // the single result envelope routes back to the correct caller session.
         let question = super::get_str(&args, "question")?;
 
         // Read user context from task-locals BEFORE tokio::spawn so the

@@ -1572,7 +1572,7 @@ impl TelegramChannel {
     /// Everything except a cheap in-flight check runs in the spawned task:
     /// the reverse-lookup of the chat's bound user (first match wins for
     /// group chats), the command payload computed from their current
-    /// role/admin state, and the scoped `setMyCommands` registration when
+    /// admin state, and the scoped `setMyCommands` registration when
     /// it differs from the last successful one (change detection) with
     /// in-flight coalescing.
     fn spawn_menu_refresh(&self, chat_id: &str) {
@@ -3001,8 +3001,9 @@ pub fn format_board_line(
 ///
 /// State-aware entries: exactly one of `/pause` or `/unpause` appears (the
 /// one matching the workspace's paused state), and exactly one of
-/// `/maintenance_on` or `/maintenance_off`. Admins without a selected shared
-/// workspace get neither pair (there is no workspace state to reflect).
+/// `/maintenance_on` or `/maintenance_off`. The admin without a selected
+/// shared workspace gets neither pair (there is no workspace state to
+/// reflect).
 #[must_use]
 pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
     let mut entries: Vec<(String, String)> = Vec::new();
@@ -3011,7 +3012,7 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
         entries.push(("board".to_string(), BOARD_COMMAND_DESC.to_string()));
         entries.push(("archive".to_string(), ARCHIVE_COMMAND_DESC.to_string()));
 
-        // `/update` is global (any full-permission admin) and shown only when
+        // `/update` is global (the single admin) and shown only when
         // the shared availability cache confirms an update — always in
         // local-checkout mode, registry mode only when a strictly newer stable
         // version exists. The menu reflects the cached state, never a network
@@ -3056,7 +3057,7 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
     ));
 
     // `/clear` is anchored at the very bottom of the menu. The `/agents`
-    // role-switch entry is gone: the pool is the constant single Assistant,
+    // role-switch entry is gone: the Assistant is every account's only role,
     // so there is nothing to switch.
     entries.push(("clear".to_string(), CLEAR_COMMAND_DESC.to_string()));
     entries

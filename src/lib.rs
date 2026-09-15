@@ -781,9 +781,9 @@ pub struct Agent {
     /// The user who triggered this agent run — used by tools (e.g. AnalyzeTool)
     /// to route async sub-agent results back to the correct user.
     pub(crate) user_name: String,
-    /// Whether the triggering user has `permissions='full'` (admin) — gates the
-    /// Assistant's full-permission toolset and role prompt.
-    pub(crate) full_access: bool,
+    /// Whether the triggering account is the admin — gates the Assistant's
+    /// widened toolset and role prompt.
+    pub(crate) is_admin: bool,
     /// The channel origin (gui, telegram, voice) of the triggering message.
     pub(crate) channel: String,
     /// DIRECT PARENT INVOCATION grouping key for the Running Agents view

@@ -4,7 +4,7 @@ mod enrichment;
 pub(crate) mod reply;
 pub mod telegram;
 use enrichment::has_inbound_temp_marker;
-pub use enrichment::{EnrichmentStrategy, enrich_links, enrich_message};
+pub use enrichment::{enrich_links, enrich_message};
 pub use reply::{ReplyReference, apply_reply_marker};
 pub use telegram::mirror_gui_message_to_telegram;
 
