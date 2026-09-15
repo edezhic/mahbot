@@ -633,7 +633,7 @@ async fn run_alarm_trigger_task(alarm: Alarm, trigger: StoredTrigger) {
     match trigger_notification(&alarm, &trigger, &outcome, deletion.as_ref()) {
         Some(content) => deliver_alarm_notification(&alarm, content).await,
         None => {
-            tracing::info!(alarm = %alarm.id, "alarm check reported nothing — staying silent");
+            tracing::debug!(alarm = %alarm.id, "alarm check reported nothing — staying silent");
         }
     }
 }
@@ -729,7 +729,7 @@ async fn run_alarm_sweep(batch_limit: usize) -> Result<()> {
         }
     }
     if fired > 0 || failed > 0 {
-        tracing::info!(fired, failed, "alarm sweep complete");
+        tracing::debug!(fired, failed, "alarm sweep complete");
     }
     Ok(())
 }
