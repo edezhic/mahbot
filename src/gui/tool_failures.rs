@@ -96,6 +96,18 @@ impl ToolFailuresState {
         self.state.pagination.reset();
     }
 
+    /// Drop the cached entries and return to the first page. Used after a clear
+    /// so rows already known deleted are not rendered while the refresh is in
+    /// flight.
+    pub(crate) fn clear_entries(&mut self) {
+        self.state.clear_entries();
+    }
+
+    /// Surface a failed clear in this tab's error banner.
+    pub(crate) fn fail(&mut self, error: String) {
+        self.state.load_state.fail(error);
+    }
+
     /// Go to the previous page and refresh.
     pub fn prev_page(&mut self) -> Task<ToolFailuresMessage> {
         if self.state.pagination.prev_page() {

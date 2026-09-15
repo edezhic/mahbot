@@ -3,13 +3,14 @@
 //!
 //! Each tab (All Logs / Issues / Tool Failures) keeps its own entries,
 //! pagination state and search query, so switching tabs never reuses another
-//! tab's page index or search. The bottom bar holds pagination + search; the
-//! top bar holds only the tabs.
+//! tab's page index or search. The bottom bar holds pagination, this tab's
+//! clear button (deletes the tab's records from the store, behind the shared
+//! confirmation modal) and search; the top bar holds only the tabs.
 
 use crate::logs::{LogEntry, LogQuery, LogStore};
 
 use iced::advanced::text::Span;
-use iced::widget::{Column, Space, button, column, container, row, text};
+use iced::widget::{Column, Space, button, column, container, row, stack, text};
 use iced::{Alignment, Element, Length, Subscription, Task, window};
 use iced_anim::Animated;
 use iced_anim::transition::Easing;
@@ -18,6 +19,7 @@ use std::time::{Duration, Instant};
 use iced_fonts::lucide;
 
 use super::common::PaginatedTabState;
+use super::dialog;
 use super::menus::{ContextMenu, MenuItem};
 use super::theme;
 use super::widgets;
@@ -28,6 +30,56 @@ pub enum LogsTab {
     AllLogs,
     Issues,
     ToolFailures,
+}
+
+impl LogsTab {
+    /// The level filter this tab's listing query uses — and therefore the exact
+    /// scope of its clear button, which always empties the whole tab and never
+    /// the searched subset. Only the log tabs have one (All Logs means every
+    /// level); the Tool Failures tab does not read the logs table at all, so
+    /// its `None` carries no scope.
+    fn level_filter(self) -> Option<&'static str> {
+        match self {
+            Self::Issues => Some("ERROR,WARN"),
+            Self::AllLogs | Self::ToolFailures => None,
+        }
+    }
+
+    /// Label of this tab's clear button (also the title of its confirmation).
+    fn clear_label(self) -> &'static str {
+        match self {
+            Self::AllLogs => "Clear logs",
+            Self::Issues => "Clear issues",
+            Self::ToolFailures => "Clear failures",
+        }
+    }
+
+    /// Consequence paragraphs for this tab's clear confirmation: the scope the
+    /// button names, including where the deleted records are shown elsewhere.
+    fn clear_consequences(self) -> [&'static str; 3] {
+        match self {
+            Self::AllLogs => [
+                "This permanently deletes every stored log record — informational, \
+                 warning and error — for every workspace and user.",
+                "The Issues view shows warnings and errors from the same records, so \
+                 it is emptied too.",
+                "Nothing can be recovered.",
+            ],
+            Self::Issues => [
+                "This permanently deletes every stored warning and error record, for \
+                 every workspace and user.",
+                "Informational records are kept and stay in the All Logs view.",
+                "Nothing can be recovered.",
+            ],
+            Self::ToolFailures => [
+                "This permanently deletes every recorded failed tool call, for every \
+                 workspace and user.",
+                "Successful tool calls are kept — only the failed rows this tab lists \
+                 are deleted.",
+                "Nothing can be recovered.",
+            ],
+        }
+    }
 }
 
 fn log_stream_producer() -> impl futures_util::Stream<Item = LogMessage> {
@@ -88,6 +140,17 @@ pub enum LogMessage {
     /// `update()`, not in the per-frame `view()`.
     CopyEntry(LogEntry),
 
+    /// Clear button pressed — ask for confirmation before deleting anything.
+    RequestClear,
+    /// The confirmation's danger action — delete the pending tab's records.
+    ClearConfirmed,
+    /// The confirmation was dismissed (Keep/backdrop/Escape) — nothing deleted.
+    ClearDismissed,
+    /// A clear finished. `Ok` = the delete committed; `Err` carries the failure
+    /// to surface in that tab's error banner. Records already buffered by the
+    /// log writer may still land after it.
+    Cleared(LogsTab, Result<(), String>),
+
     /// Bridged Tool Failures sub-messages.
     ToolFailures(super::tool_failures::ToolFailuresMessage),
 }
@@ -119,6 +182,10 @@ pub struct LogsState {
     debounce: super::common::DebounceState,
     /// Buffer for the shared search input (bound to the active tab's query).
     search_buffer: super::common::SingleLineEditorState,
+
+    /// Tab whose clear button awaits confirmation. `Some` while the confirm
+    /// modal is open — nothing is deleted without it.
+    pending_clear: Option<LogsTab>,
 }
 
 impl LogsState {
@@ -137,6 +204,7 @@ impl LogsState {
             ),
             debounce: super::common::DebounceState::new(),
             search_buffer: super::common::SingleLineEditorState::new(""),
+            pending_clear: None,
         }
     }
 
@@ -202,11 +270,7 @@ impl LogsState {
         };
         let generation = data.begin_refresh();
         let query = LogQuery {
-            // Issues shows ERROR/WARN entries only; All Logs is unfiltered.
-            level: match tab {
-                LogsTab::Issues => Some("ERROR,WARN".to_string()),
-                LogsTab::AllLogs | LogsTab::ToolFailures => None,
-            },
+            level: tab.level_filter().map(str::to_owned),
             target: None,
             search: crate::util::none_if_empty(&data.search),
             since: None,
@@ -266,6 +330,71 @@ impl LogsState {
                 data.handle_refresh_error(generation, e, false);
                 Task::none()
             }
+            LogMessage::RequestClear => {
+                self.pending_clear = Some(self.active_tab);
+                Task::none()
+            }
+            LogMessage::ClearDismissed => {
+                self.pending_clear = None;
+                Task::none()
+            }
+            LogMessage::ClearConfirmed => {
+                // The dialog names the tab it was opened for, not whichever tab
+                // is active now, so a tab switch behind the modal cannot retarget it.
+                let Some(tab) = self.pending_clear.take() else {
+                    return Task::none();
+                };
+                let store = log_store.clone();
+                Task::perform(
+                    async move {
+                        // Explicit per tab: a catch-all would turn a future tab
+                        // into an unfiltered `DELETE FROM logs`.
+                        let result = match tab {
+                            LogsTab::AllLogs => store.clear_logs(None).await,
+                            LogsTab::Issues => {
+                                store.clear_logs(LogsTab::Issues.level_filter()).await
+                            }
+                            LogsTab::ToolFailures => store.clear_tool_errors().await,
+                        };
+                        result.map(|_| ()).map_err(|e| e.to_string())
+                    },
+                    move |result| LogMessage::Cleared(tab, result),
+                )
+            }
+            LogMessage::Cleared(tab, result) => match result {
+                Ok(()) => {
+                    // Post-clear: the pressed tab returns to its first page and
+                    // keeps its typed search; its count is re-read by the
+                    // refresh below, never adjusted in place.
+                    match self.tab_data_mut(tab) {
+                        Some(data) => data.clear_entries(),
+                        None => self.tool_failures_state.clear_entries(),
+                    }
+                    let pressed = self.refresh_tab(log_store, tab);
+                    if tab == LogsTab::ToolFailures {
+                        return pressed;
+                    }
+                    // Both log tabs read the same table, so the other one holds
+                    // rows this clear just deleted — and it may be the tab on
+                    // screen. Drop that copy and re-read it too.
+                    let (sibling, sibling_tab) = if tab == LogsTab::AllLogs {
+                        (&mut self.issues, LogsTab::Issues)
+                    } else {
+                        (&mut self.all_logs, LogsTab::AllLogs)
+                    };
+                    sibling.entries.clear();
+                    Task::batch([pressed, self.refresh_tab(log_store, sibling_tab)])
+                }
+                Err(e) => {
+                    // This surface has no completion-notice plumbing; its
+                    // per-tab error banner is the channel for a failed clear.
+                    match self.tab_data_mut(tab) {
+                        Some(data) => data.load_state.fail(e),
+                        None => self.tool_failures_state.fail(e),
+                    }
+                    Task::none()
+                }
+            },
             LogMessage::LiveEntry(entry) => {
                 // Live entries only arrive while the All Logs tab is active
                 // (the subscription is gated in `subscription()`).
@@ -372,6 +501,11 @@ impl LogsState {
                     .map(LogMessage::ToolFailures),
             },
             LogMessage::Escape => {
+                // Escape never confirms: while the confirm modal is open it only
+                // dismisses it.
+                if self.pending_clear.take().is_some() {
+                    return Task::none();
+                }
                 self.focus_search = false;
                 Task::none()
             }
@@ -448,14 +582,41 @@ impl LogsState {
         // tracing to report them without recursing into itself).
         let write_error_banner = Self::write_error_banner();
 
-        // ── Bottom bar: pagination + search ────────────────────────
+        // ── Bottom bar: pagination + clear + search ────────────────
         let bottom_bar = self.bottom_bar();
 
         let content = column![tab_bar, write_error_banner, body, bottom_bar]
             .width(Length::Fill)
             .height(Length::Fill);
 
-        widgets::page_bare(content)
+        let page = widgets::page_bare(content);
+        // Confirm-dialog overlay: the page is stack child 0, the dialog (or a
+        // type-stable placeholder) child 1 — the shapes never change, so the
+        // page keeps its widget state as the modal opens/closes (same pattern
+        // as the Running page).
+        let confirm_layer: Element<'_, LogMessage> = match self.pending_clear {
+            Some(tab) => Self::clear_confirm_dialog(tab),
+            None => stack([widgets::empty_stack_placeholder()]).into(),
+        };
+        stack([page, confirm_layer]).into()
+    }
+
+    /// The clear confirmation for `tab`: the shared confirm-dialog/backdrop
+    /// pair, with the tab's scope named in the title, the danger button and the
+    /// listed consequences. There is no undo, so nothing is deleted without it.
+    fn clear_confirm_dialog(tab: LogsTab) -> Element<'static, LogMessage> {
+        widgets::modal_backdrop(
+            dialog::confirm_dialog(
+                dialog::dialog_title(format!("{}?", tab.clear_label())),
+                dialog::dialog_body(tab.clear_consequences()),
+                [
+                    dialog::DialogAction::secondary("Keep records", LogMessage::ClearDismissed),
+                    dialog::DialogAction::danger(tab.clear_label(), LogMessage::ClearConfirmed),
+                ],
+            ),
+            LogMessage::ClearDismissed,
+            0.5,
+        )
     }
 
     /// Render a warning banner when the log-writer task has observed DB insert
@@ -507,8 +668,8 @@ impl LogsState {
         .into()
     }
 
-    /// Render the bottom bar: pagination controls and the search input, both
-    /// bound to the active tab.
+    /// Render the bottom bar: pagination controls, the active tab's clear
+    /// button and the search input, all bound to the active tab.
     fn bottom_bar(&self) -> Element<'_, LogMessage> {
         let (page, total_pages) = match self.tab_data(self.active_tab) {
             Some(d) => (d.pagination.page, d.pagination.total_pages()),
@@ -550,6 +711,13 @@ impl LogsState {
             .into()
         };
 
+        // Clear this tab — sits between the paging controls and the search box.
+        // Always rendered: a tab refilling from live activity right after a
+        // clear must stay clearable, so this is not tied to the paging state.
+        let clear_button = button(text(self.active_tab.clear_label()).size(theme::TEXT_12))
+            .style(theme::button_text_danger)
+            .on_press(LogMessage::RequestClear);
+
         let search_input: Element<'_, LogMessage> = if self.focus_search {
             container(super::widgets::single_line_editor(
                 &self.search_buffer.buffer,
@@ -584,6 +752,8 @@ impl LogsState {
 
         let bottom_row = row![
             pagination_cluster,
+            Space::new().width(theme::SPACE_8),
+            clear_button,
             Space::new().width(Length::Fill),
             search_group,
         ]

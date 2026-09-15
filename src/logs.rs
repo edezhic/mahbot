@@ -173,6 +173,26 @@ impl LogStore {
         Ok(n)
     }
 
+    /// Delete stored log records in one Logs tab's scope, returning the number
+    /// of rows deleted. `level_filter` uses [`LogQuery::level`] syntax; `None`
+    /// means every level (the All Logs tab).
+    ///
+    /// The predicate comes from the same [`build_where_clause`] as the tab's
+    /// listing query and is built from the tab's level filter alone — the tab's
+    /// search text is deliberately never part of it, because the button empties
+    /// the whole tab rather than the searched subset.
+    pub(crate) async fn clear_logs(&self, level_filter: Option<&str>) -> anyhow::Result<u64> {
+        let filters = LogQuery {
+            level: level_filter.map(str::to_owned),
+            ..LogQuery::default()
+        };
+        let (where_sql, values) = build_where_clause(&filters);
+        self.conn
+            .execute(&format!("DELETE FROM logs {where_sql}"), values)
+            .await
+            .context("Failed to clear log entries")
+    }
+
     /// Query log entries with optional filters.
     ///
     /// Uses LIKE-based search on target and message columns.
@@ -1058,6 +1078,42 @@ mod tests {
     // Helper to seed log entries in tests
     async fn seed_entries(store: &LogStore, entries: &[LogEntry]) {
         store.insert_batch(entries).await.unwrap();
+    }
+
+    /// The per-tab clear scopes: the Issues scope deletes warnings and errors
+    /// only, the All Logs scope deletes every stored record (including the ones
+    /// the Issues view shows).
+    #[tokio::test]
+    async fn clear_logs_scopes_match_the_tabs() {
+        let (store, _dir) = test_store().await;
+        seed_entries(
+            &store,
+            &[
+                LogEntry {
+                    level: "INFO".into(),
+                    ..Default::default()
+                },
+                LogEntry {
+                    level: "WARN".into(),
+                    ..Default::default()
+                },
+                LogEntry {
+                    level: "ERROR".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+
+        // Issues scope: warnings and errors only — the informational row survives.
+        assert_eq!(store.clear_logs(Some("ERROR,WARN")).await.unwrap(), 2);
+        let (entries, total) = store.query(&LogQuery::default()).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(entries[0].level, "INFO");
+
+        // All Logs scope: every stored record.
+        assert_eq!(store.clear_logs(None).await.unwrap(), 1);
+        assert_eq!(store.query(&LogQuery::default()).await.unwrap().1, 0);
     }
 
     /// Open a healthy store in a fresh temp dir, seed one entry, and checkpoint

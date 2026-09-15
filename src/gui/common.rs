@@ -271,6 +271,13 @@ impl<T> PaginatedTabState<T> {
             self.load_state.set_has_loaded();
         }
     }
+
+    /// Drop the loaded entries and return to the first page — the post-delete
+    /// state of a tab whose rows no longer exist.
+    pub(crate) fn clear_entries(&mut self) {
+        self.entries.clear();
+        self.pagination.reset();
+    }
 }
 
 // ── Debounce state ──────────────────────────────────────────────────

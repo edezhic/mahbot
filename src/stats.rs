@@ -16,7 +16,7 @@
 //! schema. Consumers access the store through [`crate::logs::LOG_STORE`].
 
 use crate::db::{self};
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 // Column definitions for tool_error SELECT queries.
 crate::columns! {
@@ -109,6 +109,24 @@ impl crate::logs::LogStore {
         }
 
         Ok((entries, total))
+    }
+
+    /// Delete every failed tool call the Tool Failures tab lists, returning the
+    /// number of rows deleted.
+    ///
+    /// The predicate comes from the tab's own listing filter, built with no
+    /// search term, so the clear can never exceed the unfiltered tab: only rows
+    /// carrying an `error_message` go, and the other records in the store
+    /// (successful calls and the rest of the telemetry) are left untouched.
+    pub(crate) async fn clear_tool_errors(&self) -> Result<u64> {
+        let (where_clause, params) = build_tool_error_filter(&ToolErrorQuery::default());
+        self.conn
+            .execute(
+                &format!("DELETE FROM tool_calls WHERE {where_clause}"),
+                params,
+            )
+            .await
+            .context("Failed to clear failed tool calls")
     }
 
     /// Write a batch of per-call tool records for a single agent flush.
@@ -746,6 +764,59 @@ mod tests {
             .await
             .expect("query_tool_errors with search");
         assert_eq!(total, 0, "search 'timeout' should find 0 errors");
+    }
+
+    /// The Tool Failures clear deletes exactly the failed rows the tab lists:
+    /// the successful calls — the rows the usage/cost figures are computed
+    /// from — must survive.
+    #[tokio::test]
+    async fn clear_tool_errors_keeps_successful_calls() {
+        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let records = vec![
+            crate::ToolCallRecord {
+                tool_name: "read".to_string(),
+                arguments: "{}".to_string(),
+                duration_ms: 1,
+                success: true,
+                error_message: None,
+            },
+            crate::ToolCallRecord {
+                tool_name: "write".to_string(),
+                arguments: "{}".to_string(),
+                duration_ms: 2,
+                success: false,
+                error_message: Some("permission denied".to_string()),
+            },
+            crate::ToolCallRecord {
+                tool_name: "edit".to_string(),
+                arguments: "{}".to_string(),
+                duration_ms: 3,
+                success: false,
+                error_message: Some("no match".to_string()),
+            },
+        ];
+        store
+            .flush_batch("test-agent", "Engineer", "my-workspace", &records)
+            .await
+            .expect("flush_batch");
+
+        assert_eq!(store.clear_tool_errors().await.expect("clear"), 2);
+
+        let (errors, total) = store
+            .query_tool_errors(&ToolErrorQuery::default(), 10, 0)
+            .await
+            .expect("query_tool_errors");
+        assert!(errors.is_empty());
+        assert_eq!(total, 0);
+
+        let remaining = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM tool_calls", (), |row| {
+                row.get::<i64>(0)
+            })
+            .await
+            .expect("count tool_calls");
+        assert_eq!(remaining, 1, "the successful call must survive the clear");
     }
 
     /// `llm_requests` insert round-trip — verifies the schema (including
