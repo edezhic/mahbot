@@ -552,6 +552,11 @@ pub const MAX_BOUNCES: usize = 10;
 /// prereq-indicator warning yellow. Halfway to the [`MAX_BOUNCES`] breaker cap.
 pub const BOUNCE_BADGE_WARNING_THRESHOLD: usize = 5;
 
+/// Half of the ticket's rework allowance — the last point at which the rounds
+/// still to come are enough for the ticket to land. See
+/// [`bounce_hits_halfway_mark`] for when the Manager's halfway notice fires.
+const BOUNCE_HALFWAY_MARK: usize = MAX_BOUNCES / 2;
+
 // ── Transition + notification helpers (shared by the phase modules) ─────
 
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
@@ -617,6 +622,8 @@ pub(crate) struct TransitionCtx<'t, 'l> {
     actor: &'l str,
     /// True when this Failed transition was a bounce-breaker drain.
     breaker_trip: bool,
+    /// Carries the halfway notice; set only with [`NotifyPolicy::Notify`].
+    halfway_mark: bool,
 }
 
 impl<'t, 'l> TransitionCtx<'t, 'l> {
@@ -636,6 +643,7 @@ impl<'t, 'l> TransitionCtx<'t, 'l> {
             log_label,
             actor,
             breaker_trip: false,
+            halfway_mark: false,
         }
     }
     fn notifying(
@@ -672,6 +680,10 @@ impl<'t, 'l> TransitionCtx<'t, 'l> {
     }
     fn with_breaker(mut self, breaker_trip: bool) -> Self {
         self.breaker_trip = breaker_trip;
+        self
+    }
+    fn with_halfway_mark(mut self, halfway_mark: bool) -> Self {
+        self.halfway_mark = halfway_mark;
         self
     }
 }
@@ -733,16 +745,7 @@ where
 
     if matches!(outcome, FinalizeOutcome::Applied) {
         match ctx.notify {
-            NotifyPolicy::Notify => {
-                notify_ticket(
-                    ctx.ticket,
-                    ctx.source,
-                    ctx.target,
-                    ctx.breaker_trip,
-                    ctx.actor,
-                )
-                .await;
-            }
+            NotifyPolicy::Notify => notify_ticket(&ctx).await,
             // Buffer: the transition is materialized by the CDC-driven chronicle
             // subscriber and delivered on the next drain.
             NotifyPolicy::Buffer => {}
@@ -920,14 +923,12 @@ async fn last_comment_as_failure_details(ticket_id: &str) -> String {
     }
 }
 
-/// Enqueue a notification for the Manager about a ticket transition.
-async fn notify_ticket(
-    ticket: &Ticket,
-    source: TicketPhase,
-    target_phase: TicketPhase,
-    breaker_trip: bool,
-    actor: &str,
-) {
+/// Enqueue a notification for the Manager about a ticket transition, with the
+/// extra section the transition context calls for: the failure-triage block on
+/// a Failed transition, or the halfway notice on a bounce that lands on the
+/// halfway mark of the ticket's rework allowance.
+async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
+    let ticket = ctx.ticket;
     let Some(ws) = resolve_ticket_workspace(ticket, "skipping notification").await else {
         error!(
             ticket = %ticket.id,
@@ -939,10 +940,10 @@ async fn notify_ticket(
 
     let transition_log = format!(
         "[{}] {}: {} → {}",
-        actor,
+        ctx.actor,
         ticket.id,
-        source.as_ref(),
-        target_phase.as_ref(),
+        ctx.source.as_ref(),
+        ctx.target.as_ref(),
     );
 
     // The chronicle row for the just-committed transition is materialized by the
@@ -960,15 +961,15 @@ async fn notify_ticket(
         &[
             ("{{ticket_id}}", &ticket.id),
             ("{{ticket_title}}", &ticket.title),
-            ("{{ticket_phase}}", target_phase.as_ref()),
+            ("{{ticket_phase}}", ctx.target.as_ref()),
             ("{{transition_log}}", &transition_log),
             ("{{ticket_updates}}", &drained),
         ],
     );
 
-    if target_phase == TicketPhase::Failed {
+    if ctx.target == TicketPhase::Failed {
         let failure_details = last_comment_as_failure_details(&ticket.id).await;
-        let workspace_status = if breaker_trip {
+        let workspace_status = if ctx.breaker_trip {
             "Beware that all the other tickets have been moved back from Queued \
              to Planning."
                 .to_string()
@@ -985,6 +986,11 @@ async fn notify_ticket(
         );
         message.push_str("\n\n");
         message.push_str(&warning);
+    }
+
+    if ctx.halfway_mark {
+        message.push_str("\n\n");
+        message.push_str(&load_prompt("pipeline/halfway_notification.md"));
     }
 
     let agent_id = manager_agent_id(&ws.name);
@@ -1555,6 +1561,16 @@ fn bounce_exhausted(bounce_count: i64) -> bool {
     usize::try_from(bounce_count).unwrap_or(usize::MAX) >= MAX_BOUNCES
 }
 
+/// Returns true when the bounce being applied lands the counter exactly on
+/// [`BOUNCE_HALFWAY_MARK`] — the one point where the Manager gets the halfway
+/// notice. `bounce_count` is the count *before* the increment, so matching
+/// exactly (never `>=`) keeps the notice once-per-ticket and never backfills
+/// tickets already past the mark.
+#[must_use]
+fn bounce_hits_halfway_mark(bounce_count: i64) -> bool {
+    usize::try_from(bounce_count).is_ok_and(|n| n + 1 == BOUNCE_HALFWAY_MARK)
+}
+
 /// Move all other Queued tickets in the workspace to Planning after a breaker
 /// trip.
 ///
@@ -1611,19 +1627,23 @@ async fn bounce_to_development(
     job_id: &str,
 ) -> FinalizeOutcome {
     let trip = bounce_exhausted(ticket.bounce_count);
+    let halfway = bounce_hits_halfway_mark(ticket.bounce_count);
     let target = if trip {
         TicketPhase::Failed
     } else {
         TicketPhase::InDevelopment
     };
-    let notify = if trip {
+    // A halfway bounce notifies immediately rather than buffering for the next
+    // drain — the notice only has value while the ticket still runs.
+    let notify = if trip || halfway {
         NotifyPolicy::Notify
     } else {
         NotifyPolicy::Buffer
     };
     let trip_comment = trip.then(bounce_breaker_trip_comment);
-    let ctx =
-        TransitionCtx::new(ticket, source, target, notify, log_label, actor).with_breaker(trip);
+    let ctx = TransitionCtx::new(ticket, source, target, notify, log_label, actor)
+        .with_breaker(trip)
+        .with_halfway_mark(halfway);
 
     let outcome = with_comment_and_transition(ctx, async |tx| {
         if let Some(comment) = &trip_comment {

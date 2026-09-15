@@ -523,6 +523,93 @@ async fn run_claim_pipeline_claims_new_work() {
     );
 }
 
+/// The bounce landing on the halfway mark reaches the Manager as a board
+/// notification carrying the halfway notice — and only that one bounce does, so
+/// a ticket is never notified twice and a ticket already past the mark is never
+/// backfilled.
+#[tokio::test]
+async fn halfway_bounce_notifies_manager_once() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let ws = create_test_workspace("/tmp/halfway_ws", "halfway_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    // Registered up front so the notifications land in a local inbox instead of
+    // spawning real Manager turns.
+    let mut manager_inbox =
+        crate::agent::message_router::register_agent(&crate::session::manager_agent_id(&ws.name));
+
+    let mark = i64::try_from(super::BOUNCE_HALFWAY_MARK).unwrap();
+    let bounced = halfway_bounce(&ws, mark - 1).await;
+    assert_eq!(bounced.bounce_count, mark);
+    let job = manager_inbox
+        .try_recv()
+        .expect("the bounce landing on the mark notifies the Manager");
+    assert!(
+        job.content
+            .contains("⏳ This ticket has used half the rounds it gets."),
+        "halfway notice missing from the Manager notification:\n{}",
+        job.content,
+    );
+    assert!(
+        manager_inbox.try_recv().is_err(),
+        "the halfway notice is sent once per ticket",
+    );
+
+    halfway_bounce(&ws, mark).await;
+    assert!(
+        manager_inbox.try_recv().is_err(),
+        "a bounce past the mark does not re-notify",
+    );
+    crate::agent::message_router::unregister_agent(&crate::session::manager_agent_id(&ws.name));
+}
+
+/// Bounce a fresh InReview ticket whose bounce counter starts at `bounce_count`,
+/// returning the ticket as the bounce left it.
+async fn halfway_bounce(ws: &Workspace, bounce_count: i64) -> Ticket {
+    let store = crate::pipeline::board::store();
+    let id = make_ticket(store, ws, "Halfway", TicketPhase::InReview).await;
+    let job_id = crate::generate_id();
+    crate::jobs::spawn_job(
+        &crate::session::store().conn,
+        &job_id,
+        "review",
+        &ws.name,
+        "",
+        "",
+        crate::Role::Reviewer,
+        &[],
+        &crate::jobs::SpawnChild::Phase {
+            phase: TicketPhase::InReview,
+            ticket_id: id.clone(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE tickets SET bounce_count = ?1 WHERE id = ?2",
+            crate::db::params![bounce_count, id.clone()],
+        )
+        .await
+        .unwrap();
+    super::bounce_to_development(
+        &expect_ticket(store, &id).await,
+        TicketPhase::InReview,
+        "Reviewers",
+        "Reviewer",
+        "reviewer",
+        "failed",
+        &job_id,
+    )
+    .await;
+    expect_ticket(store, &id).await
+}
+
 /// A non-exhausting bounce moves the ticket back to InDevelopment and
 /// increments the bounce counter (no breaker trip, no workspace pause).
 #[tokio::test]
