@@ -2530,7 +2530,7 @@ fn prepare_assistant_turn(response: ChatResponse) -> PreparedAssistantTurn {
 /// Rejection message for a `sleep` call made in a round with accompanying
 /// raw text: the text is never delivered (tool rounds are never displayed)
 /// and the successful sleep would end the run before anything is sent.
-const SLEEP_WITH_TEXT_REJECTION: &str = "sleep must be called alone: your text was NOT delivered — text written in any round that contains a tool call never reaches the user. Resend your text as a plain-text round with no tool calls, then call sleep alone.";
+const SLEEP_WITH_TEXT_REJECTION: &str = "sleep must be called alone: your text was NOT delivered — text written in any round that contains a tool call never reaches the user. If that text was meant for the user, resend it as a plain-text round with no tool calls and no sleep call: that round ends your turn and delivers it. If it was not meant for the user, call sleep alone, with no text and no other tool call.";
 
 /// Rejection message for a `sleep` call bundled with other tool calls.
 const SLEEP_BUNDLED_REJECTION: &str = "sleep must be called alone: it was bundled with other tool calls. Call sleep in its own round with no other tool calls — and no text, since text written in a tool round is never delivered to the user.";
