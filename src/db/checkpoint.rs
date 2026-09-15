@@ -38,15 +38,22 @@
 //!
 //! A genuine failure a completion does not follow opens (or extends) a per-store
 //! *failure window*: the run of consecutive failing rounds the failure has lasted,
-//! with its cumulative attempts and its opening cause. The round warns with the
-//! window's running counts; only a window that has spanned both floors —
-//! [`CHECKPOINT_FAILURE_MIN_ROUNDS`] consecutive rounds AND
+//! with its cumulative attempts and its opening cause. Only a window that has
+//! spanned both floors — [`CHECKPOINT_FAILURE_MIN_ROUNDS`] consecutive rounds AND
 //! [`CHECKPOINT_FAILURE_WINDOW`] of elapsed time — decides the stop, and then once,
 //! filing those cumulative facts in the record. The window is in-memory and bounded,
 //! and its retry pause races the daemon's own shutdown
 //! ([`crate::shutdown::sleep_or_shutdown_or_drain`]), so a round the drain cuts short
 //! decides nothing, and the store that drained the process can leave a sibling store's
 //! open window unfiled.
+//!
+//! A round reports itself once, never per attempt: a genuine failure's per-attempt
+//! lines are DEBUG only, and what a failing round keeps is one warning, carrying the
+//! round's first failure as the cause — while a round the daemon's own shutdown cuts
+//! short keeps the cut-short warning, its only trace. The exit round's single attempt
+//! keeps its own warning ([`exit_checkpoint`]). A completion is DEBUG only too: a
+//! failure a later attempt cures is the routine heal the retries exist for, so a
+//! transient hiccup that heals leaves no record at all — its accepted price.
 //!
 //! The only cure is a completed checkpoint, which closes the window wherever it
 //! happens — first attempt, a retry, or a later round. A round that ends without a
@@ -101,10 +108,10 @@
 //!
 //! [`Connection::run_checkpoint`] arms a per-call sink so the engine's own reason
 //! for a failed checkpoint travels with the checkpoint error — see
-//! [`crate::db::checkpoint_cause`] for how it is obtained and what it costs. The
-//! warn lines print that error's outermost message; the durable record renders the
-//! whole chain. That reason is also what tells a blocked attempt, which never counts
-//! towards a stop, from a genuine pager error
+//! [`crate::db::checkpoint_cause`] for how it is obtained and what it costs. A
+//! failing round's warning and the durable record render the error's whole chain;
+//! the DEBUG lines print its outermost message only. That reason is also what tells
+//! a blocked attempt, which never counts towards a stop, from a genuine pager error
 //! ([`crate::db::checkpoint_cause::is_blocked_checkpoint`]).
 
 use futures_util::future::{FutureExt, join_all};
@@ -613,15 +620,15 @@ fn extend_failure_window(
     (window, exhausted)
 }
 
-/// Drop the store's window when a round closes it — a completed checkpoint included
-/// — warning with the cumulative facts it accumulated: a closed window is the whole
-/// trace a failure that did not last leaves (only an exhausted window files a durable
-/// block). Borrows the key, unlike [`extend_failure_window`]: a round that closes never
-/// puts a window back. Returns whether one was open, which is what
-/// [`cure_failure_window`] needs; the round's other closing arms ignore it.
-fn close_failure_window(name: &'static str, key: &Path, reason: &'static str) -> bool {
+/// Drop the store's window when a round it was open for ends without a genuine
+/// failure, warning with the cumulative facts it accumulated: a closed window is the
+/// whole trace a failure that did not last leaves (only an exhausted window files a
+/// durable block). Borrows the key, unlike [`extend_failure_window`]: a round that
+/// closes never puts a window back. A round a completion cured closes its window
+/// through [`cure_failure_window`] instead, at DEBUG.
+fn close_failure_window(name: &'static str, key: &Path, reason: &'static str) {
     let Some(window) = FAILURE_WINDOWS.lock().unwrap_poison().remove(key) else {
-        return false;
+        return;
     };
     warn!(
         db = %name,
@@ -631,22 +638,28 @@ fn close_failure_window(name: &'static str, key: &Path, reason: &'static str) ->
         reason,
         "Checkpoint failure window closed — continuing",
     );
-    true
 }
 
-/// A completed checkpoint is the cure: close the store's window if one is open and
-/// warn with its cumulative facts. A round that had no window to close still warns
-/// when it recorded genuine failures of its own — the completion is only a DEBUG line
-/// and the log store retains INFO, so this warning is the whole trace a cured round
-/// leaves. A plain healthy completion logs nothing but that DEBUG line.
+/// A completed checkpoint is the cure: drop the store's window if one is open. A
+/// completion that followed a genuine failure — this round's or an earlier round's —
+/// is the routine heal the retries exist for, so it is recorded at DEBUG, the level
+/// the per-attempt failures it cures are recorded at; a plain healthy completion with
+/// nothing to cure is left entirely to the round's own DEBUG line.
 fn cure_failure_window(name: &'static str, key: &Path, round_failures: usize) {
-    if !close_failure_window(name, key, "a completed checkpoint") && round_failures > 0 {
-        warn!(
-            db = %name,
-            round_failures,
-            "Checkpoint completed on a retry after a genuine failure — continuing",
-        );
-    }
+    let Some(window) = FAILURE_WINDOWS.lock().unwrap_poison().remove(key) else {
+        if round_failures > 0 {
+            debug!(db = %name, round_failures, "Checkpoint completed on a retry");
+        }
+        return;
+    };
+    debug!(
+        db = %name,
+        round_failures,
+        window_attempts = window.attempts,
+        window_rounds = window.rounds,
+        elapsed_ms = window.elapsed().as_millis(),
+        "Checkpoint completed — failure window closed",
+    );
 }
 
 /// The periodic round's decision table: its arms own what each engine answer means
@@ -745,8 +758,15 @@ async fn periodic_checkpoint_inner<'a, Fut>(
             }
             // A genuine failure: kept for the report, retried after the pause, and —
             // when the failure window is exhausted — the reason the service stops.
+            // This line is DEBUG: the round reports itself once, with this failure
+            // as the cause (see the module header).
             Attempted::Ran(Err(e)) => {
-                warn!(attempt = attempt_no, error = %e, db = %name, "Failed to checkpoint database WAL");
+                debug!(
+                    attempt = attempt_no,
+                    error = %e,
+                    db = %name,
+                    "Failed to checkpoint database WAL"
+                );
                 first_failure_at.get_or_insert_with(Instant::now);
                 failures.push((attempt_no, e));
             }
@@ -768,9 +788,13 @@ async fn periodic_checkpoint_inner<'a, Fut>(
         if attempt_no < CHECKPOINT_ATTEMPTS
             && !crate::shutdown::sleep_or_shutdown_or_drain(retry_pause).await
         {
+            // This warning is the round's only record, so the failure the round
+            // already made rides it as the cause.
+            let cause = failures.first().map(|(_, e)| format!("{e:#}"));
             warn!(
                 db = %name,
                 round_attempts = attempts_made,
+                error = cause.as_deref(),
                 "Checkpoint round cut short by the daemon's own shutdown — failure window not decided",
             );
             return;
@@ -798,9 +822,11 @@ async fn periodic_checkpoint_inner<'a, Fut>(
         &first_failure,
         span,
     );
-    // Not yet terminal: one failing round never stops a healthy service. Warnings
-    // only — the durable block is filed once, when the window is exhausted and the
-    // stop is decided.
+    // Not yet terminal: one failing round never stops a healthy service. This one
+    // warning is the whole record a failing round leaves (see the module header), and
+    // it carries the round's first failure as the cause — the same one the window is
+    // dated from and the terminal block renders as its `checkpoint error:`. The durable
+    // block is filed once, when the window is exhausted and the stop is decided.
     if !exhausted {
         warn!(
             db = %name,
@@ -808,6 +834,7 @@ async fn periodic_checkpoint_inner<'a, Fut>(
             window_attempts = window.attempts,
             window_rounds = window.rounds,
             elapsed_ms = window.elapsed().as_millis(),
+            error = %first_failure,
             "Genuine checkpoint failure with no completion — failure window not exhausted, continuing",
         );
         return;

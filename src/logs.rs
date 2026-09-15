@@ -367,8 +367,14 @@ fn log_entry_from_row(row: &Row) -> anyhow::Result<LogEntry> {
 /// [`log_layers`] for why it must not be a global subscriber filter. `tantivy`
 /// reports through the standard `log` interface, so its directive only ever
 /// matches records that arrive over the bridge [`install_log_bridge`] installs.
+///
+/// `pdf_extract` is the PDF text layer that [`crate::document`] converts with: on a
+/// font table whose glyphs and Unicode disagree it warns once per page, so a single
+/// document produces hundreds of near-identical records. The crate is held to ERROR
+/// for that reason — a genuine parse failure is still recorded, everything quieter is
+/// not.
 pub(crate) const DEFAULT_LOG_FILTER: &str =
-    "info,turso_core=warn,tantivy=warn,fff_search=error,fff_search::grep=error";
+    "info,turso_core=warn,tantivy=warn,fff_search=error,fff_search::grep=error,pdf_extract=error";
 
 /// The production layer stack: the JSON log layer, with the log filter applied
 /// PER LAYER, plus the engine-cause capture layer (see
@@ -1596,6 +1602,38 @@ mod tests {
             entry.target,
             module_path!(),
             "the record's real target must survive the bridge, not become the literal `log`",
+        );
+    }
+
+    /// The level cut [`DEFAULT_LOG_FILTER`] applies to the PDF text layer the read
+    /// tool's document conversion runs: that dependency's warnings are dropped
+    /// before the store, its errors still reach it. The cut is the target's level,
+    /// not the target itself, and a document conversion is exactly what cannot be
+    /// driven hermetically, so the layer's view of the dependency is what is
+    /// asserted.
+    #[test]
+    fn the_default_filter_holds_the_pdf_dependency_to_error() {
+        const TARGET: &str = "pdf_extract";
+        const DROPPED: &str = "a warning the dependency emits once per page";
+        const KEPT: &str = "the dependency's own error";
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _guard = tracing::subscriber::set_default(log_layers(
+            make_log_writer(tx),
+            EnvFilter::new(DEFAULT_LOG_FILTER),
+        ));
+        tracing::warn!(target: TARGET, "{DROPPED}");
+        tracing::error!(target: TARGET, "{KEPT}");
+        let mut written = String::new();
+        while let Ok(line) = rx.try_recv() {
+            written.push_str(&line);
+        }
+        assert!(
+            !written.contains(DROPPED),
+            "the dependency's warnings must not reach the log layer: {written}"
+        );
+        assert!(
+            written.contains(KEPT),
+            "the dependency's errors must still reach the log layer: {written}"
         );
     }
 }

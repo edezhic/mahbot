@@ -2673,7 +2673,9 @@ impl Channel for TelegramChannel {
                             continue;
                         }
                         PollOutcome::Error(desc) => {
-                            tracing::warn!("Telegram getUpdates API error: {desc}");
+                            // Informational: the poll is retried every 5s, so an
+                            // unhealthy API would otherwise keep the issues view full.
+                            tracing::info!("Telegram getUpdates API error: {desc}");
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             continue;
                         }
