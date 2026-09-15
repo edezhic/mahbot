@@ -179,14 +179,6 @@ const fn true_val() -> bool {
 /// `--force` frontend verb above is the deliberate exception).
 const AGENT_TAB_PREFIX: &str = "agent-tab-";
 
-/// Whether `name` belongs to the agent-run session family — the only names the
-/// release queue may stop. The in-memory path meets this by construction
-/// (`resolve_session`); a name read back from the durable record file is checked
-/// against it, so a corrupt file cannot point the queue at a session it does not own
-/// (the user's own, `default`, a `link-enricher-*`, an empty string).
-pub(crate) fn is_agent_tab_session(name: &str) -> bool {
-    name.starts_with(AGENT_TAB_PREFIX)
-}
 /// Logical name of the per-run default session.
 const DEFAULT_TAB: &str = "default";
 

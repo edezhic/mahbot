@@ -274,8 +274,9 @@ fn absorb(entry: &mut PendingRunRelease, incoming: PendingRunRelease, keep: Elig
 /// what keeps a run that is back from losing its tabs. Enforces the queue cap (oldest
 /// dropped).
 fn merge_record(entry: PendingRunRelease, eligibility: Eligibility) {
-    // Only a run's own namespace can ever be addressed again, so a record without one is
-    // never queued: releasing it could close a session this queue does not own.
+    // The namespace is what a record is identified by — records are merged, and
+    // matched against the runs live right now, by it — so a record without one is
+    // never queued.
     if entry.namespace.is_empty() || entry.names.is_empty() {
         return;
     }
@@ -344,9 +345,8 @@ fn queue_run_session_release_after(sessions: &super::chrome::ChromeRunSessions, 
 /// stopped is retried after the restart instead of being lost, and a held record
 /// survives the restart it is waiting for — with its attempt count, so the bound stays
 /// bounded across restarts. An unreadable or corrupt file is ignored rather than
-/// treated as a failure, and a name it carries is released only if it is an agent-run
-/// session under that record's own namespace: losing or rejecting a record can leave
-/// tabs open, never close a session this queue does not own.
+/// treated as a failure, and the file is this queue's own state: the names it carries
+/// are released exactly as written, whatever they are.
 fn restore_pending_releases() {
     let Some(path) = release_settings().store else {
         return;
@@ -366,12 +366,7 @@ fn restore_pending_releases() {
         }
     };
     let mut restored = 0usize;
-    for mut record in records.into_iter().take(MAX_PENDING_RELEASES) {
-        // The file is input from outside this process: it is not trusted to name the
-        // sessions this queue may stop.
-        record.names.retain(|name| {
-            crate::tools::chrome::is_agent_tab_session(name) && name.starts_with(&record.namespace)
-        });
+    for record in records.into_iter().take(MAX_PENDING_RELEASES) {
         if record.names.is_empty() {
             continue;
         }
@@ -1508,9 +1503,9 @@ mod tests {
         );
     }
 
-    /// A record file that cannot be read — or cannot be trusted — is never fatal: an
-    /// unreadable one restores nothing, and a parseable one keeps only what is
-    /// legitimate (a clamped deadline, and names under the record's own namespace).
+    /// A record file that cannot be read — or that carries an absurd deadline — is
+    /// never fatal: an unreadable one restores nothing, and a parseable one whose
+    /// deadline is absurd is restored with it clamped rather than trusted.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn a_corrupt_record_file_is_ignored() {
@@ -1540,23 +1535,52 @@ mod tests {
             delays[0] <= RELEASE_RETRY_CAP,
             "its deadline is clamped to the ladder's cap: {delays:?}"
         );
+        clear_pending_releases();
+    }
 
-        // The file is outside input: a name it carries is released only when it is an
-        // agent-run session under the record's own namespace, so a foreign name cannot
-        // point the queue at a session this record does not own.
+    /// The record file is this queue's own state, not input to be judged: a record
+    /// naming sessions outside the family this queue opens is restored with those
+    /// names untouched, and released exactly as it wrote them. An entry with no names
+    /// is still not queued.
+    #[tokio::test]
+    #[serial_test::serial(chrome_release)]
+    async fn a_restored_record_releases_its_names_exactly_as_written() {
+        let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
         clear_pending_releases();
         fs::write(
             guard.store_path(),
-            r#"[{"namespace":"agent-tab-absurd-","names":["default","link-enricher-x","","agent-tab-other-default","agent-tab-absurd-kept"]},{"namespace":"agent-tab-empty-","names":["default"]}]"#,
+            r#"[{"namespace":"agent-tab-written-","names":["default","link-enricher-x","","agent-tab-other-default","agent-tab-written-kept"]},{"namespace":"agent-tab-nameless-","names":[]}]"#,
         )
-        .expect("write foreign-names record file");
+        .expect("write record file naming foreign sessions");
 
         restore_pending_releases();
 
+        let restored: Vec<String> = [
+            "default",
+            "link-enricher-x",
+            "",
+            "agent-tab-other-default",
+            "agent-tab-written-kept",
+        ]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
         assert_eq!(
             pending_names_and_attempts(),
-            vec![(vec!["agent-tab-absurd-kept".to_string()], 0)],
-            "only names under the record's own namespace survive; a record left with none is not queued"
+            vec![(restored.clone(), 0)],
+            "every name the entry carries is restored as written; the entry left with no names is not queued"
+        );
+
+        release_due().await;
+
+        assert!(
+            pending_releases_snapshot().is_empty(),
+            "the record is released like any other"
+        );
+        assert_eq!(
+            sorted(guard.log_lines()),
+            stop_invocations(&restored),
+            "one `session stop` per name, each exactly as the record wrote it"
         );
         clear_pending_releases();
     }
