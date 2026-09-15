@@ -26,7 +26,8 @@
 //! what is granted to them (`users.granted_tools`). The `<custom-tools>`
 //! context block is the model-facing catalogue and follows the same split; it
 //! is fixed when a session is built, so a grant change on a guest whose session
-//! already exists is announced into that session ([`notify_grant_change`]).
+//! already exists is announced into that session ([`notify_grant_change`]),
+//! carrying the granted tool's own entry so the tool is usable from the notice.
 
 use crate::Workspace;
 use crate::prompt::{load_prompt, substitute};
@@ -311,46 +312,57 @@ async fn catalogue() -> Vec<CustomToolEntry> {
 
 // ── Catalogue block ──────────────────────────────────────────────────────
 
-/// Render one line per tool: its description, then its parameters narrated in
-/// prose (name, basic type, required-ness). The admin-authored text is
+/// One tool's entry: its description, then its parameters narrated in prose
+/// (name, basic type, required-ness). The admin-authored text is
 /// credential-scrubbed on the way into the prompt, like the product's other
 /// user-provided text that enters one.
+///
+/// The `<custom-tools>` block and a grant notice both render a tool through
+/// this, so the entry an Assistant reads in the notice is the entry its list
+/// shows, character for character.
+fn render_line(tool: &CustomToolEntry) -> String {
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "- {}: {}",
+        tool.name,
+        crate::util::scrub_credentials(&tool.description)
+    );
+    if !tool.params.is_empty() {
+        out.push_str(" Parameters: ");
+        for (i, param) in tool.params.iter().enumerate() {
+            if i > 0 {
+                out.push_str("; ");
+            }
+            let _ = write!(
+                out,
+                "{} ({}, {})",
+                param.name,
+                param.ty.as_str(),
+                if param.required {
+                    "required"
+                } else {
+                    "optional"
+                }
+            );
+            if !param.description.is_empty() {
+                let _ = write!(
+                    out,
+                    " — {}",
+                    crate::util::scrub_credentials(&param.description)
+                );
+            }
+        }
+        out.push('.');
+    }
+    out
+}
+
+/// The block's listing: one entry line per tool ([`render_line`]).
 fn render_lines(tools: &[&CustomToolEntry]) -> String {
     let mut out = String::new();
     for tool in tools {
-        let _ = write!(
-            out,
-            "- {}: {}",
-            tool.name,
-            crate::util::scrub_credentials(&tool.description)
-        );
-        if !tool.params.is_empty() {
-            out.push_str(" Parameters: ");
-            for (i, param) in tool.params.iter().enumerate() {
-                if i > 0 {
-                    out.push_str("; ");
-                }
-                let _ = write!(
-                    out,
-                    "{} ({}, {})",
-                    param.name,
-                    param.ty.as_str(),
-                    if param.required {
-                        "required"
-                    } else {
-                        "optional"
-                    }
-                );
-                if !param.description.is_empty() {
-                    let _ = write!(
-                        out,
-                        " — {}",
-                        crate::util::scrub_credentials(&param.description)
-                    );
-                }
-            }
-            out.push('.');
-        }
+        out.push_str(&render_line(tool));
         out.push('\n');
     }
     out.trim_end().to_string()
@@ -405,6 +417,12 @@ fn block_for(catalogue: &[CustomToolEntry], granted: &[String], is_admin: bool) 
 /// account it applies to — the `<custom-tools>` block is fixed when the session
 /// is built.
 ///
+/// A grant notice also carries the granted tool's own entry, rendered by the
+/// same [`render_line`] the block lists — the account's list cannot name a tool
+/// granted after the session was built, so the notice is where the tool becomes
+/// usable. A removal says only that the tool is gone: its interface is of no
+/// use to an account that may no longer call it.
+///
 /// Nothing is announced to the admin's own Assistant (it holds every tool, so
 /// a grant on that account changes nothing for it) nor to an account whose
 /// Assistant has no session yet — its first session is built with the current
@@ -424,14 +442,29 @@ pub(crate) async fn notify_grant_change(user_name: &str, tool: &str, granted: bo
     if !crate::session::store().has_content(&agent_id).await {
         return;
     }
-    let content = substitute(
-        &load_prompt(if granted {
-            "custom_tools_granted.md"
-        } else {
-            "custom_tools_revoked.md"
-        }),
-        &[("{{tools}}", tool)],
-    );
+    let content = if granted {
+        // The catalogue's tool of that exact name, never the account's grants:
+        // by now the grant is recorded and the account's own list is stale. A
+        // name with no readable definition behind it — no such tool, or an
+        // unreadable file — contributes nothing, and the notice then reads
+        // exactly as it always has. The entry is frozen into the durable
+        // envelope here, so a replay shows the same text.
+        let entry = catalogue()
+            .await
+            .iter()
+            .find(|t| t.name == tool)
+            .map(|t| format!("\n{}", render_line(t)))
+            .unwrap_or_default();
+        substitute(
+            &load_prompt("custom_tools_granted.md"),
+            &[("{{tools}}", tool), ("{{entry}}", &entry)],
+        )
+    } else {
+        substitute(
+            &load_prompt("custom_tools_revoked.md"),
+            &[("{{tools}}", tool)],
+        )
+    };
     if let Err(e) =
         crate::agent::message_router::deliver_assistant_notice(&agent_id, user_name, content).await
     {
@@ -1098,6 +1131,9 @@ mod tests {
     /// notified and an account without an Assistant session is left alone.
     #[tokio::test]
     async fn grant_change_notice_wakes_only_an_existing_guest_session() {
+        // A name no test authors a file for, so the catalogue holds no readable
+        // definition for it.
+        const ABSENT: &str = "notice_absent_tool";
         crate::util::test::init_management_test_stores().await;
         let store = crate::users::store();
         let guest = "grant_notice_guest";
@@ -1118,12 +1154,18 @@ mod tests {
         )
         .await;
 
-        notify_grant_change(guest, "probe", true).await;
+        notify_grant_change(guest, ABSENT, true).await;
         let job = rx.try_recv().expect("an existing session is woken");
-        assert!(
-            job.content.contains("probe") && job.content.contains("granted"),
-            "got: {}",
-            job.content
+        // With no definition to render there is no entry: the notice keeps the
+        // exact text it has always had — no empty slot, no blank line — and says
+        // nothing about the tool's health.
+        assert_eq!(
+            job.content,
+            format!(
+                "<custom-tools-notice>\n\
+                 Custom tools granted to your account: {ABSENT}\n\
+                 </custom-tools-notice>\n"
+            )
         );
         assert_eq!(
             job.kind,
@@ -1132,12 +1174,15 @@ mod tests {
         assert_eq!(job.role, crate::Role::Assistant);
         assert!(job.pending_job_id.is_some(), "the notice must be durable");
 
-        notify_grant_change(guest, "probe", false).await;
+        notify_grant_change(guest, ABSENT, false).await;
         let job = rx.try_recv().expect("a revocation is announced too");
-        assert!(
-            job.content.contains("probe") && job.content.contains("removed"),
-            "got: {}",
-            job.content
+        assert_eq!(
+            job.content,
+            format!(
+                "<custom-tools-notice>\n\
+                 Custom tools removed from your account: {ABSENT}\n\
+                 </custom-tools-notice>\n"
+            )
         );
 
         // The admin holds every tool, so its own account is never a recipient —
@@ -1156,7 +1201,7 @@ mod tests {
             "hello",
         )
         .await;
-        notify_grant_change(crate::users::ADMIN_USER_NAME, "probe", true).await;
+        notify_grant_change(crate::users::ADMIN_USER_NAME, ABSENT, true).await;
         assert!(
             !has_tool_notice(&admin_id).await,
             "the admin already holds every custom tool"
@@ -1170,14 +1215,86 @@ mod tests {
             crate::Role::Assistant.as_str(),
             &crate::users::personal_workspace_name(fresh),
         );
-        notify_grant_change(fresh, "probe", true).await;
+        notify_grant_change(fresh, ABSENT, true).await;
         assert!(!has_tool_notice(&fresh_id).await, "no session to wake");
 
         crate::agent::message_router::unregister_agent(&guest_id);
-        // Leave no durable rows behind for other tests' boot-replay paths.
+        clear_pending(&guest_id).await;
+    }
+
+    /// A grant notice carries the granted tool's own entry — the very line the
+    /// `<custom-tools>` block renders for it, scrubbing included — so the tool
+    /// is usable straight from the notice. A removal carries the name and the
+    /// direction and no entry.
+    #[tokio::test]
+    async fn grant_notice_carries_the_tools_own_entry() {
+        crate::util::test::init_management_test_stores().await;
+        let dir = shared_dir();
+        std::fs::create_dir_all(&dir).expect("create the shared folder");
+        let probe = ProbeFile(dir.join("notice_entry_probe.ts"));
+        std::fs::write(
+            &probe.0,
+            "// @description Reports the notice probe.\n\
+             // @param city string required the city to look up\n",
+        )
+        .expect("write the probe tool");
+
+        let guest = "grant_notice_entry_guest";
+        crate::users::store().add_user(guest).await.unwrap();
+        let guest_id = crate::session::resolve_agent_id(
+            guest,
+            crate::Role::Assistant.as_str(),
+            &crate::users::personal_workspace_name(guest),
+        );
+        let mut rx = crate::agent::message_router::register_agent(&guest_id);
+        crate::util::test::seed_session_row(
+            &crate::session::store().conn,
+            &guest_id,
+            "user",
+            "hello",
+        )
+        .await;
+
+        let entry = load_catalogue(&dir)
+            .into_iter()
+            .find(|t| t.name == "notice_entry_probe")
+            .expect("the probe tool is in the catalogue");
+
+        notify_grant_change(guest, "notice_entry_probe", true).await;
+        let job = rx.try_recv().expect("an existing session is woken");
+        // The entry is the block's own rendering of the tool — the very text a
+        // session-start list shows for it — following the notice's wording as
+        // its own line.
+        assert_eq!(
+            job.content,
+            format!(
+                "<custom-tools-notice>\n\
+                 Custom tools granted to your account: notice_entry_probe\n\
+                 {}\n\
+                 </custom-tools-notice>\n",
+                render_lines(&[&entry])
+            )
+        );
+
+        notify_grant_change(guest, "notice_entry_probe", false).await;
+        let job = rx.try_recv().expect("a revocation is announced too");
+        assert_eq!(
+            job.content,
+            "<custom-tools-notice>\n\
+             Custom tools removed from your account: notice_entry_probe\n\
+             </custom-tools-notice>\n"
+        );
+
+        crate::agent::message_router::unregister_agent(&guest_id);
+        clear_pending(&guest_id).await;
+    }
+
+    /// Delete the durable notice rows addressed to `agent_id`, so other tests'
+    /// boot-replay paths never pick them up.
+    async fn clear_pending(agent_id: &str) {
         let conn = &crate::session::store().conn;
         for row in crate::jobs::list_pending_jobs(conn).await.unwrap() {
-            if row.target_agent_id == guest_id {
+            if row.target_agent_id == agent_id {
                 crate::jobs::delete_pending_job(conn, &row.id)
                     .await
                     .unwrap();
