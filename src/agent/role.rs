@@ -308,9 +308,8 @@ impl Role {
     /// `is_admin` says whether the triggering account is the admin. It only
     /// widens the Assistant's toolset: `shell`, `implement`,
     /// `research`, `computer`, `mahbot_config`, `mahbot_debug` and the
-    /// Assistant↔Manager chat tools are added, and `add_alarm` gains its
-    /// command form. Every other role's toolset is byte-identical regardless
-    /// of its value.
+    /// Assistant↔Manager chat tools are added. Every other role's toolset is
+    /// byte-identical regardless of its value.
     ///
     /// `chrome_sessions` is the run-scoped tracker shared with the agent's
     /// `ChromeTool`: every session the run opens is handed to the run-end
@@ -383,7 +382,7 @@ impl Role {
             Role::Assistant => {
                 let mut t: Vec<Box<dyn Tool>> = vec![
                     Box::new(AnalyzeTool::new(DispatchMode::Async, Role::Assistant)),
-                    Box::new(AddAlarmTool::new(is_admin)),
+                    Box::new(AddAlarmTool),
                     Box::new(ListAlarmsTool),
                     Box::new(RemoveAlarmTool),
                     Box::new(EditTool),
@@ -813,65 +812,6 @@ mod tests {
                     assert!(
                         !has,
                         "{}{} must not advertise `sleep`",
-                        role.as_str(),
-                        if is_admin { " (admin)" } else { "" }
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn add_alarm_command_param_is_admin_only() {
-        // Acceptance pin: `add_alarm`'s `command` parameter is granted ONLY to
-        // the admin's Assistant. Every other combination — including a guest's
-        // Assistant and every non-Assistant role — must neither advertise
-        // the property in the schema nor append the command capability doc to
-        // the description. The description check is structural (base vs
-        // base + `tool/add_alarm_command.md`) so prompt rewording cannot
-        // silently break or bypass it.
-        let ws = crate::workspace::test_ws("test");
-        let base_desc = AddAlarmTool::new(false).description();
-        let command_doc = crate::prompt::load_prompt("tool/add_alarm_command.md");
-        assert!(
-            command_doc.contains("`command`"),
-            "add_alarm_command.md must document the `command` parameter"
-        );
-        for role in Role::iter() {
-            for is_admin in [false, true] {
-                let has_tool = role
-                    .tools(&ws, is_admin, test_sessions())
-                    .into_iter()
-                    .find(|t| t.name() == "add_alarm");
-                let Some(tool) = has_tool else {
-                    // `add_alarm` is Assistant-only; a role that never
-                    // advertises it cannot leak the command capability either.
-                    continue;
-                };
-                let has_command = tool.parameters_schema()["properties"]
-                    .get("command")
-                    .is_some();
-                let appends_doc = tool.description().contains(&command_doc);
-                if role == crate::Role::Assistant && is_admin {
-                    assert!(
-                        has_command,
-                        "the admin's Assistant must advertise `add_alarm.command`"
-                    );
-                    assert!(
-                        appends_doc,
-                        "the admin's Assistant description must append the command doc"
-                    );
-                } else {
-                    assert!(
-                        !has_command,
-                        "{}{} must not advertise `add_alarm.command`",
-                        role.as_str(),
-                        if is_admin { " (admin)" } else { "" }
-                    );
-                    assert_eq!(
-                        tool.description(),
-                        base_desc,
-                        "{}{} must not append the command doc",
                         role.as_str(),
                         if is_admin { " (admin)" } else { "" }
                     );

@@ -999,9 +999,7 @@ fn assistant_context_blocks(
 }
 
 /// Render one line per alarm — same shape as the `list_alarms` tool output,
-/// plus the interval for periodic alarms. The command field passes through
-/// `scrub_credentials` (same contract as fired-alarm notifications) before it
-/// can land in the persisted system prompt. `None` when there are no alarms.
+/// plus the interval for periodic alarms. `None` when there are no alarms.
 fn render_alarm_lines(alarms: &[Alarm]) -> Option<String> {
     if alarms.is_empty() {
         return None;
@@ -1015,8 +1013,8 @@ fn render_alarm_lines(alarms: &[Alarm]) -> Option<String> {
             let _ = write!(out, " (every {interval} seconds)");
         }
         let _ = write!(out, ", {}, next fire: {}", alarm.text, fire);
-        if let Some(cmd) = &alarm.command {
-            let _ = write!(out, ", command: {}", crate::util::scrub_credentials(cmd));
+        if let Some(trigger) = &alarm.trigger {
+            let _ = write!(out, ", trigger: {}", trigger.render());
         }
         out.push('\n');
     }
@@ -1706,7 +1704,7 @@ mod tests {
             user_name: "u".to_string(),
             kind: "one-shot".to_string(),
             text: "hello".to_string(),
-            command: None,
+            trigger: None,
             interval_seconds: None,
             next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
         };
@@ -1812,18 +1810,18 @@ mod tests {
         assert!(render_personal_file_lines(Vec::new()).is_none());
     }
 
-    /// Alarm line rendering: a periodic interval is annotated, the command is
-    /// credential-scrubbed (raw secret never leaks), and an empty alarm set
-    /// renders as `None`.
+    /// Alarm line rendering: a periodic interval is annotated, the trigger is
+    /// rendered verbatim (no scrubbing — alarm-born text is not redacted on the
+    /// alarm side), and an empty alarm set renders as `None`.
     #[test]
-    fn alarm_lines_scrub_and_interval() {
+    fn alarm_lines_show_trigger_and_interval() {
         let one_shot = Alarm {
             id: "a1".to_string(),
             session_id: "s1".to_string(),
             user_name: "u".to_string(),
             kind: "one-shot".to_string(),
             text: "hello".to_string(),
-            command: None,
+            trigger: None,
             interval_seconds: None,
             next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
         };
@@ -1833,16 +1831,27 @@ mod tests {
             user_name: "u".to_string(),
             kind: "periodic".to_string(),
             text: "check".to_string(),
-            command: Some("curl -s -H 'api_key: supersecretvalue123' https://x".to_string()),
+            trigger: Some(crate::alarms::StoredTrigger::Tool(crate::alarms::Trigger {
+                tool: "weather".to_string(),
+                args: serde_json::Map::from_iter([
+                    ("city".to_string(), serde_json::json!("Minsk")),
+                    (
+                        "api_key".to_string(),
+                        serde_json::json!("supersecretvalue123"),
+                    ),
+                ]),
+            })),
             interval_seconds: Some(3600),
             next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
         };
 
         let lines = render_alarm_lines(&[one_shot, periodic]).expect("alarms render");
         assert!(lines.contains("every 3600 seconds"));
-        assert!(lines.contains("command:"));
-        assert!(!lines.contains("supersecretvalue123"));
-        assert!(lines.contains("*[REDACTED]"));
+        assert!(lines.contains("trigger: weather "));
+        assert!(lines.contains("\"city\":\"Minsk\""));
+        // Scrubbing was deliberately removed: a credential-shaped argument
+        // reaches the persisted prompt verbatim.
+        assert!(lines.contains("\"api_key\":\"supersecretvalue123\""));
         assert!(lines.contains("next fire:"));
 
         assert!(render_alarm_lines(&[]).is_none());

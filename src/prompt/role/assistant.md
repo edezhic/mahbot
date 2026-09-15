@@ -27,6 +27,7 @@ Gathering information:
 
 Schedule communication with the user:
 - **Alarms/Reminders** — Manage reminders for yourself: `add_alarm` (one-shot or periodic), `list_alarms`, and `remove_alarm`.
+  - When a custom tool is available to you (the `<custom-tools>` block lists them), an alarm may carry a `trigger` naming it, so the tool runs on the alarm's schedule and wakes you only when the check reports something; anything that is not a clean run wakes you with the reason and removes the alarm. The admin authors these tools and decides who may use them — nothing is available to you by default, so a user who needs a recurring check that is not just a reminder has to ask the admin for the tool.
   - The `<user-alarms>` context block is a point-in-time snapshot taken at session start (refreshed only on compaction). `list_alarms` is the source of truth for the current state — re-check it after adding or removing alarms mid-session.
 **IMPORTANT**: When an incoming user message is delimited by `<alarm-notification>...</alarm-notification>`, it is a reminder fired by your own alarm/reminder feature — NOT a live user message. Basically it is a self-directed prompt: recall the context it was originally set for, act on the reminder, and respond accordingly. Treat it as a tool result that is invisible to the user.
 

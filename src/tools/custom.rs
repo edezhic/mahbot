@@ -100,8 +100,8 @@ struct Param {
     description: String,
 }
 
-/// A usable tool: its parsed header plus the file that defines it.
-struct ScriptTool {
+/// A usable custom tool: its parsed header plus the file that defines it.
+struct CustomToolEntry {
     name: String,
     description: String,
     params: Vec<Param>,
@@ -254,7 +254,7 @@ fn read_header_source(path: &Path) -> std::io::Result<String> {
 /// (byte-wise — the same deterministic ordering the product's other
 /// file-defined descriptions use). Files with a non-runnable extension, a
 /// malformed header, or a name another file already took are skipped.
-fn load_catalogue(dir: &Path) -> Vec<ScriptTool> {
+fn load_catalogue(dir: &Path) -> Vec<CustomToolEntry> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -271,7 +271,7 @@ fn load_catalogue(dir: &Path) -> Vec<ScriptTool> {
     // malformed `.js` leaves the tool to a later `.ts` rather than erasing it.
     files.sort();
 
-    let mut tools: Vec<ScriptTool> = Vec::new();
+    let mut tools: Vec<CustomToolEntry> = Vec::new();
     for path in files {
         let Some(name) = path
             .file_stem()
@@ -289,7 +289,7 @@ fn load_catalogue(dir: &Path) -> Vec<ScriptTool> {
         let Some((description, params)) = parse_header(&source) else {
             continue;
         };
-        tools.push(ScriptTool {
+        tools.push(CustomToolEntry {
             name,
             description,
             params,
@@ -301,7 +301,7 @@ fn load_catalogue(dir: &Path) -> Vec<ScriptTool> {
 }
 
 /// Load the catalogue off the async runtime (it reads the folder).
-async fn catalogue() -> Vec<ScriptTool> {
+async fn catalogue() -> Vec<CustomToolEntry> {
     tokio::task::spawn_blocking(|| load_catalogue(&shared_dir()))
         .await
         .unwrap_or_default()
@@ -313,7 +313,7 @@ async fn catalogue() -> Vec<ScriptTool> {
 /// prose (name, basic type, required-ness). The admin-authored text is
 /// credential-scrubbed on the way into the prompt, like the product's other
 /// user-provided text that enters one.
-fn render_lines(tools: &[&ScriptTool]) -> String {
+fn render_lines(tools: &[&CustomToolEntry]) -> String {
     let mut out = String::new();
     for tool in tools {
         let _ = write!(
@@ -379,8 +379,8 @@ pub(crate) async fn context_block(user_name: &str, is_admin: bool) -> String {
 /// granted ones for a guest — the same split the call itself enforces. A grant
 /// that matches no usable file contributes nothing, and an empty listing falls
 /// back to the matching brief form.
-fn block_for(catalogue: &[ScriptTool], granted: &[String], is_admin: bool) -> String {
-    let tools: Vec<&ScriptTool> = catalogue
+fn block_for(catalogue: &[CustomToolEntry], granted: &[String], is_admin: bool) -> String {
+    let tools: Vec<&CustomToolEntry> = catalogue
         .iter()
         .filter(|t| is_admin || granted.iter().any(|g| g == &t.name))
         .collect();
@@ -399,15 +399,134 @@ fn block_for(catalogue: &[ScriptTool], granted: &[String], is_admin: bool) -> St
 
 // ── Call path ────────────────────────────────────────────────────────────
 
-/// Refuse a call whose tool name is not a usable name (see [`is_tool_name`]).
-fn check_tool_name(name: &str) -> anyhow::Result<()> {
-    if is_tool_name(name) {
-        return Ok(());
+/// A resolved custom-tool call: the script to run and the arguments it receives.
+pub(crate) struct ResolvedCall {
+    /// The tool's file.
+    pub path: PathBuf,
+    /// The declared arguments the caller supplied, coerced to their types.
+    pub args: Map<String, Value>,
+    /// The supplied argument names the tool does not declare. The call path
+    /// reports them back with the run's output; a strict caller has none,
+    /// because it refuses them instead.
+    pub ignored: Vec<String>,
+}
+
+impl ResolvedCall {
+    /// The JSON object the script receives as its single argv entry.
+    pub(crate) fn payload(&self) -> String {
+        serde_json::to_string(&self.args).expect("a custom tool's arguments are serializable")
     }
-    anyhow::bail!(
-        "forbidden: \"{name}\" is not a tool name — hint: a tool's name is the file \
-         name without its extension"
-    )
+}
+
+/// Why a custom-tool call could not be resolved.
+///
+/// The call path renders these as its `forbidden:` / `not-found:` / `usage:`
+/// refusals; an alarm's arming and firing paths turn them into their own
+/// wording, which is why the reason is a value rather than a formatted error.
+pub(crate) enum CallRefusal {
+    /// The name is not a callable tool name at all (a path, a dot-file, empty).
+    Name { name: String },
+    /// The caller may not call this name: not the admin and not granted it.
+    Unavailable { name: String },
+    /// No usable tool of that name: no such file, or a header the catalogue
+    /// refuses.
+    NotUsable { name: String },
+    /// The arguments do not fit the tool's declared interface.
+    Arguments(anyhow::Error),
+}
+
+impl CallRefusal {
+    /// The refusal as a normal call reports it to the model.
+    pub(crate) fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Name { name } => anyhow::anyhow!(
+                "forbidden: \"{name}\" is not a tool name — hint: a tool's name is the file \
+                 name without its extension"
+            ),
+            Self::Unavailable { name } => anyhow::anyhow!(
+                "forbidden: custom tool \"{name}\" is not granted to you — hint: only tools \
+                 granted to your account can be called"
+            ),
+            Self::NotUsable { name } => anyhow::anyhow!(
+                "not-found: custom tool \"{name}\" is not usable — hint: a tool is a \
+                 `{name}.ts` (or .js/.tsx/…) script in the admin's `shared` folder whose \
+                 leading comment block declares a `@description` and one `@param` per \
+                 argument"
+            ),
+            Self::Arguments(e) => e,
+        }
+    }
+}
+
+/// Refuse a name that is not a callable tool name at all (see [`is_tool_name`]).
+///
+/// A caller that must settle the name before anything else about the call — the
+/// normal call path, which reads the argument object next — calls this itself,
+/// as [`resolve_tool_call`] does first for every path.
+fn check_name(name: &str) -> Result<(), CallRefusal> {
+    if is_tool_name(name) {
+        Ok(())
+    } else {
+        Err(CallRefusal::Name {
+            name: name.to_string(),
+        })
+    }
+}
+
+/// Resolve `name` for `caller` and validate `supplied` against the tool's
+/// declared interface, returning the script to run and the arguments it gets.
+///
+/// Availability is settled before the catalogue is read — exactly as a normal
+/// call already does it — so no path that resolves a tool can be used to learn
+/// what exists. `strict` additionally refuses arguments the tool does not
+/// declare; the default (a normal call) ignores them and reports them back.
+pub(crate) async fn resolve_tool_call(
+    caller: &str,
+    name: &str,
+    supplied: &Map<String, Value>,
+    strict: bool,
+) -> Result<ResolvedCall, CallRefusal> {
+    check_name(name)?;
+    // The admin may call anything; a guest only what is granted to them. The
+    // refusal comes before the catalogue is read so it cannot probe which tools
+    // exist — nor leak anything about their declared parameters.
+    if !crate::users::is_admin(caller).await
+        && !crate::users::granted_tools(caller)
+            .await
+            .iter()
+            .any(|granted| granted == name)
+    {
+        return Err(CallRefusal::Unavailable {
+            name: name.to_string(),
+        });
+    }
+    let Some(tool) = catalogue().await.into_iter().find(|t| t.name == name) else {
+        return Err(CallRefusal::NotUsable {
+            name: name.to_string(),
+        });
+    };
+
+    let ignored = ignored_arguments(&tool, supplied);
+    if strict && !ignored.is_empty() {
+        // The note rides the refusal, exactly as it rides a refused run: the
+        // assistant is shown which arguments were ignored.
+        return Err(CallRefusal::Arguments(report_ignored_failure(
+            anyhow::anyhow!(
+                "usage: custom tool \"{name}\" was given arguments it does not declare — \
+                 hint: a trigger passes only the arguments the tool declares"
+            ),
+            &ignored,
+        )));
+    }
+    let args = match check_arguments(&tool, supplied) {
+        Ok(args) => args,
+        Err(e) => return Err(CallRefusal::Arguments(report_ignored_failure(e, &ignored))),
+    };
+    Ok(ResolvedCall {
+        path: tool.path,
+        args,
+        ignored,
+    })
 }
 
 /// A JSON number that denotes an integer — `3` and `3.0` alike. The declared
@@ -465,7 +584,7 @@ fn checked(param: &Param, value: &Value) -> anyhow::Result<Value> {
 /// neither forwarded nor a type mismatch. The unrecognised names come from
 /// [`ignored_arguments`], which the caller reports back alongside this.
 fn check_arguments(
-    tool: &ScriptTool,
+    tool: &CustomToolEntry,
     supplied: &Map<String, Value>,
 ) -> anyhow::Result<Map<String, Value>> {
     let mut payload = Map::new();
@@ -491,7 +610,7 @@ fn check_arguments(
 
 /// The supplied argument names the tool does not declare: ignored and reported
 /// back to the caller, never fatal.
-fn ignored_arguments(tool: &ScriptTool, supplied: &Map<String, Value>) -> Vec<String> {
+fn ignored_arguments(tool: &CustomToolEntry, supplied: &Map<String, Value>) -> Vec<String> {
     let mut ignored: Vec<String> = supplied
         .keys()
         .filter(|key| !tool.params.iter().any(|p| &p.name == *key))
@@ -541,69 +660,33 @@ impl Tool for CustomTool {
         }
 
         let name = super::get_str(&args, "tool")?;
-        check_tool_name(name)?;
-        let empty = Map::new();
-        let supplied = match args.get("args") {
-            None | Some(Value::Null) => &empty,
-            Some(Value::Object(map)) => map,
-            Some(other) => return Err(super::wrong_type("args", "an object", other)),
-        };
-
-        // The admin may call anything; a guest only what is granted to
-        // them. The refusal names no way to retry successfully, and it comes
-        // before the catalogue is read so a refusal cannot probe which tools
-        // exist — nor leak anything about their declared parameters.
-        if !crate::users::is_admin(&caller).await
-            && !crate::users::granted_tools(&caller)
-                .await
-                .iter()
-                .any(|granted| granted == name)
-        {
-            anyhow::bail!(
-                "forbidden: custom tool \"{name}\" is not granted to you — hint: only tools \
-                 granted to your account can be called"
-            );
-        }
-
-        let Some(tool) = catalogue().await.into_iter().find(|t| t.name == name) else {
-            anyhow::bail!(
-                "not-found: custom tool \"{name}\" is not usable — hint: a tool is a \
-                 `{name}.ts` (or .js/.tsx/…) script in the admin's `shared` folder whose \
-                 leading comment block declares a `@description` and one `@param` per \
-                 argument"
-            );
-        };
-
-        // The tool's declared interface is known from here, so the caller's
-        // unrecognised arguments can be reported back on a refusal as well as
-        // on a run — never as an error of their own. A run with nothing to
-        // report is returned as it came; the agent-level tool-result path
-        // renders `(no output)` for an empty one.
-        let ignored = ignored_arguments(&tool, supplied);
-        let payload = match check_arguments(&tool, supplied) {
-            Ok(payload) => payload,
-            Err(e) => return Err(report_ignored_failure(e, &ignored)),
-        };
+        // The call's identity is settled before its arguments, as it was before
+        // the resolver below was extracted: a bad name outranks a malformed
+        // `args`.
+        check_name(name).map_err(CallRefusal::into_error)?;
+        let supplied = super::get_object(&args, "args")?;
+        // A normal call is not strict: an argument the tool does not declare is
+        // ignored and reported back with the run rather than refused.
+        let call = resolve_tool_call(&caller, name, &supplied, false)
+            .await
+            .map_err(CallRefusal::into_error)?;
 
         let Some(bun) = crate::tools::bun::bun_binary_path() else {
             return Err(report_ignored_failure(
                 super::internal_fault("the managed bun runtime is unavailable"),
-                &ignored,
+                &call.ignored,
             ));
         };
         let run = crate::tools::shell::run_program_with_timeout(
             ws,
             &bun,
-            &[
-                tool.path.display().to_string(),
-                Value::Object(payload).to_string(),
-            ],
+            &[call.path.display().to_string(), call.payload()],
             &format!("custom tool \"{name}\""),
         )
         .await;
         match run {
-            Ok(output) => Ok(report_ignored(&output, &ignored)),
-            Err(e) => Err(report_ignored_failure(e, &ignored)),
+            Ok(output) => Ok(report_ignored(&output, &call.ignored)),
+            Err(e) => Err(report_ignored_failure(e, &call.ignored)),
         }
     }
 }
@@ -636,15 +719,7 @@ fn report_ignored_failure(e: anyhow::Error, ignored: &[String]) -> anyhow::Error
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A file removed on drop, so a failing assertion cannot strand it in a
-    /// shared test folder.
-    struct ProbeFile(PathBuf);
-    impl Drop for ProbeFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
+    use crate::util::test::ProbeFile;
 
     #[test]
     fn header_parses_comments_and_all_four_types() {
@@ -705,7 +780,7 @@ mod tests {
     #[test]
     fn catalogue_lines_narrate_parameters() {
         let tools = [
-            ScriptTool {
+            CustomToolEntry {
                 name: "weather".to_string(),
                 description: "Fetches the weather.".to_string(),
                 params: vec![
@@ -724,14 +799,14 @@ mod tests {
                 ],
                 path: PathBuf::from("weather.ts"),
             },
-            ScriptTool {
+            CustomToolEntry {
                 name: "disk".to_string(),
                 description: "Reports disk usage.".to_string(),
                 params: Vec::new(),
                 path: PathBuf::from("disk.js"),
             },
         ];
-        let refs: Vec<&ScriptTool> = tools.iter().collect();
+        let refs: Vec<&CustomToolEntry> = tools.iter().collect();
         assert_eq!(
             render_lines(&refs),
             "- weather: Fetches the weather. Parameters: city (string, required) — the city to \
@@ -782,13 +857,13 @@ mod tests {
     /// left.
     #[test]
     fn block_lists_the_whole_catalogue_or_the_granted_subset() {
-        let script = |name: &str| ScriptTool {
+        let entry = |name: &str| CustomToolEntry {
             name: name.to_string(),
             description: format!("The {name} tool."),
             params: Vec::new(),
             path: PathBuf::from(format!("{name}.ts")),
         };
-        let catalogue = [script("alpha"), script("beta")];
+        let catalogue = [entry("alpha"), entry("beta")];
 
         let admin = block_for(&catalogue, &[], true);
         assert!(
@@ -880,9 +955,51 @@ mod tests {
         assert!(err.contains("[ignored arguments: extra]"), "got: {err}");
     }
 
+    /// The one difference a strict caller (an alarm) has: an argument the tool
+    /// does not declare is refused rather than ignored, and the availability
+    /// gate is settled before anything is looked up either way.
+    #[tokio::test]
+    async fn strict_calls_refuse_undeclared_arguments() {
+        crate::util::test::init_management_test_stores().await;
+        let dir = shared_dir();
+        std::fs::create_dir_all(&dir).expect("create the shared folder");
+        let probe = ProbeFile(dir.join("strict_probe.ts"));
+        std::fs::write(
+            &probe.0,
+            "// @description Strict probe.\n// @param city string required the city\n",
+        )
+        .expect("write the probe tool");
+        let supplied = json!({ "city": "Minsk", "extra": 1 });
+        let supplied = supplied.as_object().unwrap();
+
+        let Err(CallRefusal::Arguments(e)) =
+            resolve_tool_call("admin", "strict_probe", supplied, true).await
+        else {
+            panic!("a strict call must refuse an undeclared argument");
+        };
+        assert!(e.to_string().starts_with("usage: "), "got: {e}");
+
+        // The same arguments are a normal call's business as usual: they
+        // resolve, and the unrecognised one comes back for the caller to see.
+        let resolved = resolve_tool_call("admin", "strict_probe", supplied, false)
+            .await
+            .unwrap_or_else(|_| panic!("a normal call ignores an undeclared argument"));
+        assert_eq!(resolved.ignored, ["extra"]);
+        assert_eq!(resolved.args["city"], json!("Minsk"));
+
+        // A guest without the grant is refused whatever the name resolves to —
+        // here to nothing at all — so no path that arms an alarm can probe the
+        // catalogue.
+        let unavailable = resolve_tool_call("strict_probe_guest", "ghost", supplied, true).await;
+        assert!(
+            matches!(unavailable, Err(CallRefusal::Unavailable { .. })),
+            "an ungranted caller must be refused before the tool is looked up"
+        );
+    }
+
     #[test]
     fn arguments_are_checked_shallowly() {
-        let tool = ScriptTool {
+        let tool = CustomToolEntry {
             name: "weather".to_string(),
             description: String::new(),
             params: vec![

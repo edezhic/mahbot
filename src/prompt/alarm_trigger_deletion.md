@@ -1,0 +1,1 @@
+The alarm was DELETED — a check that does not run cleanly is auto-deleted to avoid repeated failures. Fix the underlying problem, then recreate the alarm.

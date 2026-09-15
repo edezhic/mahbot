@@ -160,6 +160,18 @@ pub(crate) fn get_str_array(val: &Value, key: &str) -> anyhow::Result<Vec<String
     }
 }
 
+/// Extract an object field, defaulting to an empty object.
+///
+/// Absent or null yields an empty object (the [`get_str_array`] shape, so
+/// callers need no default of their own); a present non-object is a usage error.
+pub(crate) fn get_object(val: &Value, key: &str) -> anyhow::Result<serde_json::Map<String, Value>> {
+    match val.get(key) {
+        None | Some(Value::Null) => Ok(serde_json::Map::new()),
+        Some(Value::Object(map)) => Ok(map.clone()),
+        Some(v) => Err(wrong_type(key, "an object", v)),
+    }
+}
+
 /// Extract an optional bool field.
 ///
 /// Absent or null yields [`Option::None`]; a present non-boolean is a usage

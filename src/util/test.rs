@@ -27,6 +27,9 @@
 //! Also provides [`seed_session_row`], a session-seeding helper shared by the
 //! analyze/implement tool tests (it exists because the session store's
 //! `batch_append` is `session`-module private).
+//!
+//! Also provides [`ProbeFile`], a self-removing probe file for the tests that
+//! author a tool into a shared catalogue folder.
 
 #![cfg(test)]
 
@@ -62,6 +65,15 @@ static TEST_ROOT_CREATOR_PID: OnceLock<libc::pid_t> = OnceLock::new();
 pub fn env_lock() -> &'static std::sync::Mutex<()> {
     static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
     ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// A probe file that removes itself on drop.
+pub(crate) struct ProbeFile(pub PathBuf);
+
+impl Drop for ProbeFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 // ── Test-global exclusion via serial_test keys ─────────────

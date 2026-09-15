@@ -195,8 +195,8 @@ use std::time::{Duration, Instant};
 // ── JSON helpers ─────────────────────────────────────────────────────────
 
 use crate::util::json::{
-    get_bool, get_opt_bool, get_opt_i64, get_opt_str, get_opt_u64, get_str, get_str_array,
-    get_usize, wrong_type,
+    get_bool, get_object, get_opt_bool, get_opt_i64, get_opt_str, get_opt_u64, get_str,
+    get_str_array, get_usize, wrong_type,
 };
 
 /// Prepend a note about argument normalization so the model can see what was

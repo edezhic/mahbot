@@ -596,52 +596,59 @@ async fn run_command_with_timeout(
     }
 }
 
-/// Outcome of a raw (un-annotated) command run, used by command-armed alarms.
+/// Outcome of a direct program run (argv — never a shell command string), used
+/// by trigger-armed alarms to decide whether a check reported anything.
 ///
-/// `output` is the combined stdout+stderr AFTER ANSI stripping but WITHOUT
-/// credential scrubbing and WITHOUT the shell pipeline's annotations
-/// (exit-status note, timing, spill hints) — the delivery path scrubs the
-/// composed notification once. `has_output` is the wake/no-wake signal,
-/// computed from the pre-redaction text, so ANSI-escape-only or fully
-/// credential-redacted output counts as no output.
-pub(crate) struct RawCommandOutcome {
+/// `output` is the combined stdout+stderr AFTER ANSI stripping, but WITHOUT
+/// credential scrubbing and WITHOUT the shell pipeline's annotations (the
+/// exit-status note, timing, spill hints). `has_output` is the wake/no-wake
+/// signal and reads the streams themselves: output that is nothing but
+/// whitespace or escape sequences is still output.
+pub(crate) struct ProgramOutcome {
+    /// Whether the program exited with status 0.
     pub success: bool,
+    /// How the run ended, e.g. `exit status 2` or `timed out after 600s`.
     pub detail: String,
+    /// Combined stdout+stderr, ANSI-stripped, unscrubbed.
     pub output: String,
+    /// Whether the program emitted anything at all.
     pub has_output: bool,
 }
 
 /// Build the outcome for a run that produced (possibly partial) raw streams.
 /// A run with no streams at all (spawn failure) yields empty, no-output.
-fn raw_command_outcome(
-    success: bool,
-    detail: String,
-    stdout: &[u8],
-    stderr: &[u8],
-) -> RawCommandOutcome {
-    let output = decode_raw_streams(stdout, stderr);
-    RawCommandOutcome {
+fn program_outcome(success: bool, detail: String, stdout: &[u8], stderr: &[u8]) -> ProgramOutcome {
+    ProgramOutcome {
         success,
         detail,
-        has_output: !crate::util::is_blank_after_redaction(&output),
-        output,
+        output: decode_raw_streams(stdout, stderr),
+        // The raw streams decide: only a run that emitted nothing at all
+        // reported nothing.
+        has_output: !stdout.is_empty() || !stderr.is_empty(),
     }
 }
 
-/// Run `command` in `ws` with the shell machinery's containment (sanitized
-/// SAFE_ENV_VARS env, process-group kill on timeout, fixed
-/// `DEFAULT_SHELL_TIMEOUT_SECS` timeout) but NO output profiles, NO read-only
-/// validation, NO grep-engine interception, and NO spill files.
-pub(crate) async fn run_raw_command(ws: &Workspace, command: &str) -> RawCommandOutcome {
-    let mut cmd = build_shell_command(command, ws.as_path());
-    let result = run_command_with_timeout(
-        &mut cmd,
-        Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
-        output_drain_timeout(),
-    )
-    .await;
+/// Run `program` with `args` (argv — never a shell command string) in `ws` and
+/// return the raw run result. The single place that decides how a direct run is
+/// contained: the sanitized environment, [`DEFAULT_SHELL_TIMEOUT_SECS`] with a
+/// process-group kill on unix, the per-pipe output cap and the post-exit drain
+/// bound.
+async fn run_program(ws: &Workspace, program: &Path, args: &[String]) -> ShellRunResult {
+    let timeout = Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS);
+    let mut cmd = build_program_command(program, args, ws.as_path());
+    run_command_with_timeout(&mut cmd, timeout, output_drain_timeout()).await
+}
 
-    match result {
+/// Run `program` with `args` in `ws` and report the run as an outcome instead
+/// of folding a non-zero exit into an error: a run that did not complete is a
+/// failed outcome, never an `Err`, because the caller's rule is about what the
+/// run reported rather than about this layer's error type.
+pub(crate) async fn run_program_outcome(
+    ws: &Workspace,
+    program: &Path,
+    args: &[String],
+) -> ProgramOutcome {
+    match run_program(ws, program, args).await {
         ShellRunResult::Completed {
             stdout,
             stderr,
@@ -649,7 +656,7 @@ pub(crate) async fn run_raw_command(ws: &Workspace, command: &str) -> RawCommand
             ..
         } => {
             let code = status.code();
-            raw_command_outcome(
+            program_outcome(
                 code == Some(0),
                 match code {
                     Some(n) => format!("exit status {n}"),
@@ -659,28 +666,27 @@ pub(crate) async fn run_raw_command(ws: &Workspace, command: &str) -> RawCommand
                 &stderr,
             )
         }
-        ShellRunResult::TimedOut { stdout, stderr, .. } => raw_command_outcome(
+        ShellRunResult::TimedOut { stdout, stderr, .. } => program_outcome(
             false,
-            format!("timed out after {DEFAULT_SHELL_TIMEOUT_SECS}s (process group killed)"),
+            format!("timed out after {DEFAULT_SHELL_TIMEOUT_SECS}s"),
             &stdout,
             &stderr,
         ),
-        ShellRunResult::DrainTimedOut { stdout, stderr, .. } => raw_command_outcome(
+        ShellRunResult::DrainTimedOut { stdout, stderr, .. } => program_outcome(
             false,
             "output drain overrun — a leftover process held the pipes".to_string(),
             &stdout,
             &stderr,
         ),
         ShellRunResult::SpawnFailed(e) => {
-            raw_command_outcome(false, format!("failed to start: {e}"), &[], &[])
+            program_outcome(false, format!("failed to start: {e}"), &[], &[])
         }
     }
 }
 
 /// Run `program` with `args` (argv — never a shell command string) in `ws`,
-/// under the shell's containment and its standard bounds: the sanitized
-/// environment, the default command timeout (process-group kill on unix), the
-/// per-pipe output cap and the post-exit drain bound.
+/// under the containment and standard bounds [`run_program`] applies to a
+/// direct run.
 ///
 /// `label` names what the caller asked to run and is what the failure prose
 /// talks about, so the model reads back the thing it called rather than the
@@ -700,10 +706,7 @@ pub(crate) async fn run_program_with_timeout(
     args: &[String],
     label: &str,
 ) -> anyhow::Result<String> {
-    let timeout = Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS);
-    let mut cmd = build_program_command(program, args, ws.as_path());
-
-    match run_command_with_timeout(&mut cmd, timeout, output_drain_timeout()).await {
+    match run_program(ws, program, args).await {
         ShellRunResult::Completed {
             stdout,
             stderr,
@@ -729,8 +732,7 @@ pub(crate) async fn run_program_with_timeout(
             elapsed,
             ..
         } => Err(anyhow::anyhow!(
-            "timeout: {label} did not finish within {}s and was killed\n{}",
-            timeout.as_secs(),
+            "timeout: {label} did not finish within {DEFAULT_SHELL_TIMEOUT_SECS}s and was killed\n{}",
             program_error_tail(elapsed, &stdout, &stderr),
         )),
         ShellRunResult::DrainTimedOut {
@@ -774,8 +776,9 @@ fn program_error_tail(elapsed: Duration, stdout: &[u8], stderr: &[u8]) -> String
 
 /// Decode both raw streams (lossy UTF-8 + ANSI strip) and combine stderr onto
 /// its own line when non-blank (never a leading blank line when stdout is
-/// empty). Output is NOT credential-scrubbed here — the caller scrubs the
-/// composed notification once.
+/// empty). Never credential-scrubbed here: the `custom` tool's output is scrubbed
+/// by the agent-level pass, while an alarm's trigger deliberately shows a check
+/// exactly as the check produced it.
 fn decode_raw_streams(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = decode_and_strip_ansi(stdout);
     let stderr = decode_and_strip_ansi(stderr);
@@ -3550,49 +3553,82 @@ mod tests {
         );
     }
 
+    /// A direct program run reported as an outcome: output is raw and
+    /// un-annotated, and only the raw streams decide whether anything was
+    /// reported.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn run_raw_command_reports_success_output_and_failure() {
+    async fn run_program_outcome_reports_output_and_status_without_annotations() {
         let tmp = TempDir::new().expect("tempdir");
         let ws = crate::workspace::test_ws(tmp.path());
 
         // Success with stdout — raw, un-annotated output.
-        let out = run_raw_command(&ws, "echo hello-raw-out").await;
+        let out =
+            run_program_outcome(&ws, Path::new("/bin/sh"), &sh_args("echo hello-prog-out")).await;
         assert!(out.success);
         assert!(out.has_output);
-        assert!(out.output.contains("hello-raw-out"), "got: {}", out.output);
+        assert!(out.output.contains("hello-prog-out"), "got: {}", out.output);
         assert!(!out.output.contains("[exit status"), "got: {}", out.output);
         assert_eq!(out.detail, "exit status 0");
 
-        // stderr counts as output — with no leading blank line.
-        let out = run_raw_command(&ws, "echo only-warnings >&2").await;
-        assert!(out.success && out.has_output);
-        assert!(
-            out.output.starts_with("only-warnings"),
-            "got: {:?}",
-            out.output
-        );
-
-        // ANSI-escape-only output counts as empty.
-        let out = run_raw_command(&ws, "printf '\\033[32m\\033[0m'").await;
-        assert!(out.success && !out.has_output);
-
-        // Empty success stays empty.
-        let out = run_raw_command(&ws, "true").await;
-        assert!(out.success && !out.has_output && out.output.is_empty());
-
-        // Non-zero exit is a failure with the exit code in the detail.
-        let out = run_raw_command(&ws, "exit 3").await;
-        assert!(!out.success);
-        assert!(!out.has_output);
-        assert_eq!(out.detail, "exit status 3");
-
-        // Spawn failure (command not found): sh itself reports the error on
-        // stderr and exits 127 — the shell's error message counts as output.
-        let out = run_raw_command(&ws, "mahbot-no-such-binary-xyz").await;
+        // Non-zero exit is a failed outcome whose output is still just the
+        // program's own text.
+        let out =
+            run_program_outcome(&ws, Path::new("/bin/sh"), &sh_args("echo bad; exit 3")).await;
         assert!(!out.success);
         assert!(out.has_output);
-        assert!(out.output.contains("not found"), "got: {}", out.output);
-        assert_eq!(out.detail, "exit status 127");
+        assert!(out.output.contains("bad"), "got: {}", out.output);
+        assert!(!out.output.contains("[exit status"), "got: {}", out.output);
+        assert_eq!(out.detail, "exit status 3");
+
+        // No output at all: nothing was reported.
+        let out = run_program_outcome(&ws, Path::new("/bin/sh"), &sh_args("printf ''")).await;
+        assert!(out.success);
+        assert!(!out.has_output);
+        assert!(out.output.is_empty());
+
+        // Whitespace-only output still counts as reported — the raw streams
+        // decide, not the trimmed text.
+        let out = run_program_outcome(&ws, Path::new("/bin/sh"), &sh_args("printf '\\n'")).await;
+        assert!(out.has_output);
+
+        // ... and so does escape-sequence-only output — reported, even though
+        // the ANSI strip leaves nothing readable behind.
+        let out = run_program_outcome(
+            &ws,
+            Path::new("/bin/sh"),
+            &sh_args("printf '\\033[32m\\033[0m'"),
+        )
+        .await;
+        assert!(out.has_output);
+        assert!(out.output.is_empty(), "got: {}", out.output);
+
+        // stderr alone counts as output.
+        let out = run_program_outcome(&ws, Path::new("/bin/sh"), &sh_args("echo hi >&2")).await;
+        assert!(out.has_output);
+        assert!(out.output.contains("hi"), "got: {}", out.output);
+
+        // The literal is split so this source does not itself look like a
+        // credential to output scrubbers; the control below proves the scrubber
+        // rewrites it, and that it therefore reaches the alarm verbatim.
+        let raw = concat!("API_KEY=", "abcd1234");
+        assert!(
+            scrub_credentials(raw).contains("*[REDACTED]"),
+            "the scrubber must rewrite this value, or the pin below is vacuous"
+        );
+        let out =
+            run_program_outcome(&ws, Path::new("/bin/sh"), &sh_args(&format!("echo {raw}"))).await;
+        assert!(out.has_output);
+        assert_eq!(
+            out.output.trim(),
+            raw,
+            "the check's output must reach the alarm unredacted"
+        );
+    }
+
+    #[cfg(unix)]
+    fn sh_args(script: &str) -> Vec<String> {
+        vec!["-c".to_string(), script.to_string()]
     }
 
     #[tokio::test]

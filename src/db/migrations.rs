@@ -22,23 +22,25 @@
 //! a fresh file), and the id-only applied check makes their recorded ids
 //! `1`–`23` harmless no-ops. The baseline (`24`–`26`) creates the exact
 //! current shape on fresh installs and is a strict no-op on existing ones,
-//! except entries `25`/`27`–`34`/`38`, which genuinely upfill the retired delta
-//! `23`'s `chat_history` reply columns, the `workspaces.maintainer_recommendations`
+//! except entries `25`/`27`–`34`/`38`/`42`, which genuinely upfill the retired
+//! delta `23`'s `chat_history` reply columns, the `workspaces.maintainer_recommendations`
 //! and `jobs.caller_agent_id` / `session_metadata.created_at` columns, the
 //! per-user `image_gen_model` / `video_model` columns, the backfilled
 //! `jobs.mode` discriminator, the `session_metadata.sleep_ended` marker, the
 //! `alarms.command` column, the `chat_history.broadcast_id` column, the
-//! `tickets.last_transition_actor` / `ticket_chronicle.actor` columns, and the
+//! `tickets.last_transition_actor` / `ticket_chronicle.actor` columns, the
 //! nullable `users.granted_tools` column on one-delta-behind / current
-//! databases. The tail's data migrations are
+//! databases, and the `alarms.trigger` column that replaces the retired shell
+//! command. The tail's data migrations are
 //! `36`, which detaches guests from shared workspaces by clearing
-//! `users.selected_workspace`, and `37`, which rewrites the legacy `DeepSeek`
-//! provider-routing display name to the canonical `deepseek` slug. The tail's
+//! `users.selected_workspace`, `37`, which rewrites the legacy `DeepSeek`
+//! provider-routing display name to the canonical `deepseek` slug, and `41`,
+//! which deletes every command-armed `alarms` row. The tail's
 //! drops are `39`/`40`, which remove `users.permissions` and
 //! `users.selected_role` — account kind is the admin's name and no account
-//! stores an agent role.
+//! stores an agent role — and `43`, which retires the `alarms.command` column.
 //!
-//! Future schema changes resume the chain at id `41` with monotonically
+//! Future schema changes resume the chain at id `44` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -294,7 +296,7 @@ CREATE TABLE IF NOT EXISTS alarms (
     next_fire_at     TEXT NOT NULL,
     status           TEXT NOT NULL DEFAULT 'active',
     created_at       TEXT NOT NULL,
-    command          TEXT
+    trigger          TEXT
 );
 -- ── Indexes ────────────────────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket_id ON ticket_comments(ticket_id);
@@ -485,7 +487,8 @@ const REWRITE_LEGACY_DEEPSEEK_ROUTING_SLUG: &str = "UPDATE config_model_routing 
 ///   NULL-sentinel (sync = has caller pin, async = NULL).
 /// - `31` adds the `session_metadata.sleep_ended` marker via a guarded Rust
 ///   body — a real upfill on existing installs, a no-op on fresh ones.
-/// - `32` adds the nullable `alarms.command` column.
+/// - `32` adds the nullable `alarms.command` column — retired storage: the
+///   baseline no longer declares it and entry `43` drops it again.
 /// - `33` adds the nullable `chat_history.broadcast_id` column.
 /// - `34` adds the `tickets.last_transition_actor` and
 ///   `ticket_chronicle.actor` columns for phase-transition actor attribution.
@@ -499,6 +502,13 @@ const REWRITE_LEGACY_DEEPSEEK_ROUTING_SLUG: &str = "UPDATE config_model_routing 
 ///   account kind is the admin's name, and no account stores an agent role.
 ///   Two entries, never one, so each drop keeps its own body (see
 ///   [`drop_column_if_missing`]).
+/// - `41` deletes every command-armed `alarms` row (a data migration: the
+///   command-armed alarm feature is gone, so those rows are removed before any
+///   of them can fire again).
+/// - `42` adds the nullable `alarms.trigger` column, the alarm's tool-call
+///   trigger that replaced the retired shell command (a no-op on fresh
+///   installs, whose baseline already declares it).
+/// - `43` drops the retired `alarms.command` column.
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -584,6 +594,21 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "40",
         target: TargetDb::Core,
         body: MigrationBody::Rust(drop_users_selected_role),
+    },
+    Migration {
+        id: "41",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(remove_command_alarms),
+    },
+    Migration {
+        id: "42",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_alarms_trigger),
+    },
+    Migration {
+        id: "43",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(drop_alarms_command),
     },
 ];
 
@@ -887,10 +912,11 @@ fn add_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 }
 
 /// Upfill the nullable `alarms.command` column for databases created before
-/// delta `32`. Fresh installs get the column from entry `24`'s `CREATE TABLE`,
-/// so the probe makes this a no-op there. Guarded by [`add_column_if_missing`],
-/// so this body is idempotent (non-transactional like every Rust body,
-/// re-runnable until recorded).
+/// delta `32`. The baseline no longer declares the column — the command-armed
+/// alarm feature is retired and the baseline carries its replacement `trigger`
+/// — so on a fresh install this adds `command` and delta `43` drops it again.
+/// Guarded by [`add_column_if_missing`], so this body is idempotent
+/// (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_alarms_command(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "alarms", "command").await
 }
@@ -963,6 +989,57 @@ fn drop_users_selected_role(conn: &Connection) -> BoxFuture<'_, anyhow::Result<(
 /// to the single Assistant and therefore decided nothing.
 async fn run_drop_users_selected_role(conn: &Connection) -> anyhow::Result<()> {
     drop_column_if_missing(conn, "users", "selected_role").await
+}
+
+fn remove_command_alarms(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_remove_command_alarms(conn))
+}
+
+/// Data migration: delete every command-armed alarm row — active or long
+/// settled — before any of them can fire again. The command-armed alarm
+/// feature is gone, so nothing is converted and no notice is left on those
+/// rows; entry `43` then retires the column itself.
+///
+/// Guarded by [`column_exists`]: every normal path reaches this entry after
+/// `32` added the column, so the probe passes, but a hard-coded
+/// `DELETE … WHERE command IS NOT NULL` would be a hard boot failure on a store
+/// whose `alarms` table lacks it — and catalog errors are never absorbed.
+async fn run_remove_command_alarms(conn: &Connection) -> anyhow::Result<()> {
+    if !column_exists(conn, "alarms", "command").await? {
+        return Ok(());
+    }
+    conn.execute("DELETE FROM alarms WHERE command IS NOT NULL", ())
+        .await
+        .with_context(|| "Failed to delete command-armed alarms")?;
+    Ok(())
+}
+
+fn add_alarms_trigger(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_alarms_trigger(conn))
+}
+
+/// Upfill the nullable `alarms.trigger` column for databases created before
+/// delta `42`. Fresh installs get the column from entry `24`'s `CREATE TABLE`,
+/// so the probe makes this a no-op there. Guarded by
+/// [`add_column_if_missing`], so this body is idempotent (non-transactional
+/// like every Rust body, re-runnable until recorded). Holds the alarm's
+/// tool-call trigger: `{"tool": ..., "args": {...}}`.
+async fn run_add_alarms_trigger(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "alarms", "trigger").await
+}
+
+fn drop_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_drop_alarms_command(conn))
+}
+
+/// Drop `alarms.command` for databases created before delta `43`.
+///
+/// The column armed an alarm with a shell command, a feature that no longer
+/// exists; entry `41` has already deleted every row that carried one, so the
+/// drop retires storage only. Nothing else references the column: it is not
+/// indexed and not part of a PK/UNIQUE/CHECK/FK constraint.
+async fn run_drop_alarms_command(conn: &Connection) -> anyhow::Result<()> {
+    drop_column_if_missing(conn, "alarms", "command").await
 }
 
 #[cfg(test)]
@@ -1115,7 +1192,7 @@ mod tests {
                 "next_fire_at",
                 "status",
                 "created_at",
-                "command",
+                "trigger",
             ],
         ),
         (
@@ -2268,13 +2345,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     // ── Tests ──────────────────────────────────────────────────────────
 
-    /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`
-    /// upfills and the `36`–`40` tail, and converges to the exact current core
+    /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
+    /// upfills and the `36`–`43` tail, and converges to the exact current core
     /// shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
     /// `pipeline_reservation` / `paused_frozen` and of the account-kind
-    /// `users.permissions` / `users.selected_role`).
+    /// `users.permissions` / `users.selected_role` / `alarms.command`).
     #[tokio::test]
     async fn fresh_install_converges_to_expected_shape() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2296,10 +2373,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             applied,
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-                "40"
+                "40", "41", "42", "43"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–40 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–43 tail exactly"
         );
     }
 
@@ -2565,7 +2642,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`40`) as a
+    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`43`) as a
     /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
     /// column upfill, the delta-28 `jobs.caller_agent_id` /
     /// `session_metadata.created_at` column upfills (plus the delta-28
@@ -2574,8 +2651,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `sleep_ended` column upfill, the delta-32 `alarms.command` column
     /// upfill, the delta-33 `chat_history.broadcast_id` column upfill, the
     /// delta-34 `tickets.last_transition_actor` / `ticket_chronicle.actor`
-    /// column upfill, the delta-38 `users.granted_tools` column upfill, and the
-    /// delta-39/40 `users` column drops —
+    /// column upfill, the delta-38 `users.granted_tools` column upfill, the
+    /// delta-39/40 `users` column drops, and the delta-41/42/43 `alarms`
+    /// command retirement (delete the command-armed rows, add `trigger`, drop
+    /// `command`) —
     /// plus the delta-36 data rewrite, which detaches the seeded guest from
     /// `users.selected_workspace` (row counts unchanged; the snapshot compares
     /// only counts, chat content and tickets). All asserted explicitly. This
@@ -2607,7 +2686,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40",
+            "40", "41", "42", "43",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -2616,18 +2695,21 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..40"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..43"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
         // jobs/session_metadata (delta 28), users (deltas 29/38/39/40),
         // jobs.mode (delta 30), session_metadata.sleep_ended (delta 31),
-        // alarms.command (delta 32), chat_history.broadcast_id (delta 33) and
+        // alarms.command (delta 32, retired by deltas 41/42/43),
+        // chat_history.broadcast_id (delta 33) and
         // tickets/ticket_chronicle (delta 34) change in shape and the delta-28
         // `idx_jobs_caller_agent` index is added. Delta `36` rewrites
         // `users.selected_workspace` data (detaching the seeded guest),
         // which leaves row counts unchanged — the snapshot compares only
         // counts, chat content and tickets, so the no-op assertions still hold.
+        // The seeded alarm row carries no command, so the delta-41 delete
+        // matches no rows and the count is unchanged there too.
         assert_core_catalog_unchanged(
             &conn,
             &before,
@@ -2680,10 +2762,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         );
         let after_alarms_cols = column_sets(&conn, &["alarms"]).await;
         let mut expected_alarms_cols = before.cols["alarms"].clone();
-        expected_alarms_cols.push("command".to_string());
+        expected_alarms_cols.push("trigger".to_string());
         assert_eq!(
             after_alarms_cols["alarms"], expected_alarms_cols,
-            "reopen must append exactly command to alarms columns"
+            "reopen must trade command (delta 32) for trigger (deltas 42/43) on alarms columns"
         );
         let after_chat_cols = column_sets(&conn, &["chat_history"]).await;
         let mut expected_chat_cols = before.cols["chat_history"].clone();
@@ -2809,10 +2891,12 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
     /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
     /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
-    /// entries `36`–`40`: two data migrations (detaching guests from
-    /// shared workspaces, and rewriting the legacy `DeepSeek` routing slug),
-    /// the `users.granted_tools` column and the drops of the account-kind
-    /// `users.permissions` / `users.selected_role` columns.
+    /// entries `36`–`43`: three data migrations (detaching guests from
+    /// shared workspaces, rewriting the legacy `DeepSeek` routing slug, and
+    /// deleting the command-armed alarm rows), the `users.granted_tools`
+    /// column, the drops of the account-kind `users.permissions` /
+    /// `users.selected_role` columns, and the `alarms.trigger` upfill plus the
+    /// `alarms.command` drop that retire the command-armed alarm feature.
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
@@ -2914,7 +2998,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40",
+            "40", "41", "42", "43",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -2923,7 +3007,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..40"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..43"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -2946,8 +3030,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         );
         let after_alarms_cols = column_names(&conn, "alarms").await;
         assert!(
-            after_alarms_cols.contains(&"command".to_string()),
-            "command must be added to alarms"
+            after_alarms_cols.contains(&"trigger".to_string())
+                && !after_alarms_cols.contains(&"command".to_string()),
+            "the retired command column must be replaced by trigger on alarms"
         );
         let after_chat_cols = column_names(&conn, "chat_history").await;
         assert!(
@@ -2971,7 +3056,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "only chat_history (delta 25/33), workspaces (delta 27), \
              jobs/session_metadata (delta 28), users (deltas 29/38), jobs.mode \
              (delta 30), session_metadata.sleep_ended (delta 31), \
-             alarms.command (delta 32) and tickets/ticket_chronicle (delta 34) \
+             alarms.command → trigger (deltas 32/41/42/43) and \
+             tickets/ticket_chronicle (delta 34) \
              columns may change on the 0.5.0 upgrade"
         );
     }
@@ -3160,6 +3246,71 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         run_drop_users_permissions(&conn).await.unwrap();
         run_drop_users_selected_role(&conn).await.unwrap();
         assert_eq!(column_names(&conn, "users").await, expected_columns);
+    }
+
+    /// Behavioral pin for the alarm-tail deltas: entry `41` deletes every row
+    /// that carried a shell command — active and long settled alike — while
+    /// command-free rows survive, and entry `43` drops the column, leaving the
+    /// new end state. Delta `42` is pinned by the one-delta-behind reopen test
+    /// instead: the baseline seeded here already declares `trigger`.
+    #[tokio::test]
+    async fn command_armed_alarms_are_deleted_and_the_command_column_is_dropped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        // Seed into the catalog front through delta `32`: by then the table has
+        // the retired `alarms.command` (added by `32`, dropped only by `43`) and
+        // the tail that follows re-runs entry `41`'s delete over what is seeded.
+        // The baseline already declares `trigger`, so the seeded table carries
+        // both columns — the delete only ever looks at `command`.
+        let through_command = MIGRATIONS
+            .iter()
+            .position(|m| m.id == "32")
+            .expect("entry 32 in the catalog");
+        run_catalog(&conn, TargetDb::Core, &MIGRATIONS[..=through_command])
+            .await
+            .expect("catalog through delta 32");
+        let now = crate::db::now();
+        for (id, status, command) in [
+            ("armed_active", "active", Some("rm -rf /tmp/x")),
+            ("armed_settled", "fired", Some("say done")),
+            ("reminder", "active", None),
+        ] {
+            conn.execute(
+                "INSERT INTO alarms \
+                 (id, session_id, user_name, kind, text, next_fire_at, status, created_at, command) \
+                 VALUES (?1, 's1', 'bob', 'reminder', 'ping', ?2, ?3, ?2, ?4)",
+                params![id, now.clone(), status, command],
+            )
+            .await
+            .unwrap();
+        }
+
+        run_migrations(&conn, TargetDb::Core)
+            .await
+            .expect("new catalog");
+
+        let remaining: Vec<String> = conn
+            .query("SELECT id FROM alarms ORDER BY id", ())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec!["reminder".to_string()],
+            "delta 41 must delete every command-armed alarm row and keep the rest"
+        );
+        // The end state carries `trigger` and no `command` (delta `43`). The
+        // `trigger` half is the baseline's own declaration, so it is the reopen
+        // test — not this fixture — that would catch a missing delta `42`.
+        let cols = column_names(&conn, "alarms").await;
+        assert!(!cols.contains(&"command".to_string()), "got: {cols:?}");
     }
 
     /// Behavioral pin for catalog entry `37`: the legacy DeepSeek routing value

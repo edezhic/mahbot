@@ -1,9 +1,7 @@
 <alarm-notification>
 Your reminder "{{text}}" is due now (scheduled for {{fire_at}}).
 
-Command: `{{command}}`
-{{command_status}}
-{{command_deletion}}
-
-{{command_output}}
+Trigger: `{{trigger}}`
+{{trigger_status}}
+{{trigger_deletion}}{{trigger_output}}
 </alarm-notification>
