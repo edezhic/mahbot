@@ -1,7 +1,7 @@
 Chrome browser automation: navigate web pages, interact with elements, extract content, and capture screenshots for visual inspection. Returns an accessibility-tree snapshot for AI consumption.
 
 ## Required parameter
-`tab` — a logical session name. Missing or empty uses a unique per-run session that is closed automatically when your run ends. Sessions are mapped to a private per-run namespace under the hood, so the same name never collides across concurrent runs. Use an explicit different name (e.g. "docs") only to keep multiple pages open simultaneously. Same tab = serialized operations on that page.
+`tab` — a logical session name. Missing or empty uses a per-run session that is released when your run ends. Sessions are mapped to a private per-run namespace derived from the run's identity, so a name here never addresses another run's session — and a run resumed under that identity re-attaches the names it was working with. Use an explicit different name (e.g. "docs") only to keep multiple pages open simultaneously. Same tab = serialized operations on that page.
 
 ## Workflow
 ### 1. Navigate: `open <url>`

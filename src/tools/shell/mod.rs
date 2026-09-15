@@ -1595,9 +1595,10 @@ pub(crate) fn record_spill_owner(path: std::path::PathBuf) {
 /// path that is a directory (the read tool's per-call document-conversion
 /// artifacts) is removed whole with [`std::fs::remove_dir_all`], a spill file
 /// with [`std::fs::remove_file`]. Also clears the registry entry so a later run
-/// of the same agent id starts fresh. Callers: the agent run end hook
-/// (`run_agent`) and the diagnostics runner (which passes
-/// [`crate::agent::role::DIAGNOSTICS_ROLE`]) — the diagnostics spill owner is
+/// of the same agent id starts fresh. Callers: the agent run-end cleanup guard
+/// (`RunEndCleanup`, which fires on every unwinding exit path of a run — see its
+/// doc for the ones it cannot cover) and the diagnostics runner (which passes
+/// [`crate::agent::role::DIAGNOSTICS_ROLE`]). The diagnostics spill owner is
 /// [`crate::agent::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`).
 pub(crate) fn cleanup_agent_spills(agent_id: &str) {
     let mut map = SPILL_OWNERS.lock().unwrap_poison();

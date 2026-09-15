@@ -319,6 +319,15 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::chrome_daemon::run_watchdog(),
     );
 
+    // Ended-run chrome session releases: the sessions the runs that ended handed
+    // over (`mahbot::tools::chrome_release` owns what a release does and trusts).
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "chrome-run-releases",
+        mahbot::tools::chrome_release::run_session_release_queue(),
+    );
+
     // Managed chrome-use: silent first install at startup (no consent flow —
     // the user accepted quiet-install risk) plus a delayed once-per-boot
     // auto-update of an existing install. All failures are non-fatal and
@@ -541,7 +550,7 @@ async fn shutdown_after_dashboard() {
     // after the update's finalizing drain fired it. A future exit path that
     // drops the runtime without firing the token would break this invariant.
     mahbot::agent::registry::AGENT_REGISTRY.shutdown_all();
-    mahbot::tools::chrome::close_all_chrome_sessions().await;
+    mahbot::tools::chrome_release::flush_and_close_all_chrome_sessions().await;
 
     // Take the JoinSet out of the lock before awaiting (drop guard).
     let maybe_tasks = {

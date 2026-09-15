@@ -25,10 +25,14 @@
 //!
 //! Verified tab-sweep: mahbot-owned session tab groups (`link-enricher-*`) are
 //! closed through the CLI and verified by round-over-round re-enumeration. A
-//! bare `session stop` is not enough — it SIGTERMs the daemon, waits ~1 s, then
-//! force-kills, so when the extension relay is slow or wedged the daemon's
-//! graceful tab close cannot finish inside that window and the scratch tab is
-//! orphaned forever (no other mechanism ever reclaims it).
+//! bare `session stop` cannot settle them: a group can hold tabs the session
+//! ADOPTED, which stop never closes and never reports (the ended-run release in
+//! [`crate::tools::chrome_release`] relies on stop only for tabs its run itself
+//! CREATED), and this file's own stop (`stop_session_daemon`) is bounded by
+//! `CLI_TIMEOUT` — which expires as the daemon's shutdown grace does, so the
+//! reclaim that follows never runs and a scratch tab it misses is orphaned
+//! forever (no other mechanism ever reclaims it). What a stop proves and what it
+//! costs is stated by the live-verified behaviours below.
 //!
 //! Trade-offs:
 //! - A genuine daemon wedge surfaces on the first real chrome call, which pays
@@ -46,7 +50,6 @@ use crate::chrome::contract::{
 };
 use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, ensure_chrome_env, spawn_cli};
 use crate::util::UnwrapPoison;
-use futures_util::future::join_all;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -467,8 +470,8 @@ pub(crate) const CHROME_USE_INSTALL_HINT: &str = "It installs automatically in t
 static CLI_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
 /// Absolute path of the chrome-use binary, or `None` when definitively not
-/// installed. Spawns must go through this (not the bare name) so PATH
-/// mutations and non-PATH install locations cannot break them.
+/// installed. Spawns must go through this (not the bare name) so PATH mutations
+/// and non-PATH install locations cannot break them.
 pub(crate) fn cli_path() -> Option<PathBuf> {
     let mut cache = CLI_PATH
         .get_or_init(|| Mutex::new(None))
@@ -657,19 +660,32 @@ pub(crate) async fn cli_version() -> Option<semver::Version> {
     parse_cli_version(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Spawn a chrome-use CLI call through [`crate::chrome::spawn::spawn_cli`] with
-/// the shared env, `--json`, and an optional `--session`, bounded by
-/// [`CLI_TIMEOUT`] — a wedged daemon hangs inside the CLI's own ~152 s retry
-/// loop, so every call must be bounded.
+/// The probed-path variant of [`run_cli_bounded_at`], bounded by [`CLI_TIMEOUT`]
+/// — a wedged daemon hangs inside the CLI's own ~152 s retry loop, so every call
+/// must be bounded.
 async fn run_cli_bounded(args: &[&str], session: Option<&str>) -> Option<std::process::Output> {
     let path = cli_path()?;
+    run_cli_bounded_at(&path, args, session, CLI_TIMEOUT).await
+}
+
+/// A bounded chrome-use CLI call through [`crate::chrome::spawn::spawn_cli`]
+/// (shared env, `--json`, optional `--session`) against an already-resolved binary,
+/// so a caller that resolves the path itself does not pay for a second probe.
+/// `timeout` is the caller's own bound: the shared [`CLI_TIMEOUT`] for everything
+/// that must fail fast, a longer one for a call that waits on the CLI's own cleanup.
+async fn run_cli_bounded_at(
+    path: &Path,
+    args: &[&str],
+    session: Option<&str>,
+    timeout: Duration,
+) -> Option<std::process::Output> {
     match spawn_cli(CliSpawn {
-        path: &path,
+        path,
         args,
         session,
         json: true,
         capture_stderr: false,
-        timeout: CliTimeout::Bounded(CLI_TIMEOUT),
+        timeout: CliTimeout::Bounded(timeout),
         cancel_kills: true,
         input: None,
         chrome_deadline: None,
@@ -681,14 +697,36 @@ async fn run_cli_bounded(args: &[&str], session: Option<&str>) -> Option<std::pr
     }
 }
 
-/// Run a chrome-use CLI command with `--json` (and optional `--session`),
-/// bounded by [`CLI_TIMEOUT`] — a wedged daemon would otherwise hang the
-/// CLI's own ~152 s retry loop inside the health/recovery path. `Ok(value)` on
-/// success; `Err(Some(msg))` when the CLI answered with a structured error
-/// (the message survives for signature detection); `Err(None)` on
-/// timeout/spawn/parse failure.
+/// The probed-path variant of [`run_cli_json_at`], bounded by [`CLI_TIMEOUT`].
 async fn run_cli_json_opt(args: &[&str], session: Option<&str>) -> Result<Value, Option<String>> {
-    let out = run_cli_bounded(args, session).await.ok_or(None)?;
+    run_cli_bounded(args, session)
+        .await
+        .as_ref()
+        .ok_or(None)
+        .and_then(json_outcome)
+}
+
+/// [`run_cli_bounded_at`] plus the `--json` envelope contract: `Ok(value)` on
+/// success; `Err(Some(msg))` when the CLI answered with a structured error (the
+/// message survives for signature detection); `Err(None)` on timeout/spawn/parse
+/// failure. The path-and-timeout-taking entry point, for a caller that has resolved
+/// the binary itself and knows what its own bound must be.
+pub(crate) async fn run_cli_json_at(
+    path: &Path,
+    args: &[&str],
+    session: Option<&str>,
+    timeout: Duration,
+) -> Result<Value, Option<String>> {
+    run_cli_bounded_at(path, args, session, timeout)
+        .await
+        .as_ref()
+        .ok_or(None)
+        .and_then(json_outcome)
+}
+
+/// One bounded call's envelope verdict: the decoded JSON on a zero exit with
+/// `success: true`, else the structured error the CLI reported.
+fn json_outcome(out: &std::process::Output) -> Result<Value, Option<String>> {
     let v: Value = serde_json::from_slice(&out.stdout).map_err(|_| None)?;
     let env = ChromeResponse::from_value(&v);
     if !out.status.success() || env.verdict() != Some(true) {
@@ -925,7 +963,7 @@ struct SweepTab {
 // ≥1.5.101 idle keeps external tabs alive — the explicit close/stop the sweep
 // uses still cleans up, so the verified behaviors below are unchanged):
 // - `tab list --session <name>` enumerates only that session's tab group (the
-//   relay scopes `Target.getTargets` per announced group, issue #40). When the
+//   relay scopes `Target.getTargets` per announced group, leeguooooo/chrome-use#40). When the
 //   session has no daemon the CLI spawns one: an empty group makes it create a
 //   fresh scratch tab; a non-empty group makes it ADOPT the existing tabs
 //   without marking them created (`created_targets` stays empty).
@@ -939,10 +977,21 @@ struct SweepTab {
 //   JSON response is not proof of closure — only re-enumeration is, and a
 //   failed close REAPPEARS in the next same-daemon `tab list` (resync adopts
 //   still-open tabs again), which is the convergence loop.
-// - `session stop` SIGTERMs the daemon (its shutdown handler closes its
-//   created tabs best-effort through the relay), waits ≤ 1 s, then SIGKILLs.
-//   Its exit code / JSON success are NOT proof of closure, and adopted tabs
-//   are never closed at shutdown.
+// - `session stop` SIGTERMs the daemon — whose shutdown handler closes its
+//   created tabs best-effort through the relay — waits out the daemon's shutdown
+//   grace (an upstream chrome-use figure, not a constant of this repo: 8 s on the
+//   installed CLI, 1 s before leeguooooo/chrome-use#192), then SIGKILLs. That
+//   shutdown close is best-effort and NOT proof of anything. What follows it IS:
+//   chrome-use then reconnects to the browser endpoint and reclaims the session's
+//   PERSISTED created-tab ownership record under its own 20 s timeout — ≈28 s end
+//   to end on the installed CLI, the whole of what one stop may legitimately spend,
+//   which is the budget the ended-run release's attempt bound has to clear (this
+//   file's `CLI_TIMEOUT` deliberately fails fast instead) — dropping a tab's id only
+//   when its close was acknowledged, and exits non-zero while the record still holds
+//   anything. So a successful stop proves that every tab the session CREATED is
+//   gone, and proves nothing for a tab the session ADOPTED (stop never closes
+//   adopted tabs) — which is why the sweep verifies by round-over-round
+//   re-enumeration rather than by the stop's own exit code.
 //
 // Residual limits (accepted): the sweep's scratch tab is about:blank and the
 // extension refuses to re-attach `about:` URLs (its `eligible()`/`SKIP_URL`
@@ -961,7 +1010,9 @@ struct SweepTab {
 // daemon inventory drops dead pids) — documented residual.
 /// Close every tab in a mahbot-owned session's tab group except the sweep's own
 /// scratch, verifying closure by round-over-round re-enumeration. Shared by the
-/// startup sweep and the link-enricher per-fetch close.
+/// startup sweep and the link-enricher per-fetch close, which keep to mahbot-owned
+/// names — a name that is not one is not ours to touch, so the refusal below is a
+/// fail-closed backstop rather than a live path.
 pub(crate) async fn sweep_session(name: &str) {
     if !is_mahbot_session_name(name) {
         warn!(
@@ -1050,56 +1101,6 @@ pub(crate) async fn sweep_session(name: &str) {
         }
     }
     sweep_warn_transition(SweepWarn::Deferred);
-}
-
-/// Close the chrome sessions one agent run's chrome tooling used, via the
-/// created-only close (`--session <name> close` — chrome-use drops the
-/// session's own tabs without enumerating anything, so the user's own tabs
-/// are never touched). Best-effort and strictly warn-only: a failed close
-/// (daemon down, wedged CLI) leaks the session's tabs — an accepted edge, the
-/// same class as the other cleanup paths. Called from the agent run end
-/// (`run_agent`).
-pub(crate) async fn close_run_sessions(sessions: &super::chrome::ChromeRunSessions) {
-    let names = sessions.snapshot();
-    if names.is_empty() {
-        return;
-    }
-    // Nothing can be closed while the relay/daemon is down; skip the
-    // guaranteed-to-fail CLI round-trips (same skip gate as the sweep).
-    if let Some(failure) = service_state().await {
-        for name in &names {
-            warn!(
-                session = name,
-                ?failure,
-                "agent-run chrome session close skipped — chrome service unavailable"
-            );
-        }
-        return;
-    }
-    let closes: Vec<_> = names.iter().map(|name| close_run_session(name)).collect();
-    join_all(closes).await;
-}
-
-async fn close_run_session(name: &str) {
-    match run_cli_bounded(&["close"], Some(name)).await {
-        None => warn!(
-            session = name,
-            "agent-run chrome session close timed out or daemon unavailable — tabs may leak until closed by hand"
-        ),
-        Some(out) if !out.status.success() => warn!(
-            session = name,
-            "agent-run chrome session close failed: {}",
-            // run_cli_bounded nulls stderr — the envelope error on stdout is
-            // the only failure detail available.
-            ChromeResponse::from_value(&serde_json::from_slice(&out.stdout).unwrap_or_default())
-                .error
-                .unwrap_or_else(|| {
-                    let status = out.status;
-                    format!("exit status {status}")
-                })
-        ),
-        Some(_) => debug!(session = name, "agent-run chrome session closed"),
-    }
 }
 
 /// Only mahbot-owned session names may be swept — link-enricher-* and ephemeral
@@ -1268,10 +1269,10 @@ async fn session_close_tab(name: &str, tab_id: &str, deadline: Instant) -> Optio
         .map(|_| ())
 }
 
-/// Bounded `session stop` — its exit code is never trusted as proof of closure
-/// (re-enumeration is), and it is skipped when the sweep is already over
-/// budget (the daemon idles out on its own and the next sweep retries). The
-/// session is named by the helper's `--session` flag alone.
+/// Bounded `session stop` — its outcome is deliberately ignored: the sweep
+/// proves closure by round-over-round re-enumeration. Skipped when the sweep is
+/// already over budget (the daemon idles out on its own and the next sweep
+/// retries). The session is named by the helper's `--session` flag alone.
 async fn stop_session_daemon(name: &str, deadline: Instant) -> Option<()> {
     if Instant::now() >= deadline {
         return None;
@@ -1928,11 +1929,9 @@ async fn run_update_check() {
 /// accumulate. Each sweep is verified (round-over-round convergence) and only
 /// ever closes the target session's own tabs — sessions owned by other agents
 /// or the user (explicit tabs, `default`, any non-mahbot name) are never
-/// touched. Agent-run sessions are instead closed at run end, but a hard-killed
-/// run's `agent-tab-*` sessions may leak (accepted residual, the same class as
-/// dead-daemon link-enricher orphans — they are not enumerable here). Dead
-/// link-enricher orphans stay until the tab is closed by hand — a documented
-/// residual limit.
+/// touched, and neither are run-owned `agent-tab-*` ones, which are not mahbot
+/// names at all (`chrome.rs`'s `AGENT_TAB_PREFIX`). Dead link-enricher orphans stay
+/// until the tab is closed by hand — a documented residual limit.
 async fn cleanup_stale_sessions() {
     let Some(sessions) = registered_sessions().await else {
         return;

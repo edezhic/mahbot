@@ -268,8 +268,9 @@ static CAPTURE_PATHS: LazyLock<std::sync::Mutex<HashMap<String, String>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Drop an agent's per-agent registry entries (observation/target/capture) at
-/// agent-run end, so state never leaks across runs. Called from `run_agent`
-/// with the agent's id string (matching [`core::agent_key`]'s task-local value).
+/// agent-run end, so state never leaks across runs. Called from the agent's
+/// run-end cleanup guard (`RunEndCleanup`) with the agent's id string (matching
+/// [`core::agent_key`]'s task-local value).
 pub(crate) fn cleanup_agent_state(agent_key: &str) {
     CAPTURE_PATHS.lock().unwrap_poison().remove(agent_key);
     core::clear_agent_state(agent_key);

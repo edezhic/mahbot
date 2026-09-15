@@ -7,6 +7,7 @@ pub(crate) mod analyze;
 pub mod bun;
 pub mod chrome;
 pub mod chrome_daemon;
+pub mod chrome_release;
 pub mod computer;
 pub(crate) mod custom;
 pub(crate) mod edit;

@@ -314,9 +314,9 @@ impl Role {
     /// command form. Every other role's toolset is byte-identical regardless
     /// of its value.
     ///
-    /// `chrome_sessions` is the run-scoped chrome session tracker shared with
-    /// the agent's `ChromeTool` so every session the run opens is closed at
-    /// run end.
+    /// `chrome_sessions` is the run-scoped tracker shared with the agent's
+    /// `ChromeTool`: every session the run opens is handed to the run-end
+    /// release queue (see `crate::agent::RunEndCleanup`).
     #[must_use]
     pub(crate) fn tools(
         self,

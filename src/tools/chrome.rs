@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -169,34 +170,94 @@ const fn true_val() -> bool {
     true
 }
 
-/// Root session namespace of the interactive chrome tool. Every agent-run
-/// session lives under `agent-tab-`, which both the CLI `session stop` guard
-/// (`PROTECTED_SESSION_PREFIXES`) and the daemon orphan sweep leave untouched.
+/// Root session namespace of the interactive chrome tool. Every agent-run session
+/// lives under `agent-tab-`: that keeps it out of the daemon orphan sweep, and
+/// inside the protected-session set of the `mahbot chrome` frontend, which refuses
+/// a bare `session stop` on one without `--force` — so the prefix must not change.
+/// An `agent-tab-*` session belongs to the run that opened it: mahbot's own sweeps
+/// leave every one of them alone, and that run's release is their closer (the
+/// `--force` frontend verb above is the deliberate exception).
 const AGENT_TAB_PREFIX: &str = "agent-tab-";
+
+/// Whether `name` belongs to the agent-run session family — the only names the
+/// release queue may stop. The in-memory path meets this by construction
+/// (`resolve_session`); a name read back from the durable record file is checked
+/// against it, so a corrupt file cannot point the queue at a session it does not own
+/// (the user's own, `default`, a `link-enricher-*`, an empty string).
+pub(crate) fn is_agent_tab_session(name: &str) -> bool {
+    name.starts_with(AGENT_TAB_PREFIX)
+}
 /// Logical name of the per-run default session.
 const DEFAULT_TAB: &str = "default";
-/// Random per-boot salt, paired with the namespace counter: unique within
-/// the process via the counter, and never re-minted after a daemon restart
-/// via the salt — a hard-killed run's leaked sessions can't be re-addressed.
-static CHROME_BOOT_SALT: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(crate::generate_suffix);
-/// Monotonic per-process namespace counter.
-static CHROME_NAMESPACE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Chrome sessions one agent run's chrome tooling opened. chrome-use
-/// ≥1.5.101 no longer closes external Chrome tabs when the daemon idles out,
-/// so every session name the run used is recorded here and closed at run end —
-/// the created-only close path, never an enumeration sweep (a sweep could
-/// close the user's own tabs).
+/// Physical session namespace of one agent run: `agent-tab-<key>-`, where `key`
+/// is a hex digest of the run's agent id — the identity the daemon re-reads from
+/// durable state when it re-drives an interrupted run. Every segment of one run
+/// therefore resolves the SAME physical session names, so a run resumed after a
+/// daemon restart or self-update re-attaches to the tabs it was working with
+/// (chrome-use re-attaches a session's tabs by name) and its run-end release
+/// addresses those same names. 12 hex chars (48 bits) is ample for the distinct
+/// agent ids of one machine, and a digest is stable across binary versions — the
+/// namespace must survive a self-update.
+///
+/// One exception to that stability, at the per-tab level: a logical name the
+/// sanitizer had to change carries a `DefaultHasher` suffix (`resolve_session`),
+/// whose algorithm has no cross-release guarantee — such a tab is not re-attached
+/// after a self-update that changed it. Its group is still closed at run end: the
+/// name it was opened under is the one the run recorded.
+///
+/// The price of deriving the name rather than minting it: a session opened under a
+/// scheme no agent id derives from is addressable by no release, so nothing can
+/// reclaim it — the cost paid by the runs in flight when per-boot random names were
+/// replaced.
+fn run_session_namespace(agent_id: &str) -> String {
+    let hex = crate::util::hex_string(&Sha256::digest(agent_id.as_bytes()));
+    format!("{AGENT_TAB_PREFIX}{}-", &hex[..12])
+}
+
+/// Every chrome session name ONE agent run's chrome tooling opened, recorded so
+/// that run's release can address exactly those names — never an enumeration.
 #[derive(Default)]
-pub(crate) struct ChromeRunSessions(std::sync::Mutex<BTreeSet<String>>);
+pub(crate) struct ChromeRunSessions {
+    /// Physical namespace of the run this tracker belongs to (empty for the
+    /// shared non-agent instance, which passes names through unchanged).
+    namespace: String,
+    names: std::sync::Mutex<BTreeSet<String>>,
+}
 
 impl ChromeRunSessions {
-    fn track(&self, name: &str) {
-        self.0.lock().unwrap_poison().insert(name.to_string());
+    /// Tracker for one agent run, registered as live for as long as it lives, so the
+    /// live-namespace guard keeps an earlier run's release off the names a later
+    /// segment of the same id resolves (see
+    /// [`crate::tools::chrome_release::register_run_namespace`], and
+    /// [`run_session_namespace`] for why the two resolve alike).
+    pub(crate) fn for_run(agent_id: &str) -> std::sync::Arc<Self> {
+        let namespace = run_session_namespace(agent_id);
+        super::chrome_release::register_run_namespace(&namespace);
+        std::sync::Arc::new(Self {
+            namespace,
+            names: std::sync::Mutex::new(BTreeSet::new()),
+        })
     }
+
+    /// Physical session namespace of this run — the prefix every logical tab
+    /// name of the run is resolved under.
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub(crate) fn track(&self, name: &str) {
+        self.names.lock().unwrap_poison().insert(name.to_string());
+    }
+
     pub(crate) fn snapshot(&self) -> Vec<String> {
-        self.0.lock().unwrap_poison().iter().cloned().collect()
+        self.names.lock().unwrap_poison().iter().cloned().collect()
+    }
+}
+
+impl Drop for ChromeRunSessions {
+    fn drop(&mut self) {
+        super::chrome_release::unregister_run_namespace(&self.namespace);
     }
 }
 
@@ -204,11 +265,12 @@ impl ChromeRunSessions {
 ///
 /// Each operation requires a `tab` name — separate chrome sessions
 /// (isolated via `--session`). Every session an agent run dispatches is
-/// resolved to the run's private `agent-tab-<salt>-<id>-` namespace (see
-/// [`ChromeTool::resolve_session`]), so concurrent agent runs can never
-/// collide on or address each other's sessions; tool output keeps showing
-/// the logical tab name. Every dispatched session is closed at run end.
-/// Operations on the same tab are serialized via a per-tab lock.
+/// resolved to the run's private namespace (`ChromeTool::resolve_session` plus
+/// `ChromeRunSessions`) and handed to that run's release, so concurrent runs of
+/// different ids can never collide on or address each other's sessions (see
+/// `run_session_namespace` for the same-id case and its transitional residue); tool
+/// output keeps showing the logical tab name. Operations on the same tab are
+/// serialized via a per-tab lock.
 #[derive(Default)]
 pub struct ChromeTool {
     /// Per-tab locks — only serializes operations on the same tab.
@@ -219,24 +281,22 @@ pub struct ChromeTool {
     /// call is guarded by the action being `Screenshot`, so a stale value from
     /// a prior round can never be re-attached to a non-screenshot call.
     last_screenshot: std::sync::Mutex<Option<String>>,
-    /// Session namespace prefix for this instance (`agent-tab-<salt>-<id>-`
-    /// for one agent run, empty for the shared non-agent instance — link
+    /// Session namespace prefix for this instance (one agent run's
+    /// `agent-tab-<key>-`, empty for the shared non-agent instance — link
     /// enrichment keeps its own sweepable `link-enricher-*` sessions).
     session_prefix: String,
-    /// Chrome sessions this run's chrome tooling used — closed at run end.
+    /// Chrome sessions this run's chrome tooling used — handed to the run's
+    /// release when the run ends.
     chrome_sessions: std::sync::Arc<ChromeRunSessions>,
 }
 
 impl ChromeTool {
     /// Construct a chrome tool for one agent run, sharing the run's session
-    /// tracker so every session the run opens is closed at run end. The run's
-    /// namespace id is the random boot salt plus a fresh counter value, so
-    /// the run's sessions can never collide with (or resolve to) another
-    /// run's — including a run from before a daemon restart.
+    /// tracker: its namespace prefixes every session the run dispatches, and the
+    /// run's own names are the ones released at run end.
     pub(crate) fn new(chrome_sessions: std::sync::Arc<ChromeRunSessions>) -> Self {
-        let id = CHROME_NAMESPACE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
-            session_prefix: format!("{AGENT_TAB_PREFIX}{}-{id}-", *CHROME_BOOT_SALT),
+            session_prefix: chrome_sessions.namespace().to_string(),
             chrome_sessions,
             ..Default::default()
         }
@@ -259,7 +319,10 @@ impl ChromeTool {
         }
         // The sanitizer collapses distinct names (per-char mapping plus the
         // 40-char truncation); suffixing the raw name's hash keeps distinct
-        // logical tabs from collapsing into one physical session.
+        // logical tabs from collapsing into one physical session. That hasher is
+        // `std::hash::DefaultHasher` — deterministic within a build, but with no
+        // cross-release guarantee, which is the one place a run's names can change
+        // under it (see `run_session_namespace`).
         let mut hasher = DefaultHasher::new();
         tab.hash(&mut hasher);
         format!(
@@ -292,10 +355,10 @@ impl ChromeTool {
     ///
     /// Falls back to `textContent` if the JavaScript eval fails.
     ///
-    /// The tab is left open — caller should close it with `close_session` when
-    /// done.  The per-tab lock is held for the full duration (navigate +
-    /// extract) so concurrent callers targeting the same tab are serialized
-    /// consistently.
+    /// The tab is left open — an agent run's tab is kept until the run ends (its
+    /// release closes it); the per-tab lock is held for the full duration
+    /// (navigate + extract) so concurrent callers targeting the same tab are
+    /// serialized consistently.
     pub async fn fetch_page_text(&self, url: &str, tab: &str) -> anyhow::Result<String> {
         crate::chrome::validate_url(url)?;
 
@@ -326,22 +389,20 @@ impl ChromeTool {
     /// Close a chrome session tab by name — verified: the session's tab group
     /// is swept (enumerate → close → re-enumerate convergence) so a leftover
     /// cannot be orphaned silently by a kill-based close. Only the target
-    /// session's own tabs are touched. Non-mahbot session names (e.g. the
-    /// agent-facing `agent-tab-*` sessions) are refused by the sweep's
-    /// strict-scope rule — agent-facing sessions are instead closed at run end
-    /// (chrome-use ≥1.5.101 idle no longer closes them).
+    /// session's own tabs are touched, and only the shared instance sweeps at all:
+    /// a run's own tooling is handed its LOGICAL tab names, which are not session
+    /// names, and its namespaced sessions are the run-end release's business.
     pub async fn close_session(&self, tab: &str) {
-        super::chrome_daemon::sweep_session(tab).await;
+        if self.session_prefix.is_empty() {
+            super::chrome_daemon::sweep_session(tab).await;
+        }
     }
 
-    /// If the response shows a failed navigation — the tab never left the
-    /// scratch `about:blank` page, or Chrome committed to its error page — fail
-    /// with a cause. The blank-page case means the navigation never committed,
-    /// so the session is closed (verified sweep) to avoid an orphaned tab; a
-    /// committed Chrome error page keeps the tab open — the navigation
-    /// committed, so the tab stays reusable for a retry. The close is refused
-    /// for non-mahbot session names (strict-scope rule), leaving the tab to the
-    /// run-end session close. No-op when the navigation committed.
+    /// Fail with a cause when the response shows a failed navigation: the tab never
+    /// left its `about:blank` scratch (the navigation never committed, so the session
+    /// is closed — a no-op for a run's own instance, whose namespaced sessions are the
+    /// run-end release's business), or Chrome committed to its error page (the tab stays
+    /// open, reusable for a retry); no-op when the navigation committed.
     async fn bail_on_failed_navigation(
         &self,
         tab: &str,
@@ -470,8 +531,8 @@ impl ChromeTool {
         // Resolve the logical tab to this run's namespaced physical session
         // at the single dispatch point, and record the physical name after
         // the CLI path resolved, so a missing CLI never registers a pointless
-        // close — the run-end close only needs sessions that were actually
-        // dispatched.
+        // release — the run-end release queue only needs sessions that were
+        // actually dispatched.
         let session = self.resolve_session(tab);
         self.chrome_sessions.track(&session);
 
@@ -836,11 +897,15 @@ impl ChromeTool {
     }
 }
 
-/// Close all running chrome sessions at shutdown. The chrome-use
-/// child process does not always get reaped on process exit — its
-/// sessions hold open ports and lingering instances that can
-/// interfere with the next daemon startup.
-pub async fn close_all_chrome_sessions() {
+/// Close all running chrome sessions at shutdown, leaving the run-owned
+/// `agent-tab-*` ones alone (`AGENT_TAB_PREFIX` owns that rule). Called through
+/// `chrome_release::flush_and_close_all_chrome_sessions`, the one chrome shutdown
+/// entry point.
+///
+/// The chrome-use child process does not always get reaped on process exit — its
+/// sessions hold open ports and lingering instances that can interfere with the next
+/// daemon startup.
+pub(crate) async fn close_all_chrome_sessions() {
     if tokio::time::timeout(SHUTDOWN_CLEANUP_TIMEOUT, close_all_chrome_sessions_inner())
         .await
         .is_err()
@@ -912,7 +977,7 @@ async fn close_all_chrome_sessions_inner() {
         }
     };
 
-    let sessions: Vec<String> = match serde_json::from_slice::<Value>(&list_output.stdout) {
+    let mut sessions: Vec<String> = match serde_json::from_slice::<Value>(&list_output.stdout) {
         Ok(v) => {
             // Gate only on an explicit failure verdict; a payload with neither
             // verdict key proceeds (tolerance-first — unknown future envelopes
@@ -937,6 +1002,15 @@ async fn close_all_chrome_sessions_inner() {
     if sessions.is_empty() {
         tracing::debug!("No open chrome-use sessions to close");
         return;
+    }
+
+    // Agent-run sessions belong to their run and are never closed here
+    // (see `chrome_release`).
+    let before = sessions.len();
+    sessions.retain(|s| !s.starts_with(AGENT_TAB_PREFIX));
+    let agent_sessions = before - sessions.len();
+    if agent_sessions > 0 {
+        tracing::debug!(agent_sessions, "left agent-run chrome session(s) open");
     }
 
     let close_futures: Vec<_> = sessions
@@ -1016,13 +1090,13 @@ impl Tool for ChromeTool {
                 "tab": {
                     "type": "string",
                     "description": "Logical name for this chrome session. \
-                     Missing or empty defaults to a unique per-run session \
-                     (closed automatically when your run ends). Sessions are \
-                     mapped to a private per-run namespace under the hood, so \
-                     the same name never collides across concurrent runs. Only \
-                     use an explicit name (e.g. \"docs\", \"github\") if you \
-                     need to keep multiple pages open simultaneously. Same \
-                     tab = serialized operations on that page."
+                     Missing or empty uses the run's default tab, released when \
+                     your run ends. Sessions live in a private per-run namespace, \
+                     so a name here never addresses another run's session — and a \
+                     run re-driven under its own identity re-attaches the names it \
+                     was working with. Use an explicit name (e.g. \"docs\", \
+                     \"github\") only to keep multiple pages open simultaneously. \
+                     Same tab = serialized operations on that page."
                 }
             },
             "required": ["action", "tab"]
@@ -1111,14 +1185,11 @@ impl Tool for ChromeTool {
 }
 
 impl ChromeTool {
-    /// Resolve the tab for a call. An explicit non-empty tab passes through
-    /// as the logical name; missing/empty falls back to the per-run default
-    /// logical session — physically unique per `ChromeTool` instance (one
-    /// agent run) via the namespace prefix in [`ChromeTool::resolve_session`],
-    /// so concurrent runs never collide on a shared session and closing it at
-    /// run end can't clobber another run's tabs. Defaulting is echoed in tool
-    /// output (logical names only — physical session names never surface to
-    /// the model).
+    /// Resolve the tab for a call. An explicit non-empty tab passes through as the
+    /// logical name; missing/empty falls back to the per-run default logical session,
+    /// which [`ChromeTool::resolve_session`] maps into this run's namespace (a function
+    /// of the agent id — see [`run_session_namespace`]). Defaulting is echoed in tool
+    /// output (logical names only — physical session names never surface to the model).
     fn normalize_tab(args: &Value) -> (String, Option<String>) {
         if let Some(tab) = super::get_opt_str(args, "tab").filter(|s| !s.is_empty()) {
             (tab.to_string(), None)
@@ -2679,14 +2750,20 @@ mod tests {
     fn session_resolution_namespaces_per_agent_run() {
         // Two agent runs using the SAME logical tabs resolve to DIFFERENT
         // physical sessions — no cross-run drift or contamination.
-        let a = ChromeTool::new(Arc::new(ChromeRunSessions::default()));
-        let b = ChromeTool::new(Arc::new(ChromeRunSessions::default()));
+        let a = ChromeTool::new(ChromeRunSessions::for_run("run-a"));
+        let b = ChromeTool::new(ChromeRunSessions::for_run("run-b"));
         for tab in [DEFAULT_TAB, "docs"] {
             let (sa, sb) = (a.resolve_session(tab), b.resolve_session(tab));
             assert_ne!(sa, sb, "each run needs its own session for tab {tab}");
             assert!(sa.starts_with(AGENT_TAB_PREFIX) && sb.starts_with(AGENT_TAB_PREFIX));
             assert!(sa.ends_with(tab) && sb.ends_with(tab));
         }
+        // The namespace is a pure function of the run's agent id: a run
+        // re-derived after a daemon restart (or a self-update) resolves the
+        // same physical names, so it re-attaches to the tabs it was working
+        // with and its release addresses them.
+        let resumed = ChromeTool::new(ChromeRunSessions::for_run("run-a"));
+        assert_eq!(resumed.resolve_session("docs"), a.resolve_session("docs"));
         // Idempotent: echoing back an own physical name never double-prefixes.
         let physical = a.resolve_session("docs");
         assert_eq!(a.resolve_session(&physical), physical);
@@ -2716,8 +2793,9 @@ mod tests {
     fn agent_sessions_are_never_orphan_swept() {
         // The namespace keeps the protected `agent-tab-` root, so the
         // daemon's orphan-protection sweep can never close a live run's
-        // session (and hard-killed runs leak by design, not get swept).
-        let tool = ChromeTool::new(Arc::new(ChromeRunSessions::default()));
+        // session; the run's own release (verified `session stop`) reclaims
+        // them, not this sweep.
+        let tool = ChromeTool::new(ChromeRunSessions::for_run("run-namespace"));
         for tab in [DEFAULT_TAB, "docs"] {
             assert!(!crate::tools::chrome_daemon::is_mahbot_session_name(
                 &tool.resolve_session(tab)

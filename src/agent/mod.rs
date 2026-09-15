@@ -381,31 +381,45 @@ fn injected_images_message(
     )))
 }
 
-/// One-pass derivation of a role's advertised tools and their specs — the
-/// single source for both [`Agent::new`] and the research wrap-up snapshot
-/// (`.1`), so the frozen post-deadline replay can never drift from the live
-/// agent's tools (KV-cache byte identity). The returned `chrome_sessions` is
-/// the run-scoped tracker (`ChromeTool` records every session it opens into
-/// it; [`crate::tools::chrome_daemon::close_run_sessions`] closes them at
-/// run end).
+/// One-pass derivation of a role's advertised tools and their specs — the single
+/// source for both [`Agent::new`] and the research wrap-up snapshot
+/// ([`role_tool_specs`]), so the frozen post-deadline replay can never drift from
+/// the live agent's tools (KV-cache byte identity). The caller owns the run-scoped
+/// tracker of the chrome sessions those tools open, which the run's end releases
+/// ([`crate::tools::chrome::ChromeRunSessions::for_run`]).
 #[must_use]
 pub(crate) fn role_tools_and_specs(
     role: crate::Role,
     ws: &crate::Workspace,
     full_access: bool,
-) -> (
-    Vec<Box<dyn Tool>>,
-    Vec<crate::ToolSpec>,
-    std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
-) {
-    let chrome_sessions = std::sync::Arc::new(crate::tools::chrome::ChromeRunSessions::default());
+    chrome_sessions: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
+) -> (Vec<Box<dyn Tool>>, Vec<crate::ToolSpec>) {
     let tools: Vec<Box<dyn Tool>> = role
-        .tools(ws, full_access, chrome_sessions.clone())
+        .tools(ws, full_access, chrome_sessions)
         .into_iter()
         .filter(|t| t.is_advertised())
         .collect();
     let tool_specs = tools.iter().map(|t| t.spec()).collect();
-    (tools, tool_specs, chrome_sessions)
+    (tools, tool_specs)
+}
+
+/// The advertised tool specs of one role without a run: a caller that builds the
+/// tools only to snapshot their schemas has no run to own chrome sessions, so the
+/// tools get a tracker with no namespace (`ChromeRunSessions::default`) — one that
+/// never claims a run's.
+#[must_use]
+pub(crate) fn role_tool_specs(
+    role: crate::Role,
+    ws: &crate::Workspace,
+    full_access: bool,
+) -> Vec<crate::ToolSpec> {
+    role_tools_and_specs(
+        role,
+        ws,
+        full_access,
+        std::sync::Arc::new(crate::tools::chrome::ChromeRunSessions::default()),
+    )
+    .1
 }
 
 /// A role's derived chat-request triplet (model slot → per-model provider
@@ -501,7 +515,13 @@ impl Agent {
         parent_key: Option<crate::agent::registry::ParentKey>,
         parent_label: Option<String>,
     ) -> Self {
-        let (tools, tool_specs, chrome_sessions) = role_tools_and_specs(role, ws, full_access);
+        let chrome_sessions = crate::tools::chrome::ChromeRunSessions::for_run(&agent_id);
+        let (tools, tool_specs) = role_tools_and_specs(
+            role,
+            ws,
+            full_access,
+            std::sync::Arc::clone(&chrome_sessions),
+        );
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let pause_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2608,6 +2628,61 @@ where
     handles
 }
 
+/// Everything an agent run releases for its own temporary use when the run ends:
+/// its spill files, its per-agent computer registry entries, and the chrome
+/// sessions it opened. Released from a `Drop` rather than from trailing statements
+/// because a run cut off mid-flight never reaches a trailing statement, and
+/// everything it used would then be stranded with nothing left that records it. The
+/// chrome part is only handed over (the `chrome-run-releases` task does the work,
+/// outliving the run).
+///
+/// The one limit this rule owns: a run still working when the process exits, and
+/// a run killed outright (SIGKILL), never run destructors — the self-update path's
+/// `exit(0)` bypasses them by design — so nothing is ever queued for that run's
+/// chrome sessions and the tabs it opened stay open; nothing else records them,
+/// because the shutdown sweep deliberately leaves `agent-tab-*` alone.
+struct RunEndCleanup {
+    agent_id: String,
+    chrome: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
+    /// Whether [`RunEndCleanup::ended`] held the release back for a resumed segment.
+    held: bool,
+}
+
+impl RunEndCleanup {
+    fn new(
+        agent_id: String,
+        chrome: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
+    ) -> Self {
+        Self {
+            agent_id,
+            chrome,
+            held: false,
+        }
+    }
+
+    /// Record how the run ended — which ends hold the release back is
+    /// [`holds_run_end`]'s rule.
+    ///
+    /// [`holds_run_end`]: crate::tools::chrome_release::holds_run_end
+    fn ended(&mut self, classification: &str) {
+        self.held = crate::tools::chrome_release::holds_run_end(classification);
+    }
+}
+
+impl Drop for RunEndCleanup {
+    fn drop(&mut self) {
+        // Owner-deletes-at-end: remove the spill files this agent run created
+        // (safe on macOS — the run is over, nothing will read them again).
+        crate::tools::shell::cleanup_agent_spills(&self.agent_id);
+        // Drop the per-agent computer registry entries (observation/target/
+        // capture) so they never leak into a later run.
+        crate::tools::computer::cleanup_agent_state(&self.agent_id);
+        // Hand the run's chrome sessions to the release queue. The tracker's own
+        // `Drop` unregisters the run's namespace once the run's last owner goes.
+        crate::tools::chrome_release::queue_run_session_release(&self.chrome, self.held);
+    }
+}
+
 /// Core agent lifecycle: create agent (auto-registers with its own
 /// CancellationToken), run work, handle cancellation and errors.
 /// Returns the agent (even on failure) and the response on success.
@@ -2655,7 +2730,6 @@ pub(crate) async fn run_agent(
     let _router_guard = incoming_rx
         .is_some()
         .then(|| UnregisterOnDrop(agent_id.clone()));
-    let agent_id_for_cleanup = agent_id.clone();
     let mut agent = Agent::new(
         agent_id,
         role,
@@ -2672,16 +2746,18 @@ pub(crate) async fn run_agent(
         agent.round_ts = Some(round.round_ts);
         agent.first_call_notify = round.first_call_notify;
     }
+    // Everything this run owns for its own temporary use is released by this
+    // guard — including on the paths that never reach a trailing statement.
+    let mut run_end = RunEndCleanup::new(
+        agent.agent_id.clone(),
+        std::sync::Arc::clone(&agent.chrome_sessions),
+    );
     let result = agent.work(message, resume).await;
-
-    // Capture the run-scoped chrome-session tracker before the match moves
-    // `agent` into the outcome — the run-end close needs it after cleanup.
-    let chrome_sessions = std::sync::Arc::clone(&agent.chrome_sessions);
 
     // A completed Ok result is kept regardless of cancel cause — the token may
     // have fired just as work() finished; downstream finalizers are the
     // authority on how a cancelled run's result is used.
-    let outcome = match result {
+    match result {
         Ok(response) => (agent, Some(response)),
         Err(e) => {
             // Capture the real cause (full chain) so ticket dispatchers can
@@ -2689,20 +2765,22 @@ pub(crate) async fn run_agent(
             agent.failure = Some(format!("{e:#}"));
             agent.failure_class = failure_class_from_error(&e);
             let classification = failure_classification(&agent, Some(&e));
+            // The chrome release's hold (`holds_run_end`'s rule).
+            run_end.ended(classification);
             let error_chain = crate::util::failure_detail(&format!("{e:#}"), "agent failure log");
             // During global (SIGTERM/SIGINT) shutdown, in-flight agents return
-            // errors from work() — expected, not real failures. The global
-            // token fires before `shutdown_all()` cancels per-agent tokens, so
-            // either path resolves to classification "shutdown". Log at debug
+            // errors from work() — expected, not real failures. The drain check
+            // runs first, so a run force-cancelled once the drain cap is hit
+            // also classifies as "drain"; both are non-failures. Log at debug
             // level to avoid misleading ERROR noise on clean shutdown. The
-            // graceful drain, a cooperative pause-freeze, and a deliberate
+            // cooperative ends (drain, shutdown, pause) and a deliberate
             // cancellation (internal_cancel — user/GUI cancel or a re-dispatch)
-            // get the same treatment.
-            if classification == "shutdown"
-                || classification == "drain"
-                || classification == "pause"
-                || classification == "internal_cancel"
-            {
+            // get the same treatment; this log's own classification decides that.
+            let non_failure = matches!(
+                classification,
+                "drain" | "shutdown" | "pause" | "internal_cancel"
+            );
+            if non_failure {
                 tracing::debug!(
                     agent_id = %agent.agent_id,
                     workspace = %ws.name,
@@ -2725,18 +2803,7 @@ pub(crate) async fn run_agent(
             }
             (agent, None)
         }
-    };
-
-    // Owner-deletes-at-end: remove the spill files this agent run created
-    // (safe on macOS — the run is over, nothing will read them again).
-    crate::tools::shell::cleanup_agent_spills(&agent_id_for_cleanup);
-    // Drop the per-agent computer registry entries (observation/target/capture)
-    // so they never leak into a later run.
-    crate::tools::computer::cleanup_agent_state(&agent_id_for_cleanup);
-    // Close the chrome sessions this run opened — chrome-use ≥1.5.101 keeps
-    // external Chrome tabs alive on daemon idle, so the close must be explicit.
-    crate::tools::chrome_daemon::close_run_sessions(&chrome_sessions).await;
-    outcome
+    }
 }
 
 /// Default dispatch: no ticket, empty user/channel, no inbox.
@@ -2832,6 +2899,7 @@ fn failure_classification(agent: &Agent, error: Option<&anyhow::Error>) -> &'sta
 mod tests {
     use super::*;
     use crate::Tool;
+    use crate::tools::chrome_release;
     use crate::util::test::{FakeProvider, install_fake_provider, install_test_retry_policy};
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
@@ -6099,5 +6167,105 @@ mod tests {
             Some("RESULT_TWO"),
             "second frame call binds the newer job"
         );
+    }
+
+    // ── Run-end cleanup guard ────────────────────────────────────────
+
+    /// Seed a spill file owned by a fresh test-only agent id, plus a run
+    /// session tracker holding one name. The temp dir is returned so it
+    /// outlives the guard: only the guard may reclaim the spill file.
+    async fn seed_run_owned_state(
+        agent_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("spill.txt");
+        std::fs::write(&spill, "spilled output").unwrap();
+        CURRENT_TOOL_AGENT_ID
+            .scope(Some(agent_id.to_string()), async {
+                crate::tools::shell::record_spill_owner(spill.clone());
+            })
+            .await;
+        // The run's own tracker (`for_run`, not `default`), holding a name the way a
+        // `ChromeTool` dispatch would.
+        let sessions = crate::tools::chrome::ChromeRunSessions::for_run(agent_id);
+        sessions.track(&format!("{}default", sessions.namespace()));
+        (dir, spill, sessions)
+    }
+
+    /// A run whose future is dropped — a round/research deadline abort or a
+    /// panic, the paths that never reach a trailing statement — still reclaims
+    /// its spill files and hands its chrome sessions to the release queue.
+    #[tokio::test]
+    #[serial_test::serial(chrome_release)]
+    async fn run_end_guard_cleans_up_a_dropped_run() {
+        let agent_id = format!("run-end-guard-{:016x}", rand::random::<u64>());
+        let (_dir, spill, sessions) = seed_run_owned_state(&agent_id).await;
+        chrome_release::clear_pending_releases();
+        // The hand-off persists its record, and this test has no store of its own.
+        let _no_store = chrome_release::no_release_store();
+
+        drop(RunEndCleanup::new(
+            agent_id,
+            std::sync::Arc::clone(&sessions),
+        ));
+
+        assert!(!spill.exists(), "the run's spill file is reclaimed");
+        assert_eq!(
+            chrome_release::pending_names_and_attempts(),
+            vec![(vec![format!("{}default", sessions.namespace())], 0)],
+            "the ended run handed its session over for release"
+        );
+        chrome_release::clear_pending_releases();
+    }
+
+    /// The run-end decision wired to the guard: every end hands its sessions over
+    /// (the dropped-run test covers that half), and the ends that
+    /// `chrome_release::holds_run_end` names hold them back.
+    #[tokio::test]
+    #[serial_test::serial(chrome_release)]
+    async fn an_ended_run_hands_its_sessions_over_and_holds_only_a_resumed_run() {
+        use crate::tools::chrome_release::RELEASE_HOLD_REDRIVEN_RUN;
+
+        chrome_release::clear_pending_releases();
+        // Every end here persists its record, and this test has no store of its own.
+        let _no_store = chrome_release::no_release_store();
+        let cut_id = format!("run-end-keep-{:016x}", rand::random::<u64>());
+        let (_cut_dir, _cut_spill, cut_sessions) = seed_run_owned_state(&cut_id).await;
+        let mut cut = RunEndCleanup::new(cut_id, std::sync::Arc::clone(&cut_sessions));
+        cut.ended("drain");
+        drop(cut);
+        assert!(
+            chrome_release::pending_release_delays()[0]
+                >= RELEASE_HOLD_REDRIVEN_RUN.saturating_sub(std::time::Duration::from_secs(5)),
+            "a run the daemon cut off holds its release back for its resumed segment"
+        );
+
+        chrome_release::clear_pending_releases();
+        let pause_id = format!("run-end-pause-{:016x}", rand::random::<u64>());
+        let (_pause_dir, _pause_spill, paused_sessions) = seed_run_owned_state(&pause_id).await;
+        let mut paused = RunEndCleanup::new(pause_id, std::sync::Arc::clone(&paused_sessions));
+        paused.ended("pause");
+        drop(paused);
+        assert!(
+            chrome_release::pending_release_delays()[0]
+                >= RELEASE_HOLD_REDRIVEN_RUN.saturating_sub(std::time::Duration::from_secs(5)),
+            "a run frozen by a workspace pause resumes at unpause under its own id"
+        );
+
+        chrome_release::clear_pending_releases();
+        let final_id = format!("run-end-release-{:016x}", rand::random::<u64>());
+        let (_dir, _spill, sessions) = seed_run_owned_state(&final_id).await;
+        let mut ended = RunEndCleanup::new(final_id, std::sync::Arc::clone(&sessions));
+        ended.ended("transport");
+        drop(ended);
+        assert!(
+            chrome_release::pending_release_delays()[0] < std::time::Duration::from_secs(1),
+            "an end that is final releases at once"
+        );
+        chrome_release::clear_pending_releases();
     }
 }

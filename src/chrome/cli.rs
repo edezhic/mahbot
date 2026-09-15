@@ -48,10 +48,17 @@ use serde_json::{Value, json};
 /// `open` defaults higher: [`DEFAULT_OPEN_TIMEOUT`] (whole-operation budget).
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// `session stop` bound: chrome-use's stop (SIGTERM, ~1s wait, force-kill, tab
-/// cleanup) can legitimately take up to ~20s, so the 8s default step bound
-/// would report a misleading timeout after the stop actually succeeded.
-const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(25);
+/// `session stop` bound: one stop waits out the session daemon's shutdown grace
+/// (8 s on the installed CLI) and then reconnects to reclaim the tabs the session
+/// created under chrome-use's own 20 s — the ≈28 s end to end the live-verified
+/// behaviours in [`crate::tools::chrome_daemon`] state. The 8 s default step bound
+/// would cut that off with a misleading timeout, which describes the commoner case —
+/// a stop cut off while it was still legitimately reclaiming its tabs — not just the
+/// narrower race in which it had already succeeded. The bound is therefore the 60 s
+/// the ended-run release gives one attempt (`chrome_release`'s
+/// `RELEASE_ATTEMPT_TIMEOUT`) — a bit over twice the worst case, and the same number,
+/// so the two cannot drift apart. At 25 s it fell ~3 s short of that worst case.
+const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `session status` probe bound: a real command against the named session, so
 /// chrome-use's own session-unresponsive classification has room to fire

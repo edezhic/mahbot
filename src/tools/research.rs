@@ -34,7 +34,7 @@
 //! machinery remain untouched.
 
 use crate::agent::message_router::{self, AgentJob, MessageKind};
-use crate::agent::{chat_request, role_tools_and_specs, run_default_agent};
+use crate::agent::{chat_request, role_tool_specs, run_default_agent};
 use crate::prompt::{load_prompt, substitute};
 use crate::retry::FailureClass;
 use crate::tools::analyze::{
@@ -1891,7 +1891,7 @@ async fn round1_research(
     // Dispatch-time wrap-up snapshots: frozen params + advertised tool
     // schemas, captured before spawn (aborted tasks lose their values). The
     // specs are constant across the round's members (same role+workspace).
-    let wrap_up_specs = role_tools_and_specs(Role::Analyst, ws, false).1;
+    let wrap_up_specs = role_tool_specs(Role::Analyst, ws, false);
     let mut idx = 0usize;
     for sq in &plan.sub_questions {
         for k in 0..=usize::from(sq.risk == "high") {
@@ -2024,7 +2024,7 @@ async fn run_gap_round(
     let mut snapshots: Vec<WrapUpEntry> = Vec::new();
     // Dispatch-time wrap-up snapshots (see round1_research) — same specs for
     // every member of the round.
-    let wrap_up_specs = role_tools_and_specs(Role::Analyst, ws, false).1;
+    let wrap_up_specs = role_tool_specs(Role::Analyst, ws, false);
     for (i, gap) in gaps.iter().enumerate() {
         let ws = ws.clone();
         let question = question.to_string();
