@@ -292,26 +292,15 @@ pub async fn route_user_message(
     route(&agent_id, job);
 }
 
-/// Persist a durable Manager-bound envelope to `pending_jobs` before routing —
-/// the at-least-once delivery boundary. `producer` names the producer in the
-/// failure warn (the message text differs per producer, e.g. "manager message"
-/// vs "agent message"). Returns `(persisted, id)`: on a successful write
-/// `persisted` is `true` and `id` is the row id to stamp onto the job; on a
-/// persistence failure `persisted` is `false` and `id` is `None`, and the
-/// caller falls back to best-effort (at-most-once) routing.
-async fn persist_manager_envelope(job: &AgentJob, producer: &str) -> (bool, Option<String>) {
+/// Persist `job` to `pending_jobs` and stamp the row id onto it — the
+/// at-least-once boundary every durable producer shares. An `Err` is a failed
+/// write, not a dropped message: the caller still routes the job and logs the
+/// cause against its own context.
+async fn persist_and_stamp(job: &mut AgentJob) -> anyhow::Result<()> {
     let id = crate::generate_id();
-    match persist_pending(job, id.clone()).await {
-        Ok(()) => (true, Some(id)),
-        Err(e) => {
-            warn!(
-                error = %e,
-                producer,
-                "Failed to persist manager-bound envelope — routing best-effort (at-most-once)",
-            );
-            (false, None)
-        }
-    }
+    persist_pending(job, id.clone()).await?;
+    job.pending_job_id = Some(id);
+    Ok(())
 }
 
 /// Stamp `job.pending_job_id` from a freshly persisted durable envelope and
@@ -326,10 +315,17 @@ async fn persist_manager_envelope(job: &AgentJob, producer: &str) -> (bool, Opti
 /// exit — the fix primarily closes the silent-drop on the normal-path
 /// double fault, not the drain window.
 async fn stamp_and_route(mut job: AgentJob, target: &str, producer: &str) {
-    let (persisted, id) = persist_manager_envelope(&job, producer).await;
-    if let Some(id) = id {
-        job.pending_job_id = Some(id);
-    }
+    let persisted = match persist_and_stamp(&mut job).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                error = %e,
+                producer,
+                "Failed to persist manager-bound envelope — routing best-effort (at-most-once)",
+            );
+            false
+        }
+    };
     if crate::shutdown::aborting() && persisted {
         return;
     }
@@ -373,7 +369,8 @@ pub async fn route_agent_message_to_manager(
 /// from the envelope by [`crate::jobs::pending_job_params`].
 /// Used by the durable producers: manager-bound messages routed here,
 /// analyze/research results via [`crate::jobs::complete_job_with_envelope`],
-/// and alarm notifications from the alarm sweep (`alarms::fire_alarm`).
+/// and assistant notices ([`deliver_assistant_notice`]) from the alarm sweep
+/// (`alarms::fire_alarm`) and the custom-tool grant path.
 pub(crate) async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Result<()> {
     let now = db::now();
     crate::session::store()
@@ -384,6 +381,43 @@ pub(crate) async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Resul
         )
         .await?;
     Ok(())
+}
+
+/// Deliver a durable notice into an Assistant session: build the
+/// [`MessageKind::UserMessage`] envelope, persist it to `pending_jobs` BEFORE
+/// routing (a crash after persisting replays it at boot), then route it to
+/// `agent_id`.
+///
+/// The reminder-parity delivery path — a fired alarm and a custom-tool grant
+/// change both arrive through it. `agent_id` is the resolved Assistant session
+/// key; alarm delivery passes the id stored on the alarm rather than
+/// re-deriving it (re-derivation would double-escape colliding user names). The
+/// text is delivered as composed — notice text is not credential-scrubbed.
+///
+/// An `Err` is a failed persistence: the notice was still routed, best-effort
+/// (at-most-once), and the caller logs the cause against its own context.
+pub(crate) async fn deliver_assistant_notice(
+    agent_id: &str,
+    user_name: &str,
+    content: String,
+) -> anyhow::Result<()> {
+    let mut job = AgentJob {
+        content,
+        // The user's own personal workspace — the Assistant is pinned there.
+        workspace_name: crate::users::personal_workspace_name(user_name),
+        user_name: user_name.to_string(),
+        // History-attribution tag only — the reply is broadcast to all of the
+        // user's channel bindings, so no single transport is claimed here.
+        channel: "gui".to_string(),
+        kind: MessageKind::UserMessage,
+        role: Role::Assistant,
+        reply_target: None,
+        pending_job_id: None,
+        originating_workspace: None,
+    };
+    let durable = persist_and_stamp(&mut job).await;
+    route(agent_id, job);
+    durable
 }
 
 /// Register an agent in the router table without spawning a consumer loop.

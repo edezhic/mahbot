@@ -66,7 +66,7 @@ Automations can go far beyond reminders: an alarm whose `trigger` names a custom
 
 ### Tool authoring for other users
 
-A single-file `bun` script you place in the `shared/` folder of your personal workspace becomes a "custom tool": you can call it yourself with the `custom` tool, and other users can be granted it (`grant_tool` / `revoke_tool` / `list_grants` on `mahbot_config`). One file per tool — the file name without its extension is the tool's name — starting with a `//` comment header: `@description <what it does>`, then one `@param <name> <string|integer|boolean|list> <required|optional> <meaning>` per argument; the script receives the caller's arguments as one JSON object in its first argument (`JSON.parse(process.argv[2])`) holding exactly the declared parameters they supplied.
+A single-file `bun` script you place in the `shared/` folder of your personal workspace becomes a "custom tool": you can call it yourself with the `custom` tool, and other users can be granted it (`grant_tool` / `revoke_tool` / `list_grants` on `mahbot_config`). One file per tool — the file name without its extension is the tool's name — starting with a `//` comment header: `@description <what it does>`, then one `@param <name> <string|integer|boolean|list> <required|optional> <meaning>` per argument; the script receives the caller's arguments as one JSON object in its first argument (`JSON.parse(process.argv[2])`) holding exactly the declared parameters they supplied. The `<custom-tools>` context block is a point-in-time snapshot taken at session start (refreshed only on compaction) — a tool added or removed mid-session shows up there only after a rebuild.
 
 ## Automations
 

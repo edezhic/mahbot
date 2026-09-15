@@ -8,7 +8,7 @@ use crate::config::{
     CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
     CONFIG_KEY_WEB_SEARCH_PROVIDER,
 };
-use crate::users::format_grants;
+use crate::users::{GrantChange, format_grants};
 use crate::{Tool, Workspace};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -258,11 +258,19 @@ impl MahbotConfigTool {
         }
 
         let store = crate::users::store();
-        if !store.add_grant(user, tool).await? {
-            return Err(err(format!(
-                "not-found: no user '{user}' — hint: grants need an existing user; create \
-                 them first"
-            )));
+        match store.add_grant(user, tool).await? {
+            GrantChange::NoUser => {
+                return Err(err(format!(
+                    "not-found: no user '{user}' — hint: grants need an existing user; create \
+                     them first"
+                )));
+            }
+            // An idempotent re-grant changes nothing, so there is nothing to
+            // announce; only a real change wakes the account's Assistant.
+            GrantChange::Unchanged => {}
+            GrantChange::Changed => {
+                crate::tools::custom::notify_grant_change(user, tool, true).await;
+            }
         }
         let grants = store.get_grants(user).await?;
         Ok(format!(
@@ -276,10 +284,17 @@ impl MahbotConfigTool {
         let tool = super::get_str(&args, "tool")?;
 
         let store = crate::users::store();
-        if !store.remove_grant(user, tool).await? {
+        match store.remove_grant(user, tool).await? {
             // A missing user is not an error, but reporting a revoke that
             // touched nothing would be a false confirmation.
-            return Ok(format!("No user '{user}' — nothing was revoked."));
+            GrantChange::NoUser => {
+                return Ok(format!("No user '{user}' — nothing was revoked."));
+            }
+            // Only a real change is announced — see `exec_grant_tool`.
+            GrantChange::Unchanged => {}
+            GrantChange::Changed => {
+                crate::tools::custom::notify_grant_change(user, tool, false).await;
+            }
         }
         let grants = store.get_grants(user).await?;
         Ok(format!(

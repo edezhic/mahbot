@@ -18,9 +18,7 @@ use anyhow::Context as _;
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration};
 
-use crate::Role;
 use crate::Workspace;
-use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::db;
 use crate::tools::custom::CallRefusal;
 use crate::tools::shell::ProgramOutcome;
@@ -418,56 +416,31 @@ async fn fire_plain_alarm(alarm: &Alarm) -> Result<()> {
             ("{{fire_at}}", &alarm.next_fire_at),
         ],
     );
-    deliver_alarm_notification(alarm, content).await?;
+    deliver_alarm_notification(alarm, content).await;
     advance_alarm_state(alarm, &now).await?;
     Ok(())
 }
 
-/// Build the durable [`AgentJob`] envelope for an alarm delivery, persist it
-/// best-effort (a persistence failure degrades to at-most-once routing), and
-/// route it into the calling assistant's session.
+/// Deliver an alarm's notice into the calling assistant's session, logging a
+/// lost durable copy against the alarm it came from.
 ///
-/// The content is delivered exactly as composed — alarm-born text (the
-/// reminder, the trigger, and what the check produced) is deliberately not
-/// credential-scrubbed on this path.
-async fn deliver_alarm_notification(alarm: &Alarm, content: String) -> Result<()> {
-    // Delivery is sourced from the stored raw user/workspace so a reminder
-    // targets the right personal session regardless of agent-ID escaping.
-    let user = &alarm.user_name;
-    let workspace_name = crate::users::personal_workspace_name(user);
-    let agent_id = alarm.session_id.clone();
-    let mut job = AgentJob {
+/// Delivery is sourced from the stored raw user and session id so the notice
+/// targets the right personal session regardless of agent-ID escaping — never
+/// re-derived from the id, which would double-escape colliding user names.
+async fn deliver_alarm_notification(alarm: &Alarm, content: String) {
+    if let Err(e) = crate::agent::message_router::deliver_assistant_notice(
+        &alarm.session_id,
+        &alarm.user_name,
         content,
-        workspace_name,
-        user_name: user.clone(),
-        // History-attribution tag only — the reply is broadcast to all of the
-        // user's channel bindings, so no single transport is claimed here.
-        channel: "gui".to_string(),
-        kind: MessageKind::UserMessage,
-        role: Role::Assistant,
-        reply_target: None,
-        pending_job_id: None,
-        originating_workspace: None,
-    };
-    // Persist a durable envelope BEFORE routing so a crash after persisting
-    // but before the consumer delivers the message replays the reminder at
-    // boot — closes the loss side of at-least-once. A persistence failure
-    // degrades to best-effort (at-most-once) routing.
-    let id = crate::generate_id();
-    let persisted = match crate::agent::message_router::persist_pending(&job, id.clone()).await {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(alarm = %alarm.id, error = %e, "Failed to persist alarm delivery — routing best-effort");
-            false
-        }
-    };
-    if persisted {
-        job.pending_job_id = Some(id);
+    )
+    .await
+    {
+        tracing::warn!(
+            alarm = %alarm.id,
+            error = %e,
+            "Failed to persist alarm delivery — routing best-effort"
+        );
     }
-
-    // Route the (now durable) notification into the Assistant session.
-    crate::agent::message_router::route(&agent_id, job);
-    Ok(())
 }
 
 /// Advance an alarm's stored state past `now`: one-shot → `status='fired'`;
@@ -658,11 +631,7 @@ async fn run_alarm_trigger_task(alarm: Alarm, trigger: StoredTrigger) {
     };
 
     match trigger_notification(&alarm, &trigger, &outcome, deletion.as_ref()) {
-        Some(content) => {
-            if let Err(e) = deliver_alarm_notification(&alarm, content).await {
-                tracing::warn!(alarm = %alarm.id, error = %e, "Failed to deliver alarm notification");
-            }
-        }
+        Some(content) => deliver_alarm_notification(&alarm, content).await,
         None => {
             tracing::info!(alarm = %alarm.id, "alarm check reported nothing — staying silent");
         }

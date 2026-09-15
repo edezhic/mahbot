@@ -24,7 +24,9 @@
 //!
 //! Availability is per user: the admin may call anything, a guest only
 //! what is granted to them (`users.granted_tools`). The `<custom-tools>`
-//! context block is the model-facing catalogue and follows the same split.
+//! context block is the model-facing catalogue and follows the same split; it
+//! is fixed when a session is built, so a grant change on a guest whose session
+//! already exists is announced into that session ([`notify_grant_change`]).
 
 use crate::Workspace;
 use crate::prompt::{load_prompt, substitute};
@@ -395,6 +397,50 @@ fn block_for(catalogue: &[CustomToolEntry], granted: &[String], is_admin: bool) 
         &load_prompt("context/custom_tools.md"),
         &[("{{tools}}", &render_lines(&tools))],
     )
+}
+
+/// Wake `user_name`'s Assistant with a notice that one of its custom-tool
+/// grants changed: a tool was granted to, or revoked from, the account. The
+/// admin-side `grant_tool` / `revoke_tool` action is otherwise invisible to the
+/// account it applies to — the `<custom-tools>` block is fixed when the session
+/// is built.
+///
+/// Nothing is announced to the admin's own Assistant (it holds every tool, so
+/// a grant on that account changes nothing for it) nor to an account whose
+/// Assistant has no session yet — its first session is built with the current
+/// list, so there is nothing to correct.
+pub(crate) async fn notify_grant_change(user_name: &str, tool: &str, granted: bool) {
+    if crate::users::is_admin_name(user_name) {
+        return;
+    }
+    let agent_id = crate::session::resolve_agent_id(
+        user_name,
+        crate::Role::Assistant.as_str(),
+        &crate::users::personal_workspace_name(user_name),
+    );
+    // An emptied session (a cleared or truncated one) behaves like a first one
+    // — its next turn rebuilds the whole system prompt — so it has nothing to
+    // correct either.
+    if !crate::session::store().has_content(&agent_id).await {
+        return;
+    }
+    let content = substitute(
+        &load_prompt(if granted {
+            "custom_tools_granted.md"
+        } else {
+            "custom_tools_revoked.md"
+        }),
+        &[("{{tools}}", tool)],
+    );
+    if let Err(e) =
+        crate::agent::message_router::deliver_assistant_notice(&agent_id, user_name, content).await
+    {
+        tracing::warn!(
+            user = %user_name,
+            error = %e,
+            "Failed to persist the grant notice — routing best-effort"
+        );
+    }
 }
 
 // ── Call path ────────────────────────────────────────────────────────────
@@ -1045,5 +1091,108 @@ mod tests {
                 check_arguments(&tool, supplied.as_object().unwrap()).expect_err("must refuse");
             assert!(err.to_string().starts_with("usage: "), "{err}");
         }
+    }
+
+    /// A real grant change wakes the guest's existing Assistant session with a
+    /// durable notice naming the tool and the direction; the admin is never
+    /// notified and an account without an Assistant session is left alone.
+    #[tokio::test]
+    async fn grant_change_notice_wakes_only_an_existing_guest_session() {
+        crate::util::test::init_management_test_stores().await;
+        let store = crate::users::store();
+        let guest = "grant_notice_guest";
+        store.add_user(guest).await.unwrap();
+        let guest_id = crate::session::resolve_agent_id(
+            guest,
+            crate::Role::Assistant.as_str(),
+            &crate::users::personal_workspace_name(guest),
+        );
+        // A registered receiver captures the routed job deterministically — no
+        // consumer loop (and no agent run) is spawned.
+        let mut rx = crate::agent::message_router::register_agent(&guest_id);
+        crate::util::test::seed_session_row(
+            &crate::session::store().conn,
+            &guest_id,
+            "user",
+            "hello",
+        )
+        .await;
+
+        notify_grant_change(guest, "probe", true).await;
+        let job = rx.try_recv().expect("an existing session is woken");
+        assert!(
+            job.content.contains("probe") && job.content.contains("granted"),
+            "got: {}",
+            job.content
+        );
+        assert_eq!(
+            job.kind,
+            crate::agent::message_router::MessageKind::UserMessage
+        );
+        assert_eq!(job.role, crate::Role::Assistant);
+        assert!(job.pending_job_id.is_some(), "the notice must be durable");
+
+        notify_grant_change(guest, "probe", false).await;
+        let job = rx.try_recv().expect("a revocation is announced too");
+        assert!(
+            job.content.contains("probe") && job.content.contains("removed"),
+            "got: {}",
+            job.content
+        );
+
+        // The admin holds every tool, so its own account is never a recipient —
+        // not even with a live session. Asserted on the durable rows rather than
+        // a registered receiver: registering the production admin id would take
+        // over the shared router's entry for it and swallow other tests' jobs.
+        let admin_id = crate::session::resolve_agent_id(
+            crate::users::ADMIN_USER_NAME,
+            crate::Role::Assistant.as_str(),
+            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+        );
+        crate::util::test::seed_session_row(
+            &crate::session::store().conn,
+            &admin_id,
+            "user",
+            "hello",
+        )
+        .await;
+        notify_grant_change(crate::users::ADMIN_USER_NAME, "probe", true).await;
+        assert!(
+            !has_tool_notice(&admin_id).await,
+            "the admin already holds every custom tool"
+        );
+
+        // No session yet → nothing to announce: the first one carries the list.
+        let fresh = "grant_notice_no_session";
+        store.add_user(fresh).await.unwrap();
+        let fresh_id = crate::session::resolve_agent_id(
+            fresh,
+            crate::Role::Assistant.as_str(),
+            &crate::users::personal_workspace_name(fresh),
+        );
+        notify_grant_change(fresh, "probe", true).await;
+        assert!(!has_tool_notice(&fresh_id).await, "no session to wake");
+
+        crate::agent::message_router::unregister_agent(&guest_id);
+        // Leave no durable rows behind for other tests' boot-replay paths.
+        let conn = &crate::session::store().conn;
+        for row in crate::jobs::list_pending_jobs(conn).await.unwrap() {
+            if row.target_agent_id == guest_id {
+                crate::jobs::delete_pending_job(conn, &row.id)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Whether a durable custom-tool notice is addressed to `agent_id`.
+    async fn has_tool_notice(agent_id: &str) -> bool {
+        crate::jobs::list_pending_jobs(&crate::session::store().conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|row| {
+                row.target_agent_id == agent_id && row.envelope.contains("<custom-tools-notice>")
+            })
     }
 }

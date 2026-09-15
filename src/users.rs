@@ -365,11 +365,10 @@ impl UserStore {
         ))
     }
 
-    /// Grant the custom tool `tool` to `user_name`. Returns whether the user row
-    /// exists — granting is idempotent, and a grant never inserts a users row (a
-    /// ghost user would appear in the GUI), so the caller reports the missing
-    /// user itself.
-    pub(crate) async fn add_grant(&self, user_name: &str, tool: &str) -> Result<bool> {
+    /// Grant the custom tool `tool` to `user_name`. Granting is idempotent, and
+    /// a grant never inserts a users row (a ghost user would appear in the GUI),
+    /// so the caller reports the missing user itself.
+    pub(crate) async fn add_grant(&self, user_name: &str, tool: &str) -> Result<GrantChange> {
         self.update_grants(user_name, |grants| {
             if grants.iter().any(|g| g == tool) {
                 return false;
@@ -381,10 +380,10 @@ impl UserStore {
     }
 
     /// Revoke the custom tool `tool` from `user_name`. Idempotent: an absent
-    /// grant is a silent no-op. Returns whether the user row exists, so the
-    /// caller can report a missing user instead of a false confirmation — a
-    /// revoke never inserts one either.
-    pub(crate) async fn remove_grant(&self, user_name: &str, tool: &str) -> Result<bool> {
+    /// grant is a silent no-op. The result tells the caller which of the three
+    /// cases it hit, so it can report a missing user instead of a false
+    /// confirmation — a revoke never inserts a row either.
+    pub(crate) async fn remove_grant(&self, user_name: &str, tool: &str) -> Result<GrantChange> {
         self.update_grants(user_name, |grants| {
             let before = grants.len();
             grants.retain(|g| g != tool);
@@ -418,13 +417,14 @@ impl UserStore {
 
     /// Read-modify-write the `users.granted_tools` set for `user_name` in one
     /// transaction. `mutate` edits the parsed, sorted set; returning `false`
-    /// skips the write (the caller's idempotent no-op). Returns whether the
-    /// user row exists: a missing row is left untouched, never inserted.
+    /// skips the write (the caller's idempotent no-op). A missing row is left
+    /// untouched, never inserted — the caller reports that from the returned
+    /// [`GrantChange`] instead.
     async fn update_grants(
         &self,
         user_name: &str,
         mutate: impl FnOnce(&mut Vec<String>) -> bool,
-    ) -> Result<bool> {
+    ) -> Result<GrantChange> {
         let tx = self.conn.begin_tx().await?;
         let rows = tx
             .query(
@@ -434,12 +434,12 @@ impl UserStore {
             .await?;
         let Some(row) = rows.first() else {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(GrantChange::NoUser);
         };
         let mut grants = parse_grants(row.get::<Option<String>>(0)?);
         if !mutate(&mut grants) {
             tx.rollback().await?;
-            return Ok(true);
+            return Ok(GrantChange::Unchanged);
         }
         // The closures only add or remove one name, so a push is the one thing
         // that can break the parsed set's sorted order.
@@ -450,8 +450,19 @@ impl UserStore {
         )
         .await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(GrantChange::Changed)
     }
+}
+
+/// What a grants read-modify-write did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GrantChange {
+    /// No such `users` row — nothing was written, and none is inserted.
+    NoUser,
+    /// The row exists and already held the requested state — nothing written.
+    Unchanged,
+    /// The row exists and its grant set changed.
+    Changed,
 }
 
 /// Parse the `users.granted_tools` JSON array column. A NULL, empty or
@@ -1157,7 +1168,11 @@ mod tests {
         assert_eq!(stored.as_deref(), Some(r#"["alpha","zeta"]"#));
 
         // Granting twice is a no-op; the parsed record carries the grants.
-        store.add_grant(user, "alpha").await.unwrap();
+        assert_eq!(
+            store.add_grant(user, "alpha").await.unwrap(),
+            GrantChange::Unchanged,
+            "re-granting a tool the user already holds changes nothing"
+        );
         assert_eq!(
             store.get_grants(user).await.unwrap(),
             vec!["alpha".to_string(), "zeta".to_string()]
@@ -1174,12 +1189,17 @@ mod tests {
 
         // Revoking an absent grant — or revoking from a user without a row —
         // is a silent no-op.
-        assert!(store.remove_grant(user, "absent").await.unwrap());
-        assert!(
-            !store
+        assert_eq!(
+            store.remove_grant(user, "absent").await.unwrap(),
+            GrantChange::Unchanged,
+            "revoking a grant the user does not hold changes nothing"
+        );
+        assert_eq!(
+            store
                 .remove_grant("grant_no_such_user", "alpha")
                 .await
                 .unwrap(),
+            GrantChange::NoUser,
             "revoking from a missing user reports that no row exists"
         );
         assert_eq!(
@@ -1189,8 +1209,9 @@ mod tests {
 
         // Granting to a user without a row reports the missing row instead of
         // creating one.
-        assert!(
-            !store.add_grant("grant_ghost_user", "alpha").await.unwrap(),
+        assert_eq!(
+            store.add_grant("grant_ghost_user", "alpha").await.unwrap(),
+            GrantChange::NoUser,
             "granting to an unknown user must report that no row exists"
         );
         assert!(
