@@ -172,15 +172,11 @@ fn board_listing_isolates_hostile_titles() {
     // Pin the production format string — if `handle_board_listing`'s helper
     // drifts, this test fails instead of silently covering a stale fixture.
     assert_eq!(
-        format_board_line(
-            &crate::pipeline::board::TicketPhase::InDevelopment,
-            "mahbot-123",
-            "Title",
-        ),
-        "• **in development** `mahbot-123` Title"
+        format_board_line(&TicketPhase::InDevelopment, "mahbot-123", "Title"),
+        "🔨 `mahbot-123` Title"
     );
 
-    let state = crate::pipeline::board::TicketPhase::InDevelopment;
+    let state = TicketPhase::InDevelopment;
     let lines = [
         format_board_line(&state, "mahbot-1", "Fix * unclosed italic"),
         format_board_line(&state, "mahbot-2", "Use `git status` and *pair* ok"),
@@ -193,11 +189,11 @@ fn board_listing_isolates_hostile_titles() {
     let listing = lines.join("\n");
     let html = markdown_to_telegram_html(&listing);
 
-    // Every line keeps its bold state and monospace ID.
+    // Every line keeps its phase emoji and monospace ID.
     for line in html.split('\n') {
-        assert!(line.starts_with("• <b>"), "state formatting lost: {line:?}");
+        assert!(line.starts_with("🔨 "), "phase emoji lost: {line:?}");
         assert!(
-            line.contains("</b> <code>") && line.contains("</code> "),
+            line.contains("<code>") && line.contains("</code> "),
             "id formatting lost: {line:?}"
         );
     }

@@ -1,5 +1,6 @@
 use crate::channels::ReplyReference;
 use crate::channels::reply::normalize_reply_text;
+use crate::pipeline::board::TicketPhase;
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
 use crate::util::media_target::{self, MediaTarget};
 use crate::util::{
@@ -2984,16 +2985,37 @@ async fn post_set_my_commands(
     }
 }
 
-/// Format one `/board` listing line: bold state, monospace ticket ID, then
-/// the title. Shared by the Telegram `/board` handler and its tests so the
-/// format cannot silently drift between them.
+/// The phase glyph standing in for the phase word on one `/board` listing
+/// line. Keyed by the phase itself — the match is exhaustive with no fallback
+/// arm, so a newly added phase is a compile error rather than a silently
+/// missing (or transposed) row.
+///
+/// All twelve glyphs already default to emoji presentation, so none carries a
+/// variation selector. This is deliberately not `TicketPhase::display_name()`:
+/// the desktop board badge keeps the phase words.
+fn phase_emoji(phase: TicketPhase) -> &'static str {
+    match phase {
+        TicketPhase::Backlog => "📥",
+        TicketPhase::Analysis => "🔍",
+        TicketPhase::Planning => "🧭",
+        TicketPhase::Queued => "⏳",
+        TicketPhase::InDevelopment => "🔨",
+        TicketPhase::InDiagnostics => "🧪",
+        TicketPhase::InSanitation => "🧹",
+        TicketPhase::InReview => "👀",
+        TicketPhase::InQa => "🎯",
+        TicketPhase::Done => "✅",
+        TicketPhase::Cancelled => "🚫",
+        TicketPhase::Failed => "❌",
+    }
+}
+
+/// Format one `/board` listing line: the phase emoji, monospace ticket ID,
+/// then the title. Shared by the Telegram `/board` handler and its tests so
+/// the format cannot silently drift between them.
 #[must_use]
-pub fn format_board_line(
-    phase: &crate::pipeline::board::TicketPhase,
-    id: &str,
-    title: &str,
-) -> String {
-    format!("• **{}** `{}` {}", phase.display_name(), id, title)
+pub fn format_board_line(phase: &TicketPhase, id: &str, title: &str) -> String {
+    format!("{} `{}` {}", phase_emoji(*phase), id, title)
 }
 
 /// (command, description) entries for a user's Telegram command menu,

@@ -1105,11 +1105,11 @@ async fn handle_board_listing(msg: &ChannelMessage, ws_name: &str) {
         send_telegram_reply(msg, "No tickets.".to_string()).await;
         return;
     }
-    // `•` bullet instead of `*` — the listing is rendered through Telegram's
-    // markdown→HTML conversion, where a leading `*` would pair with a `*` in
-    // a ticket title and swallow the status/id into an italic span. State is
-    // bold, the ticket ID is monospace; each line converts independently, so
-    // markdown-special characters in a title cannot corrupt other lines.
+    // The line opens with a per-phase emoji rather than a `•`/`*` bullet: a
+    // leading `*` would pair with a `*` in a ticket title and swallow the id
+    // and title into an italic span. The ticket ID is monospace; each line
+    // converts independently, so markdown-special characters in a title cannot
+    // corrupt other lines.
     let listing = ordered
         .iter()
         .map(|t| mahbot::channels::telegram::format_board_line(&t.phase, &t.id, &t.title))
