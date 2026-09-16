@@ -976,23 +976,177 @@ async fn usernameless_sender_stays_unauthorized_despite_legacy_binding() {
         .bind_channel("alice", "telegram", "unknown")
         .await
         .unwrap();
-    // A username-less sender resolves to the sentinel, which the guard rejects
-    // before any user_channels lookup — so it stays unauthorized even though a
-    // legacy "unknown" row exists. The chat context is valid, so only the
-    // sentinel guard can produce None here.
-    assert!(
-        resolve_authorized_sender(
-            &serde_json::json!({"id": 1}),
-            &serde_json::json!({"chat": {"id": 42}}),
-        )
-        .await
-        .is_none()
-    );
+    // The sender carries no nickname at all and no numeric binding exists, so
+    // the legacy "unknown" row must not authorize them.
+    for sender in [
+        // A real username-less sender.
+        serde_json::json!({"from": {"id": 1}}),
+        // A sender whose reported nickname is the reserved word itself.
+        serde_json::json!({"from": {"id": 1, "username": "unknown"}}),
+    ] {
+        assert!(
+            resolve_authorized_sender(&sender, &serde_json::json!({"chat": {"id": 42}}))
+                .await
+                .is_none(),
+            "the reserved sentinel must never authorize: {sender}"
+        );
+    }
     // Clean up so the shared store isn't polluted for later tests.
     crate::users::store()
         .unbind_channel("alice", "telegram", "unknown")
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn usernameless_sender_is_authorized_by_a_numeric_binding() {
+    // The same sender as the sentinel test above, but bound by number: the
+    // no-nickname refusal belongs to the nickname way only, so the legacy
+    // "unknown" row (still bound to alice here) must not swallow a numeric
+    // match. The message itself carries no nickname at all.
+    let _ch = test_channel().await;
+    let store = crate::users::store();
+    store
+        .bind_channel("alice", "telegram", "unknown")
+        .await
+        .unwrap();
+    store.add_user("num_user").await.unwrap();
+    store.bind_telegram("num_user", "31415926").await.unwrap();
+    assert_eq!(
+        resolve_authorized_sender(
+            &serde_json::json!({"from": {"id": 31_415_926}}),
+            &serde_json::json!({"chat": {"id": 42}}),
+        )
+        .await,
+        Some(("num_user".to_string(), "42".to_string(), "42".to_string())),
+    );
+    // Clean up so the shared store isn't polluted for later tests.
+    store
+        .unbind_channel("num_user", "telegram", "31415926")
+        .await
+        .unwrap();
+    store
+        .unbind_channel("alice", "telegram", "unknown")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn numeric_binding_outranks_a_nickname_bound_to_another_account() {
+    let _ch = test_channel().await;
+    let store = crate::users::store();
+    store.add_user("num_rank").await.unwrap();
+    store.add_user("nick_rank").await.unwrap();
+    // The nickname's row is visited before the number's (the scan follows the
+    // `(channel, identifier)` unique index, and `!` sorts before any digit), so
+    // an implementation returning the first matching row of either kind would
+    // return the nickname's account: the number has to win on identity, not on
+    // scan order.
+    store.bind_telegram("num_rank", "27182818").await.unwrap();
+    store.bind_telegram("nick_rank", "!ranknick").await.unwrap();
+
+    // The sender carries both identities, each bound to a different account:
+    // the number decides, since it is the one that survives a rename.
+    let authorized = resolve_authorized_sender(
+        &serde_json::json!({"from": {"id": 27_182_818, "username": "!ranknick"}}),
+        &serde_json::json!({"chat": {"id": 42}}),
+    )
+    .await
+    .expect("the number binds");
+    assert_eq!(authorized.0, "num_rank");
+
+    // Clean up so the shared store isn't polluted for later tests.
+    store
+        .unbind_channel("num_rank", "telegram", "27182818")
+        .await
+        .unwrap();
+    store
+        .unbind_channel("nick_rank", "telegram", "!ranknick")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn bot_sender_is_refused_even_when_its_nickname_is_bound() {
+    // "alice" is bound to alice in the shared fixtures, so only the bot
+    // identity itself can produce the refusal.
+    let _ch = test_channel().await;
+    assert!(
+        resolve_authorized_sender(
+            &serde_json::json!({
+                "from": {"id": 424_242, "username": "alice", "is_bot": true}
+            }),
+            &serde_json::json!({"chat": {"id": 42}}),
+        )
+        .await
+        .is_none()
+    );
+}
+
+#[tokio::test]
+async fn chat_attributed_message_is_refused_even_when_its_sender_is_bound() {
+    // A channel post (or the anonymous group administrator) cites a `from`
+    // that names the bound nickname, yet the message speaks for the chat, not
+    // for that person.
+    let _ch = test_channel().await;
+    assert!(
+        resolve_authorized_sender(
+            &serde_json::json!({
+                "sender_chat": {"id": -100_200_300, "type": "channel", "title": "Chan"},
+                "from": {"id": 424_243, "username": "alice"}
+            }),
+            &serde_json::json!({"chat": {"id": 42}}),
+        )
+        .await
+        .is_none()
+    );
+}
+
+#[tokio::test]
+async fn telegram_service_identity_senders_are_refused() {
+    let _ch = test_channel().await;
+    // Each carries a bound nickname too, so only the identity itself can
+    // produce the refusal.
+    let cases = [
+        ("anonymous group administrator", 1_087_968_824_i64),
+        ("message attributed to a channel", 136_817_688),
+        ("auto-forwarded channel post", 777_000),
+    ];
+    for (name, id) in cases {
+        assert!(
+            resolve_authorized_sender(
+                &serde_json::json!({"from": {"id": id, "username": "alice"}}),
+                &serde_json::json!({"chat": {"id": 42}}),
+            )
+            .await
+            .is_none(),
+            "case {name}: expected rejection"
+        );
+    }
+}
+
+#[tokio::test]
+async fn callback_query_authorizes_the_person_when_its_message_is_chat_attributed() {
+    // The clicker is `from` of the callback_query; the keyboard's message can
+    // be chat-attributed (`sender_chat`), which must not refuse the person who
+    // pressed the button.
+    let ch = test_channel().await;
+    let cq = test_callback_query(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 100,
+            "sender_chat": {"id": -100_200_300, "type": "channel", "title": "Chan"},
+            "chat": {"id": -100_200_300}
+        }),
+    )]);
+
+    let msg = ch
+        .parse_callback_query(&cq)
+        .await
+        .expect("the clicker's own identity authorizes");
+    assert_eq!(msg.user_name, "alice");
+    assert_eq!(msg.chat_id.as_deref(), Some("-100200300"));
+    assert_eq!(msg.message_id, Some(100));
 }
 
 // ─────────────────────────────────────────────────────────────────────

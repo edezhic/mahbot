@@ -51,7 +51,8 @@ pub enum UsersMessage {
     CloseBindInput,
     /// Inline binding text input changed.
     BindInputChanged(EditorAction),
-    /// Confirm binding the entered Telegram username to the target user.
+    /// Confirm binding the entered Telegram @username or numeric id to the
+    /// target user.
     SubmitBind(String),
     /// Unbind a Telegram channel from a user.
     UnbindChannel(String, String),
@@ -76,7 +77,6 @@ pub struct UsersState {
     // Telegram binding inline input (single-target, like delete_target)
     pub(crate) bind_target: Option<String>,
     pub(crate) bind_input: SingleLineEditorState,
-    pub(crate) bind_error: Option<String>,
     pub(crate) binding: bool,
 }
 
@@ -90,7 +90,6 @@ impl UsersState {
             deleting: false,
             bind_target: None,
             bind_input: SingleLineEditorState::new(""),
-            bind_error: None,
             binding: false,
         }
     }
@@ -143,7 +142,6 @@ impl UsersState {
                 self.delete_target = None;
                 self.bind_target = None;
                 self.bind_input.clear();
-                self.bind_error = None;
                 Task::none()
             }
             UsersMessage::DeleteResult(Ok(())) => {
@@ -160,7 +158,6 @@ impl UsersState {
             UsersMessage::OpenBindInput(user_name) => {
                 self.bind_target = Some(user_name);
                 self.bind_input.clear();
-                self.bind_error = None;
                 // Also cancel any pending delete confirmation (mutual exclusion).
                 self.delete_target = None;
                 Task::none()
@@ -168,7 +165,6 @@ impl UsersState {
             UsersMessage::CloseBindInput => {
                 self.bind_target = None;
                 self.bind_input.clear();
-                self.bind_error = None;
                 Task::none()
             }
             UsersMessage::BindInputChanged(action) => {
@@ -176,24 +172,19 @@ impl UsersState {
                     return task;
                 }
                 self.bind_input.apply_action(action);
-                self.bind_error = None;
                 Task::none()
             }
             UsersMessage::SubmitBind(user_name) => {
                 self.binding = true;
-                self.bind_error = None;
                 let user_clone = user_name.clone();
                 let input = self.bind_input.text().clone();
                 Task::perform(
                     async move {
                         let store = user_store()?;
-                        let identifier = store
-                            .validate_telegram_bind(&user_clone, &input)
-                            .await
-                            .map_err(|e| e.to_string())?;
                         store
-                            .bind_channel(&user_clone, "telegram", &identifier)
+                            .bind_telegram(&user_clone, &input)
                             .await
+                            .map(|_| ())
                             .map_err(|e| e.to_string())
                     },
                     move |res| UsersMessage::BindResult(res, user_name),
@@ -201,7 +192,6 @@ impl UsersState {
             }
             UsersMessage::UnbindChannel(user_name, identifier) => {
                 self.binding = true;
-                self.bind_error = None;
                 let user_clone = user_name.clone();
                 Task::perform(
                     async move {
@@ -218,14 +208,13 @@ impl UsersState {
                 self.binding = false;
                 self.bind_target = None;
                 self.bind_input.clear();
-                self.bind_error = None;
                 self.refresh()
             }
             UsersMessage::BindResult(Err(e), user_name) => {
                 self.binding = false;
-                if self.bind_target.as_deref() == Some(&user_name) {
-                    self.bind_error = Some(format!("Failed to bind: {e}"));
-                } else {
+                // A failed bind leaves the editor open with the toast as its
+                // only signal; a failed unbind has no editor to keep.
+                if self.bind_target.as_deref() != Some(&user_name) {
                     self.load_state.fail(format!("Failed to unbind: {e}"));
                 }
                 Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))

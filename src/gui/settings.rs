@@ -2043,7 +2043,7 @@ impl SettingsState {
                             Space::new().width(theme::SPACE_8).into(),
                             widgets::single_line_editor(
                                 &us.bind_input.buffer,
-                                "@username",
+                                "@username or id",
                                 false,
                                 // Fills the left segment so the editor spans
                                 // the row; the fixed-size label and
@@ -2087,7 +2087,7 @@ impl SettingsState {
                             .into()
                     } else if let Some(binding) = telegram_binding {
                         // Already bound — show channel info and unbind button
-                        let display = binding.identifier.as_str();
+                        let display = crate::users::settings_binding_label(&binding.identifier);
                         row![
                             lucide::link::<iced::Theme, iced::Renderer>()
                                 .size(theme::TEXT_11)

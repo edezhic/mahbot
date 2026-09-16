@@ -3,8 +3,10 @@
 //! Two tables in the consolidated domain database (`core.db`):
 //! - `users` — canonical account identity: `name`, `selected_workspace`,
 //!   `granted_tools` (the per-account custom-tool grants).
-//! - `user_channels` — channel bindings: maps a channel+identifier (e.g. Telegram @username)
-//!   to an account. The `reply_target` is stored here (per-channel routing address).
+//! - `user_channels` — channel bindings: maps a channel+identifier to an
+//!   account. The `reply_target` is stored here (per-channel routing address).
+//!   A Telegram identifier is either a nickname or a person's numeric id — an
+//!   account holds at most one Telegram binding, so the two are alternatives.
 //!
 //! Account identity is independent of any external channel. Changing a Telegram
 //! `@username` does not affect the account's identity. Accounts are created via
@@ -33,29 +35,136 @@ use std::path::PathBuf;
 use tracing::warn;
 
 /// Sentinel that `extract_sender_user_name` (src/channels/telegram.rs)
-/// substitutes for Telegram senders without an @username. Never a valid
-/// binding identifier: a binding with this identifier would authorize every
-/// username-less sender as its owner.
+/// substitutes for Telegram senders without an @username. It is no nickname
+/// anyone can hold: binding it is refused, and it never matches a sender — a
+/// sender without a nickname is matched by their numeric id, or not at all.
 pub(crate) const TELEGRAM_UNKNOWN_SENTINEL: &str = "unknown";
+
+/// Telegram's own non-person identities, refused both as bindings and as
+/// senders: the anonymous group administrator (1087968824), a message
+/// attributed to a channel (136817688), and a channel post auto-forwarded into
+/// a linked discussion group (777000) — the same number as Telegram's own
+/// service account.
+const TELEGRAM_SERVICE_IDS: [&str; 3] = ["1087968824", "136817688", "777000"];
+
+/// The nicknames those identities carry (777000 has none). Telegram usernames
+/// are case-insensitive, so the comparison is too.
+const TELEGRAM_SERVICE_NICKNAMES: [&str; 2] = ["groupanonymousbot", "channel_bot"];
 
 /// The app's own admin account — the single owner identity the desktop GUI
 /// always acts as. Seeded idempotently by [`UserStore::ensure_admin_user`].
 pub(crate) const ADMIN_USER_NAME: &str = "admin";
 
-/// Normalize a Telegram handle for binding: trim surrounding whitespace and
-/// strip one leading `@`, then trim again. Rejects an empty handle and the
-/// reserved `TELEGRAM_UNKNOWN_SENTINEL` (matched case-sensitively — a real
-/// user legitimately named @Unknown stays bindable).
-fn normalize_telegram_handle(handle: &str) -> anyhow::Result<String> {
-    let handle = handle.trim();
-    let handle = handle.strip_prefix('@').unwrap_or(handle).trim();
-    if handle.is_empty() {
-        anyhow::bail!("Telegram handle is empty");
+/// How a Telegram binding identifier is written: as a number or as a nickname.
+enum TelegramKey {
+    /// Canonical form: digits, no leading `+`, no leading zeros.
+    Number(String),
+    /// Byte-for-byte as entered or stored.
+    Nickname(String),
+}
+
+/// The digits of a number-shaped value: after trimming, a single optional
+/// leading `+`, nothing but digits.
+fn telegram_digits(value: &str) -> Option<&str> {
+    let digits = value.trim();
+    let digits = digits.strip_prefix('+').unwrap_or(digits);
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
+}
+
+/// Classify a Telegram binding identifier by its shape.
+///
+/// A Telegram nickname can never be a bare number, so the shape decides: a
+/// number-shaped value is a numeric id, canonicalized here so the same number
+/// written differently is one and the same value. Anything else keeps its
+/// nickname meaning. `None` only for a value that is number-shaped yet nothing
+/// but zeros: no person's number.
+fn telegram_key(value: &str) -> Option<TelegramKey> {
+    let Some(digits) = telegram_digits(value) else {
+        return Some(TelegramKey::Nickname(value.to_string()));
+    };
+    let canonical = digits.trim_start_matches('0');
+    (!canonical.is_empty()).then(|| TelegramKey::Number(canonical.to_string()))
+}
+
+/// The canonical form of a numeric id — digits with the leading zeros removed.
+/// `None` when the value is not number-shaped or is nothing but zeros.
+fn canonical_telegram_number(value: &str) -> Option<String> {
+    match telegram_key(value) {
+        Some(TelegramKey::Number(number)) => Some(number),
+        _ => None,
     }
-    if handle == TELEGRAM_UNKNOWN_SENTINEL {
-        anyhow::bail!("'unknown' is a reserved Telegram handle and cannot be bound");
+}
+
+/// Normalize a value entered as a Telegram binding and refuse what can never
+/// belong to a person: the reserved `unknown` sentinel, Telegram's own service
+/// identities under either spelling, and a value that is nothing but zeros.
+/// A single leading `@` is stripped as it always has been; what remains decides
+/// the kind, and a number is kept as the number itself.
+fn normalize_telegram_binding(value: &str) -> anyhow::Result<String> {
+    let trimmed = value.trim();
+    let trimmed = trimmed.strip_prefix('@').unwrap_or(trimmed).trim();
+    match telegram_key(trimmed) {
+        Some(TelegramKey::Number(id)) => {
+            if is_telegram_service_id(&id) {
+                anyhow::bail!("'{id}' is a Telegram service identity and cannot be bound");
+            }
+            Ok(id)
+        }
+        Some(TelegramKey::Nickname(nickname)) => {
+            if nickname.is_empty() {
+                anyhow::bail!("Telegram binding is empty");
+            }
+            if nickname == TELEGRAM_UNKNOWN_SENTINEL {
+                anyhow::bail!("'unknown' is a reserved Telegram nickname and cannot be bound");
+            }
+            if is_telegram_service_nickname(&nickname) {
+                anyhow::bail!("'@{nickname}' is a Telegram service identity and cannot be bound");
+            }
+            Ok(nickname)
+        }
+        None => anyhow::bail!("a Telegram id of nothing but zeros is not a person's number"),
     }
-    Ok(handle.to_string())
+}
+
+/// Whether a canonical numeric id is one of Telegram's own service identities.
+pub(crate) fn is_telegram_service_id(id: &str) -> bool {
+    TELEGRAM_SERVICE_IDS.contains(&id)
+}
+
+/// Whether a nickname is the one a Telegram service identity carries.
+fn is_telegram_service_nickname(nickname: &str) -> bool {
+    let lowercase = nickname.to_ascii_lowercase();
+    TELEGRAM_SERVICE_NICKNAMES.contains(&lowercase.as_str())
+}
+
+/// Whether a stored Telegram identifier is written as a number — digits alone,
+/// however spelled — rather than as a nickname. A stored value that is
+/// number-shaped but nothing but zeros is no person's number and binds nobody;
+/// it is still written as a number, so it is shown as an id and never as `@0`.
+fn telegram_identifier_is_number(identifier: &str) -> bool {
+    telegram_digits(identifier).is_some()
+}
+
+/// Name a Telegram binding in a message a person reads: a nickname keeps the
+/// `@` it is entered with, a number is labelled as an id — never in nickname
+/// form.
+pub(crate) fn describe_telegram_binding(identifier: &str) -> String {
+    if telegram_identifier_is_number(identifier) {
+        format!("id {}", identifier.trim())
+    } else {
+        format!("@{identifier}")
+    }
+}
+
+/// The Settings → Users row's label for an account's Telegram binding: the
+/// nickname exactly as it has always been shown, a number labelled as an id so
+/// it can never read as a nickname.
+pub(crate) fn settings_binding_label(identifier: &str) -> String {
+    if telegram_identifier_is_number(identifier) {
+        describe_telegram_binding(identifier)
+    } else {
+        identifier.to_string()
+    }
 }
 
 crate::define_store! {
@@ -166,11 +275,11 @@ impl UserStore {
 
     /// Low-level upsert binding a `(channel, identifier)` pair to a user.
     /// `channel` is e.g. `"telegram"`, `identifier` is the channel-specific
-    /// identifier (Telegram @username without the @ prefix). Uses
+    /// identifier (a Telegram nickname or canonical numeric id). Uses
     /// INSERT OR REPLACE — a `(channel, identifier)` pair already bound to
-    /// another user is silently reassigned. User-facing Telegram bind paths
-    /// must call [`UserStore::validate_telegram_bind`] first (reserved-sentinel
-    /// + anti-steal guards).
+    /// another user is silently reassigned. User-facing Telegram bind paths go
+    /// through [`UserStore::bind_telegram`], which validates first (reserved
+    /// sentinel + service identities + at-most-one + anti-steal guards).
     pub async fn bind_channel(
         &self,
         user_name: &str,
@@ -187,20 +296,154 @@ impl UserStore {
         Ok(())
     }
 
-    /// Validate a Telegram handle on a user-facing bind path and return the
-    /// normalized identifier (trimmed, leading `@` stripped) ready for
-    /// [`UserStore::bind_channel`]. Rejects the reserved "unknown" sentinel and
-    /// fails closed on a handle already bound to a DIFFERENT user (anti-steal:
-    /// `bind_channel` is INSERT OR REPLACE and would silently reassign it).
-    /// Rebinding the same user stays allowed.
-    pub async fn validate_telegram_bind(&self, user_name: &str, handle: &str) -> Result<String> {
-        let handle = normalize_telegram_handle(handle)?;
-        if let Some(existing) = self.resolve_user_by_channel("telegram", &handle).await?
-            && existing != user_name
-        {
-            anyhow::bail!("@{handle} is already bound to user '{existing}'");
+    /// Validate a Telegram binding value on a user-facing path and return the
+    /// normalized identifier ready for [`UserStore::bind_channel`].
+    ///
+    /// Refuses, in order: a value that can never belong to a person
+    /// ([`normalize_telegram_binding`]); an account that already holds a
+    /// Telegram binding (an account holds at most one, so switching ways is
+    /// remove-then-attach — re-attaching even the identical value is refused
+    /// like any other attach); and a value already bound to another account
+    /// (anti-steal: `bind_channel` is INSERT OR REPLACE and would silently
+    /// reassign it). The at-most-one rule is Telegram-only — other channels
+    /// keep storing what they store today.
+    pub async fn validate_telegram_bind(&self, user_name: &str, value: &str) -> Result<String> {
+        let identifier = normalize_telegram_binding(value)?;
+        if let Some(existing) = self.telegram_binding(user_name).await? {
+            anyhow::bail!(
+                "'{user_name}' already has a Telegram binding ({}) — remove it on the \
+                 Settings → Users page first, then attach the new one",
+                describe_telegram_binding(&existing)
+            );
         }
-        Ok(handle)
+        // The at-most-one check above proved this account holds no Telegram row
+        // at all, so an owner found here is always someone else.
+        if let Some(owner) = self.telegram_binding_owner(&identifier).await? {
+            anyhow::bail!(
+                "{} is already bound to user '{owner}'",
+                describe_telegram_binding(&identifier)
+            );
+        }
+        Ok(identifier)
+    }
+
+    /// Attach a Telegram binding to an account: validate, then record it.
+    /// Returns the normalized identifier (the number itself for a numeric id).
+    pub async fn bind_telegram(&self, user_name: &str, value: &str) -> Result<String> {
+        let identifier = self.validate_telegram_bind(user_name, value).await?;
+        self.attach_telegram_binding(user_name, &identifier).await?;
+        Ok(identifier)
+    }
+
+    /// [`UserStore::bind_telegram`] for the admin, whose own bind has always
+    /// also recorded a nickname as its starting address — kept for
+    /// compatibility with how that address has always been stored, not because
+    /// a nickname is sendable (it is not a Telegram chat id, so it only starts
+    /// working once the admin writes to the bot). A number is a real address on
+    /// every path; no other path records a nickname address.
+    pub async fn bind_telegram_for_admin(&self, value: &str) -> Result<String> {
+        let identifier = self.bind_telegram(ADMIN_USER_NAME, value).await?;
+        if !telegram_identifier_is_number(&identifier) {
+            self.update_channel_contact("telegram", &identifier, &identifier)
+                .await?;
+        }
+        Ok(identifier)
+    }
+
+    /// Record an already-validated Telegram `identifier` as `user_name`'s
+    /// binding, and — when it is a number — that number as the binding's own
+    /// delivery address. A number is a valid private-chat address, so it is
+    /// known from the start (Telegram still forbids a bot to open the
+    /// conversation until that person writes); a nickname has no address until
+    /// its owner writes, so nothing is recorded for it here.
+    pub async fn attach_telegram_binding(&self, user_name: &str, identifier: &str) -> Result<()> {
+        self.bind_channel(user_name, "telegram", identifier).await?;
+        if telegram_identifier_is_number(identifier) {
+            self.update_channel_contact("telegram", identifier, identifier)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The account's Telegram binding identifier, if it holds one. An account
+    /// holds at most one; a legacy account with several reports the first.
+    pub(crate) async fn telegram_binding(&self, user_name: &str) -> Result<Option<String>> {
+        Ok(self
+            .get_user_channels(user_name)
+            .await?
+            .into_iter()
+            .find(|c| c.channel == "telegram")
+            .map(|c| c.identifier))
+    }
+
+    /// The account that already holds `identifier` — under any spelling of the
+    /// same number — if any. Uses the same matching as the sender path, so a
+    /// value that differs only in spelling is recognised as the same value.
+    async fn telegram_binding_owner(&self, identifier: &str) -> Result<Option<String>> {
+        let matched = match telegram_key(identifier) {
+            Some(TelegramKey::Number(number)) => {
+                self.resolve_telegram_user(Some(&number), None).await?
+            }
+            _ => self.resolve_telegram_user(None, Some(identifier)).await?,
+        };
+        Ok(matched.map(|matched| matched.user_name))
+    }
+
+    /// Resolve a Telegram sender to the account that owns them, by the sender's
+    /// OWN identity — never by the conversation the event arrived in: the
+    /// numeric id first (a number belongs to that one person and survives a
+    /// rename or a dropped nickname), then the nickname, which decides only
+    /// when no number matches. `nickname` is `None` for a sender Telegram
+    /// reports without one. Returns the matched binding's stored identifier
+    /// alongside the account, so the caller refreshes the address of the
+    /// binding that actually matched.
+    ///
+    /// A stored value is matched by the shape it was always meant to have, so
+    /// an existing binding spelled `00123` is the number 123; one that equals a
+    /// service identity authorizes nobody.
+    pub async fn resolve_telegram_user(
+        &self,
+        numeric_id: Option<&str>,
+        nickname: Option<&str>,
+    ) -> Result<Option<TelegramMatch>> {
+        let numeric_id = numeric_id.and_then(canonical_telegram_number);
+        let rows = self
+            .conn
+            .query(
+                "SELECT user_name, identifier FROM user_channels WHERE channel = 'telegram'",
+                db::params![],
+            )
+            .await?;
+        let mut nickname_match = None;
+        for row in &rows {
+            let user_name: String = row.get(0)?;
+            let identifier: String = row.get(1)?;
+            match telegram_key(&identifier) {
+                // A stored service identity authorizes nobody.
+                Some(TelegramKey::Number(number)) if !is_telegram_service_id(&number) => {
+                    if numeric_id.as_deref() == Some(number.as_str()) {
+                        return Ok(Some(TelegramMatch {
+                            user_name,
+                            identifier,
+                        }));
+                    }
+                }
+                // The reserved sentinel is never a match: a binding with it
+                // authorizes nobody.
+                Some(TelegramKey::Nickname(nick))
+                    if nick != TELEGRAM_UNKNOWN_SENTINEL
+                        && nickname_match.is_none()
+                        && nickname == Some(nick.as_str()) =>
+                {
+                    nickname_match = Some(TelegramMatch {
+                        user_name,
+                        identifier,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(nickname_match)
     }
 
     /// Unbind a channel from a user.
@@ -234,22 +477,6 @@ impl UserStore {
             )
             .await?;
         Ok(())
-    }
-
-    /// Resolve a channel+identifier pair to a user name. Returns `None` if
-    /// no binding exists (user not authorized on this channel).
-    pub async fn resolve_user_by_channel(
-        &self,
-        channel: &str,
-        identifier: &str,
-    ) -> Result<Option<String>> {
-        self.conn
-            .query_optional(
-                "SELECT user_name FROM user_channels WHERE channel = ?1 AND identifier = ?2",
-                db::params![channel, identifier],
-                |row| row.get::<String>(0),
-            )
-            .await
     }
 
     /// Get all channel bindings for a user.
@@ -552,10 +779,20 @@ pub(crate) fn validate_new_user_name(name: &str) -> Result<()> {
 pub struct ChannelBinding {
     /// The channel type (e.g. "telegram").
     pub channel: String,
-    /// The channel-specific identifier (e.g. Telegram @username).
+    /// The channel-specific identifier (a Telegram nickname, or a numeric id).
     pub identifier: String,
     /// Routing address for replies on this channel (e.g. Telegram chat_id:thread_id).
     pub reply_target: Option<String>,
+}
+
+/// The account a Telegram sender belongs to, with the binding that matched it.
+#[derive(Debug, Clone)]
+pub struct TelegramMatch {
+    /// The account's canonical name.
+    pub user_name: String,
+    /// The stored identifier of the binding that matched — the binding whose
+    /// delivery address follows this sender's conversation.
+    pub identifier: String,
 }
 
 // ── Personal workspace path helper ────────────────────────────
@@ -900,19 +1137,6 @@ pub async fn resolve_session_target(user_name: &str) -> (Role, Workspace) {
     )
 }
 
-/// Resolve a channel+identifier pair to the canonical user name.
-/// Returns `None` if no binding exists (user not authorized on this channel).
-pub async fn resolve_user_by_channel(channel: &str, identifier: &str) -> Option<String> {
-    let store = USER_STORE.get()?;
-    store
-        .resolve_user_by_channel(channel, identifier)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, ?channel, ?identifier, "Failed to resolve user by channel");
-            None
-        })
-}
-
 /// Resolve the canonical user name whose channel binding's `reply_target`
 /// matches the given outbound recipient (exact or `target:thread`).
 /// First match wins for group chats shared by multiple users.
@@ -1241,17 +1465,36 @@ mod tests {
     }
 
     #[test]
-    fn normalize_telegram_handle_rules() {
-        assert_eq!(normalize_telegram_handle("alice").unwrap(), "alice");
-        assert_eq!(normalize_telegram_handle("  alice  ").unwrap(), "alice");
-        assert_eq!(normalize_telegram_handle("@alice").unwrap(), "alice");
-        // A leading @ is stripped once, then the remainder is trimmed.
-        assert_eq!(normalize_telegram_handle(" @ alice ").unwrap(), "alice");
+    fn normalize_telegram_binding_rules() {
+        // Nicknames: trim, one leading '@' stripped, then trimmed again.
+        assert_eq!(normalize_telegram_binding("alice").unwrap(), "alice");
+        assert_eq!(normalize_telegram_binding("  alice  ").unwrap(), "alice");
+        assert_eq!(normalize_telegram_binding("@alice").unwrap(), "alice");
+        assert_eq!(normalize_telegram_binding(" @ alice ").unwrap(), "alice");
         // Reserved sentinel is rejected (case-sensitively — "Unknown" stays bindable).
-        assert!(normalize_telegram_handle("unknown").is_err());
-        assert!(normalize_telegram_handle("   ").is_err());
-        assert!(normalize_telegram_handle("@").is_err());
-        assert_eq!(normalize_telegram_handle("Unknown").unwrap(), "Unknown");
+        assert!(normalize_telegram_binding("unknown").is_err());
+        assert!(normalize_telegram_binding("   ").is_err());
+        assert!(normalize_telegram_binding("@").is_err());
+        assert_eq!(normalize_telegram_binding("Unknown").unwrap(), "Unknown");
+        // A nickname can never be a bare number, so digits are the number
+        // itself — however they are spelled.
+        assert_eq!(
+            normalize_telegram_binding("123456789").unwrap(),
+            "123456789"
+        );
+        assert_eq!(normalize_telegram_binding("  +00123 ").unwrap(), "123");
+        assert_eq!(normalize_telegram_binding("@123").unwrap(), "123");
+        assert_eq!(normalize_telegram_binding("alice123").unwrap(), "alice123");
+        // Nothing but zeros is no person's number.
+        assert!(normalize_telegram_binding("0").is_err());
+        assert!(normalize_telegram_binding("000").is_err());
+        assert!(normalize_telegram_binding("+000").is_err());
+        // Telegram's own service identities, under either spelling.
+        assert!(normalize_telegram_binding("777000").is_err());
+        assert!(normalize_telegram_binding("1087968824").is_err());
+        assert!(normalize_telegram_binding("136817688").is_err());
+        assert!(normalize_telegram_binding("@GroupAnonymousBot").is_err());
+        assert!(normalize_telegram_binding("channel_bot").is_err());
     }
 
     #[tokio::test]
@@ -1264,15 +1507,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Rebinding the same owner is allowed.
-        assert_eq!(
-            store
-                .validate_telegram_bind("bind_guard_owner", "@guard_handle")
-                .await
-                .unwrap(),
-            "guard_handle"
-        );
-
         // Anti-steal: a different user cannot take over the handle.
         let err = store
             .validate_telegram_bind("bind_guard_other", "guard_handle")
@@ -1283,6 +1517,17 @@ mod tests {
             "error must name the current owner: {err}"
         );
 
+        // At-most-one: even re-attaching the identical value is refused, and
+        // the refusal names the binding to remove first.
+        let err = store
+            .validate_telegram_bind("bind_guard_owner", "@guard_handle")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("@guard_handle") && err.to_string().contains("remove"),
+            "error must name the existing binding and how to free the account: {err}"
+        );
+
         // Reserved sentinel is rejected, fail-closed.
         let err = store
             .validate_telegram_bind("bind_guard_owner", "unknown")
@@ -1291,6 +1536,113 @@ mod tests {
         assert!(
             err.to_string().contains("reserved"),
             "error must mention 'reserved': {err}"
+        );
+    }
+
+    /// A binding by number is kept as the number itself, carries its own
+    /// delivery address from the moment it is attached, and matches a sender by
+    /// that number.
+    #[tokio::test]
+    async fn numeric_telegram_bindings_match_by_sender_identity() {
+        let (store, _dir) = crate::open_test_store!(UserStore, "numeric_telegram_bind");
+        for name in ["num_owner", "nick_owner", "num_taker"] {
+            store.add_user(name).await.unwrap();
+        }
+
+        store.bind_telegram("nick_owner", "frank").await.unwrap();
+        assert_eq!(
+            store.bind_telegram("num_owner", " +00123 ").await.unwrap(),
+            "123",
+            "the number itself is what is kept"
+        );
+        assert_eq!(
+            store.get_user_channels("num_owner").await.unwrap()[0]
+                .reply_target
+                .as_deref(),
+            Some("123"),
+            "a number is its own deliverable address"
+        );
+        // The same number written differently is the same value: another
+        // account cannot take it over by spelling it differently.
+        let err = store
+            .validate_telegram_bind("num_taker", " 00123 ")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("num_owner"),
+            "a differently spelled number is the same binding: {err}"
+        );
+
+        // A sender with no nickname is matched by their number alone. (The
+        // number outranking a bound nickname is pinned end-to-end in the
+        // `channels::telegram` tests.)
+        let matched = store
+            .resolve_telegram_user(Some("123"), None)
+            .await
+            .unwrap()
+            .expect("the number binds");
+        assert_eq!(matched.user_name, "num_owner");
+        assert_eq!(matched.identifier, "123");
+
+        // The nickname decides where no number matches.
+        let matched = store
+            .resolve_telegram_user(Some("124"), Some("frank"))
+            .await
+            .unwrap()
+            .expect("a nickname-only sender matches their nickname");
+        assert_eq!(matched.user_name, "nick_owner");
+
+        // An unbound identity matches nobody.
+        assert!(
+            store
+                .resolve_telegram_user(Some("124"), Some("frank_ish"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A stored spelling of the same number is the same binding.
+        store
+            .unbind_channel("num_owner", "telegram", "123")
+            .await
+            .unwrap();
+        store
+            .bind_channel("nick_owner", "telegram", "00123 ")
+            .await
+            .unwrap();
+        let matched = store
+            .resolve_telegram_user(Some("123"), None)
+            .await
+            .unwrap()
+            .expect("a stored non-canonical spelling is matched as the number");
+        assert_eq!(matched.user_name, "nick_owner");
+
+        // A stored service identity authorizes nobody.
+        store
+            .bind_channel("nick_owner", "telegram", "777000")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .resolve_telegram_user(Some("777000"), None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A legacy row holding the reserved sentinel stays inert: it is never a
+        // nickname match, so a sender reporting that nickname cannot authorize
+        // through it.
+        store
+            .bind_channel("nick_owner", "telegram", "unknown")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .resolve_telegram_user(None, Some("unknown"))
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

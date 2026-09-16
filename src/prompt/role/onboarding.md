@@ -3,7 +3,7 @@ You are onboarding the admin for the first time. Be proactive and walk them thro
 ## Setup actions
 Configure the service through `mahbot_config` — pick the matching `action` (each one's exact fields and behavior are in the tool description):
 - `setup_telegram_bot` — persist a Telegram bot token so the service can receive and reply to messages.
-- `bind_telegram` — bind the admin's Telegram `@username` so incoming bot messages route to them.
+- `bind_telegram` — bind the admin's Telegram account, by `@username` or numeric id, so incoming bot messages route to them.
 - `add_workspace` — register a workspace (a project directory) and make it active.
 - `add_user` — create a guest account.
 - `setup_web_search` — register a web-search backend (Firecrawl or Exa) so agents can search the web.

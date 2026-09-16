@@ -234,6 +234,52 @@ fn extract_sender_user_name(message: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// A Telegram sender that is a person, as Telegram presents the event.
+struct TelegramSender {
+    /// The numeric id Telegram reports, as digits.
+    numeric_id: Option<String>,
+    /// The nickname, when the sender has one.
+    nickname: Option<String>,
+}
+
+/// The person a Telegram event came from, or `None` when the sender is not a
+/// person: a message sent on behalf of a chat (`sender_chat` — a channel post,
+/// the anonymous group administrator, an auto-forwarded channel post), a bot
+/// (Telegram's own bots included), or one of Telegram's own service identities.
+/// Decided by the sender's identity as Telegram presents it, never by the
+/// spelling of a nickname, so no nickname list can outrun it.
+fn telegram_sender_person(source: &serde_json::Value) -> Option<TelegramSender> {
+    if source.get("sender_chat").is_some() {
+        return None;
+    }
+    let from = source.get("from")?;
+    if from.get("is_bot").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    let numeric_id = from
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .map(|id| id.to_string());
+    if let Some(id) = &numeric_id
+        && crate::users::is_telegram_service_id(id)
+    {
+        return None;
+    }
+    // The reserved sentinel means "no nickname": a sender whose reported
+    // username is that literal word is folded to nickname-less here, and the
+    // store's row scan skips a stored row holding it — either alone keeps a
+    // legacy "unknown" binding inert.
+    let nickname = from
+        .get("username")
+        .and_then(serde_json::Value::as_str)
+        .filter(|nickname| *nickname != crate::users::TELEGRAM_UNKNOWN_SENTINEL)
+        .map(String::from);
+    Some(TelegramSender {
+        numeric_id,
+        nickname,
+    })
+}
+
 /// Extracted metadata common to both text and attachment message parsing.
 struct MessageContext {
     user_name: String,
@@ -1042,32 +1088,47 @@ fn parse_recipient(recipient: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Extract sender info, verify authorization, and update contact metadata.
-/// Returns `None` if the user is not authorized or if chat context is missing.
-/// On auth failure, the caller is responsible for logging (e.g., caller may want to
-/// log the username). Contact info is updated only on success.
+/// Authorize a Telegram event by the identity of the person it came from, and
+/// derive the reply context it arrived in.
 ///
-/// Returns a 3-tuple `(canonical_user, chat_id, reply_target)` where:
-/// - `canonical_user`: the resolved system username for the Telegram sender
-/// - `chat_id`: the raw chat ID (e.g., `"123456"`)
-/// - `reply_target`: the reply target string (e.g., `"123456"` or `"123456:789"` for threads)
+/// `sender_source` is the object Telegram presents the sender in — the message
+/// itself for a normal message (so `sender_chat` is read there), the
+/// `callback_query` for a button press, so a keyboard attached to a
+/// chat-attributed message still authorizes the person who pressed it.
+/// `chat_source` is the object carrying the `chat` the event arrived in; it
+/// only supplies the delivery address, never the identity.
+///
+/// Returns `None` if the sender is not a person ([`telegram_sender_person`]),
+/// matches no binding, or the chat context is missing; otherwise a 3-tuple
+/// `(canonical_user, chat_id, reply_target)` where `canonical_user` is the
+/// account the binding resolved to, `chat_id` the raw chat ID (e.g. `"123456"`)
+/// and `reply_target` the reply target string (e.g. `"123456"`, or
+/// `"123456:789"` for threads). On auth failure the caller logs; the contact is
+/// updated only on success, and only on the binding that actually matched.
 async fn resolve_authorized_sender(
     sender_source: &serde_json::Value,
     chat_source: &serde_json::Value,
 ) -> Option<(String, String, String)> {
-    let username = extract_sender_user_name(sender_source);
-    // Fail-closed: the sentinel is never a valid binding identity. Even if a
-    // legacy "unknown" row exists in user_channels, a username-less sender
-    // must stay unauthorized.
-    if username == crate::users::TELEGRAM_UNKNOWN_SENTINEL {
-        return None;
-    }
-    // Look up the canonical user name via user_channels binding
-    let canonical_user = crate::users::resolve_user_by_channel("telegram", &username).await?;
+    // Authorization keys on the identity of the person who sent the event — a
+    // number first, since it survives a rename or a dropped nickname, then the
+    // nickname. The conversation the event arrived in only supplies the
+    // delivery address.
+    let sender = telegram_sender_person(sender_source)?;
+    let matched = match crate::users::store()
+        .resolve_telegram_user(sender.numeric_id.as_deref(), sender.nickname.as_deref())
+        .await
+    {
+        Ok(matched) => matched?,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to resolve Telegram sender to an account");
+            return None;
+        }
+    };
     let (chat_id, reply_target) = extract_chat_context(chat_source)?;
     // Update reply_target for future message delivery
-    let _ = crate::users::update_channel_contact("telegram", &username, &reply_target).await;
-    Some((canonical_user, chat_id, reply_target))
+    let _ =
+        crate::users::update_channel_contact("telegram", &matched.identifier, &reply_target).await;
+    Some((matched.user_name, chat_id, reply_target))
 }
 
 /// Parse a Markdown link `[label](url)` starting at byte offset `i`, which must
