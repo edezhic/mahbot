@@ -17,10 +17,14 @@
 //! dispatch latch — the only in-memory state is the running-body registry
 //! ([`PHASE_BODIES_RUNNING`]), a runtime-transport guard that stops a second
 //! phase body from being spawned on the same job during the pre-roster window.
-//! A paused workspace skips claims and job creation; current work finishes
-//! normally and the unpause re-drives it. A workspace holding a failed ticket
-//! awaiting Manager triage skips the `Queued -> InDevelopment` claim (enforced
-//! inside the claim predicate, not here); every other puller step still runs.
+//! The poll step's job/claim gate ([`process_single_workspace`]) runs the ticket
+//! pipeline only for a workspace that is both unpaused and ready: a freeze and a
+//! workspace that is not ready (awaiting its first analysis, re-analysing, or
+//! failed) hold every claim and job creation, while the discovery itself and the
+//! manager/maintainer/auxiliary agents are not gated by it. A workspace holding a
+//! failed ticket awaiting Manager triage skips the `Queued -> InDevelopment` claim
+//! (enforced inside the claim predicate, not here); every other puller step still
+//! runs.
 
 pub mod analysis;
 pub mod board;
@@ -236,23 +240,25 @@ async fn process_single_workspace(ws: Workspace) {
     // 0. Pending-workspace pickup — a pending workspace (added without a
     // provider key, or returned to pending after provider-class discovery
     // failures) is claimed into its first discovery when the provider is
-    // configured. Runs before the claim pipeline: a freshly-claimed workspace
-    // re-arms the analysis pause, so no Backlog/Queued claims race the
-    // discovery. A successful claim returns the fresh post-claim copy; the
-    // pipeline below then runs against the claimed analyzing+paused state
-    // instead of the pre-claim poll-round copy.
+    // configured. Deliberately ahead of the gate below and exempt from it, so
+    // the discovery it starts always runs to completion; the freshly claimed
+    // state (analyzing + paused) then fails that gate and ends this round.
     let ws = match pickup_pending_workspace(&ws).await {
         Some(claimed) => claimed,
         None => ws,
     };
 
-    // Re-read the LIVE pause state; a genuinely paused workspace must not claim
-    // new work or create jobs in this round.
+    // The gate from the module doc — re-read the LIVE state, so a pause or a
+    // status change landing mid-round bites immediately.
     if let Ok(Some(live)) = crate::workspace::store().get_by_name(&ws.name).await
-        && live.paused
-        && live.status == WorkspaceStatus::Ready
+        && (live.paused || live.status != WorkspaceStatus::Ready)
     {
-        tracing::debug!(workspace = %ws.name, "Workspace paused mid-poll — skipping claim/dispatch for this round");
+        tracing::debug!(
+            workspace = %ws.name,
+            paused = live.paused,
+            status = %live.status,
+            "Workspace not ready for the ticket pipeline — skipping claim/dispatch for this round"
+        );
         return;
     }
 
@@ -265,9 +271,9 @@ async fn process_single_workspace(ws: Workspace) {
 }
 
 /// Claim a pending workspace into its first discovery, returning the fresh
-/// post-claim [`Workspace`] (status `analyzing`, paused) so the remaining
-/// poll steps run against the claimed state; `None` when the workspace stays
-/// pending (not pending / provider unconfigured / cooldown armed / claim lost).
+/// post-claim [`Workspace`] so the caller does not keep a stale pre-claim copy;
+/// `None` when the workspace stays pending (not pending / provider
+/// unconfigured / cooldown armed / claim lost).
 async fn pickup_pending_workspace(ws: &Workspace) -> Option<Workspace> {
     let (generation, discover_diagnostics) = pickup_claim(ws).await?;
 
@@ -279,10 +285,9 @@ async fn pickup_pending_workspace(ws: &Workspace) -> Option<Workspace> {
     );
     crate::workspace::spawn_workspace_discovery(ws, generation, discover_diagnostics);
 
-    // Re-read so the following poll steps see the claimed state (analyzing +
-    // paused), not the stale pre-claim copy. On a read failure the caller
-    // falls back to the poll-round copy — the pipeline's pause gate still
-    // blocks new-work claims on it.
+    // Re-read so the returned copy is the claimed state (analyzing + paused),
+    // not the stale pre-claim one. On a read failure the caller keeps the
+    // poll-round copy — its own round is gated on live state anyway.
     crate::workspace::store()
         .get_by_name(&ws.name)
         .await
@@ -296,9 +301,11 @@ async fn pickup_pending_workspace(ws: &Workspace) -> Option<Workspace> {
 /// the workspace was atomically claimed, `None` when it must stay pending.
 ///
 /// The claim deliberately does **not** gate on `ws.paused`: a `Pending`
-/// workspace always carries `paused = 1` (the analysis pause written by
-/// `add()` and the discovery finalizer), so gating on the paused column would
-/// block every pending pickup and break the analysis-pause flow.
+/// workspace is born paused (the analysis pause written by `add()`), so gating
+/// on the paused column would block every pending pickup and break the
+/// analysis-pause flow. The poll step's own gate holds claims and dispatch for a
+/// frozen or not-ready workspace; this pickup is deliberately exempt, since the
+/// discovery it starts must run to completion.
 async fn pickup_claim(ws: &Workspace) -> Option<(i64, bool)> {
     if ws.status != WorkspaceStatus::Pending {
         return None;
@@ -847,13 +854,37 @@ fn pause_status_sentence(paused: bool) -> String {
     }
 }
 
+/// Route a notice to a workspace's Manager agent on the system channel — the
+/// path of the notices that report a failure WITHOUT a ticket phase change
+/// (the engineer hard failure and the sanitation round stop). The Manager
+/// cannot resume the workspace itself, so the notice exists to be passed on to
+/// the user.
+fn notify_manager_system(ws_name: &str, content: String) {
+    let agent_id = manager_agent_id(ws_name);
+    message_router::route(
+        &agent_id,
+        message_router::AgentJob {
+            content,
+            workspace_name: ws_name.to_string(),
+            user_name: "system".to_string(),
+            channel: String::new(),
+            kind: message_router::MessageKind::UserMessage,
+            role: Role::Manager,
+            reply_target: None,
+            pending_job_id: None,
+            originating_workspace: None,
+        },
+    );
+}
+
 /// Pause the workspace after a technical/agent failure so queued development
 /// tickets are not claimed and don't cascade through the pipeline failing
 /// identically one after another.
 ///
 /// Returns `true` when this call paused the workspace, `false` when it was
-/// already paused, could not be resolved, or the service is shutting down (a
-/// shutdown-interrupted run must never pause).
+/// already paused (the cooperative freeze is still signalled), could not be
+/// resolved, or the service is shutting down (a shutdown-interrupted run must
+/// never pause).
 pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) -> bool {
     if crate::shutdown::aborting() {
         return false;
@@ -862,6 +893,12 @@ pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) ->
         return false;
     };
     if ws.paused {
+        // Already frozen — possibly by the discovery's own analysis pause, which
+        // writes the flag through direct SQL and never signals the registry.
+        // Signal it here so the freeze stops in-flight ticket agents at their
+        // next round boundary at every workspace status, not just the ones that
+        // went through `set_paused`.
+        crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(&ws.name);
         return false;
     }
     match crate::workspace::store().set_paused(&ws.name, true).await {
@@ -891,24 +928,26 @@ pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) ->
 /// job) so the puller creates a FRESH one from scratch. Cancels any orphaned
 /// ticket agents, leaves an explanatory comment, pauses the workspace only for
 /// the implementation phases, and deletes the phase job. Consumes no bounce
-/// budget.
+/// budget. Returns whether THIS call paused the workspace: `false` for a phase
+/// that does not pause (a non-pipeline-occupied one) and when this call did not
+/// perform the pause — it was already paused, or the pause was skipped (a
+/// shutdown, or a workspace that could not be resolved).
 async fn reset_phase_attempt(
     ticket: &Ticket,
     phase: TicketPhase,
     job_id: &str,
     reason: &str,
     comment: &str,
-) {
+) -> bool {
     crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
     // The workspace pause still happens for implementation phases, but it is
     // silent in ticket history (the caller's substantive reason is the comment).
-    if phase.is_pipeline_occupied() {
-        pause_workspace_on_failure(ticket, reason).await;
-    }
+    let paused = phase.is_pipeline_occupied() && pause_workspace_on_failure(ticket, reason).await;
     if let Err(e) = board().add_comment(&ticket.id, SYSTEM_ROLE, comment).await {
         warn!(ticket = %ticket.id, error = %e, "Failed to comment phase reset");
     }
     let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
+    paused
 }
 
 /// Fetch the last ticket comment (any role) as failure details for a Manager

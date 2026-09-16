@@ -425,6 +425,25 @@ mod tests {
         assert!(format_chronicle(&[]).is_empty());
     }
 
+    /// Chronicle rows materialized for one ticket. Scoped to the ticket: the
+    /// global store is shared with every other test in the process, so an
+    /// unfiltered count races their ticket writes.
+    async fn chronicle_rows_for(board: &crate::pipeline::BoardStore, ticket_id: &str) -> i64 {
+        board
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM ticket_chronicle WHERE ticket_id = ?1",
+                crate::db::params![ticket_id],
+            )
+            .await
+            .unwrap()[0]
+            .get_value(0)
+            .unwrap()
+            .as_integer()
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// End-to-end composition: a real ticket phase change is captured, the CDC
     /// drainer materializes it into `ticket_chronicle` (via the synchronous
     /// subscriber), and `drain` delivers the grouped `<ticket-updates>` block.
@@ -452,16 +471,7 @@ mod tests {
         let mut count = 0;
         for _ in 0..20 {
             crate::db::cdc::drain_once(&board.conn).await.unwrap();
-            count = board
-                .conn
-                .query("SELECT COUNT(*) FROM ticket_chronicle", ())
-                .await
-                .unwrap()[0]
-                .get_value(0)
-                .unwrap()
-                .as_integer()
-                .copied()
-                .unwrap_or(0);
+            count = chronicle_rows_for(board, &ticket_id).await;
             if count > 0 {
                 break;
             }
@@ -494,16 +504,7 @@ mod tests {
             .unwrap();
         for _ in 0..20 {
             crate::db::cdc::drain_once(&board.conn).await.unwrap();
-            count = board
-                .conn
-                .query("SELECT COUNT(*) FROM ticket_chronicle", ())
-                .await
-                .unwrap()[0]
-                .get_value(0)
-                .unwrap()
-                .as_integer()
-                .copied()
-                .unwrap_or(0);
+            count = chronicle_rows_for(board, &ticket_id).await;
             if count >= 2 {
                 break;
             }

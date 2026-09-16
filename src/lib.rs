@@ -226,9 +226,10 @@ pub struct Workspace {
     /// agent run failure, all verifiers failing, user cancelling an in-flight
     /// run) so queued development tickets aren't claimed and don't cascade.
     /// Lifted via the normal unpause path (GUI toggle or rediscovery; the
-    /// nightly loop skips paused workspaces). A discovery already in flight
-    /// when the pause lands can still clear it on completion — residual race,
-    /// see `finalize_discovery`.
+    /// nightly loop skips paused workspaces). A discovery already in flight when
+    /// the pause lands clears it on completion without checking who set it: the
+    /// round stopped by that failure replays once and freezes the workspace
+    /// again — see `finalize_discovery`.
     pub paused: bool,
     /// RFC 3339 timestamp of the last completed maintainer run.
     /// `None` means the workspace has never been maintained.

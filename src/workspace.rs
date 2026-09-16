@@ -316,11 +316,11 @@ async fn run_workspace_diagnostics(
 ///   (`add` writes `paused = 1` alongside `status = Pending`; rediscover
 ///   and pickup — `claim_pending_for_discovery` — write it alongside
 ///   `status = Analyzing`), and rediscovery is the documented unpause path —
-///   so a successful discovery clears it. While that pause is set, the claim
-///   pipeline's gate also holds automatic Backlog→Analysis and
-///   Queued→InDevelopment claims (see `run_claim_pipeline` in
-///   the management module), so backlog and Queued tickets wait out the
-///   discovery and are picked up on the next poll cycle after this unpause.
+///   so a successful discovery clears it. Since the poll step's gate also holds
+///   every claim and phase-job creation while the workspace is not ready (its
+///   analysis pause included), automatic Backlog→Analysis and
+///   Queued→InDevelopment claims wait out the discovery and are picked up on the
+///   next poll cycle after this unpause.
 /// - [`DiscoveryOutcome::Fatal`] (at least one non-provider failure — runtime
 ///   errors, parse failures): sets status to `failed` (terminal, manual
 ///   Re-analyze as before) and leaves `paused` untouched. Panics never reach
@@ -336,11 +336,13 @@ async fn run_workspace_diagnostics(
 ///
 /// ## Known limitation
 ///
-/// A pause that lands mid-flight (failure auto-pause or manual toggle after the
-/// user unpaused an analyzing workspace) is indistinguishable from the
-/// discovery's own analysis pause — the paused column carries no owner or
-/// timestamp. The nightly loop skips paused workspaces, which closes the
-/// scheduled path; the residual window requires a manual unpause mid-analysis.
+/// This unpause does not check who set the pause: a failure/operator pause that
+/// landed while the discovery was in flight is cleared together with the
+/// discovery's own analysis pause (the `paused` column carries no owner or
+/// timestamp). A round stopped by such a failure therefore replays once after
+/// the discovery completes, fails again and freezes the workspace on its own
+/// `set_paused` — bounded, not a loop. The nightly loop skips paused
+/// workspaces, which closes the scheduled path.
 async fn finalize_discovery(
     storage: &WorkspaceStore,
     ws_name: &str,
@@ -1189,9 +1191,11 @@ impl WorkspaceStore {
             // cancel and must not cancel the in-flight discovery agents.
             //
             // The store→registry call mirrors `set_maintenance_enabled` above (which
-            // cancels Maintainer agents): the store is the single choke point
-            // for every pause entry point (GUI, Telegram, failure), so the
-            // cancel is guaranteed rather than left to each caller.
+            // cancels Maintainer agents): this method is the choke point for every
+            // pause entry point (GUI, Telegram, and the failure freeze), so the
+            // cancel is guaranteed rather than left to each caller. The one caller
+            // that signals the registry itself is `pause_workspace_on_failure`
+            // finding the flag already set — it has no write to piggyback on.
             crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(name);
             tracing::info!(workspace = name, "Workspace pipeline paused");
         } else {

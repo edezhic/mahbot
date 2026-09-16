@@ -9,9 +9,9 @@ use crate::{Agent, Role, Workspace};
 
 use super::{
     RETRY_EXHAUSTION_MARKER, SYSTEM_ROLE, StageRunKind, TicketPhase, TransitionCtx, board,
-    comment_and_transition_or_bail, guard_job_phase, guard_stage, info, manager_agent_id,
-    message_router, pause_freezing, pause_status_sentence, pause_workspace_on_failure,
-    run_stage_agent, sync_phase_job_task, warn,
+    comment_and_transition_or_bail, guard_job_phase, guard_stage, info, notify_manager_system,
+    pause_freezing, pause_status_sentence, pause_workspace_on_failure, run_stage_agent,
+    sync_phase_job_task, warn,
 };
 
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
@@ -126,29 +126,14 @@ fn engineer_failure_comment(shutdown: bool, error: Option<&str>) -> String {
 /// Notify the Manager that a workspace was paused because of an engineer hard
 /// failure.
 fn notify_engineer_pause(ws: &Workspace, failure_details: &str, paused: bool) {
-    let workspace_status = pause_status_sentence(paused);
-    let warning = substitute(
+    let content = substitute(
         &load_prompt("pipeline/engineer_pause_notification.md"),
         &[
             ("{{failure_details}}", failure_details),
-            ("{{workspace_status}}", &workspace_status),
+            ("{{workspace_status}}", &pause_status_sentence(paused)),
         ],
     );
-    let agent_id = manager_agent_id(&ws.name);
-    message_router::route(
-        &agent_id,
-        message_router::AgentJob {
-            content: warning,
-            workspace_name: ws.name.clone(),
-            user_name: "system".to_string(),
-            channel: String::new(),
-            kind: message_router::MessageKind::UserMessage,
-            role: Role::Manager,
-            reply_target: None,
-            pending_job_id: None,
-            originating_workspace: None,
-        },
-    );
+    notify_manager_system(&ws.name, content);
 }
 
 /// Shared engineer post-run tail: phase/drain guards, failure handling, pause,

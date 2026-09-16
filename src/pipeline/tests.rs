@@ -1948,8 +1948,12 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
         "the engineer session pin must survive the round job's deletion",
     );
 
-    // The puller re-creates a fresh InDevelopment job on a paused workspace and
-    // re-drives it (the re-created body consumes this script).
+    // Resume, as production does: the poll gate serves only an unpaused, ready
+    // workspace (the step below is driven directly here).
+    crate::workspace::store()
+        .set_paused(&ws.name, false)
+        .await
+        .unwrap();
     {
         let fake = crate::util::test::FakeProvider::new()
             .ok("implemented")
@@ -2229,6 +2233,64 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
     assert_workspace_paused(&ws, false).await;
 }
 
+/// A failure freeze that lands while the workspace is ALREADY paused — the
+/// discovery's own analysis pause owns the flag, and it is written by direct
+/// SQL, so nothing signalled the registry — still freezes in-flight ticket
+/// agents. Only the write in `set_paused` would otherwise reach them, so
+/// `pause_workspace_on_failure` signals the freeze itself.
+#[serial_test::serial(provider, drain)]
+#[tokio::test]
+async fn failure_freeze_while_paused_stops_in_flight_ticket_agent() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/freeze_while_paused_ws", "freeze_while_paused_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    // Paused before the round is dispatched, so no agent of this round has been
+    // signalled yet — the registry only sees the pause through the failure call.
+    crate::workspace::store()
+        .set_paused(&ws.name, true)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "FreezeWhilePaused", TicketPhase::InQa).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(&job_id, &ws, &id, TicketPhase::InQa, crate::Role::Qa, "qa").await;
+
+    {
+        // Holding script: tool calls keep the verifier in flight until the
+        // freeze lands.
+        let mut fake = crate::util::test::FakeProvider::new().ok_tool_call("read");
+        for _ in 0..9 {
+            fake = fake.ok_tool_call("read");
+        }
+        let _seam = crate::util::test::install_retry_seam(fake);
+
+        let ticket = expect_ticket(store, &id).await;
+        let handle = tokio::spawn(super::qa::run(
+            std::sync::Arc::new(ticket.clone()),
+            ws.clone(),
+            job_id.clone(),
+        ));
+        wait_for_agent_registered(&id, std::time::Duration::from_secs(2)).await;
+
+        assert!(
+            !super::pause_workspace_on_failure(&ticket, "test freeze while paused").await,
+            "the workspace was already paused, so this call does not pause it",
+        );
+        handle.await.unwrap();
+
+        assert!(
+            expect_phase_job(store, &id, TicketPhase::InQa)
+                .await
+                .is_some(),
+            "the frozen round must keep its phase job for the unpause re-drive",
+        );
+    }
+}
+
 /// (i) A stage re-drive whose session carries a dangling analyze call runs the
 /// universal resume-completion step BEFORE the engineer's model round: the
 /// owned analyze job (Done roster) is terminalized, its consolidated result
@@ -2371,5 +2433,241 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
     assert!(
         messages[0].contains("STAGE_RESULT"),
         "the engineer's first model round sees the settled result"
+    );
+}
+
+// ── 9. Sanitation round stop — a round that cannot finish is not retried ──
+
+/// A persistent commit failure (a rejecting hook, a broken index, a missing git
+/// identity, an unreadable repository) must STOP the sanitation round instead of
+/// leaving its job behind for the puller to re-drive every poll tick: the full
+/// cause reaches the ticket, the workspace is frozen, the phase job is deleted,
+/// and the ticket stays in sanitation with its changes uncommitted.
+#[cfg(unix)]
+#[serial_test::serial(provider, drain)]
+#[tokio::test]
+async fn sanitation_commit_failure_stops_round_and_freezes_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
+    let ws = create_test_workspace(repo_path.to_str().unwrap(), "sanitation_stop_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    // Registered up front so the stop's Manager notice lands in a local inbox
+    // instead of spawning a real Manager turn.
+    let mut manager_inbox =
+        crate::agent::message_router::register_agent(&crate::session::manager_agent_id(&ws.name));
+    let id = make_ticket(store, &ws, "SanitationStop", TicketPhase::InSanitation).await;
+
+    let hook = repo_path.join(".git").join("hooks").join("pre-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\necho 'rejected by test hook' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let head_before = crate::git::commands::run_git_head(repo_path.as_path())
+        .await
+        .unwrap();
+
+    // The dirty tree the pass round would have committed.
+    std::fs::write(repo_path.join("unexpected.txt"), b"x\n").unwrap();
+
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::InSanitation,
+        crate::Role::Sanitation,
+        "sanitation",
+    )
+    .await;
+    {
+        let fake = crate::util::test::FakeProvider::new()
+            .ok("sanitation inspected")
+            .ok(r#"{"pass":true,"garbage_files":[],"rationale":"clean"}"#);
+        let _seam = crate::util::test::install_retry_seam(fake);
+        super::sanitation::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id.clone(),
+        )
+        .await;
+
+        let notice = manager_inbox
+            .try_recv()
+            .expect("the stop must notify the Manager");
+        assert!(
+            notice.content.contains(&id) && notice.content.contains("rejected by test hook"),
+            "the Manager notice must carry the ticket and the real cause:\n{}",
+            notice.content,
+        );
+        assert!(
+            manager_inbox.try_recv().is_err(),
+            "the stop notifies the Manager exactly once",
+        );
+    }
+
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::InSanitation,
+        "a stopped sanitation round must leave the ticket in its phase",
+    );
+    assert_workspace_paused(&ws, true).await;
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::InSanitation)
+            .await
+            .is_none(),
+        "the stopped round's phase job must be deleted",
+    );
+    let comments = store.get_comments(&id).await.unwrap();
+    let stop = comments
+        .iter()
+        .find(|c| c.content.contains("rejected by test hook"))
+        .expect("the ticket must carry the git process message");
+    assert!(
+        stop.content.contains("Failed to commit changes"),
+        "the stop comment must keep the full error chain: {}",
+        stop.content,
+    );
+    assert_eq!(
+        crate::git::commands::run_git_head(repo_path.as_path())
+            .await
+            .unwrap(),
+        head_before,
+        "the failing round must not create a commit",
+    );
+
+    // The frozen workspace holds the puller: the deleted job is not re-created.
+    super::process_single_workspace(
+        crate::workspace::store()
+            .get_by_name(&ws.name)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::InSanitation)
+            .await
+            .is_none(),
+        "a frozen workspace must not re-drive the stopped sanitation round",
+    );
+
+    crate::agent::message_router::unregister_agent(&crate::session::manager_agent_id(&ws.name));
+    drop(repo_dir);
+}
+
+/// The ticket pipeline runs only for a workspace that is BOTH unpaused and
+/// ready: a freeze holds at every status, and a workspace that is not ready —
+/// awaiting its first analysis, re-analysing (with or without a freeze), or
+/// failed — takes no ticket work either. No claims, no phase jobs.
+///
+/// The pending pickup stays exempt (it starts the discovery itself), and no
+/// provider is configured in tests, so a `Pending` row is never claimed into a
+/// discovery here and keeps its status.
+#[serial_test::serial(provider, drain)]
+#[tokio::test]
+async fn unsettled_or_frozen_workspace_skips_claims_and_dispatch() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+
+    for (idx, status, paused) in [
+        (0, WorkspaceStatus::Analyzing, true),  // frozen mid Re-analyse
+        (1, WorkspaceStatus::Analyzing, false), // resumed mid Re-analyse
+        (2, WorkspaceStatus::Pending, false),   // awaiting the first analysis
+        (3, WorkspaceStatus::Failed, false),    // discovery failed
+    ] {
+        let name = format!("unsettled_ws_{idx}");
+        let ws = create_test_workspace(&format!("/tmp/{name}"), &name).await;
+        let backlog = make_ticket(store, &ws, "Unsettled backlog", TicketPhase::Backlog).await;
+        age_ticket_past_grace(store, &backlog).await;
+        let dev = make_ticket(store, &ws, "Unsettled dev", TicketPhase::InDevelopment).await;
+
+        crate::workspace::store()
+            .set_status(&ws.name, &status)
+            .await
+            .unwrap();
+        crate::workspace::store()
+            .set_paused(&ws.name, paused)
+            .await
+            .unwrap();
+
+        super::process_single_workspace(
+            crate::workspace::store()
+                .get_by_name(&ws.name)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(
+            expect_ticket_phase(store, &backlog).await,
+            TicketPhase::Backlog,
+            "{status}/{paused}: an unsettled workspace must not claim backlog tickets",
+        );
+        assert!(
+            expect_phase_job(store, &dev, TicketPhase::InDevelopment)
+                .await
+                .is_none(),
+            "{status}/{paused}: an unsettled workspace must not start phases",
+        );
+    }
+
+    // Positive control: the same poll step does claim for a ready, unpaused
+    // workspace. The pre-created job carries a launched roster row, so the
+    // dispatch arm skips it instead of spawning a real phase body.
+    let ws = create_test_workspace("/tmp/settled_ws", "settled_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    crate::workspace::store()
+        .set_paused(&ws.name, false)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "Settled backlog", TicketPhase::Backlog).await;
+    age_ticket_past_grace(store, &id).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Analysis,
+        crate::Role::Analyst,
+        "analysis",
+    )
+    .await;
+    crate::jobs::upsert_job_agent(
+        &crate::session::store().conn,
+        &job_id,
+        "settled_ws_analyst_roster",
+        crate::jobs::AgentKind::Analyst,
+        crate::jobs::RowStatus::Launched,
+    )
+    .await
+    .unwrap();
+
+    super::process_single_workspace(
+        crate::workspace::store()
+            .get_by_name(&ws.name)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Analysis,
+        "a ready, unpaused workspace must claim its aged backlog ticket",
     );
 }

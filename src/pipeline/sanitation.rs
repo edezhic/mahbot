@@ -9,9 +9,9 @@ use crate::{Agent, Role, Workspace};
 use super::{
     BoardStore, FinalizeOutcome, StageRunKind, TicketPhase, TransitionCtx, board,
     bounce_to_development, clear_implementation_roster, determine_notify_policy, error,
-    guard_job_phase, guard_stage, info, list_new_or_untracked_files, pause_freezing,
-    reset_phase_attempt, run_git_status, run_stage_agent, sync_phase_job_task, warn,
-    with_comment_and_transition,
+    guard_job_phase, guard_stage, info, list_new_or_untracked_files, notify_manager_system,
+    pause_freezing, pause_status_sentence, reset_phase_attempt, run_git_status, run_stage_agent,
+    sync_phase_job_task, warn, with_comment_and_transition,
 };
 
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
@@ -48,100 +48,129 @@ async fn transition_ticket_to_done_no_comment(ticket: &Ticket, source: TicketPha
     }
 }
 
-/// Ensure git is available and run `git status --porcelain`.
-async fn ensure_git_or_done_and_get_status(
-    ticket: &Ticket,
-    ws: &Workspace,
-    phase: TicketPhase,
-    error_context: &'static str,
-) -> Option<String> {
-    let repo_path = ws.as_path();
-
+/// Why the workspace has no usable repository — git not installed, or the root
+/// not a repo — or `None` when it has one. Both halves are the precondition for
+/// every git read and for the commit in this module; each caller states its own
+/// behaviour for the no-repo case.
+async fn missing_repo_reason(ws: &Workspace) -> Option<&'static str> {
     if !crate::git::commands::git_is_installed().await {
-        transition_ticket_to_done_no_comment(
-            ticket,
-            phase,
-            "Git not installed — moving to Done without commit",
-        )
-        .await;
-        return None;
+        return Some("Git not installed — moving to Done without commit");
     }
-    if !crate::git::commands::is_git_repo(repo_path) {
-        transition_ticket_to_done_no_comment(
-            ticket,
-            phase,
-            "Not a git repo — moving to Done without commit",
-        )
-        .await;
-        return None;
+    if !crate::git::commands::is_git_repo(ws.as_path()) {
+        return Some("Not a git repo — moving to Done without commit");
     }
-
-    match run_git_status(repo_path).await {
-        Ok(porcelain) => Some(porcelain),
-        Err(e) => {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to check git status — staying in {} for retry: {}",
-                phase.as_ref(),
-                error_context,
-            );
-            None
-        }
-    }
+    None
 }
 
-/// Finalize a ticket given an already-obtained `git status --porcelain` output.
-async fn finalize_ticket_with_git_status(
-    ticket: Ticket,
-    ws: Workspace,
-    source: TicketPhase,
-    porcelain: &str,
-) {
-    let repo_path = ws.as_path();
+/// Shared sanitation finalize tail: clear the implementation roster and
+/// finalize the ticket at Done via its git status. A Done transition that
+/// declines — the ticket was moved externally (a cancel), or the transition
+/// errored — is not a round failure and is not stopped here.
+///
+/// `Err` carries the full failure chain (including the git process output) when
+/// the repository state could not be read or the commit failed — the caller
+/// stops the round. `Ok(())` means the finalize ran to its end: the Done
+/// transition was attempted, with or without a commit (a clean tree and a
+/// workspace without a repository move to Done without one).
+async fn finalize_sanitation_ticket(
+    ticket: &Ticket,
+    ws: &Workspace,
+    job_id: &str,
+) -> Result<(), String> {
+    clear_implementation_roster(&crate::session::store().conn, job_id, &ticket.id).await;
+    let phase = TicketPhase::InSanitation;
+
+    if let Some(reason) = missing_repo_reason(ws).await {
+        transition_ticket_to_done_no_comment(ticket, phase, reason).await;
+        return Ok(());
+    }
+
+    let porcelain = run_git_status(ws.as_path())
+        .await
+        .map_err(|e| format!("{e:#}"))?;
 
     if porcelain.trim().is_empty() {
         transition_ticket_to_done_no_comment(
-            &ticket,
-            source,
+            ticket,
+            phase,
             "Clean working tree — moving to Done without commit",
         )
         .await;
-        return;
+        return Ok(());
     }
 
-    match crate::git::commands::run_git_commit(repo_path, &ticket.title).await {
+    match crate::git::commands::run_git_commit(ws.as_path(), &ticket.title).await {
         Ok(commit_info) => {
             // A pipeline auto-commit is a ref-only change the file watcher
             // never reports, so notify the GUI to refresh the footer promptly
             // instead of waiting for the periodic remote timer.
-            crate::git::commands::notify_git_commit(repo_path);
-            finalize_commit_and_transition(&ticket, commit_info, source).await;
+            crate::git::commands::notify_git_commit(ws.as_path());
+            finalize_commit_and_transition(ticket, commit_info, phase).await;
+            Ok(())
         }
-        Err(e) => {
-            error!(
-                ticket = %ticket.id,
-                error = %e,
-                "Commit failed — staying in {} for retry",
-                source.as_ref(),
-            );
-        }
+        Err(e) => Err(format!("{e:#}")),
     }
 }
 
-/// Shared sanitation finalize tail: clear the implementation roster and
-/// finalize the ticket at Done via its git status. A `None` status (git
-/// unavailable → ticket moved to Done without commit; transient status
-/// failure → ticket stays in phase for retry) simply returns.
-async fn finalize_sanitation_ticket(ticket: Ticket, ws: &Workspace, job_id: &str) {
-    clear_implementation_roster(&crate::session::store().conn, job_id, &ticket.id).await;
-    let Some(porcelain) =
-        ensure_git_or_done_and_get_status(&ticket, ws, TicketPhase::InSanitation, "finalize").await
-    else {
-        return;
-    };
-    finalize_ticket_with_git_status(ticket, ws.clone(), TicketPhase::InSanitation, &porcelain)
-        .await;
+/// The round's tail: finalize the ticket at Done, or stop the round when the
+/// repository state could not be read or the commit failed. Stopping is the
+/// shared technical-failure path — a round that cannot finish must never leave
+/// its phase job behind for the puller to re-drive.
+async fn finish_or_stop(ticket: &Ticket, ws: &Workspace, job_id: &str) {
+    if let Err(cause) = finalize_sanitation_ticket(ticket, ws, job_id).await {
+        stop_sanitation_round(ticket, ws, job_id, &cause).await;
+    }
+}
+
+/// Stop a sanitation round that could not finish: the full cause in the log and
+/// in a ticket comment, the workspace frozen, the phase job deleted. The ticket
+/// stays in `InSanitation` and the round is replayed from scratch once the
+/// workspace is unpaused — the uncommitted changes are preserved.
+async fn stop_sanitation_round(ticket: &Ticket, ws: &Workspace, job_id: &str, cause: &str) {
+    error!(
+        ticket = %ticket.id,
+        error = %cause,
+        "Sanitation round could not finish — stopping the round and freezing the workspace"
+    );
+    let detail = crate::util::failure_detail(cause, "sanitation failure");
+    let comment = substitute(
+        &load_prompt("pipeline/sanitation_stop_comment.md"),
+        &[("{{failure_details}}", &detail)],
+    );
+
+    // Read before the freeze lands: `reset_phase_attempt` reports whether THIS
+    // stop paused the workspace, so an already-set flag means the freeze is not
+    // this failure's (a human pause, or a failure stop on another ticket) and
+    // still has to be described in the notice. The notice itself is never
+    // suppressed: a stop cannot repeat inside one freeze episode (it deletes the
+    // phase job and the freeze holds the poll gate), so the cause always reaches
+    // the Manager.
+    let was_frozen = matches!(
+        crate::workspace::store().get_by_name(&ws.name).await,
+        Ok(Some(live)) if live.paused
+    );
+
+    let pause_occurred = reset_phase_attempt(
+        ticket,
+        TicketPhase::InSanitation,
+        job_id,
+        "sanitation failure",
+        &comment,
+    )
+    .await;
+
+    let content = substitute(
+        &load_prompt("pipeline/sanitation_stop_notification.md"),
+        &[
+            ("{{ticket_id}}", &ticket.id),
+            ("{{failure_details}}", &detail),
+            (
+                "{{workspace_status}}",
+                &pause_status_sentence(pause_occurred || was_frozen),
+            ),
+        ],
+    );
+    notify_manager_system(&ws.name, content);
 }
 
 /// After a successful `git commit`, persist the metadata and transition the
@@ -269,15 +298,26 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
             // No new/untracked files — skip the sanitation agent entirely and
             // commit straight to Done (no bounce budget consumed). The skip is
             // silent in ticket history.
-            finalize_sanitation_ticket((*ticket).clone(), &ws, job_id).await;
+            finish_or_stop(&ticket, &ws, job_id).await;
             return;
         }
         Ok(files) => files.join("\n"),
         Err(e) => {
+            let Some(reason) = missing_repo_reason(&ws).await else {
+                // A genuine repository-state read failure: stop the round rather
+                // than let the agent inspect a placeholder list and commit the
+                // tree uninspected.
+                stop_sanitation_round(&ticket, &ws, job_id, &format!("{e:#}")).await;
+                return;
+            };
+            // No usable repository: keep the dedicated silent Done fallback —
+            // the agent round proceeds without a file list and the finalize
+            // then moves the ticket to Done without a commit.
             warn!(
                 ticket = %ticket.id,
                 error = %e,
-                "Failed to list untracked files — proceeding with empty list",
+                reason,
+                "Failed to list untracked files — proceeding without a file list",
             );
             String::from("(could not list untracked files)")
         }
@@ -321,7 +361,7 @@ async fn process_sanitation_verdict(
         {
             warn!(ticket = %ticket.id, error = %e, "Failed to record sanitation pass comment");
         }
-        finalize_sanitation_ticket(ticket.clone(), ws, job_id).await;
+        finish_or_stop(ticket, ws, job_id).await;
     } else {
         let garbage_list = verdict.garbage_files.join("\n- ");
         let comment = substitute(

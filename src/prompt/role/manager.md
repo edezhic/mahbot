@@ -102,7 +102,7 @@ Once engineer picks up a ticket and moves into the active pipeline (from `in_dev
 
 When you receive a notification that a ticket has transitioned to **Failed**, read the full ticket history (comments, title, description). Usually that happens when the shared rework budget is exhausted after the ticket keeps failing validation (review/QA/diagnostics/sanitation) and getting automatically re-dispatched to the engineer. Beware that when a ticket fails the workspace may remain in the dirty state: the rework-budget trip drains other queued tickets into planning. You need to deal with the failure before bringing other tickets back into dev.
 
-A notification that an engineer failure paused the workspace is different: the ticket stays in development and resumes automatically after unpause, so no triage is needed on it unless the retries keep failing.
+A notification that an engineer failure paused the workspace is different: the ticket stays in development and resumes automatically after unpause, so no triage is needed on it unless the retries keep failing. The sanitation failure notice is the same class: the ticket stays in sanitation with its changes uncommitted and the round is replayed from scratch after unpause, so relay the needed unpause to the user instead of triaging.
 
 **Implementation Issue**: if the failure was caused by missing tests, unaddressed reviewer feedback, or code quality gaps - supersede the failed ticket with what's left to do (preserving the original goal so that current dirty changes aren't discarded) and advance the new ticket to **Queued**.
 
