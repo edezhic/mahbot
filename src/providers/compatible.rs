@@ -736,19 +736,15 @@ impl OpenAiCompatibleProvider {
 
         // OpenRouter provider preferences — OpenRouter-only:
         // the block has no meaning outside OpenRouter, so it is never sent to
-        // custom endpoints. Per-request `data_collection: allow` overrides the
-        // account-level strict privacy default so data-collecting paid endpoints
-        // remain reachable; optional routing fields are merged into the same
-        // object when configured.
-        if crate::config::is_default_endpoint(&self.base_url) {
-            let mut provider = request
+        // custom endpoints. It carries the pinned provider order with fallbacks
+        // disabled, and is only assembled when an order is configured.
+        if crate::config::is_default_endpoint(&self.base_url)
+            && let Some(provider) = request
                 .provider_order
                 .as_deref()
                 .and_then(provider_routing_json)
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default();
-            provider.insert("data_collection".to_string(), serde_json::json!("allow"));
-            extra.insert("provider".to_string(), serde_json::Value::Object(provider));
+        {
+            extra.insert("provider".to_string(), provider);
         }
 
         // Reasoning effort — model-family-aware for custom endpoints.
@@ -1215,7 +1211,8 @@ mod tests {
 
     /// Provider routing is OpenRouter-only: asserted on
     /// the serialized request body at the builder choke point — the block is
-    /// sent for the default endpoint and suppressed for a custom endpoint,
+    /// sent for the default endpoint when an order is configured, suppressed
+    /// entirely when it is not, and suppressed for a custom endpoint,
     /// while `reasoning_effort` is sent unchanged to the default endpoint and
     /// translated per model family on custom endpoints.
     #[test]
@@ -1224,9 +1221,9 @@ mod tests {
         request.provider_order = Some("deepseek".to_string());
         request.reasoning_effort = Some("xhigh".to_string());
 
-        let body = |p: &OpenAiCompatibleProvider| {
+        let body = |p: &OpenAiCompatibleProvider, request: &ProviderChatRequest| {
             let req = p
-                .build_http_request_with_client(p.http_client(), &request)
+                .build_http_request_with_client(p.http_client(), request)
                 .build()
                 .expect("request builds");
             String::from_utf8(
@@ -1245,7 +1242,7 @@ mod tests {
             crate::config::DEFAULT_PROVIDER_ENDPOINT,
             Some("sk-or"),
         );
-        let or_body = body(&or_provider);
+        let or_body = body(&or_provider, &request);
         assert!(
             or_body.contains("\"provider\""),
             "default endpoint must send the provider block: {or_body}"
@@ -1255,38 +1252,17 @@ mod tests {
             "routing order must be inside the block: {or_body}"
         );
         assert!(
-            or_body.contains("\"data_collection\":\"allow\""),
-            "default endpoint must override account privacy with data_collection allow: {or_body}"
-        );
-        assert!(
             or_body.contains("xhigh"),
             "reasoning_effort must be sent to the default endpoint: {or_body}"
         );
 
-        // Default endpoint without routing still sends data_collection allow.
+        // Default endpoint without routing sends no provider block at all.
         let mut no_routing = test_request(vec![ChatMessage::user("hello")], None);
         no_routing.provider_order = None;
-        let no_routing_body = {
-            let req = or_provider
-                .build_http_request_with_client(or_provider.http_client(), &no_routing)
-                .build()
-                .expect("request builds");
-            String::from_utf8(
-                req.body()
-                    .expect("full body")
-                    .as_bytes()
-                    .expect("bytes")
-                    .to_vec(),
-            )
-            .expect("utf8 body")
-        };
+        let no_routing_body = body(&or_provider, &no_routing);
         assert!(
-            no_routing_body.contains("\"data_collection\":\"allow\""),
-            "default endpoint must send data_collection allow even without routing: {no_routing_body}"
-        );
-        assert!(
-            !no_routing_body.contains("\"order\""),
-            "no routing order when provider_order is unset: {no_routing_body}"
+            !no_routing_body.contains("\"provider\""),
+            "no provider block when provider_order is unset: {no_routing_body}"
         );
 
         // Custom endpoint → routing block suppressed; reasoning_effort is
@@ -1294,7 +1270,7 @@ mod tests {
         // The 'test' model matches no family → fallback → xhigh→max.
         let custom_provider =
             OpenAiCompatibleProvider::new("Custom endpoint", "http://localhost:8080/v1", None);
-        let custom_body = body(&custom_provider);
+        let custom_body = body(&custom_provider, &request);
         assert!(
             !custom_body.contains("\"provider\""),
             "custom endpoint must not receive the OpenRouter routing block: {custom_body}"
