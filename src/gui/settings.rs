@@ -2141,24 +2141,16 @@ impl SettingsState {
                         .into()
                     };
 
-                let mut segment = row![
+                let segment = row![
                     text(&user.name)
                         .size(theme::TEXT_14)
-                        .color(theme::TEXT_PRIMARY)
+                        .color(theme::TEXT_PRIMARY),
+                    telegram_elem,
                 ]
                 .spacing(theme::SPACE_8)
                 .align_y(Alignment::Center);
-                // The account kind, derived from the name — the name is the only
-                // admin marker the product stores.
-                segment = segment.push(
-                    text(if is_admin { "admin" } else { "guest" })
-                        .size(theme::TEXT_12)
-                        .color(theme::TEXT_SECONDARY),
-                );
 
-                let mut card_body = Column::new()
-                    .spacing(theme::SPACE_2)
-                    .push(segment.push(telegram_elem));
+                let mut card_body = Column::new().spacing(theme::SPACE_2).push(segment);
                 // The admin holds the whole tool catalogue implicitly, so a
                 // grant line on the card would misstate what they can call.
                 if !is_admin {
