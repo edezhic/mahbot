@@ -1226,7 +1226,9 @@ async fn save_generated_file(
         })?;
 
     if matches!(stripped, Cow::Owned(_)) {
-        tracing::info!(
+        // Debug: one record per generated image — the strip running is the normal
+        // case, not a finding the log store or the issues view needs.
+        tracing::debug!(
             path = %output_path.display(),
             "Stripped AI-provenance metadata from a generated image artifact"
         );

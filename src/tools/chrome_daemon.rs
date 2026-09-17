@@ -125,7 +125,7 @@ const SWEEP_TOTAL_BUDGET: Duration = Duration::from_secs(15);
 /// (a healthy host converges in 3 rounds; a retried failed close needs 4–5).
 const SWEEP_MAX_ROUNDS: u32 = 5;
 
-/// Classified cause for a failed health check. Drives cause-specific warnings
+/// Classified cause for a failed health check. Drives cause-specific records
 /// and decides whether auto-recovery can help at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeFailure {
@@ -279,11 +279,11 @@ struct DaemonHealth {
     /// sustained-health reset clears them, so down messaging stays honest.
     launch_outcome: Option<ChromeLaunchOutcome>,
     /// Last classified failure — surfaces the cause in LLM-facing
-    /// messages and drives transition-based warning logging.
+    /// messages and drives transition-based reporting.
     last_failure: Option<ProbeFailure>,
-    /// The failure cause the last transition-based warning named — reset on
-    /// recovery so the same cause warns again after a healthy spell.
-    last_cause_warned: Option<ProbeFailure>,
+    /// The failure cause the last transition-based record named — reset on
+    /// recovery so the same cause is reported again after a healthy spell.
+    last_cause_reported: Option<ProbeFailure>,
     /// Start of the current sustained-healthy streak — the restart budget
     /// resets only once this reaches [`SUSTAINED_HEALTHY_WINDOW`]; any failure
     /// aborts the streak.
@@ -333,7 +333,7 @@ impl DaemonHealth {
                 // Sustained health — open a fresh bounded cycle for both budgets.
                 self.restart_budget.reset();
                 self.launch_budget.reset();
-                self.last_cause_warned = None;
+                self.last_cause_reported = None;
             }
             if seed_window && self.healthy_since.is_none() {
                 self.healthy_since = Some(now);
@@ -2152,14 +2152,16 @@ fn spawn_chrome_detached(binary: &Path) -> std::io::Result<()> {
     cmd.spawn().map(|_| ())
 }
 
-/// Warn once per cause transition — an ongoing failure does not spam every
-/// watchdog interval, but the same cause warns again after a healthy spell.
-fn warn_transition(failure: ProbeFailure) {
+/// Report the cause once per transition — an ongoing failure does not spam every
+/// watchdog interval, but the same cause is reported again after a healthy
+/// spell. Severity is per cause: the wedge record is informational (the restart
+/// it announces is automatic), every other cause is a warning.
+fn report_cause(failure: ProbeFailure) {
     let mut h = health().lock().unwrap_poison();
-    if h.last_cause_warned == Some(failure) {
+    if h.last_cause_reported == Some(failure) {
         return;
     }
-    h.last_cause_warned = Some(failure);
+    h.last_cause_reported = Some(failure);
     match failure {
         ProbeFailure::NotInstalled => warn!(
             "chrome-use extension or native host is not installed — the browser \
@@ -2210,8 +2212,11 @@ fn warn_transition(failure: ProbeFailure) {
              debugger attach; about:blank tabs are never re-attached) — close the leftover \
              tab in Chrome to unblock the session"
         ),
+        // Informational: the restart it announces is automatic and this cause is
+        // deduplicated per transition, so a self-cleared wedge should not sit in
+        // the issues view — a failed restart and an exhausted budget still do.
         ProbeFailure::DaemonWedge => {
-            warn!("chrome daemon is unresponsive — restarting it (bounded backoff).");
+            info!("chrome daemon is unresponsive — restarting it (bounded backoff).");
         }
     }
 }
@@ -2244,7 +2249,7 @@ fn log_gate_denied(gate: RecoveryGate, noun: &str, max: u32) {
 /// fix and never consume restart attempts. A transient relay drop is waited out
 /// first and consumes no attempt if it self-heals.
 async fn attempt_recovery(mut failure: ProbeFailure) {
-    warn_transition(failure);
+    report_cause(failure);
     // Unfixable causes stop here — they never consume restart attempts.
     if failure.is_unfixable() {
         return;
@@ -2281,9 +2286,9 @@ async fn attempt_recovery(mut failure: ProbeFailure) {
                 return;
             }
             ProbeOutcome::Down(f) => {
-                // Re-classified (e.g. now a wedge or a closed browser) — re-warn
-                // and re-gate below.
-                warn_transition(f);
+                // Re-classified (e.g. now a wedge or a closed browser) — re-report
+                // the cause and re-gate below.
+                report_cause(f);
                 if f.is_unfixable() {
                     return;
                 }

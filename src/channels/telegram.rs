@@ -2310,7 +2310,9 @@ impl TelegramChannel {
             let err = resp.text().await?;
             anyhow::bail!("Telegram {api_method} failed: {err}");
         }
-        tracing::info!("Telegram {api_method} sent to {chat_id}: {label}");
+        // Debug: one record per successfully delivered attachment — routine traffic
+        // on a path whose failures are reported separately, at warn.
+        tracing::debug!("Telegram {api_method} sent to {chat_id}: {label}");
         Ok(())
     }
 
