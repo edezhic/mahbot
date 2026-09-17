@@ -44,6 +44,8 @@ use anyhow::{Result, anyhow};
 use qwen_asr::context::QwenModel;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "voice-tests")]
+use crate::audio::wake_capture;
 use crate::vector::cosine_similarity;
 
 // ── Constants ────────────────────────────────────────────────────────────
@@ -170,6 +172,9 @@ pub(crate) fn encode_window(model: &QwenModel, samples: &[f32]) -> Result<Vec<f3
         .ok_or_else(|| anyhow!("encoder forward failed for {mel_frames}-frame window"))?;
     debug_assert!(total_tokens <= MAX_TOKENS_PER_CHUNK);
 
+    #[cfg(feature = "voice-tests")]
+    wake_capture::on_window_tokens(&features, total_tokens, model.config.enc_output_dim);
+
     // ── Mean-pool tokens → window embedding ──
     let output_dim = model.config.enc_output_dim;
     let mut pooled = vec![0.0f32; output_dim];
@@ -200,7 +205,7 @@ pub(crate) fn l2_normalize(v: &[f32]) -> Vec<f32> {
 }
 
 /// L2-normalize a vector in place (no-op for zero/empty vectors).
-fn l2_normalize_in_place(v: &mut [f32]) {
+pub(crate) fn l2_normalize_in_place(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-8 {
         let inv = 1.0 / norm;

@@ -85,6 +85,12 @@ pub fn run_wake_word_benchmark() {
     voice_pipeline_e2e_test::run_wake_word_benchmark();
 }
 
+/// Offline analyser entry point, called by `benches/wake_analysis.rs`.
+#[cfg(feature = "voice-tests")]
+pub fn run_wake_analysis() {
+    crate::audio::wake_analysis::run();
+}
+
 // Constants
 
 /// Target sample rate: 16 kHz mono.
@@ -3809,6 +3815,9 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
                     if _rolling_sum > ctx.instrumentation.peak_score {
                         ctx.instrumentation.peak_score = _rolling_sum;
                     }
+                    // Bench capture: the product's own per-window statistic
+                    // (the rolling sum it compares against its decision level).
+                    crate::audio::wake_capture::on_window_scored(_rolling_sum);
                 }
 
                 if detected {
