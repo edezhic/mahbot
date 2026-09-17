@@ -877,23 +877,28 @@ fn check_words(
 
     // Effective command: strip shell prefixes and env assignments for the
     // blocklist dispatch.
-    let first_word = super::first_command_word(&segment).to_string();
-    if first_word.is_empty() {
+    let Some((cmd_idx, first_word, cmd_words)) = super::command_word_from_segment(&segment) else {
         return Ok(());
-    }
+    };
+    // A path-spelled verb dispatches on its derived basename (`'/usr/bin/git'`
+    // routes like `git`), but a variable is only ever resolved from the RAW
+    // spelling of the word: a balanced single-quoted word is a literal command
+    // name and never a reference (`'$BIN'` names a command spelled `$BIN`).
+    let first_word = first_word.to_string();
+    let verb_raw = cmd_words[cmd_idx].to_string();
     let first_word = match classify_verb_word(&first_word) {
         VerbClass::Literal(v) => v.to_string(),
-        VerbClass::Unprovable => match resolve_var_command_word(&first_word, state) {
+        VerbClass::Unprovable => match resolve_var_command_word(&verb_raw, state) {
             Some(resolved) => {
                 // `env HOME=/tmp/x "$BIN" ...`: site 1 saw a literal forwarding
                 // prefix and never hit the variable. Rewrite the variable word
                 // so the git/mutator/flag predicates (which scan `segment`) see
                 // the literal verb, then re-derive the dispatch basename from
                 // the rebuilt segment. The word is located by the exact
-                // spelling `classify_verb_word` rejected; if it cannot be found
-                // (e.g. a basename-normalized first_word), reject fail-closed
-                // rather than dispatch on a partially rewritten segment.
-                match words.iter().position(|w| *w == first_word) {
+                // spelling `classify_verb_word` rejected; if it cannot be found,
+                // reject fail-closed rather than dispatch on a partially
+                // rewritten segment.
+                match words.iter().position(|w| *w == verb_raw) {
                     Some(idx) => {
                         segment = segment_with_word_replaced(words, idx, &resolved);
                         super::first_command_word(&segment).to_string()
@@ -2738,7 +2743,7 @@ fn loop_var_binding(words: &[String], state: &ValidationState) -> Option<VarBind
 /// quoting, escapes, substitutions — the guard cannot prove what the word
 /// resolves to without full shell word-expansion modeling).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum VerbClass<'a> {
+pub(super) enum VerbClass<'a> {
     Literal(&'a str),
     Unprovable,
 }
@@ -2948,12 +2953,28 @@ fn scan_time_operand_head<'a>(words: &[&'a str], mut i: usize) -> (usize, Vec<&'
 /// Classify a verb word as provably literal or unprovable.
 ///
 /// A balanced-quoted word (`"cd"`, `'cd'`) is literal (the shell concatenates
-/// nothing and the quoted content is the command name). Anything with `$`
-/// (variables, `$(...)`, ANSI-C `$'...'`), backslashes, brace-expansion
-/// metacharacters (`{touch,}` expands to `touch` — an unmodeled word list),
-/// or quote characters outside a balanced pair (`"c"d`, `c'd'`) cannot be
-/// normalized without full word-expansion modeling — unprovable, fail-closed.
-fn classify_verb_word(w: &str) -> VerbClass<'_> {
+/// nothing and the quoted content is the command name), and inside single
+/// quotes nothing expands at all — `'/opt/Doe, John$/bin/mahbot'` IS that path
+/// — so a balanced SINGLE-quoted word is literal down to its metacharacters.
+/// Anything else with `$` (variables, `$(...)`, ANSI-C `$'...'`), backslashes,
+/// brace-expansion metacharacters (`{touch,}` expands to `touch` — an unmodeled
+/// word list), or quote characters outside a balanced pair (`"c"d`, `c'd'`)
+/// cannot be normalized without full word-expansion modeling — unprovable,
+/// fail-closed.
+///
+/// Shared with [`super::command_word_basename`]: the guard's dispatch and the
+/// profile/basename derivation must agree on what a literal command name is.
+pub(super) fn classify_verb_word(w: &str) -> VerbClass<'_> {
+    // Unix-only, like the engine rewrite this arm serves: elsewhere the
+    // accept-set must stay exactly as it was.
+    #[cfg(unix)]
+    if let Some((content, true)) = scan::strip_outer_quotes(w) {
+        return if content.is_empty() {
+            VerbClass::Unprovable
+        } else {
+            VerbClass::Literal(content)
+        };
+    }
     if w.contains(['$', '\\', '{', '}', ',']) {
         return VerbClass::Unprovable;
     }
@@ -4586,17 +4607,18 @@ fn matches_mutation_token(word: &str, tokens: &[&str]) -> bool {
 ///
 /// Skips leading environment variable assignments, the `git` command word,
 /// global flags and their values, and collects all remaining words as the
-/// subcommand.
+/// subcommand. The command word is reduced to its basename through
+/// [`super::command_word_basename`] plus a residual quote strip, so every
+/// quoted path spelling (`'/usr/bin/git' status`, `/usr/bin/'git' status`)
+/// resolves to the same subcommand as the plain one: a mangled basename here
+/// yields an empty subcommand, which [`check_git_segment`] reads as "no git
+/// command" and returns early on.
 fn extract_git_subcommand(segment: &str) -> String {
     let words = scan::split_words_keeping_substitutions(segment);
     let Some(git_idx) = super::find_first_command_word_index(&words) else {
         return String::new();
     };
-    let git_word = words[git_idx]
-        .rsplit('/')
-        .next()
-        .expect("rsplit always yields at least one element");
-    let git_word = scan::strip_quoted_word(git_word);
+    let git_word = scan::strip_quoted_word(super::command_word_basename(words[git_idx]));
     if git_word != "git" {
         return String::new();
     }
@@ -6284,9 +6306,12 @@ mod tests {
             ("/usr/bin/git -C /tmp status", true), // -C repo redirect now allowed
             ("./git init", false),
             ("./git log", true),
-            // quoted git and quotes inside the final path component are
-            // rejected fail-closed: bare forms at the verb gate, prefix-
-            // forwarded forms via git-layer validation
+            // quoted git spellings and quotes inside the final path component
+            // are rejected fail-closed, by different layers: a fully quoted
+            // bare word is unquoted and hits the git-layer subcommand rules,
+            // while an interior quote in a bare path word is unprovable at the
+            // verb gate (prefix-forwarded forms dispatch on the derived
+            // basename — the rows below)
             ("'git' init", false),
             ("/usr/bin/'git' init", false),
             ("sudo /usr/bin/'git' reset --hard", false),
@@ -6298,6 +6323,41 @@ mod tests {
             ("env /usr/bin/git push", false),
             // combined short-flag cluster through the same gate
             ("/usr/bin/git branch -df feature", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// A shell-quoted command word must dispatch on its basename exactly like
+    /// the unquoted spelling. This is what lets a read-only role run the grep
+    /// engine's self-generated rewrite, whose verb is always a quoted absolute
+    /// executable path; the widening is exactly that equivalence, so a mutating
+    /// verb stays gated whichever way its path is spelled, and a quote *inside*
+    /// the path stays rejected fail-closed.
+    #[cfg(unix)]
+    #[test]
+    fn quoted_absolute_verb_paths_dispatch_on_the_basename() {
+        let cases = [
+            ("'/opt/mahbot/bin/mahbot' --version", true),
+            ("\"/opt/mahbot/bin/mahbot\" --version", true),
+            // Install paths the engine's `shell_quote` must quote: a space, and
+            // characters only single quotes make literal. These are the rows
+            // read-only grep serving depends on.
+            (
+                "'/opt/mahbot dir/bin/mahbot' __grep-engine '{\"x\":1}'",
+                true,
+            ),
+            ("'/Users/Doe, John$/bin,1/mahbot' --version", true),
+            ("'/bin/ls' -la", true),
+            ("'/usr/bin/git' log", true),
+            ("'/usr/bin/git' reset --hard", false), // mutating git: still gated
+            ("'/bin/rm' -rf /__mahbot_readonly_test_ws__", false), // workspace write: still gated
+            ("'/bin/rm' -rf /tmp/x", true),         // same verdict as `/bin/rm -rf /tmp/x`
+            // Quote inside the path component (including the `'\''` form the
+            // shell writes for an apostrophe): rejected fail-closed, accepted
+            // residual — the guard is not contorted for it.
+            ("'/usr/bin/'git' status", false),
+            (r"'/opt/it'\''s/mahbot' --version", false),
         ];
 
         run_cases(&cases);
@@ -6345,9 +6405,12 @@ mod tests {
                 false,
             ),
             ("for f in a b; do \"$f\"; done", false), // loop vars are not bound
-            // single quotes are literal text — `'$BIN'` names a command
-            // literally spelled `$BIN`, nothing to resolve
+            // single quotes are literal text, so `'$BIN'` is not a variable
+            // reference and stays rejected fail-closed — including when a word
+            // spelled `$BIN` follows it: the raw spelling is the resolution
+            // source, so a look-alike argument cannot be resolved by mistake
             ("BIN=git; '$BIN' status", false),
+            ("BIN=git; '$BIN' $BIN status", false),
         ];
 
         run_cases(&cases);

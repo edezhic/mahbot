@@ -1147,7 +1147,7 @@ impl ShellTool {
                 // The rewrite was produced but ReadOnly validation rejected it —
                 // the whole command ran real grep. Per-member skip reasons
                 // describe the analysis, not why real grep ran.
-                "rewrite not applied"
+                "read-only guard rejected rewrite"
             } else if applied {
                 grep_serve
                     .outcomes
@@ -1156,13 +1156,13 @@ impl ShellTool {
                     .map(|o| o.reason.as_str())
                     .unwrap_or_default()
             } else {
-                // Engine unavailable / spec too large: the outcomes already
-                // carry the concrete reason.
+                // No rewrite at all (engine unavailable / spec too large / only
+                // skipped members): the outcomes carry the concrete reason.
                 grep_serve
                     .outcomes
                     .iter()
                     .find(|o| !o.reason.is_empty())
-                    .map_or("rewrite not applied", |o| o.reason.as_str())
+                    .map_or("no rewrite produced", |o| o.reason.as_str())
             };
             let shape = grep_serve.telemetry_shape(served);
             let mode = match self.mode {
@@ -1472,14 +1472,25 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> String {
-        match self.mode {
-            ShellMode::ReadOnly => {
-                let banner = crate::prompt::load_prompt("tool/shell_readonly_banner.md");
-                let base = crate::prompt::load_prompt(&format!("tool/{}.md", self.name()));
-                format!("{banner}\n\n{base}")
-            }
-            ShellMode::Full => crate::prompt::load_prompt("tool/shell_full.md"),
-        }
+        // The base description and the grep-engine disclosure are shared
+        // verbatim between the modes (a single copy each, so the two
+        // descriptions cannot drift); only the read-only banner and the
+        // full-mode sections are mode-specific.
+        let base = crate::prompt::load_prompt("tool/shell.md");
+        let notes = crate::prompt::load_prompt("tool/shell_grep_notes.md");
+        let sections: [String; 3] = match self.mode {
+            ShellMode::ReadOnly => [
+                crate::prompt::load_prompt("tool/shell_readonly_banner.md"),
+                base,
+                notes,
+            ],
+            ShellMode::Full => [
+                base,
+                crate::prompt::load_prompt("tool/shell_full.md"),
+                notes,
+            ],
+        };
+        sections.map(|s| s.trim_end().to_owned()).join("\n\n")
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1994,25 +2005,42 @@ pub(super) fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
 /// shift the command word onto a substitution's inner word and skip the
 /// mutator/git/cargo dispatch), finds the first non-prefix/non-flag/non-env
 /// word index via [`find_first_command_word_index`], and extracts the
-/// basename from it. Returns `None` when no command word is found (e.g., only
-/// prefixes/flags/env assignments).
+/// basename from it (see [`command_word_basename`]). Returns `None` when no
+/// command word is found (e.g., only prefixes/flags/env assignments).
 fn command_word_from_segment(segment: &str) -> Option<(usize, &str, Vec<&str>)> {
     let trimmed = segment.trim();
     let words = scan::split_words_keeping_substitutions(trimmed);
     let idx = find_first_command_word_index(&words)?;
-    let cmd = words[idx]
-        .rsplit('/')
+    Some((idx, command_word_basename(words[idx]), words))
+}
+
+/// Basename of a command word, for the blocklist/git/profile dispatch.
+///
+/// Balanced quotes are not part of the name, so the split runs on the literal
+/// spelling rather than the raw one — otherwise the split leaves a stray quote
+/// in the basename (`'/opt/mahbot/bin/mahbot'` → `mahbot'`) and the verb
+/// classifiers read the result as unprovable. An unprovable word keeps its raw
+/// spelling: it is no literal name anyway, and the guard resolves a variable
+/// command word by exact spelling (`"$BIN"` must stay `"$BIN"`).
+pub(super) fn command_word_basename(word: &str) -> &str {
+    // Unix-only, like the classifier arm this consumes (see
+    // `classify_verb_word`): elsewhere the raw spelling is split, as before.
+    #[cfg(unix)]
+    let word = match readonly::classify_verb_word(word) {
+        readonly::VerbClass::Literal(content) => content,
+        readonly::VerbClass::Unprovable => word,
+    };
+    word.rsplit('/')
         .next()
-        .expect("rsplit always yields at least one element");
-    Some((idx, cmd, words))
+        .expect("rsplit always yields at least one element")
 }
 
 /// Extract just the first command word (basename) from a shell segment.
 ///
-/// Strips shell prefixes, environment variable assignments (`KEY=value`),
-/// and absolute paths, but stops before any subcommand detection.
-/// This is the lightweight alternative to [`canonical_command`] for callers
-/// that only need the command name (e.g., `check_segment`).
+/// Strips shell prefixes, environment variable assignments (`KEY=value`), and
+/// absolute paths, but stops before any subcommand detection. This is the
+/// lightweight alternative to [`canonical_command`] for callers that only need
+/// the command name (e.g., the read-only guard's verb dispatch).
 pub(super) fn first_command_word(segment: &str) -> &str {
     let Some((_, cmd, _)) = command_word_from_segment(segment) else {
         return "";
@@ -2040,7 +2068,8 @@ fn canonical_command(segment: &str) -> String {
     }
 
     // Skip flags between command and subcommand using shared helper
-    // cmd is the bare basename (rsplit('/').next()), so == comparison is safe.
+    // cmd is the bare basename (quotes stripped, then rsplit('/').next()),
+    // so == comparison is safe.
     let is_git = cmd == "git";
     if let Some(sub_idx) = find_first_non_flag_index(remaining, is_git) {
         format!("{} {}", cmd, remaining[sub_idx])
@@ -3842,9 +3871,8 @@ mod tests {
 
     #[test]
     fn full_description_and_schema_cover_background_capability() {
-        // The Full variant gets its own prompt asset and extended argument
-        // schema describing the background capability; ReadOnly keeps the
-        // read-only prompt byte-identical.
+        // The Full variant gets its own prompt asset and an extended argument
+        // schema describing the background capability.
         let full = ShellTool::new(ShellMode::Full);
         let description = full.description();
         assert!(
@@ -3873,6 +3901,22 @@ mod tests {
         assert_eq!(
             props["background"]["default"], false,
             "background must default to false"
+        );
+    }
+
+    /// The read-only variant shares the base description and the grep-engine
+    /// disclosure with Full, but must not advertise the full-only background
+    /// capability (it has no `background` argument).
+    #[test]
+    fn read_only_description_covers_grep_notes_without_background_capability() {
+        let description = ShellTool::new(ShellMode::ReadOnly).description();
+        assert!(
+            description.contains("## Grep notes"),
+            "read-only description must carry the grep-engine disclosure"
+        );
+        assert!(
+            !description.contains("Background mode"),
+            "read-only description must not advertise the full-only background capability"
         );
     }
 
@@ -4575,6 +4619,25 @@ mod tests {
                 "canonical_command({input:?})",
             );
         }
+    }
+
+    /// A quoted path spelling profiles like its unquoted twin. Profiles are
+    /// selected from the original command string, so this is what gives an
+    /// agent-written `'/usr/local/bin/cargo' build` the cargo output treatment.
+    #[cfg(unix)]
+    #[test]
+    fn quoted_path_spelling_selects_the_same_profile_as_its_unquoted_twin() {
+        let selected = |command: &str| {
+            let segments = extract_command_segments(command);
+            select_profile(&segments, false)
+                .match_command
+                .as_str()
+                .to_owned()
+        };
+        let quoted = selected("'/usr/local/bin/cargo' build");
+        assert_eq!(quoted, selected("/usr/local/bin/cargo build"));
+        // Non-vacuity: an unrelated command must NOT select that same profile.
+        assert_ne!(quoted, selected("'/usr/local/bin/true' build"));
     }
 
     #[test]

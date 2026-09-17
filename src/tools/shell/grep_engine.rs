@@ -1,5 +1,8 @@
 //! Transparent grep/egrep/fgrep interception for the shell tool, in BOTH
-//! read-only and full modes (the engine itself is inherently read-only).
+//! read-only and full modes (the engine itself is inherently read-only). The
+//! read-only branch re-validates the rewrite through `shell::readonly` before
+//! running it, and the rewrite's verb is a shell-quoted absolute path, so the
+//! guard must accept that spelling for the mode to serve anything at all.
 //!
 //! The shell guard passes commands to a real shell. Grep-family invocations
 //! that can be served are rewritten to a hidden `__grep-engine` subcommand of
@@ -361,8 +364,20 @@ fn lightweight_scan(command: &str) -> (bool, usize, String) {
     (recursive, operand_count, flag_str)
 }
 
-/// Rewrite with an explicit home (subprocess harness uses a fixture home for
-/// `~` operands); production gate (single-file lookups stay on real grep).
+/// Rewrite `command` for a harness-supplied workspace/home. The production
+/// serve gate (`engine_available`) is deliberately bypassed so the parity and
+/// guard harnesses can drive the rewrite directly; the analyser's own
+/// fallbacks still apply, and so does the spec-size cap — enforced here, the
+/// way the production path enforces it in `try_serve_command`.
+#[cfg(any(test, feature = "grep-engine-e2e"))]
+fn served_rewrite(command: &str, workspace_root: &Path, home: &Path) -> Option<String> {
+    let (specs, _, rewritten, _) = analyze_command(command, workspace_root, home, false).ok()?;
+    if specs.is_empty() || !specs.iter().all(spec_json_ok) {
+        return None;
+    }
+    Some(rewritten)
+}
+
 #[cfg(feature = "grep-engine-e2e")]
 #[doc(hidden)]
 #[must_use]
@@ -371,16 +386,7 @@ pub fn grep_engine_rewrite_for_test(
     workspace_root: &Path,
     home: &Path,
 ) -> Option<String> {
-    let (specs, _, rewritten, _) = analyze_command(command, workspace_root, home, false).ok()?;
-    if specs.is_empty() {
-        return None;
-    }
-    for spec in &specs {
-        if !spec_json_ok(spec) {
-            return None;
-        }
-    }
-    Some(rewritten)
+    served_rewrite(command, workspace_root, home)
 }
 
 /// Whether a served spec exercises the parallel recursive directory walk
@@ -3985,6 +3991,39 @@ mod segmenter_pins {
         assert!(
             split_segments("echo a ;; echo b").is_err(),
             "grep: ;; outside case"
+        );
+    }
+}
+
+// ── Read-only serve pin (no feature gate) ───────────────────────────────
+
+#[cfg(all(test, unix))]
+mod read_only_serve_pins {
+    use super::super::readonly::{CheckContext, check_command};
+    use super::*;
+
+    /// Pins the module-header invariant: a generated rewrite must pass the
+    /// read-only guard.
+    #[test]
+    fn generated_rewrite_passes_the_read_only_guard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&ws).expect("ws");
+        fs::create_dir_all(&home).expect("home");
+
+        let rewritten =
+            served_rewrite("grep -rn needle .", &ws, &home).expect("a recursive grep is servable");
+        assert!(rewritten.contains(ENGINE_VERB), "{rewritten}");
+        assert!(
+            rewritten.starts_with('\''),
+            "rewrite quotes the executable path: {rewritten}"
+        );
+
+        let ctx = CheckContext::for_workspace(&ws);
+        assert!(
+            check_command(&rewritten, &ctx).is_ok(),
+            "read-only guard rejected the engine rewrite: {rewritten}"
         );
     }
 }

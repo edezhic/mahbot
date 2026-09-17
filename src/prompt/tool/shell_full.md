@@ -1,5 +1,3 @@
-Execute a shell command. Commands run from the workspace directory. Use when a task needs a command-line operation that is not better handled by read, edit or search. Output is filtered: 1MB hard truncation; generic output shows first/last ~10 lines (max 200) with long lines (>500 chars) shortened; JSON output is replaced with a summary preview; `cargo test` hides passing tests, showing only failures + summary; stderr on success only shows `warning:` and error lines. Large output spills to a temp file with a `[view with: read <path>]` hint — use `read` on that path for full unfiltered output.
-
 ## Background mode
 
 For long-running non-interactive commands (e.g. starting a dev server that must keep running), set `background: true` (default false). The command then keeps running after this tool call returns:
@@ -14,6 +12,4 @@ For long-running non-interactive commands (e.g. starting a dev server that must 
 
 Caveats: output is unbounded — a command that prints forever will fill the temp disk. Prefer commands that write modest output, and tail large outputs via the shell tool (the read tool caps text files at 10 MB). Output files persist in the temp area until the periodic temp cleaner or the OS temp sweep reclaims them (the daemon performs no startup purge).
 
-## Grep notes
-
-Recursive greps (`grep -rn <pat> .`) are served by a fast built-in engine that skips hidden/gitignored content (e.g. `target/`, `.git/`, `node_modules/`) — matches under those paths are not found. To search there, pass an explicit path or `cd` into the subdir. Engine-served recursive greps may also return files in a different order than the system `grep` (parallel walk); the set of matching lines is the same. `background: true` greps are NOT served by the engine (they run on the real system `grep`).
+Background-mode greps are NOT served by the engine — `background: true` runs the real system `grep`, so the Grep notes below do not apply to it.

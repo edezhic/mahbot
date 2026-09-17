@@ -1,0 +1,3 @@
+## Grep notes
+
+Recursive greps (`grep -rn <pat> .`) are served by a fast built-in engine that skips hidden content and everything the ignore rules exclude (e.g. `target/`, `.git/`, `node_modules/`) — `.ignore` files everywhere, and inside a git repository also `.gitignore`, the repository's own `.git/info/exclude` and your global git ignore. Matches under those paths are not found: to search there, pass an explicit path or `cd` into the subdir. Engine-served recursive greps may also return files in a different order than the system `grep` (parallel walk); the set of matching lines is the same.
