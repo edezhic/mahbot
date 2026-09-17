@@ -9,8 +9,10 @@
     clippy::collapsible_if
 )]
 
+pub(crate) mod alarms;
 pub(crate) mod board;
 pub(crate) mod common;
+pub(crate) mod custom_tools;
 pub(crate) mod dialog;
 pub(crate) mod diff;
 pub(crate) mod diff_widget;
@@ -136,21 +138,29 @@ pub enum Page {
     Shell,
     Editor,
     Settings,
+    Alarms,
+    CustomTools,
     /// Live view of running agents and in-flight non-agent LLM work.
     RunningAgents,
 }
 
 impl Page {
-    /// Pages in the sidebar top nav (Home, Editor, Shell) — the Cmd+number
-    /// keyboard map. The top nav renders this list minus the pages
-    /// [`Dashboard::page_available`] excludes; the keyboard map stays fixed.
+    /// Pages in the sidebar top nav — the Cmd+number keyboard map. Membership
+    /// is positional: the shortcut is the page's 1-based index here, and the top
+    /// nav renders this list minus the pages [`Dashboard::page_available`]
+    /// excludes, so the keyboard map stays fixed regardless of what is shown.
     const fn sidebar_pages() -> &'static [Page] {
-        &[Page::Home, Page::Editor, Page::Shell]
+        &[Page::Home, Page::Editor, Page::Shell, Page::Alarms]
     }
 
-    /// Pages in the sidebar bottom nav (Sessions, Logs, Settings) — click-only, no keyboard shortcut.
+    /// Pages in the sidebar bottom nav — click-only, no keyboard shortcut.
     const fn sidebar_bottom_pages() -> &'static [Page] {
-        &[Page::Sessions, Page::Logs, Page::Settings]
+        &[
+            Page::CustomTools,
+            Page::Sessions,
+            Page::Logs,
+            Page::Settings,
+        ]
     }
 
     const fn label(self) -> &'static str {
@@ -161,6 +171,8 @@ impl Page {
             Page::Shell => "Shell",
             Page::Editor => "Editor",
             Page::Settings => "Settings",
+            Page::Alarms => "Alarms",
+            Page::CustomTools => "Custom Tools",
             Page::RunningAgents => "Running Agents",
         }
     }
@@ -358,6 +370,10 @@ pub enum Message {
     Logs(logs::LogMessage),
     Board(board::BoardMessage),
     Sessions(sessions::SessionsMessage),
+    /// Alarms page messages (read-only refresh).
+    Alarms(alarms::AlarmsMessage),
+    /// Custom Tools page messages (read-only refresh).
+    CustomTools(custom_tools::CustomToolsMessage),
     /// Running Agents page messages (manual research-run cancel).
     RunningAgents(running::RunningMessage),
     /// Diff modal overlay (not a page) — wraps [`diff::DiffMessage`].
@@ -597,6 +613,8 @@ pub struct Dashboard {
     logs_state: logs::LogsState,
     board_state: board::BoardState,
     sessions_state: sessions::SessionsState,
+    alarms_state: alarms::AlarmsState,
+    custom_tools_state: custom_tools::CustomToolsState,
     diff_state: diff::DiffState,
     home_state: home::HomeState,
     shell_state: shell::ShellState,
@@ -640,6 +658,8 @@ impl Dashboard {
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
             sessions_state: sessions::SessionsState::new(),
+            alarms_state: alarms::AlarmsState::new(),
+            custom_tools_state: custom_tools::CustomToolsState::new(),
             diff_state: diff::DiffState::new(),
             home_state: home::HomeState::new(),
             shell_state: shell::ShellState::new(),
@@ -814,6 +834,10 @@ impl Dashboard {
                 Task::batch([snap, board_refresh])
             }
             Page::Sessions => sessions::SessionsState::refresh().map(Message::Sessions),
+            // The two read-only pages hold only a polled list, so entering them
+            // starts a read rather than a render of stale entries.
+            Page::Alarms => self.alarms_state.refresh().map(Message::Alarms),
+            Page::CustomTools => self.custom_tools_state.refresh().map(Message::CustomTools),
             Page::Settings => {
                 self.settings_state.refresh();
                 // Workspace list comes from the shared map; only the users
@@ -933,14 +957,14 @@ impl Dashboard {
                     .board_state
                     .update(board::BoardMessage::Escape)
                     .map(Message::Board),
-                // Shell and Running Agents have no escape handling.
+                // Shell, Alarms and Custom Tools have no escape handling.
                 // Running Agents: Escape dismisses the pending research-cancel
                 // confirmation (Keep) — never confirms it.
                 Page::RunningAgents => {
                     self.pending_research_cancel = None;
                     Task::none()
                 }
-                Page::Shell => Task::none(),
+                Page::Shell | Page::Alarms | Page::CustomTools => Task::none(),
                 Page::Logs => self
                     .logs_state
                     .update(
@@ -1184,6 +1208,11 @@ impl Dashboard {
                 self.board_state.update(msg).map(Message::Board)
             }
             Message::Sessions(msg) => self.sessions_state.update(msg).map(Message::Sessions),
+            Message::Alarms(msg) => self.alarms_state.update(msg).map(Message::Alarms),
+            Message::CustomTools(msg) => self
+                .custom_tools_state
+                .update(msg)
+                .map(Message::CustomTools),
             Message::RunningAgents(msg) => self.process_running_message(msg),
             // Intercept CloseModal from successful manual commit — auto-close
             // the diff modal while keeping the diff state in working-tree view.
@@ -1772,6 +1801,8 @@ impl Dashboard {
             }
             Page::Logs => self.logs_state.view().map(Message::Logs),
             Page::Sessions => self.sessions_state.view().map(Message::Sessions),
+            Page::Alarms => self.alarms_state.view().map(Message::Alarms),
+            Page::CustomTools => self.custom_tools_state.view().map(Message::CustomTools),
             Page::Shell => {
                 if self.page_available(Page::Shell) {
                     self.shell_state.view().map(Message::Shell)
@@ -2157,6 +2188,16 @@ impl Dashboard {
                 iced::Subscription::none()
             },
             self.home_state.subscription().map(Message::Home),
+            // The two read-only pages re-read their source while they are open;
+            // the tick is page-gated so a page nobody is looking at reads
+            // nothing.
+            match self.page {
+                Page::Alarms => iced::time::every(common::POLLED_LIST_REFRESH_INTERVAL)
+                    .map(|_| Message::Alarms(alarms::AlarmsMessage::Tick)),
+                Page::CustomTools => iced::time::every(common::POLLED_LIST_REFRESH_INTERVAL)
+                    .map(|_| Message::CustomTools(custom_tools::CustomToolsMessage::Tick)),
+                _ => iced::Subscription::none(),
+            },
             iced::Subscription::run(shutdown_subscription),
             // Git file-change subscription: drives the event-driven local git
             // footer refresh when workspace files change.
@@ -2415,6 +2456,8 @@ fn page_icon(page: Page) -> iced::widget::Text<'static, iced::Theme, iced::Rende
         Page::Editor => lucide::pencil_line::<iced::Theme, iced::Renderer>(),
         Page::Shell => lucide::terminal::<iced::Theme, iced::Renderer>(),
         Page::Sessions => lucide::scroll_text::<iced::Theme, iced::Renderer>(),
+        Page::Alarms => lucide::bell::<iced::Theme, iced::Renderer>(),
+        Page::CustomTools => lucide::hammer::<iced::Theme, iced::Renderer>(),
         Page::Logs => lucide::activity::<iced::Theme, iced::Renderer>(),
         Page::Settings => lucide::settings::<iced::Theme, iced::Renderer>(),
         Page::RunningAgents => lucide::radar::<iced::Theme, iced::Renderer>(),
@@ -2488,15 +2531,15 @@ impl Dashboard {
         col
     }
 
-    /// Sidebar top nav icons: Home, Editor, Shell. Running Agents
+    /// Sidebar top nav icons (see [`Page::sidebar_pages`]). Running Agents
     /// is not in the sidebar — it is reachable only via the footer activity
     /// indicators.
     fn render_sidebar_nav(&self) -> Element<'_, Message> {
         self.sidebar_nav_column(Page::sidebar_pages()).into()
     }
 
-    /// Sidebar bottom nav icons: Sessions, Logs, Settings — click-only,
-    /// no keyboard shortcut.
+    /// Sidebar bottom nav icons (see [`Page::sidebar_bottom_pages`]) —
+    /// click-only, no keyboard shortcut.
     fn render_sidebar_bottom_nav(&self) -> Element<'_, Message> {
         self.sidebar_nav_column(Page::sidebar_bottom_pages()).into()
     }

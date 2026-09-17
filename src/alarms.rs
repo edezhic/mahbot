@@ -331,6 +331,20 @@ pub(crate) async fn list_user_alarms(user_name: &str) -> Result<Vec<Alarm>> {
     Ok(rows.iter().map(alarm_from_row).collect::<Result<_, _>>()?)
 }
 
+/// Every active alarm of every owner, ordered by owner name and then by next
+/// fire time — the read backing the read-only alarms page. The page groups by
+/// the name recorded on the alarm itself, so an alarm whose account is gone is
+/// still listed under it.
+pub(crate) async fn list_all_active_alarms() -> Result<Vec<Alarm>> {
+    let sql = format!(
+        "SELECT {ALARM_COLUMNS} FROM alarms \
+         WHERE status = 'active' \
+         ORDER BY user_name ASC, next_fire_at ASC"
+    );
+    let rows = store().conn.query(&sql, db::params![]).await?;
+    Ok(rows.iter().map(alarm_from_row).collect::<Result<_, _>>()?)
+}
+
 /// Mark an active alarm as removed; returns the removed alarm or `None`.
 pub(crate) async fn remove_alarm(session_id: &str, id: &str) -> Result<Option<Alarm>> {
     let sql = format!(

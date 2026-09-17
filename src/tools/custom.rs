@@ -55,7 +55,7 @@ const MAX_HEADER_BYTES: u64 = 16 * 1024;
 
 /// The four argument types the shallow validation knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParamType {
+pub(crate) enum ParamType {
     Str,
     Integer,
     Boolean,
@@ -74,7 +74,7 @@ impl ParamType {
     }
 
     /// Name used in the catalogue block.
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Str => "string",
             Self::Integer => "integer",
@@ -95,20 +95,44 @@ impl ParamType {
 }
 
 /// One declared parameter.
-struct Param {
-    name: String,
-    ty: ParamType,
-    required: bool,
+#[derive(Debug, Clone)]
+pub(crate) struct Param {
+    pub(crate) name: String,
+    pub(crate) ty: ParamType,
+    pub(crate) required: bool,
     /// Author-supplied prose, rendered in the catalogue block.
-    description: String,
+    pub(crate) description: String,
 }
 
-/// A usable custom tool: its parsed header plus the file that defines it.
-struct CustomToolEntry {
+/// A usable custom tool: its parsed header plus the file that defines it. The
+/// name is reached through [`ToolListing::name`], so it stays module-private.
+#[derive(Debug, Clone)]
+pub(crate) struct CustomToolEntry {
     name: String,
-    description: String,
-    params: Vec<Param>,
+    pub(crate) description: String,
+    pub(crate) params: Vec<Param>,
     path: PathBuf,
+}
+
+/// One tool as the tools page lists it: the header parsed from the file that
+/// defines it, or the fact that no file under its name has a usable one.
+#[derive(Debug, Clone)]
+pub(crate) enum ToolListing {
+    /// At least one file under the name parses; the first one in path order
+    /// defines the tool.
+    Usable(CustomToolEntry),
+    /// Every file under the name is unusable — an unreadable file counts as
+    /// unusable. Shown as a name with no description and no arguments.
+    Broken(String),
+}
+
+impl ToolListing {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Usable(entry) => &entry.name,
+            Self::Broken(name) => name,
+        }
+    }
 }
 
 /// Split `line` into its first `n` whitespace-separated words plus the rest of
@@ -253,13 +277,15 @@ fn read_header_source(path: &Path) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Load the catalogue: every usable tool in the folder, ordered by name
-/// (byte-wise — the same deterministic ordering the product's other
-/// file-defined descriptions use). Files with a non-runnable extension, a
-/// malformed header, or a name another file already took are skipped.
-fn load_catalogue(dir: &Path) -> Vec<CustomToolEntry> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+/// Candidate tool files: regular files directly in the folder whose extension
+/// the managed runtime executes, ordered by path. A folder that does not exist
+/// holds no tools — the admin has simply not written one yet; any other failure
+/// to read it is a failure, which the tools page keeps its last list across.
+fn candidate_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
     let mut files: Vec<PathBuf> = entries
         .flatten()
@@ -273,34 +299,89 @@ fn load_catalogue(dir: &Path) -> Vec<CustomToolEntry> {
     // resolves the same way on every read: the first *usable* file wins, so a
     // malformed `.js` leaves the tool to a later `.ts` rather than erasing it.
     files.sort();
+    Ok(files)
+}
 
-    let mut tools: Vec<CustomToolEntry> = Vec::new();
-    for path in files {
-        let Some(name) = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-        else {
+/// The tool name a candidate file defines, when it is a usable name: a name the
+/// call path would refuse is not a tool at all — not even a broken one.
+fn tool_name_of(path: &Path) -> Option<String> {
+    let name = path.file_stem().and_then(|s| s.to_str())?;
+    if !is_tool_name(name) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// The listing for `name` parsed from the file at `path`: `None` when the file
+/// cannot be read or its header cannot be parsed.
+fn usable_listing(path: PathBuf, name: String) -> Option<ToolListing> {
+    let source = read_header_source(&path).ok()?;
+    let (description, params) = parse_header(&source)?;
+    Some(ToolListing::Usable(CustomToolEntry {
+        name,
+        description,
+        params,
+        path,
+    }))
+}
+
+/// Every tool name in the folder, in name order (byte-wise — the same
+/// deterministic ordering the product's other file-defined descriptions use),
+/// broken ones included.
+fn load_listings(dir: &Path) -> std::io::Result<Vec<ToolListing>> {
+    let mut listings: Vec<ToolListing> = Vec::new();
+    for path in candidate_files(dir)? {
+        let Some(name) = tool_name_of(&path) else {
             continue;
         };
-        if !is_tool_name(&name) || tools.iter().any(|t| t.name == name) {
+        // A name already given a header keeps it: only a still-broken name can
+        // be upgraded, so a later broken sibling never downgrades a good file.
+        let listed = listings.iter().position(|l| l.name() == name);
+        if listed.is_some_and(|index| matches!(listings[index], ToolListing::Usable(_))) {
             continue;
         }
-        let Ok(source) = read_header_source(&path) else {
+        let Some(listing) = usable_listing(path, name.clone()) else {
+            // Nothing under this name parses: the name is listed as broken
+            // unless a file under it already said so.
+            if listed.is_none() {
+                listings.push(ToolListing::Broken(name));
+            }
             continue;
         };
-        let Some((description, params)) = parse_header(&source) else {
-            continue;
-        };
-        tools.push(CustomToolEntry {
-            name,
-            description,
-            params,
-            path,
-        });
+        match listed {
+            Some(index) => listings[index] = listing,
+            None => listings.push(listing),
+        }
     }
-    tools.sort_by(|a, b| a.name.cmp(&b.name));
-    tools
+    listings.sort_by(|a, b| a.name().cmp(b.name()));
+    Ok(listings)
+}
+
+/// The catalogue block's source: the usable subset of [`load_listings`], which
+/// owns the discovery rules (a runnable extension, one file per name, a header
+/// that parses). A folder that cannot be read describes no tools: the prompt
+/// form has nowhere to report the failure.
+fn load_catalogue(dir: &Path) -> Vec<CustomToolEntry> {
+    load_listings(dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|listing| match listing {
+            ToolListing::Usable(entry) => Some(entry),
+            ToolListing::Broken(_) => None,
+        })
+        .collect()
+}
+
+/// The tools page's read: every tool in the folder, broken ones included. Run
+/// off the async runtime — it reads the folder.
+///
+/// A folder that cannot be read is an error here (unlike [`load_catalogue`]):
+/// the page then keeps the list it last loaded rather than showing it empty.
+pub(crate) async fn list_tool_listings() -> Result<Vec<ToolListing>, String> {
+    tokio::task::spawn_blocking(|| load_listings(&shared_dir()))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 /// Load the catalogue off the async runtime (it reads the folder).
@@ -893,41 +974,82 @@ mod tests {
         );
     }
 
-    #[test]
-    fn catalogue_skips_unusable_files() {
+    /// The folder the discovery tests share: a tool that parses, a same-stem
+    /// pair that both parse, a name whose first file by path is broken and whose
+    /// second parses, a name every file of which is broken, and the files that
+    /// must never count as tools at all.
+    fn discovery_fixture() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
         let write = |name: &str, body: &str| {
             std::fs::write(tmp.path().join(name), body).expect("write");
         };
-        write(
-            "weather.ts",
-            "// @description Weather.\n// @param city string required city\n",
-        );
         write("helper.js", "// @description Helper.\n");
+        // Same stem, both usable: the first file by path wins, so the collision
+        // is not order-dependent.
+        write("weather.js", "// @description Other weather.\n");
+        write("weather.ts", "// @description Weather.\n");
+        // Same stem, the first file broken: the later one gives the name a
+        // header rather than the malformed sibling erasing it.
+        write("mended.js", "// @param city string required\n");
+        write("mended.ts", "// @description Mended.\n");
+        // Malformed header, no sibling to rescue the name.
+        write("wrecked.ts", "// @param city string required\n");
         // Not runnable by the runtime.
         write("notes.txt", "// @description Notes.\n");
         write("script.py", "// @description Python.\n");
         // A dot-file is not a tool: discovery and the call path share one name
-        // predicate, so the block never advertises a name a call would refuse.
+        // predicate, so no surface advertises a name a call would refuse.
         write(".hidden.ts", "// @description Hidden.\n");
-        // Malformed header.
-        write("broken.ts", "// @param city string required\n");
-        // Same stem as weather.ts — the first file by path wins, so the
-        // collision is not order-dependent.
-        write("weather.js", "// @description Other weather.\n");
         std::fs::create_dir(tmp.path().join("nested")).expect("mkdir");
         std::fs::write(
             tmp.path().join("nested/hidden.ts"),
             "// @description Nested.\n",
         )
         .expect("write");
+        tmp
+    }
 
+    #[test]
+    fn catalogue_skips_unusable_files() {
+        let tmp = discovery_fixture();
         let tools = load_catalogue(tmp.path());
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["helper", "weather"]);
+        assert_eq!(names, ["helper", "mended", "weather"]);
         let weather = tools.iter().find(|t| t.name == "weather").expect("weather");
         assert_eq!(weather.description, "Other weather.");
         assert!(weather.path.ends_with("weather.js"));
+    }
+
+    /// Broken files are listed, not skipped, and a usable sibling under the same
+    /// stem takes the name over — the page and the model catalogue must never
+    /// disagree about which tools exist.
+    #[test]
+    fn listings_include_broken_tools_in_name_order() {
+        let tmp = discovery_fixture();
+        let listings = load_listings(tmp.path()).expect("read the folder");
+        let names: Vec<&str> = listings.iter().map(ToolListing::name).collect();
+        assert_eq!(names, ["helper", "mended", "weather", "wrecked"]);
+        // The page shows the same file the catalogue picks for a name two files
+        // define.
+        let usable = |name: &str| match listings.iter().find(|l| l.name() == name) {
+            Some(ToolListing::Usable(entry)) => entry.description.clone(),
+            other => panic!("expected a usable {name}, got {other:?}"),
+        };
+        assert_eq!(usable("weather"), "Other weather.");
+        // A broken first file leaves the name to its usable sibling.
+        assert_eq!(usable("mended"), "Mended.");
+        // A name every file of which is broken stays listed as broken.
+        assert!(matches!(
+            listings.iter().find(|l| l.name() == "wrecked"),
+            Some(ToolListing::Broken(_))
+        ));
+        // A folder nobody has written a tool into holds no tools — it is not a
+        // failed read, which is what the page keeps its last list across.
+        assert!(
+            load_listings(&tmp.path().join("absent"))
+                .expect("an absent folder is not a failure")
+                .is_empty()
+        );
     }
 
     /// The block's listing split is what keeps a guest from being told about

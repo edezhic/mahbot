@@ -191,6 +191,77 @@ impl AsyncLoadState {
     }
 }
 
+/// Interval the polled-list pages re-read their source at, while they are open.
+///
+/// The tick is deliberately not gated on a read being in flight — the render
+/// that follows it is what moves the alarms countdown, so suppressing it would
+/// freeze the digits. Starting no second read while one is in flight is
+/// [`PolledList`]'s job.
+pub(crate) const POLLED_LIST_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A list a page re-reads on a timer.
+///
+/// The rules the ticking pages share, so no page restates them:
+/// - [`begin`](Self::begin) starts a read only when none is in flight, so the
+///   ticks never pile reads up;
+/// - the entries of the last successful read stay on screen while the next read
+///   is in flight and after a failed one, so a failure never blanks the page;
+/// - [`loaded`](Self::loaded) flips on the first outcome either way, so the
+///   "Loading…" placeholder belongs to the first read only;
+/// - a failure is recorded as data, once per read — nothing is logged here, so
+///   a page whose read keeps failing writes no log records.
+pub(crate) struct PolledList<T> {
+    entries: Vec<T>,
+    in_flight: bool,
+    loaded: bool,
+    error: Option<String>,
+}
+
+impl<T> PolledList<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            in_flight: false,
+            loaded: false,
+            error: None,
+        }
+    }
+
+    /// Mark a read in flight; `false` when one already is (start no second read).
+    pub(crate) fn begin(&mut self) -> bool {
+        if self.in_flight {
+            return false;
+        }
+        self.in_flight = true;
+        true
+    }
+
+    /// Apply a finished read: keep the previous entries when it failed.
+    pub(crate) fn settle(&mut self, result: Result<Vec<T>, String>) {
+        self.in_flight = false;
+        self.loaded = true;
+        match result {
+            Ok(entries) => {
+                self.entries = entries;
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    pub(crate) fn entries(&self) -> &[T] {
+        &self.entries
+    }
+
+    pub(crate) const fn loaded(&self) -> bool {
+        self.loaded
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
 /// Shared state for a paginated tab that fetches typed entries.
 ///
 /// Groups the per-tab fields (`entries`, `load_state`, `pagination`, `search`,
