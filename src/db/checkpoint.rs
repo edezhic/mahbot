@@ -27,12 +27,12 @@
 //! TRUNCATE above it, plus an independent per-store integrity verification —
 //! the auto-checkpoint loop spawned by the binary's background task set).
 //!
-//! A periodic round makes up to three attempts at a store's checkpoint — the
-//! original plus at most two more, spaced by [`CHECKPOINT_RETRY_PAUSE`] — for
-//! EVERY store, whether or not it carries a search index. What the engine answers
-//! decides the round, arm by arm ([`periodic_checkpoint_inner`]). The exit-time
-//! round keeps its single attempt and never recovers or drains
-//! ([`exit_checkpoint`]).
+//! A periodic round makes up to [`CHECKPOINT_ATTEMPTS`] attempts at a store's
+//! checkpoint — the original plus one retry per entry in the growing
+//! [`CHECKPOINT_RETRY_PAUSES`] schedule — for EVERY store, whether or not it
+//! carries a search index. What the engine answers decides the round, arm by arm
+//! ([`periodic_checkpoint_inner`]). The exit-time round keeps its single attempt
+//! and never recovers or drains ([`exit_checkpoint`]).
 //!
 //! # A failing round never stops the service by itself
 //!
@@ -45,7 +45,9 @@
 //! and its retry pause races the daemon's own shutdown
 //! ([`crate::shutdown::sleep_or_shutdown_or_drain`]), so a round the drain cuts short
 //! decides nothing, and the store that drained the process can leave a sibling store's
-//! open window unfiled.
+//! open window unfiled. A round that keeps failing spends the whole retry schedule
+//! before it decides, so a persistently failing store's rounds stretch by that
+//! schedule — the accepted cost of the more patient retries.
 //!
 //! A round reports itself once, never per attempt: a genuine failure's per-attempt
 //! lines are DEBUG only, and what a failing round keeps is one warning, carrying the
@@ -142,15 +144,30 @@ const WAL_CHECKPOINT_CAP_BYTES: u64 = 32 * 1024 * 1024;
 /// corruption — it is an actionable signal, not evidence about the store.
 const DEFAULT_CHECKPOINT_MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Total attempts a periodic checkpoint round makes (the original plus at most
-/// two more) before it decides, for every store.
-const CHECKPOINT_ATTEMPTS: usize = 3;
+/// Total attempts a periodic checkpoint round makes for a store before it
+/// decides: the original plus one retry per entry in [`CHECKPOINT_RETRY_PAUSES`]
+/// (whose length is this count less one).
+const CHECKPOINT_ATTEMPTS: usize = 6;
 
-/// Real pause before every retry, whichever answer opened it: a retry issued
-/// immediately against the same in-memory engine state is the same attempt again,
-/// so it is worth only what the spacing is worth. Two pauses per round stay far
-/// below the round's 5-minute cadence.
-const CHECKPOINT_RETRY_PAUSE: Duration = Duration::from_secs(1);
+/// The real pause before each retry of a periodic round, in attempt order — the
+/// entry at index `i` spaces the retry that follows attempt `i + 1`, so the
+/// schedule's length *is* the round's retry count, one fewer than
+/// [`CHECKPOINT_ATTEMPTS`]. The spacing grows to a 60 s ceiling — 1, 5, 15, 30,
+/// 60 s, ~111 s for the whole round — because the failures it spaces are the
+/// engine's own transient refusals, which clear by themselves: a retry issued
+/// against unchanged in-memory engine state is worth only what its spacing is
+/// worth. The schedule is a fixed, hard bound — six attempts and a capped pause,
+/// never an unbounded wait, so the waiting it adds can never become a hung round
+/// (the duration of an attempt itself is bounded as little as it was before); the
+/// span the schedule adds to a failing store's 5-minute cadence is the accepted
+/// price.
+const CHECKPOINT_RETRY_PAUSES: [Duration; CHECKPOINT_ATTEMPTS - 1] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
 
 /// Consecutive failing rounds a store's failure window must span before a genuine
 /// failure may decide the stop — one failing round never stops a healthy service.
@@ -520,7 +537,7 @@ async fn periodic_checkpoint(
         name,
         conn,
         root,
-        CHECKPOINT_RETRY_PAUSE,
+        CHECKPOINT_RETRY_PAUSES,
         CHECKPOINT_FAILURE_WINDOW,
         || checkpoint_attempt(name, conn, truncate, root),
     )
@@ -669,12 +686,13 @@ fn cure_failure_window(name: &'static str, key: &Path, round_failures: usize) {
 /// without an engine-side failing checkpoint, which is not reproducible
 /// hermetically (see [`crate::db::checkpoint_cause`]): [`periodic_checkpoint`] is
 /// the single caller and always passes the gate + engine attempt. It, and the two
-/// timing parameters — `retry_pause`, the real pause before a retry, and `span`, how
-/// long a store's failure window must have been open — are the round's only seam: the
-/// tests compress both, production passes the two constants. Nothing outside this
-/// module can reach it, which is also where the failure window's whole rule is
-/// verified: that a real failure on a *healthy* store would have been cured by a
-/// later attempt is not end-to-end observable, only that the later attempt is made.
+/// timing parameters — `retry_pauses`, the real pauses before the retries, and
+/// `span`, how long a store's failure window must have been open — are the round's
+/// only seam: the tests compress both, production passes the two constants.
+/// Nothing outside this module can reach it, which is also where the failure
+/// window's whole rule is verified: that a real failure on a *healthy* store would
+/// have been cured by a later attempt is not end-to-end observable, only that the
+/// later attempt is made.
 ///
 /// The attempt future is `Send` because the periodic round runs inside the
 /// process's spawned task set.
@@ -683,7 +701,7 @@ async fn periodic_checkpoint_inner<'a, Fut>(
     name: &'static str,
     conn: &'a Connection,
     root: Option<&Path>,
-    retry_pause: Duration,
+    retry_pauses: [Duration; CHECKPOINT_ATTEMPTS - 1],
     span: Duration,
     mut attempt: impl FnMut() -> Fut,
 ) where
@@ -779,14 +797,15 @@ async fn periodic_checkpoint_inner<'a, Fut>(
         }
         // Every iteration that reaches here leads to a retry (a completion and a
         // lone partial fold return, a refusal breaks), and the retry is spaced in
-        // real time — never issued back to back against the same in-memory engine
-        // state. The pause races the daemon's own shutdown, so a round the shutdown
-        // or drain cut short decides nothing: the window is left exactly as it was,
-        // and this round's failures reach no window at all, because a drain means the
-        // process is on its way out and a window is a claim about one that keeps
-        // serving.
-        if attempt_no < CHECKPOINT_ATTEMPTS
-            && !crate::shutdown::sleep_or_shutdown_or_drain(retry_pause).await
+        // real time by the next schedule entry — never issued back to back against
+        // the same in-memory engine state. The schedule's length is the retry count
+        // itself, so the last attempt has no pause to take. The pause races the
+        // daemon's own shutdown, so a round the shutdown or drain cut short decides
+        // nothing: the window is left exactly as it was, and this round's failures
+        // reach no window at all, because a drain means the process is on its way
+        // out and a window is a claim about one that keeps serving.
+        if let Some(pause) = retry_pauses.get(attempt_no - 1).copied()
+            && !crate::shutdown::sleep_or_shutdown_or_drain(pause).await
         {
             // This warning is the round's only record, so the failure the round
             // already made rides it as the cause.
@@ -1076,8 +1095,11 @@ mod tests {
         ))
     }
 
-    /// The retry pause the round's tests use: none, so a round's retries are instant.
-    const TEST_PAUSE: Duration = Duration::ZERO;
+    /// The retry pauses the round's tests use: none, so a round's retries are instant
+    /// — the schedule production spaces in real time ([`CHECKPOINT_RETRY_PAUSES`]) is
+    /// never waited out.
+    const TEST_PAUSES: [Duration; CHECKPOINT_ATTEMPTS - 1] =
+        [Duration::ZERO; CHECKPOINT_ATTEMPTS - 1];
 
     /// Whether the store `conn` has open currently carries an open failure window.
     fn window_open(conn: &Connection) -> bool {
@@ -1102,11 +1124,11 @@ mod tests {
         root: &Path,
         rounds: usize,
         error: &str,
-        retry_pause: Duration,
+        retry_pauses: [Duration; CHECKPOINT_ATTEMPTS - 1],
         span: Duration,
     ) -> usize {
         let error = error.to_string();
-        rounds_with_answers(name, conn, root, rounds, retry_pause, span, move |_| {
+        rounds_with_answers(name, conn, root, rounds, retry_pauses, span, move |_| {
             let error = error.clone();
             async move { Attempted::Ran(Err(anyhow::anyhow!(error))) }
         })
@@ -1121,7 +1143,7 @@ mod tests {
         conn: &Connection,
         root: &Path,
         rounds: usize,
-        retry_pause: Duration,
+        retry_pauses: [Duration; CHECKPOINT_ATTEMPTS - 1],
         span: Duration,
         mut answer: A,
     ) -> usize
@@ -1132,7 +1154,7 @@ mod tests {
         let mut attempts = 0usize;
         for _ in 0..rounds {
             let mut attempt_no = 0usize;
-            periodic_checkpoint_inner(name, conn, Some(root), retry_pause, span, || {
+            periodic_checkpoint_inner(name, conn, Some(root), retry_pauses, span, || {
                 attempt_no += 1;
                 attempts += 1;
                 answer(attempt_no)
@@ -1311,7 +1333,7 @@ mod tests {
             "core",
             &conn,
             Some(tmp.path()),
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
             || {
                 attempt_no += 1;
@@ -1384,7 +1406,7 @@ mod tests {
             store,
             tmp.path(),
             rounds,
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
             |attempt_no| async move {
                 // Each round's first attempt corrupts the index again: the round's own
@@ -1442,7 +1464,7 @@ mod tests {
             &conn,
             tmp.path(),
             rounds,
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
             |attempt_no| {
                 let answer = if attempt_no == 1 {
@@ -1484,26 +1506,33 @@ mod tests {
     /// returned.
     async fn a_round_cured_by_its_last_attempt(conn: &Connection, root: &Path) {
         let mut attempt_no = 0;
-        periodic_checkpoint_inner("core", conn, Some(root), TEST_PAUSE, Duration::ZERO, || {
-            attempt_no += 1;
-            let n = attempt_no;
-            async move {
-                Attempted::Ran(if n == CHECKPOINT_ATTEMPTS {
-                    Ok(CheckpointOutcome {
-                        busy: false,
-                        log_frames: 0,
-                        checkpointed_frames: 0,
+        periodic_checkpoint_inner(
+            "core",
+            conn,
+            Some(root),
+            TEST_PAUSES,
+            Duration::ZERO,
+            || {
+                attempt_no += 1;
+                let n = attempt_no;
+                async move {
+                    Attempted::Ran(if n == CHECKPOINT_ATTEMPTS {
+                        Ok(CheckpointOutcome {
+                            busy: false,
+                            log_frames: 0,
+                            checkpointed_frames: 0,
+                        })
+                    } else {
+                        Err(anyhow::anyhow!("injected checkpoint failure"))
                     })
-                } else {
-                    Err(anyhow::anyhow!("injected checkpoint failure"))
-                })
-            }
-        })
+                }
+            },
+        )
         .await;
 
         assert_eq!(
             attempt_no, CHECKPOINT_ATTEMPTS,
-            "a completed last attempt ends the round without a fourth one"
+            "a completion on the last attempt leaves no attempt to follow it"
         );
         assert!(
             !crate::shutdown::is_draining(),
@@ -1565,7 +1594,7 @@ mod tests {
     }
 
     /// A store with no ticket-title FTS index (repair is NotApplicable) still gets
-    /// all three attempts on every failing round, and once the window is exhausted
+    /// every attempt on every failing round, and once the window is exhausted
     /// it writes error.log and begins the drain; an environment-caused checkpoint
     /// error is marked as such in the record.
     #[tokio::test]
@@ -1581,14 +1610,14 @@ mod tests {
             tmp.path(),
             rounds,
             "no space left on device",
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
         )
         .await;
         assert_eq!(
             attempts,
             CHECKPOINT_ATTEMPTS * rounds,
-            "every store gets all three attempts of every failing round, indexed or not"
+            "every store gets every attempt of every failing round, indexed or not"
         );
 
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
@@ -1607,13 +1636,13 @@ mod tests {
         crate::shutdown::drain_clear();
     }
 
-    /// A store whose ticket-title index is present and healthy still gets all
-    /// three attempts on every failing round, and a persistent failure still stops
+    /// A store whose ticket-title index is present and healthy still gets every
+    /// attempt on every failing round, and a persistent failure still stops
     /// the service once the window is exhausted: the attempts are never gated on
     /// what the repair applies or what it returns.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
-    async fn a_healthy_index_store_gets_all_three_attempts_and_stops() {
+    async fn a_healthy_index_store_gets_every_attempt_and_stops() {
         crate::shutdown::drain_clear();
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let conn = crate::db::open_consolidated_store(tmp.path())
@@ -1628,7 +1657,7 @@ mod tests {
             tmp.path(),
             rounds,
             "injected checkpoint failure",
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
         )
         .await;
@@ -1650,6 +1679,42 @@ mod tests {
         crate::shutdown::drain_clear();
     }
 
+    /// The round spaces its retries by the schedule it was handed, taking one
+    /// entry per retry: [`CHECKPOINT_ATTEMPTS`] attempts with the whole production
+    /// schedule ([`CHECKPOINT_RETRY_PAUSES`]) spent between them. The schedule is
+    /// passed scaled down to milliseconds so the wait is real but cheap — elapsed
+    /// time is the only way to observe the spacing without a hook in the round, and
+    /// a round that spends none of the schedule (a dropped pause, an indexing that
+    /// never hits an entry) finishes far short of it.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn a_failing_round_spaces_its_retries_by_the_production_schedule() {
+        crate::shutdown::drain_clear();
+        let (tmp, conn) = temp_store("core").await;
+        let schedule = CHECKPOINT_RETRY_PAUSES.map(|pause| pause / 1000);
+        let started = tokio::time::Instant::now();
+
+        let attempts = failing_rounds(
+            "core",
+            &conn,
+            tmp.path(),
+            1,
+            "injected checkpoint failure",
+            schedule,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(
+            attempts, CHECKPOINT_ATTEMPTS,
+            "a failing round runs every attempt the schedule has pauses for",
+        );
+        assert!(
+            started.elapsed() >= schedule.into_iter().sum::<Duration>(),
+            "the round must spend the schedule's own pause before each retry",
+        );
+    }
+
     /// A partially folded journal is normal: the round does nothing about it —
     /// no retry, no record, no warning — and the service keeps serving.
     #[tokio::test]
@@ -1663,7 +1728,7 @@ mod tests {
             "core",
             &conn,
             Some(tmp.path()),
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
             || {
                 attempts += 1;
@@ -1706,7 +1771,7 @@ mod tests {
             "core",
             &conn,
             Some(tmp.path()),
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
             || {
                 attempts += 1;
@@ -1745,7 +1810,7 @@ mod tests {
             &conn,
             tmp.path(),
             window_rounds(),
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
             |attempt_no| {
                 let answer = if attempt_no == 1 {
@@ -1792,7 +1857,7 @@ mod tests {
             &conn,
             tmp.path(),
             rounds,
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
             |attempt_no| {
                 let answer = if attempt_no == 1 {
@@ -1839,7 +1904,7 @@ mod tests {
             &conn,
             tmp.path(),
             window_rounds(),
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
             |attempt_no| {
                 let answer = match attempt_no {
@@ -1873,7 +1938,7 @@ mod tests {
         crate::shutdown::drain_clear();
     }
 
-    /// A panicking attempt is a failed attempt: every round makes all three
+    /// A panicking attempt is a failed attempt: every round makes all of its
     /// attempts, files the panic as the reason, and once the window is exhausted the
     /// service drains.
     #[tokio::test]
@@ -1888,7 +1953,7 @@ mod tests {
             &conn,
             tmp.path(),
             rounds,
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
             |_| async {
                 Attempted::Ran(guarded_checkpoint(async { panic!("injected attempt panic") }).await)
@@ -1938,7 +2003,7 @@ mod tests {
         let conn_ref = &conn;
 
         let mut attempts = 0usize;
-        periodic_checkpoint_inner(name, &conn, Some(path), TEST_PAUSE, Duration::ZERO, || {
+        periodic_checkpoint_inner(name, &conn, Some(path), TEST_PAUSES, Duration::ZERO, || {
             attempts += 1;
             checkpoint_attempt(name, conn_ref, true, Some(path))
         })
@@ -2019,7 +2084,7 @@ mod tests {
             &conn,
             tmp.path(),
             rounds,
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
             |attempt_no| {
                 let answer = if attempt_no == 1 {
@@ -2069,7 +2134,7 @@ mod tests {
             tmp.path(),
             1,
             "injected checkpoint failure",
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
         )
         .await;
@@ -2110,7 +2175,7 @@ mod tests {
             tmp.path(),
             rounds,
             "injected checkpoint failure",
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::ZERO,
         )
         .await;
@@ -2165,7 +2230,7 @@ mod tests {
     async fn the_window_records_the_cause_that_opened_it() {
         crate::shutdown::drain_clear();
         let (tmp, conn) = temp_store("core").await;
-        let (retry_pause, span) = (TEST_PAUSE, Duration::ZERO);
+        let (retry_pauses, span) = (TEST_PAUSES, Duration::ZERO);
 
         // The first round opens the window with its own cause; the second exhausts it
         // with a different one.
@@ -2175,7 +2240,7 @@ mod tests {
             tmp.path(),
             1,
             "injected first failure",
-            retry_pause,
+            retry_pauses,
             span,
         )
         .await;
@@ -2185,7 +2250,7 @@ mod tests {
             tmp.path(),
             1,
             "injected second failure",
-            retry_pause,
+            retry_pauses,
             span,
         )
         .await;
@@ -2215,7 +2280,7 @@ mod tests {
     async fn a_completed_checkpoint_closes_the_window_and_the_next_failure_starts_a_new_one() {
         crate::shutdown::drain_clear();
         let (tmp, conn) = temp_store("core").await;
-        let (retry_pause, span) = (TEST_PAUSE, Duration::ZERO);
+        let (retry_pauses, span) = (TEST_PAUSES, Duration::ZERO);
 
         failing_rounds(
             "core",
@@ -2223,7 +2288,7 @@ mod tests {
             tmp.path(),
             1,
             "injected checkpoint failure",
-            retry_pause,
+            retry_pauses,
             span,
         )
         .await;
@@ -2234,7 +2299,7 @@ mod tests {
 
         // A round whose first attempt is a real, completing checkpoint: the completion
         // is what closes the window, not a retry.
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), retry_pause, span, || {
+        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), retry_pauses, span, || {
             let conn = conn.clone();
             async move { Attempted::Ran(conn.checkpoint_ungated().await) }
         })
@@ -2258,7 +2323,7 @@ mod tests {
             tmp.path(),
             1,
             "injected checkpoint failure",
-            retry_pause,
+            retry_pauses,
             span,
         )
         .await;
@@ -2284,7 +2349,7 @@ mod tests {
     async fn a_round_that_did_not_fail_closes_the_window() {
         crate::shutdown::drain_clear();
         let (tmp, conn) = temp_store("core").await;
-        let (retry_pause, span) = (TEST_PAUSE, Duration::ZERO);
+        let (retry_pauses, span) = (TEST_PAUSES, Duration::ZERO);
 
         failing_rounds(
             "core",
@@ -2292,7 +2357,7 @@ mod tests {
             tmp.path(),
             1,
             "injected checkpoint failure",
-            retry_pause,
+            retry_pauses,
             span,
         )
         .await;
@@ -2305,7 +2370,7 @@ mod tests {
             "core",
             &conn,
             Some(tmp.path()),
-            retry_pause,
+            retry_pauses,
             span,
             || async { Attempted::Ran(Err(blocked_checkpoint_error())) },
         )
@@ -2321,7 +2386,7 @@ mod tests {
             tmp.path(),
             1,
             "injected checkpoint failure",
-            retry_pause,
+            retry_pauses,
             span,
         )
         .await;
@@ -2352,7 +2417,7 @@ mod tests {
             tmp.path(),
             rounds,
             "injected checkpoint failure",
-            TEST_PAUSE,
+            TEST_PAUSES,
             Duration::from_secs(3600),
         )
         .await;
@@ -2378,7 +2443,7 @@ mod tests {
     async fn a_window_that_outlives_its_span_stops_on_the_next_failing_round() {
         crate::shutdown::drain_clear();
         let (tmp, conn) = temp_store("core").await;
-        let (retry_pause, span) = (TEST_PAUSE, Duration::from_millis(100));
+        let (retry_pauses, span) = (TEST_PAUSES, Duration::from_millis(100));
 
         failing_rounds(
             "core",
@@ -2386,7 +2451,7 @@ mod tests {
             tmp.path(),
             1,
             "injected checkpoint failure",
-            retry_pause,
+            retry_pauses,
             span,
         )
         .await;
@@ -2403,7 +2468,7 @@ mod tests {
             tmp.path(),
             1,
             "injected checkpoint failure",
-            retry_pause,
+            retry_pauses,
             span,
         )
         .await;
@@ -2423,7 +2488,11 @@ mod tests {
     async fn a_round_cut_short_by_a_drain_decides_nothing() {
         crate::shutdown::drain_clear();
         let (tmp, conn) = temp_store("core").await;
-        let (retry_pause, span) = (Duration::from_millis(10), Duration::ZERO);
+        // The first pause is non-zero on purpose: with the drain already begun, an
+        // already-elapsed zero sleep is as ready as the drain watch, and `select!`
+        // picks between ready branches at random — the timer must lose.
+        let (mut retry_pauses, span) = (TEST_PAUSES, Duration::ZERO);
+        retry_pauses[0] = Duration::from_millis(10);
 
         crate::shutdown::drain_begin();
         let attempts = failing_rounds(
@@ -2432,7 +2501,7 @@ mod tests {
             tmp.path(),
             1,
             "injected checkpoint failure",
-            retry_pause,
+            retry_pauses,
             span,
         )
         .await;
