@@ -10,10 +10,6 @@
 pub mod local_transcriber;
 pub mod tts;
 pub mod voice;
-#[cfg(feature = "voice-tests")]
-pub(crate) mod wake_analysis;
-#[cfg(feature = "voice-tests")]
-pub(crate) mod wake_capture;
 pub(crate) mod wake_word;
 
 use anyhow::{Context as _, Result, anyhow};

@@ -33,8 +33,8 @@ grep-engine-e2e = []
 name = "mahbot"
 path = "src/main.rs"
 # Skip the app binary for `--no-default-features` builds.  The canonical bench
-# invocation `cargo bench --no-default-features --features voice-tests
-# --bench wake_word` uses this to avoid the bin's full-program link.
+# invocation `cargo bench --no-default-features --features voice-tests` uses
+# this to avoid the bin's full-program link.
 # NOTE: `bench = false` does NOT prevent `cargo bench` from building the bin
 # (rust-lang/cargo#15702); `required-features` is the reliable mechanism.
 required-features = ["full"]
@@ -266,12 +266,6 @@ serial_test = "3"
 
 [[bench]]
 name = "wake_word"
-harness = false
-required-features = ["voice-tests"]
-
-# Offline analyser over the capture `wake_word` writes (no models, no stores).
-[[bench]]
-name = "wake_analysis"
 harness = false
 required-features = ["voice-tests"]
 

@@ -61,17 +61,6 @@
 //! clock is auditable from the top-level `wall_clock_secs` key (whole run,
 //! report-assembly window included).
 //!
-//! # Measurement capture (bench-only, opt-in)
-//!
-//! A second, opt-in capture records the raw encoder token matrices the
-//! scoring path already computes, the product's own per-window statistic, and
-//! a per-clip detection ledger, plus the frozen A/B partition
-//! ([`crate::audio::wake_capture`]).  It is off by default
-//! (`MAHBOT_WAKE_CAPTURE=baseline|measure` opts in; `baseline` writes only the
-//! non-token artifacts) and the default build is unaffected.  The offline
-//! analyser that consumes the captured files is a separate target — this
-//! module only measures and writes.
-//!
 //! # Requirements
 //!
 //! * TTS models must be downloaded and cached (run the app once).
@@ -89,7 +78,6 @@
 
 use super::*; // voice module items (handle_wake_word_detection, PipelineCtx, etc.)
 use crate::audio::tts;
-use crate::audio::wake_capture;
 use crate::util::hex_string;
 use earshot::Detector;
 use rand::{RngExt, SeedableRng};
@@ -1594,33 +1582,12 @@ struct DetectionResult {
     adaptive_state_pre_flush: super::AdaptiveThresholdState,
 }
 
-/// Neutralise the product's post-fire state after a firing frame so the
-/// measured pass keeps scoring every window: the wall-clock cooldown is
-/// dropped deterministically (no `Instant` is ever compared) and the
-/// recording flag the fire left set is cleared (leaving it set would stop all
-/// further scoring).  Nothing the fire itself does — including the Soft reset
-/// handoff inside `handle_wake_word_detection` — changes.
-fn neutralise_fire(ctx: &mut super::PipelineCtx) {
-    ctx.last_wake_word_detection = None;
-    ctx.is_recording = false;
-}
-
 /// Run the production streaming wake word detection pipeline on audio samples.
 ///
 /// Feeds audio through [`handle_wake_word_detection`] in FRAME_LENGTH chunks,
 /// exercising the full streaming chain: raw accumulation, VAD gating,
 /// stride-gated window encoding, [`score_single_embedding`], and cooldown
 /// logic.
-///
-/// Two modes:
-/// * shipped/baseline — returns at the first fire, exactly as production
-///   stops scoring once the wake word is seen;
-/// * measurement (`wake_capture::measuring()`) — keeps feeding the whole clip
-///   so every window of the clip is captured, neutralising the product's
-///   post-fire suppression deterministically after the firing frame
-///   (`last_wake_word_detection = None`, `is_recording = false`).  The Soft
-///   reset handoff inside [`handle_wake_word_detection`] still runs unchanged
-///   inside the firing frame.
 ///
 /// After all audio is fed, silence frames are sent to flush any remaining
 /// detection state (matching how the production pipeline handles
@@ -1631,27 +1598,19 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
     // Save pre-existing timestamp — we only return true if detection fires
     // during THIS call, not because a prior call already set the field.
     let before = ctx.last_wake_word_detection;
-    let mut fired = false;
-    wake_capture::mark_flush(false);
 
     // Feed audio in FRAME_LENGTH chunks through the raw-sample streaming path
     // (no AGC/NS — the encoder pipeline consumes raw audio directly).
     for chunk in samples.chunks(super::FRAME_LENGTH) {
         process_frame(chunk, ctx);
         if ctx.last_wake_word_detection != before {
-            fired = true;
-            if !wake_capture::measuring() {
-                // No flush ran on this path, so the pre-flush snapshot is the
-                // current state; the boundary-fire branch in the callers is
-                // unreachable when `detected` is true anyway.
-                return DetectionResult {
-                    detected: true,
-                    adaptive_state_pre_flush: ctx.adaptive_threshold.clone(),
-                };
-            }
-            // Measured pass: neutralise the product's post-fire state (see
-            // `neutralise_fire`) so the rest of the clip is still scored.
-            neutralise_fire(ctx);
+            // No flush ran on this path, so the pre-flush snapshot is the
+            // current state; the boundary-fire branch in the callers is
+            // unreachable when `detected` is true anyway.
+            return DetectionResult {
+                detected: true,
+                adaptive_state_pre_flush: ctx.adaptive_threshold.clone(),
+            };
         }
     }
 
@@ -1668,7 +1627,6 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
     // benchmark's shared-state design wants the adapted state to survive the
     // boundary rather than re-bootstrapping per variant.
     let adaptive_state_pre_flush = ctx.adaptive_threshold.clone();
-    wake_capture::mark_flush(true);
     //
     // Feed FRAME_LENGTH digital-silence chunks (production's mic delivers real
     // zeros, not empty Vecs — see process_frame) until:
@@ -1684,26 +1642,15 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
     // detection is possible — further silence cannot produce a detection.
     let mut silence_chunks = 0usize;
     while silence_chunks < super::SEGMENT_TIMEOUT_HOPS + 4 {
+        if ctx.last_wake_word_detection != before {
+            return DetectionResult {
+                detected: true,
+                adaptive_state_pre_flush,
+            };
+        }
         let window_was_nonempty = !ctx.score_window.is_empty();
         process_frame(&vec![0.0; super::FRAME_LENGTH], ctx);
         silence_chunks += 1;
-        // The fire check sits between the frame and the break: a break-frame fire
-        // is the common case (detection resets the rolling window, which is exactly
-        // what the break tests), and the measure pass must neutralise the fire
-        // before the loop can stop.  The shipped path is unchanged — the pre-change
-        // code caught a break-frame fire in its trailing `detected` comparison.
-        if ctx.last_wake_word_detection != before {
-            fired = true;
-            if !wake_capture::measuring() {
-                return DetectionResult {
-                    detected: true,
-                    adaptive_state_pre_flush,
-                };
-            }
-            // Measured pass: neutralise the product's post-fire state (see
-            // `neutralise_fire`), exactly as in the clip body above.
-            neutralise_fire(ctx);
-        }
         // Segment boundary (or NO_MATCH reset) emptied the rolling window —
         // further silence cannot produce a detection, so stop feeding.
         if window_was_nonempty && ctx.score_window.is_empty() {
@@ -1712,7 +1659,7 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
     }
 
     DetectionResult {
-        detected: fired,
+        detected: ctx.last_wake_word_detection != before,
         adaptive_state_pre_flush,
     }
 }
@@ -1730,14 +1677,11 @@ struct DetectionMetrics {
 /// eliminating the repetitive match-and-track boilerplate.
 ///
 /// # Parameters
-/// - `family`: capture family name (`confusable`/`unrelated`/`silence`/
-///   `noise`) for the measurement ledger.
 /// - `variants`: audio clips with descriptive labels.
 /// - `metrics`: `on_detection` fills `.false_accepts`.
 /// - `on_detection`: called with `(&mut metrics, label_str)` when the
 ///   wake word is detected; negatives push to `.false_accepts`.
 fn test_detection_samples(
-    family: &str,
     variants: &[(Vec<f32>, String)],
     metrics: &mut DetectionMetrics,
     on_detection: impl Fn(&mut DetectionMetrics, &str),
@@ -1777,13 +1721,7 @@ fn test_detection_samples(
         if !cold_start {
             consume_warmup(&mut ctx);
         }
-        // Arming after warm-up and immediately before the run keeps warm-up
-        // (and calibration) windows out of the capture — the scope is the
-        // whole exclusion mechanism.
-        wake_capture::arm_clip(family, label);
         let result = run_streaming_detection(samples, &mut ctx);
-        wake_capture::disarm();
-        wake_capture::record_clip_result(family, label, result.detected);
         // Propagate the updated adaptive state for the next variant (warm pass
         // only — the cold pass keeps each variant's bootstrap independent).
         //
@@ -2062,10 +2000,8 @@ fn faph_clear_instrumentation(ctx: &mut super::PipelineCtx) {
 //      real audio (parallel feed of the pinned subset below).
 //   3. Data coverage — 40 utterances + 113 non-phrases + the real-audio
 //      hours (speech + noise) + run wall time.
-// plus the worker count and the FA/h basis note.  The default report carries
-// no per-frame arrays, no analysis sections and no old-run comparisons; the
-// opt-in measurement capture (`MAHBOT_WAKE_CAPTURE`) adds a `measurement` block
-// plus its own files in a separate directory and changes no metric.
+// plus the worker count and the FA/h basis note.  No per-frame arrays, no
+// analysis sections, no old-run comparisons.
 
 /// Pinned real-audio subset for the wake-word bench's FA-per-hour metric.
 ///
@@ -2566,11 +2502,7 @@ pub(crate) fn run_wake_word_benchmark() {
         return;
     }
     let train_clips = enrollment_variants;
-    // Capture the run's in-memory enrolment utterance token matrices
-    // (measure mode only — the capture module decides).
-    wake_capture::arm_enrollment();
     let utterance_embeddings = vad_segment_and_enroll(&train_clips);
-    wake_capture::disarm();
     if utterance_embeddings.is_empty() {
         eprintln!(
             "FATAL: VAD-gated enrollment produced no utterances from {} training clips",
@@ -2678,23 +2610,9 @@ pub(crate) fn run_wake_word_benchmark() {
         "Recognition basis: {} held-out wake-only clips (enrolled voice, seeds 3000+)",
         held_out_recall_clips.len(),
     );
-    // Partition each family BEFORE its clips are scored (the bench-only
-    // measurement writes the frozen A/B assignment here).
-    let positive_labels: Vec<String> = held_out_recall_clips
-        .iter()
-        .map(|(_, label)| label.clone())
-        .collect();
-    wake_capture::write_partition(
-        wake_capture::POSITIVE_FAMILY,
-        &wake_capture::partition_family(wake_capture::POSITIVE_FAMILY, &positive_labels),
-    );
     let mut recognized = 0usize;
-    for (pcm, label) in &held_out_recall_clips {
-        wake_capture::arm_clip(wake_capture::POSITIVE_FAMILY, label);
-        let detected = run_enrolled_cold_variant(pcm);
-        wake_capture::disarm();
-        wake_capture::record_clip_result(wake_capture::POSITIVE_FAMILY, label, detected);
-        if detected {
+    for (pcm, _label) in &held_out_recall_clips {
+        if run_enrolled_cold_variant(pcm) {
             recognized += 1;
         }
     }
@@ -2725,35 +2643,40 @@ pub(crate) fn run_wake_word_benchmark() {
              (likely TTS synthesis misses on a cold cache) — reporting the actual count",
         );
     }
-    // Family → its clips, in the order the corpus is fed.  The pairing is
-    // stated here so a renamed family or a reordered corpus fails at this
-    // literal instead of partitioning a wrong corpus.
-    let negative_families = [
-        ("confusable", &negative_corpus.confusable),
-        ("unrelated", &negative_corpus.unrelated),
-        ("silence", &negative_corpus.silence),
-        ("noise", &negative_corpus.noise),
-    ];
-    for &(family, clips) in &negative_families {
-        let labels: Vec<String> = clips.iter().map(|(_, label)| label.clone()).collect();
-        wake_capture::write_partition(family, &wake_capture::partition_family(family, &labels));
-    }
     let mut fa_metrics = DetectionMetrics::default();
     // The warm pass's adaptive harbor must be the bench enrollment's own
     // co-derived static threshold — not the no-enrollment default (1.65),
     // which would silently raise the false-reaction bar for a hot-floor
     // enrollment (static 1.35).
     let mut shared_adaptive = super::AdaptiveThresholdState::warmed(static_match_threshold);
-    for &(family, clips) in &negative_families {
-        test_detection_samples(
-            family,
-            clips,
-            &mut fa_metrics,
-            |m, l| m.false_accepts.push(l.to_string()),
-            Some(&mut shared_adaptive),
-            false, // warm pass only (negative phase)
-        );
-    }
+    test_detection_samples(
+        &negative_corpus.confusable,
+        &mut fa_metrics,
+        |m, l| m.false_accepts.push(l.to_string()),
+        Some(&mut shared_adaptive),
+        false, // warm pass only (negative phase)
+    );
+    test_detection_samples(
+        &negative_corpus.unrelated,
+        &mut fa_metrics,
+        |m, l| m.false_accepts.push(l.to_string()),
+        Some(&mut shared_adaptive),
+        false, // warm pass only (negative phase)
+    );
+    test_detection_samples(
+        &negative_corpus.silence,
+        &mut fa_metrics,
+        |m, l| m.false_accepts.push(l.to_string()),
+        Some(&mut shared_adaptive),
+        false, // warm pass only (negative phase)
+    );
+    test_detection_samples(
+        &negative_corpus.noise,
+        &mut fa_metrics,
+        |m, l| m.false_accepts.push(l.to_string()),
+        Some(&mut shared_adaptive),
+        false, // warm pass only (negative phase)
+    );
     let false_reactions = fa_metrics.false_accepts.len();
     let non_phrase_rate = if non_phrase_total > 0 {
         false_reactions as f64 / non_phrase_total as f64
@@ -2766,28 +2689,8 @@ pub(crate) fn run_wake_word_benchmark() {
     );
     eprintln!("  False reactions: {false_reactions}/{non_phrase_total} on the non-phrase set");
 
-    // ── Measurement capture: actual corpus counts + meta (bench-only, off by
-    // default; write_meta no-ops when capture is off) ──
-    let mut corpus_counts = vec![(wake_capture::POSITIVE_FAMILY, recognition_total)];
-    corpus_counts.extend(
-        negative_families
-            .iter()
-            .map(|(family, clips)| (*family, clips.len())),
-    );
-    wake_capture::write_meta(&corpus_counts);
-
     // ── Metric 2b: Real-audio FA/h (parallel, pinned subset) ──
-    // The measured pass is corpus-only: the real-audio phase feeds none of the
-    // captured curves and its windows are never armed, so its cost is pure
-    // waste.  The baseline pass runs it exactly as today.
-    let real_audio = if wake_capture::measuring() {
-        skip_json(
-            "measured_pass",
-            "MAHBOT_WAKE_CAPTURE=measure: the real-audio phase feeds none of the captured curves",
-        )
-    } else {
-        run_real_audio_phase()
-    };
+    let real_audio = run_real_audio_phase();
     // Coverage numbers are read from the real-audio section BEFORE the json!
     // macro moves `real_audio` into the report.
     let real_audio_audio_hours = real_audio["feed"]["audio_hours_fed"].as_f64();
@@ -2796,7 +2699,7 @@ pub(crate) fn run_wake_word_benchmark() {
 
     // ── Report: the three metrics + coverage + worker count + wall time ──
     let wall_clock_secs = overall_start.elapsed().as_secs_f64();
-    let mut report = serde_json::json!({
+    let report = serde_json::json!({
         "benchmark": "wake_word",
         "wake_phrase": BENCH_WAKE_PHRASE,
         "recognition": {
@@ -2842,18 +2745,6 @@ pub(crate) fn run_wake_word_benchmark() {
                        synthesized (TTS) speech, not real human speech; real audio is \
                        used for the false-reaction rate only.",
     });
-    // Bench-only measurement block (absent in `off` mode, which is the default).
-    if wake_capture::active() {
-        report["measurement"] = serde_json::json!({
-            "mode": wake_capture::pass_name(),
-            "run": wake_capture::run_id(),
-            "capture_dir": wake_capture::capture_dir().display().to_string(),
-            "selection_half": wake_capture::SELECTION_HALF,
-            "windows_captured": wake_capture::windows_captured(),
-            "flush_windows": wake_capture::flush_windows(),
-            "enrollment_utterances": wake_capture::enrollment_utterances(),
-        });
-    }
 
     // Stop the heartbeat thread.
     heartbeat_stop.store(true, std::sync::atomic::Ordering::Relaxed);
