@@ -2159,6 +2159,19 @@ impl PipelineCtx {
         cue::play(Cue::End);
     }
 
+    /// End an enrollment attempt — cancelled by the user, or failed during
+    /// finalization.
+    ///
+    /// Cancel is the only level that clears the global enrollment accumulators,
+    /// and it also clears the ctx-level `collecting_negatives`: those two are
+    /// what the Phase 2→3 and Phase 3→4 gates read.  It leaves the VAD alone so
+    /// the noise-floor estimate carries into detection.  The caller owns the
+    /// voice status.
+    fn end_enrollment_attempt(&mut self) {
+        self.reset_pipeline_state(ResetLevel::Cancel);
+        self.enrollment_mode = false;
+    }
+
     /// Parameterised pipeline state reset.
     ///
     /// | Field | Full | Soft | Cancel |
@@ -2234,8 +2247,6 @@ impl PipelineCtx {
                 // Full does NOT clear global enrollment accumulators — those
                 // survive mic stop/start cycles so mid-enrollment progress is
                 // preserved across toggle-off/on.
-                // Only ResetLevel::Cancel (explicit cancel or start-fresh)
-                // clears the global enrollment accumulators.
             }
             ResetLevel::Soft => {
                 // Preserve VAD state, vad_threshold, last_wake_word_detection
@@ -2586,9 +2597,7 @@ impl PipelineCtx {
     }
 
     fn handle_cancel_enrollment(&mut self) {
-        self.reset_pipeline_state(ResetLevel::Cancel);
-        self.enrollment_mode = false;
-        // vad_threshold already restored to VAD_THRESHOLD by Cancel level.
+        self.end_enrollment_attempt();
         set_status(if self.is_listening {
             VoiceStatus::Listening
         } else {
@@ -2890,23 +2899,12 @@ impl PipelineCtx {
 /// Schedule a transition back to [`VoiceStatus::Listening`] after enrollment
 /// finalization completes successfully.
 ///
-/// Runs [`reset_pipeline_state(Cancel)`](PipelineCtx::reset_pipeline_state),
-/// sets `enrollment_mode = false`, and spawns a 1.5-second delayed task that
-/// transitions to [`VoiceStatus::Listening`] (respecting the global shutdown
-/// token so it does not write stale state after pipeline exit).
-///
-/// Called from both:
-/// - The Phase 2→4 direct finalization path (existing behavior)
-/// - The Phase 3→4 path (new owner-negative collection path)
+/// Ends the attempt via [`PipelineCtx::end_enrollment_attempt`] and spawns a
+/// 1.5-second delayed task that transitions to [`VoiceStatus::Listening`]
+/// (respecting the global shutdown token so it does not write stale state after
+/// pipeline exit).
 fn schedule_listening_transition(ctx: &mut PipelineCtx) {
-    // Clear all audio buffers BEFORE resetting enrollment_mode to prevent
-    // stale audio from leaking into detection mode during the ~1.5s delay.
-    // Cancel level: clears audio buffers, enrollment accumulators, restores
-    // vad_threshold to VAD_THRESHOLD, but preserves VAD continuity.
-    // Does NOT call reset_vad() — the earshot noise floor estimate from the
-    // enrollment phase is deliberately carried through to detection mode.
-    ctx.reset_pipeline_state(ResetLevel::Cancel);
-    ctx.enrollment_mode = false;
+    ctx.end_enrollment_attempt();
     // Schedule transition to Listening after showing "Enrolled" for 1.5s.
     tokio::spawn(async {
         let shutdown_token = crate::shutdown::shutdown_token();
@@ -3010,8 +3008,9 @@ fn enrollment_consistency_check(utterance_embeddings: &[Vec<f32>]) -> Result<Vec
 /// the self-test, and persist the v2 enrollment record.
 ///
 /// Called after Phase 3 owner-negative collection completes (or times out).
-/// Returns `true` on success; on failure sets an error status and returns
-/// `false` (the user can re-initiate enrollment).
+/// Returns `true` on success.  On failure the cause is logged, `false` is
+/// returned, and the caller ends the attempt via
+/// [`PipelineCtx::end_enrollment_attempt`] so the user can start a new one.
 #[expect(clippy::too_many_lines)]
 async fn finalize_enrollment_pipeline() -> bool {
     if !models_ready() {
@@ -3137,6 +3136,11 @@ async fn finalize_enrollment_pipeline() -> bool {
 
     if !persist_enrollment(&enrollment).await {
         warn!("Enrollment persisted to memory but failed to save to config DB");
+        // The enrollment is live in memory until the process exits — name the
+        // saving failure, not a wake-word failure.
+        set_status(VoiceStatus::Error(
+            "Wake word enrolled but not saved — it will be lost when the app restarts".to_string(),
+        ));
         return false;
     }
 
@@ -3443,14 +3447,6 @@ pub async fn run_voice_pipeline() {
                         "residual",
                     );
                 }
-                // The residual take emptied the buffer: reset the state-machine
-                // indices so a failed finalization (which leaves
-                // collecting_negatives=true until the user retries/cancels)
-                // cannot resume processing against a stale watermark into an
-                // empty buffer.
-                ctx.phase3_processed = 0;
-                ctx.phase3_silence_samples = 0;
-
                 // Cap is ~360k at 16kHz, well within f64 mantissa precision.
                 let collected_secs = {
                     #[expect(clippy::cast_precision_loss)]
@@ -3477,10 +3473,11 @@ pub async fn run_voice_pipeline() {
                 if success {
                     set_status(VoiceStatus::Enrolled);
                     schedule_listening_transition(&mut ctx);
+                } else {
+                    // A failed finalization ends the attempt like a successful one
+                    // — leaving it open re-enters finalization on every mic chunk.
+                    ctx.end_enrollment_attempt();
                 }
-                // On failure, the error status is already set by
-                // finalize_enrollment_pipeline.  The user can retry by
-                // re-initiating enrollment.
             } else {
                 // Update status with current progress.
                 let accumulated_secs = ctx.negatives_speech_samples / SAMPLE_RATE as usize;
@@ -3548,9 +3545,9 @@ pub fn get_enrolled_phrase() -> Option<String> {
 /// `wake_word_templates` (it's structurally excluded), so this update is
 /// about cross-session visibility.
 ///
-/// Warnings are logged on failure. Returns `true` if both the DB write and the
-/// CONFIG update succeeded. Callers use the return value to gate their own
-/// success logging.
+/// Warnings are logged on failure.  Returns `true` if both the DB write and the
+/// CONFIG update succeeded; the only caller ends the enrollment attempt on
+/// `false`, leaving the enrollment in memory for the rest of the session.
 async fn persist_enrollment(enrollment: &WakeWordEnrollment) -> bool {
     let Ok(json) = serde_json::to_string(enrollment) else {
         warn!("Failed to serialize wake word enrollment for persistence");
@@ -3767,9 +3764,8 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     );
 
     if utterance_count >= NUM_ENROLLMENT_SAMPLES {
-        // All 10 utterances collected.  Signal that Phase 2 is complete and
-        // the pipeline should transition to Phase 3 (owner-negative collection)
-        // or proceed directly to finalization.
+        // All 10 utterances collected: signal Phase 2 completion so the main
+        // loop's Phase 2→3 transition starts owner-negative collection.
         voice_state().write().unwrap_poison().utterances_collected = true;
         // Keep the current Enrolling status until transition_to_phase3 fires.
     } else {
