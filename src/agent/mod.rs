@@ -1363,7 +1363,7 @@ impl Agent {
         };
 
         let rejected = tool_calls.iter().filter(|c| c.name == "sleep").count();
-        tracing::warn!(
+        tracing::info!(
             agent_id = %self.agent_id,
             role = %self.role,
             rejected,
