@@ -42,7 +42,9 @@
 //! (2560 samples ≈ 160 ms), derived from [`SCORE_STRIDE_MEL_FRAMES`] (16 mel
 //! frames × 160-sample mel stride).  The raw audio ring is capped at
 //! [`AUDIO_BUFFER_MAX`] (~2.0 s) so the VAD loop and the pre-wake recording
-//! handoff always see a bounded trailing window.
+//! handoff always see a bounded trailing window.  A fire is accepted only near
+//! the start of the speech segment it belongs to — see
+//! [`WAKE_WORD_MAX_SEGMENT_STEPS`] for the position and its justification.
 //!
 //! # Enrollment
 //!
@@ -274,6 +276,24 @@ const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 /// counter.
 const ROLLING_WINDOW_N: usize = 3;
 
+/// Maximum position at which a fire is accepted, counted in stride-gated
+/// scoring steps since the first scoring step of the current speech segment
+/// (a segment starts at the first speech after [`SEGMENT_TIMEOUT_HOPS`] of
+/// silence ends the previous one, and ends when silence returns).  One step is
+/// one [`SCORE_STRIDE_SAMPLES`] stride ≈ 160 ms, so six steps cover roughly
+/// the first 1.0 s of the segment.
+///
+/// Six is the chosen trade: the tighter window removes substantially more
+/// false fires than a wider one, which is the trade the owner chose.
+/// Measured price of this value, against the earlier eight-step (~1.3 s)
+/// window: recognition 43/50 against 46/50 — the three commands that stopped
+/// firing are two previously-firing wake-only clips and one
+/// command-plus-other-speech clip — synthetic false accepts 19 of 121 against
+/// 36 of 121, and 15 merged fires (19 raw events) on the hour of real audio
+/// against the 18 merged (22 raw) belonging to the earlier eight-step run.
+/// Fixed product behaviour — there is no switch.
+const WAKE_WORD_MAX_SEGMENT_STEPS: usize = 6;
+
 // ── Adaptive threshold ──────────────────────────────────────
 
 /// Number of recent per-frame scores to track for adaptive threshold
@@ -387,9 +407,12 @@ fn process_wake_word_score(
 /// It scores the embedding as the cosine soft score against the enrolled
 /// prototype ([`WakeWordEnrollment::soft_score`]), feeds/peeks the adaptive
 /// threshold, and applies rolling window scoring via
-/// [`process_wake_word_score`].  Detection fires immediately when the rolling
-/// sum crosses the effective threshold — the pipeline is speaker-blind with
-/// no second-stage gate.
+/// [`process_wake_word_score`].  Detection fires as soon as the rolling sum
+/// crosses the effective threshold: the scoring is speaker-blind (cosine to
+/// the enrolled prototype, no separate speaker check) and this function adds
+/// no gate of its own — [`handle_wake_word_detection`] is where the live
+/// pipeline additionally requires the fire to sit within
+/// [`WAKE_WORD_MAX_SEGMENT_STEPS`] steps of the segment start.
 ///
 /// # Returns
 /// - `(true, rolling_sum, total_score, effective_threshold)` — the embedding
@@ -480,8 +503,8 @@ fn score_single_embedding(
         info!("VOICE_DEBUG: total_score={total_score:.4}{below_note} rolling_sum={rolling_sum:.4}",);
     }
 
-    // Immediate-fire: no second-stage gate — a threshold
-    // crossing fires detection on this frame (speaker-blind pipeline).
+    // Immediate-fire: this function applies no gate beyond the threshold
+    // crossing (the segment-position cut is the caller's — see above).
     (detected, rolling_sum, total_score, effective_threshold)
 }
 
@@ -1974,6 +1997,13 @@ struct PipelineCtx {
     /// persisted across calls.  When it reaches [`SEGMENT_TIMEOUT_HOPS`]
     /// (~300 ms) the per-segment detection state resets.
     segment_silence_hops: usize,
+    /// Stride-gated scoring steps taken since the first scoring step of the
+    /// current speech segment.  Every scoring step counts, including steps
+    /// that re-score unchanged audio while the speaker pauses.  Cleared where
+    /// the segment ends and wherever a detection is handled, so each command
+    /// is judged on its own; a fire is accepted only while this is
+    /// ≤ [`WAKE_WORD_MAX_SEGMENT_STEPS`].
+    segment_score_steps: usize,
     /// Adaptive threshold tracker for the rolling score window.
     adaptive_threshold: AdaptiveThresholdState,
     /// Adaptive threshold k multiplier (fixed at [`ADAPTIVE_K_DEFAULT`]).
@@ -2054,6 +2084,7 @@ impl PipelineCtx {
             // Fixed default — no config key backs this field.
             adaptive_k: ADAPTIVE_K_DEFAULT,
             segment_silence_hops: 0,
+            segment_score_steps: 0,
             #[cfg(feature = "voice-tests")]
             instrumentation: DetectionInstrumentation::new(),
         }
@@ -2080,7 +2111,7 @@ impl PipelineCtx {
     /// | Field | Full | Soft | Cancel |
     /// |---|---|---|---|
     /// | `audio_buffer`, `command_buffer`, `score_window`, `negative_audio_buf`, `frame_vad`, `frame_raw_audio` | cleared | cleared | cleared |
-    /// | `silence_sample_count`, `segment_silence_hops`, `last_score_sample_count` | = 0 | = 0 | = 0 |
+    /// | `silence_sample_count`, `segment_silence_hops`, `segment_score_steps`, `last_score_sample_count` | = 0 | = 0 | = 0 |
     /// | `utterance_had_speech`, `utterance_silence_samples`, `enrollment_no_speech_frame_count`, `vad_positives_in_a_row`, `emitted_utterances`, `enrollment_pending`, `noise_rms_estimate` | cleared | cleared | cleared |
     /// | Phase 3 (`collecting_negatives`, `phase3_audio_buf`, `phase3_silence_samples`, `negatives_speech_samples`, `phase3_processed`, `phase3_start_time`) | cleared | cleared | cleared |
     /// | `vad_threshold` | `VAD_THRESHOLD` | preserved | `VAD_THRESHOLD` |
@@ -2104,6 +2135,7 @@ impl PipelineCtx {
         self.score_window.clear();
         self.negative_audio_buf.clear();
         self.segment_silence_hops = 0;
+        self.segment_score_steps = 0;
         self.last_score_sample_count = 0;
 
         // ── Enrollment detection/accumulator state (cleared by all levels) ──
@@ -2183,6 +2215,7 @@ impl PipelineCtx {
     /// | `score_window` | Yes | **Critical**: rolling scores must not accumulate across utterances — this is the primary false-trigger mechanism this function fixes |
     /// | `adaptive_threshold` | Yes | Noise floor estimate is per-segment; the 5-call bootstrap is brief and acceptable |
     /// | `segment_silence_hops` | Yes | Reset the silence counter so the next segment starts fresh |
+    /// | `segment_score_steps` | Yes | The next segment must start again at position 1 |
     ///
     /// **Preserved**: `audio_buffer` (normal drain handles leftover overlap),
     /// VAD state (acoustic environment unchanged), `vad_threshold`,
@@ -2197,6 +2230,7 @@ impl PipelineCtx {
 
         // ── Reset silence counter ──
         self.segment_silence_hops = 0;
+        self.segment_score_steps = 0;
 
         // ── Reset the raw ring + VAD cursor so the next utterance starts a
         // fresh segment (the trailing ≤1 s window must not span the boundary).
@@ -3661,7 +3695,10 @@ fn push_capped(buf: &mut Vec<f32>, samples: &[f32], cap: usize) -> usize {
 ///    this call (or the rolling window is mid-utterance), the trailing ≤1 s
 ///    of the VAD-gated [`PipelineCtx::speech_window`] is encoded through the
 ///    shared Qwen3-ASR encoder ([`crate::audio::wake_word::encode_window`])
-///    and scored via [`score_single_embedding`].
+///    and scored via [`score_single_embedding`].  A fire is accepted only
+///    within the first [`WAKE_WORD_MAX_SEGMENT_STEPS`] scoring steps of the
+///    current segment (counted in [`PipelineCtx::segment_score_steps`]); a
+///    later match is refused.
 /// 5. **Detection→recording handoff** — on detection the ring is moved into
 ///    [`PipelineCtx::command_buffer`] with a Soft reset so recording starts
 ///    with the pre-wake context.
@@ -3775,6 +3812,11 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
             return;
         };
 
+        // The segment clock the fire-position cut reads advances only on steps
+        // that really score: a stride that bailed out above (no enrollment, no
+        // model yet) must not shorten the segment's accept window.
+        ctx.segment_score_steps += 1;
+
         // Take the trailing ≤WAKE_WORD_WINDOW_SAMPLES of the VAD-gated speech
         // window.  Scoring speech-only audio (not the raw ring) keeps the
         // cosine distribution aligned with enrollment — raw trailing audio
@@ -3811,7 +3853,12 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
                     }
                 }
 
-                if detected {
+                // A fire is accepted only near the start of the segment it
+                // belongs to; past that position the match is inert (the
+                // position only grows within a segment, so a refused match
+                // stays refused until a boundary or a handled detection
+                // clears the count).
+                if detected && ctx.segment_score_steps <= WAKE_WORD_MAX_SEGMENT_STEPS {
                     // Detection fires immediately — the handoff below
                     // completes the transition to recording mode.
                     ctx.is_recording = true;
@@ -5455,6 +5502,7 @@ mod tests {
             Some(Instant::now().checked_sub(Duration::from_secs(5)).unwrap());
         ctx.auto_start_pending = true;
         ctx.is_recording = true;
+        ctx.segment_score_steps = 7;
         ctx
     }
 
@@ -5486,6 +5534,10 @@ mod tests {
         assert_eq!(
             ctx.segment_silence_hops, 0,
             "segment_silence_hops must be cleared by all reset levels"
+        );
+        assert_eq!(
+            ctx.segment_score_steps, 0,
+            "segment_score_steps must be cleared by all reset levels"
         );
 
         // Phase 3 owner-negative state.
@@ -5896,6 +5948,7 @@ mod tests {
         let mut ctx = PipelineCtx::new();
         ctx.score_window = vec![0.5; 5];
         ctx.segment_silence_hops = 10;
+        ctx.segment_score_steps = 7;
 
         // Complete adaptive threshold bootstrap so the reset-to-bootstrapping
         // assertion is meaningful (not trivially true from PipelineCtx::new()).
@@ -5921,6 +5974,10 @@ mod tests {
             ctx.segment_silence_hops, 0,
             "segment_silence_hops must be reset"
         );
+        assert_eq!(
+            ctx.segment_score_steps, 0,
+            "segment_score_steps must be reset at the boundary"
+        );
         assert!(
             ctx.adaptive_threshold.is_bootstrapping(),
             "adaptive_threshold must be reset (re-enter bootstrap)"
@@ -5932,6 +5989,7 @@ mod tests {
         let mut ctx = PipelineCtx::new();
         ctx.score_window = vec![0.5; 5];
         ctx.segment_silence_hops = 10;
+        ctx.segment_score_steps = 7;
 
         // hop_count below threshold → state persisted
         let below_threshold = SEGMENT_TIMEOUT_HOPS - 1;
@@ -5941,6 +5999,10 @@ mod tests {
         assert_eq!(
             ctx.segment_silence_hops, below_threshold,
             "counter must be persisted below threshold"
+        );
+        assert_eq!(
+            ctx.segment_score_steps, 7,
+            "segment_score_steps must persist inside a continuing segment"
         );
         assert!(
             !ctx.score_window.is_empty(),

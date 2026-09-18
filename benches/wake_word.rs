@@ -1,9 +1,9 @@
 /// Wake-word benchmark (three plain metrics) with a single-instance lock and
 /// a hung-run timeout.
 ///
-/// This is the ONLY wake-word benchmark: recognition (X of 40 phrase
-/// utterances), false reactions (N on the 113 non-phrase set + a rate per
-/// hour on real audio), and data coverage — nothing else.
+/// This is the ONLY wake-word benchmark: recognition (X of the recognition
+/// set), false reactions (N on the non-phrase set + a rate per hour on real
+/// audio), and data coverage — nothing else.
 ///
 /// # Budget
 ///

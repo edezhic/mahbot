@@ -7,9 +7,11 @@
 //! the shared Qwen3-ASR encoder), calibrates it against negative samples,
 //! then runs detection on:
 //!
-//! * Positive cases (wake word variants)
+//! * Positive cases — wake-word variants alone (held-out)
+//! * Positive cases — command + other speech (wake phrase at the very start)
 //! * Negative — confusable near-miss phrases
 //! * Negative — completely unrelated speech
+//! * Negative — the phrase mentioned in passing inside a sentence
 //! * Negative — silence and noise
 //!
 //! # Running as benchmark (canonical — minimal feature set)
@@ -56,10 +58,11 @@
 //! First run populates the TTS audio cache (subsequent runs hit it).  The
 //! encoder pipeline re-encodes raw audio through the shared Qwen3-ASR model
 //! per run — there is no embedding disk cache — so the wall clock is dominated
-//! by encoder forwards over the TEST surface (40-clip wake-only basis, the
-//! 113 non-phrase set, and the parallel real-audio feed).  The exact wall
-//! clock is auditable from the top-level `wall_clock_secs` key (whole run,
-//! report-assembly window included).
+//! by encoder forwards over the TEST surface (the held-out wake-only basis
+//! plus the command-plus-other-speech class, the non-phrase set of
+//! [`EXPECTED_NON_PHRASE_TOTAL`] clips, and the parallel real-audio feed).
+//! The exact wall clock is auditable from the top-level `wall_clock_secs` key
+//! (whole run, report-assembly window included).
 //!
 //! # Requirements
 //!
@@ -309,6 +312,64 @@ const UNRELATED_PHRASES: &[&str] = &[
 /// Seeds per unrelated phrase and the base seed — bench-local.
 const UNRELATED_SEEDS_PER_PHRASE: usize = 3;
 const UNRELATED_SEED_BASE: u64 = 2000;
+
+// ── New corpus classes (new material, enrolled voice) ─────────────────────
+// Both lists below are NEW material: no entry is taken from
+// [`CONFUSABLE_PHRASES`], [`UNRELATED_PHRASES`] or [`OWNER_NEGATIVE_PHRASES`],
+// none of which is modified (the enrolment calibration is built from them).
+// Both are rendered by [`generate_phrase_clips_cached`], whose doc states the
+// construction constraints their clips must satisfy.
+
+/// "Command + other speech" phrases: the wake phrase at the very start of the
+/// utterance, immediately followed (no pause) by a few words of unrelated
+/// speech — the commands a user actually says.  Recognition side (expected to
+/// fire), measured in the same cold pass as the held-out wake-only clips.
+const COMMAND_PLUS_SPEECH_PHRASES: &[&str] = &[
+    "hey mahbot turn on the kitchen light",
+    "hey mahbot play something quiet please",
+    "hey mahbot call my sister back",
+    "hey mahbot set an alarm for six",
+    "hey mahbot add milk to the list",
+    "hey mahbot open yesterdays notes",
+    "hey mahbot check the weather tomorrow",
+    "hey mahbot tell me the headlines",
+    "hey mahbot remind me about dinner",
+    "hey mahbot what time is the train",
+];
+/// Seed base for the command-plus-other-speech clips (collision-free band,
+/// away from 100-109 enrollment, 3000-3039 held-out, 800/810/900/910 detection
+/// negatives, 9000+ owner training).
+const COMMAND_PLUS_SPEECH_SEED_BASE: u64 = 3100;
+
+/// "Phrase mentioned in passing inside a sentence" phrases: the wake phrase
+/// some seconds into ONE uninterrupted utterance of unrelated speech, with
+/// speech continuing after it.  False-accept side: refusing these is success,
+/// a fire is an error and is counted as one.
+const PHRASE_IN_PASSING_PHRASES: &[&str] = &[
+    "so i was telling my brother hey mahbot should wait until tomorrow",
+    "the plan for saturday morning is hey mahbot can bring the tickets",
+    "when you look at the report hey mahbot thinks the numbers are wrong",
+    "the weather has been odd this week and hey mahbot says the garden needs rain",
+    "there is a long story about the move but hey mahbot already heard most of it",
+    "yesterday we walked by the river and hey mahbot took some pictures",
+    "i have been reading about the railways and hey mahbot says it rambles",
+    "on my way home i bought batteries and hey mahbot asked for coffee",
+];
+/// Seed base for the phrase-in-passing clips (same collision-free band
+/// discipline).
+const PHRASE_IN_PASSING_SEED_BASE: u64 = 3200;
+
+/// Pinned non-phrase corpus size, derived from the same lists and bands
+/// [`build_negative_corpus`] builds the corpus from: the confusable bands, the
+/// unrelated bands, the silence matrix, the noise profiles, and the
+/// phrase-in-passing class.  A run short of this means TTS synthesis misses on
+/// a cold cache.
+const EXPECTED_NON_PHRASE_TOTAL: usize = CONFUSABLE_BANDS.len() * CONFUSABLE_PHRASES.len()
+    + UNRELATED_BANDS.len() * UNRELATED_PHRASES.len()
+    + SILENCE_DURATIONS.len()
+    + NOISE_PROFILES.len()
+    + NOISE_PROFILES_DETECTION_ONLY.len()
+    + PHRASE_IN_PASSING_PHRASES.len();
 
 /// Silence durations for the negative silence matrix: three
 /// durations in samples at 16 kHz (0.5 s / 1.0 s / 2.0 s).
@@ -676,38 +737,57 @@ fn generate_enrollment_variants_cached(
     variants
 }
 
-/// Wake-only held-out recall clip count (seeds 3000..3000+N).  Enlarged to
-/// 40: the original 16 clips (3000-3015) plus 24 new clips in the freed
-/// collision-free band (3016-3039).  The basis IS this enlarged set — there
-/// is no separate 16-clip sub-pool.
+/// Seed base for the held-out wake-only clips: a collision-free band (avoids
+/// 100-109 enrollment, 800+ detection variants, 947 warmup, 9000+ owner
+/// training, 2000+ unrelated training).
+const HELD_OUT_SEED_BASE: u64 = 3000;
+
+/// Wake-only held-out recall clip count: seeds [`HELD_OUT_SEED_BASE`]..+N.
+/// Enlarged to 40: the original 16 clips (3000-3015) plus 24 new clips in the
+/// freed collision-free band (3016-3039).  The basis IS this enlarged set —
+/// there is no separate 16-clip sub-pool.
+///
+/// Unseen renderings of the ENROLLED voice, generated strictly after training
+/// and never added to any training pool.  Renders the bare wake phrase alone:
+/// the phrase-in-passing case is measured by the dedicated negative set, and
+/// the command-plus-other-speech set covers the phrase at the start of a
+/// longer utterance.
 const HELD_OUT_WAKE_ONLY_CLIPS: usize = 40;
 
-/// Generate the held-out recall set: unseen renderings of the ENROLLED voice
-/// at collision-free seeds (3000+ — avoids 100-109 enrollment, 800+ detection
-/// variants, 947 warmup, 9000+ owner training, 2000+ unrelated training).
-/// Generated strictly after training and never added to any training pool.
-/// Wake phrase alone only — embedded-in-sentence detection is not a product
-/// requirement and is not measured.
-fn generate_held_out_recall_clips_cached(
+/// Render one clip per phrase: ONE continuous TTS synthesis of the whole text
+/// (never assembled from separately rendered pieces) in the enrolled voice, at
+/// seed `seed_base + index`, cached across runs.  Labels are
+/// `{style}_{label_tag}_s{seed}`.
+///
+/// Every clip must contain no internal silence of ~0.3 s or more — a rendered
+/// pause starts a new speech segment, which would split a
+/// command-plus-other-speech utterance or disguise a phrase-in-passing clip as
+/// a bare-phrase one.  A rendering that has one is re-authored from another
+/// text or seed, never accepted.
+fn generate_phrase_clips_cached(
+    phrases: &[&str],
+    seed_base: u64,
+    label_tag: &str,
     enrolled_style: &str,
     model_hash: &str,
     cache_dir: &std::path::Path,
 ) -> Vec<(Vec<f32>, String)> {
-    let mut clips = Vec::new();
-    for i in 0..HELD_OUT_WAKE_ONLY_CLIPS {
-        let seed = 3000 + i as u64;
-        if let Some(pcm) = synthesize_wake_word_variant_cached(
-            BENCH_WAKE_PHRASE,
-            enrolled_style,
-            seed,
-            TARGET_SAMPLE_RATE,
-            model_hash,
-            cache_dir,
-        ) {
-            clips.push((pcm, format!("{enrolled_style}_heldout_wake_s{seed}")));
-        }
-    }
-    clips
+    phrases
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &phrase)| {
+            let seed = seed_base + i as u64;
+            synthesize_wake_word_variant_cached(
+                phrase,
+                enrolled_style,
+                seed,
+                TARGET_SAMPLE_RATE,
+                model_hash,
+                cache_dir,
+            )
+            .map(|pcm| (pcm, format!("{enrolled_style}_{label_tag}_s{seed}")))
+        })
+        .collect()
 }
 
 /// Seed configuration for TTS phrase variant generation.
@@ -1153,6 +1233,11 @@ fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
 /// - **`last_score_sample_count`** — reset so the first test-utterance scoring
 ///   step waits for [`SCORE_STRIDE_SAMPLES`](super::SCORE_STRIDE_SAMPLES) of
 ///   test audio (the warm-up feed's stride counter must not shorten it).
+/// - **`segment_score_steps`** — reset to 0 so the test utterance's first
+///   scoring step is position 1 of its own segment (otherwise warm-up steps
+///   would start every warm-pass clip past the
+///   [`WAKE_WORD_MAX_SEGMENT_STEPS`](super::WAKE_WORD_MAX_SEGMENT_STEPS) cut,
+///   making each a free pass).
 ///
 /// **Preserved**: `audio_buffer` (the trailing raw ring — the encoder window
 /// spans the most recent second of audio, so warm-up context is exactly what
@@ -1190,6 +1275,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     ctx.score_window.clear();
     ctx.segment_silence_hops = 0;
     ctx.last_score_sample_count = 0;
+    ctx.segment_score_steps = 0;
     ctx.audio_buffer.clear();
     ctx.speech_window.clear();
     ctx.vad_cursor = 0;
@@ -1762,24 +1848,37 @@ fn test_detection_samples(
     }
 }
 
+/// Seed bands of the negative detection corpus as `(seed base, label prefix)`:
+/// two confusable bands and two unrelated bands, one seed per phrase per band.
+/// Consumed by [`build_negative_corpus`] and by the pinned
+/// [`EXPECTED_NON_PHRASE_TOTAL`], so adding a band moves both.
+const CONFUSABLE_BANDS: &[(u64, &str)] = &[(800, "confusable"), (810, "confusable2")];
+const UNRELATED_BANDS: &[(u64, &str)] = &[(900, "unrelated"), (910, "unrelated2")];
+
 /// The full negative detection corpus, built ONCE by [`build_negative_corpus`]
-/// and consumed by the false-reaction metric (confusable bands 800/810,
-/// unrelated bands 900/910, silence, noise profiles).
+/// and consumed by the false-reaction metric ([`CONFUSABLE_BANDS`],
+/// [`UNRELATED_BANDS`], silence, noise profiles, and the phrase-in-passing
+/// class).
 struct NegativeCorpus {
-    /// Confusable band 800 + confusable2 band 810 (merged).
+    /// Confusable bands ([`CONFUSABLE_BANDS`], merged).
     confusable: Vec<(Vec<f32>, String)>,
-    /// Unrelated band 900 + unrelated2 band 910 (merged).
+    /// Unrelated bands ([`UNRELATED_BANDS`], merged).
     unrelated: Vec<(Vec<f32>, String)>,
     /// Silence profiles ([`SILENCE_DURATIONS`]).
     silence: Vec<(Vec<f32>, String)>,
     /// Noise profiles ([`all_noise_profiles`]).
     noise: Vec<(Vec<f32>, String)>,
+    /// Phrase-in-passing clips ([`PHRASE_IN_PASSING_PHRASES`]) — fed LAST so
+    /// the earlier blocks see the same running state as before this class
+    /// existed.
+    phrase_in_passing: Vec<(Vec<f32>, String)>,
 }
 
 /// Build the negative detection corpus with the same generators and seed
 /// bands as the detection metric — the single source of truth for the
 /// negative corpus.  Deterministic given the TTS PCM cache.
 fn build_negative_corpus(
+    enrolled_style: &str,
     available_styles: &[String],
     model_version_hash: &str,
     cache_dir_path: &std::path::Path,
@@ -1798,8 +1897,10 @@ fn build_negative_corpus(
             cache_dir_path,
         )
     };
-    let mut confusable = conf_seed(800, "confusable");
-    confusable.extend(conf_seed(810, "confusable2"));
+    let mut confusable: Vec<(Vec<f32>, String)> = Vec::new();
+    for &(band, prefix) in CONFUSABLE_BANDS {
+        confusable.extend(conf_seed(band, prefix));
+    }
     let unrel_seed = |band: u64, prefix: &str| {
         generate_phrase_variants_cached(
             UNRELATED_PHRASES,
@@ -1814,8 +1915,10 @@ fn build_negative_corpus(
             cache_dir_path,
         )
     };
-    let mut unrelated = unrel_seed(900, "unrelated");
-    unrelated.extend(unrel_seed(910, "unrelated2"));
+    let mut unrelated: Vec<(Vec<f32>, String)> = Vec::new();
+    for &(band, prefix) in UNRELATED_BANDS {
+        unrelated.extend(unrel_seed(band, prefix));
+    }
     let silence: Vec<(Vec<f32>, String)> = SILENCE_DURATIONS
         .iter()
         .map(|(label, len)| (vec![0.0f32; *len], label.to_string()))
@@ -1823,11 +1926,20 @@ fn build_negative_corpus(
     let noise: Vec<(Vec<f32>, String)> = all_noise_profiles()
         .map(|(label, generator)| (generator(), (*label).to_string()))
         .collect();
+    let phrase_in_passing = generate_phrase_clips_cached(
+        PHRASE_IN_PASSING_PHRASES,
+        PHRASE_IN_PASSING_SEED_BASE,
+        "phrase_in_passing",
+        enrolled_style,
+        model_version_hash,
+        cache_dir_path,
+    );
     NegativeCorpus {
         confusable,
         unrelated,
         silence,
         noise,
+        phrase_in_passing,
     }
 }
 
@@ -1994,12 +2106,14 @@ fn faph_clear_instrumentation(ctx: &mut super::PipelineCtx) {
 // ═══════════════════════════════════════════════════════════════════════
 //
 // The whole report is exactly three metrics:
-//   1. Recognition — X of 40 phrase utterances recognized (fixed bench
-//      phrase BENCH_WAKE_PHRASE, the existing 40-clip held-out basis).
-//   2. False reactions — N on the 113 non-phrase set + a rate per hour on
-//      real audio (parallel feed of the pinned subset below).
-//   3. Data coverage — 40 utterances + 113 non-phrases + the real-audio
-//      hours (speech + noise) + run wall time.
+//   1. Recognition — X of the recognition set (the held-out wake-only
+//      basis PLUS the command-plus-other-speech class, run in one cold pass)
+//      recognized (fixed bench phrase BENCH_WAKE_PHRASE).
+//   2. False reactions — N on the non-phrase set (EXPECTED_NON_PHRASE_TOTAL
+//      pinned clips) + a rate per hour on real audio (parallel feed of the
+//      pinned subset below).
+//   3. Data coverage — the recognition clips + the non-phrase set + the
+//      real-audio hours (speech + noise) + run wall time.
 // plus the worker count and the FA/h basis note.  No per-frame arrays, no
 // analysis sections, no old-run comparisons.
 
@@ -2597,50 +2711,86 @@ pub(crate) fn run_wake_word_benchmark() {
     );
     super::set_enrollment(enrollment);
 
-    // ── Metric 1: Recognition — the 40-clip held-out wake-only basis ──
+    // ── Metric 1: Recognition — held-out wake-only + command + other speech ──
     // Same generation and the SAME real streaming cold pass
     // (run_enrolled_cold_variant → run_streaming_detection →
     // handle_wake_word_detection).
-    let held_out_recall_clips = generate_held_out_recall_clips_cached(
+    // Held-out wake-only basis: bare wake phrase, seeds HELD_OUT_SEED_BASE+
+    // (provenance on HELD_OUT_WAKE_ONLY_CLIPS).
+    let held_out_recall_clips = generate_phrase_clips_cached(
+        &[BENCH_WAKE_PHRASE; HELD_OUT_WAKE_ONLY_CLIPS],
+        HELD_OUT_SEED_BASE,
+        "heldout_wake",
+        &voice_allocation.enrolled,
+        &model_version_hash,
+        &cache_dir_path,
+    );
+    let command_plus_speech_clips = generate_phrase_clips_cached(
+        COMMAND_PLUS_SPEECH_PHRASES,
+        COMMAND_PLUS_SPEECH_SEED_BASE,
+        "command_other",
         &voice_allocation.enrolled,
         &model_version_hash,
         &cache_dir_path,
     );
     info!(
-        "Recognition basis: {} held-out wake-only clips (enrolled voice, seeds 3000+)",
+        "Recognition basis: {} held-out wake-only clips (enrolled voice, seeds {}+) + \
+         {} command-plus-other-speech clips (enrolled voice, seeds {}+)",
         held_out_recall_clips.len(),
+        HELD_OUT_SEED_BASE,
+        command_plus_speech_clips.len(),
+        COMMAND_PLUS_SPEECH_SEED_BASE,
     );
     let mut recognized = 0usize;
-    for (pcm, _label) in &held_out_recall_clips {
+    let mut missed: Vec<&str> = Vec::new();
+    for (pcm, label) in held_out_recall_clips
+        .iter()
+        .chain(command_plus_speech_clips.iter())
+    {
         if run_enrolled_cold_variant(pcm) {
             recognized += 1;
+        } else {
+            missed.push(label);
         }
     }
-    let recognition_total = held_out_recall_clips.len();
+    if !missed.is_empty() {
+        eprintln!("  Missed recognition clips: {}", missed.join(", "));
+    }
+    let recognition_total = held_out_recall_clips.len() + command_plus_speech_clips.len();
     let recognition_rate = if recognition_total > 0 {
         recognized as f64 / recognition_total as f64
     } else {
         f64::NAN
     };
     info!(
-        "Recognition: {recognized}/{recognition_total} ({:.1}%)",
+        "Recognition (held-out wake-only + command + other speech): {recognized}/{recognition_total} \
+         ({:.1}%)",
         recognition_rate * 100.0,
     );
-    eprintln!("  Recognition: {recognized}/{recognition_total} wake-word utterances recognized");
+    eprintln!(
+        "  Recognition: {recognized}/{recognition_total} wake-word utterances recognized \
+         (held-out wake-only + command + other speech)"
+    );
 
-    // ── Metric 2a: False reactions — the 113 non-phrase set ──
+    // ── Metric 2a: False reactions — the non-phrase set ──
     // Shared negative corpus + the shared warm detection pass
     // (test_detection_samples).
-    let negative_corpus =
-        build_negative_corpus(&available_styles, &model_version_hash, &cache_dir_path);
+    let negative_corpus = build_negative_corpus(
+        &voice_allocation.enrolled,
+        &available_styles,
+        &model_version_hash,
+        &cache_dir_path,
+    );
     let non_phrase_total = negative_corpus.confusable.len()
         + negative_corpus.unrelated.len()
         + negative_corpus.silence.len()
-        + negative_corpus.noise.len();
-    if non_phrase_total != 113 {
+        + negative_corpus.noise.len()
+        + negative_corpus.phrase_in_passing.len();
+    if non_phrase_total != EXPECTED_NON_PHRASE_TOTAL {
         warn!(
-            "Wake-word bench non-phrase set size is {non_phrase_total}, not the pinned 113 \
-             (likely TTS synthesis misses on a cold cache) — reporting the actual count",
+            "Wake-word bench non-phrase set size is {non_phrase_total}, not the pinned \
+             {EXPECTED_NON_PHRASE_TOTAL} (likely TTS synthesis misses on a cold cache) — \
+             reporting the actual count",
         );
     }
     let mut fa_metrics = DetectionMetrics::default();
@@ -2677,6 +2827,13 @@ pub(crate) fn run_wake_word_benchmark() {
         Some(&mut shared_adaptive),
         false, // warm pass only (negative phase)
     );
+    test_detection_samples(
+        &negative_corpus.phrase_in_passing,
+        &mut fa_metrics,
+        |m, l| m.false_accepts.push(l.to_string()),
+        Some(&mut shared_adaptive),
+        false, // warm pass only (negative phase)
+    );
     let false_reactions = fa_metrics.false_accepts.len();
     let non_phrase_rate = if non_phrase_total > 0 {
         false_reactions as f64 / non_phrase_total as f64
@@ -2706,8 +2863,15 @@ pub(crate) fn run_wake_word_benchmark() {
             "detected": recognized,
             "of": recognition_total,
             "rate": recognition_rate,
-            "basis": "existing 40-clip held-out wake-only basis (enrolled voice, \
-                      seeds 3000+, fixed bench phrase)",
+            "basis": format!(
+                "the {}-clip held-out wake-only basis (seeds {}+) PLUS the {}-clip \
+                 command-plus-other-speech class (seeds {}+), one cold pass, enrolled \
+                 voice, fixed bench phrase",
+                held_out_recall_clips.len(),
+                HELD_OUT_SEED_BASE,
+                command_plus_speech_clips.len(),
+                COMMAND_PLUS_SPEECH_SEED_BASE,
+            ),
         },
         "calibration": {
             "neg_mean": calibration.neg_mean,
@@ -2724,8 +2888,15 @@ pub(crate) fn run_wake_word_benchmark() {
                 "false_reactions": false_reactions,
                 "of": non_phrase_total,
                 "rate": non_phrase_rate,
-                "basis": "the 113 non-phrase set (56 confusable + 40 unrelated + 3 \
-                          silence + 14 noise profiles)",
+                "basis": format!(
+                    "the {non_phrase_total}-clip non-phrase set: {} confusable + {} unrelated \
+                     + {} silence + {} noise profiles + {} phrase-in-passing",
+                    negative_corpus.confusable.len(),
+                    negative_corpus.unrelated.len(),
+                    negative_corpus.silence.len(),
+                    negative_corpus.noise.len(),
+                    negative_corpus.phrase_in_passing.len(),
+                ),
             },
             "real_audio": real_audio,
         },
@@ -2780,8 +2951,8 @@ pub(crate) fn run_wake_word_benchmark() {
          ═══════════════════════════════════════════════════════════\n\
          Date/Time:      {timestamp}\n\
          Wake phrase:    {wake}\n\
-         1. Recognition:        {recognized}/{recognition_total} of 40 phrase utterances\n\
-         2. False reactions:    {false_reactions}/{non_phrase_total} on the 113 non-phrase set\n\
+         1. Recognition:        {recognized}/{recognition_total} phrase utterances\n\
+         2. False reactions:    {false_reactions}/{non_phrase_total} on the non-phrase set\n\
          \x20  Real-audio FA/h:   see real_audio section ({workers} parallel workers, {assignment})\n\
          3. Coverage:    {recognition_total} utterances + {non_phrase_total} non-phrases + real audio ({audio_hours:.2} h speech+noise)\n\
          Wall time:      {wall:.1}s ({wall_min:.1} min)\n\
