@@ -184,12 +184,13 @@ pub static DOWNLOAD_EVENTS: OnceLock<broadcast::Sender<TtsDownloadEvent>> = Once
 /// Wrapper around rodio's audio output.
 ///
 /// rodio 0.22 splits output into a `MixerDeviceSink` (owns the cpal stream)
-/// and a `Mixer` handle (a cheap `Arc` clone). Players are created from the
-/// mixer via `Player::connect_new(&mixer)` on async tasks; the sink itself is
-/// created once at startup and never touched again. Both members are `Send +
-/// Sync` — the cpal `Stream` inside `MixerDeviceSink` dropped its
-/// `NotSendSyncAcrossAllPlatforms` phantom marker in cpal 0.17, so the
-/// wrapper auto-derives both traits and the historical `unsafe impl
+/// and a `Mixer` handle (a cheap `Arc` clone). Read-aloud creates its players
+/// from the mixer via `Player::connect_new(&mixer)`; the wake-word cues
+/// ([`crate::audio::cue`]) append their source to the same mixer. The sink is
+/// created lazily by `open_audio_output()` and never touched again. Both
+/// members are `Send + Sync` — the cpal `Stream` inside `MixerDeviceSink`
+/// dropped its `NotSendSyncAcrossAllPlatforms` phantom marker in cpal 0.17, so
+/// the wrapper auto-derives both traits and the historical `unsafe impl
 /// Send`/`Sync` are no longer needed (a future rodio/cpal bump that
 /// re-introduces a non-`Send` type would fail to compile at the
 /// `static AUDIO_OUTPUT` below — the correct loud failure).
@@ -304,10 +305,11 @@ pub fn models_ready() -> bool {
 
 /// Returns `true` if the audio output device was successfully initialized.
 ///
-/// This checks whether `DeviceSinkBuilder::open_default_sink()` succeeded
-/// via [`ensure_audio_output()`]. Models may be loaded ([`models_ready()`]) but
-/// audio output may still be unavailable (e.g., headless system, no speakers,
-/// CoreAudio initialization failure).
+/// This checks whether `DeviceSinkBuilder::open_default_sink()` succeeded —
+/// through [`ensure_audio_output()`] or its silent counterpart
+/// [`ensure_audio_output_silent()`] used by the wake-word cues. Models may be
+/// loaded ([`models_ready()`]) but audio output may still be unavailable (e.g.,
+/// headless system, no speakers, CoreAudio initialization failure).
 ///
 /// The device is opened lazily on demand ([`ensure_audio_output()`]); this
 /// passive check reflects whether that open has succeeded. Runtime device
@@ -318,15 +320,39 @@ pub fn audio_output_ready() -> bool {
 }
 
 /// Open the OS audio output device on demand (idempotent, best-effort).
-/// Returns whether output is ready. Called lazily so a disabled TTS
-/// subsystem never opens the device: at boot after config load (when
-/// enabled), on the Settings enable toggle, and before playback.
+/// Returns whether output is ready.
+///
+/// Nothing opens the device at init: read-aloud opens it when it is enabled
+/// (after config load, on the Settings enable toggle, before playback), and the
+/// wake-word cues open it independently of read-aloud via
+/// [`ensure_audio_output_silent()`] (when the microphone starts, and before a
+/// cue).
 ///
 /// On failure this warns and leaves [`AUDIO_OUTPUT`] unset (playback disabled),
 /// matching the previous [`init_global()`] behavior. A later call retries a
 /// previously-failed open.
 #[must_use]
 pub fn ensure_audio_output() -> bool {
+    open_audio_output(true)
+}
+
+/// [`ensure_audio_output`] for the wake-word cues ([`crate::audio::cue`]).
+/// Identical, except that a failed open is not warned about: a host without
+/// audio output must stay silent, logs and GUI Issues view included.
+#[must_use]
+pub(crate) fn ensure_audio_output_silent() -> bool {
+    open_audio_output(false)
+}
+
+/// Mixer of the shared output device, for playback that is not read-aloud (the
+/// wake-word cues). `None` until the device has been opened.
+pub(crate) fn playback_mixer() -> Option<rodio::mixer::Mixer> {
+    AUDIO_OUTPUT.get().map(|output| output.mixer.clone())
+}
+
+/// Shared body of [`ensure_audio_output`] and [`ensure_audio_output_silent`];
+/// `warn_on_failure` picks the log level a failed device open is reported at.
+fn open_audio_output(warn_on_failure: bool) -> bool {
     if AUDIO_OUTPUT.get().is_some() {
         return true;
     }
@@ -351,7 +377,11 @@ pub fn ensure_audio_output() -> bool {
             }
         }
         Err(e) => {
-            warn!("TTS: failed to initialize audio output — playback will be disabled: {e}");
+            if warn_on_failure {
+                warn!("TTS: failed to initialize audio output — playback will be disabled: {e}");
+            } else {
+                debug!("Audio output unavailable — playback stays silent: {e}");
+            }
         }
     }
     AUDIO_OUTPUT.get().is_some()
@@ -508,11 +538,11 @@ pub fn init_global() -> Result<()> {
         .set(dl_tx)
         .map_err(|_| anyhow!("DOWNLOAD_EVENTS already initialized"))?;
 
-    // The OS audio output device is intentionally NOT opened here — a disabled
-    // TTS subsystem must never touch the device. It is opened lazily on demand
-    // via [`ensure_audio_output()`] (after config load, on the enable toggle,
-    // and before playback).
-
+    // The OS audio output device is intentionally NOT opened here: it is opened
+    // lazily on demand via [`ensure_audio_output()`] once something actually
+    // needs it — the read-aloud enable path (after config load, on the Settings
+    // toggle, before playback) or the wake-word cues ([`crate::audio::cue`]),
+    // which share the same device independently of read-aloud.
     Ok(())
 }
 
@@ -1615,7 +1645,7 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
         // Create a fresh player for this chunk and begin playback immediately.
         // Each chunk gets its own player (connected to the shared mixer) so we
         // can cancel per-chunk playback. `Player::connect_new` is infallible —
-        // the fallible device-open work happened once in `init_global()`.
+        // the fallible device-open work lives in `open_audio_output()`.
         let player = Player::connect_new(&audio_output.mixer);
 
         if current_player.is_none() {

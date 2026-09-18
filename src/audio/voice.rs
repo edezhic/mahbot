@@ -15,7 +15,14 @@
 //!    against the enrolled prototype, mapped through negative-sample
 //!    calibration into a soft score, with the rolling-sum detection machinery
 //!    (speaker-blind, immediate-fire).
-//! 5. **Command recording** — record speech until silence or 10 min cap
+//! 5. **Command recording** — record speech until silence or the 10 min cap.
+//!    Recording starts by discarding everything captured before the fire plus
+//!    [`POST_FIRE_DISCARD_SAMPLES`], so the trigger phrase is not carried into
+//!    the recognition input (at worst a trailing fragment of it survives, when
+//!    the phrase is still being spoken at the fire); an activation whose
+//!    retained audio holds no speech delivers nothing at all.  Two short cue
+//!    sounds (see [`crate::audio::cue`]) mark the start and the end of the
+//!    recording.
 //! 6. **Transcription** — via the shared Qwen3-ASR local transcriber
 //! 7. **Routing** — transcribed text is routed to the admin's Assistant via
 //!    [`route_to_agent`] (the desktop GUI has a single acting identity, the
@@ -41,9 +48,9 @@
 //! encoder.  The stride between scoring steps is [`SCORE_STRIDE_SAMPLES`]
 //! (2560 samples ≈ 160 ms), derived from [`SCORE_STRIDE_MEL_FRAMES`] (16 mel
 //! frames × 160-sample mel stride).  The raw audio ring is capped at
-//! [`AUDIO_BUFFER_MAX`] (~2.0 s) so the VAD loop and the pre-wake recording
-//! handoff always see a bounded trailing window.  A fire is accepted only near
-//! the start of the speech segment it belongs to — see
+//! [`AUDIO_BUFFER_MAX`] (~2.0 s) so the VAD loop always sees a bounded trailing
+//! window; the ring itself is dropped when detection fires.  A fire is
+//! accepted only near the start of the speech segment it belongs to — see
 //! [`WAKE_WORD_MAX_SEGMENT_STEPS`] for the position and its justification.
 //!
 //! # Enrollment
@@ -55,6 +62,7 @@
 //! enrollment schema under the `wake_word_templates` config key; old v1 records
 //! are rejected (re-enrollment required).
 
+use crate::audio::cue::{self, Cue};
 use crate::audio::wake_word::{
     self, ENROLLMENT_CONSISTENCY_MIN_FRACTION, ENROLLMENT_CONSISTENCY_MIN_SIMILARITY,
     MIN_ENROLLMENT_UTTERANCES, WAKE_WORD_EMBEDDING_DIM, WINDOW_SAMPLES, WakeWordEnrollment,
@@ -261,9 +269,25 @@ const SCORE_STRIDE_SAMPLES: usize =
 
 /// Cap for the raw audio ring (~2.0 s): one full [`WINDOW_SAMPLES`] window
 /// (12 160 samples) plus up to eight scoring strides of context
-/// (8 × 2560 = 20 480) so the VAD loop and pre-wake recording handoff always
-/// have the most recent audio while older samples drain.
+/// (8 × 2560 = 20 480) so the VAD loop always has the most recent audio to
+/// consume while older samples drain.  The ring is the raw VAD input only —
+/// the detection→recording handoff drops it wholesale (see
+/// [`handle_wake_word_detection`]), so nothing downstream depends on its depth.
 const AUDIO_BUFFER_MAX: usize = WINDOW_SAMPLES + 8 * SCORE_STRIDE_SAMPLES;
+
+/// Audio discarded at the start of a wake-word recording (0.2 s).
+///
+/// Everything captured before the fire is dropped outright, and this window
+/// covers what the detection lag left behind plus the recording-start cue
+/// ([`Cue::Start`], which the still-open microphone captures): the cue is ~70 ms
+/// of it, the rest absorbs the detection handoff and output latency.  The price
+/// is the opening of the command — up to ~0.5 s in the worst case, when the
+/// command starts right after the trigger phrase and detection lands late —
+/// which is the accepted trade for keeping the trigger phrase out of the
+/// recognition input; a trailing fragment of the phrase can still survive when
+/// the phrase is still being spoken at the fire.  Fixed product behaviour —
+/// there is no switch.
+const POST_FIRE_DISCARD_SAMPLES: usize = 200 * SAMPLE_RATE as usize / 1000;
 
 /// Cooldown after a wake word detection — prevents rapid consecutive false
 /// triggers.
@@ -1848,6 +1872,14 @@ struct PipelineCtx {
     /// time, so that system load / processing delays don't affect recording
     /// cutoff consistency.
     silence_sample_count: usize,
+    /// Wake-word recording: samples still to be dropped from the front of the
+    /// recording before any of it reaches recognition
+    /// ([`POST_FIRE_DISCARD_SAMPLES`]).  Armed by the detection handoff.
+    post_fire_discard_samples: usize,
+    /// Whether the retained part of the current wake-word recording contained
+    /// any speech, judged by the same per-chunk VAD measurement detection uses.
+    /// A recording with none is dropped without delivering anything.
+    recording_had_speech: bool,
     enrollment_mode: bool,
     /// Accumulated VAD decisions across all frames processed this enrollment
     /// session.  Paired with [`frame_raw_audio`] for the extracted
@@ -1924,9 +1956,8 @@ struct PipelineCtx {
     speech_window: Vec<f32>,
     /// Number of samples at the FRONT of [`audio_buffer`] already consumed by
     /// the VAD frame loop.  The VAD loop advances this cursor instead of
-    /// draining the ring, so the ring retains the pre-wake raw context for
-    /// the detection→recording handoff even after every frame has been
-    /// VAD-checked.
+    /// draining the ring, so the ring keeps the whole trailing window of raw
+    /// audio even after every frame has been VAD-checked.
     vad_cursor: usize,
     /// Samples processed since the last window encoding (scoring step).
     /// Reset to 0 after each encode; when it reaches [`SCORE_STRIDE_SAMPLES`]
@@ -2047,6 +2078,8 @@ impl PipelineCtx {
             resume_listening_after_recording: false,
             command_buffer: Vec::new(),
             silence_sample_count: 0,
+            post_fire_discard_samples: 0,
+            recording_had_speech: false,
             enrollment_mode: false,
             frame_vad: Vec::new(),
             frame_raw_audio: Vec::new(),
@@ -2106,13 +2139,33 @@ impl PipelineCtx {
         self.auto_start_pending = auto_start;
     }
 
+    /// End an in-flight wake-word recording, if there is one: clear its state and
+    /// play its end cue.
+    ///
+    /// Every path that stops a recording for an operational reason goes through
+    /// here, so a new stop reason cannot forget the cue (process teardown that
+    /// simply closes the command channel is the one exception — nothing observes
+    /// a cue then).  Soft level drops the recording/detection buffers while
+    /// preserving VAD continuity, `vad_threshold` and the wake-word cooldown
+    /// timestamp, so the trigger cannot immediately re-fire.  The caller owns the
+    /// voice status (Listening after a normal end, Enrolling after an aborted
+    /// recording).
+    fn end_wake_recording(&mut self) {
+        if !self.is_recording {
+            return;
+        }
+        self.reset_pipeline_state(ResetLevel::Soft);
+        self.is_recording = false;
+        cue::play(Cue::End);
+    }
+
     /// Parameterised pipeline state reset.
     ///
     /// | Field | Full | Soft | Cancel |
     /// |---|---|---|---|
     /// | `audio_buffer`, `command_buffer`, `score_window`, `negative_audio_buf`, `frame_vad`, `frame_raw_audio` | cleared | cleared | cleared |
-    /// | `silence_sample_count`, `segment_silence_hops`, `segment_score_steps`, `last_score_sample_count` | = 0 | = 0 | = 0 |
-    /// | `utterance_had_speech`, `utterance_silence_samples`, `enrollment_no_speech_frame_count`, `vad_positives_in_a_row`, `emitted_utterances`, `enrollment_pending`, `noise_rms_estimate` | cleared | cleared | cleared |
+    /// | `silence_sample_count`, `segment_silence_hops`, `segment_score_steps`, `last_score_sample_count`, `post_fire_discard_samples` | = 0 | = 0 | = 0 |
+    /// | `recording_had_speech`, `utterance_had_speech`, `utterance_silence_samples`, `enrollment_no_speech_frame_count`, `vad_positives_in_a_row`, `emitted_utterances`, `enrollment_pending`, `noise_rms_estimate` | cleared | cleared | cleared |
     /// | Phase 3 (`collecting_negatives`, `phase3_audio_buf`, `phase3_silence_samples`, `negatives_speech_samples`, `phase3_processed`, `phase3_start_time`) | cleared | cleared | cleared |
     /// | `vad_threshold` | `VAD_THRESHOLD` | preserved | `VAD_THRESHOLD` |
     /// | `enrollment_vad` | `None` | `None` | `None` |
@@ -2132,6 +2185,8 @@ impl PipelineCtx {
         self.vad_cursor = 0;
         self.command_buffer.clear();
         self.silence_sample_count = 0;
+        self.post_fire_discard_samples = 0;
+        self.recording_had_speech = false;
         self.score_window.clear();
         self.negative_audio_buf.clear();
         self.segment_silence_hops = 0;
@@ -2401,6 +2456,11 @@ impl PipelineCtx {
                     self.is_listening = true;
                     set_status(VoiceStatus::Listening);
                     info!("Voice pipeline: started listening");
+                    // Open the cue output device now, while nothing is being
+                    // recorded: a cold device open on the detection path would
+                    // delay the start cue past the opening the recording
+                    // discards, leaking it into recognized audio.
+                    cue::warm_up();
                 }
                 Err(e) => {
                     warn!("Failed to start microphone: {e}");
@@ -2419,6 +2479,9 @@ impl PipelineCtx {
 
     /// Stop the wake-word mic and tear down pipeline state.
     ///
+    /// A wake-word recording in flight is abandoned here (the Full reset below
+    /// clears its state) and plays its end cue.
+    ///
     /// Returns `true` when an in-progress mic-button recording was aborted
     /// (the caller broadcasts a discard notice so the loss is not silent).
     fn handle_stop_listening(&mut self) -> bool {
@@ -2428,6 +2491,10 @@ impl PipelineCtx {
         // Global enrollment accumulators are preserved across mic stop/start
         // so mid-enrollment progress survives toggle-off/on.
         let aborted_recording = self.manual_recording;
+        // A wake-word recording is abandoned here too: the end cue and the state
+        // clear both belong to the helper, which is a no-op when nothing is
+        // recording (its Soft reset is subsumed by the Full reset below).
+        self.end_wake_recording();
         self.reset_pipeline_state(ResetLevel::Full);
         self.is_listening = false;
         self.enrollment_mode = false;
@@ -2461,6 +2528,14 @@ impl PipelineCtx {
             self.resume_listening_after_recording = false;
             self.command_buffer.clear();
             self.silence_sample_count = 0;
+        }
+
+        // A wake-word recording cannot survive enrollment either — the same
+        // router priority would starve it.  Abandon it (its end cue included) so
+        // no recording state outlives it.
+        if self.is_recording {
+            warn!("Aborting wake-word recording — enrollment started");
+            self.end_wake_recording();
         }
 
         // Resume existing enrollment progress if available (e.g., the user
@@ -2564,6 +2639,8 @@ impl PipelineCtx {
     fn handle_shutdown(&mut self) {
         self.set_manual_recording(false);
         self.resume_listening_after_recording = false;
+        // A wake-word recording stops here like anywhere else.
+        self.end_wake_recording();
         drop(self.mic_stream.take());
     }
 
@@ -3278,6 +3355,13 @@ pub async fn run_voice_pipeline() {
                     handle_recording_audio(samples, &mut ctx).await;
                 } else {
                     handle_wake_word_detection(&samples, &mut ctx);
+                    // A fire starts a recording: acknowledge it with the start
+                    // cue.  Played from the loop rather than from the detector
+                    // so the wake-word bench — which calls the detector
+                    // directly — never plays it.
+                    if ctx.is_recording {
+                        cue::play(Cue::Start);
+                    }
                 }
             }
 
@@ -3489,18 +3573,43 @@ async fn persist_enrollment(enrollment: &WakeWordEnrollment) -> bool {
 
 /// Handle audio during wake-word command recording (post-detection).
 ///
-/// Accumulates audio into `command_buffer`, tracks silence by sample count,
-/// and stops recording after [`SILENCE_THRESHOLD_SAMPLES`] of silence or the
-/// [`MAX_RECORD_SECS`] cap, then transcribes and routes the command.
+/// The opening [`POST_FIRE_DISCARD_SAMPLES`] of the recording are dropped, so the
+/// audio handed to recognition begins after the trigger (the pre-fire audio is
+/// already gone by then; only the phrase tail left by a fire that landed
+/// mid-phrase can survive).  The remainder accumulates into `command_buffer`,
+/// silence is tracked by sample count, and the recording stops after
+/// [`SILENCE_THRESHOLD_SAMPLES`] of silence or the [`MAX_RECORD_SECS`] cap, then
+/// transcribes and routes the command.
+///
+/// A recording whose retained audio contains no speech is dropped without
+/// delivering anything — no message, no notice.  The manual mic-button path
+/// (which keeps its own "no speech detected" notice) is unaffected.
 ///
 /// Silence duration is measured in audio samples (not wall-clock time) so that
 /// system load / processing delays don't affect recording cutoff consistency.
 #[expect(clippy::cast_precision_loss)]
 async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
-    ctx.command_buffer.extend_from_slice(&samples);
-    let speech = is_speech_with_threshold(&samples, ctx.vad_threshold);
+    // Discard the armed opening before anything is kept.  The dropped samples
+    // are still fed to the VAD: the detector is stateful and tracks the live
+    // stream, so skipping them would leave the trigger phrase in its context
+    // and make the first retained frames read as speech — which would wrongly
+    // satisfy the no-speech gate below.
+    let discarded = ctx.post_fire_discard_samples.min(samples.len());
+    ctx.post_fire_discard_samples -= discarded;
+    if discarded > 0 {
+        // The verdict is intentionally unused — this only advances the detector.
+        is_speech_with_threshold(&samples[..discarded], ctx.vad_threshold);
+    }
+    let samples = &samples[discarded..];
+    if samples.is_empty() {
+        return;
+    }
+
+    ctx.command_buffer.extend_from_slice(samples);
+    let speech = is_speech_with_threshold(samples, ctx.vad_threshold);
     if speech {
         ctx.silence_sample_count = 0;
+        ctx.recording_had_speech = true;
     } else {
         // Accumulate silence by raw chunk size: each call receives a
         // variable-size chunk of audio samples directly from the mic.
@@ -3521,8 +3630,26 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
             }
         );
 
-        set_status(VoiceStatus::Transcribing);
+        // The recording has ended — acknowledge that regardless of what
+        // follows (silence, the cap, a failed transcription) — and clear its
+        // state, so no outcome below owns a reset of its own.
+        let had_speech = ctx.recording_had_speech;
         let cmd_buf = std::mem::take(&mut ctx.command_buffer);
+        ctx.end_wake_recording();
+
+        // A silent activation delivers nothing: no message, no notice.  The
+        // recording is dropped before transcription so silence cannot turn
+        // into junk either.
+        if !had_speech {
+            debug!(
+                "No speech in wake-word recording — dropping {} samples",
+                cmd_buf.len()
+            );
+            set_status(VoiceStatus::Listening);
+            return;
+        }
+
+        set_status(VoiceStatus::Transcribing);
 
         match transcribe_audio(&cmd_buf).await {
             Ok(transcribed) => {
@@ -3538,15 +3665,6 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
                 } else {
                     route_to_agent(transcribed).await;
                 }
-
-                // Cleanup: return to listening immediately on success.
-                // Soft reset clears detection/recording buffers (audio,
-                // score_window, command_buffer, negative_audio_buf) while
-                // preserving VAD state, vad_threshold, and the wake-word
-                // cooldown timestamp to prevent immediate re-triggering.
-                ctx.reset_pipeline_state(ResetLevel::Soft);
-                ctx.is_recording = false;
-                set_status(VoiceStatus::Listening);
             }
             Err(e) => {
                 warn!("Transcription failed: {e}");
@@ -3562,16 +3680,13 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
                 // non-blocking alternative).
                 ctx.refractory_until = Some(Instant::now() + Duration::from_secs(3));
 
-                // Cleanup the recording state.
-                // Soft reset clears recording/detection buffers while preserving
-                // VAD continuity so the noise floor estimate survives the
-                // refractory period.
-                ctx.reset_pipeline_state(ResetLevel::Soft);
-                ctx.is_recording = false;
                 // Do NOT set status to Listening here — the refractory delay
                 // is handled in the main loop's post-select section.
+                return;
             }
         }
+
+        set_status(VoiceStatus::Listening);
     }
 }
 
@@ -3699,9 +3814,10 @@ fn push_capped(buf: &mut Vec<f32>, samples: &[f32], cap: usize) -> usize {
 ///    within the first [`WAKE_WORD_MAX_SEGMENT_STEPS`] scoring steps of the
 ///    current segment (counted in [`PipelineCtx::segment_score_steps`]); a
 ///    later match is refused.
-/// 5. **Detection→recording handoff** — on detection the ring is moved into
-///    [`PipelineCtx::command_buffer`] with a Soft reset so recording starts
-///    with the pre-wake context.
+/// 5. **Detection→recording handoff** — on detection the raw ring is dropped
+///    (everything it holds was captured before the fire, the trigger phrase
+///    included) and the recording is armed to discard its own opening
+///    ([`POST_FIRE_DISCARD_SAMPLES`]) before anything reaches recognition.
 fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
     // ── Cooldown check ──
     // If we recently detected the wake word, skip ALL processing for this
@@ -3731,9 +3847,10 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
     // full frame would double-feed overlapping audio and corrupt earshot's
     // internal ring buffer).  No mel frames are built — the VAD loop only
     // tracks speech presence and per-segment silence; scoring encodes the
-    // VAD-gated `speech_window`, not this ring.  The ring is NOT drained
-    // here: `vad_cursor` advances instead, so on detection the ring still
-    // holds the pre-wake raw context for the recording handoff (step 5).
+    // VAD-gated `speech_window`, not this ring.  The ring is NOT drained:
+    // `vad_cursor` marks the consumed prefix and the unconsumed overlap tail
+    // (up to FRAME_LENGTH - HOP_LENGTH samples) has to survive into the next
+    // call.
     let mut speech_seen_this_call = false;
     // Side-channel for consecutive VAD-negative hop tracking, seeded with the
     // accumulated count from previous calls so the counter is continuous.
@@ -3873,15 +3990,17 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
     }
 
     // ── Detection→recording handoff ──
-    // When detection fires, the raw ring is moved into command_buffer so
-    // recording starts with the pre-wake context.  A Soft reset clears the
-    // detection state (score window, adaptive threshold, audio buffers)
-    // while preserving VAD continuity and the cooldown timestamp.
+    // The ring is dropped, not seeded into the recording: everything it holds
+    // was captured before the fire — the trigger phrase included — and the
+    // recorded command must start after the phrase that triggered it (a
+    // trailing fragment can still survive when the phrase is still being spoken
+    // at the fire).  A Soft reset clears the detection state (ring, speech
+    // window, score window) while preserving VAD continuity, the adaptive
+    // threshold and the cooldown timestamp; the recording then starts by
+    // discarding its own opening.
     if ctx.is_recording {
-        let audio = std::mem::take(&mut ctx.audio_buffer);
         ctx.reset_pipeline_state(ResetLevel::Soft);
-        ctx.command_buffer.extend_from_slice(&audio);
-        ctx.last_score_sample_count = 0;
+        ctx.post_fire_discard_samples = POST_FIRE_DISCARD_SAMPLES;
     }
 }
 
@@ -5479,6 +5598,8 @@ mod tests {
         ctx.audio_buffer = vec![0.5; 100];
         ctx.command_buffer = vec![0.5; 100];
         ctx.silence_sample_count = 1000;
+        ctx.post_fire_discard_samples = 1000;
+        ctx.recording_had_speech = true;
         ctx.score_window = vec![0.5; 5];
         ctx.last_score_sample_count = 512;
         ctx.negative_audio_buf = vec![0.5; 50];
@@ -5513,6 +5634,8 @@ mod tests {
         assert!(ctx.audio_buffer.is_empty());
         assert!(ctx.command_buffer.is_empty());
         assert_eq!(ctx.silence_sample_count, 0);
+        assert_eq!(ctx.post_fire_discard_samples, 0);
+        assert!(!ctx.recording_had_speech);
         assert!(ctx.score_window.is_empty());
         assert_eq!(ctx.last_score_sample_count, 0);
         assert!(ctx.negative_audio_buf.is_empty());
