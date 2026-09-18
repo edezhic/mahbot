@@ -266,9 +266,10 @@ pub struct ConfigData {
     /// Enable voice assistant (wake word detection and voice commands).
     /// Set to `"true"` to enable voice mode.
     pub voice_enabled: Option<String>,
-    /// Enable text-to-speech for agent responses (default: `"false"`).
-    /// Set to `"true"` to enable. When enabled, the Assistant's agent responses
-    /// are spoken aloud via the OS-native audio player.
+    /// Enable text-to-speech for the admin's assistant replies (default:
+    /// `"false"`). Set to `"true"` to enable. When enabled, the Assistant's
+    /// replies in the admin's own conversation are spoken aloud via the
+    /// OS-native audio player; every other account's messages stay silent.
     pub tts_enabled: Option<String>,
     /// Language tag for TTS synthesis (default: `"na"` — language-agnostic).
     /// Supported codes: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr,

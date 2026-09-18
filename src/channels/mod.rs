@@ -93,8 +93,8 @@ impl BroadcastPersistEntry {
 ///
 /// TTS audio playback is handled separately by [`crate::audio::tts::init_listener()`],
 /// which subscribes to [`CHAT_BROADCAST`](crate::CHAT_BROADCAST) and triggers
-/// speech for matching agent messages.  This function does not itself invoke
-/// any TTS logic.
+/// speech for the admin's own assistant messages.  This function does not
+/// itself invoke any TTS logic.
 ///
 /// Takes explicit `user_name` (canonical user name), `channel` (e.g. "telegram", "gui"),
 /// and primitive fields — does **not** depend on [`crate::SendMessage`], so it can be used

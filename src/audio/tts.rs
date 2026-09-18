@@ -2,16 +2,17 @@
 //!
 //! # Overview
 //!
-//! This module provides automatic TTS synthesis for agent responses delivered
-//! to the GUI dashboard. Synthesis runs **asynchronously** and **non-blocking**
-//! — the message delivery completes immediately, and any audio playback
-//! happens in the background.
+//! This module provides automatic TTS synthesis for the admin's assistant
+//! replies. Synthesis runs **asynchronously** and **non-blocking** — the
+//! message delivery completes immediately, and any audio playback happens in
+//! the background.
 //!
 //! TTS is **not** a tool that agents call. It is background infrastructure,
-//! exactly like the voice wake-word system, that automatically speaks agent
-//! responses when:
+//! exactly like the voice wake-word system, that automatically speaks a
+//! response when:
 //!
-//! 1. The response is delivered to the GUI dashboard.
+//! 1. The response is attributed to the admin's own account — every other
+//!    account's messages stay silent.
 //! 2. The responding agent is the Assistant — the only role any account routes
 //!    to.
 //! 3. TTS is enabled in config.
@@ -546,8 +547,8 @@ pub fn init_global() -> Result<()> {
     Ok(())
 }
 
-/// Subscribe to [`CHAT_BROADCAST`](crate::CHAT_BROADCAST) and speak agent
-/// responses aloud that match the TTS criteria.
+/// Subscribe to [`CHAT_BROADCAST`](crate::CHAT_BROADCAST) and speak the admin's
+/// own assistant replies aloud.
 ///
 /// This is the TTS trigger mechanism — it replaces what was previously an
 /// ad-hoc conditional in `broadcast_and_persist_agent_response` with a
@@ -560,6 +561,14 @@ pub fn init_global() -> Result<()> {
 /// 2. TTS is globally enabled and models are loaded
 /// 3. The responding agent is the Assistant — the only role any account routes
 ///    to
+/// 4. The message is attributed to the admin's own account
+///    ([`crate::users::is_admin_name`]) — another account's messages, and
+///    messages with no attributable account, stay silent
+///
+/// The account test is deliberately the only discriminator: the channel a
+/// message arrived on is irrelevant, so the replies to the admin's voice input
+/// and Telegram messages are spoken exactly like his GUI ones, and so are the
+/// Assistant's confirmations addressed to him.
 ///
 /// Must be called **after** [`crate::CHAT_BROADCAST`] has been initialized
 /// (i.e. after `init_message_pipeline`).
@@ -577,14 +586,15 @@ pub fn init_listener() {
             match rx.recv().await {
                 Ok(ChatEvent::Message {
                     direction: ChatDirection::Agent,
-                    channel: _,
+                    user_name,
                     agent_role: Some(ref role_name),
                     content,
                     transient,
                     ..
                 }) if is_enabled()
                     && !transient
-                    && role_name == crate::Role::Assistant.as_str() =>
+                    && role_name == crate::Role::Assistant.as_str()
+                    && crate::users::is_admin_name(&user_name) =>
                 {
                     speak(&content);
                 }
@@ -2290,23 +2300,20 @@ mod tests {
     //
     // These tests verify that init_listener() correctly dispatches to
     // speak() when a matching ChatEvent::Message arrives on CHAT_BROADCAST,
-    // and that the guard conditions (is_enabled) are respected.
+    // and that the guard conditions (is_enabled, the admin account) are
+    // respected.
 
-    /// Broadcast a ChatEvent::Message with the given parameters to CHAT_BROADCAST.
-    /// Panics if CHAT_BROADCAST is not initialized.
-    fn broadcast_test_event(
-        direction: crate::ChatDirection,
-        channel: &str,
-        agent_role: Option<&str>,
-    ) {
+    /// Broadcast an agent `ChatEvent::Message` from `user_name` to
+    /// CHAT_BROADCAST. Panics if CHAT_BROADCAST is not initialized.
+    fn broadcast_test_event(user_name: &str, agent_role: Option<&str>) {
         let tx = crate::CHAT_BROADCAST.get().unwrap();
         let _ = tx.send(crate::ChatEvent::Message {
             message_id: "test-tts".to_string(),
-            user_name: "testuser".to_string(),
+            user_name: user_name.to_string(),
             content: "Ignore — test event.".to_string(),
-            direction,
+            direction: crate::ChatDirection::Agent,
             timestamp: String::new(),
-            channel: channel.to_string(),
+            channel: "gui".to_string(),
             agent_role: agent_role.map(String::from),
             workspace: "test".to_string(),
             optimistic_id: None,
@@ -2315,60 +2322,90 @@ mod tests {
         });
     }
 
-    #[tokio::test]
-    #[serial_test::serial(tts)]
-    async fn test_init_listener_dispatches_speak() {
-        // Initialize test stores so the broadcast user exists.
+    /// Initialize the broadcast plus the enabled TTS state the listener
+    /// guards on, and start a listener. Returns the previous model state,
+    /// which the caller restores.
+    async fn start_enabled_listener() -> ModelState {
         crate::util::test::init_test_stores().await;
-        crate::users::store()
-            .add_user("testuser")
-            .await
-            .expect("add_user");
-
-        // Set up CHAT_BROADCAST (idempotent — safe to call from parallel tests)
+        // CHAT_BROADCAST is idempotent — safe to call from parallel tests
         crate::CHAT_BROADCAST.get_or_init(|| {
             let (tx, _rx) = tokio::sync::broadcast::channel(256);
             tx
         });
 
-        // Enable TTS for the happy path
         let prev_state = STATE.load(Ordering::Acquire);
         STATE.store(ModelState::Ready, Ordering::Release);
         let _ = crate::config::CONFIG.set_string_field("tts_enabled", "true");
 
-        // Reset speak counter
         SPEAK_COUNT.store(0, Ordering::Release);
-
-        // Suppress OS audio-device open so this test exercises dispatch logic
-        // without touching the real CoreAudio device (environment-dependent stall).
-        let _audio_suppression = SuppressAudioDeviceGuard::new();
-
-        // Start the listener
         init_listener();
-
         // Give the listener time to subscribe before we send
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        prev_state
+    }
 
-        // Broadcast a matching event (Agent direction, gui channel, assistant role)
-        broadcast_test_event(crate::ChatDirection::Agent, "gui", Some("assistant"));
-
-        // Wait for the listener to process (up to 500ms total)
-        let mut spoke = false;
+    /// Wait up to 500ms for `speak()` to be called; returns whether it was.
+    async fn wait_for_speak() -> bool {
         for _ in 0..25 {
             if SPEAK_COUNT.load(Ordering::Acquire) > 0 {
-                spoke = true;
-                break;
+                return true;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        false
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(tts)]
+    async fn test_init_listener_dispatches_speak() {
+        // Suppress OS audio-device open so this test exercises dispatch logic
+        // without touching the real CoreAudio device (environment-dependent stall).
+        let _audio_suppression = SuppressAudioDeviceGuard::new();
+        let prev_state = start_enabled_listener().await;
+
+        // Broadcast a matching event: the admin's assistant message
+        broadcast_test_event(crate::users::ADMIN_USER_NAME, Some("assistant"));
 
         assert!(
-            spoke,
+            wait_for_speak().await,
             "speak() should have been called after matching ChatEvent::Message"
         );
 
         // Restore global state for other tests (audio-device suppression is
         // lifted by the guard's drop)
+        STATE.store(prev_state, Ordering::Release);
+    }
+
+    /// Only the admin's own conversation is spoken: a guest account's message —
+    /// whatever kind — and a message with no attributable account must both stay
+    /// silent, while the admin's own is still spoken by the same listener (the
+    /// in-test positive control keeps this from passing vacuously).
+    #[tokio::test]
+    #[serial_test::serial(tts)]
+    async fn test_init_listener_silences_other_accounts() {
+        let _audio_suppression = SuppressAudioDeviceGuard::new();
+        let prev_state = start_enabled_listener().await;
+
+        // Another account's assistant reply, and an unattributed message.
+        broadcast_test_event("guest", Some("assistant"));
+        broadcast_test_event("", Some("assistant"));
+
+        // A conservative wait: a wrongly-called speak() is still observed even
+        // under heavy scheduling delay.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            SPEAK_COUNT.load(Ordering::Acquire),
+            0,
+            "speak() must NOT be called for a non-admin or unattributed account"
+        );
+
+        // Positive control: the same listener still speaks the admin's message.
+        broadcast_test_event(crate::users::ADMIN_USER_NAME, Some("assistant"));
+        assert!(
+            wait_for_speak().await,
+            "the admin's own assistant message must still be spoken"
+        );
+
         STATE.store(prev_state, Ordering::Release);
     }
 
@@ -2391,8 +2428,9 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Broadcast the same matching event
-        broadcast_test_event(crate::ChatDirection::Agent, "gui", Some("assistant"));
+        // Broadcast the same matching event, from the admin so only the
+        // enabled guard can keep the listener silent.
+        broadcast_test_event(crate::users::ADMIN_USER_NAME, Some("assistant"));
 
         // Wait enough time for processing (negative test — the wait is a
         // conservative restore of the original 200 ms so a wrongly-called
