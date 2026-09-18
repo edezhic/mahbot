@@ -636,6 +636,10 @@ pub enum VoiceStatus {
     RecordingManual,
     Transcribing,
     MicPermissionDenied,
+    /// The microphone became unavailable while voice was in use.  Voice stops
+    /// (no recording is left hanging and no enrollment survives) and no device
+    /// is acquired automatically: the user recovers by pressing the record
+    /// button or switching voice off and on.
     MicDisconnected,
     /// Actively enrolled, waiting for the next sample.
     /// `sample` = completed samples, `total` = required, `duration_ms` = most recent
@@ -855,6 +859,10 @@ pub fn is_manual_recording() -> bool {
     MANUAL_RECORDING_ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Notice for the [`VoiceStatus::MicPermissionDenied`] state: the microphone
+/// cannot be used, and the fix is on the user's side.
+const MIC_PERMISSION_NOTICE: &str = "Microphone permission denied — enable mic access to record";
+
 /// Best-effort reason a mic-button recording cannot start right now
 /// (None = allowed). Mirrors the field-based guards in
 /// [`PipelineCtx::handle_start_manual_recording`] for the GUI's pre-flight
@@ -877,10 +885,9 @@ pub fn manual_recording_blocked_reason() -> Option<&'static str> {
         | VoiceStatus::ListeningDuringEnrollment { .. }
         | VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
         | VoiceStatus::EnrollingNegatives { .. } => Some("Voice enrollment is in progress"),
-        VoiceStatus::MicPermissionDenied => {
-            Some("Microphone permission denied — enable mic access to record")
-        }
-        VoiceStatus::MicDisconnected => Some("Microphone disconnected"),
+        VoiceStatus::MicPermissionDenied => Some(MIC_PERMISSION_NOTICE),
+        // MicDisconnected is not blocked — retrying is how the user recovers
+        // (see [`VoiceStatus::MicDisconnected`]).
         _ => None,
     }
 }
@@ -1047,6 +1054,16 @@ fn is_mic_permission_error(err: &anyhow::Error) -> bool {
         || msg.to_lowercase().contains("access denied")
 }
 
+/// Status for a microphone that could not be opened: a permission problem is
+/// reported as one, anything else as the device being unavailable.
+fn mic_start_failure(err: &anyhow::Error) -> VoiceStatus {
+    if is_mic_permission_error(err) {
+        VoiceStatus::MicPermissionDenied
+    } else {
+        VoiceStatus::MicDisconnected
+    }
+}
+
 // Microphone capture
 
 /// Convert raw audio samples to mono f32 and send to the pipeline.
@@ -1086,14 +1103,26 @@ fn convert_and_send_audio_to_pipeline<T, F>(
     let _ = tx.try_send(resampled);
 }
 
-/// Log a microphone stream error and update the pipeline status.
-// Error callback for microphone streams — a fn item so it can be shared
-// across every build_input_stream call.
-#[allow(clippy::needless_pass_by_value)]
-fn mic_error(err: cpal::Error) {
+/// Error callback for microphone streams: report the error and, when no audio
+/// can be delivered any more (the device was removed, its host died, or the
+/// stream was invalidated and never rebuilt), report that on the stream's own
+/// loss channel.
+///
+/// Everything else the callback reports keeps voice running: a buffer
+/// overrun/underrun (the backend recovers), a device that is merely busy or
+/// automatically rerouted, and a permission problem, which keeps its own
+/// [`VoiceStatus::MicPermissionDenied`] wording.  The stream owns the channel
+/// (see [`Microphone`]), so a late report from a replaced stream dies with it.
+fn mic_error(err: &cpal::Error, lost_tx: &mpsc::UnboundedSender<()>) {
     error!("Microphone stream error: {err}");
-    // The stream error callback runs on the audio thread; the main pipeline
-    // will observe the mic stream ending and set MicDisconnected.
+    if matches!(
+        err.kind(),
+        cpal::ErrorKind::DeviceNotAvailable
+            | cpal::ErrorKind::HostUnavailable
+            | cpal::ErrorKind::StreamInvalidated
+    ) {
+        let _ = lost_tx.send(());
+    }
 }
 
 /// Build a cpal input stream for a supported sample format.
@@ -1101,6 +1130,7 @@ fn build_int_stream<T, F>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     sample_tx: &Arc<mpsc::Sender<Vec<f32>>>,
+    lost_tx: &mpsc::UnboundedSender<()>,
     channels: u16,
     sample_rate: u32,
     convert: F,
@@ -1110,19 +1140,49 @@ where
     F: Fn(&T) -> f32 + Send + 'static,
 {
     let tx = sample_tx.clone();
+    let lost_tx = lost_tx.clone();
     device.build_input_stream::<T, _, _>(
         *config,
         move |data, _| {
             convert_and_send_audio_to_pipeline(&tx, data, channels, sample_rate, &convert);
         },
-        mic_error,
+        move |err| mic_error(&err, &lost_tx),
         None,
     )
 }
 
-/// Start the microphone and return a channel of mono 16 kHz f32 samples.
-fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
+/// An open microphone: the sample stream, the `cpal::Stream` driving it, and
+/// that stream's loss reports.  All three belong to one device stream, so they
+/// are created, held and dropped together and a loss report can only ever
+/// describe the microphone the pipeline currently owns.
+struct Microphone {
+    rx: mpsc::Receiver<Vec<f32>>,
+    lost_rx: mpsc::UnboundedReceiver<()>,
+    #[expect(
+        dead_code,
+        reason = "Dropping the stream is what stops the capture; holding it is the point"
+    )]
+    stream: cpal::Stream,
+}
+
+impl Microphone {
+    /// Await the next chunk of mono 16 kHz samples; `None` means the stream can
+    /// no longer deliver audio — its error callback reported the device as gone,
+    /// or it ended without saying why.
+    async fn next(&mut self) -> Option<Vec<f32>> {
+        tokio::select! {
+            chunk = self.rx.recv() => chunk,
+            // `None` (the callback is gone) means the stream cannot report at
+            // all — the same dead microphone the callback would describe.
+            _ = self.lost_rx.recv() => None,
+        }
+    }
+}
+
+/// Start the microphone and return it with its sample and loss channels.
+fn start_microphone() -> Result<Microphone> {
     let (tx, rx) = mpsc::channel::<Vec<f32>>(MIC_CHANNEL_CAPACITY);
+    let (lost_tx, lost_rx) = mpsc::unbounded_channel::<()>();
 
     let host = cpal::default_host();
     let device = host
@@ -1153,6 +1213,7 @@ fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
             &device,
             &stream_config,
             &sample_tx,
+            &lost_tx,
             channels,
             sample_rate,
             |&s| s,
@@ -1161,6 +1222,7 @@ fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
             &device,
             &stream_config,
             &sample_tx,
+            &lost_tx,
             channels,
             sample_rate,
             |&s| f32::from(s) / f32::from(i16::MAX),
@@ -1169,6 +1231,7 @@ fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
             &device,
             &stream_config,
             &sample_tx,
+            &lost_tx,
             channels,
             sample_rate,
             |&s| (f32::from(s) / f32::from(u16::MAX)) * 2.0 - 1.0,
@@ -1183,7 +1246,11 @@ fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
         "Microphone listening started ({} Hz, {} channels)",
         sample_rate, channels
     );
-    Ok((rx, stream))
+    Ok(Microphone {
+        rx,
+        lost_rx,
+        stream,
+    })
 }
 
 // Transcription via existing Qwen3-ASR
@@ -1856,16 +1923,20 @@ impl DetectionInstrumentation {
 /// Runtime state for the voice pipeline main loop.
 #[expect(clippy::struct_excessive_bools)]
 struct PipelineCtx {
-    mic_rx: Option<mpsc::Receiver<Vec<f32>>>,
-    mic_stream: Option<cpal::Stream>,
+    /// The open microphone, if any.  One handle owns the sample stream, the
+    /// device stream and that stream's loss reports, so they can never drift
+    /// apart (see [`Microphone`]).
+    mic: Option<Microphone>,
     is_listening: bool,
     is_recording: bool,
     /// Mic-button-initiated recording (Home composer). While active, wake-word
     /// detection is paused and audio accumulates into [`command_buffer`].
     manual_recording: bool,
-    /// Whether wake-word listening was active before a manual recording
-    /// started (or was requested while one was in progress) — restored when
-    /// the manual recording ends.
+    /// Whether wake-word listening resumes when the current manual recording
+    /// ends: set when the wake-word mic was already running (or asked to start
+    /// while the recording was in progress), and when the user's switch is on
+    /// for a recording-only microphone — so a recording never leaves voice
+    /// stopped while the switch shows it on.
     resume_listening_after_recording: bool,
     command_buffer: Vec<f32>,
     /// Track silence duration by audio sample count rather than wall-clock
@@ -2070,8 +2141,7 @@ enum ResetLevel {
 impl PipelineCtx {
     fn new() -> Self {
         Self {
-            mic_rx: None,
-            mic_stream: None,
+            mic: None,
             is_listening: false,
             is_recording: false,
             manual_recording: false,
@@ -2159,8 +2229,8 @@ impl PipelineCtx {
         cue::play(Cue::End);
     }
 
-    /// End an enrollment attempt — cancelled by the user, or failed during
-    /// finalization.
+    /// End an enrollment attempt — completed successfully, cancelled by the
+    /// user, failed during finalization, or cut short by a lost microphone.
     ///
     /// Cancel is the only level that clears the global enrollment accumulators,
     /// and it also clears the ctx-level `collecting_negatives`: those two are
@@ -2190,7 +2260,7 @@ impl PipelineCtx {
     /// | `resume_listening_after_recording` | preserved | preserved | preserved |
     /// | VAD (`reset_vad()`) | called | NOT called | NOT called |
     /// | Global `enrollment_embeddings`, `negative_audio_chunks` | preserved | preserved | cleared |
-    /// | `refractory_until`, `last_error_message_time`, `last_voice_notice_time`, `last_model_retry`, `mic_rx`, `mic_stream`, `is_listening`, `enrollment_mode` | NOT touched | NOT touched | NOT touched |
+    /// | `refractory_until`, `last_error_message_time`, `last_voice_notice_time`, `last_model_retry`, `mic`, `is_listening`, `enrollment_mode` | NOT touched | NOT touched | NOT touched |
     fn reset_pipeline_state(&mut self, level: ResetLevel) {
         // ── Audio accumulators (cleared by all levels) ──
         self.audio_buffer.clear();
@@ -2342,17 +2412,20 @@ impl PipelineCtx {
     /// Called once per main-loop iteration.  When the pipeline is in
     /// [`VoiceStatus::Error`] after a transcription failure, the refractory
     /// period (3 seconds) prevents immediate re-triggering.  Once the timer
-    /// expires this method transitions back to Listening unless the pipeline
-    /// is currently recording (which would mean a concurrent error path
-    /// already initiated a new recording).
+    /// expires this method transitions back to Listening unless the pipeline is
+    /// currently recording (which would mean a concurrent error path already
+    /// initiated a new recording) or not listening any more (nothing to return
+    /// to — e.g. the microphone was lost and an Error status came from
+    /// somewhere else).
     fn check_refractory_period(&mut self) {
         if let Some(refractory_until) = self.refractory_until
             && Instant::now() >= refractory_until
         {
             self.refractory_until = None;
-            // Only transition if we're in an Error state and not currently
-            // recording — a concurrent error path could have cleared this.
-            if !self.is_recording && matches!(get_status(), VoiceStatus::Error(_)) {
+            if self.is_listening
+                && !self.is_recording
+                && matches!(get_status(), VoiceStatus::Error(_))
+            {
                 set_status(VoiceStatus::Listening);
             }
         }
@@ -2459,11 +2532,10 @@ impl PipelineCtx {
         }
         if !self.is_listening {
             self.reset_pipeline_state(ResetLevel::Full);
-            drop(self.mic_stream.take());
+            self.mic = None;
             match start_microphone() {
-                Ok((rx, stream)) => {
-                    self.mic_rx = Some(rx);
-                    self.mic_stream = Some(stream);
+                Ok(mic) => {
+                    self.mic = Some(mic);
                     self.is_listening = true;
                     set_status(VoiceStatus::Listening);
                     info!("Voice pipeline: started listening");
@@ -2475,50 +2547,80 @@ impl PipelineCtx {
                 }
                 Err(e) => {
                     warn!("Failed to start microphone: {e}");
-                    set_status(if is_mic_permission_error(&e) {
-                        VoiceStatus::MicPermissionDenied
-                    } else {
-                        VoiceStatus::MicDisconnected
-                    });
-                    // auto_start_pending is NOT set here — the user must
-                    // re-toggle Voice OFF/ON to retry after resolving the
-                    // mic issue.
+                    set_status(mic_start_failure(&e));
+                    // auto_start_pending stays cleared: re-opening the device is
+                    // the user's own action ([`VoiceStatus::MicDisconnected`]),
+                    // never an automatic retry.
                 }
             }
         }
     }
 
-    /// Stop the wake-word mic and tear down pipeline state.
+    /// Tear down the open microphone and the per-stream pipeline state.
     ///
-    /// A wake-word recording in flight is abandoned here (the Full reset below
-    /// clears its state) and plays its end cue.
-    ///
-    /// Returns `true` when an in-progress mic-button recording was aborted
-    /// (the caller broadcasts a discard notice so the loss is not silent).
-    fn handle_stop_listening(&mut self) -> bool {
-        // Full reset: the mic stream is being torn down, so the old VAD
-        // state is no longer representative of the next acoustic
-        // environment.  Full level uses reset_vad().
-        // Global enrollment accumulators are preserved across mic stop/start
-        // so mid-enrollment progress survives toggle-off/on.
+    /// The caller owns the resulting voice status: [`VoiceStatus::Disabled`] on
+    /// an explicit stop or a loss with the wake-word switch off,
+    /// [`VoiceStatus::MicDisconnected`] when the device disappeared while voice
+    /// was on.  Returns `true` when an in-progress mic-button recording was
+    /// aborted (the caller broadcasts a discard notice so the loss is not
+    /// silent).
+    fn teardown_microphone(&mut self) -> bool {
         let aborted_recording = self.manual_recording;
-        // A wake-word recording is abandoned here too: the end cue and the state
+        // A wake-word recording is abandoned here: the end cue and the state
         // clear both belong to the helper, which is a no-op when nothing is
-        // recording (its Soft reset is subsumed by the Full reset below).
+        // recording.
         self.end_wake_recording();
+        // Full reset: the mic stream is being torn down, so the old VAD state
+        // is no longer representative of the next acoustic environment (Full
+        // uses `reset_vad()`).  Global enrollment accumulators are deliberately
+        // preserved here — the toggle-off/on path keeps mid-enrollment progress
+        // — so a caller that must end an attempt cancels it explicitly.
         self.reset_pipeline_state(ResetLevel::Full);
         self.is_listening = false;
         self.enrollment_mode = false;
         self.resume_listening_after_recording = false;
-        drop(self.mic_stream.take());
-        self.mic_rx = None;
+        self.mic = None;
+        aborted_recording
+    }
+
+    /// Stop the wake-word mic and tear down pipeline state.
+    fn handle_stop_listening(&mut self) -> bool {
+        let aborted_recording = self.teardown_microphone();
         set_status(VoiceStatus::Disabled);
         info!("Voice pipeline: stopped listening");
         aborted_recording
     }
 
-    /// Returns `true` when an in-progress mic-button recording was aborted
-    /// (the caller broadcasts a discard notice so the loss is not silent).
+    /// Handle the microphone becoming unavailable (device unplugged, its host
+    /// gone, the stream invalidated), reported by the stream itself.
+    ///
+    /// No audio can arrive any more, so everything the microphone was doing
+    /// ends here: a wake-word recording stops like any other stop (end cue
+    /// included), a mic-button recording is discarded, and an enrollment attempt
+    /// is abandoned with everything it collected dropped, so its gates cannot
+    /// complete it later with no microphone.  Nothing is re-armed: re-opening
+    /// the device is the user's own action ([`VoiceStatus::MicDisconnected`]).
+    fn handle_microphone_lost(&mut self) -> bool {
+        self.end_enrollment_attempt();
+        let aborted_recording = self.teardown_microphone();
+        // Read the switch and write the status under one lock: a user turning
+        // voice off while this runs keeps the Disabled state their action
+        // wrote, never a stale one from here.
+        {
+            let mut state = voice_state().write().unwrap_poison();
+            let status = if state.enabled {
+                VoiceStatus::MicDisconnected
+            } else {
+                VoiceStatus::Disabled
+            };
+            set_status_and_notify(&mut state, status);
+        }
+        info!("Voice pipeline: microphone unavailable — voice input stopped");
+        aborted_recording
+    }
+
+    /// Returns `true` when an in-progress mic-button recording was aborted for
+    /// enrollment (the caller broadcasts a discard notice).
     fn handle_start_enrollment(&mut self, phrase: &str) -> bool {
         if !self.is_listening {
             warn!("Cannot start enrollment: microphone not running");
@@ -2650,15 +2752,15 @@ impl PipelineCtx {
         self.resume_listening_after_recording = false;
         // A wake-word recording stops here like anywhere else.
         self.end_wake_recording();
-        drop(self.mic_stream.take());
+        self.mic = None;
     }
 
     /// Start a mic-button-initiated voice message recording.
     ///
     /// Pauses wake-word detection for the duration of the recording
     /// (mutual exclusion — audio routes to [`handle_manual_recording_audio`]
-    /// instead of [`handle_wake_word_detection`]). When the recording ends,
-    /// wake-word listening resumes exactly as it was before it started.
+    /// instead of [`handle_wake_word_detection`]).  Wake-word listening resumes
+    /// when the recording ends, as `resume_listening_after_recording` decides.
     ///
     /// Works independently of the wake-word assistant: the microphone is
     /// started on demand when voice is not already listening.
@@ -2689,10 +2791,7 @@ impl PipelineCtx {
             return Some("Voice recording unavailable — local transcription is disabled");
         }
 
-        // Save whether wake-word listening should resume after the recording.
-        self.resume_listening_after_recording = self.is_listening;
-
-        if self.mic_rx.is_none() {
+        if self.mic.is_none() {
             // Voice assistant not listening — start the mic just for this
             // recording (models must be ready for transcription).
             if !models_ready() {
@@ -2700,21 +2799,30 @@ impl PipelineCtx {
                 return Some("Voice models are still loading — try again in a moment");
             }
             match start_microphone() {
-                Ok((rx, stream)) => {
-                    self.mic_rx = Some(rx);
-                    self.mic_stream = Some(stream);
-                }
+                Ok(mic) => self.mic = Some(mic),
                 Err(e) => {
                     warn!("Failed to start recording mic: {e}");
-                    return Some(if is_mic_permission_error(&e) {
-                        "Microphone permission denied — enable mic access to record"
+                    // Say why the microphone is unavailable; with the mic still
+                    // gone the attempt leaves that state standing rather than
+                    // silently doing nothing.
+                    let status = mic_start_failure(&e);
+                    let notice = if matches!(status, VoiceStatus::MicPermissionDenied) {
+                        MIC_PERMISSION_NOTICE
                     } else {
                         "Could not start the microphone — check your input device"
-                    });
+                    };
+                    set_status(status);
+                    return Some(notice);
                 }
             }
         }
 
+        // Resume wake-word listening after the recording whenever the user's
+        // switch is on — not only when the wake-word mic was already running.
+        // The mic may have been opened just for this recording (after a
+        // microphone loss), and a recording must not leave voice sitting
+        // stopped while the switch shows it on.
+        self.resume_listening_after_recording = self.is_listening || is_enabled();
         self.set_manual_recording(true);
         self.command_buffer.clear();
         self.silence_sample_count = 0;
@@ -2782,9 +2890,9 @@ impl PipelineCtx {
         self.end_manual_recording();
     }
 
-    /// Finalize a manual recording session: resume wake-word listening if it
-    /// was active before (or was requested during the recording), otherwise
-    /// tear down the recording-only mic.
+    /// Finalize a manual recording session: resume wake-word listening when
+    /// `resume_listening_after_recording` says so, otherwise tear down the
+    /// recording-only mic.
     fn end_manual_recording(&mut self) {
         self.set_manual_recording(false);
         if self.resume_listening_after_recording {
@@ -2802,8 +2910,7 @@ impl PipelineCtx {
                 // the recording-only mic instead of leaving a zombie stream.
                 self.handle_start_listening();
                 if !self.is_listening {
-                    drop(self.mic_stream.take());
-                    self.mic_rx = None;
+                    self.mic = None;
                     // Preserve a mic-failure status set by
                     // handle_start_listening so the user sees WHY the
                     // wake-word assistant did not resume.
@@ -2821,8 +2928,7 @@ impl PipelineCtx {
             // config but still loading models auto-starts after the recording.
             self.full_reset_preserving_auto_start();
             self.is_listening = false;
-            drop(self.mic_stream.take());
-            self.mic_rx = None;
+            self.mic = None;
             set_status(VoiceStatus::Disabled);
         }
         debug!("Voice pipeline: manual recording ended");
@@ -3307,19 +3413,19 @@ pub async fn run_voice_pipeline() {
                 }
             }
 
-            audio_chunk = async {
-                if let Some(rx) = &mut ctx.mic_rx {
-                    rx.recv().await
+            event = async {
+                if let Some(mic) = &mut ctx.mic {
+                    mic.next().await
                 } else {
-                    std::future::pending::<Option<Vec<f32>>>().await
+                    std::future::pending().await
                 }
             } => {
-                let Some(samples) = audio_chunk else {
-                    warn!("Microphone stream ended");
-                    set_status(VoiceStatus::MicDisconnected);
-                    // Mic loss mid-recording aborts the mic-button recording —
-                    // broadcast a notice so the loss is not silent.
-                    if ctx.handle_stop_listening() {
+                let Some(samples) = event else {
+                    // The device is gone: the handler ends everything the
+                    // microphone was doing (a recording is discarded, not sent),
+                    // drops what an enrollment collected, and stops claiming to
+                    // listen.
+                    if ctx.handle_microphone_lost() {
                         ctx.broadcast_voice_notice(
                             "*Voice: recording discarded — microphone disconnected*",
                         )
@@ -4550,18 +4656,21 @@ mod tests {
     fn refractory_period_transition_table() {
         let _ = init_global();
 
-        // (case, timer elapsed?, recording?, initial status, expected status check, timer cleared?)
+        // (case, timer elapsed?, listening?, recording?, initial status,
+        //  expected status check, timer cleared?)
         #[expect(clippy::type_complexity)] // refractory transition table
         let cases: [(
             &str,
             bool,
             bool,
+            bool,
             VoiceStatus,
             fn(&VoiceStatus) -> bool,
             bool,
-        ); 4] = [
+        ); 5] = [
             (
                 "elapsed_error_to_listening",
+                true,
                 true,
                 false,
                 VoiceStatus::Error("test error".to_string()),
@@ -4570,6 +4679,7 @@ mod tests {
             ),
             (
                 "elapsed_disabled_stays",
+                true,
                 true,
                 false,
                 VoiceStatus::Disabled,
@@ -4581,6 +4691,7 @@ mod tests {
                 "elapsed_recording_stays_error",
                 true,
                 true,
+                true,
                 VoiceStatus::Error("test error".to_string()),
                 |s| matches!(s, VoiceStatus::Error(_)),
                 true,
@@ -4588,15 +4699,30 @@ mod tests {
             (
                 "future_timer_preserved",
                 false,
+                true,
                 false,
                 VoiceStatus::Error("test error".to_string()),
                 |s| matches!(s, VoiceStatus::Error(_)),
                 false,
             ),
+            (
+                // Nothing to return to: the microphone is gone, so an Error
+                // status (e.g. a failed Enroll) must not become Listening.
+                "elapsed_not_listening_stays_error",
+                true,
+                false,
+                false,
+                VoiceStatus::Error("test error".to_string()),
+                |s| matches!(s, VoiceStatus::Error(_)),
+                true,
+            ),
         ];
 
-        for (name, timer_elapsed, is_recording, initial, expect, timer_cleared) in cases {
+        for (name, timer_elapsed, is_listening, is_recording, initial, expect, timer_cleared) in
+            cases
+        {
             let mut ctx = PipelineCtx::new();
+            ctx.is_listening = is_listening;
             ctx.is_recording = is_recording;
             ctx.refractory_until = Some(if timer_elapsed {
                 Instant::now()
@@ -4696,7 +4822,94 @@ mod tests {
         // No wake-word listening before → mic torn down, voice disabled.
         assert!(!ctx.manual_recording);
         assert!(!ctx.is_listening);
-        assert!(ctx.mic_rx.is_none());
+        assert!(ctx.mic.is_none());
+        assert!(matches!(get_status(), VoiceStatus::Disabled));
+    }
+
+    // ── Microphone-loss tests ────────────────────────────────────────────
+    // The device-loss scenarios themselves need real hardware; these cover the
+    // state transitions the loss handler performs.
+
+    /// A loss during enrollment abandons the attempt completely — nothing may
+    /// be built or stored from it later, and voice must not claim to listen.
+    #[test]
+    #[serial_test::serial(voice)]
+    fn microphone_loss_abandons_enrollment_and_stops_listening() {
+        let _ = init_global();
+        set_enabled(true);
+        let mut ctx = PipelineCtx::new();
+        ctx.is_listening = true;
+        ctx.enrollment_mode = true;
+        ctx.collecting_negatives = true;
+        ctx.negatives_speech_samples = 1234;
+        ctx.auto_start_pending = true;
+        {
+            let mut state = voice_state().write().unwrap_poison();
+            state.enrollment_embeddings.push(vec![0.5; 1024]);
+            state.owner_negative_chunks.push(vec![0.5; 100]);
+            state.enrolled_utterance_count = NUM_ENROLLMENT_SAMPLES;
+            state.utterances_collected = true;
+            state.enrolling_phrase = Some("hey mahbot".to_string());
+        }
+        set_status(VoiceStatus::Enrolling {
+            sample: NUM_ENROLLMENT_SAMPLES,
+            total: NUM_ENROLLMENT_SAMPLES,
+            duration_ms: 900,
+            quality: None,
+        });
+
+        let aborted = ctx.handle_microphone_lost();
+
+        assert!(!aborted, "no mic-button recording was in progress");
+        // The attempt is gone, accumulators included: a later tick cannot
+        // finish it, and a fresh Enroll starts from scratch.
+        assert!(!ctx.enrollment_mode);
+        assert!(!ctx.collecting_negatives);
+        assert_eq!(ctx.negatives_speech_samples, 0);
+        let state = voice_state().read().unwrap_poison();
+        assert!(state.enrollment_embeddings.is_empty());
+        assert!(state.owner_negative_chunks.is_empty());
+        assert_eq!(state.enrolled_utterance_count, 0);
+        assert!(!state.utterances_collected);
+        assert!(state.enrolling_phrase.is_none());
+        drop(state);
+
+        // Voice stopped with the honest status, and the user's switch is
+        // untouched.
+        assert!(!ctx.is_listening);
+        assert!(!ctx.auto_start_pending, "no automatic re-acquisition");
+        assert!(matches!(get_status(), VoiceStatus::MicDisconnected));
+        assert!(is_enabled(), "the wake-word switch is the user's setting");
+
+        // A genuinely fresh attempt: nothing of the failed start is left that
+        // could block it — the GUI pre-flight included, so the record button
+        // really tries again instead of refusing.
+        assert_eq!(manual_recording_blocked_reason(), None);
+        assert!(ctx.mic.is_none());
+        assert!(!ctx.manual_recording);
+    }
+
+    /// With voice switched off there is nothing claiming to listen, so the
+    /// resting state after a loss is Disabled.
+    #[test]
+    #[serial_test::serial(voice)]
+    fn microphone_loss_with_voice_disabled_rests_disabled() {
+        let _ = init_global();
+        set_enabled(false);
+        let mut ctx = PipelineCtx::new();
+        ctx.is_listening = true;
+        ctx.manual_recording = true;
+        ctx.command_buffer = vec![0.5; 100];
+        set_status(VoiceStatus::RecordingManual);
+
+        let aborted = ctx.handle_microphone_lost();
+
+        assert!(
+            aborted,
+            "the in-flight recording is reported for the notice"
+        );
+        assert!(!ctx.manual_recording);
+        assert!(ctx.command_buffer.is_empty());
         assert!(matches!(get_status(), VoiceStatus::Disabled));
     }
 
