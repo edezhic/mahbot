@@ -111,6 +111,15 @@ fn apply_reply_marker_precedes_forwarded_prefix() {
     );
 }
 
+/// The real `enrich_links` call below drives the owner's own Chrome session
+/// (it opens a `link-enricher-*` tab and leaves the visit in his history),
+/// while the assertions only check marker ordering and hold with or without a
+/// browser. Run it explicitly with:
+///
+/// ```sh
+/// cargo test marker_injection_follows_link_enrichment -- --ignored --nocapture
+/// ```
+#[ignore = "drives the owner's real Chrome session to fetch the link; runs only when explicitly invoked"]
 #[tokio::test]
 async fn marker_injection_follows_link_enrichment() {
     // Mirrors the bin's process_channel_message ordering: enrich first, then
