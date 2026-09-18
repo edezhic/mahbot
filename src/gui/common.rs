@@ -191,7 +191,7 @@ impl AsyncLoadState {
     }
 }
 
-/// Interval the polled-list pages re-read their source at, while they are open.
+/// Interval a polled list re-reads its source at, while it is shown.
 ///
 /// The tick is deliberately not gated on a read being in flight — the render
 /// that follows it is what moves the alarms countdown, so suppressing it would
@@ -199,17 +199,17 @@ impl AsyncLoadState {
 /// [`PolledList`]'s job.
 pub(crate) const POLLED_LIST_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// A list a page re-reads on a timer.
+/// A list a surface re-reads on a timer.
 ///
-/// The rules the ticking pages share, so no page restates them:
+/// The rules the ticking lists share, so no consumer restates them:
 /// - [`begin`](Self::begin) starts a read only when none is in flight, so the
 ///   ticks never pile reads up;
 /// - the entries of the last successful read stay on screen while the next read
-///   is in flight and after a failed one, so a failure never blanks the page;
+///   is in flight and after a failed one, so a failure never blanks the list;
 /// - [`loaded`](Self::loaded) flips on the first outcome either way, so the
 ///   "Loading…" placeholder belongs to the first read only;
 /// - a failure is recorded as data, once per read — nothing is logged here, so
-///   a page whose read keeps failing writes no log records.
+///   a caller whose read keeps failing writes no log records.
 pub(crate) struct PolledList<T> {
     entries: Vec<T>,
     in_flight: bool,

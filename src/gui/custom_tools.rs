@@ -1,24 +1,16 @@
-//! Custom Tools dashboard page — the admin's tool files, read-only.
+//! Custom tools area of the Settings page — the admin's tool files, read-only.
 //!
-//! The page lists the files the admin defines custom tools in, together with
-//! their headers: nothing here creates, edits, grants or runs a tool. A file
+//! The area lists the files the admin defines custom tools in, with a details
+//! window per tool: nothing here creates, edits, grants or runs a tool. A file
 //! whose header does not parse is listed as not usable instead of being skipped,
-//! and the folder is re-read once a second, so a file added, fixed or deleted on
-//! disk shows up without a restart.
+//! and the folder is re-read once a second while the page is open, so a file
+//! added, fixed or deleted on disk shows up without a restart.
 
-use iced::widget::{Column, column, container, row, text};
-use iced::{Alignment, Element, Length, Task};
-use iced_fonts::lucide;
+use iced::Task;
 
-use crate::tools::custom::{Param, ToolListing};
+use crate::tools::custom::ToolListing;
 
 use super::common::PolledList;
-use super::{theme, widgets};
-
-/// What a tool no file under whose name has a readable header shows in place of
-/// its description and arguments.
-const BROKEN_TOOL_NOTE: &str =
-    "Not usable — the file cannot be read or its header cannot be parsed";
 
 #[derive(Debug, Clone)]
 pub(crate) enum CustomToolsMessage {
@@ -26,21 +18,32 @@ pub(crate) enum CustomToolsMessage {
     Tick,
     /// A read finished. `Err` keeps the last loaded list on screen.
     Refreshed(Result<Vec<ToolListing>, String>),
+    /// Open the read-only details window for the named tool.
+    OpenDetails(String),
+    /// Close the details window — the Close button, Escape or a backdrop click.
+    CloseDetails,
 }
 
 pub(crate) struct CustomToolsState {
-    list: PolledList<ToolListing>,
+    /// The polled listing the area renders; the ticking/keeping rules are
+    /// [`PolledList`]'s.
+    pub(crate) list: PolledList<ToolListing>,
+    /// Name of the tool whose details window is open. Every read replaces the
+    /// list wholesale, so the window follows the name rather than an entry, and
+    /// a name the latest read no longer lists is dropped.
+    details: Option<String>,
 }
 
 impl CustomToolsState {
     pub(crate) const fn new() -> Self {
         Self {
             list: PolledList::new(),
+            details: None,
         }
     }
 
-    /// Read the tool folder now, unless a read is in flight. Called on
-    /// navigation, so opening the page always starts a fresh read.
+    /// Read the tool folder now, unless a read is in flight. Called on entering
+    /// Settings and on every refresh tick.
     pub(crate) fn refresh(&mut self) -> Task<CustomToolsMessage> {
         if !self.list.begin() {
             return Task::none();
@@ -54,106 +57,60 @@ impl CustomToolsState {
     pub(crate) fn update(&mut self, message: CustomToolsMessage) -> Task<CustomToolsMessage> {
         match message {
             CustomToolsMessage::Tick => self.refresh(),
+            CustomToolsMessage::OpenDetails(name) => {
+                self.details = Some(name);
+                Task::none()
+            }
+            CustomToolsMessage::CloseDetails => {
+                self.close_details();
+                Task::none()
+            }
             CustomToolsMessage::Refreshed(result) => {
                 self.list.settle(result);
+                // The selection follows the listing: re-deriving it drops a tool
+                // the read no longer lists, so a tool that comes back later
+                // cannot resurrect its window.
+                self.details = self.details().map(|tool| tool.name().to_owned());
                 Task::none()
             }
         }
     }
 
-    pub(crate) fn view(&self) -> Element<'_, CustomToolsMessage> {
-        let mut content = column![];
+    /// Close the details window (its Close button, Escape or a backdrop click).
+    pub(crate) fn close_details(&mut self) {
+        self.details = None;
+    }
 
-        // Error display — inset to align with the vscroll-wrapped list below.
-        content = widgets::push_error_banner_inset(content, self.list.error());
-
-        if !self.list.loaded() {
-            content = content.push(widgets::scroll_h_inset(widgets::loading_text()));
-        } else if self.list.entries().is_empty() {
-            // A failed read must not masquerade as a legitimately empty list:
-            // the error banner above is the only thing rendered then.
-            if self.list.error().is_none() {
-                content = content.push(widgets::empty_state_placeholder(
-                    lucide::hammer::<iced::Theme, iced::Renderer>(),
-                    "No custom tools",
-                    theme::TEXT_MUTED,
-                ));
-            }
-        } else {
-            // A step apart, so each tool reads as its own block.
-            let mut list = Column::new().spacing(theme::SPACE_4);
-            for listing in self.list.entries() {
-                list = list.push(render_tool(listing));
-            }
-            content = content.push(widgets::vscroll(list));
-        }
-
-        widgets::page(content)
+    /// The tool the details window shows, or `None` when no window is open or
+    /// the tool is no longer listed. The single source of truth for whether the
+    /// window is open, and total by construction — an absent tool is never
+    /// looked up and never panics.
+    pub(crate) fn details(&self) -> Option<&ToolListing> {
+        let name = self.details.as_deref()?;
+        self.list.entries().iter().find(|l| l.name() == name)
     }
 }
 
-fn render_tool(listing: &ToolListing) -> Element<'_, CustomToolsMessage> {
-    let mut entry = Column::new().spacing(theme::SPACE_4).push(
-        text(listing.name())
-            .size(theme::TEXT_14)
-            .font(super::JETBRAINS_MONO)
-            .color(theme::TEXT_PRIMARY),
-    );
-    match listing {
-        ToolListing::Broken(_) => {
-            entry = entry.push(
-                text(BROKEN_TOOL_NOTE)
-                    .size(theme::TEXT_12)
-                    .color(theme::STATUS_WARNING),
-            );
-        }
-        ToolListing::Usable(tool) => {
-            entry = entry.push(
-                text(&tool.description)
-                    .size(theme::TEXT_13)
-                    .color(theme::TEXT_SECONDARY)
-                    .width(Length::Fill),
-            );
-            for param in &tool.params {
-                entry = entry.push(render_param(param));
-            }
-        }
-    }
-    // The log row's card: one block per tool, spanning the entry width.
-    container(entry)
-        .padding(theme::PAD_6)
-        .width(Length::Fill)
-        .style(theme::surface_card_style)
-        .into()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn render_param(param: &Param) -> Element<'_, CustomToolsMessage> {
-    row![
-        text(&param.name)
-            .size(theme::TEXT_12)
-            .font(super::JETBRAINS_MONO)
-            .color(theme::TEXT_PRIMARY),
-        widgets::badge_pill(
-            param.ty.as_str().to_string(),
-            (theme::TEXT_SECONDARY, theme::HOVER),
-            widgets::PILL_COMPACT,
-        ),
-        widgets::badge_pill(
-            if param.required {
-                "required"
-            } else {
-                "optional"
-            }
-            .to_string(),
-            (theme::TEXT_SECONDARY, theme::HOVER),
-            widgets::PILL_COMPACT,
-        ),
-        text(&param.description)
-            .size(theme::TEXT_12)
-            .color(theme::TEXT_SECONDARY)
-            .width(Length::Fill),
-    ]
-    .spacing(theme::SPACE_6)
-    .align_y(Alignment::Center)
-    .into()
+    /// The listing is replaced wholesale by every read, so a tool dropped from a
+    /// read closes its window — and a later read settling it back must not
+    /// reopen it.
+    #[test]
+    fn a_read_that_drops_the_open_tool_closes_its_window() {
+        let mut state = CustomToolsState::new();
+        let _ = state.update(CustomToolsMessage::Refreshed(Ok(weather())));
+        let _ = state.update(CustomToolsMessage::OpenDetails("weather".to_string()));
+        assert!(state.details().is_some());
+
+        let _ = state.update(CustomToolsMessage::Refreshed(Ok(Vec::new())));
+        let _ = state.update(CustomToolsMessage::Refreshed(Ok(weather())));
+        assert!(state.details().is_none());
+    }
+
+    fn weather() -> Vec<ToolListing> {
+        vec![ToolListing::Broken("weather".to_string())]
+    }
 }

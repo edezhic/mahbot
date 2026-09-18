@@ -172,7 +172,7 @@ pub fn role_badge_color(role: &str) -> (Color, Color) {
 pub fn role_icon(role: &crate::Role) -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
     match role {
         crate::Role::Manager => lucide::bot(),
-        crate::Role::Engineer => lucide::wrench(),
+        crate::Role::Engineer => lucide::hammer(),
         crate::Role::Analyst => lucide::scan_search(),
         crate::Role::Coder => lucide::code(),
         crate::Role::Qa => lucide::gavel(),

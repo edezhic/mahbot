@@ -6,8 +6,8 @@
 //! toggles/pickers) via the per-field persistence
 //! functions in [`crate::config`].
 //!
-//! Also manages workspaces and users (formerly separate pages), with
-//! modal dialogs for add operations.
+//! Also manages workspaces, users and the custom-tools list (formerly separate
+//! pages), with modal dialogs for the add operations.
 
 use crate::Role;
 use crate::Workspace;
@@ -18,6 +18,7 @@ use crate::config::{
     CONFIG_KEY_VOICE_ENABLED, CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL, ConfigData,
     ModelRouting,
 };
+use crate::tools::custom::ToolListing;
 use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
@@ -32,6 +33,7 @@ use iced_fonts::lucide;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::common::SingleLineEditorState;
+use super::custom_tools;
 use super::dialog;
 use super::editor_widget::EditorAction;
 use super::menus::{ContextMenu, MenuItem};
@@ -229,6 +231,7 @@ pub enum PasswordTarget {
 }
 
 #[derive(Debug, Clone)]
+#[expect(private_interfaces)] // CustomToolsMsg wraps pub(crate) CustomToolsMessage
 pub enum SettingsMessage {
     /// Generic editable config field identified by its snake_case key
     /// (matches the keys in [`crate::config::ConfigData::set_string_field`]).
@@ -321,6 +324,9 @@ pub enum SettingsMessage {
     SubmitAddUser,
     /// Result of user add.
     AddUserResult(Result<(), String>),
+    // ── Custom tools area (sub-messages) ────────────────────────
+    /// Wrapped custom-tools area message.
+    CustomToolsMsg(custom_tools::CustomToolsMessage),
     /// Escape key pressed (dismisses modal if open).
     Escape,
     // ── Model picker messages ─────────────────────────────
@@ -528,6 +534,10 @@ pub struct SettingsState {
     /// Whether the add-user operation is in flight.
     add_user_adding: bool,
 
+    // ── Custom tools area state ─────────────────────────────────
+    /// The read-only list of custom tool files (see [`custom_tools`]).
+    pub(crate) custom_tools_state: custom_tools::CustomToolsState,
+
     // ── Model picker state ────────────────────────────────
     /// Text input buffers for model pickers, indexed by [`ModelPickerTarget::idx`].
     model_picker_inputs: [SingleLineEditorState; ModelPickerTarget::COUNT],
@@ -596,6 +606,7 @@ impl SettingsState {
             show_add_user_modal: false,
             add_user_sender: SingleLineEditorState::new(""),
             add_user_adding: false,
+            custom_tools_state: custom_tools::CustomToolsState::new(),
             model_picker_inputs: std::array::from_fn(|_| SingleLineEditorState::new("")),
             voice_toggle_gen: 0,
             transcription_toggle_gen: 0,
@@ -1468,6 +1479,12 @@ impl SettingsState {
                 )))
             }
 
+            // ── Custom tools area ───────────────────────────────
+            SettingsMessage::CustomToolsMsg(msg) => self
+                .custom_tools_state
+                .update(msg)
+                .map(SettingsMessage::CustomToolsMsg),
+
             // ── Model picker messages ─────────────────────────
             SettingsMessage::ModelPicker { target, action } => {
                 match (target, action) {
@@ -1559,6 +1576,11 @@ impl SettingsState {
                 } else if self.show_add_user_modal {
                     self.close_add_user_modal();
                 } else {
+                    // The last tier, matching render_modal_overlay: the
+                    // custom-tools details window and the delete-confirm and
+                    // diagnostics modals are all dismissed here (each only if
+                    // it is the open one).
+                    self.custom_tools_state.close_details();
                     return Task::batch([
                         self.workspaces_state
                             .update(workspaces::WorkspacesMessage::Escape)
@@ -1584,6 +1606,9 @@ impl SettingsState {
 
         // User management section (right column, below workspaces)
         let us_section = self.users_section();
+
+        // Custom tools area (right column, below users)
+        let tools_section = self.custom_tools_section();
 
         // Existing config sections (left column)
         let config_sections = Column::new()
@@ -1613,7 +1638,13 @@ impl SettingsState {
         // comes only from the right column's internal left padding (no spacer
         // element).
         let left_col = config_sections;
-        let right_col = column![ws_section, Space::new().height(16), us_section,];
+        let right_col = column![
+            ws_section,
+            Space::new().height(16),
+            us_section,
+            Space::new().height(16),
+            tools_section,
+        ];
 
         let mut content = column![];
 
@@ -2200,8 +2231,148 @@ impl SettingsState {
         section_with_header_action("Users", plus_btn, column![rows])
     }
 
-    /// Render the add-workspace or add-user modal overlay. Returns a
-    /// type-stable placeholder when no modal is open.
+    /// Render the custom tools area for the Settings page.
+    fn custom_tools_section(&self) -> Element<'_, SettingsMessage> {
+        let tools = &self.custom_tools_state;
+
+        let mut rows = Column::new().spacing(theme::SPACE_4);
+        rows = widgets::push_error_banner(rows, tools.list.error());
+
+        // The empty line stands in only for a successfully read, genuinely
+        // empty folder: a failed read keeps its banner and its last list, and
+        // before the first read lands nothing is shown for the empty case.
+        if tools.list.entries().is_empty() && tools.list.loaded() && tools.list.error().is_none() {
+            rows = rows.push(
+                text("No custom tools.")
+                    .size(theme::TEXT_12)
+                    .color(theme::TEXT_MUTED),
+            );
+        }
+
+        for listing in tools.list.entries() {
+            rows = rows.push(Self::custom_tool_card(listing));
+        }
+
+        section("Custom Tools", rows)
+    }
+
+    /// One custom tool as the area lists it: a small card carrying the tool's
+    /// name, plus a warning glyph when its file cannot be read or parsed. The
+    /// card itself is the click target — it carries no separate button or link.
+    fn custom_tool_card(listing: &ToolListing) -> Element<'_, SettingsMessage> {
+        let mut label = Row::new()
+            .spacing(theme::SPACE_4)
+            .align_y(Alignment::Center)
+            .push(
+                text(listing.name())
+                    .size(theme::TEXT_13)
+                    .font(theme::JETBRAINS_MONO)
+                    .color(theme::TEXT_PRIMARY),
+            );
+        if matches!(listing, ToolListing::Broken(_)) {
+            label = label.push(
+                lucide::triangle_alert::<iced::Theme, iced::Renderer>()
+                    .size(theme::TEXT_14)
+                    .color(theme::STATUS_WARNING),
+            );
+        }
+
+        container(
+            button(label)
+                .width(Length::Fill)
+                .padding(theme::PAD_6)
+                .style(theme::button_text)
+                .on_press(SettingsMessage::CustomToolsMsg(
+                    custom_tools::CustomToolsMessage::OpenDetails(listing.name().to_string()),
+                )),
+        )
+        .width(Length::Fill)
+        .style(theme::surface_card_style)
+        .into()
+    }
+
+    /// The read-only details window for one tool: its name, its description and
+    /// every parameter (name, type, required/optional, description) — or, for a
+    /// file that cannot be read or parsed, the "not usable" statement in place
+    /// of them. Nothing is actioned here but closing the window.
+    fn custom_tool_dialog(tool: &ToolListing) -> Element<'_, SettingsMessage> {
+        let mut body = Column::new().spacing(theme::SPACE_6);
+        match tool {
+            ToolListing::Broken(_) => {
+                body = body.push(
+                    text("Not usable — the file cannot be read or its header cannot be parsed")
+                        .size(theme::TEXT_13)
+                        .color(theme::STATUS_WARNING),
+                );
+            }
+            ToolListing::Usable(entry) => {
+                body = body.push(
+                    text(&entry.description)
+                        .size(theme::TEXT_13)
+                        .color(theme::TEXT_SECONDARY)
+                        .width(Length::Fill),
+                );
+                for param in &entry.params {
+                    body = body.push(
+                        row![
+                            text(&param.name)
+                                .size(theme::TEXT_12)
+                                .font(theme::JETBRAINS_MONO)
+                                .color(theme::TEXT_PRIMARY),
+                            widgets::badge_pill(
+                                param.ty.as_str().to_string(),
+                                (theme::TEXT_SECONDARY, theme::HOVER),
+                                widgets::PILL_COMPACT,
+                            ),
+                            widgets::badge_pill(
+                                if param.required {
+                                    "required"
+                                } else {
+                                    "optional"
+                                }
+                                .to_string(),
+                                (theme::TEXT_SECONDARY, theme::HOVER),
+                                widgets::PILL_COMPACT,
+                            ),
+                            text(&param.description)
+                                .size(theme::TEXT_12)
+                                .color(theme::TEXT_SECONDARY)
+                                .width(Length::Fill),
+                        ]
+                        .spacing(theme::SPACE_6)
+                        .align_y(Alignment::Center),
+                    );
+                }
+            }
+        }
+
+        dialog::dialog_shell(
+            column![
+                dialog::dialog_title(tool.name()),
+                Space::new().height(16),
+                // Sized to the details and capped, so a long description or
+                // many parameters stay readable by scrolling inside the window.
+                container(widgets::vscroll_sized(body, Length::Fill, Length::Shrink))
+                    .max_height(320.0),
+                Space::new().height(16),
+                dialog::dialog_footer_row([button(text("Close").size(theme::TEXT_13))
+                    .style(theme::button_secondary)
+                    .on_press(SettingsMessage::CustomToolsMsg(
+                        custom_tools::CustomToolsMessage::CloseDetails,
+                    ))
+                    .into()]),
+            ]
+            .spacing(theme::SPACE_8)
+            .width(Length::Fill),
+            620.0,
+            24.0,
+        )
+        .into()
+    }
+
+    /// Render the Settings modal overlay: whichever of the add-workspace,
+    /// add-user, user delete-confirm, workspace diagnostics and custom-tool
+    /// details windows is open, or a type-stable placeholder when none is.
     fn render_modal_overlay(&self) -> Element<'_, SettingsMessage> {
         if self.show_add_workspace_modal {
             let dialog = self.add_workspace_dialog();
@@ -2221,6 +2392,13 @@ impl SettingsState {
             widgets::modal_backdrop(
                 dialog,
                 SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Escape),
+                0.5,
+            )
+        } else if let Some(tool) = self.custom_tools_state.details() {
+            let dialog = Self::custom_tool_dialog(tool);
+            widgets::modal_backdrop(
+                dialog,
+                SettingsMessage::CustomToolsMsg(custom_tools::CustomToolsMessage::CloseDetails),
                 0.5,
             )
         } else {

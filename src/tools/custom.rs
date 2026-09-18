@@ -114,8 +114,8 @@ pub(crate) struct CustomToolEntry {
     path: PathBuf,
 }
 
-/// One tool as the tools page lists it: the header parsed from the file that
-/// defines it, or the fact that no file under its name has a usable one.
+/// One tool as a listing shows it: the header parsed from the file that defines
+/// it, or the fact that no file under its name has a usable one.
 #[derive(Debug, Clone)]
 pub(crate) enum ToolListing {
     /// At least one file under the name parses; the first one in path order
@@ -279,8 +279,8 @@ fn read_header_source(path: &Path) -> std::io::Result<String> {
 
 /// Candidate tool files: regular files directly in the folder whose extension
 /// the managed runtime executes, ordered by path. A folder that does not exist
-/// holds no tools — the admin has simply not written one yet; any other failure
-/// to read it is a failure, which the tools page keeps its last list across.
+/// holds no tools — the admin has simply not written one yet. Any other failure
+/// to read it is a real failure, not an empty folder.
 fn candidate_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -372,11 +372,12 @@ fn load_catalogue(dir: &Path) -> Vec<CustomToolEntry> {
         .collect()
 }
 
-/// The tools page's read: every tool in the folder, broken ones included. Run
-/// off the async runtime — it reads the folder.
+/// A listing read: every tool in the folder, broken ones included. Run off the
+/// async runtime — it reads the folder.
 ///
-/// A folder that cannot be read is an error here (unlike [`load_catalogue`]):
-/// the page then keeps the list it last loaded rather than showing it empty.
+/// A folder that cannot be read is an error here (unlike [`load_catalogue`], the
+/// model-facing read): a caller then keeps the list it last loaded rather than
+/// showing the folder as empty.
 pub(crate) async fn list_tool_listings() -> Result<Vec<ToolListing>, String> {
     tokio::task::spawn_blocking(|| load_listings(&shared_dir()))
         .await
@@ -1021,7 +1022,7 @@ mod tests {
     }
 
     /// Broken files are listed, not skipped, and a usable sibling under the same
-    /// stem takes the name over — the page and the model catalogue must never
+    /// stem takes the name over — the listing and the model catalogue must never
     /// disagree about which tools exist.
     #[test]
     fn listings_include_broken_tools_in_name_order() {
@@ -1029,8 +1030,8 @@ mod tests {
         let listings = load_listings(tmp.path()).expect("read the folder");
         let names: Vec<&str> = listings.iter().map(ToolListing::name).collect();
         assert_eq!(names, ["helper", "mended", "weather", "wrecked"]);
-        // The page shows the same file the catalogue picks for a name two files
-        // define.
+        // The listing shows the same file the catalogue picks when two files
+        // share a name.
         let usable = |name: &str| match listings.iter().find(|l| l.name() == name) {
             Some(ToolListing::Usable(entry)) => entry.description.clone(),
             other => panic!("expected a usable {name}, got {other:?}"),
@@ -1043,8 +1044,8 @@ mod tests {
             listings.iter().find(|l| l.name() == "wrecked"),
             Some(ToolListing::Broken(_))
         ));
-        // A folder nobody has written a tool into holds no tools — it is not a
-        // failed read, which is what the page keeps its last list across.
+        // A folder nobody has written a tool into holds no tools — an empty
+        // listing, not a failed read.
         assert!(
             load_listings(&tmp.path().join("absent"))
                 .expect("an absent folder is not a failure")

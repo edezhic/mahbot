@@ -139,7 +139,6 @@ pub enum Page {
     Editor,
     Settings,
     Alarms,
-    CustomTools,
     /// Live view of running agents and in-flight non-agent LLM work.
     RunningAgents,
 }
@@ -155,12 +154,7 @@ impl Page {
 
     /// Pages in the sidebar bottom nav — click-only, no keyboard shortcut.
     const fn sidebar_bottom_pages() -> &'static [Page] {
-        &[
-            Page::CustomTools,
-            Page::Sessions,
-            Page::Logs,
-            Page::Settings,
-        ]
+        &[Page::Sessions, Page::Logs, Page::Settings]
     }
 
     const fn label(self) -> &'static str {
@@ -172,7 +166,6 @@ impl Page {
             Page::Editor => "Editor",
             Page::Settings => "Settings",
             Page::Alarms => "Alarms",
-            Page::CustomTools => "Custom Tools",
             Page::RunningAgents => "Running Agents",
         }
     }
@@ -372,8 +365,6 @@ pub enum Message {
     Sessions(sessions::SessionsMessage),
     /// Alarms page messages (refresh and card-menu deletion).
     Alarms(alarms::AlarmsMessage),
-    /// Custom Tools page messages (read-only refresh).
-    CustomTools(custom_tools::CustomToolsMessage),
     /// Running Agents page messages (manual research-run cancel).
     RunningAgents(running::RunningMessage),
     /// Diff modal overlay (not a page) — wraps [`diff::DiffMessage`].
@@ -615,7 +606,6 @@ pub struct Dashboard {
     board_state: board::BoardState,
     sessions_state: sessions::SessionsState,
     alarms_state: alarms::AlarmsState,
-    custom_tools_state: custom_tools::CustomToolsState,
     diff_state: diff::DiffState,
     home_state: home::HomeState,
     shell_state: shell::ShellState,
@@ -660,7 +650,6 @@ impl Dashboard {
             board_state: board::BoardState::new(),
             sessions_state: sessions::SessionsState::new(),
             alarms_state: alarms::AlarmsState::new(),
-            custom_tools_state: custom_tools::CustomToolsState::new(),
             diff_state: diff::DiffState::new(),
             home_state: home::HomeState::new(),
             shell_state: shell::ShellState::new(),
@@ -835,16 +824,19 @@ impl Dashboard {
                 Task::batch([snap, board_refresh])
             }
             Page::Sessions => sessions::SessionsState::refresh().map(Message::Sessions),
-            // These two pages render nothing but their polled list, so entering
-            // them starts a read rather than a render of stale entries.
+            // The Alarms page renders nothing but its polled list, so entering
+            // it starts a read rather than a render of stale entries.
             Page::Alarms => self.alarms_state.refresh().map(Message::Alarms),
-            Page::CustomTools => self.custom_tools_state.refresh().map(Message::CustomTools),
             Page::Settings => {
                 self.settings_state.refresh();
                 // Workspace list comes from the shared map; only the users
-                // list needs a DB refresh on navigation.
+                // list and the custom-tools area need a DB / folder read on
+                // navigation.
                 self.sync_settings_workspaces_from_map();
-                self.refresh_settings_users()
+                Task::batch([
+                    self.refresh_settings_users(),
+                    self.refresh_settings_custom_tools(),
+                ])
             }
         };
         Task::batch([visibility, refresh])
@@ -858,6 +850,15 @@ impl Dashboard {
             .users_state
             .refresh()
             .map(|msg| Message::Settings(settings::SettingsMessage::UserMsg(msg)))
+    }
+
+    /// Refresh the Settings custom-tools area (its tool-folder read). Does not
+    /// absorb the config snapshot (`settings_state.refresh()`).
+    fn refresh_settings_custom_tools(&mut self) -> Task<Message> {
+        self.settings_state
+            .custom_tools_state
+            .refresh()
+            .map(|msg| Message::Settings(settings::SettingsMessage::CustomToolsMsg(msg)))
     }
 
     /// Sync the Settings workspaces section list from the shared workspace map
@@ -958,14 +959,14 @@ impl Dashboard {
                     .board_state
                     .update(board::BoardMessage::Escape)
                     .map(Message::Board),
-                // Shell, Alarms and Custom Tools have no escape handling.
+                // Shell and Alarms have no escape handling.
                 // Running Agents: Escape dismisses the pending research-cancel
                 // confirmation (Keep) — never confirms it.
                 Page::RunningAgents => {
                     self.pending_research_cancel = None;
                     Task::none()
                 }
-                Page::Shell | Page::Alarms | Page::CustomTools => Task::none(),
+                Page::Shell | Page::Alarms => Task::none(),
                 Page::Logs => self
                     .logs_state
                     .update(
@@ -1210,10 +1211,6 @@ impl Dashboard {
             }
             Message::Sessions(msg) => self.sessions_state.update(msg).map(Message::Sessions),
             Message::Alarms(msg) => self.alarms_state.update(msg).map(Message::Alarms),
-            Message::CustomTools(msg) => self
-                .custom_tools_state
-                .update(msg)
-                .map(Message::CustomTools),
             Message::RunningAgents(msg) => self.process_running_message(msg),
             // Intercept CloseModal from successful manual commit — auto-close
             // the diff modal while keeping the diff state in working-tree view.
@@ -1803,7 +1800,6 @@ impl Dashboard {
             Page::Logs => self.logs_state.view().map(Message::Logs),
             Page::Sessions => self.sessions_state.view().map(Message::Sessions),
             Page::Alarms => self.alarms_state.view().map(Message::Alarms),
-            Page::CustomTools => self.custom_tools_state.view().map(Message::CustomTools),
             Page::Shell => {
                 if self.page_available(Page::Shell) {
                     self.shell_state.view().map(Message::Shell)
@@ -2189,14 +2185,19 @@ impl Dashboard {
                 iced::Subscription::none()
             },
             self.home_state.subscription().map(Message::Home),
-            // The two polled pages re-read their source while they are open;
-            // the tick is page-gated so a page nobody is looking at reads
-            // nothing.
+            // The Alarms page and the Settings page's custom-tools area re-read
+            // their source while they are shown; the tick is page-gated so a
+            // page nobody is looking at reads nothing.
             match self.page {
                 Page::Alarms => iced::time::every(common::POLLED_LIST_REFRESH_INTERVAL)
                     .map(|_| Message::Alarms(alarms::AlarmsMessage::Tick)),
-                Page::CustomTools => iced::time::every(common::POLLED_LIST_REFRESH_INTERVAL)
-                    .map(|_| Message::CustomTools(custom_tools::CustomToolsMessage::Tick)),
+                Page::Settings => {
+                    iced::time::every(common::POLLED_LIST_REFRESH_INTERVAL).map(|_| {
+                        Message::Settings(settings::SettingsMessage::CustomToolsMsg(
+                            custom_tools::CustomToolsMessage::Tick,
+                        ))
+                    })
+                }
                 _ => iced::Subscription::none(),
             },
             iced::Subscription::run(shutdown_subscription),
@@ -2458,7 +2459,6 @@ fn page_icon(page: Page) -> iced::widget::Text<'static, iced::Theme, iced::Rende
         Page::Shell => lucide::terminal::<iced::Theme, iced::Renderer>(),
         Page::Sessions => lucide::scroll_text::<iced::Theme, iced::Renderer>(),
         Page::Alarms => lucide::bell::<iced::Theme, iced::Renderer>(),
-        Page::CustomTools => lucide::hammer::<iced::Theme, iced::Renderer>(),
         Page::Logs => lucide::activity::<iced::Theme, iced::Renderer>(),
         Page::Settings => lucide::settings::<iced::Theme, iced::Renderer>(),
         Page::RunningAgents => lucide::radar::<iced::Theme, iced::Renderer>(),
