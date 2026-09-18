@@ -386,8 +386,6 @@ pub enum SettingsMessage {
     TtsToggleResult(u64, Result<(), String>),
     /// Retry TTS model download after a permanent failure.
     TtsRetryModels,
-    /// Request a toast notification from the dashboard.
-    Toast(super::ToastMessage),
 }
 
 // ── State ────────────────────────────────────────────────────────
@@ -1563,12 +1561,6 @@ impl SettingsState {
                     Task::none()
                 }
             },
-
-            SettingsMessage::Toast(_) => {
-                // Toast messages are intercepted by Dashboard::as_toast()
-                // before dispatch — this arm should never be reached.
-                Task::none()
-            }
 
             SettingsMessage::Escape => {
                 if self.show_add_workspace_modal {

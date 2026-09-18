@@ -404,8 +404,7 @@ impl Message {
             | Message::Sessions(sessions::SessionsMessage::Toast(tm))
             | Message::Alarms(alarms::AlarmsMessage::Toast(tm))
             | Message::Settings(
-                settings::SettingsMessage::Toast(tm)
-                | settings::SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Toast(tm))
+                settings::SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Toast(tm))
                 | settings::SettingsMessage::UserMsg(users::UsersMessage::Toast(tm)),
             ) => Some(tm),
             _ => None,

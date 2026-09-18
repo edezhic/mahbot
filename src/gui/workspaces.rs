@@ -81,7 +81,6 @@ pub struct WorkspacesState {
     pub(crate) workspaces: Vec<Workspace>,
     pub(crate) load_state: super::common::AsyncLoadState,
     pub(crate) delete_target: Option<String>,
-    pub(crate) deleting: bool,
 
     /// Read-only context view modal: (workspace_name, context kind, parsed_markdown_items).
     /// `None` while the modal is not open, `Some` with `None` items while loading.
@@ -118,7 +117,6 @@ impl WorkspacesState {
             workspaces: Vec::new(),
             load_state: super::common::AsyncLoadState::new(),
             delete_target: None,
-            deleting: false,
             context_view: None,
             context_view_error: None,
             diagnostics_modal: None,
@@ -144,7 +142,6 @@ impl WorkspacesState {
             }
             WorkspacesMessage::ConfirmDelete(name) => {
                 self.delete_target = None;
-                self.deleting = true;
                 Task::perform(
                     async move {
                         crate::workspace::store()
@@ -162,12 +159,10 @@ impl WorkspacesState {
             // Successful mutations are refreshed by the Dashboard's shared-map
             // reload (see process_settings_message) — no local store read.
             WorkspacesMessage::DeleteResult(Ok(())) => {
-                self.deleting = false;
                 self.load_state.clear_error();
                 Task::none()
             }
             WorkspacesMessage::DeleteResult(Err(e)) => {
-                self.deleting = false;
                 self.load_state.fail(e.clone());
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
             }

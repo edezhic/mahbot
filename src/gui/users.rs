@@ -72,7 +72,6 @@ pub struct UsersState {
 
     // Delete confirmation
     pub(crate) delete_target: Option<String>,
-    pub(crate) deleting: bool,
 
     // Telegram binding inline input (single-target, like delete_target)
     pub(crate) bind_target: Option<String>,
@@ -87,7 +86,6 @@ impl UsersState {
             users: Vec::new(),
             load_state: super::common::AsyncLoadState::new(),
             delete_target: None,
-            deleting: false,
             bind_target: None,
             bind_input: SingleLineEditorState::new(""),
             binding: false,
@@ -129,7 +127,6 @@ impl UsersState {
             }
             UsersMessage::ConfirmDelete(sender) => {
                 self.delete_target = None;
-                self.deleting = true;
                 Task::perform(
                     async move {
                         let store = user_store()?;
@@ -145,12 +142,10 @@ impl UsersState {
                 Task::none()
             }
             UsersMessage::DeleteResult(Ok(())) => {
-                self.deleting = false;
                 self.load_state.clear_error();
                 self.refresh()
             }
             UsersMessage::DeleteResult(Err(e)) => {
-                self.deleting = false;
                 self.load_state.fail(e.clone());
                 Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))
             }
