@@ -6,7 +6,7 @@
 //! and the folder is re-read once a second, so a file added, fixed or deleted on
 //! disk shows up without a restart.
 
-use iced::widget::{Column, column, row, text};
+use iced::widget::{Column, column, container, row, text};
 use iced::{Alignment, Element, Length, Task};
 use iced_fonts::lucide;
 
@@ -80,7 +80,8 @@ impl CustomToolsState {
                 ));
             }
         } else {
-            let mut list = Column::new().spacing(theme::SPACE_16);
+            // A step apart, so each tool reads as its own block.
+            let mut list = Column::new().spacing(theme::SPACE_4);
             for listing in self.list.entries() {
                 list = list.push(render_tool(listing));
             }
@@ -118,7 +119,12 @@ fn render_tool(listing: &ToolListing) -> Element<'_, CustomToolsMessage> {
             }
         }
     }
-    entry.into()
+    // The log row's card: one block per tool, spanning the entry width.
+    container(entry)
+        .padding(theme::PAD_6)
+        .width(Length::Fill)
+        .style(theme::surface_card_style)
+        .into()
 }
 
 fn render_param(param: &Param) -> Element<'_, CustomToolsMessage> {

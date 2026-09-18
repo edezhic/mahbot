@@ -1,22 +1,30 @@
-//! Alarms dashboard page — every active alarm of every user, read-only.
+//! Alarms dashboard page — every active alarm of every user.
 //!
-//! Nothing here creates, edits, cancels or deletes an alarm: the page reads the
-//! active alarms and renders them, grouped by owner, with a live countdown. It
-//! re-reads the list once a second while it is open; the countdown is rendered
-//! from the wall clock on every re-render, so a tick that starts no read still
-//! moves the digits.
+//! The page reads the active alarms and renders them as cards, grouped by
+//! owner, with a live countdown. Its only action is deleting one alarm from its
+//! card's context menu: the card leaves the page through the next refresh.
+//! Nothing here creates, edits or fires an alarm. The page re-reads the list
+//! once a second while it is open; the countdown is rendered from the wall
+//! clock on every re-render, so a tick that starts no read still moves the
+//! digits.
 
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Local, Utc};
-use iced::widget::{Column, column, row, text};
+use iced::widget::{Column, column, container, row, text};
 use iced::{Alignment, Element, Length, Task};
 use iced_fonts::lucide;
 
 use crate::alarms::Alarm;
 
+use super::ToastMessage;
 use super::common::PolledList;
+use super::menus::{ContextMenu, MenuItem};
 use super::{theme, widgets};
+
+/// The notice for an alarm that was already gone when the delete ran — a
+/// one-shot that fired, or one removed elsewhere: no failure, but no success.
+const ALREADY_GONE: &str = "Alarm was already gone";
 
 #[derive(Debug, Clone)]
 pub(crate) enum AlarmsMessage {
@@ -24,6 +32,12 @@ pub(crate) enum AlarmsMessage {
     Tick,
     /// A read finished. `Err` keeps the last loaded list on screen.
     Refreshed(Result<Vec<Alarm>, String>),
+    /// Delete the alarm the context menu was opened on, identified by its own
+    /// row: another account's alarm — or a gone account's — is deleted the same
+    /// way.
+    Delete { id: String, session_id: String },
+    /// Outcome of an action, shown by the dashboard as a brief notice.
+    Toast(ToastMessage),
 }
 
 pub(crate) struct AlarmsState {
@@ -53,6 +67,19 @@ impl AlarmsState {
                 self.list.settle(result);
                 Task::none()
             }
+            // The card is left to the page's own refresh: it is gone from the
+            // store, so the next read drops it, and a failed delete leaves it
+            // in place.
+            AlarmsMessage::Delete { id, session_id } => Task::perform(
+                async move {
+                    crate::alarms::remove_alarm(&session_id, &id)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+                delete_outcome,
+            ),
+            // The dashboard shows the notice and never routes it here.
+            AlarmsMessage::Toast(_) => Task::none(),
         }
     }
 
@@ -78,12 +105,17 @@ impl AlarmsState {
             let now = Local::now();
             let mut sections = Column::new().spacing(theme::SPACE_16);
             for (owner, alarms) in group_by_owner(self.list.entries()) {
-                let mut section = Column::new()
-                    .spacing(theme::SPACE_6)
-                    .push(widgets::section_heading(owner));
+                // Cards SPACE_4 apart — tighter than the SPACE_6 below a
+                // heading and the SPACE_16 between owners, so each owner's
+                // cards read as one group.
+                let mut cards = Column::new().spacing(theme::SPACE_4);
                 for alarm in alarms {
-                    section = section.push(render_alarm(alarm, now));
+                    cards = cards.push(render_alarm(alarm, now));
                 }
+                let section = Column::new()
+                    .spacing(theme::SPACE_6)
+                    .push(widgets::section_heading(owner))
+                    .push(cards);
                 sections = sections.push(section);
             }
             content = content.push(widgets::vscroll(sections));
@@ -115,6 +147,8 @@ fn group_by_owner(alarms: &[Alarm]) -> Vec<(&str, Vec<&Alarm>)> {
     groups.into_iter().collect()
 }
 
+/// One alarm as its own card — the log row's surface, padding and width — with
+/// a right-click menu whose single item deletes it.
 fn render_alarm(alarm: &Alarm, now: DateTime<Local>) -> Element<'_, AlarmsMessage> {
     let mut entry = Column::new().spacing(theme::SPACE_2).push(
         row![
@@ -140,7 +174,34 @@ fn render_alarm(alarm: &Alarm, now: DateTime<Local>) -> Element<'_, AlarmsMessag
                 .color(theme::TEXT_MUTED),
         );
     }
-    entry.into()
+
+    // Keyed by the alarm's row: a refresh that reshuffles the list closes this
+    // menu instead of redirecting its Delete at another alarm.
+    ContextMenu::new(
+        container(entry)
+            .padding(theme::PAD_6)
+            .width(Length::Fill)
+            .style(theme::surface_card_style),
+        vec![MenuItem::with_icon(
+            lucide::advanced_text::trash,
+            "Delete".into(),
+            AlarmsMessage::Delete {
+                id: alarm.id.clone(),
+                session_id: alarm.session_id.clone(),
+            },
+        )],
+    )
+    .key(&alarm.id)
+    .into()
+}
+
+/// The notice a delete attempt is reported with.
+fn delete_outcome(result: Result<Option<Alarm>, String>) -> AlarmsMessage {
+    match result {
+        Ok(Some(_)) => AlarmsMessage::Toast(ToastMessage::Deleted),
+        Ok(None) => AlarmsMessage::Toast(ToastMessage::Warning(ALREADY_GONE.to_string())),
+        Err(e) => AlarmsMessage::Toast(ToastMessage::Error(e)),
+    }
 }
 
 /// The next-fire label of an alarm against the local clock: `now` once it is

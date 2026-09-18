@@ -370,7 +370,7 @@ pub enum Message {
     Logs(logs::LogMessage),
     Board(board::BoardMessage),
     Sessions(sessions::SessionsMessage),
-    /// Alarms page messages (read-only refresh).
+    /// Alarms page messages (refresh and card-menu deletion).
     Alarms(alarms::AlarmsMessage),
     /// Custom Tools page messages (read-only refresh).
     CustomTools(custom_tools::CustomToolsMessage),
@@ -411,6 +411,7 @@ impl Message {
             | Message::Git(git::GitMessage::Toast(tm))
             | Message::Editor(editor::EditorMessage::Toast(tm))
             | Message::Sessions(sessions::SessionsMessage::Toast(tm))
+            | Message::Alarms(alarms::AlarmsMessage::Toast(tm))
             | Message::Settings(
                 settings::SettingsMessage::Toast(tm)
                 | settings::SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Toast(tm))
@@ -834,8 +835,8 @@ impl Dashboard {
                 Task::batch([snap, board_refresh])
             }
             Page::Sessions => sessions::SessionsState::refresh().map(Message::Sessions),
-            // The two read-only pages hold only a polled list, so entering them
-            // starts a read rather than a render of stale entries.
+            // These two pages render nothing but their polled list, so entering
+            // them starts a read rather than a render of stale entries.
             Page::Alarms => self.alarms_state.refresh().map(Message::Alarms),
             Page::CustomTools => self.custom_tools_state.refresh().map(Message::CustomTools),
             Page::Settings => {
@@ -2188,7 +2189,7 @@ impl Dashboard {
                 iced::Subscription::none()
             },
             self.home_state.subscription().map(Message::Home),
-            // The two read-only pages re-read their source while they are open;
+            // The two polled pages re-read their source while they are open;
             // the tick is page-gated so a page nobody is looking at reads
             // nothing.
             match self.page {

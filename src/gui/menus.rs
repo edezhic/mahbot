@@ -134,6 +134,7 @@ where
 {
     underlay: Element<'a, Message, Theme, Renderer>,
     menu_items: Vec<MenuItem<Message>>,
+    key: Option<&'a str>,
 }
 
 impl<'a, Message, Theme, Renderer> ContextMenu<'a, Message, Theme, Renderer>
@@ -152,7 +153,21 @@ where
         Self {
             underlay: underlay.into(),
             menu_items,
+            key: None,
         }
+    }
+
+    /// Binds the menu to the entry it wraps, identified by `key` (a stable id
+    /// that survives a re-read of the list).
+    ///
+    /// The open state lives in the widget tree slot the menu was rendered at:
+    /// when that slot holds a different entry on a later frame — a polled list
+    /// that reordered underneath the open menu — the menu is dismissed instead
+    /// of firing its action against the new occupant.
+    #[must_use]
+    pub fn key(mut self, key: &'a str) -> Self {
+        self.key = Some(key);
+        self
     }
 }
 
@@ -164,6 +179,8 @@ struct ContextMenuState {
     /// Currently hovered menu item index, persisted across frames
     /// so the highlight remains visible when the cursor is stationary.
     hovered: Option<usize>,
+    /// The [`ContextMenu::key`] the open menu was opened on; `None` unkeyed.
+    key: Option<String>,
 }
 
 impl ContextMenuState {
@@ -172,6 +189,7 @@ impl ContextMenuState {
             show: false,
             position: Point::ORIGIN,
             hovered: None,
+            key: None,
         }
     }
 }
@@ -203,6 +221,13 @@ where
     }
 
     fn diff(&self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<ContextMenuState>();
+
+        if state.show && state.key.as_deref() != self.key {
+            state.show = false;
+            state.hovered = None;
+        }
+
         tree.diff_children(&[&self.underlay]);
     }
 
@@ -287,6 +312,7 @@ where
                 state.show = true;
                 state.position = pos;
                 state.hovered = None;
+                state.key = self.key.map(str::to_owned);
                 shell.request_redraw();
                 shell.capture_event();
             }
