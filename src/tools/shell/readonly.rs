@@ -25,6 +25,10 @@
 //! text-scanning helpers used by out-of-scope consumers live in
 //! [`crate::tools::shell::scan`]; this module only uses word-level helpers on
 //! words reconstructed from the syntax tree.
+//!
+//! The Windows (cmd.exe) layer lives in [`windows`] — an additive platform
+//! layer, active only when [`ShellPlatform::Windows`], that leaves every unix
+//! verdict and test unchanged.
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -32,6 +36,8 @@ use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 
 use super::scan::{self, CdScan};
+
+mod windows;
 
 /// Shell execution mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +47,23 @@ pub enum ShellMode {
     /// Read-only shell — only inspection commands allowed.
     ReadOnly,
 }
+
+/// The platform whose shell runs the validated command string (`sh -c` on unix,
+/// `cmd.exe /C` on Windows). The guard's platform rules key on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ShellPlatform {
+    Unix,
+    Windows,
+}
+
+/// The running process's [`ShellPlatform`] — the single source every platform
+/// rule in this module reads. Its spawn side is [`super::build_shell_command`]
+/// (`cmd.exe /C` on Windows, `sh -c` elsewhere); the two must not drift.
+const SHELL_PLATFORM: ShellPlatform = if cfg!(windows) {
+    ShellPlatform::Windows
+} else {
+    ShellPlatform::Unix
+};
 
 // ── Const tables ─────────────────────────────────────────────────────────
 
@@ -221,11 +244,13 @@ const GIT_REMOTE_MUTATIONS: &[&str] = &[
 // ── Context and validation state ─────────────────────────────────────────
 
 /// Immutable context for one validation: the session workspace root, the
-/// allowed OS temp roots, and the session shell's temp-variable baseline.
+/// allowed OS temp roots, the session shell's temp-variable baseline, and the
+/// platform whose shell runs the validated string.
 pub(super) struct CheckContext {
     pub(crate) workspace_root: std::path::PathBuf,
     pub(crate) temp_roots: Vec<std::path::PathBuf>,
     pub(crate) temp_vars: Vec<(String, String)>,
+    pub(crate) platform: ShellPlatform,
 }
 
 impl CheckContext {
@@ -233,10 +258,19 @@ impl CheckContext {
     /// OS temp roots and the session shell's temp-variable bindings, taken from
     /// the same single source the shell environment itself is given.
     pub(super) fn for_workspace(workspace_root: &Path) -> Self {
+        Self::for_platform(workspace_root, SHELL_PLATFORM)
+    }
+
+    /// [`Self::for_workspace`] with an explicit platform — the only production
+    /// path is `for_workspace`, and this constructor exists so both platforms'
+    /// verdicts are drivable from any host's unit-test lane: the platform is a
+    /// value, never a `cfg` branch.
+    fn for_platform(workspace_root: &Path, platform: ShellPlatform) -> Self {
         Self {
             workspace_root: workspace_root.to_path_buf(),
             temp_roots: crate::tools::path::allowed_temp_roots(),
             temp_vars: crate::temp::shell_temp_vars(),
+            platform,
         }
     }
 }
@@ -333,16 +367,40 @@ pub(super) fn check_command(command_str: &str, ctx: &CheckContext) -> Result<(),
     parse_and_walk(trimmed, &mut state)
 }
 
-/// Fail-closed rejection for a command the bash grammar cannot parse. Parser
-/// gaps over-reject (herestrings, `<>`, multiple heredocs per line, unquoted
-/// `%(` in git --format); the banner lists the accepted over-rejection
-/// classes.
-fn parse_error(cmd: &str) -> String {
+/// The parser gaps the guard over-rejects on both platforms: it reads every
+/// command as bash, so a unix spelling and a shape only cmd.exe accepts fail the
+/// same parse.
+const PARSE_GAP_EXAMPLES: &str = "herestrings, `<>` redirects, unquoted `%(` in git --format";
+
+/// The rewrite worth asking for, per platform: cmd.exe runs none of the bash
+/// spellings the unix arm names, and the shapes that fail there are its own — so
+/// one shared hint would send an agent to syntax the other interpreter.
+fn parse_error_hint(platform: ShellPlatform) -> String {
+    match platform {
+        ShellPlatform::Unix => format!(
+            "If this command is a known bash construct ({PARSE_GAP_EXAMPLES}), rewrite it in a \
+             plainer form (e.g. use `$()` not backticks, quote format strings, use a quoted heredoc \
+             delimiter)."
+        ),
+        ShellPlatform::Windows => format!(
+            "If this command is a shape cmd.exe accepts but this guard's parser cannot read \
+             (`if exist x ( … )`, `for %i in (…) do …`), or a bash construct it does not read \
+             ({PARSE_GAP_EXAMPLES}), rewrite it in the plain spelling cmd.exe accepts (quote \
+             format strings; no `$()` or backtick substitution)."
+        ),
+    }
+}
+
+/// Fail-closed rejection for a command the grammar cannot parse. Parser gaps
+/// over-reject ([`PARSE_GAP_EXAMPLES`], plus several heredocs in one line). The
+/// head is a statement about the guard — it reads every command as bash on both
+/// platforms — rather than advice for the agent, so only the hint is
+/// platform-selected.
+fn parse_error(cmd: &str, platform: ShellPlatform) -> String {
     format!(
         "⚠️ Read-only mode: the command could not be parsed as valid bash — rejected fail-closed.\n\
-         Command: `{cmd}`\n\
-         If this command is a known bash construct (herestrings, `<>` redirects, unquoted `%(` in git --format), \
-         rewrite it in a plainer form (e.g. use `$()` not backticks, quote format strings, use a quoted heredoc delimiter)."
+         Command: `{cmd}`\n{}",
+        parse_error_hint(platform)
     )
 }
 
@@ -490,19 +548,20 @@ fn walk_word_substitutions<'a>(
     // Fail-closed on parse errors (defensive: `parse_and_walk` already
     // rejects ERROR/MISSING trees, but sub-tree walks must never skip them).
     if node.is_error() || node.is_missing() {
-        return Err(parse_error(&w.src));
+        return Err(parse_error(&w.src, state.ctx.platform));
     }
     // The node itself may be a substitution (`echo $(touch f)` — the walker
     // descends into every word-ish child, and the substitution is one of them).
     match node.kind() {
         "command_substitution" => {
-            // Backtick form: fail-closed reject (hint the `$()` spelling).
+            // Only the backtick form is refused outright.
             if node_text(node, w).starts_with('`') {
                 return Err(format!(
                     "⚠️ Read-only mode: backtick command substitution is not allowed — its content cannot be safely tracked.\n\
                      Command: `{}`\n\
-                     Suggestion: use `$()` instead of backticks, e.g. `echo \"$(ls)\"`.",
-                    w.src
+                     Suggestion: {}",
+                    w.src,
+                    backtick_suggestion(state.ctx.platform)
                 ));
             }
             let mut snap = state.snapshot();
@@ -570,7 +629,7 @@ fn walk_node<'a>(
     extras: Vec<String>,
 ) -> Result<(), String> {
     if node.is_error() || node.is_missing() {
-        return Err(parse_error(&w.src));
+        return Err(parse_error(&w.src, state.ctx.platform));
     }
     match node.kind() {
         "program" | "list" | "do_group" => {
@@ -615,7 +674,6 @@ fn walk_node<'a>(
         "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
             validate_redirect(node, w, state)
         }
-        "comment" => Ok(()),
         _ => Err(unrecognized_node(node, w)),
     }
 }
@@ -663,7 +721,7 @@ fn walk_sequence_of<'a>(
                         w.src
                     ));
                 }
-                "ERROR" => return Err(parse_error(&w.src)),
+                "ERROR" => return Err(parse_error(&w.src, state.ctx.platform)),
                 _ => {} // `;` `&&` `||` `|` newlines and keywords — state threads
             }
             continue;
@@ -815,9 +873,13 @@ fn check_words(
                 apply_env_bindings(words, state, None)?;
                 return Ok(());
             }
-            let Some(resolved) = resolve_var_command_word(words[idx], state) else {
+            let Some(resolved) = resolve_unprovable_verb(words[idx], state) else {
                 let cmd = originals.join(" ");
-                return reject(&cmd, UNPROVABLE_VERB_WHY, UNPROVABLE_VERB_HINT);
+                return reject(
+                    &cmd,
+                    UNPROVABLE_VERB_WHY,
+                    unprovable_verb_hint(state.ctx.platform),
+                );
             };
             verb_rewrite = Some((idx, resolved.clone()));
             (idx, Cow::Owned(resolved))
@@ -827,10 +889,27 @@ fn check_words(
             class: VerbClass::Literal(v),
         } => (idx, Cow::Borrowed(v)),
     };
+    // Windows (cmd.exe) layer: the verb spelling, `/switch` arguments, `%VAR%`
+    // expansion and the temp-path model differ from the unix ones, so the layer
+    // owns the verdict for the verbs it models; everything else falls through
+    // to the shared dispatch below. See [`windows`].
+    //
+    // The command text both this layer and the shared dispatch below read is
+    // built at its first use: the cd/eval/keyword returns further down never
+    // reach it, and on unix this branch is skipped entirely.
+    let mut joined: Option<String> = None;
+    if state.ctx.platform == ShellPlatform::Windows {
+        let text = joined.get_or_insert_with(|| originals.join(" "));
+        match windows::check_segment(words, verb_idx, text, state.ctx) {
+            windows::WinVerdict::Allow => return Ok(()),
+            windows::WinVerdict::Refuse(rejection) => return Err(rejection),
+            windows::WinVerdict::Pass => {}
+        }
+    }
     // Matched on the resolved verb itself: cd/pushd/popd are builtins with no
     // path form, so a path-valued binding can never invoke them — its dispatch
     // falls through to the basename checks below and cwd tracking never
-    // engages (fail-closed).
+    // engages (fail-closed). Windows never reaches this; see [`windows`].
     if matches!(verb.as_ref(), "cd" | "pushd" | "popd") {
         process_cd_words(words, verb_idx, &verb, state);
         return Ok(());
@@ -873,7 +952,7 @@ fn check_words(
     let mut segment = if let Some((idx, value)) = &verb_rewrite {
         segment_with_word_replaced(words, *idx, value)
     } else {
-        originals.join(" ")
+        joined.unwrap_or_else(|| originals.join(" "))
     };
 
     // Effective command: strip shell prefixes and env assignments for the
@@ -889,7 +968,7 @@ fn check_words(
     let verb_raw = cmd_words[cmd_idx].to_string();
     let first_word = match classify_verb_word(&first_word) {
         VerbClass::Literal(v) => v.to_string(),
-        VerbClass::Unprovable => match resolve_var_command_word(&verb_raw, state) {
+        VerbClass::Unprovable => match resolve_unprovable_verb(&verb_raw, state) {
             Some(resolved) => {
                 // `env HOME=/tmp/x "$BIN" ...`: site 1 saw a literal forwarding
                 // prefix and never hit the variable. Rewrite the variable word
@@ -904,12 +983,30 @@ fn check_words(
                         segment = segment_with_word_replaced(words, idx, &resolved);
                         super::first_command_word(&segment).to_string()
                     }
-                    None => return reject(&segment, UNPROVABLE_VERB_WHY, UNPROVABLE_VERB_HINT),
+                    None => {
+                        return reject(
+                            &segment,
+                            UNPROVABLE_VERB_WHY,
+                            unprovable_verb_hint(state.ctx.platform),
+                        );
+                    }
                 }
             }
-            None => return reject(&segment, UNPROVABLE_VERB_WHY, UNPROVABLE_VERB_HINT),
+            None => {
+                return reject(
+                    &segment,
+                    UNPROVABLE_VERB_WHY,
+                    unprovable_verb_hint(state.ctx.platform),
+                );
+            }
         },
     };
+    // cmd.exe dispatches commands case-insensitively and ignores the
+    // executable extension (`TAR`, `Curl`, `shutdown.exe`, `GIT.EXE` all run
+    // the same program as the lowercase bare spelling), so on its platform the
+    // shared tables are matched on the layer's verb key of the raw command
+    // word; the unix verdicts stay case-sensitive.
+    let first_word = windows::dispatch_word(state.ctx.platform, &verb_raw, first_word);
 
     // 'mktemp' creates a temp directory and outputs its path — always allowed.
     if first_word == "mktemp" {
@@ -926,14 +1023,15 @@ fn check_words(
             .is_none_or(|reject| reject(&segment, first_word.as_str(), state))
         {
             let (education, fallback) = check.suggestions;
+            let suggestion = if has_unresolved_var_path(&segment, state) {
+                education(state.ctx.platform)
+            } else {
+                fallback(state.ctx.platform)
+            };
             return reject(
                 &segment,
                 &check.rejection.replace("{verb}", first_word.as_str()),
-                if has_unresolved_var_path(&segment, state) {
-                    education
-                } else {
-                    fallback
-                },
+                suggestion,
             );
         }
         if first_word == "mkdir" {
@@ -944,6 +1042,18 @@ fn check_words(
 
     // Git-specific checks
     if first_word == "git" {
+        // cmd.exe dispatches `Git`/`GIT`/`GIT.EXE` to the same program, while
+        // the git dispatch re-derives the command word from the segment text
+        // and matches it case-sensitively — fold that word so the mixed-case
+        // and extension-qualified spellings get the `git` verdict. The word is
+        // located the way the git dispatch locates it (prefixes and env
+        // assignments skipped), not at `verb_idx`, which a forwarding prefix
+        // occupies.
+        if state.ctx.platform == ShellPlatform::Windows
+            && let Some(idx) = super::find_first_command_word_index(words)
+        {
+            segment = segment_with_word_replaced(words, idx, "git");
+        }
         return check_git_segment(&segment);
     }
 
@@ -1219,13 +1329,14 @@ fn validate_redirect<'a>(
             let mut snap = state.snapshot();
             validate_heredoc(node, w, state, &[], &mut snap)
         }
-        "herestring_redirect" => Err(parse_error(&w.src)),
+        "herestring_redirect" => Err(parse_error(&w.src, state.ctx.platform)),
         _ => Err(unrecognized_node(node, w)),
     }
 }
 
 /// Validate a `> file`-family redirect: output ops (`>`, `>>`, `>|`, `>&`
-/// with a path target, `&>`, `&>>`) must target /dev/null or a path under a
+/// with a path target, `&>`, `&>>`) must target the platform's null device
+/// (`/dev/null` on unix, cmd's `NUL` family on Windows) or a path under a
 /// temp root; fd-dups (`>&2`, `2>&1`) and input ops (`<`, `<&`) are always
 /// allowed. A missing target rejects. Substitutions anywhere in the node
 /// (targets and words swallowed after the target) execute and are validated
@@ -1255,7 +1366,7 @@ fn validate_file_redirect<'a>(
                     fd_dup_target = c.kind() == "number";
                 }
             }
-            "ERROR" => return Err(parse_error(&w.src)),
+            "ERROR" => return Err(parse_error(&w.src, state.ctx.platform)),
             _ => {}
         }
     }
@@ -1279,22 +1390,43 @@ fn validate_file_redirect<'a>(
         ));
     };
     let target_text = node_text(target, w);
-    if target_text == "/dev/null" {
+    if is_null_target(&target_text, state) {
         return Ok(());
     }
     if writes_outside_temp(&target_text, state) {
-        return Err(disallowed_redirect_err(&w.src, &target_text));
+        return Err(disallowed_redirect_err(&w.src, &target_text, state));
     }
     Ok(())
 }
 
+/// The null device in the platform's own spelling: `/dev/null` on unix, cmd's
+/// `NUL` family on Windows — `/dev/null` is an ordinary path under cmd.exe.
+fn is_null_target(target: &str, state: &ValidationState) -> bool {
+    if state.ctx.platform == ShellPlatform::Windows {
+        windows::is_null_device(target)
+    } else {
+        target == "/dev/null"
+    }
+}
+
 /// Rejection message for a redirect targeting a non-temp path.
-fn disallowed_redirect_err(cmd: &str, target: &str) -> String {
+fn disallowed_redirect_err(cmd: &str, target: &str, state: &ValidationState) -> String {
+    let (allowed, suggestion) = if state.ctx.platform == ShellPlatform::Windows {
+        (
+            "the NUL device, 2>&1, 1>&2, or paths under the daemon temp location (`%TMP%`/`%TEMP%`)",
+            "pipe to `| more` or filter with `| findstr <pattern>` to limit output.",
+        )
+    } else {
+        (
+            "/dev/null, 2>&1, 1>&2, or paths under /tmp, /var/tmp, or the OS temp directory",
+            "pipe to a pager (e.g., `| less`) or use `| head` to limit output.",
+        )
+    };
     format!(
         "⚠️ Read-only mode: command contains a disallowed output redirect (`{target}`).\n\
          Command: `{cmd}`\n\
-         Redirects are only allowed to /dev/null, 2>&1, 1>&2, or paths under /tmp, /var/tmp, or the OS temp directory.\n\
-         Suggestion: pipe to a pager (e.g., `| less`) or use `| head` to limit output."
+         Redirects are only allowed to {allowed}.\n\
+         Suggestion: {suggestion}"
     )
 }
 
@@ -2242,6 +2374,11 @@ fn resolve_path_word(word: &str, state: &ValidationState) -> Option<std::path::P
 /// True when a path word resolves outside every allowed temp root (or cannot
 /// be proven under one) — the temp-write contract gate.
 fn writes_outside_temp(word: &str, state: &ValidationState) -> bool {
+    if state.ctx.platform == ShellPlatform::Windows {
+        // The cmd.exe path model: a drive-letter path is not a host `Path` on
+        // every host that must be able to judge it.
+        return !windows::under_temp(word, state.ctx);
+    }
     let Some(p) = resolve_path_word(word, state) else {
         return true;
     };
@@ -2272,13 +2409,23 @@ fn is_path_under_temp(path: &std::path::Path, ctx: &CheckContext) -> bool {
 
 // ── Variable binding machinery ───────────────────────────────────────────
 
-/// Reject `GIT_*` env bindings (quote-stripped) except the documented
-/// `GIT_PAGER` carve-out — git only paginates on a TTY and the shell tool
-/// captures via pipes, so a pager binding can never spawn. Covers
-/// GIT_EXTERNAL_DIFF, GIT_SSH_COMMAND, GIT_CONFIG_*, GIT_DIR, GIT_EXEC_PATH,
-/// GIT_TRACE*, GIT_ASKPASS — all invisible to the subcommand allowlist.
-/// Also fires on non-git commands (`GIT_DIR=/tmp ls`): fail-closed trade-off
-/// closing transitive git invocation (make inheriting GIT_*).
+/// True when an environment variable name is a refused `GIT_*` binding: git
+/// reads them as exec vectors (GIT_EXTERNAL_DIFF, GIT_SSH_COMMAND,
+/// GIT_CONFIG_*, GIT_DIR, GIT_EXEC_PATH, GIT_TRACE*, GIT_ASKPASS — all
+/// invisible to the subcommand allowlist), with `GIT_PAGER` the documented
+/// carve-out (git only paginates on a TTY and the shell tool captures via
+/// pipes, so a pager binding can never spawn). The Windows caller folds the name
+/// first (`windows::check_set`): cmd's environment matches variable names
+/// case-insensitively, so `set git_dir=…` binds the same variable the unix
+/// spelling does.
+fn git_env_name_denied(name: &str) -> bool {
+    name.starts_with("GIT_") && name != "GIT_PAGER"
+}
+
+/// Reject `GIT_*` env bindings (quote-stripped) through
+/// [`git_env_name_denied`]. Also fires on non-git commands (`GIT_DIR=/tmp ls`):
+/// fail-closed trade-off closing transitive git invocation (make inheriting
+/// GIT_*).
 ///
 /// This rejects *user-supplied* shell assignments. MahBot's git module sets
 /// `GIT_CONFIG_*` internally on the spawned `Command` (not via the shell), so
@@ -2286,8 +2433,7 @@ fn is_path_under_temp(path: &std::path::Path, ctx: &CheckContext) -> bool {
 fn check_git_env_binding(word: &str) -> Result<(), String> {
     let w = scan::strip_quoted_word(word);
     if let Some((name, _)) = w.split_once('=')
-        && name.starts_with("GIT_")
-        && name != "GIT_PAGER"
+        && git_env_name_denied(name)
     {
         return reject(
             word,
@@ -2548,7 +2694,7 @@ fn path_exists_or_created(
 /// extraction go through [`scan::cd_target_after_options`]; a bare
 /// `cd`/`cd -P` or an invalid option (`cd -e`) resets fail-closed — the cd
 /// errors at runtime, so tracking would approve a chained write that lands
-/// in the real CWD.
+/// in the real CWD. Unix only; see [`windows`].
 fn process_cd_words(words: &[&str], cd_idx: usize, verb: &str, state: &mut ValidationState) {
     // Every executed cd/pushd/popd moves the real CWD in the current shell —
     // construct walkers compare this counter to detect the leak.
@@ -2660,8 +2806,13 @@ fn parse_and_walk(text: &str, state: &mut ValidationState) -> Result<(), String>
         .ok_or_else(|| "failed to parse the command".to_string())?;
     let root = tree.root_node();
     if root.has_error() {
-        return Err(parse_error(text));
+        return Err(parse_error(text, state.ctx.platform));
     }
+    // The Windows whole-line divergences (a comment, an unquoted `;`, a heredoc)
+    // are refused here, once for the whole command string and in every nesting
+    // position: the layer decides them in this scan rather than in the walker
+    // below, whose handlers are the unix-shaped ones. See [`windows::check_line`].
+    windows::check_line(root, text, state.ctx)?;
     let mut w = W {
         src: text.to_string(),
         last_start: state.snapshot(),
@@ -3017,6 +3168,24 @@ fn resolve_var_command_word(word: &str, state: &ValidationState) -> Option<Strin
     Some(value.to_string())
 }
 
+/// Resolve a verb word the shared classifier calls unprovable: on Unix, as a
+/// variable bound earlier in this invocation to a literal; on Windows, as a
+/// cmd.exe command word (`C:\Windows\System32\format.com` → `format`,
+/// `del.exe` → `del`), whose spelling the Windows layer owns. `None` keeps the
+/// existing fail-closed rejection.
+///
+/// The two resolutions do not mix: cmd.exe can neither execute a `NAME=value`
+/// assignment nor expand `$NAME`, so a bound value would describe a command the
+/// runtime cannot run.
+fn resolve_unprovable_verb(word: &str, state: &ValidationState) -> Option<String> {
+    if state.ctx.platform == ShellPlatform::Windows {
+        // The Windows layer's verb key reads a path-qualified, extension-
+        // qualified or quoted spelling the unix classifier calls unprovable.
+        return windows::verb_key(word);
+    }
+    resolve_var_command_word(word, state)
+}
+
 /// True when the command's words are exactly one bare substitution span at
 /// command position (a standalone `$(...)`/backtick — its content executes in
 /// a subshell and was already validated by the walker).
@@ -3031,11 +3200,32 @@ fn is_bare_substitution_segment(words: &[&str]) -> bool {
     scan::substitution_span(s, 0).is_some_and(|(_, next)| next == s.len() && !s.starts_with("${"))
 }
 
-/// The shared rejection texts of both unprovable-verb sites in [`check_words`]
+/// The shared rejection text of the unprovable-verb sites in [`check_words`]
 /// (AST verb resolution and the prefix-stripped text dispatch).
 const UNPROVABLE_VERB_WHY: &str = "the command verb cannot be proven safe (concatenated quotes, escapes, or substitution-formed).";
-const UNPROVABLE_VERB_HINT: &str =
-    "write the command name literally (e.g. `cd`, `rm`) so it can be validated.";
+
+/// The unprovable-verb suggestion, naming a verb of the session's own platform.
+fn unprovable_verb_hint(platform: ShellPlatform) -> &'static str {
+    match platform {
+        ShellPlatform::Unix => {
+            "write the command name literally (e.g. `cd`, `rm`) so it can be validated."
+        }
+        ShellPlatform::Windows => {
+            "write the command name literally (e.g. `cd`, `dir`) so it can be validated."
+        }
+    }
+}
+
+/// The backtick-substitution suggestion, per platform: the `$()` spelling the
+/// unix arm teaches is not one cmd.exe can run.
+fn backtick_suggestion(platform: ShellPlatform) -> &'static str {
+    match platform {
+        ShellPlatform::Unix => "use `$()` instead of backticks, e.g. `echo \"$(ls)\"`.",
+        ShellPlatform::Windows => {
+            "drop the substitution — cmd.exe runs neither backticks nor `$()`."
+        }
+    }
+}
 
 /// Rebuild the segment text with the word at `idx` replaced by `value` — used
 /// when a variable command word resolves to a literal, so every downstream
@@ -3048,26 +3238,33 @@ fn segment_with_word_replaced(words: &[&str], idx: usize, value: &str) -> String
 
 // ── Keep-set dispatch tables ─────────────────────────────────────────────
 
-/// Rejection template helper.
-fn reject<T>(cmd: &str, why: &str, suggestion: &str) -> Result<T, String> {
-    Err(format!(
+/// The shared read-only rejection text.
+fn rejection_message(cmd: &str, why: &str, suggestion: &str) -> String {
+    format!(
         "⚠️ Read-only mode: {why}\n\
          Command: `{cmd}`\n\
          Suggestion: {suggestion}"
-    ))
+    )
+}
+
+/// Rejection template helper.
+fn reject<T>(cmd: &str, why: &str, suggestion: &str) -> Result<T, String> {
+    Err(rejection_message(cmd, why, suggestion))
 }
 
 /// Scratch-file mutators allowed when all explicit path args are under temp.
 const SCRATCH_MUTATORS: &[&str] = &["tee", "touch", "mkdir"];
 
 /// Temp-directory mutators allowed when all explicit path args are under temp.
-///
-/// These are commands that modify files on disk but are allowed in read-only mode
-/// when all path arguments target temp directories (/tmp, /var/tmp, or the OS temp
-/// directory). The prompt tells agents: "Writing to the OS temp directory is allowed."
 const TEMP_MUTATORS: &[&str] = &[
     "cp", "mv", "rm", "rmdir", "unlink", "gzip", "gunzip", "bzip2", "xz", "zstd", "zip",
 ];
+
+/// One suggestion text of a rejection row, selected against the session's
+/// platform when the message is built: the rows are a `const` table dispatched
+/// on both platforms, so a row whose advice names platform tools cannot bake one
+/// platform's names in.
+type Suggestion = fn(ShellPlatform) -> &'static str;
 
 /// One temp-gated mutator dispatch row.
 struct MutatorCheck {
@@ -3077,10 +3274,12 @@ struct MutatorCheck {
     rejects: Option<fn(&str, &str, &ValidationState) -> bool>,
     /// Rejection reason template with a `{verb}` placeholder.
     rejection: &'static str,
-    /// Suggestion strings: the first educates about recognized temp-variable
-    /// spellings when a `$` path failed to resolve; the second is the generic
-    /// read-only-alternatives fallback.
-    suggestions: (&'static str, &'static str),
+    /// The suggestion pair: the first educates about the platform's temp-path
+    /// spelling (shown when a `$` path failed to resolve), the second is the
+    /// fallback for a literal path that failed the gate — the temp route plus
+    /// read-only alternatives where the row grants a temp location, inspection
+    /// commands alone where it does not.
+    suggestions: (Suggestion, Suggestion),
 }
 
 /// True when a scratch mutator writes outside temp.
@@ -3095,7 +3294,50 @@ fn temp_rejects(segment: &str, verb: &str, state: &ValidationState) -> bool {
     !temp_mutator_paths_under_temp(segment, verb, state)
 }
 
-const READONLY_ALTERNATIVES: &str = "use read-only alternatives to inspect files, e.g. `cat`, `head`, `tail`, `ls`, `file`, `stat`.";
+/// Read-only inspection commands, in this platform's own spellings.
+///
+/// The check tables below are `const` and dispatched on both platforms, so a row
+/// whose advice names this platform's tools cannot bake one platform's names in:
+/// the sender resolves it against [`ShellPlatform`] when the message is built.
+fn inspect_alternatives(platform: ShellPlatform) -> &'static str {
+    match platform {
+        ShellPlatform::Unix => {
+            "use read-only alternatives to inspect files, e.g. `cat`, `head`, `tail`, `ls`, `file`, `stat`."
+        }
+        ShellPlatform::Windows => {
+            "use read-only alternatives to inspect files, e.g. `type`, `dir`, `findstr`, `more`."
+        }
+    }
+}
+
+/// How to name a temp destination in this platform's own shell — same reason as
+/// [`inspect_alternatives`].
+fn temp_path_hint(platform: ShellPlatform) -> &'static str {
+    match platform {
+        ShellPlatform::Unix => {
+            "name the temp location literally (a path under `/tmp`, `/var/tmp` or the OS temp directory, or a directory bound with `NAME=$(mktemp -d)` and referenced as `$NAME`)."
+        }
+        ShellPlatform::Windows => {
+            "name the temp location absolutely — its literal spelling, or `%TMP%`/`%TEMP%` (double-quoted when it carries a space)."
+        }
+    }
+}
+
+/// The fallback for a refused write that had a temp grant to lose: the
+/// temp-mutator rows use it, and so does the Windows layer's own temp gate. It
+/// restates the clauses of [`temp_path_hint`] and [`inspect_alternatives`]
+/// instead of composing them, because a [`Suggestion`] is a `&'static str`
+/// selector — composing would mean building a string per refusal.
+fn temp_path_or_alternatives_hint(platform: ShellPlatform) -> &'static str {
+    match platform {
+        ShellPlatform::Unix => {
+            "use a path under `/tmp`, `/var/tmp` or the OS temp directory, or use read-only alternatives (`cat`, `head`, `tail`, `ls`, `file`, `stat`)."
+        }
+        ShellPlatform::Windows => {
+            "use a path under the daemon temp root (its literal spelling, or `%TMP%`/`%TEMP%`), or use read-only alternatives (`type`, `dir`, `findstr`, `more`)."
+        }
+    }
+}
 
 /// Temp-gated mutator dispatch, iterated in order by [`check_words`]:
 /// scratch mutators (tee/touch/mkdir), temp mutators (cp/mv/rm/…), then the
@@ -3105,25 +3347,19 @@ const MUTATOR_CHECKS: &[MutatorCheck] = &[
         verbs: SCRATCH_MUTATORS,
         rejects: Some(scratch_rejects),
         rejection: "`{verb}` is not allowed outside temp directories — it modifies the workspace.",
-        suggestions: (
-            "use a literal path under /tmp, or bind the directory first with `NAME=$(mktemp -d)` and reference `$NAME`.",
-            READONLY_ALTERNATIVES,
-        ),
+        suggestions: (temp_path_hint, temp_path_or_alternatives_hint),
     },
     MutatorCheck {
         verbs: TEMP_MUTATORS,
         rejects: Some(temp_rejects),
-        rejection: "`{verb}` is not allowed outside temp directories — it modifies files outside /tmp.",
-        suggestions: (
-            "use a literal path under /tmp, or bind the directory first with `NAME=$(mktemp -d)` and reference `$NAME`.",
-            "use paths under /tmp, /var/tmp, or the OS temp directory, or use read-only alternatives like `cat`, `head`, `tail`, `ls`, `file`, `stat`.",
-        ),
+        rejection: "`{verb}` is not allowed outside temp directories — it modifies files outside the temp location.",
+        suggestions: (temp_path_hint, temp_path_or_alternatives_hint),
     },
     MutatorCheck {
         verbs: MUTATING_COMMANDS,
         rejects: None,
         rejection: "`{verb}` is not allowed — it modifies the workspace.",
-        suggestions: (READONLY_ALTERNATIVES, READONLY_ALTERNATIVES),
+        suggestions: (inspect_alternatives, inspect_alternatives),
     },
 ];
 
@@ -3133,6 +3369,9 @@ struct FlagCheck {
     verb: &'static str,
     predicate: fn(&str, &ValidationState) -> bool,
     rejection: &'static str,
+    /// Suggestion text. Fixed, unlike [`MutatorCheck::suggestions`]: a flag row
+    /// names only the verb the agent itself invoked (plus the neutral `<temp>`
+    /// placeholder), so it reads the same on both platforms.
     suggestion: &'static str,
 }
 
@@ -3143,25 +3382,25 @@ const FLAG_CHECKS: &[FlagCheck] = &[
         verb: "sed",
         predicate: has_sed_mutation,
         rejection: "`sed` in-place editing (`-i`/`-I`/`--in-place`) is not allowed outside temp directories — it modifies files in-place.",
-        suggestion: "use `sed` without in-place flags to output to stdout, e.g. `sed 's/a/b/' file`, or use `-i` with a path under /tmp.",
+        suggestion: "use `sed` without in-place flags to output to stdout, e.g. `sed 's/a/b/' file`, or use `-i` with a path under the temp location.",
     },
     FlagCheck {
         verb: "awk",
         predicate: has_inplace,
         rejection: "`awk -i inplace` is not allowed — it edits files in-place.",
-        suggestion: "use `awk` without `-i inplace` to output to stdout, e.g. `awk '{print $1}' file`, or use `-i inplace` with a path under /tmp.",
+        suggestion: "use `awk` without `-i inplace` to output to stdout, e.g. `awk '{print $1}' file`, or use `-i inplace` with a path under the temp location.",
     },
     FlagCheck {
         verb: "dd",
         predicate: has_dd_mutation,
         rejection: "`dd of=...` is not allowed outside temp directories — it writes a file.",
-        suggestion: "use `dd of=/tmp/...` to write under the OS temp directory, or use read-only alternatives like `cat`, `head`, `tail`, `ls`, `file`, `stat`.",
+        suggestion: "use `dd of=<temp>/...` to write a file under the temp location; to read the file back, use a read-only inspection command.",
     },
     FlagCheck {
         verb: "curl",
         predicate: has_curl_mutation,
         rejection: "`curl` with output flags is not allowed outside temp directories.",
-        suggestion: "use `curl` without output flags to display content in stdout, or use `curl -o /tmp/...` to save to temp.",
+        suggestion: "use `curl` without output flags to display content in stdout, or use `curl -o <temp>/...` to save under the temp location.",
     },
     FlagCheck {
         verb: "tar",
@@ -3173,13 +3412,13 @@ const FLAG_CHECKS: &[FlagCheck] = &[
         verb: "base64",
         predicate: has_base64_mutation,
         rejection: "`base64` with output flags is not allowed outside temp directories.",
-        suggestion: "use `base64` without output flags to print to stdout, or use `base64 -o /tmp/...` to save to temp.",
+        suggestion: "use `base64` without output flags to print to stdout, or `base64 -o <temp>/...` to save under the temp location.",
     },
     FlagCheck {
         verb: "wget",
         predicate: has_wget_mutation,
         rejection: "`wget` with output flags is not allowed outside temp directories.",
-        suggestion: "use `curl` without output flags to display content in stdout, or use `wget -O /tmp/...` to save to temp.",
+        suggestion: "use `wget -O <temp>/...` to save the download under the temp location — without an output flag `wget` always writes into the current directory.",
     },
 ];
 
@@ -3213,8 +3452,8 @@ fn non_flag_path_args(segment: &str) -> Vec<String> {
 }
 
 /// True when a path argument contains a `$` variable that failed to resolve —
-/// used to tailor rejection messages with the recognized temp-variable
-/// spellings (a literal temp path, or `NAME=$(mktemp -d)`).
+/// the selector between a [`MUTATOR_CHECKS`] row's temp-path education and its
+/// read-only-alternatives fallback.
 fn has_unresolved_var_path(segment: &str, state: &ValidationState) -> bool {
     non_flag_path_args(segment)
         .iter()
@@ -4269,15 +4508,24 @@ const TAR_BENIGN_LONG_OPTIONS: &[&str] = &["--checkpoint"];
 /// This is the **whitelist** for [`is_tar_mutating`]'s negative detection
 /// strategy. Add new safe/list-only operations (e.g. `--diff`/`--compare`)
 /// here rather than adding blacklist checks to [`is_tar_mutating`].
-fn is_tar_list_only(command: &str) -> bool {
+fn is_tar_list_only(command: &str, state: &ValidationState) -> bool {
     let parts: Vec<&str> = scan::split_words_keeping_substitutions(command);
     // Locate the tar verb first: the first word whose shell-delivered form is
-    // `tar` or ends with `/tar`. The segment may carry `env`/`sudo`/assignment
+    // `tar` or ends with `/tar`, or — on cmd.exe, which dispatches by name
+    // without the executable extension — a spelling the Windows layer's verb key
+    // reads as `tar` (`TAR.EXE`, `tar.bat`); on unix those are the spellings
+    // above, and the unix tables stay case-sensitive. A drive-letter spelling
+    // (`C:\…\TAR.EXE`) is the shell-delivered form's own casualty — the bash
+    // parse drops the backslashes — so no tar verb is found and the list-mode
+    // check refuses fail-closed. The segment may carry `env`/`sudo`/assignment
     // prefixes (FlagCheck predicates receive the full segment), so the verb is
     // not necessarily the first part.
     let Some(verb_idx) = parts.iter().position(|w| {
         let p = shell_word(w);
-        p == "tar" || p.ends_with("/tar")
+        p == "tar"
+            || p.ends_with("/tar")
+            || (state.ctx.platform == ShellPlatform::Windows
+                && windows::verb_key(&p).is_some_and(|key| key == "tar"))
     }) else {
         return false; // no tar verb found — reject (conservative)
     };
@@ -4377,8 +4625,8 @@ fn is_tar_list_only(command: &str) -> bool {
 ///     [`is_tar_list_only`] to whitelist them.
 /// *   Do **not** add positive blacklist checks to this function — they
 ///     would be dead code, masked by the fallback.
-fn is_tar_mutating(command: &str, _state: &ValidationState) -> bool {
-    !is_tar_list_only(command)
+fn is_tar_mutating(command: &str, state: &ValidationState) -> bool {
+    !is_tar_list_only(command, state)
 }
 
 /// Check if `base64` writes output outside temp (see [`has_output_mutation`]).
@@ -4756,7 +5004,7 @@ fn check_git_output_flag(trimmed: &str, subcommand: &str) -> Result<(), String> 
         return reject(
             trimmed,
             "`--output` is not allowed in read-only mode — it writes the git output to a file.",
-            "drop the flag; use a shell redirect like `git diff > /tmp/out` to save output to the OS temp directory.",
+            "drop the flag; to capture the output, redirect it to a file under the daemon temp root (`git diff > <temp>/out`).",
         );
     }
     Ok(())
@@ -5078,6 +5326,12 @@ mod tests {
     /// resolve against this root and are therefore rejected as workspace
     /// writes, matching production semantics where the workspace lives outside
     /// the OS temp dirs.
+    ///
+    /// Pinned to [`ShellPlatform::Unix`]: these are the unix verdicts, and the
+    /// host platform must never decide what they assert. The roots and
+    /// variables stay host-derived on purpose, so the battery targets the unix
+    /// hosts it is written for — a Windows lane pins its own unix expectations
+    /// instead of reading this fixture as host-independent.
     fn test_ctx() -> CheckContext {
         CheckContext {
             workspace_root: std::path::PathBuf::from("/__mahbot_readonly_test_ws__"),
@@ -5085,6 +5339,7 @@ mod tests {
             // Match the session shell env — the same single source the
             // production context uses.
             temp_vars: crate::temp::shell_temp_vars(),
+            platform: ShellPlatform::Unix,
         }
     }
 
@@ -7809,6 +8064,18 @@ mod tests {
         assert!(
             err.contains("$(mktemp -d)"),
             "temp-mutator denial should teach the variable spelling: {err}"
+        );
+        // A literal path refusal names the temp route as well, not only how to
+        // inspect instead — on both mutator rows that hold a temp grant.
+        let err = check_command("rm /__mahbot_readonly_test_ws__/x", &ctx).unwrap_err();
+        assert!(
+            err.contains("use a path under `/tmp`"),
+            "temp-mutator denial should name the temp location: {err}"
+        );
+        let err = check_command("touch /__mahbot_readonly_test_ws__/x", &ctx).unwrap_err();
+        assert!(
+            err.contains("use a path under `/tmp`"),
+            "scratch-mutator denial should name the temp location: {err}"
         );
     }
 

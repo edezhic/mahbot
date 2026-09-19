@@ -176,7 +176,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// PGID from `sh`, preventing orphaned CPU-consuming process trees when a
 /// shell command times out.
 fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::Command {
-    // Platform-specific shell selection and arguments.
+    // The spawn side of `readonly::SHELL_PLATFORM`; the two must not drift.
     #[cfg(not(target_os = "windows"))]
     let mut process = {
         let mut p = tokio::process::Command::new("sh");
@@ -1575,14 +1575,25 @@ fn inherited_env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// The read-only banner with the daemon's temp root substituted in — the one
-/// spelling of the temp location that resolves the same way in every shell (a
-/// literal path; the platform's temp variables are the shells' own interface,
-/// not something the guard's lexical model can resolve).
+/// The read-only banner: the shared skeleton with the daemon's temp root and the
+/// session platform's check bullets substituted in. A literal path is the one
+/// spelling every shell resolves the same way, so the skeleton carries it; the
+/// platform's own tools and temp variables are named only in the selected
+/// fragment, since one shared file would push one platform's spellings at the
+/// other's sessions (the same reason `crate::temp`'s temp-cleanup renderer
+/// selects its tool block).
 fn render_readonly_banner() -> String {
+    let platform_checks = crate::prompt::load_prompt(if cfg!(windows) {
+        "tool/shell_readonly_banner_windows.md"
+    } else {
+        "tool/shell_readonly_banner_unix.md"
+    });
     crate::prompt::substitute(
         &crate::prompt::load_prompt("tool/shell_readonly_banner.md"),
-        &[("{{temp_root}}", &crate::temp::shell_tmpdir())],
+        &[
+            ("{{temp_root}}", &crate::temp::shell_tmpdir()),
+            ("{{platform_checks}}", platform_checks.trim_end()),
+        ],
     )
 }
 
@@ -5246,5 +5257,33 @@ mod tests {
                 eq: Some("API_KEY=abcd*[REDACTED]"),
             },
         ]);
+    }
+
+    /// Both platform fragments of the read-only banner must be embedded, and
+    /// must carry no placeholder of their own: `substitute` does not rescan a
+    /// replacement value. The shared skeleton must keep exactly the two keys the
+    /// renderer supplies — a stray one would render literally into every agent's
+    /// banner. The renderer picks the fragment with `cfg!`, so a typo in the
+    /// Windows key would otherwise panic on a Windows host only.
+    #[test]
+    fn read_only_banner_assets_are_embedded() {
+        let shared = crate::prompt::load_prompt("tool/shell_readonly_banner.md");
+        for key in ["{{temp_root}}", "{{platform_checks}}"] {
+            assert!(shared.contains(key), "the shared banner lost {key}");
+        }
+        let rest = shared
+            .replace("{{temp_root}}", "")
+            .replace("{{platform_checks}}", "");
+        assert!(
+            !rest.contains("{{"),
+            "the shared banner carries an unrendered key"
+        );
+        for asset in [
+            "tool/shell_readonly_banner_unix.md",
+            "tool/shell_readonly_banner_windows.md",
+        ] {
+            let text = crate::prompt::load_prompt(asset);
+            assert!(!text.contains("{{"), "{asset} carries a placeholder");
+        }
     }
 }

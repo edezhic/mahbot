@@ -17,7 +17,9 @@ done.
 
 A Windows temp area has no sockets, FIFOs or devices — the only by-type nodes
 to watch for are links and reparse points. A removal always names a
-fully-qualified path, never a wildcard sweep.
+fully-qualified path, never a wildcard sweep, and a path that carries a space is
+double-quoted (`del /f /q "C:\Users\…\Temp\mahbot\junk.txt"`) — the read-only
+guard refuses an unquoted operand, which cmd.exe would hand over in pieces.
 
 **Accepted approximation of the "leave the whole tree" rule.** There is no
 shipped pre-flight probe for "is anything in this tree open", so on Windows the

@@ -67,11 +67,11 @@
 //!
 //! Deletion is never this module's business: the cleaner removes with the
 //! read-only shell, so that shell is the only permission involved — this module
-//! adds no private deletion path and weakens no guard. On unix the guard gates
-//! the removal verbs (`rm`/`rmdir`) on the accepted temp roots. Its verb lists
-//! are unix-shaped, so on Windows the `del`/`rd` the tool block names are not
-//! gated there at all: the task rule is what keeps the cleaner inside the scan
-//! roots on that platform, and the guard owns its own verb model.
+//! adds no private deletion path and weakens no guard. The guard gates the
+//! removal verbs on the accepted temp roots on every platform: `rm`/`rmdir`
+//! through its unix rules, and the `del`/`rd` the Windows tool block names
+//! through its Windows layer (`tools::shell::readonly::windows`), which grants
+//! the same temp-scoped deletion and nothing outside it.
 //!
 //! Accepted limits, stated rather than assumed:
 //! - junk an older build's hard-coded shell temp variable left in the
