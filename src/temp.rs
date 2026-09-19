@@ -1,13 +1,15 @@
-//! Daemon temp lifecycle: one private `/tmp/mahbot` root for ALL daemon temp
-//! artifacts, plus the periodic temp cleaner that reclaims abandoned
-//! agent artifacts from the common OS temp folder.
+//! Daemon temp lifecycle: one private temp root for ALL daemon temp artifacts,
+//! plus the periodic temp cleaner that reclaims abandoned agent artifacts from
+//! the common OS temp folder.
 //!
 //! ## One root
 //!
-//! The daemon creates a single private root under `/tmp` (`/tmp/mahbot`,
-//! mode 0700) with exclusive-create + ownership/mode verification, and fails
-//! loudly on a squatted path. It then pins its own `TMPDIR` to that root at
-//! the very start of startup (before config and any temp use), so every
+//! The daemon creates a single private root — `/tmp/mahbot` (mode 0700) on
+//! unix, `<user temp>\mahbot` on Windows — with exclusive-create plus
+//! ownership/type verification, and fails loudly on a squatted path. It then
+//! pins its own temp environment to that root at the very start of startup
+//! (before config and any temp use) — every name in [`TEMP_ENV_VARS`], i.e.
+//! `TMPDIR` on unix and `TMP`/`TEMP` on Windows — so every
 //! `std::env::temp_dir()`-based consumer relocates automatically: shell spill
 //! files, research run folders, background-mode output, voice/telegram temp.
 //! The root is simply recreated/re-verified on every boot.
@@ -17,25 +19,75 @@
 //! below, by the OS's own temp sweep, and by each run's completion flow (see
 //! [`crate::research_cleanup`]).
 //!
-//! The path is fixed (no per-user `-{uid}` suffix): this is a single-user
+//! The unix path is fixed (no per-user `-{uid}` suffix): this is a single-user
 //! deployment, and the suffix was superfluous. The accepted multi-user
 //! consequence: with a shared fixed path, a second OS user's daemon fails
 //! loudly at boot via the ownership check below. Old suffixed leftovers
 //! (`/tmp/mahbot-<uid>`) are reclaimed by the periodic temp cleaner like any
 //! other old agent artifact.
 //!
-//! Shell children get `TMPDIR` set to the same root (see
-//! [`crate::tools::shell::shell_tmpdir`]).
+//! ### "Restricted to the user" is inherited on Windows
+//!
+//! The Windows root sits inside whatever the platform's temp lookup resolves to
+//! (`%TMP%`, `%TEMP%`, the user profile, the standard library's machine-wide
+//! last resort), so it inherits that directory's DACL: the DACL itself is never
+//! inspected, and inheriting it is the accepted approximation of unix's explicit
+//! 0700. Accepted rather than handled: a redirected-but-valid temp location is
+//! used silently (the daemon cannot tell it apart from a legitimate one), and a
+//! broken or unreachable one makes the daemon refuse to start loudly (the create
+//! or the reuse verification fails there, exactly like a unix root that is not
+//! ours). The platform's lookup is infallible by signature, so a machine where
+//! it cannot answer at all is either caught by the absolute-path check below (an
+//! empty result) or aborts inside the standard library — not a recorded startup
+//! failure.
+//!
+//! Known deviation from "per-user", stated rather than assumed: a SYSTEM-account
+//! launch resolves the machine-wide `C:\Windows\Temp` and creates
+//! `C:\Windows\Temp\mahbot` there. Such a launch is not refused — unix does not
+//! refuse root either, and a service deployment has to keep booting — so under
+//! SYSTEM the root is only as private as the directory it sits in.
+//!
+//! [`TEMP_ENV_VARS`] is the single source for the temp variable *names*, and
+//! the pinned root ([`shell_tmpdir`]) for their value — both packaged as
+//! [`shell_temp_vars`], which is what the daemon's own pin, the temp entries of
+//! the environment shell children receive ([`crate::tools::shell`]) and the
+//! read-only guard's temp model all take from, so a name or a value cannot reach
+//! one of them and miss another. The cleaner's roots are the same pinned root
+//! plus [`legacy_temp_dir`], so they cannot disagree about the location either.
 //!
 //! ## Periodic cleaner (Sanitation role)
 //!
 //! A Sanitation-role agent ([`run_temp_cleanup_loop`]) keeps the common OS temp
-//! area bounded. Its judgement and its scan roots live in its task prompt
-//! (`src/prompt/sanitation/temp_cleanup.md`): there are no programmatic
-//! exclusions and no shell-guard changes — the read-only shell's existing
-//! TEMP_MUTATORS gate on temp roots is what permits deletion at all. This
-//! module owns only WHEN the cleaner runs; the cadence rules are documented on
-//! the constants and helpers below.
+//! area bounded. Its judgement lives in its task prompt
+//! (`src/prompt/sanitation/temp_cleanup.md`, parameterised with
+//! `sanitation/temp_cleanup_tools_{unix,windows}.md`) and the roots it may act
+//! in are [`cleanup_scan_roots`]. This module owns only WHEN the cleaner runs
+//! and WHICH roots it is given; the cadence rules are documented on the
+//! constants and helpers below.
+//!
+//! Deletion is never this module's business: the cleaner removes with the
+//! read-only shell, so that shell is the only permission involved — this module
+//! adds no private deletion path and weakens no guard. On unix the guard gates
+//! the removal verbs (`rm`/`rmdir`) on the accepted temp roots. Its verb lists
+//! are unix-shaped, so on Windows the `del`/`rd` the tool block names are not
+//! gated there at all: the task rule is what keeps the cleaner inside the scan
+//! roots on that platform, and the guard owns its own verb model.
+//!
+//! Accepted limits, stated rather than assumed:
+//! - junk an older build's hard-coded shell temp variable left in the
+//!   machine-wide system temp directory is not reclaimed: that directory is
+//!   never a scan root, because it belongs to every user on the machine;
+//! - the free-space reading becomes live on Windows for the first time — the
+//!   store-shrinking gate can now skip a TRUNCATE checkpoint on a nearly full
+//!   disk, and this cadence can reach its daily mode, which dispatches a run.
+//!   The thresholds mix an absolute floor with a share of the volume, so a
+//!   caller whose available space is capped below that floor (a small per-user
+//!   quota) stays in daily mode and keeps dispatching — accepted, since the
+//!   schedule and its hysteresis are fixed by policy;
+//! - real free-space values, the directory the children receive, reparse-point
+//!   refusal and the deletion of a file another process holds open are
+//!   Windows-runtime behaviour with no host-side oracle; the host exercises the
+//!   scan-root selection, the dispatch gate and the private root's verification.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -47,132 +99,540 @@ use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::FutureExt;
 
+// ── Private temp root ─────────────────────────────────────────────────────
+
 /// The pinned private temp root, set once by [`init_temp_root`].
 static TEMP_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
-/// The pre-pin OS temp dir (e.g. `/var/folders/.../T` on macOS). Captured
-/// before the `TMPDIR` pin so the readonly guard keeps it as an allowed root
-/// (bare macOS `mktemp` ignores `TMPDIR` and lands there).
+/// The pre-pin OS temp dir (the darwin user temp dir on macOS, the user's own
+/// temp directory on Windows). Captured before the env pin so the readonly
+/// guard and the cleaner keep it as a root of their own: bare macOS `mktemp`
+/// ignores `TMPDIR` and lands there, and the cleaner's scan roots include the
+/// user's temp area on every platform.
 static LEGACY_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// The pinned root path, if [`init_temp_root`] ran (production unix startup).
+/// The temp environment variable names this platform uses, in precedence
+/// order. The module-internal source of [`shell_temp_vars`], which is how the
+/// daemon's own pin, the environment handed to shell children and the read-only
+/// guard's temp model all get their names. Keyed on `windows` rather than `unix`
+/// (the axis the root derivation below uses): the per-user-temp story is the
+/// Windows one, so any other target keeps the historical `TMPDIR`.
+#[cfg(windows)]
+const TEMP_ENV_VARS: &[&str] = &["TMP", "TEMP"];
+#[cfg(not(windows))]
+const TEMP_ENV_VARS: &[&str] = &["TMPDIR"];
+
+/// The pinned root path, if [`init_temp_root`] ran.
 #[must_use]
 fn temp_root() -> Option<&'static Path> {
     TEMP_ROOT.get().map(PathBuf::as_path)
 }
 
-/// The pre-pin OS temp dir (the legacy darwin dir on macOS), if captured.
+/// The pre-pin OS temp dir on EVERY platform — the darwin user temp dir
+/// (`/var/folders/.../T`) that bare `mktemp` uses on macOS, the user's own temp
+/// directory on Windows — if captured.
 #[must_use]
 pub(crate) fn legacy_temp_dir() -> Option<&'static Path> {
     LEGACY_TEMP_DIR.get().map(PathBuf::as_path)
 }
 
-/// Initialize the private temp root and pin `TMPDIR` to it.
+/// The temp value handed to shell children and to the read-only guard: the
+/// pinned private root when available, otherwise the platform's own temp
+/// location.
+#[must_use]
+pub(crate) fn shell_tmpdir() -> String {
+    temp_root().map_or_else(temp_baseline, |p| p.to_string_lossy().into_owned())
+}
+
+/// [`shell_tmpdir`]'s fallback when no private root is pinned: the historical
+/// `"/tmp"` baseline, which is where a unix consumer that ignores `TMPDIR`
+/// lands anyway.
+#[cfg(unix)]
+fn temp_baseline() -> String {
+    "/tmp".to_string()
+}
+
+/// [`shell_tmpdir`]'s fallback when no private root is pinned: the platform's
+/// own temp location.
+#[cfg(not(unix))]
+fn temp_baseline() -> String {
+    std::env::temp_dir().to_string_lossy().into_owned()
+}
+
+/// The temp variables handed to shell children and modelled by the read-only
+/// guard: every name in [`TEMP_ENV_VARS`] bound to [`shell_tmpdir`], so the
+/// environment, the guard and the cleaner's own root cannot drift apart.
+#[must_use]
+pub(crate) fn shell_temp_vars() -> Vec<(String, String)> {
+    let value = shell_tmpdir();
+    TEMP_ENV_VARS
+        .iter()
+        .map(|name| ((*name).to_string(), value.clone()))
+        .collect()
+}
+
+/// Initialize the private temp root and pin the platform's temp environment to
+/// it.
 ///
 /// Must run at the very start of startup, BEFORE config and any temp use, and
 /// AFTER the debug/`__grep-engine` subcommand dispatches (those must not
-/// create the root). Unix-only: `/tmp/mahbot` is meaningless on Windows,
-/// where the shell env uses `TEMP`/`TMP` instead.
+/// create the root). Cross-platform: `/tmp/mahbot` on unix, `<user temp>\mahbot`
+/// on Windows.
 ///
 /// Failure modes (fail loudly, never paper over):
+/// - the OS temp dir the Windows root is derived from is not an absolute path;
 /// - the root exists but is not a directory;
-/// - the root exists and is owned by a different uid (squatting — with the
-///   fixed shared path this is also the second-OS-user guard: their daemon
-///   fails loudly here, the accepted multi-user consequence);
+/// - the root exists as a link or reparse point;
+/// - the root exists and is not ours (squatting — with the fixed shared unix
+///   path this is also the second-OS-user guard: their daemon fails loudly
+///   here, the accepted multi-user consequence);
 /// - the root's mode has group/other bits AND re-chmod fails — a loose mode on
-///   OUR OWN path (uid verified) is self-healed to 0700 (a previous boot's
-///   create-time chmod can fail on a race with the umask; bricking startup
-///   forever over that would be worse).
-#[cfg(unix)]
+///   OUR OWN path (ownership verified) is self-healed to 0700 (a previous
+///   boot's create-time chmod can fail on a race with the umask; bricking
+///   startup forever over that would be worse).
 pub fn init_temp_root() -> anyhow::Result<()> {
-    // Capture the legacy temp dir BEFORE the pin — on macOS this is the
-    // darwin user temp dir (`/var/folders/.../T`) that bare `mktemp` uses.
     let legacy = std::env::temp_dir();
-    let uid = unsafe { libc::geteuid() };
-    // Fixed shared path (no `-{uid}` suffix): single-user deployment; the
-    // ownership check below is what makes the shared path safe — a second OS
-    // user's daemon fails loudly at boot instead of sharing the root.
+    // The unix root is the fixed shared `/tmp/mahbot` — no `-{uid}` suffix, this
+    // is a single-user deployment, and the ownership check in
+    // `verify_private_root` is what makes a shared path safe (a second OS user's
+    // daemon fails loudly at boot instead of sharing the root). The OS temp dir
+    // does not move it: it stays only a scan root and an allowlist entry, so a
+    // relative `TMPDIR` is harmless here. Off unix the root IS derived from that
+    // dir, which is why the derivation refuses a relative one.
+    #[cfg(unix)]
     let root = PathBuf::from("/tmp/mahbot");
+    #[cfg(not(unix))]
+    let root = private_temp_root(&legacy)?;
 
-    // Exclusive create with explicit mode 0700. `create_dir` fails when the
-    // path already exists (exclusive semantics); the mode is applied
-    // explicitly because `create_dir` honors the process umask.
+    // Exclusive create (`create_dir` fails when the path already exists, which
+    // is also how reuse is detected). The restriction is applied explicitly on
+    // unix because `create_dir` honors the process umask; on Windows the root
+    // inherits the DACL of the per-user temp directory it is created in (the
+    // accepted approximation of 0700 — see the module doc).
     match std::fs::create_dir(&root) {
         Ok(()) => {
-            std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-                .map_err(|e| {
-                    anyhow::anyhow!("temp root {}: chmod 0700 failed: {e}", root.display())
-                })?;
+            #[cfg(unix)]
+            restrict_private_root(&root)?;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Reuse after verification: ownership + mode + dir-ness.
-            use std::os::unix::fs::MetadataExt;
-            let meta = std::fs::symlink_metadata(&root)
-                .map_err(|e| anyhow::anyhow!("temp root {}: stat failed: {e}", root.display()))?;
-            if !meta.is_dir() {
-                anyhow::bail!(
-                    "temp root {} exists and is not a directory — refusing to use it",
-                    root.display()
-                );
-            }
-            if meta.uid() != uid {
-                anyhow::bail!(
-                    "temp root {} is owned by uid {} (expected {uid}) — refusing a squatted path",
-                    root.display(),
-                    meta.uid()
-                );
-            }
-            let mode = meta.mode() & 0o777;
-            if mode & 0o077 != 0 {
-                // Self-heal: a loose mode on OUR OWN path is a previous
-                // boot's create-time chmod failure (umask raced it), NOT a
-                // squatter — the uid check above already proved ownership.
-                // Re-chmod 0700 instead of bricking startup forever.
-                std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "temp root {} has group/other permissions (mode {mode:o}) and re-chmod 0700 failed: {e}",
-                            root.display()
-                        )
-                    })?;
-                tracing::warn!(
-                    root = %root.display(),
-                    mode = format_args!("{mode:o}"),
-                    "Temp root had loose permissions — re-chmod 0700 (self-heal, path owned by self)"
-                );
-            }
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => verify_private_root(&root)?,
         Err(e) => anyhow::bail!("temp root {}: create failed: {e}", root.display()),
     }
 
     let _ = TEMP_ROOT.set(root.clone());
     let _ = LEGACY_TEMP_DIR.set(legacy);
 
-    // Pin TMPDIR before any temp use. SAFETY: single-threaded startup (before
-    // the tokio runtime / iced), no concurrent env access.
-    unsafe { std::env::set_var("TMPDIR", &root) };
+    // Pin the temp environment before any temp use, from the SAME pair the shell
+    // children and the read-only guard are handed ([`shell_temp_vars`]): one
+    // function is what makes the pin, the children and the guard agree by
+    // construction instead of by inspection. SAFETY: single-threaded startup
+    // (before the tokio runtime / iced), no concurrent env access.
+    unsafe {
+        for (name, value) in shell_temp_vars() {
+            std::env::set_var(name, value);
+        }
+    }
     tracing::info!(root = %root.display(), "Pinned daemon temp root");
     Ok(())
 }
 
-/// No-op on non-unix (the shell env there uses `TEMP`/`TMP`, not `TMPDIR`).
+/// The private root off unix: the platform's temp location joined with `mahbot`
+/// — on a normal Windows machine that is the calling user's own temp directory,
+/// hence user-only through the DACL it inherits (see the module doc for what
+/// that does and does not cover). Never the machine-wide `C:\Windows\Temp` and
+/// never under the daemon's storage root, which the cleaner must never scan —
+/// except under the SYSTEM account, whose own temp lookup is machine-wide (the
+/// stated deviation in the module doc). The OS temp dir must be absolute:
+/// joining `mahbot` onto a relative one would derive the root from the process's
+/// cwd.
 #[cfg(not(unix))]
-pub fn init_temp_root() -> anyhow::Result<()> {
+fn private_temp_root(legacy: &Path) -> Result<PathBuf> {
+    anyhow::ensure!(
+        legacy.is_absolute(),
+        "OS temp dir {} is not an absolute path — refusing to derive the private temp root from it",
+        legacy.display()
+    );
+    Ok(legacy.join("mahbot"))
+}
+
+/// Restrict a freshly created private root to its owner. Unix only: the Windows
+/// root inherits the DACL of the per-user temp directory it is created in (the
+/// accepted approximation — see the module doc).
+#[cfg(unix)]
+fn restrict_private_root(root: &Path) -> Result<()> {
+    std::fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .map_err(|e| anyhow::anyhow!("temp root {}: chmod 0700 failed: {e}", root.display()))
+}
+
+/// Verify a root that already exists (reuse after a previous boot): a real
+/// directory, not a link/reparse point, owned by us — with unix's loose mode
+/// self-healed on our own path.
+fn verify_private_root(root: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(root)
+        .map_err(|e| anyhow::anyhow!("temp root {}: stat failed: {e}", root.display()))?;
+    // Link check first: on unix `symlink_metadata` never reports a symlink as a
+    // directory either, but naming the link is the more precise refusal.
+    if is_link_like(&meta) {
+        anyhow::bail!(
+            "temp root {} is a link or reparse point — refusing to use it",
+            root.display()
+        );
+    }
+    if !meta.is_dir() {
+        anyhow::bail!(
+            "temp root {} exists and is not a directory — refusing to use it",
+            root.display()
+        );
+    }
+    anyhow::ensure!(
+        is_owned_by_current_user(root)?,
+        "temp root {} is not owned by the current user — refusing a squatted path",
+        root.display()
+    );
+    // Off unix the restriction is the inherited DACL, so there is no mode to
+    // heal; a loose mode there is simply not a thing this check can see.
+    #[cfg(unix)]
+    self_heal_loose_mode(root, &meta)?;
     Ok(())
 }
 
-/// The `TMPDIR` value for shell children: the pinned root when available,
-/// otherwise the historical `"/tmp"` baseline (tests / non-unix).
+/// Whether `meta` describes a link: a symlink on unix, a reparse point on
+/// Windows. The Windows arm reads the RAW attribute because a name-surrogate
+/// check (symlink-only) would let a junction through — and a junction into
+/// someone else's directory would move every constraint here onto that
+/// directory.
+#[cfg(windows)]
 #[must_use]
-pub(crate) fn shell_tmpdir() -> String {
-    temp_root().map_or_else(|| "/tmp".to_string(), |p| p.to_string_lossy().into_owned())
+fn is_link_like(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    let reparse_point = windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    meta.file_attributes() & reparse_point != 0
+}
+
+/// Whether `meta` describes a link: a symlink on unix, a reparse point on
+/// Windows.
+#[cfg(not(windows))]
+#[must_use]
+fn is_link_like(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
+}
+
+/// Whether `root` belongs to the current effective user (the uid check that
+/// makes the shared unix path safe).
+#[cfg(unix)]
+fn is_owned_by_current_user(root: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::symlink_metadata(root)
+        .map_err(|e| anyhow::anyhow!("temp root {}: stat failed: {e}", root.display()))?;
+    Ok(meta.uid() == unsafe { libc::geteuid() })
+}
+
+/// Whether `root` belongs to the current user: the file's owner SID must match
+/// the process token's user SID, or the token's default-owner SID — an ELEVATED
+/// process stamps its default owner (`BUILTIN\Administrators`) on every object
+/// it creates, so without that second comparison the daemon would refuse the
+/// root it created itself on the boot after an elevated first run.
+///
+/// Accepted limit: those two SIDs are the *elevated* token's own. A root first
+/// created by an elevated run is therefore owned by `BUILTIN\Administrators`,
+/// and a later non-elevated run (whose user and default-owner SIDs are both the
+/// plain user) matches neither — it refuses loudly and needs `<temp>\mahbot`
+/// removed by hand before the daemon can boot again.
+#[cfg(windows)]
+fn is_owned_by_current_user(root: &Path) -> Result<bool> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{TokenOwner, TokenUser};
+
+    let owner = file_owner_sid(root)?;
+    let token = open_process_token()?;
+    let user = token_sid(token, TokenUser);
+    let default_owner = token_sid(token, TokenOwner);
+    // SAFETY: `token` is the handle `open_process_token` produced and both SID
+    // byte vectors were already copied out of it.
+    unsafe { CloseHandle(token) };
+    if owner == user? {
+        return Ok(true);
+    }
+    Ok(default_owner.is_ok_and(|sid| sid == owner))
+}
+
+/// The current process's access token, opened for querying only.
+#[cfg(windows)]
+fn open_process_token() -> Result<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // A null handle: `HANDLE` is a plain integer in `windows_sys`.
+    let mut token: HANDLE = 0;
+    // SAFETY: `GetCurrentProcess` is a pseudo-handle (no close needed) and
+    // `token` is a distinct local written only by the call.
+    let opened = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY,
+            std::ptr::addr_of_mut!(token),
+        )
+    };
+    if opened == 0 {
+        return Err(anyhow::anyhow!(
+            "OpenProcessToken failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(token)
+}
+
+/// The SID bytes of a token's `TokenUser`/`TokenOwner` information class,
+/// copied out of a two-pass `GetTokenInformation` buffer.
+#[cfg(windows)]
+fn token_sid(token: windows_sys::Win32::Foundation::HANDLE, class: i32) -> Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::PSID;
+    use windows_sys::Win32::Security::GetTokenInformation;
+
+    let mut len = 0_u32;
+    // First pass: the call is expected to fail with ERROR_INSUFFICIENT_BUFFER,
+    // so its return value is only informational — `len` is what is used.
+    // SAFETY: a null buffer with length 0 is the documented size query.
+    unsafe {
+        GetTokenInformation(
+            token,
+            class,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::addr_of_mut!(len),
+        );
+    }
+    if len == 0 {
+        return Err(anyhow::anyhow!(
+            "GetTokenInformation({class}) size query failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut buf = vec![0_u8; len as usize];
+    // SAFETY: `buf` is a valid writable allocation of the length just reported.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            class,
+            buf.as_mut_ptr().cast(),
+            len,
+            std::ptr::addr_of_mut!(len),
+        )
+    };
+    if ok == 0 {
+        return Err(anyhow::anyhow!(
+            "GetTokenInformation({class}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: both `TokenUser` (`TOKEN_USER`) and `TokenOwner` (`TOKEN_OWNER`)
+    // report a structure whose only leading member is the SID pointer, so the
+    // buffer's first word is it. It is read unaligned because the byte buffer
+    // carries no alignment guarantee, and the SID it points at lives inside
+    // `buf`, which outlives the copy.
+    let sid = unsafe { buf.as_ptr().cast::<PSID>().read_unaligned() };
+    copy_sid(sid)
+}
+
+/// The owning SID of `root`, copied out of the file's security descriptor.
+#[cfg(windows)]
+fn file_owner_sid(root: &Path) -> Result<Vec<u8>> {
+    use windows_sys::Win32::Security::{
+        GetFileSecurityW, GetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION,
+    };
+
+    let Some(mut wide) = crate::util::wide_path(root) else {
+        anyhow::bail!(
+            "temp root {}: path contains an interior NUL",
+            root.display()
+        );
+    };
+    wide.push(0);
+    let mut needed = 0_u32;
+    // First pass: expected to fail with ERROR_INSUFFICIENT_BUFFER, only `needed`
+    // is used. SAFETY: a null descriptor with length 0 is the documented size
+    // query.
+    unsafe {
+        GetFileSecurityW(
+            wide.as_ptr(),
+            OWNER_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::addr_of_mut!(needed),
+        );
+    }
+    if needed == 0 {
+        return Err(anyhow::anyhow!(
+            "GetFileSecurityW({}) size query failed: {}",
+            root.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // u64 units so the descriptor is naturally aligned for the API.
+    let mut descriptor = vec![0_u64; needed.div_ceil(8) as usize];
+    // SAFETY: `descriptor` is a writable allocation of at least `needed` bytes.
+    let ok = unsafe {
+        GetFileSecurityW(
+            wide.as_ptr(),
+            OWNER_SECURITY_INFORMATION,
+            descriptor.as_mut_ptr().cast(),
+            needed,
+            std::ptr::addr_of_mut!(needed),
+        )
+    };
+    if ok == 0 {
+        return Err(anyhow::anyhow!(
+            "GetFileSecurityW({}) failed: {}",
+            root.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut owner = std::ptr::null_mut();
+    let mut defaulted = 0;
+    // SAFETY: `descriptor` holds the descriptor the call above wrote; `owner`
+    // receives a pointer INTO it, so the SID is copied out below while it is
+    // still alive.
+    let ok = unsafe {
+        GetSecurityDescriptorOwner(
+            descriptor.as_mut_ptr().cast(),
+            std::ptr::addr_of_mut!(owner),
+            std::ptr::addr_of_mut!(defaulted),
+        )
+    };
+    if ok == 0 {
+        return Err(anyhow::anyhow!(
+            "GetSecurityDescriptorOwner({}) failed: {}",
+            root.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    copy_sid(owner)
+}
+
+/// Copy a SID's bytes out of the structure that owns them.
+#[cfg(windows)]
+fn copy_sid(sid: windows_sys::Win32::Foundation::PSID) -> Result<Vec<u8>> {
+    use windows_sys::Win32::Security::GetLengthSid;
+
+    if sid.is_null() {
+        anyhow::bail!("security descriptor reports no owner SID");
+    }
+    // SAFETY: `sid` points at a valid SID owned by a buffer that outlives this
+    // call.
+    let len = unsafe { GetLengthSid(sid) };
+    if len == 0 {
+        return Err(anyhow::anyhow!(
+            "GetLengthSid failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `GetLengthSid` reports the SID's byte length and the SID is not
+    // mutated for the duration of the copy.
+    Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len as usize) }.to_vec())
+}
+
+/// The loose-mode self-heal (unix only): a loose mode on OUR OWN path is a
+/// previous boot's create-time chmod failure (the umask raced it), NOT a
+/// squatter — the ownership check already proved the path is ours. Re-chmod
+/// 0700 instead of bricking startup forever.
+#[cfg(unix)]
+fn self_heal_loose_mode(root: &Path, meta: &std::fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "temp root {} has group/other permissions (mode {mode:o}) and re-chmod 0700 failed: {e}",
+                    root.display()
+                )
+            })?;
+        tracing::warn!(
+            root = %root.display(),
+            mode = format_args!("{mode:o}"),
+            "Temp root had loose permissions — re-chmod 0700 (self-heal, path owned by self)"
+        );
+    }
+    Ok(())
+}
+
+// ── Cleaner scan roots ────────────────────────────────────────────────────
+
+/// One root the periodic temp cleaner may act in.
+struct CleanupRoot {
+    path: PathBuf,
+    /// The daemon's own private temp root, as opposed to the user's temp area.
+    private: bool,
+}
+
+/// Select the scanner's roots: the platform's candidates in scan order — the
+/// pinned private root, the pre-pin OS temp dir, then (unix only) the literal
+/// `/tmp` and `/private/tmp`, the paths a command reaches without consulting the
+/// environment at all, which is exactly what a bare `mktemp` in a pipeline does
+/// — then resolve each one through [`cleanup_roots_from`].
+///
+/// This is also what the cleaner prompt is rendered from, so the prompt and the
+/// read-only guard cannot disagree about where the cleaner may act.
+#[must_use]
+fn cleanup_scan_roots() -> Vec<CleanupRoot> {
+    let mut roots = Vec::new();
+    if let Some(root) = temp_root() {
+        roots.push(CleanupRoot {
+            path: root.to_path_buf(),
+            private: true,
+        });
+    }
+    if let Some(legacy) = legacy_temp_dir() {
+        roots.push(CleanupRoot {
+            path: legacy.to_path_buf(),
+            private: false,
+        });
+    }
+    #[cfg(unix)]
+    roots.extend([
+        CleanupRoot {
+            path: PathBuf::from("/tmp"),
+            private: false,
+        },
+        CleanupRoot {
+            path: PathBuf::from("/private/tmp"),
+            private: false,
+        },
+    ]);
+    cleanup_roots_from(roots)
+}
+
+/// Resolve candidates into usable roots: a candidate that does not resolve to an
+/// existing directory is dropped, a resolved path keeps the plain spelling the
+/// cleaner's shell is given (see [`crate::util::strip_verbatim_prefix`]), and
+/// duplicates collapse keeping the FIRST occurrence — so the private flag of the
+/// earliest candidate wins and the scan order is preserved. An unresolvable
+/// candidate does not exist (or is unreachable): there is nothing there to scan.
+#[must_use]
+fn cleanup_roots_from(candidates: Vec<CleanupRoot>) -> Vec<CleanupRoot> {
+    let mut roots: Vec<CleanupRoot> = Vec::new();
+    for candidate in candidates {
+        let Ok(resolved) = std::fs::canonicalize(&candidate.path) else {
+            continue;
+        };
+        let path = crate::util::strip_verbatim_prefix(&resolved);
+        if !path.is_dir() || roots.iter().any(|root| root.path == path) {
+            continue;
+        }
+        roots.push(CleanupRoot {
+            path,
+            private: candidate.private,
+        });
+    }
+    roots
 }
 
 /// Where a BARE `mktemp -d` (no `-p`/template) actually lands on this
 /// platform. On macOS bare mktemp ignores `TMPDIR` and uses
 /// `_CS_DARWIN_USER_TEMP_DIR` (the legacy darwin dir); elsewhere mktemp
-/// honors `TMPDIR`. The readonly guard's synthetic mktemp anchor must match
-/// this, so `..` chains over it resolve like the real value.
+/// honors the platform's temp environment. The readonly guard's synthetic
+/// mktemp anchor must match this, so `..` chains over it resolve like the real
+/// value.
 #[must_use]
 pub(crate) fn bare_mktemp_landing_root() -> PathBuf {
     #[cfg(target_os = "macos")]
@@ -340,7 +800,9 @@ pub async fn run_temp_cleanup_loop() {
 async fn temp_cleanup_tick() {
     let store = crate::config_db::CONFIG_STORE.get();
     let current = stored_cleanup_mode(store).await;
-    let mode = match crate::util::disk::free_and_capacity(&std::env::temp_dir()) {
+    let mode = match crate::util::with_block_in_place(|| {
+        crate::util::disk::free_and_capacity(&std::env::temp_dir())
+    }) {
         Some((free, capacity)) => mode_after_free(current, free, capacity),
         None => current,
     };
@@ -375,7 +837,16 @@ async fn temp_cleanup_tick() {
     if !temp_cleanup_due(last_run, mode, Utc::now()) {
         return;
     }
-    if let Err(e) = dispatch_temp_cleanup().await {
+    // A tick with no target is skipped WITHOUT recording a run, so it does not
+    // burn a run on every tick and the next tick retries once a root appears.
+    // This is a skip inside the due decision — the cadence, its hysteresis and
+    // the retention policy are unchanged.
+    let roots = crate::util::with_block_in_place(cleanup_scan_roots);
+    if roots.is_empty() {
+        tracing::debug!("Temp cleaner has no existing scan root — skipping this pass");
+        return;
+    }
+    if let Err(e) = dispatch_temp_cleanup(&roots).await {
         tracing::warn!(error = %e, "Temp cleaner dispatch failed");
     }
 }
@@ -384,6 +855,45 @@ async fn temp_cleanup_tick() {
 
 /// Prompt asset for the periodic temp cleaner task.
 const TEMP_CLEANUP_PROMPT_KEY: &str = "sanitation/temp_cleanup.md";
+
+/// Render the cleaner's scan-root list: one numbered, fully-qualified path per
+/// line with a short role label. Sourced from the same values the dispatch and
+/// the read-only guard use, so the prompt cannot disagree with them.
+#[must_use]
+fn render_scan_roots(roots: &[CleanupRoot]) -> String {
+    roots
+        .iter()
+        .enumerate()
+        .map(|(idx, root)| {
+            let role = if root.private {
+                "the daemon's own private temp root"
+            } else {
+                "an OS temp area the daemon and its shells use"
+            };
+            format!("{}. `{}` — {role}", idx + 1, root.path.display())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The cleaner's task prompt: the shared procedure, with the platform's scan
+/// roots and tool spellings substituted in. Both tool blocks ship on every
+/// platform; only this one's is substituted.
+#[must_use]
+fn render_temp_cleanup_prompt(roots: &[CleanupRoot]) -> String {
+    let tools = crate::prompt::load_prompt(if cfg!(windows) {
+        "sanitation/temp_cleanup_tools_windows.md"
+    } else {
+        "sanitation/temp_cleanup_tools_unix.md"
+    });
+    crate::prompt::substitute(
+        &crate::prompt::load_prompt(TEMP_CLEANUP_PROMPT_KEY),
+        &[
+            ("{{scan_roots}}", &render_scan_roots(roots)),
+            ("{{platform_tools}}", tools.trim_end()),
+        ],
+    )
+}
 
 /// Synthetic workspace name for the cleaner. Never registered in the
 /// `workspaces` table — ephemeral, like research run roots. Explicit name: the
@@ -399,13 +909,16 @@ const TEMP_CLEANUP_WORKSPACE_NAME: &str = "tmp";
 /// leaves the cleanup due, retried on the next tick) in BOTH the persisted
 /// `config_kv` record and the in-memory mirror; the row is terminalized on
 /// every exit path (including a panic inside the agent).
-async fn dispatch_temp_cleanup() -> Result<()> {
+///
+/// The ephemeral workspace is built over `roots[0]` — the daemon's own private
+/// temp root whenever it exists — so the shell cwd always starts inside a root
+/// the cleaner may act in (the historical hard-coded `/tmp` is not the temp
+/// area at all on Windows). The tick never dispatches an empty `roots`.
+async fn dispatch_temp_cleanup(roots: &[CleanupRoot]) -> Result<()> {
     let conn = &crate::session::store().conn;
     let job_id = crate::generate_id();
-    // Ephemeral workspace over the common OS temp dir: the shell cwd lands
-    // under the scan roots and workspace-relative reads resolve there.
-    let ws = Workspace::ephemeral_run(TEMP_CLEANUP_WORKSPACE_NAME, Path::new("/tmp"));
-    let prompt = crate::prompt::load_prompt(TEMP_CLEANUP_PROMPT_KEY);
+    let ws = Workspace::ephemeral_run(TEMP_CLEANUP_WORKSPACE_NAME, &roots[0].path);
+    let prompt = render_temp_cleanup_prompt(roots);
 
     crate::jobs::spawn_job(
         conn,
@@ -498,15 +1011,143 @@ async fn run_temp_cleanup_and_finish(job_id: &str, ws: &Workspace, prompt: &str)
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn legacy_capture_and_pin_are_consistent() {
         // init_temp_root is a process-global singleton — not run in tests
-        // (it would pin TMPDIR for the whole test process). Just verify the
-        // accessors are coherent: unset → no root, no legacy.
+        // (it would pin the temp env for the whole test process). Just verify
+        // the accessors are coherent: unset → no root, no legacy.
         assert!(temp_root().is_none());
         assert!(legacy_temp_dir().is_none());
+        // Every name this platform uses carries the one shell value.
+        let vars = shell_temp_vars();
+        assert_eq!(vars.len(), TEMP_ENV_VARS.len());
+        assert!(vars.iter().all(|(_, value)| *value == shell_tmpdir()));
+        // The unix baseline is the historical literal, unchanged.
+        #[cfg(unix)]
         assert_eq!(shell_tmpdir(), "/tmp");
+    }
+
+    #[test]
+    fn verify_private_root_refuses_a_non_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("mahbot");
+        std::fs::write(&file, b"not a directory").expect("write file");
+
+        let err = verify_private_root(&file).expect_err("a regular file must be refused");
+        assert!(err.to_string().contains("not a directory"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_private_root_accepts_our_0700_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("mahbot");
+        std::fs::create_dir(&root).expect("create root");
+        std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("chmod");
+
+        verify_private_root(&root).expect("our own 0700 directory is reusable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_private_root_refuses_a_symlink() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).expect("create target");
+        let link = dir.path().join("mahbot");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        // Refused as a link: `symlink_metadata` never follows it, so the check
+        // sees the link itself and the daemon can never be moved out of the temp
+        // area by one. (A Windows junction IS a directory by attribute, which is
+        // why the reparse-point attribute is what the check reads there.)
+        let err = verify_private_root(&link).expect_err("a symlink must be refused");
+        assert!(err.to_string().contains("link or reparse point"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_private_root_self_heals_a_loose_mode() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("mahbot");
+        std::fs::create_dir(&root).expect("create root");
+        std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+
+        verify_private_root(&root).expect("a loose mode on our own path is self-healed");
+        let mode = std::fs::metadata(&root).expect("stat root").mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn prompt_renders_every_scan_root() {
+        // Only the rendering half is asserted here: every embedded asset being
+        // loadable and non-empty is already covered repo-wide (prompt.rs), and a
+        // missing asset panics in `load_prompt` anyway.
+        let roots = vec![
+            CleanupRoot {
+                path: PathBuf::from("/tmp/mahbot"),
+                private: true,
+            },
+            CleanupRoot {
+                path: PathBuf::from("/tmp"),
+                private: false,
+            },
+        ];
+        let prompt = render_temp_cleanup_prompt(&roots);
+        for root in &roots {
+            assert!(prompt.contains(&root.path.display().to_string()));
+        }
+        assert!(!prompt.contains("{{"), "unsubstituted placeholder remains");
+    }
+
+    #[test]
+    fn cleanup_roots_from_dedupes_and_drops_absent_candidates() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        // The same directory reached twice — once directly, once through a `.`
+        // detour — plus a path that does not exist at all.
+        let candidates = |private_first: bool| {
+            let direct = CleanupRoot {
+                path: root.clone(),
+                private: private_first,
+            };
+            let via_dot = CleanupRoot {
+                path: root.join("."),
+                private: !private_first,
+            };
+            let absent = CleanupRoot {
+                path: root.join("never-created"),
+                private: private_first,
+            };
+            cleanup_roots_from(vec![direct, via_dot, absent])
+        };
+
+        // Deduped to one root, resolved and in the plain spelling the cleaner's
+        // shell is handed (canonicalization on Windows yields the platform's
+        // verbatim prefix, which the root must not carry), and the FIRST
+        // occurrence's private flag wins.
+        let roots = candidates(true);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            roots[0].path,
+            crate::util::strip_verbatim_prefix(&std::fs::canonicalize(&root).expect("canonical"))
+        );
+        assert!(roots[0].private);
+        let roots = candidates(false);
+        assert_eq!(roots.len(), 1);
+        assert!(!roots[0].private);
+
+        // A candidates list holding only a never-created path resolves to an
+        // empty list — exactly the state in which a tick dispatches nothing.
+        let absent = std::env::temp_dir().join(format!("mahbot-absent-{}", crate::generate_id()));
+        let roots = cleanup_roots_from(vec![CleanupRoot {
+            path: absent,
+            private: true,
+        }]);
+        assert!(roots.is_empty());
     }
 
     #[test]

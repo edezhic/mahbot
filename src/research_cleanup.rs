@@ -93,7 +93,18 @@ pub(crate) async fn ensure_run_root(job_id: &str) -> PathBuf {
     if let Err(e) = tokio::fs::create_dir_all(&path).await {
         tracing::warn!(job = %job_id, error = %e, "Failed to create run root — analyst scratch writes may fail");
     }
-    tokio::fs::canonicalize(&path).await.unwrap_or(path)
+    canonical_run_root(job_id).await.unwrap_or(path)
+}
+
+/// The run folder's canonical path in its PLAIN spelling, for callers that must
+/// not create it (a manual cancel must not resurrect a folder the periodic temp
+/// cleaner already removed). Never the platform's verbatim prefix: this path
+/// reaches prompts, the run's workspace root and shell commands (see
+/// [`crate::util::strip_verbatim_prefix`]).
+pub(crate) async fn canonical_run_root(job_id: &str) -> std::io::Result<PathBuf> {
+    tokio::fs::canonicalize(run_root_path(job_id))
+        .await
+        .map(|canonical| crate::util::strip_verbatim_prefix(&canonical))
 }
 
 /// Does the run's per-run folder exist? The boot-replay crash-window

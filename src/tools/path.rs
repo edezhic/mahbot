@@ -322,6 +322,10 @@ fn paths_same_or_canonical(a: &Path, b: &Path) -> bool {
 }
 
 /// Whether `path` is an OS temp directory root (not merely nested under temp).
+///
+/// Deliberately permissive: it accepts every spelling any platform uses for the
+/// temp location, while the daemon's own temp environment (`crate::temp`) holds
+/// only the names this platform actually pins and models.
 fn is_os_temp_root(path: &Path) -> bool {
     let check_path = crate::util::expand_tilde(&path.to_string_lossy());
 
@@ -590,10 +594,16 @@ fn xdg_variant_path_with(get: impl Fn(&str) -> Option<String>, tilde_path: &str)
     None
 }
 
-/// Toolchain roots whose HOME-based default prefix can be relocated by an
-/// environment variable, mapped to the subpaths allowed beneath them.
-/// An empty subpath means the whole variable prefix is allowed.
-const ENV_TOOLCHAIN_ROOTS: &[(&str, &[&str])] = &[
+/// Roots whose location is spelled by an environment variable, mapped to the
+/// subpaths allowed beneath them. Two kinds share the shape: toolchain homes,
+/// whose default is a location under HOME that can be relocated entirely
+/// (`CARGO_HOME`, `RUSTUP_HOME`, …), and the Windows system roots, whose
+/// defaults hard-code the system drive — those variables exist only on Windows,
+/// so elsewhere they are unset and contribute nothing, while the rows
+/// themselves stay compiled and covered on every platform. A subpath is a
+/// `/`-separated component list joined with the host's own separator; an empty
+/// subpath means the whole variable prefix is allowed.
+const ENV_DERIVED_ROOTS: &[(&str, &[&str])] = &[
     ("CARGO_HOME", &["registry/src/", "git/checkouts/"]),
     ("RUSTUP_HOME", &["toolchains/"]),
     ("GOMODCACHE", &[""]),
@@ -601,30 +611,48 @@ const ENV_TOOLCHAIN_ROOTS: &[(&str, &[&str])] = &[
     ("GRADLE_USER_HOME", &["caches/"]),
     ("JAVA_HOME", &["include/"]),
     ("GOROOT", &["src/"]),
+    ("ProgramData", &["chocolatey/lib"]),
+    (
+        "SystemDrive",
+        &[
+            "msys64/mingw64/include",
+            "msys64/ucrt64/include",
+            "msys64/clang64/include",
+            "msys64/usr/include",
+        ],
+    ),
+    ("ProgramFiles(x86)", &["Windows Kits"]),
+    ("ProgramFiles", &["Microsoft Visual Studio"]),
 ];
 
 /// Pure, I/O-free construction of env-derived read-allowed paths.
-/// For each `(var, subpaths)` in [`ENV_TOOLCHAIN_ROOTS`], when `get(var)`
-/// yields a non-empty value, emits `<value>/<subpath>` for each subpath
-/// (an empty subpath yields the bare, trailing-slash-trimmed value).
-/// The env getter is injected so tests can drive it without mutating the
-/// process environment; production passes `|var| std::env::var(var).ok()`.
+/// For each `(var, subpaths)` in [`ENV_DERIVED_ROOTS`], when `get(var)`
+/// yields a non-empty value, emits `<value><sep><subpath>` for each subpath (an
+/// empty subpath yields the bare, trailing-separator-trimmed value). The
+/// separator is spelled explicitly because several of these values are a bare
+/// drive prefix (`C:`), and `C:` is drive-RELATIVE — a plain join onto it is
+/// not a join at all. An unset or empty variable contributes nothing: fail
+/// closed rather than allowlist a fabricated root. The env getter is injected
+/// so tests can drive it without mutating the process environment; production
+/// passes `|var| std::env::var(var).ok()`.
 #[must_use]
 fn env_derived_allowed_paths(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let sep = std::path::MAIN_SEPARATOR;
     let mut paths = Vec::new();
-    for &(var, subpaths) in ENV_TOOLCHAIN_ROOTS {
+    for &(var, subpaths) in ENV_DERIVED_ROOTS {
         let Some(value) = get(var) else {
             continue;
         };
-        let value = value.trim_end_matches('/');
+        let value = value.trim_end_matches(['\\', '/']);
         if value.is_empty() {
             continue;
         }
         for &subpath in subpaths {
-            if subpath.is_empty() {
+            let relative = subpath.replace('/', std::path::MAIN_SEPARATOR_STR);
+            if relative.is_empty() {
                 paths.push(value.to_string());
             } else {
-                paths.push(format!("{value}/{subpath}"));
+                paths.push(format!("{value}{sep}{relative}"));
             }
         }
     }
@@ -729,17 +757,12 @@ const EXTRA_ALLOWED_RAW_PATHS: &[&str] = &[
     "/opt/homebrew/Frameworks/",
     "/usr/local/opt/",
     "/usr/local/Frameworks/",
-    r"C:\ProgramData\chocolatey\lib\",
-    r"C:\msys64\mingw64\include\",
-    r"C:\msys64\ucrt64\include\",
-    r"C:\msys64\clang64\include\",
-    r"C:\msys64\usr\include\",
+    // The Windows installs of these (chocolatey, msys2, the Windows SDK, MSVC)
+    // normally live under the system drive, so they are derived from
+    // [`ENV_DERIVED_ROOTS`] rather than hard-coded here.
     // ── SDK roots ────────────────────────────────────────────
     "/Applications/Xcode.app/Contents/Developer/",
     "/Library/Developer/CommandLineTools/",
-    // ── Windows SDK / MSVC ──────────────────────────────────
-    r"C:\Program Files (x86)\Windows Kits\",
-    r"C:\Program Files\Microsoft Visual Studio\",
     // ── Swift ───────────────────────────────────────────────
     "~/.swiftpm/",
     "~/Library/Developer/Xcode/DerivedData/",
@@ -780,16 +803,25 @@ const EXTRA_ALLOWED_RAW_PATHS: &[&str] = &[
 static ALLOWED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     let mut dirs = Vec::new();
     add_path_with_canonical(&mut dirs, std::env::temp_dir());
-    add_path_with_canonical(&mut dirs, PathBuf::from("/tmp"));
-    add_path_with_canonical(&mut dirs, PathBuf::from("/private/tmp"));
-    add_path_with_canonical(&mut dirs, PathBuf::from("/var/tmp"));
+    // The unix shared temp directories. Elsewhere they are not temp roots at
+    // all, and (never canonicalizing) they would sit in the allowlist as raw
+    // paths, so they are gated rather than merely documented.
+    #[cfg(unix)]
+    {
+        add_path_with_canonical(&mut dirs, PathBuf::from("/tmp"));
+        add_path_with_canonical(&mut dirs, PathBuf::from("/private/tmp"));
+        add_path_with_canonical(&mut dirs, PathBuf::from("/var/tmp"));
+    }
     // Explicit spill directory (usually under `temp_dir()`; documents intent).
     add_path_with_canonical(&mut dirs, std::env::temp_dir().join(".agent"));
-    // The legacy (pre-pin) OS temp dir — captured before the daemon pinned
-    // TMPDIR to `/tmp/mahbot`. On macOS this is `/var/folders/.../T`,
-    // where bare `mktemp -d` STILL lands (it ignores TMPDIR). Preserving it
-    // keeps the readonly guard's coverage exactly as broad as before the pin
-    // (no write restrictions are added by the consolidation).
+    // The legacy (pre-pin) OS temp dir — the one captured before the daemon
+    // pinned the temp environment to the private root: on macOS the darwin user
+    // temp dir (`/var/folders/.../T`), where bare `mktemp -d` STILL lands
+    // because it ignores the temp variables, and on Windows the user's own temp
+    // directory. The read allowlist and the cleaner's scan roots
+    // (`crate::temp`) are built from this same value, so the guard's coverage
+    // stays exactly as broad as before the pin (no write restrictions are added
+    // by the consolidation).
     if let Some(legacy) = crate::temp::legacy_temp_dir() {
         add_path_with_canonical(&mut dirs, legacy.to_path_buf());
         add_path_with_canonical(&mut dirs, legacy.join(".agent"));
@@ -811,9 +843,11 @@ static ALLOWED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
 /// is unset, `~`-prefixed entries are skipped. Entries that follow XDG Base
 /// Directory conventions (`~/.cache/`, `~/.local/share/`, `~/.local/state/`,
 /// `~/.config/`) also generate variants using the corresponding `$XDG_*`
-/// environment variable when set. Toolchain roots whose prefix can be
-/// relocated by an environment variable (see [`ENV_TOOLCHAIN_ROOTS`]) are
-/// likewise emitted from the variable value when set.
+/// environment variable when set. Roots whose location is carried by an
+/// environment variable — relocated toolchain homes and the Windows system
+/// roots a Windows install would otherwise place on the system drive — are
+/// likewise emitted from the variable value when set (see
+/// [`ENV_DERIVED_ROOTS`]).
 static EXTRA_READ_ALLOWED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     let mut dirs = ALLOWED_TEMP_ROOTS.clone();
 
@@ -836,8 +870,8 @@ static EXTRA_READ_ALLOWED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
         }
     }
 
-    // Env-relocated toolchain roots (whole-prefix replacement, e.g.
-    // $CARGO_HOME/registry/src when CARGO_HOME is set).
+    // Env-derived roots (whole-prefix replacement, e.g. $CARGO_HOME/registry/src
+    // or $ProgramData/chocolatey/lib when those variables are set).
     for raw_path in env_derived_allowed_paths(|var| std::env::var(var).ok()) {
         add_path_with_canonical(&mut dirs, PathBuf::from(raw_path));
     }
@@ -864,6 +898,11 @@ static EXTRA_READ_ALLOWED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
 /// a purely lexical check — no filesystem I/O — so it cannot detect symlink-based
 /// escapes. The caller is responsible for that post-canonicalization validation
 /// (see [`resolve_read_target`] and [`resolve_write_target`]).
+///
+/// The workspace comparison is made on the normalised spellings of both sides
+/// (see [`crate::util::strip_verbatim_prefix`]), so a stored root and a
+/// canonicalized candidate that differ only by the Windows verbatim prefix
+/// still match.
 #[must_use]
 fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     let path = path.trim();
@@ -897,11 +936,26 @@ fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
         // this is harmless: agents use relative paths, and the post-canonicalization
         // checks in resolve_read_target / resolve_write_target catch any symlink
         // escapes that would bypass this pre-check.
-        expanded_path.starts_with(workspace_root)
+        workspace_prefix_matches(&expanded_path, workspace_root)
     } else {
         // Relative path without parent-dir components — always safe
         true
     }
+}
+
+/// Lexical workspace-prefix comparison, run on the normalised spelling of both
+/// sides (see [`crate::util::strip_verbatim_prefix`]).
+///
+/// On Windows `std::fs::canonicalize` yields verbatim (`\\?\C:\…`) paths while a
+/// stored workspace root may be spelled either way, and
+/// `Prefix(VerbatimDisk('C'))` never equals `Prefix(Disk('C'))` — so an `edit`
+/// inside an ephemeral run root, and any absolute read against a
+/// verbatim-stored root, would be refused without the normalisation. Identity
+/// for every unix path.
+#[must_use]
+fn workspace_prefix_matches(candidate: &Path, workspace_root: &Path) -> bool {
+    crate::util::strip_verbatim_prefix(candidate)
+        .starts_with(crate::util::strip_verbatim_prefix(workspace_root))
 }
 
 /// Resolve a user path segment against `workspace_root`.
@@ -1160,6 +1214,25 @@ mod tests {
                 "Dependency path should be blocked by base check"
             );
         }
+    }
+
+    /// The workspace prefix check runs on the normalised spellings, so a
+    /// candidate that differs from the root only by the Windows verbatim prefix
+    /// is still accepted — in both directions.
+    #[test]
+    fn workspace_prefix_matches_ignores_the_verbatim_prefix() {
+        assert!(workspace_prefix_matches(
+            Path::new("C:/ws/a/b"),
+            Path::new(r"\\?\C:/ws")
+        ));
+        assert!(workspace_prefix_matches(
+            Path::new(r"\\?\C:/ws/a/b"),
+            Path::new("C:/ws")
+        ));
+        assert!(!workspace_prefix_matches(
+            Path::new(r"\\?\C:/other"),
+            Path::new("C:/ws")
+        ));
     }
 
     // ── is_path_under_roots / allowed_temp_roots tests ───────────────────
@@ -1435,6 +1508,47 @@ mod tests {
                 _ => None,
             })
             .is_empty()
+        );
+
+        // A system root contributes each of its subpaths, spelled with the
+        // host's own separator.
+        let sep = std::path::MAIN_SEPARATOR;
+        let paths = env_derived_allowed_paths(|var| match var {
+            "ProgramData" => Some("/data".to_string()),
+            "ProgramFiles" => Some("/program files".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            paths,
+            vec![
+                format!("/data{sep}chocolatey{sep}lib"),
+                format!("/program files{sep}Microsoft Visual Studio"),
+            ]
+        );
+
+        // A trailing separator on the value does not double up.
+        assert_eq!(
+            env_derived_allowed_paths(|var| match var {
+                "ProgramData" => Some("/data/".to_string()),
+                _ => None,
+            }),
+            vec![format!("/data{sep}chocolatey{sep}lib")]
+        );
+
+        // A BARE drive value (`SystemDrive=C:`) is joined with an explicit
+        // separator: `C:` is drive-RELATIVE, so a plain join would produce
+        // `C:msys64…` — a different path, and the reason this formatting exists.
+        assert_eq!(
+            env_derived_allowed_paths(|var| match var {
+                "SystemDrive" => Some("C:".to_string()),
+                _ => None,
+            }),
+            vec![
+                format!("C:{sep}msys64{sep}mingw64{sep}include"),
+                format!("C:{sep}msys64{sep}ucrt64{sep}include"),
+                format!("C:{sep}msys64{sep}clang64{sep}include"),
+                format!("C:{sep}msys64{sep}usr{sep}include"),
+            ]
         );
     }
 

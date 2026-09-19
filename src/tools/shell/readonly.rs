@@ -230,12 +230,13 @@ pub(super) struct CheckContext {
 
 impl CheckContext {
     /// Context for a session rooted at `workspace_root` with the standard
-    /// OS temp roots and the session shell's temp-variable bindings.
+    /// OS temp roots and the session shell's temp-variable bindings, taken from
+    /// the same single source the shell environment itself is given.
     pub(super) fn for_workspace(workspace_root: &Path) -> Self {
         Self {
             workspace_root: workspace_root.to_path_buf(),
             temp_roots: crate::tools::path::allowed_temp_roots(),
-            temp_vars: vec![("TMPDIR".to_string(), super::shell_tmpdir())],
+            temp_vars: crate::temp::shell_temp_vars(),
         }
     }
 }
@@ -5081,8 +5082,9 @@ mod tests {
         CheckContext {
             workspace_root: std::path::PathBuf::from("/__mahbot_readonly_test_ws__"),
             temp_roots: crate::tools::path::allowed_temp_roots(),
-            // Match the session shell env (TMPDIR = shell::shell_tmpdir()); TMP/TEMP unset.
-            temp_vars: vec![("TMPDIR".to_string(), crate::tools::shell::shell_tmpdir())],
+            // Match the session shell env — the same single source the
+            // production context uses.
+            temp_vars: crate::temp::shell_temp_vars(),
         }
     }
 

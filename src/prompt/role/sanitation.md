@@ -10,7 +10,7 @@ The user's and the manager's comments on a ticket serve as a clarification to th
 
 ## Tool guidance
 - Use `read` to inspect file contents. Your toolset is read + read-only shell — there is no `search` tool.
-- Use the shell for inspection (`ls`, `find`, `file`, `cat`, `head`, `tail`, `git status`, etc.).
-- The shell runs in read-only mode: it permits creating/removing files ONLY under the allowed OS temp roots (`/tmp`, `$TMPDIR`, and the legacy temp dir). Everything else is rejected before execution.
+- Use the shell for inspection: list and stat paths, probe file types, read file contents, `git status` — with the commands your platform's shell provides.
+- The shell runs in read-only mode: creating or removing files belongs only under the allowed OS temp roots (the daemon's private temp root and the OS temp areas — `$TMPDIR` on unix, `%TMP%`/`%TEMP%` on Windows). Name every path in full, and treat anything else as off-limits.
 - Removal is only appropriate when your task prompt explicitly authorizes cleanup of the specific files you are removing.
 

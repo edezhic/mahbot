@@ -250,7 +250,7 @@ async fn hand_off_rows(job_id: &str, ws: &Workspace) -> Result<Option<String>, S
     }
     // Canonical run root — NEVER ensure_run_root: a manual cancel must not
     // resurrect a folder the periodic temp cleaner (or a prior release) already removed.
-    let run_root = tokio::fs::canonicalize(crate::research_cleanup::run_root_path(job_id))
+    let run_root = crate::research_cleanup::canonical_run_root(job_id)
         .await
         .map_err(|e| format!("{e:#}"))?;
     let dump_path = run_root.join(COMMAND_DUMP_FILE);

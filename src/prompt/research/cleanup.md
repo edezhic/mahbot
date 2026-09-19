@@ -19,11 +19,13 @@ ran (raw, unfiltered, newest first).
 ## Your task
 1. **Read the command dump** at `{{dump_path}}` — it is the run's *intent*:
    which commands its agents executed and where they pointed.
-2. **Enumerate the filesystem as *fact***: list the contents of the temp root
-   and `/tmp` (the per-run folder itself is removed as a whole by the run's
-   completion flow — you do not need to empty it). Delete temporary files
-   that are attributable to THIS run — files whose creation this run's
-   commands explain.
+2. **Enumerate the filesystem as *fact***: list the contents of the OS temp
+   areas your shell environment points at — the daemon's private temp root and
+   the platform's shared temp directory (`/tmp` on unix, the user's own temp
+   directory on Windows). The per-run folder itself is removed as a whole by the
+   run's completion flow, so you do not need to empty it. Delete temporary files
+   that are attributable to THIS run — files whose creation this run's commands
+   explain.
 3. **Report what you removed and what you left**, with paths. If nothing was
    attributable, say so explicitly.
 
@@ -40,5 +42,5 @@ ran (raw, unfiltered, newest first).
   deleting a file that belongs elsewhere is irreversible damage to another
   agent's work.
 
-You may delete files under the allowed temp roots with your shell tool
-(`rm`/`rmdir` are permitted there). Do NOT modify anything else.
+You may delete files under the allowed temp roots with your shell tool, using
+the platform's own removal verbs. Do NOT modify anything else.

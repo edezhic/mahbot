@@ -289,18 +289,9 @@ impl Workspace {
     /// workspace is not found in the database.
     ///
     /// The name is derived from the last path component (directory name).
-    /// The stored path is canonicalized so that `is_path_safe_for_workspace`
-    /// (which uses lexical `starts_with`) produces correct results even
-    /// when the workspace base is behind a symlink (e.g. `/tmp` → `/private/tmp`
-    /// on macOS).
     #[must_use]
     pub fn from_path(path: &Path) -> Self {
-        // Canonicalize to match production workspace creation (see
-        // canonicalize_workspace_path). Falls back to the raw path if the
-        // directory does not exist yet (rare in tests, but harmless).
-        let stored = crate::util::with_block_in_place(|| {
-            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-        });
+        let stored = stored_workspace_path(path);
         Self {
             name: last_path_component(&stored),
             path: stored.to_string_lossy().to_string(),
@@ -322,16 +313,29 @@ impl Workspace {
     /// is bounded by the run it serves.
     #[must_use]
     pub fn ephemeral_run(name: &str, path: &Path) -> Self {
-        let stored = crate::util::with_block_in_place(|| {
-            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-        });
         Self {
             name: name.to_string(),
-            path: stored.to_string_lossy().to_string(),
+            path: stored_workspace_path(path).to_string_lossy().to_string(),
             ephemeral: true,
             ..Default::default()
         }
     }
+}
+
+/// The path a [`Workspace`] built from a filesystem path stores: canonicalized,
+/// so `is_path_safe_for_workspace` (lexical `starts_with`) is correct even when
+/// the base is behind a symlink (`/tmp` → `/private/tmp` on macOS), and with the
+/// platform's verbatim prefix dropped (`std::fs::canonicalize` yields
+/// `\\?\C:\…` on Windows, a spelling the shell, the prompts and
+/// [`crate::tools::path`] should not have to carry). Falls back to the raw path
+/// when the directory does not exist yet.
+fn stored_workspace_path(path: &Path) -> PathBuf {
+    crate::util::with_block_in_place(|| {
+        std::fs::canonicalize(path).map_or_else(
+            |_| path.to_path_buf(),
+            |canonical| crate::util::strip_verbatim_prefix(&canonical),
+        )
+    })
 }
 
 /// Extract the last component of a path as a string.

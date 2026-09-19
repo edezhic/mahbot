@@ -194,15 +194,8 @@ fn checkpoint_min_free_bytes() -> u64 {
 }
 
 /// Free bytes on the filesystem backing `path` (0 when unavailable).
-#[cfg(unix)]
 fn available_free_bytes(path: &Path) -> u64 {
     crate::util::disk::free_and_capacity(path).map_or(0, |(free, _)| free)
-}
-
-/// Windows has no direct free-space query via libc — the gate simply never trips.
-#[cfg(not(unix))]
-fn available_free_bytes(_path: &Path) -> u64 {
-    u64::MAX
 }
 
 /// True when the store's disk has enough free space for a TRUNCATE checkpoint.
@@ -337,7 +330,11 @@ async fn checkpoint_stores(round: CheckpointRound) {
     // artifact directory from the same source (identical to
     // default_config_dir() today, but canonical if a data-dir override lands).
     let root = crate::config::CONFIG.try_storage_root();
-    let truncate_gate = root.as_deref().is_none_or(truncate_allowed);
+    // The free-space query behind the gate is a blocking syscall — and on
+    // Windows it can resolve a UNC volume — so it runs the way every other fast
+    // blocking fs call in this crate does, off the async worker's critical path.
+    let truncate_gate =
+        crate::util::with_block_in_place(|| root.as_deref().is_none_or(truncate_allowed));
     let policy = match round {
         CheckpointRound::Exit => CheckpointPolicy::Truncate,
         CheckpointRound::Periodic => CheckpointPolicy::periodic(),

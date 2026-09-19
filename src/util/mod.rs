@@ -379,6 +379,113 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// The UTF-16 (`wide`) form of `path` for a Win32 call, or `None` when the path
+/// contains an interior NUL — the API would read its name truncated there, which
+/// silently names a different path.
+#[cfg(windows)]
+#[must_use]
+pub(crate) fn wide_path(path: &Path) -> Option<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt as _;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    (!wide.contains(&0)).then_some(wide)
+}
+
+/// Strip the Windows verbatim (`\\?\`) prefix that `std::fs::canonicalize`
+/// produces there, so the path can be handed to a shell child or rendered into
+/// a prompt. Only the two forms a canonicalized *local* path takes are
+/// rewritten — a drive path (`\\?\C:\…`) and the UNC form
+/// (`\\?\UNC\srv\share`) — and the drive form only when a separator follows the
+/// colon: `\\?\C:` alone is drive-relative, so dropping its prefix would turn it
+/// into a relative path. Anything else after the prefix (a volume-GUID or
+/// `GLOBALROOT` device path) is left exactly as it came in: dropping the prefix
+/// from those yields a relative path, which is worse than a verbatim one.
+/// Identity for a path without the prefix, and for one that cannot be spelled
+/// exactly (unpaired surrogates are not rewritten lossily into a different path).
+#[must_use]
+pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+        && matches!(rest.as_bytes().get(2), Some(b'\\' | b'/'))
+    {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
+#[cfg(test)]
+mod verbatim_prefix_tests {
+    use super::strip_verbatim_prefix;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn strips_only_the_verbatim_prefix() {
+        // A path that already reads normally is returned unchanged.
+        assert_eq!(
+            strip_verbatim_prefix(Path::new("/tmp/mahbot")),
+            PathBuf::from("/tmp/mahbot")
+        );
+        // Drive path: verbatim → the plain spelling `cmd.exe` accepts.
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\a\b")),
+            PathBuf::from(r"C:\a\b")
+        );
+        // UNC form: `\\?\UNC\srv\share` is the verbatim spelling of `\\srv\share`.
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\srv\share")),
+            PathBuf::from(r"\\srv\share")
+        );
+        // A drive form with nothing after the colon is drive-RELATIVE: the
+        // prefix stays so the path is not silently turned into a relative one.
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:")),
+            PathBuf::from(r"\\?\C:")
+        );
+        // Device paths keep their prefix: stripping it would make them relative.
+        for device in [
+            r"\\?\Volume{0000}\dir",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1",
+        ] {
+            assert_eq!(
+                strip_verbatim_prefix(Path::new(device)),
+                PathBuf::from(device)
+            );
+        }
+        // A bare prefix is the "current drive" device form, not a drive path; it
+        // keeps its prefix like the other device forms.
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\")),
+            PathBuf::from(r"\\?\")
+        );
+    }
+
+    /// A path that cannot be spelled exactly comes back untouched: rewriting it
+    /// through a lossy conversion would name a *different* path (the unpaired
+    /// surrogate would become the replacement character). The path here is a
+    /// verbatim drive form with one invalid byte appended, so the check is
+    /// meaningful on every platform — the strip is a pure string rewrite.
+    #[cfg(unix)]
+    #[test]
+    fn leaves_a_path_it_cannot_spell_exactly() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut bytes = br"\\?\C:\a\b".to_vec();
+        bytes.push(0xff);
+        let raw = OsStr::from_bytes(&bytes);
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(raw)),
+            PathBuf::from(raw),
+            "an unspellable path must not be rewritten lossily"
+        );
+    }
+}
+
 /// Resolve the shared `~/.mahbot/models/` directory via the CONFIG storage root.
 ///
 /// Returns `None` if the storage root hasn't been initialized yet.  Per-model

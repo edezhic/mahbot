@@ -11,7 +11,7 @@ When a content-mode path is a raster image (PNG, JPEG, or WebP), the tool reads 
 
 When a content-mode path is a document container — a PDF, or a Word `.docx`/`.docm` (an encrypted one is reported as password-protected instead) — the tool converts it the same way an inbound chat attachment is converted, instead of returning its raw bytes. The extracted text is returned; when it is too long to inline, the tool writes it out to a file and reports that path. Pages without a usable text layer, and images embedded in a page, are attached to the conversation as images when there are at most 5 of them. With more, all of them are saved in a folder and listed by path, so you can read them individually; when even that listing would not fit the answer, the folder alone is named — list it to find them. `offset`/`limit` do not apply to a converted document. A document that yields neither text nor images, or whose conversion cannot run at all, is answered with a plain note saying so — never its raw bytes.
 
-Path restrictions: paths must be within the project workspace, or within common dependency source directories (see below). Absolute paths are allowed for temp files (e.g. $TMPDIR/* spill files from shell output) and dependency sources. Files larger than 10 MB are rejected, except document containers, which are accepted up to 50 MB.
+Path restrictions: paths must be within the project workspace, or within common dependency source directories (see below). Absolute paths are allowed for temp files (e.g. spill files from shell output under `$TMPDIR` on unix, `%TMP%`/`%TEMP%` on Windows) and dependency sources. Files larger than 10 MB are rejected, except document containers, which are accepted up to 50 MB.
 
 ## Dependency source access
 

@@ -7,6 +7,8 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+#[cfg(windows)]
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
@@ -101,14 +103,21 @@ const SHELL_PIPE_READ_CAP: usize = 256 * 1024;
 const TIMEOUT_OUTPUT_TAIL_CHARS: usize = 2_000;
 
 /// Environment variables safe to pass to shell commands.
-/// Only functional variables are included — never API keys or secrets.
+///
+/// Only functional variables are included — never API keys or secrets. The
+/// platform's temp variables are NOT listed here: they are bound to the daemon's
+/// private temp root by [`apply_safe_env`] from
+/// [`crate::temp::shell_temp_vars`].
 #[cfg(not(target_os = "windows"))]
 const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL",
 ];
 
 /// Environment variables safe to pass to shell commands on Windows.
-/// Includes Windows-specific variables needed for cmd.exe and program resolution.
+///
+/// Includes Windows-specific variables needed for cmd.exe and program
+/// resolution. The temp variables are not listed here: [`apply_safe_env`] binds
+/// them to the daemon's private temp root.
 #[cfg(target_os = "windows")]
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH",
@@ -121,19 +130,27 @@ const SAFE_ENV_VARS: &[&str] = &[
     "SYSTEMDRIVE",
     "WINDIR",
     "COMSPEC",
-    "TEMP",
-    "TMP",
     "TERM",
     "LANG",
     "USERNAME",
 ];
 
+/// Clear the child's environment and re-populate it from [`SAFE_ENV_VARS`], plus
+/// the platform's temp variables bound to the daemon's private temp root.
+///
+/// The temp names and value come from [`crate::temp::shell_temp_vars`] — the
+/// same pair the read-only guard's temp model reads — so the scratch location a
+/// child actually writes to and the location the guard accepts for a write
+/// cannot drift apart, and a new temp name reaches both at once.
 pub(crate) fn apply_safe_env(cmd: &mut tokio::process::Command) {
     cmd.env_clear();
     for &name in SAFE_ENV_VARS {
         if let Some(value) = baseline_env_value(name) {
             cmd.env(name, value);
         }
+    }
+    for (name, value) in crate::temp::shell_temp_vars() {
+        cmd.env(name, value);
     }
 }
 
@@ -146,8 +163,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// [`SAFE_ENV_VARS`] only — no parent-process environment is inherited. This
 /// prevents leaking API keys and other secrets into subprocesses (CWE-200).
 ///
-/// **Note:** `$USER`/`$USERNAME` is an intentional exception — read from the
-/// parent process (usernames are not secrets).
+/// **Note:** `$USER`/`$USERNAME` and the Windows system-path variables
+/// (`%SystemRoot%`/`%WINDIR%`, `%SystemDrive%`, `%ComSpec%`) are intentional
+/// exceptions — read from the parent process (usernames and system paths are
+/// not secrets).
 ///
 /// On Unix the child is made a process group leader (via
 /// [`process_group(0)`](tokio::process::Command::process_group)), so that the
@@ -1338,14 +1357,88 @@ const fn default_search_path_without_parent_env() -> &'static str {
     "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 }
 
+/// The system root (normally `C:\Windows`) from the system's own values — the
+/// drive is never assumed, since Windows may be installed on another one.
+///
+/// Resolution order: [`GetWindowsDirectoryW`] (authoritative — it is what the
+/// OS itself uses), then `%SystemRoot%`, then `%WINDIR%`. Cached because it is
+/// read several times per spawned command. The empty string when all three
+/// fail, in which case callers refuse to hand out a fabricated root.
+///
+/// [`GetWindowsDirectoryW`]: windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW
 #[cfg(windows)]
-fn windows_system_root() -> String {
-    r"C:\Windows".to_string()
+#[must_use]
+fn windows_system_root() -> &'static str {
+    static ROOT: OnceLock<String> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        system_root_from_api()
+            .or_else(|| env_system_root("SystemRoot"))
+            .or_else(|| env_system_root("WINDIR"))
+            .unwrap_or_else(|| {
+                tracing::error!(
+                    "Windows system root unavailable: GetWindowsDirectoryW failed and \
+                     %SystemRoot%/%WINDIR% are unset"
+                );
+                String::new()
+            })
+    })
+}
+
+/// The system root as the OS reports it, through `GetWindowsDirectoryW`'s
+/// two-pass protocol: probe the required length with a null/short buffer, then
+/// read into a buffer of exactly that length. Trailing separators are trimmed
+/// so callers can append `\System32` to the result.
+#[cfg(windows)]
+#[must_use]
+fn system_root_from_api() -> Option<String> {
+    use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+
+    // SAFETY: a null buffer with a zero size is the documented length probe —
+    // with no room to write, the API only reports the required size.
+    let needed = unsafe { GetWindowsDirectoryW(std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; needed as usize];
+    // SAFETY: `buf` has room for exactly the `needed` UTF-16 units the probe
+    // asked for; the API writes at most that many and reports how many.
+    let written = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), needed) };
+    if written == 0 {
+        return None;
+    }
+    // `written` excludes the terminator, but a root that grew between the probe
+    // and the read returns the (larger) required size instead — clamp it.
+    let root = String::from_utf16_lossy(&buf[..(written as usize).min(buf.len())]);
+    let root = root.trim_end_matches(['\\', '/', '\0']);
+    if root.is_empty() {
+        return None;
+    }
+    Some(root.to_string())
+}
+
+/// A root taken from the named environment variable: unset, empty or
+/// separator-only values count as absent, and a trailing separator is trimmed
+/// so the value joins natively.
+#[cfg(windows)]
+#[must_use]
+fn env_system_root(name: &str) -> Option<String> {
+    let value = std::env::var(name).ok()?;
+    let trimmed = value.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[cfg(windows)]
 fn default_search_path_without_parent_env() -> String {
     let root = windows_system_root();
+    if root.is_empty() {
+        // An empty baseline beats one fabricated around a drive we can't
+        // confirm; the extra prefixes are still prepended onto it.
+        return String::new();
+    }
     format!(r"{root}\System32;{root};{root}\System32\Wbem;{root}\System32\WindowsPowerShell\v1.0")
 }
 
@@ -1395,15 +1488,9 @@ fn resolved_shell_path() -> String {
     )
 }
 
-/// Baseline `TMPDIR` binding of the sanitized session environment.
-/// The daemon's private temp root when pinned (see `crate::temp`),
-/// otherwise the historical `"/tmp"` baseline (tests, non-unix). Single-sourced
-/// so the read-only validator's temp-variable model (see `baseline_env_value`)
-/// can't drift from the actual env.
-pub(crate) fn shell_tmpdir() -> String {
-    crate::temp::shell_tmpdir()
-}
-
+/// Baseline value of a sanitized session-environment variable. The temp
+/// variables are not handled here: they come from
+/// [`crate::temp::shell_temp_vars`] (see [`apply_safe_env`]).
 fn baseline_env_value(name: &str) -> Option<String> {
     match name {
         "PATH" => Some(resolved_shell_path()),
@@ -1419,7 +1506,6 @@ fn baseline_env_value(name: &str) -> Option<String> {
         "TERM" => Some("dumb".into()),
         "LANG" | "LC_ALL" | "LC_CTYPE" => Some("C.UTF-8".into()),
         "SHELL" => Some("/bin/sh".into()),
-        "TMPDIR" => Some(shell_tmpdir()),
         _ => {
             #[cfg(windows)]
             if let Some(val) = windows_baseline_env_value(name) {
@@ -1432,8 +1518,11 @@ fn baseline_env_value(name: &str) -> Option<String> {
 
 /// Returns baseline values for Windows-specific environment variables.
 ///
-/// These variables are only meaningful on Windows and provide sensible defaults
-/// when they are not set in the parent process environment.
+/// These variables are only meaningful on Windows. Where the parent process
+/// knows the value (`%SystemDrive%`, `%ComSpec%`), its own is preferred; the
+/// rest are derived from the OS-reported system root rather than from a
+/// hard-coded `C:`, so an install on another drive still gets a usable
+/// environment.
 #[cfg(windows)]
 fn windows_baseline_env_value(name: &str) -> Option<String> {
     match name {
@@ -1455,18 +1544,46 @@ fn windows_baseline_env_value(name: &str) -> Option<String> {
                 None
             }
         }),
-        "SYSTEMROOT" | "WINDIR" => Some(windows_system_root()),
-        "SYSTEMDRIVE" => Some("C:".into()),
-        "COMSPEC" => {
+        // None of these is ever fabricated around a `C:` assumption: an absent
+        // system root leaves the variable unset rather than pointing a child at
+        // a plausible-but-wrong drive.
+        "SYSTEMROOT" | "WINDIR" => {
             let root = windows_system_root();
-            Some(format!(r"{root}\System32\cmd.exe"))
+            (!root.is_empty()).then(|| root.to_string())
         }
-        "TEMP" | "TMP" => {
+        "SYSTEMDRIVE" => inherited_env_value("SystemDrive").or_else(|| {
+            // Drive prefix of the system root — the drive letter plus its colon
+            // (`C:`), derived rather than assumed: the second byte being `:`
+            // proves the `X:` shape, and both bytes are ASCII, so slicing is
+            // safe.
             let root = windows_system_root();
-            Some(format!(r"{root}\Temp"))
-        }
+            (root.as_bytes().get(1) == Some(&b':')).then(|| root[..2].to_string())
+        }),
+        "COMSPEC" => inherited_env_value("ComSpec").or_else(|| {
+            let root = windows_system_root();
+            (!root.is_empty()).then(|| format!(r"{root}\System32\cmd.exe"))
+        }),
         _ => None,
     }
+}
+
+/// The parent process's value for a Windows variable that is not a secret, when
+/// set to something non-empty — the authoritative source when it exists.
+#[cfg(windows)]
+#[must_use]
+fn inherited_env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// The read-only banner with the daemon's temp root substituted in — the one
+/// spelling of the temp location that resolves the same way in every shell (a
+/// literal path; the platform's temp variables are the shells' own interface,
+/// not something the guard's lexical model can resolve).
+fn render_readonly_banner() -> String {
+    crate::prompt::substitute(
+        &crate::prompt::load_prompt("tool/shell_readonly_banner.md"),
+        &[("{{temp_root}}", &crate::temp::shell_tmpdir())],
+    )
 }
 
 #[async_trait]
@@ -1483,11 +1600,7 @@ impl Tool for ShellTool {
         let base = crate::prompt::load_prompt("tool/shell.md");
         let notes = crate::prompt::load_prompt("tool/shell_grep_notes.md");
         let sections: [String; 3] = match self.mode {
-            ShellMode::ReadOnly => [
-                crate::prompt::load_prompt("tool/shell_readonly_banner.md"),
-                base,
-                notes,
-            ],
+            ShellMode::ReadOnly => [render_readonly_banner(), base, notes],
             ShellMode::Full => [
                 base,
                 crate::prompt::load_prompt("tool/shell_full.md"),

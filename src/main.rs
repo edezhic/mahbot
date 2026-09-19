@@ -679,10 +679,11 @@ fn main() -> Result<()> {
     mahbot::shutdown::install_console_stop_handler();
 
     // Consolidate ALL daemon temp files under one private root
-    // (`/tmp/mahbot`, mode 0700) and pin TMPDIR to it — BEFORE any
-    // temp use (config, logs, stores, shell children). The debug,
-    // __grep-engine, bench-openrouter and chrome subcommands above must NOT
-    // create the root (they exit before this point).
+    // (`/tmp/mahbot`, mode 0700; `<user temp>\mahbot` on Windows) and pin the
+    // platform's temp variables to it — BEFORE any temp use (config, logs,
+    // stores, shell children). The debug, __grep-engine, bench-openrouter and
+    // chrome subcommands above must NOT create the root (they exit before this
+    // point).
     mahbot::temp::init_temp_root()
         .map_err(|e| mahbot::boot::record_startup_failure("temp::init_temp_root", e))?;
 
