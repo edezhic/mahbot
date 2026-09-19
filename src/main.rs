@@ -379,11 +379,13 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::pipeline::run_management(),
     );
 
-    // Listen for SIGTERM/SIGINT and drive the two-signal drain protocol.
-    // First signal begins the drain (wait_for_shutdown_signal calls
-    // drain_begin and keeps listening); the task returns only on a SECOND
-    // signal, which force-cancels the drain. Clean drain completion is
-    // driven by the drain-watch task below (fires the token when no
+    // Listen for stop requests and drive the two-request drain protocol: signals
+    // on macOS/Linux, the console control handler on Windows (see
+    // `shutdown::install_console_stop_handler`). The first request begins the drain
+    // (wait_for_shutdown_signal calls drain_begin and keeps listening); the task
+    // returns only on a request that abandons the drain — a SECOND signal, or a
+    // force-cancel-class console request — which force-cancels it. Clean drain
+    // completion is driven by the drain-watch task below (fires the token when no
     // in-flight agents or orchestrator calls remain).
     tasks.spawn(async move {
         let result = AssertUnwindSafe(mahbot::shutdown::wait_for_shutdown_signal())
@@ -391,7 +393,13 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
             .await;
         match result {
             Ok(Ok(())) => {
-                info!("Second signal received — force-cancelling drain");
+                // Names the last request the platform recorded (a Windows console
+                // request); the fallback is the literal this line always carried, for
+                // the second Unix signal.
+                info!(
+                    "{} — force-cancelling drain",
+                    mahbot::shutdown::exit_trigger().unwrap_or("Second signal received")
+                );
                 mahbot::shutdown::force_cancel();
             }
             Ok(Err(e)) => {
@@ -543,14 +551,30 @@ fn init_message_pipeline(
 }
 
 async fn shutdown_after_dashboard() {
-    info!("Dashboard window closed — shutting down");
+    // Names the last stop request the platform recorded; when nothing was recorded,
+    // the line keeps the wording it always had.
+    info!(
+        "{} — shutting down",
+        mahbot::shutdown::exit_trigger().unwrap_or("Dashboard window closed")
+    );
     // No shutdown() here — the token is already fired whenever the iced runtime
     // exits: the shutdown subscription emits Message::Shutdown only after token
     // cancellation, and the UpdateResult-failure exit (save_and_exit) runs only
     // after the update's finalizing drain fired it. A future exit path that
     // drops the runtime without firing the token would break this invariant.
     mahbot::agent::registry::AGENT_REGISTRY.shutdown_all();
-    mahbot::tools::chrome_release::flush_and_close_all_chrome_sessions().await;
+
+    let release = mahbot::tools::chrome_release::flush_and_close_all_chrome_sessions();
+    match mahbot::shutdown::urgent_release_budget() {
+        // Only an urgent stop (a Windows console close) bounds the stage before the
+        // checkpoint; a cut is best-effort and the exit path carries on to it.
+        Some(budget) => {
+            if tokio::time::timeout(budget, release).await.is_err() {
+                warn!("urgent shutdown: browser session release cut at its {budget:?} budget");
+            }
+        }
+        None => release.await,
+    }
 
     // Take the JoinSet out of the lock before awaiting (drop guard).
     let maybe_tasks = {
@@ -558,6 +582,8 @@ async fn shutdown_after_dashboard() {
         guard.take()
     };
 
+    // No budget here: these tasks live on the iced runtime, which is dropped before
+    // this path runs, so joining them is a sweep of already-cancelled work.
     if let Some(mut tasks) = maybe_tasks {
         while let Some(result) = tasks.join_next().await {
             match result {
@@ -647,6 +673,10 @@ fn main() -> Result<()> {
         }
         _ => {}
     }
+
+    // Subscribe to Windows console stop requests before boot — the handler needs no
+    // runtime, it queues for the protocol loop. No-op on macOS/Linux.
+    mahbot::shutdown::install_console_stop_handler();
 
     // Consolidate ALL daemon temp files under one private root
     // (`/tmp/mahbot`, mode 0700) and pin TMPDIR to it — BEFORE any
