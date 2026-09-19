@@ -3,6 +3,11 @@
 //! Owns the shared types, coordinate math, the element-ref/observation lifecycle,
 //! the target registry, tree rendering, and the [`Backend`] trait. Contains no
 //! platform imports — `macos.rs`/`linux.rs`/`stub.rs` implement [`Backend`].
+//!
+//! Items carrying a platform-scoped `expect(dead_code)` are the ones only a real
+//! backend — or a test — calls: on a platform whose backend is the stub they
+//! have no caller, and they stay, as they are the real backends' contract. Per
+//! item, not module-wide, so `dead_code` stays armed everywhere else.
 
 use crate::util::UnwrapPoison;
 use anyhow::anyhow;
@@ -59,10 +64,12 @@ const INTERACTIVE_ROLES: &[&str] = &[
 // coordinates, unknown targets/keys, missing refs, wait caps) are plain and
 // self-describing — no taxonomy tag needed.
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), expect(dead_code))]
 pub(crate) const ERR_PERMISSION_DENIED: &str = "permission-denied";
 pub(crate) const ERR_UNSUPPORTED: &str = "unsupported";
 pub(crate) const ERR_DEGRADED: &str = "degraded";
 pub(crate) const ERR_STALE_ELEMENT: &str = "stale-element";
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), expect(dead_code))]
 pub(crate) const ERR_AMBIGUOUS_LOCATOR: &str = "ambiguous-locator";
 pub(crate) const ERR_NOT_MATCHED: &str = "not-matched";
 
@@ -325,6 +332,10 @@ pub(crate) enum RawInput {
 /// Recognized modifiers (case-insensitive): `cmd`/`command`, `ctrl`/`control`,
 /// `alt`/`option`, `shift`. The non-modifier segment is the key name and is
 /// returned lowercased (e.g. `"return"`, `"a"`, `"f5"`, `"5"`).
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", test)),
+    expect(dead_code)
+)]
 pub(crate) fn parse_key_chord(chord: &str) -> anyhow::Result<(Vec<Modifier>, String)> {
     let parts: Vec<&str> = chord.split('+').map(str::trim).collect();
     if parts.is_empty() || parts.iter().any(|p| p.is_empty()) {
@@ -360,6 +371,10 @@ pub(crate) fn parse_key_chord(chord: &str) -> anyhow::Result<(Vec<Modifier>, Str
 
 /// Map a normalized 0-1000 point to absolute global logical points on the
 /// target surface.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", test)),
+    expect(dead_code)
+)]
 pub(crate) fn normalized_to_surface(
     nx: f64,
     ny: f64,
@@ -470,6 +485,10 @@ pub(crate) fn crop_rgba(cap: &Capture, rect: (u32, u32, u32, u32)) -> anyhow::Re
 /// Place `src` RGBA pixels at `(dx, dy)` inside a `dest_w`×`dest_h` buffer,
 /// clipping to the destination bounds. Platform-free; shared by the capture
 /// composite backends.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", test)),
+    expect(dead_code)
+)]
 pub(crate) fn blit_rgba(
     dest: &mut [u8],
     dest_w: usize,
@@ -493,7 +512,7 @@ pub(crate) fn blit_rgba(
 }
 
 /// ZPixmap tile (`depth` 24/32, 4 bytes/pixel) → RGBA.
-#[cfg_attr(all(not(target_os = "linux"), not(test)), expect(dead_code))] // only the Linux backend calls this; tests exercise it everywhere
+#[cfg_attr(not(any(target_os = "linux", test)), expect(dead_code))] // only the Linux backend calls this; tests exercise it everywhere
 pub(crate) fn x11_pixels_to_rgba(
     data: &[u8],
     width: u32,
@@ -525,7 +544,7 @@ pub(crate) fn x11_pixels_to_rgba(
 /// `file://` portal URI → path, percent-decoding `%XX` (`+` kept verbatim).
 /// After `file://`, `[host]/path` with an empty host (`file:///...`) or
 /// exactly `localhost` is accepted; anything else is rejected.
-#[cfg_attr(all(not(target_os = "linux"), not(test)), expect(dead_code))] // only the Linux backend calls this; tests exercise it everywhere
+#[cfg_attr(not(any(target_os = "linux", test)), expect(dead_code))] // only the Linux backend calls this; tests exercise it everywhere
 pub(crate) fn portal_uri_to_path(uri: &str) -> Result<PathBuf, anyhow::Error> {
     let stripped = uri.strip_prefix("file://").ok_or_else(|| {
         taxonomy_error(ERR_DEGRADED, format!("portal uri is not a file uri: {uri}"))
@@ -586,7 +605,7 @@ pub(crate) fn portal_uri_to_path(uri: &str) -> Result<PathBuf, anyhow::Error> {
 /// intersection in buffer space (buffer origin = screen origin, size =
 /// screen size). `crop_rgba` clamps the far edge, so w/h are rounded up to
 /// `>= 1` (mirror `region_to_pixels` style).
-#[cfg_attr(all(not(target_os = "linux"), not(test)), expect(dead_code))] // only the Linux backend calls this; tests exercise it everywhere
+#[cfg_attr(not(any(target_os = "linux", test)), expect(dead_code))] // only the Linux backend calls this; tests exercise it everywhere
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn window_capture_rect(
     win: &SurfaceGeometry,
@@ -876,6 +895,7 @@ fn render_node(
 /// Pre-order DFS index of `target` in `root` — maps a matched node back to its
 /// handle slot (the handles are kept in the same pre-order as the tree).
 /// Platform-free; shared by the backends in `act_on_element`.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), expect(dead_code))]
 #[must_use]
 pub(crate) fn pre_order_index(root: &UiNode, target: &UiNode) -> usize {
     fn rec(node: &UiNode, target: &UiNode, counter: &mut usize, found: &mut Option<usize>) {
@@ -896,6 +916,7 @@ pub(crate) fn pre_order_index(root: &UiNode, target: &UiNode) -> usize {
 }
 
 /// Outcome of resolving a locator against a tree.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), expect(dead_code))]
 pub(crate) enum LocatorMatch<'a> {
     /// The recorded child-index path reached a node matching the role+name —
     /// the aligned element (the path is load-bearing even when the search would
@@ -914,6 +935,10 @@ pub(crate) enum LocatorMatch<'a> {
 /// search) it wins even when the search would match several nodes. Otherwise the
 /// tree is searched for role+name matches: exactly one is unique, more than one
 /// is ambiguous, and none is not-found.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", test)),
+    expect(dead_code)
+)]
 #[must_use]
 pub(crate) fn resolve_locator<'a>(root: &'a UiNode, locator: &Locator) -> LocatorMatch<'a> {
     let mut node = root;
@@ -932,6 +957,7 @@ pub(crate) fn resolve_locator<'a>(root: &'a UiNode, locator: &Locator) -> Locato
 /// Resolve a locator, mapping the ambiguous/not-found outcomes to their
 /// taxonomy errors — the shared failure contract of both backends'
 /// `act_on_element`.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), expect(dead_code))]
 pub(crate) fn resolve_locator_checked<'a>(
     root: &'a UiNode,
     locator: &Locator,
@@ -951,6 +977,7 @@ pub(crate) fn resolve_locator_checked<'a>(
 
 /// Shared refusal for acting on the `screen` target: acting addresses an
 /// element of a window, so both backends pre-check this before resolving one.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), expect(dead_code))]
 pub(crate) fn screen_act_error() -> anyhow::Error {
     taxonomy_error(
         ERR_UNSUPPORTED,
@@ -958,6 +985,10 @@ pub(crate) fn screen_act_error() -> anyhow::Error {
     )
 }
 
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", test)),
+    expect(dead_code)
+)]
 fn node_matches(node: &UiNode, locator: &Locator) -> bool {
     let role_ok = normalized_role(&node.role).eq_ignore_ascii_case(normalized_role(&locator.role));
     let name_ok = match (&locator.name, &node.name) {
@@ -968,6 +999,10 @@ fn node_matches(node: &UiNode, locator: &Locator) -> bool {
     role_ok && name_ok
 }
 
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", test)),
+    expect(dead_code)
+)]
 fn search_locator<'a>(root: &'a UiNode, locator: &Locator) -> LocatorMatch<'a> {
     let mut found: Option<&'a UiNode> = None;
     let mut count = 0usize;

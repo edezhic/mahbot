@@ -88,6 +88,10 @@ async fn bun_asset_name() -> Result<String, String> {
 /// no probe available (e.g. Windows). On Linux read `/proc/cpuinfo`; on macOS
 /// run `sysctl -a`. Probe failure → false (baseline, safe on old CPUs,
 /// SIGILL-free).
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    expect(clippy::unused_async)
+)]
 async fn host_has_avx2() -> bool {
     if !cfg!(target_arch = "x86_64") {
         return true;
@@ -103,7 +107,7 @@ async fn host_has_avx2() -> bool {
     {
         macos_sysctl_has_avx2().await
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         // No AVX2 probe is available (e.g. Windows) — prefer the plain asset
         // rather than depending on upstream's redundant `-baseline` copies.

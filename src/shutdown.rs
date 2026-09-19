@@ -10,7 +10,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::info;
 
 // ── Global shutdown token ─────────────────────────────────────────────────
 
@@ -161,6 +161,7 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
+        use tracing::debug;
 
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
@@ -193,7 +194,7 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
         info!("Received Ctrl+C — draining");
         drain_begin();
         // Non-unix: no second-signal path; the drain-watch drives completion.
-        tokio::future::pending::<()>().await;
+        std::future::pending::<()>().await;
         Ok(())
     }
 }
@@ -235,9 +236,12 @@ pub fn install_fatal_signal_handlers() {
     });
 }
 
+#[cfg(unix)]
 const SIGBUS_MSG: &str = "mahbot: caught SIGBUS (bus error), terminating\n";
+#[cfg(unix)]
 const SIGABRT_MSG: &str = "mahbot: caught SIGABRT (abort), terminating\n";
 
+#[cfg(unix)]
 extern "C" fn fatal_signal_handler(sig: i32) {
     let msg = match sig {
         libc::SIGBUS => SIGBUS_MSG,

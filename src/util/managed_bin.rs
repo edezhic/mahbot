@@ -15,6 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(unix)]
 use tracing::{debug, info, warn};
 
 // ── Release metadata ────────────────────────────────────────────────
@@ -250,7 +251,9 @@ pub(crate) fn set_executable(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("failed to set executable bit on {}: {e}", path.display()))
 }
 
+// Callers use `?` uniformly, so the signature mirrors the Unix implementation.
 #[cfg(not(unix))]
+#[expect(clippy::unnecessary_wraps)]
 pub(crate) fn set_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }

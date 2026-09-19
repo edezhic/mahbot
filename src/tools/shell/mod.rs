@@ -1006,11 +1006,12 @@ impl ShellTool {
         // Read-only mode: validate command before execution.
         // The grep engine interception runs in BOTH modes (read-only for the
         // validation path, full for the inherent read-only engine) — see below.
+        #[cfg_attr(not(unix), expect(unused_mut))] // the rewrite below is Unix-only
         let mut exec_str = command_str.to_string();
 
-        // Capture the grep-engine serve decision once, before the mode branch
-        // (the engine is Unix-only); reused by both branches for the rewrite
-        // and by the telemetry write after execution.
+        // Capture the grep-engine serve decision once, before the mode branch;
+        // reused by both branches for the rewrite and by the telemetry write
+        // after execution.
         #[cfg(unix)]
         let grep_serve = grep_engine::try_serve_command(command_str, ws.as_path());
 
@@ -1053,7 +1054,7 @@ impl ShellTool {
         let timeout = Duration::from_secs(timeout_secs);
         let drain_limit = output_drain_timeout();
 
-        #[cfg_attr(not(unix), allow(unused_mut))] // non-unix never mutates `result`
+        #[cfg_attr(not(unix), expect(unused_mut))] // non-unix never mutates `result`
         let mut result = run_command_with_timeout(&mut cmd, timeout, drain_limit).await;
 
         // Stream-size marker: the engine reports stdin-fed stream bytes
@@ -1348,7 +1349,8 @@ fn default_search_path_without_parent_env() -> String {
     format!(r"{root}\System32;{root};{root}\System32\Wbem;{root}\System32\WindowsPowerShell\v1.0")
 }
 
-fn prepend_path_entries(base: &str, extras: &[PathBuf]) -> String {
+fn prepend_path_entries(base: impl AsRef<str>, extras: &[PathBuf]) -> String {
+    let base = base.as_ref();
     let sep = if cfg!(windows) { ";" } else { ":" };
 
     let mut seen = HashSet::<String>::new();
@@ -1387,8 +1389,10 @@ fn prepend_path_entries(base: &str, extras: &[PathBuf]) -> String {
 /// `PATH` for shell tools: built from a portable system baseline plus
 /// [`extra_shell_path_prefixes`] (no parent `PATH` read).
 fn resolved_shell_path() -> String {
-    let base = default_search_path_without_parent_env();
-    prepend_path_entries(base, &extra_shell_path_prefixes())
+    prepend_path_entries(
+        default_search_path_without_parent_env(),
+        &extra_shell_path_prefixes(),
+    )
 }
 
 /// Baseline `TMPDIR` binding of the sanitized session environment.
@@ -2852,7 +2856,9 @@ mod tests {
     use crate::workspace::test_ws;
     use tempfile::TempDir;
 
-    use crate::util::test::{env_lock, set_env_var};
+    #[cfg(unix)]
+    use crate::util::test::env_lock;
+    use crate::util::test::set_env_var;
 
     // ── Table-driven test helpers ─────────────────────────────────────
     // These helpers reduce boilerplate for process_shell_output and

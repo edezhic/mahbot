@@ -3944,7 +3944,7 @@ fn map_key_to_action(
     key: &key::Key,
     modifiers: keyboard::Modifiers,
     physical_key: key::Physical,
-    _has_text: bool,
+    has_text: bool,
     single_line: bool,
     code_mode: bool,
     enter: EnterBehavior,
@@ -3953,16 +3953,15 @@ fn map_key_to_action(
     // Ctrl is reserved for emacs-style shortcuts (Ctrl+F/B/A/E/etc.)
     // and terminal conventions. On other platforms, Ctrl triggers
     // platform shortcuts alongside the Windows/Super key.
-    let platform_mod = super::detect_keyboard_mods(modifiers).is_nav_platform_mod();
+    let km = super::detect_keyboard_mods(modifiers);
+    let platform_mod = km.is_nav_platform_mod();
     let shift = modifiers.shift();
     let alt = modifiers.alt();
 
-    // On non-macOS, AltGr (Ctrl+Alt) produces text — treat as character
-    // input, not a shortcut. When `has_text` is true, AltGr is active.
-    #[cfg(not(target_os = "macos"))]
-    let altgr_active = alt && modifiers.control() && _has_text;
-    #[cfg(target_os = "macos")]
-    let altgr_active = false;
+    // On non-macOS, AltGr (Ctrl+Alt) produces text — treat it as character
+    // input, not a shortcut. `.altgr_active` is always false on macOS, and a
+    // keypress with no text is never character input.
+    let altgr_active = km.altgr_active && has_text;
 
     let mv = |dir, sel| {
         Some(EditorAction::Move {
@@ -4133,9 +4132,7 @@ fn map_key_to_action(
             // the code editor keeps its own subscription-driven undo. Gated on
             // `!code_mode` so the code-editor path is untouched.
             if !code_mode && !altgr_active && latin == Some('z') {
-                let shortcut_mod =
-                    super::detect_keyboard_mods(modifiers).is_shortcut_platform_mod();
-                if shortcut_mod {
+                if km.is_shortcut_platform_mod() {
                     if shift {
                         return Some(EditorAction::Redo);
                     }

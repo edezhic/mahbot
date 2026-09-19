@@ -7810,6 +7810,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_escape_fails_closed() {
         // A symlink inside a temp root pointing at an existing non-temp dir:

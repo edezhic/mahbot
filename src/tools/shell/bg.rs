@@ -72,6 +72,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Waiter poll interval while waiting for the command child to exit.
 const WAITER_POLL: Duration = Duration::from_millis(50);
 /// Grace between SIGTERM and SIGKILL in the two-stage stop.
+#[cfg_attr(not(unix), expect(dead_code))] // only the Unix two-stage stop has a grace
 const STOP_GRACE: Duration = Duration::from_secs(5);
 /// How long `stop()` waits for the waiter to append the exit annotation after
 /// the SIGKILL before returning (best-effort determinism for the follow-up
@@ -302,10 +303,12 @@ impl BackgroundSessions {
                 return Ok(StopResult::AlreadyFinished);
             }
             // Windows: no SIGTERM equivalent — terminate the direct child
-            // (grandchildren survive; accepted asymmetry).
-            let mut g = command.lock().unwrap_poison();
-            let _ = g.start_kill();
-            drop(g);
+            // (grandchildren survive; accepted asymmetry). The scoped block
+            // keeps the `!Send` guard out of the await below.
+            {
+                let mut g = command.lock().unwrap_poison();
+                let _ = g.start_kill();
+            }
             wait_for_finished(&finished, stop_annotation_wait()).await;
             Ok(StopResult::Stopped)
         }
@@ -380,6 +383,7 @@ impl BackgroundSessions {
     /// watcher child. Detached — it outlives the agent by a few instants on
     /// teardown to reap the children the teardown kill just signalled.
     fn spawn_waiter(self: &Arc<Self>, output_path: &Path) {
+        #[cfg(unix)]
         let sessions = self.clone();
         let output_path = output_path.to_path_buf();
         let (command, finished, early_status) = {
@@ -534,6 +538,7 @@ fn make_lifeline_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::O
 
 /// Grace between SIGTERM and SIGKILL in the two-stage stop. Env-overridable
 /// for tests.
+#[cfg_attr(not(unix), expect(dead_code))]
 fn stop_grace() -> Duration {
     crate::util::env_duration_secs("MAHBOT_BG_STOP_GRACE_SECS", STOP_GRACE.as_secs())
 }

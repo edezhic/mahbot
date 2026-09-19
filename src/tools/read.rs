@@ -2170,6 +2170,7 @@ mod utils;
     }
 
     /// Directory listing resolves symlinks to directories.
+    #[cfg(unix)]
     #[tokio::test]
     async fn directory_listing_symlink() {
         use std::os::unix::fs::symlink;

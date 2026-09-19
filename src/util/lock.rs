@@ -69,9 +69,11 @@ pub fn try_flock(file: &File) -> io::Result<bool> {
         LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
     };
 
-    let handle = file.as_raw_handle() as HANDLE;
+    // The Win32 contention code, as the `i32` that `raw_os_error` reports
+    // (`cast_signed` rather than `as` to stay clear of the wrapping-cast lint).
+    const LOCK_VIOLATION: i32 = ERROR_LOCK_VIOLATION.cast_signed();
 
-    const LOCK_VIOLATION: i32 = ERROR_LOCK_VIOLATION as i32;
+    let handle = file.as_raw_handle() as HANDLE;
 
     let mut overlapped =
         unsafe { std::mem::zeroed::<windows_sys::Win32::System::IO::OVERLAPPED>() };
@@ -82,7 +84,7 @@ pub fn try_flock(file: &File) -> io::Result<bool> {
             0,
             0,
             0,
-            &mut overlapped,
+            &raw mut overlapped,
         )
     };
     if locked != 0 {

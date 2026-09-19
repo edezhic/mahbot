@@ -54,3 +54,9 @@ Then run `mahbot` to start the service, and you'll be asked to provide one of:
 The rest of the setup will be explained and done through the agent. It will help you add a workspace, other users, connect the Telegram bot, add the search providers & browser tooling for your agents.
 
 Beware that as of now mahbot is only regularly tested on macos & linux, so it might still have unexpected bugs on other platforms.
+
+### Building from source on Windows
+
+Windows is not a supported platform yet — a full build does not complete because the local speech-recognition dependency behind the voice features has no Windows support, and what to do about that is still an open decision.
+
+Building there from source otherwise needs a C/C++ toolchain plus the Windows SDK it links against (the Visual Studio Build Tools `Desktop development with C++` workload provides both), because several dependencies (ring, zstd-sys, libz-sys, onig_sys, minimp3-sys, libgit2-sys) compile C during the build. Our own source does type-check, lint and compile for Windows — `scripts/windows-cross-check.sh` in the repository verifies that by hand (dev-only tooling, not part of the published crate).
