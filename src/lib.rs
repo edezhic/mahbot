@@ -12,6 +12,12 @@
 
 pub mod agent;
 pub mod alarms;
+/// Local audio subsystem (wake word, voice commands, local transcription,
+/// read-aloud TTS, cues). macOS-only: the speech engine it is built on has no
+/// other platform support, and nothing here has a fallback. Linux and Windows
+/// builds have no audio feature, no audio dependency and no audio control at
+/// all — an inbound voice message is refused at intake there.
+#[cfg(target_os = "macos")]
 pub mod audio;
 pub mod bench_openrouter;
 pub mod boot;
@@ -28,6 +34,9 @@ pub mod gui;
 pub mod jobs;
 pub mod logs;
 pub(crate) mod onboarding;
+/// Minimal ONNX runtime whose only consumer is the TTS pipeline
+/// ([`crate::audio::tts`]), so it is built only where that exists.
+#[cfg(target_os = "macos")]
 pub(crate) mod onnx;
 pub mod pipeline;
 pub(crate) mod prompt;

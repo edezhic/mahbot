@@ -11,8 +11,8 @@
 //! (before config and any temp use) — every name in [`TEMP_ENV_VARS`], i.e.
 //! `TMPDIR` on unix and `TMP`/`TEMP` on Windows — so every
 //! `std::env::temp_dir()`-based consumer relocates automatically: shell spill
-//! files, research run folders, background-mode output, voice/telegram temp.
-//! The root is simply recreated/re-verified on every boot.
+//! files, research run folders, background-mode output, telegram attachment
+//! staging. The root is simply recreated/re-verified on every boot.
 //!
 //! The root-setup code itself performs NO startup reclamation of its own —
 //! crash leftovers in the root are reclaimed by the periodic temp cleaner

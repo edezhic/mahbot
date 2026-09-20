@@ -687,20 +687,20 @@ fn condition_enrollment_clip(pcm: &[f32], clip_index: usize) -> Vec<f32> {
     let conditioned = match group {
         GuidedPromptGroup::Normal => pcm.to_vec(),
         GuidedPromptGroup::Distance => {
-            let attenuated = crate::util::apply_gain(pcm, -6.0);
+            let attenuated = crate::audio::util::apply_gain(pcm, -6.0);
             one_pole_lowpass(&attenuated, 3200.0, TARGET_SAMPLE_RATE)
         }
         GuidedPromptGroup::Angle => {
             let tilted = high_shelf_cut(pcm, -4.0, 3000.0, TARGET_SAMPLE_RATE);
-            crate::util::apply_gain(&tilted, -3.0)
+            crate::audio::util::apply_gain(&tilted, -3.0)
         }
         GuidedPromptGroup::Morning => {
-            let slower = crate::util::speed_perturbation(pcm, TARGET_SAMPLE_RATE, 0.92);
-            let reduced = crate::util::apply_gain(&slower, -3.0);
+            let slower = crate::audio::util::speed_perturbation(pcm, TARGET_SAMPLE_RATE, 0.92);
+            let reduced = crate::audio::util::apply_gain(&slower, -3.0);
             one_pole_lowpass(&reduced, 2200.0, TARGET_SAMPLE_RATE)
         }
     };
-    crate::util::add_noise(&conditioned, group.noise_snr_db(), 4000 + clip_index as u64)
+    crate::audio::util::add_noise(&conditioned, group.noise_snr_db(), 4000 + clip_index as u64)
 }
 
 /// Generate the 10 single-voice enrollment clips.
@@ -866,7 +866,7 @@ fn generate_white_gaussian_noise() -> Vec<f32> {
     while i < NOISE_LEN {
         // Shared EPSILON-clamp pair sampler — preserves the
         // bench's exact draw sequence (2 draws per 2 samples, cos+sin).
-        let (z1, z2) = crate::util::sample_gaussian_pair_clamped(&mut rng);
+        let (z1, z2) = crate::audio::util::sample_gaussian_pair_clamped(&mut rng);
         // Clamp to [-1.0, 1.0] — Gaussian has tails beyond [-3, 3] but
         // scaling by 0.333 keeps ~99.7% within [-1, 1].
         samples.push((z1 * 0.333).clamp(-1.0, 1.0));
@@ -881,10 +881,10 @@ fn generate_white_gaussian_noise() -> Vec<f32> {
 /// Generate pink noise (1/f spectrum) using the Voss-McCartney algorithm.
 /// Produces approximately -3 dB/octave rolloff.
 ///
-/// Uses the canonical [`crate::util::generate_pink_noise`] with a reproducible
+/// Uses the canonical [`crate::audio::util::generate_pink_noise`] with a reproducible
 /// seed (44) for deterministic benchmark output.
 fn generate_pink_noise() -> Vec<f32> {
-    crate::util::generate_pink_noise(NOISE_LEN, rand::rngs::StdRng::seed_from_u64(44))
+    crate::audio::util::generate_pink_noise(NOISE_LEN, rand::rngs::StdRng::seed_from_u64(44))
 }
 
 /// Generate brown noise (integrated white noise, 1/f² spectrum).
@@ -1156,7 +1156,7 @@ fn generate_warmup_noise_fallback() -> Vec<f32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(922);
 
     // Pink noise normalised to unit RMS at ~0.20 amplitude (≈ -14 dB).
-    let pink = crate::util::generate_pink_noise(WARMUP_PREPEND_SAMPLES, &mut rng);
+    let pink = crate::audio::util::generate_pink_noise(WARMUP_PREPEND_SAMPLES, &mut rng);
     let pink_gain = 0.20;
 
     // 200 Hz tonal component at ~0.10 amplitude (≈ -20 dB).
@@ -1417,10 +1417,10 @@ fn generate_owner_negative_sequences(
                 }
                 // Bounded low-SNR cell: brown noise at 10 dB on the VAD-gated
                 // speech — the enrolled voice under noise must not trigger.
-                let noisy = crate::util::add_noise_color(
+                let noisy = crate::audio::util::add_noise_color(
                     &speech_audio,
                     10.0,
-                    crate::util::NoiseColor::Brown,
+                    crate::audio::util::NoiseColor::Brown,
                     seed_val,
                 );
                 match crate::audio::wake_word::encode_window(&model, &noisy) {
@@ -1462,7 +1462,7 @@ fn generate_ambient_noise_sequences() -> Vec<Vec<f32>> {
             Err(e) => warn!("Ambient '{label}' level-0: encode failed: {e}"),
         }
         // Level 2: reduced amplitude (-6dB)
-        let attenuated = crate::util::apply_gain(&raw, -6.0);
+        let attenuated = crate::audio::util::apply_gain(&raw, -6.0);
         match crate::audio::wake_word::encode_window(&model, &attenuated) {
             Ok(emb) => embeddings.push(emb),
             Err(e) => warn!("Ambient '{label}' level-1: encode failed: {e}"),
@@ -2988,7 +2988,7 @@ mod tests {
     #[test]
     fn guided_prompt_dsp_deterministic_and_attenuates_hf() {
         let sample_rate = TARGET_SAMPLE_RATE;
-        let rms = |x: &[f32]| crate::util::compute_rms(x);
+        let rms = |x: &[f32]| crate::audio::util::compute_rms(x);
 
         // one_pole_lowpass: deterministic, attenuates 5 kHz through a 2.2 kHz
         // cutoff, passthrough at Nyquist.

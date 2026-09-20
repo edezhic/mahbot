@@ -461,7 +461,7 @@ impl Drop for SuppressAudioDeviceGuard {
 /// Speak `text` with the default voice (M1).
 ///
 /// Spawns a background task that synthesizes audio, plays it via rodio
-/// (cross-platform audio playback), then returns. Silently ignored if TTS is
+/// (the audio output path), then returns. Silently ignored if TTS is
 /// disabled, models aren't ready, audio output is unavailable, or text is empty.
 ///
 /// **Note:** This does NOT trigger model initialization. Models must be loaded
@@ -686,7 +686,7 @@ pub fn synthesize(
     if native_rate == target_sample_rate {
         Ok(samples)
     } else {
-        Ok(crate::util::resample_audio(
+        Ok(crate::audio::util::resample_audio(
             &samples,
             native_rate,
             target_sample_rate,
@@ -2796,7 +2796,7 @@ mod tests {
         let resampled = if native_rate == ASR_SAMPLE_RATE {
             samples
         } else {
-            crate::util::resample_audio(&samples, native_rate, ASR_SAMPLE_RATE)
+            crate::audio::util::resample_audio(&samples, native_rate, ASR_SAMPLE_RATE)
         };
 
         // ── Render WAV ────────────────────────────────────────────────

@@ -253,7 +253,8 @@ pub struct ConfigData {
     pub web_search_provider: Option<String>,
     /// Telegram Bot API token (hot-reloaded on save).
     pub telegram_bot_token: Option<String>,
-    /// Enable local Qwen3-ASR audio transcription.
+    /// Enable local Qwen3-ASR audio transcription (macOS only — the audio
+    /// subsystem has no other platform support).
     ///
     /// When `true` (default) and the model is cached or can be downloaded, audio
     /// transcription runs fully locally via the `qwen-asr` crate with Qwen3-ASR-0.6B.
@@ -263,15 +264,17 @@ pub struct ConfigData {
     /// are replaced with just the icon combo and the temp file is deleted, so
     /// voice messages are not recoverable.
     pub audio_transcription_use_local: Option<String>,
-    /// Enable voice assistant (wake word detection and voice commands).
-    /// Set to `"true"` to enable voice mode.
+    /// Enable voice assistant (wake word detection and voice commands) on
+    /// macOS, where the audio subsystem lives. Set to `"true"` to enable voice
+    /// mode.
     pub voice_enabled: Option<String>,
     /// Enable text-to-speech for the admin's assistant replies (default:
-    /// `"false"`). Set to `"true"` to enable. When enabled, the Assistant's
-    /// replies in the admin's own conversation are spoken aloud via the
-    /// OS-native audio player; every other account's messages stay silent.
+    /// `"false"`; macOS only). Set to `"true"` to enable. When enabled, the
+    /// Assistant's replies in the admin's own conversation are spoken aloud
+    /// through the audio output; every other account's messages stay silent.
     pub tts_enabled: Option<String>,
-    /// Language tag for TTS synthesis (default: `"na"` — language-agnostic).
+    /// Language tag for TTS synthesis (default: `"na"` — language-agnostic;
+    /// macOS only).
     /// Supported codes: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr,
     /// hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk,
     /// vi, na.
@@ -281,7 +284,8 @@ pub struct ConfigData {
     /// results in that language.
     pub tts_language: Option<String>,
     /// JSON-serialized wake word enrollment (v2 schema: prototype + calibration)
-    /// for the voice assistant.  Owned exclusively by the voice pipeline.
+    /// for the voice assistant (macOS only).  Owned exclusively by the voice
+    /// pipeline.
     pub wake_word_templates: Option<String>,
     /// Onboarding state machine: "init" | "finished".
     /// Absent = Init (fresh install). Set by the onboarding flow; existing

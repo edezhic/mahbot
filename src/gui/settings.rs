@@ -12,20 +12,25 @@
 use crate::Role;
 use crate::Workspace;
 use crate::config::{
-    CONFIG, CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY,
-    CONFIG_KEY_MANAGER_MODEL, CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
-    CONFIG_KEY_PROVIDER_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_TTS_ENABLED,
-    CONFIG_KEY_VOICE_ENABLED, CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL, ConfigData,
-    ModelRouting,
+    CONFIG, CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY, CONFIG_KEY_MANAGER_MODEL,
+    CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY, CONFIG_KEY_PROVIDER_KEY,
+    CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL,
+    ConfigData, ModelRouting,
+};
+#[cfg(target_os = "macos")]
+use crate::config::{
+    CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_TTS_ENABLED, CONFIG_KEY_VOICE_ENABLED,
 };
 use crate::tools::custom::ToolListing;
 use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
-    Column, Id, Row, Space, Text, button, column, container, pick_list, row, stack, text,
-    text::IntoFragment, toggler, tooltip,
+    Column, Id, Row, Space, button, column, container, pick_list, row, stack, text, toggler,
+    tooltip,
 };
+#[cfg(target_os = "macos")]
+use iced::widget::{Text, text::IntoFragment};
 use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
@@ -347,11 +352,13 @@ pub enum SettingsMessage {
     /// Detection off (they share the loaded ASR model — the cascade persists
     /// `voice_enabled` away and stops the pipeline). Toggling ON kicks the
     /// model load/download in the background (auto-activates when ready).
+    #[cfg(target_os = "macos")]
     TranscriptionToggle(bool),
     /// Result of the async transcription-toggle persistence. `voice_was_enabled`
     /// carries the pre-toggle wake-word state so a failed persist can roll both
     /// keys (and the pipeline) back. `generation` guards against stale results
     /// from rapid toggling (mirrors [`Self::VoiceToggleResult`]).
+    #[cfg(target_os = "macos")]
     TranscriptionToggleResult {
         generation: u64,
         voice_was_enabled: bool,
@@ -359,32 +366,42 @@ pub enum SettingsMessage {
     },
     /// Retry the local ASR model load/download after a terminal failure
     /// (re-toggling alone cannot recover — a dedicated action is required).
+    #[cfg(target_os = "macos")]
     RetryTranscription,
     // ── Voice assistant messages ──────────────────────────
     /// Toggle voice assistant on/off (immediately activates/deactivates the pipeline).
+    #[cfg(target_os = "macos")]
     VoiceToggle(bool),
     /// Result of async DB persistence after a voice toggle.
     /// The `u64` is a generation counter used to detect stale results
     /// from rapid toggling — if it doesn't match `SettingsState::voice_toggle_gen`,
     /// the result is ignored as stale.
+    #[cfg(target_os = "macos")]
     VoiceToggleResult(u64, Result<(), String>),
     /// Start enrollment session for wake word.
+    #[cfg(target_os = "macos")]
     StartVoiceEnrollment,
     /// Cancel enrollment session.
+    #[cfg(target_os = "macos")]
     CancelVoiceEnrollment,
     /// Retry loading voice models after a [`VoiceStatus::ModelError`].
+    #[cfg(target_os = "macos")]
     RetryVoiceModels,
     /// User typed in the wake word phrase text input.
+    #[cfg(target_os = "macos")]
     WakeWordPhraseInput(EditorAction),
     // ── TTS messages ─────────────────────────────────────
     /// Toggle TTS on/off (persisted to config DB).
+    #[cfg(target_os = "macos")]
     TtsToggle(bool),
     /// Result of async DB persistence after a TTS toggle.
     /// The `u64` is a generation counter used to detect stale results
     /// from rapid toggling — if it doesn't match `SettingsState::tts_toggle_gen`,
     /// the result is ignored as stale.
+    #[cfg(target_os = "macos")]
     TtsToggleResult(u64, Result<(), String>),
     /// Retry TTS model download after a permanent failure.
+    #[cfg(target_os = "macos")]
     TtsRetryModels,
 }
 
@@ -411,7 +428,7 @@ const TEXT_INPUT_KEYS: &[&str] = &[
 /// persist immediately on change. `audio_transcription_use_local` is not a
 /// generic ConfigField key — it is a dedicated
 /// [`SettingsMessage::TranscriptionToggle`] toggle with its own transactional
-/// persist path.
+/// persist path (macOS only, like the rest of the audio settings).
 const IMMEDIATE_KEYS: &[&str] = &[CONFIG_KEY_WEB_SEARCH_PROVIDER];
 
 /// Field id of the custom chat-endpoint URL (the `config:`-prefixed form of
@@ -485,8 +502,8 @@ pub struct SettingsState {
     /// endpoint persist arm can produce a warning, so a single slot
     /// suffices — a keyed map here would be single-key dead state.
     endpoint_warning: Option<String>,
-    /// Last error message rendered in the bottom banner — voice/TTS toggle
-    /// failures and failed custom-endpoint saves.
+    /// Last error message rendered in the bottom banner — failed custom-endpoint
+    /// saves, plus voice/TTS toggle failures on macOS.
     error: Option<String>,
     /// Per-field presentation/undo state for stateless config fields rendered
     /// through the shared single-line editor. Keyed by the canonical field id
@@ -545,14 +562,17 @@ pub struct SettingsState {
     /// Incremented before each `VoiceToggle`; the expected value is
     /// passed through to `VoiceToggleResult` so stale results from
     /// earlier toggles are detected and ignored.
+    #[cfg(target_os = "macos")]
     voice_toggle_gen: u64,
     /// Generation counter for transcription toggle operations.
     /// Incremented before each `TranscriptionToggle`; the expected value is
     /// passed through to `TranscriptionToggleResult` so stale results from
     /// earlier toggles are detected and ignored.
+    #[cfg(target_os = "macos")]
     transcription_toggle_gen: u64,
     /// Transient text input for the wake word phrase.
     /// Not persisted — passed to [`VoiceCommand::StartEnrollment`] on click.
+    #[cfg(target_os = "macos")]
     wake_word_phrase_input: SingleLineEditorState,
 
     // ── TTS state ─────────────────────────────────────────
@@ -560,11 +580,13 @@ pub struct SettingsState {
     /// Incremented before each `TtsToggle`; the expected value is
     /// passed through to `TtsToggleResult` so stale results from
     /// earlier toggles are detected and ignored.
+    #[cfg(target_os = "macos")]
     tts_toggle_gen: u64,
 }
 
 /// Sync the voice assistant pipeline state with `CONFIG.voice_enabled()`.
 /// Called from the immediate `VoiceToggle` handler after the toggle persists.
+#[cfg(target_os = "macos")]
 fn sync_voice_state(enabled: bool) {
     if enabled {
         crate::audio::voice::set_enabled(true);
@@ -606,9 +628,13 @@ impl SettingsState {
             add_user_adding: false,
             custom_tools_state: custom_tools::CustomToolsState::new(),
             model_picker_inputs: std::array::from_fn(|_| SingleLineEditorState::new("")),
+            #[cfg(target_os = "macos")]
             voice_toggle_gen: 0,
+            #[cfg(target_os = "macos")]
             transcription_toggle_gen: 0,
+            #[cfg(target_os = "macos")]
             wake_word_phrase_input: SingleLineEditorState::new(""),
+            #[cfg(target_os = "macos")]
             tts_toggle_gen: 0,
         };
         state.resync_field_editors();
@@ -776,6 +802,7 @@ impl SettingsState {
 
     /// Mirror a config value into both snapshots: the editable `self.config`
     /// and the global `CONFIG`, so a refresh() can't revert the change.
+    #[cfg(target_os = "macos")]
     fn set_both(&mut self, key: &str, value: &str) {
         let _ = self.config.set_string_field(key, value);
         let _ = crate::config::CONFIG.set_string_field(key, value);
@@ -783,12 +810,14 @@ impl SettingsState {
 
     /// Mirror a toggle in both config snapshots: `"true"`/`""` (the empty
     /// string keeps the `non_empty` accessor collapsing to None = disabled).
+    #[cfg(target_os = "macos")]
     fn set_toggle(&mut self, key: &str, enabled: bool) {
         self.set_both(key, if enabled { "true" } else { "" });
     }
 
     /// Shared voice/TTS toggle arm: mirror the new state, fire the per-toggle
     /// side effect, bump the generation counter, then persist to the DB.
+    #[cfg(target_os = "macos")]
     fn run_toggle(
         &mut self,
         key: &'static str,
@@ -818,6 +847,7 @@ impl SettingsState {
 
     /// Shared voice/TTS result arm: ignore stale generations; on DB error
     /// revert both config snapshots and the pipeline via `on_revert`.
+    #[cfg(target_os = "macos")]
     fn handle_toggle_result(
         &mut self,
         key: &str,
@@ -1216,6 +1246,7 @@ impl SettingsState {
             }
 
             // ── Transcription ───────────────────────────────────
+            #[cfg(target_os = "macos")]
             SettingsMessage::TranscriptionToggle(enabled) => {
                 self.transcription_toggle_gen += 1;
                 let generation = self.transcription_toggle_gen;
@@ -1265,6 +1296,7 @@ impl SettingsState {
                     },
                 )
             }
+            #[cfg(target_os = "macos")]
             SettingsMessage::TranscriptionToggleResult {
                 generation,
                 voice_was_enabled,
@@ -1293,12 +1325,14 @@ impl SettingsState {
                     }
                 }
             }
+            #[cfg(target_os = "macos")]
             SettingsMessage::RetryTranscription => {
                 let _ = crate::audio::local_transcriber::retry_init();
                 Task::none()
             }
 
             // ── Voice assistant ─────────────────────────────────
+            #[cfg(target_os = "macos")]
             SettingsMessage::VoiceToggle(enabled) => self.run_toggle(
                 CONFIG_KEY_VOICE_ENABLED,
                 enabled,
@@ -1309,6 +1343,7 @@ impl SettingsState {
                 SettingsMessage::VoiceToggleResult,
                 sync_voice_state,
             ),
+            #[cfg(target_os = "macos")]
             SettingsMessage::VoiceToggleResult(g, result) => self.handle_toggle_result(
                 CONFIG_KEY_VOICE_ENABLED,
                 g,
@@ -1317,6 +1352,7 @@ impl SettingsState {
                 |c| &c.voice_enabled,
                 sync_voice_state,
             ),
+            #[cfg(target_os = "macos")]
             SettingsMessage::TtsToggle(enabled) => self.run_toggle(
                 CONFIG_KEY_TTS_ENABLED,
                 enabled,
@@ -1337,6 +1373,7 @@ impl SettingsState {
                     }
                 },
             ),
+            #[cfg(target_os = "macos")]
             SettingsMessage::TtsToggleResult(g, result) => self.handle_toggle_result(
                 CONFIG_KEY_TTS_ENABLED,
                 g,
@@ -1345,10 +1382,12 @@ impl SettingsState {
                 |c| &c.tts_enabled,
                 |_| {},
             ),
+            #[cfg(target_os = "macos")]
             SettingsMessage::TtsRetryModels => {
                 let _ = crate::audio::tts::retry_download();
                 Task::none()
             }
+            #[cfg(target_os = "macos")]
             SettingsMessage::StartVoiceEnrollment => {
                 let phrase = self.wake_word_phrase_input.text();
                 crate::audio::voice::send_command(
@@ -1356,15 +1395,18 @@ impl SettingsState {
                 );
                 Task::none()
             }
+            #[cfg(target_os = "macos")]
             SettingsMessage::WakeWordPhraseInput(action) => {
                 apply_simple_editor_action(&mut self.wake_word_phrase_input, action)
             }
+            #[cfg(target_os = "macos")]
             SettingsMessage::CancelVoiceEnrollment => {
                 crate::audio::voice::send_command(
                     crate::audio::voice::VoiceCommand::CancelEnrollment,
                 );
                 Task::none()
             }
+            #[cfg(target_os = "macos")]
             SettingsMessage::RetryVoiceModels => {
                 crate::audio::voice::send_command(
                     crate::audio::voice::VoiceCommand::RetryModelLoading,
@@ -1619,10 +1661,13 @@ impl SettingsState {
         } else {
             config_sections
         };
+        // Audio section — macOS only; off macOS no section and no spacer is
+        // pushed, so nothing is left dangling between Models and About.
+        #[cfg(target_os = "macos")]
         let config_sections = config_sections
             .push(self.audio_section())
-            .push(Space::new().height(16))
-            .push(Self::about_section());
+            .push(Space::new().height(16));
+        let config_sections = config_sections.push(Self::about_section());
 
         // Two strict 50/50 columns sharing ONE outer vertical scroll (`vscroll`
         // below). Both columns are `FillPortion(1)` inside a single row, so the
@@ -2794,14 +2839,16 @@ impl SettingsState {
         )
     }
 
-    // ── Audio section ──────────────────────────
+    // ── Audio section (macOS only) ───────────────
     //
     // One 'Audio' section with exactly three rows — Transcription, Wake Word
     // Detection, Text to Speech — each with the toggle and an inline status in
     // the same row. The wake-word enrollment UI (phrase input, Enroll button,
     // enrolled-phrase display, multi-line progress/Cancel) sits below the
-    // three rows.
+    // three rows. The section does not exist off macOS, where there is no
+    // audio subsystem at all.
 
+    #[cfg(target_os = "macos")]
     #[expect(clippy::too_many_lines)]
     fn audio_section(&self) -> Element<'_, SettingsMessage> {
         let transcription_enabled =
@@ -3300,6 +3347,7 @@ fn inline_label(msg: &str, left_pad: f32, color: iced::Color) -> Element<'_, Set
 
 /// Plain-text inline status cell at the default text size — shared body of
 /// the audio-row status arms.
+#[cfg(target_os = "macos")]
 fn status_label<'a>(msg: impl IntoFragment<'a>) -> Element<'a, SettingsMessage> {
     Text::new(msg).size(theme::TEXT_13).into()
 }
@@ -3316,6 +3364,7 @@ fn inline_warning(msg: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
 }
 
 /// The gray "Disabled" inline status label shared by the audio rows.
+#[cfg(target_os = "macos")]
 fn disabled_status() -> Element<'static, SettingsMessage> {
     text("Disabled")
         .size(theme::TEXT_13)
@@ -3325,6 +3374,7 @@ fn disabled_status() -> Element<'static, SettingsMessage> {
 
 /// Toggle + inline status side by side — the shared frame of the three
 /// audio rows (Transcription / Wake Word / Text to Speech).
+#[cfg(target_os = "macos")]
 fn toggle_status_row<'a>(
     toggler: impl Into<Element<'a, SettingsMessage>>,
     status: impl Into<Element<'a, SettingsMessage>>,
@@ -3339,6 +3389,7 @@ fn toggle_status_row<'a>(
 }
 
 /// Inline "status label + Retry" row for a failed download / model load.
+#[cfg(target_os = "macos")]
 fn retry_status_row(
     label: &'static str,
     on_retry: SettingsMessage,
@@ -3374,6 +3425,7 @@ fn section_plus_button(
 }
 
 /// The Cancel button closing each live-enrollment progress column.
+#[cfg(target_os = "macos")]
 fn cancel_enrollment_button() -> Element<'static, SettingsMessage> {
     container(
         button(text("Cancel").size(theme::TEXT_13))
@@ -3386,6 +3438,7 @@ fn cancel_enrollment_button() -> Element<'static, SettingsMessage> {
 
 /// Status text framed by vertical spacers above the Cancel button — the
 /// shared skeleton of the four active-enrollment status columns.
+#[cfg(target_os = "macos")]
 fn enrollment_status_column(status: String) -> Element<'static, SettingsMessage> {
     Column::new()
         .push(Space::new().height(8))
@@ -3759,12 +3812,14 @@ mod tests {
     }
 
     // ── Toggle generation counter & rollback (shared) ──────────────
+    // macOS-only: both toggles drive the audio pipeline.
 
     /// Shared helper for toggle generation-counter and rollback tests.
     /// Parameterised by message constructors and field accessors so the
     /// same 7-scenario sequence (toggle ON, stale result, DB error revert,
     /// re-toggle, successful persist, stale-old-gen, toggle OFF + revert)
     /// is exercised exactly once per toggle without code duplication.
+    #[cfg(target_os = "macos")]
     fn assert_toggle_gen_counter_and_rollback(
         toggle_on: impl Fn(bool) -> SettingsMessage,
         toggle_result: impl Fn(u64, Result<(), String>) -> SettingsMessage,
@@ -3858,6 +3913,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)] // touches the process-global audio::voice pipeline via init_global()
     fn voice_toggle_generation_counter_and_rollback() {
         // The update handler calls sync_voice_state which accesses voice pipeline
@@ -3879,6 +3935,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn tts_toggle_generation_counter_and_rollback() {
         // Set TTS state to READY so that toggling ON does not trigger
         // spawn_or_retry_download() (which requires a Tokio runtime).  The

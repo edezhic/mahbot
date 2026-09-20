@@ -683,7 +683,7 @@ pub struct ChatComposerOptions<'a, M> {
     pub min_height: f32,
     pub max_height: f32,
     /// Action toolbar controls rendered alongside the send button inside the
-    /// input surface (Home role/mic buttons; empty for the plain Board
+    /// input surface (Home's composer controls; empty for the plain Board
     /// composer).
     pub controls: Vec<Element<'a, M>>,
     /// Grey the send button while the input is empty/whitespace-only.
@@ -762,8 +762,8 @@ pub fn chat_composer<'a, M: Clone + 'a>(
         tooltip::Position::Top,
     );
 
-    // Right-aligned action toolbar inside the input surface: controls (Home
-    // role/mic; empty for the plain Board composer) then the send button.
+    // Right-aligned action toolbar inside the input surface: controls (Home's;
+    // empty for the plain Board composer) then the send button.
     let mut toolbar = Row::new()
         .spacing(theme::SPACE_6)
         .align_y(Alignment::Center);

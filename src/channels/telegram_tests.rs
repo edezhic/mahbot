@@ -630,17 +630,22 @@ fn declared_size_refusal_boundaries() {
 }
 
 /// The rejection note is caption-then-note, with an empty caption treated as
-/// absent so no stray blank line reaches the agent.
+/// absent so no stray blank line reaches the agent; a nameless rejection (the
+/// recorded-voice refusal) leaves the name out instead of inventing one.
 #[test]
 fn attachment_rejection_content_shapes() {
     let reason = telegram_download_limit_reason();
     assert_eq!(
-        attachment_rejection_content("report.pdf", NOT_RECEIVED, &reason, Some("my report")),
+        attachment_rejection_content(Some("report.pdf"), NOT_RECEIVED, &reason, Some("my report")),
         format!("my report\n\n[File report.pdf: not received — {reason}]")
     );
     assert_eq!(
-        attachment_rejection_content("report.pdf", NOT_STORED, &reason, None),
+        attachment_rejection_content(Some("report.pdf"), NOT_STORED, &reason, None),
         format!("[File report.pdf: could not be stored — {reason}]")
+    );
+    assert_eq!(
+        attachment_rejection_content(None, NOT_RECEIVED, &reason, None),
+        format!("[File: not received — {reason}]")
     );
 }
 
@@ -1453,12 +1458,14 @@ fn test_parse_attachment_metadata() {
     .unwrap();
     assert_eq!(att.kind, IncomingAttachmentKind::Document);
     assert_eq!(att.mime_type.as_deref(), Some("image/png"));
-    // Voice message
+    // Voice message — its own kind: Telegram carries no file name, and off
+    // macOS the receive path refuses it rather than pretending it is a sound
+    // file it could transcribe.
     let att = TelegramChannel::parse_attachment_metadata(
         &serde_json::json!({"voice": {"file_id": "v", "duration": 5}}),
     )
     .unwrap();
-    assert_eq!(att.kind, IncomingAttachmentKind::Audio);
+    assert_eq!(att.kind, IncomingAttachmentKind::Voice);
     assert_eq!(att.file_id, "v");
     assert!(att.file_name.is_none());
     // Video message
@@ -1604,19 +1611,28 @@ fn attachment_content_format_rules() {
         assert!(!c.contains("[IMAGE:"), "{mime}: should not get [IMAGE:]");
         assert!(c.starts_with("[FILE:"), "{mime}: should use [FILE:]");
     }
-    // Audio kind produces [AUDIO:] marker regardless of extension
+    // A sound file is transcribed where the local audio subsystem exists
+    // ([AUDIO:]) and handed over as an ordinary attachment ([FILE:]) where it
+    // does not — the marker follows the platform, not the extension.
+    let audio_marker = |path: &str| {
+        if cfg!(target_os = "macos") {
+            format!("[AUDIO:{path}]")
+        } else {
+            format!("[FILE:{path}]")
+        }
+    };
     let c = format_attachment_content(
         IncomingAttachmentKind::Audio,
         std::path::Path::new("/tmp/workspace/voice.ogg"),
         None,
     );
-    assert_eq!(c, "[AUDIO:/tmp/workspace/voice.ogg]");
+    assert_eq!(c, audio_marker("/tmp/workspace/voice.ogg"));
     let c = format_attachment_content(
         IncomingAttachmentKind::Audio,
         std::path::Path::new("/tmp/workspace/song.mp3"),
         Some("audio/mpeg"),
     );
-    assert_eq!(c, "[AUDIO:/tmp/workspace/song.mp3]");
+    assert_eq!(c, audio_marker("/tmp/workspace/song.mp3"));
     // Video kind produces [VIDEO:] marker
     let c = format_attachment_content(
         IncomingAttachmentKind::Video,

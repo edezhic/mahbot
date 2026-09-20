@@ -36,12 +36,12 @@ Act ONLY inside these roots — everything else on the filesystem is off-limits:
 
 The daemon's own private temp root is the first one whenever it exists. It holds
 the product's own scratch: shell spills (`.agent/`), research run folders
-(`mahbot-research/`), background-session output, voice/TTS temp, database
-copies, probe and build trees. Every other root is an OS temp area the daemon
-and its shells write to — the shared one on unix, the daemon user's own temp
-directory on Windows and macOS. Each is IN SCOPE in its entirety, not just the
-product's own subfolder inside it. Where the platform gives one directory two
-names — `/tmp` and `/private/tmp` on macOS — either name is in scope.
+(`mahbot-research/`), background-session output, database copies, probe and
+build trees. Every other root is an OS temp area the daemon and its shells write
+to — the shared one on unix, the daemon user's own temp directory on Windows and
+macOS. Each is IN SCOPE in its entirety, not just the product's own subfolder
+inside it. Where the platform gives one directory two names — `/tmp` and
+`/private/tmp` on macOS — either name is in scope.
 
 NEVER act under the daemon's storage root (`~/.mahbot` on unix,
 `%USERPROFILE%\.mahbot` on Windows — its live databases, config and locks —

@@ -2,6 +2,7 @@
 //!
 //! Extracted from the duplicated `AtomicU8` lifecycle blocks (Uninit→Loading→
 //! Ready/Failed) in `audio::tts`, `audio::local_transcriber`, and `embedder`.
+//! The audio consumers are macOS-only; `embedder` is cross-platform.
 //! `ModelState`/`AtomicModelState` provide the shared state representation;
 //! [`ModelLoadGuard`] unifies the byte-identical Loading→Failed Drop guard
 //! used for panic safety in background download tasks (directly by `embedder`
@@ -67,8 +68,11 @@ impl AtomicModelState {
         self.0.store(state as u8, order);
     }
 
-    /// Returns `true` if the state is [`ModelState::Ready`].
+    /// Returns `true` if the state is [`ModelState::Ready`]. Only the
+    /// macOS-only audio subsystem (TTS and local transcription) asks this way;
+    /// the cross-platform embedder keeps its own checks on the raw state.
     #[must_use]
+    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
     pub(crate) fn is_ready(&self) -> bool {
         self.load(Ordering::Acquire) == ModelState::Ready
     }

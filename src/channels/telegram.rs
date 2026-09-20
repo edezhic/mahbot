@@ -97,13 +97,20 @@ struct IncomingAttachment {
     mime_type: Option<String>,
 }
 
-/// The kind of incoming attachment (document, photo, video, or audio).
+/// The kind of incoming attachment (document, photo, video, audio, or recorded
+/// voice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncomingAttachmentKind {
     Document,
     Photo,
     Video,
+    /// A sound file (the `audio` key). On macOS it is transcribed like a
+    /// recorded voice note; with no local audio subsystem elsewhere it takes
+    /// the ordinary file path instead.
     Audio,
+    /// A recorded voice message (the `voice` key). Telegram carries no file
+    /// name for it — OGG/Opus bytes only.
+    Voice,
 }
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
@@ -556,8 +563,11 @@ fn build_reply_reference(message: &serde_json::Value) -> Option<ReplyReference> 
 /// recognized image extension (or image MIME type) use `[IMAGE:/path]` so
 /// enrichment can convert them to native image parts; videos (native
 /// `video`/`video_note`/`animation` messages, or documents with a video
-/// MIME/extension) use `[VIDEO:/path]`; voice and audio messages use
-/// `[AUDIO:/path]`. Everything else uses `[FILE:/path]` — after one last check
+/// MIME/extension) use `[VIDEO:/path]`; audio messages use `[AUDIO:/path]` on
+/// macOS and `[FILE:/path]` (the ordinary attachment path) where no local
+/// audio subsystem exists; a recorded voice message is only ever
+/// transcribed on macOS, so elsewhere it is refused before it reaches this
+/// function. Everything else uses `[FILE:/path]` — after one last check
 /// of the file's own bytes, since a sender can omit both the name and the MIME
 /// type.
 fn format_attachment_content(
@@ -578,8 +588,17 @@ fn format_attachment_content(
         IncomingAttachmentKind::Video | IncomingAttachmentKind::Document if is_video => {
             format!("[VIDEO:{}]", local_path.display())
         }
-        IncomingAttachmentKind::Audio => {
-            format!("[AUDIO:{}]", local_path.display())
+        IncomingAttachmentKind::Audio | IncomingAttachmentKind::Voice => {
+            // macOS transcribes this through the AUDIO marker enrichment
+            // consumes; elsewhere there is no local audio, so a sound file is
+            // handed over as an ordinary attachment (a recorded voice message,
+            // which has no file name, is refused before it gets here).
+            let kind = if cfg!(target_os = "macos") {
+                "AUDIO"
+            } else {
+                "FILE"
+            };
+            format!("[{kind}:{}]", local_path.display())
         }
         _ => {
             // Neither the name nor the declared MIME type classified this
@@ -718,7 +737,10 @@ fn local_attachment_name(
     let prefix = match attachment.kind {
         IncomingAttachmentKind::Photo => "photo",
         IncomingAttachmentKind::Video => "video",
-        IncomingAttachmentKind::Audio => "audio",
+        // A recorded voice message arrives with no `file_name`, so it gets the
+        // generated `audio_<chat>_<message>.<ext>` name — with the generic
+        // fallback extension above, not a recording-specific one.
+        IncomingAttachmentKind::Audio | IncomingAttachmentKind::Voice => "audio",
         IncomingAttachmentKind::Document => "file",
     };
     let fallback = format!("{prefix}_{chat_id}_{message_id}.{ext}");
@@ -734,15 +756,22 @@ fn local_attachment_name(
 }
 
 /// Agent-facing content for a rejected attachment: the caption (when non-empty)
-/// first, then the `[File <name>: <outcome> — <reason>]` note.
+/// first, then the `[File <name>: <outcome> — <reason>]` note. `display_name`
+/// is `None` for an attachment with no usable name to show (a recorded voice
+/// message has none, and [`local_attachment_name`] would invent one with the
+/// wrong extension), which renders the name-less `[File: <outcome> — <reason>]`
+/// instead.
 #[must_use]
 fn attachment_rejection_content(
-    display_name: &str,
+    display_name: Option<&str>,
     outcome: &str,
     reason: &str,
     caption: Option<&str>,
 ) -> String {
-    let note = format!("[File {display_name}: {outcome} — {reason}]");
+    let note = match display_name {
+        Some(name) => format!("[File {name}: {outcome} — {reason}]"),
+        None => format!("[File: {outcome} — {reason}]"),
+    };
     match caption.filter(|c| !c.is_empty()) {
         Some(caption) => format!("{caption}\n\n{note}"),
         None => note,
@@ -995,6 +1024,12 @@ const ATTACHMENT_SAVE_REFUSED_REASON: &str = "the file could not be saved locall
 /// carries the bot token, so it is logged and returned as an `Err` but never
 /// rendered into the user's chat.
 const ATTACHMENT_UPLOAD_FAILED_REASON: &str = "the upload failed";
+
+/// User-facing reason when a recorded voice message arrives off macOS, where
+/// no local audio subsystem exists to transcribe it: it is refused rather than
+/// silently handed on useless.
+#[cfg(not(target_os = "macos"))]
+const VOICE_UNSUPPORTED_REASON: &str = "voice messages are not supported on this platform";
 
 /// The refusal reason for an attachment whose *declared* size exceeds a limit,
 /// or `None` when it is within both. The product cap is checked first, so a
@@ -1813,8 +1848,9 @@ impl TelegramChannel {
     ///
     /// Handles `document`, `photo` (array — takes last element for highest
     /// resolution), `video`, `video_note`, `animation`, `audio`, and `voice`.
-    /// Both `audio` and `voice` map to [`IncomingAttachmentKind::Audio`] since
-    /// there's no separate variant for each.  Returns `None` for text‑only
+    /// `audio` maps to [`IncomingAttachmentKind::Audio`] and `voice` to
+    /// [`IncomingAttachmentKind::Voice`]; the two differ in what the receive
+    /// path can do with them off macOS.  Returns `None` for text‑only
     /// and other unsupported message types.
     ///
     /// `document` is checked first because Telegram sets both `animation` and
@@ -1829,7 +1865,7 @@ impl TelegramChannel {
             ("video_note", IncomingAttachmentKind::Video),
             ("animation", IncomingAttachmentKind::Video),
             ("audio", IncomingAttachmentKind::Audio),
-            ("voice", IncomingAttachmentKind::Audio),
+            ("voice", IncomingAttachmentKind::Voice),
         ] {
             if let Some(v) = message.get(key) {
                 return Self::build_attachment(v, message, kind);
@@ -1885,6 +1921,11 @@ impl TelegramChannel {
     /// message is not an attachment or the sender is unauthorized: an attachment
     /// the bot cannot retrieve or store still yields a message, so the caption
     /// reaches the agent with the failure called out in the content.
+    ///
+    /// Off macOS a recorded voice message is refused (see
+    /// `reject_voice_message`) before any fetch — nothing there can transcribe
+    /// it, and the note names no file. An `audio` sound file is not refused: it
+    /// takes the ordinary path below, so the agent gets the file itself.
     async fn try_parse_attachment_message(
         &self,
         update: &serde_json::Value,
@@ -1896,6 +1937,17 @@ impl TelegramChannel {
         let ctx = self.extract_message_context(message).await?;
 
         let attachment = Self::parse_attachment_metadata(message)?;
+
+        // No local audio here: a recorded voice message cannot be transcribed,
+        // so refuse it before anything is fetched. A sound file (`audio`) is
+        // not affected — it takes the ordinary attachment path below.
+        #[cfg(not(target_os = "macos"))]
+        if attachment.kind == IncomingAttachmentKind::Voice {
+            return Some(
+                self.reject_voice_message(ctx, attachment.caption.as_deref())
+                    .await,
+            );
+        }
 
         // Declared-size gate. Telegram reports the size on most attachments,
         // so reject locally before spending a download; the two limits differ
@@ -2011,8 +2063,7 @@ impl TelegramChannel {
     /// produces a user-visible reply and an agent turn. `outcome` is
     /// [`NOT_RECEIVED`] or [`NOT_STORED`] — it decides whether the note may say
     /// the file never arrived. The name in the note is
-    /// [`local_attachment_name`]'s; the direct Telegram notice is best-effort (a
-    /// send failure is only logged).
+    /// [`local_attachment_name`]'s.
     async fn reject_attachment(
         &self,
         ctx: MessageContext,
@@ -2024,21 +2075,50 @@ impl TelegramChannel {
         let display_name =
             local_attachment_name(attachment, &ctx.chat_id, ctx.message_id, remote_ext);
         let notice = format!("Could not process the file \"{display_name}\": {reason}.");
-        let (_, thread_id) = parse_recipient(&ctx.reply_target);
-        if let Err(e) = self
-            .send_text_chunks(&notice, &ctx.chat_id, thread_id, None)
-            .await
-        {
-            tracing::warn!("Failed to send attachment-failure notice: {e}");
-        }
-
         let content = attachment_rejection_content(
-            &display_name,
+            Some(&display_name),
             outcome,
             reason,
             attachment.caption.as_deref(),
         );
+        self.refuse_with_notice(ctx, &notice, content).await
+    }
+
+    /// Send the user-visible refusal `notice` — best-effort, a send failure is
+    /// only logged — and return the channel message carrying the agent-facing
+    /// `content`.
+    async fn refuse_with_notice(
+        &self,
+        ctx: MessageContext,
+        notice: &str,
+        content: String,
+    ) -> ChannelMessage {
+        let (_, thread_id) = parse_recipient(&ctx.reply_target);
+        if let Err(e) = self
+            .send_text_chunks(notice, &ctx.chat_id, thread_id, None)
+            .await
+        {
+            tracing::warn!(%notice, "Failed to send refusal notice: {e}");
+        }
         ctx.into_channel_message(content, None)
+    }
+
+    /// Refuse a recorded voice message where the local audio subsystem does
+    /// not exist, before the file is fetched. Same shape as
+    /// [`Self::reject_attachment`], except that the note names no file: the
+    /// message carries no file name, and the fallback name
+    /// [`local_attachment_name`] builds has the wrong extension, so naming it
+    /// would mislead.
+    #[cfg(not(target_os = "macos"))]
+    async fn reject_voice_message(
+        &self,
+        ctx: MessageContext,
+        caption: Option<&str>,
+    ) -> ChannelMessage {
+        let notice = format!("Could not process the voice message: {VOICE_UNSUPPORTED_REASON}.");
+        let content =
+            attachment_rejection_content(None, NOT_RECEIVED, VOICE_UNSUPPORTED_REASON, caption);
+        self.refuse_with_notice(ctx, &notice, content).await
     }
 
     /// Build a forwarding attribution prefix from Telegram forward fields.

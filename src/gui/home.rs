@@ -11,7 +11,9 @@ use crate::channels::chat_history::ChatHistoryEntry;
 use crate::channels::reply::{agent_author_label, normalize_reply_text};
 use futures_util::SinkExt;
 use iced::widget::rule;
-use iced::widget::{Column, Id, Space, button, column, container, row, scrollable, text, tooltip};
+#[cfg(target_os = "macos")]
+use iced::widget::tooltip;
+use iced::widget::{Column, Id, Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length, Task};
 use iced_fonts::lucide;
 use std::collections::HashSet;
@@ -223,6 +225,113 @@ fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
     .into()
 }
 
+/// Composer mic button: starts a voice message recording for the Assistant.
+///
+/// macOS-only, like the rest of the audio UI — the button lives in the composer
+/// action toolbar and is the entry point of the manual recording flow whose
+/// state (stop + send / stop + discard, transcribing) is rendered by
+/// [`recording_popup`].
+#[cfg(target_os = "macos")]
+fn mic_control(voice_status: &crate::audio::voice::VoiceStatus) -> Element<'static, HomeMessage> {
+    // The mic is busy while the pipeline owns the mic for any recording
+    // or ASR (manual or wake-word) — the button must not look active
+    // when a new recording would be rejected.
+    let mic_busy = matches!(
+        voice_status,
+        crate::audio::voice::VoiceStatus::Recording
+            | crate::audio::voice::VoiceStatus::RecordingManual
+            | crate::audio::voice::VoiceStatus::Transcribing
+    );
+    // With local transcription disabled the shared ASR model never loads,
+    // so a mic-button recording can never start — present the control as
+    // unavailable instead of a loading state that can never complete.
+    let transcription_disabled = crate::audio::voice::is_transcription_disabled();
+    let recording_unavailable = mic_busy || transcription_disabled;
+
+    let mic_tooltip = if transcription_disabled {
+        "voice recording unavailable — local transcription is disabled"
+    } else {
+        "record voice message"
+    };
+    super::widgets::icon_tooltip_button(
+        lucide::mic::<iced::Theme, iced::Renderer>()
+            .size(theme::TEXT_14)
+            .color(if recording_unavailable {
+                theme::TEXT_MUTED
+            } else {
+                theme::TEXT_SECONDARY
+            }),
+        mic_tooltip,
+        (!recording_unavailable).then_some(HomeMessage::StartVoiceRecording),
+        theme::PAD_3,
+        theme::icon_button_style(recording_unavailable),
+        tooltip::Position::Top,
+    )
+}
+
+/// Composer recording popup: the stop + send / stop + discard controls for a
+/// mic-button recording, or a passive "Transcribing…" indicator while that
+/// recording is being transcribed (no stop controls — the ASR is finalizing).
+/// Collapses to zero height when neither state applies.
+#[cfg(target_os = "macos")]
+fn recording_popup(
+    voice_status: &crate::audio::voice::VoiceStatus,
+) -> Element<'static, HomeMessage> {
+    let recording = matches!(
+        voice_status,
+        crate::audio::voice::VoiceStatus::RecordingManual
+    );
+    // The Transcribing status is shared between the manual and wake-word
+    // paths; only a mic-button recording shows the composer popup.
+    let transcribing = matches!(voice_status, crate::audio::voice::VoiceStatus::Transcribing)
+        && crate::audio::voice::is_manual_recording();
+
+    if recording {
+        let status_label = text("Recording voice message…")
+            .size(theme::TEXT_13)
+            .color(theme::STATUS_ERROR);
+        let send_btn = button(text("Stop + Send").size(theme::TEXT_12))
+            .on_press(HomeMessage::StopVoiceRecordingSend)
+            .style(theme::button_secondary)
+            .padding(theme::PAD_5);
+        let discard_btn = button(text("Stop + Discard").size(theme::TEXT_12))
+            .on_press(HomeMessage::StopVoiceRecordingDiscard)
+            .style(theme::button_secondary)
+            .padding(theme::PAD_5);
+        container(
+            row![
+                status_label,
+                Space::new().width(Length::Fill),
+                send_btn,
+                discard_btn
+            ]
+            .spacing(theme::SPACE_8)
+            .align_y(Alignment::Center),
+        )
+        .padding(theme::PAD_8)
+        .style(theme::surface_container_style)
+        .width(Length::Fill)
+        .into()
+    } else if transcribing {
+        container(
+            row![
+                text("Transcribing voice message…")
+                    .size(theme::TEXT_13)
+                    .color(theme::TEXT_MUTED),
+                Space::new().width(Length::Fill),
+            ]
+            .spacing(theme::SPACE_8)
+            .align_y(Alignment::Center),
+        )
+        .padding(theme::PAD_8)
+        .style(theme::surface_container_style)
+        .width(Length::Fill)
+        .into()
+    } else {
+        Space::new().height(0).into()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum HomeMessage {
     /// Workspace changed (from the footer workspace picker — propagated via Dashboard).
@@ -300,10 +409,13 @@ pub enum HomeMessage {
     /// timeouts from interfering with a fresh send.
     SendingTimeout(u64),
     /// Mic button clicked — start a voice message recording to the Assistant.
+    #[cfg(target_os = "macos")]
     StartVoiceRecording,
     /// Recording popup: stop recording, transcribe, and send the voice message.
+    #[cfg(target_os = "macos")]
     StopVoiceRecordingSend,
     /// Recording popup: stop recording and discard the voice message.
+    #[cfg(target_os = "macos")]
     StopVoiceRecordingDiscard,
     /// The scripted onboarding exchange completed (provider configured) — re-run
     /// the onboarding check (now firing the Phase-2 kickoff).
@@ -1048,53 +1160,17 @@ impl HomeState {
             ))
         };
 
-        // ── Input area ───────────────────────────────────────────
+        // One status snapshot per render, so the mic button in the composer
+        // toolbar below and the recording popup cannot disagree.
+        #[cfg(target_os = "macos")]
         let voice_status = crate::audio::voice::get_status();
-        let recording = matches!(
-            voice_status,
-            crate::audio::voice::VoiceStatus::RecordingManual
-        );
-        // The Transcribing status is shared between the manual and wake-word
-        // paths; only a mic-button recording shows the composer popup.
-        let transcribing = matches!(voice_status, crate::audio::voice::VoiceStatus::Transcribing)
-            && crate::audio::voice::is_manual_recording();
-        // The mic is busy while the pipeline owns the mic for any recording
-        // or ASR (manual or wake-word) — the button must not look active
-        // when a new recording would be rejected.
-        let mic_busy = matches!(
-            voice_status,
-            crate::audio::voice::VoiceStatus::Recording
-                | crate::audio::voice::VoiceStatus::RecordingManual
-                | crate::audio::voice::VoiceStatus::Transcribing
-        );
-        // With local transcription disabled the shared ASR model never loads,
-        // so a mic-button recording can never start — present the control as
-        // unavailable instead of a loading state that can never complete.
-        let transcription_disabled = crate::audio::voice::is_transcription_disabled();
-        let recording_unavailable = mic_busy || transcription_disabled;
 
+        // ── Input area ───────────────────────────────────────────
         // Controls for the composer action toolbar: the mic button.
-        let mut controls: Vec<Element<'_, HomeMessage>> = Vec::new();
-
-        let mic_tooltip = if transcription_disabled {
-            "voice recording unavailable — local transcription is disabled"
-        } else {
-            "record voice message"
-        };
-        controls.push(super::widgets::icon_tooltip_button(
-            lucide::mic::<iced::Theme, iced::Renderer>()
-                .size(theme::TEXT_14)
-                .color(if recording_unavailable {
-                    theme::TEXT_MUTED
-                } else {
-                    theme::TEXT_SECONDARY
-                }),
-            mic_tooltip,
-            (!recording_unavailable).then_some(HomeMessage::StartVoiceRecording),
-            theme::PAD_3,
-            theme::icon_button_style(recording_unavailable),
-            tooltip::Position::Top,
-        ));
+        #[cfg(target_os = "macos")]
+        let controls: Vec<Element<'_, HomeMessage>> = vec![mic_control(&voice_status)];
+        #[cfg(not(target_os = "macos"))]
+        let controls: Vec<Element<'_, HomeMessage>> = Vec::new();
 
         // Composer strip matches the BG_BASE chat pane so the empty space around
         // the rounded bubble blends with the page instead of showing a gray panel;
@@ -1128,52 +1204,10 @@ impl HomeState {
         .into();
 
         // ── Recording popup (stop + send / stop + discard) ───────
-        // While transcribing, the popup stays visible as a passive
-        // "Transcribing…" indicator (no stop controls — the ASR is finalizing).
-        let recording_popup: Element<'_, HomeMessage> = if recording {
-            let status_label = text("Recording voice message…")
-                .size(theme::TEXT_13)
-                .color(theme::STATUS_ERROR);
-            let send_btn = button(text("Stop + Send").size(theme::TEXT_12))
-                .on_press(HomeMessage::StopVoiceRecordingSend)
-                .style(theme::button_secondary)
-                .padding(theme::PAD_5);
-            let discard_btn = button(text("Stop + Discard").size(theme::TEXT_12))
-                .on_press(HomeMessage::StopVoiceRecordingDiscard)
-                .style(theme::button_secondary)
-                .padding(theme::PAD_5);
-            container(
-                row![
-                    status_label,
-                    Space::new().width(Length::Fill),
-                    send_btn,
-                    discard_btn
-                ]
-                .spacing(theme::SPACE_8)
-                .align_y(Alignment::Center),
-            )
-            .padding(theme::PAD_8)
-            .style(theme::surface_container_style)
-            .width(Length::Fill)
-            .into()
-        } else if transcribing {
-            container(
-                row![
-                    text("Transcribing voice message…")
-                        .size(theme::TEXT_13)
-                        .color(theme::TEXT_MUTED),
-                    Space::new().width(Length::Fill),
-                ]
-                .spacing(theme::SPACE_8)
-                .align_y(Alignment::Center),
-            )
-            .padding(theme::PAD_8)
-            .style(theme::surface_container_style)
-            .width(Length::Fill)
-            .into()
-        } else {
-            Space::new().height(0).into()
-        };
+        #[cfg(target_os = "macos")]
+        let recording_popup = recording_popup(&voice_status);
+        #[cfg(not(target_os = "macos"))]
+        let recording_popup: Element<'_, HomeMessage> = Space::new().height(0).into();
 
         // ── Reply preview ────────────────────────────────────────
         // Shown between the message list and the composer while a reply target
@@ -1588,6 +1622,7 @@ impl HomeState {
                 }
                 Task::none()
             }
+            #[cfg(target_os = "macos")]
             HomeMessage::StartVoiceRecording => {
                 // Best-effort pre-flight check surfaced by the pipeline itself
                 // (single source of truth for the blocked-state mapping). The
@@ -1601,12 +1636,14 @@ impl HomeState {
                 );
                 Task::none()
             }
+            #[cfg(target_os = "macos")]
             HomeMessage::StopVoiceRecordingSend => {
                 crate::audio::voice::send_command(
                     crate::audio::voice::VoiceCommand::StopRecordingSend,
                 );
                 Task::none()
             }
+            #[cfg(target_os = "macos")]
             HomeMessage::StopVoiceRecordingDiscard => {
                 crate::audio::voice::send_command(
                     crate::audio::voice::VoiceCommand::StopRecordingDiscard,

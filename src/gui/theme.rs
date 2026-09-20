@@ -654,8 +654,8 @@ pub fn button_transparent(
 }
 
 /// Transparent-background button style with a hover/press highlight. Shared
-/// factory for the chat composer controls (role/mic, send button) and dropdown
-/// menu items — the two differ only in highlight colors and corner radius.
+/// factory for the composer's icon controls and dropdown menu items — the two
+/// differ only in highlight colors and corner radius.
 #[must_use = "button style factory returns a style closure"]
 fn transparent_button_style(
     hover: Color,
@@ -685,8 +685,8 @@ fn transparent_button_style(
     }
 }
 
-/// Icon-only button with a subtle hover/press background (chat composer
-/// role/mic controls, send button). Pass `disabled: true` to suppress the
+/// Icon-only button with a subtle hover/press background (the composer's icon
+/// controls and its send button). Pass `disabled: true` to suppress the
 /// highlight (used for the greyed send button on empty input).
 #[must_use = "button style factory returns a style closure"]
 pub fn icon_button_style(

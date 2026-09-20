@@ -3,8 +3,8 @@
 //! The two short sounds the hands-free voice path plays when a recording
 //! starts and when it stops.  They are the product's own samples — two assets
 //! embedded in the binary and played through the machine's normal audio output
-//! — so they are identical on every platform and consult no operating-system
-//! sound API, library, theme or preference.
+//! — so they never consult an operating-system sound API, library, theme or
+//! preference.
 //!
 //! Cue playback deliberately bypasses [`crate::audio::tts`]'s read-aloud path:
 //! the cues play with read-aloud off, and they must not raise the TTS playback

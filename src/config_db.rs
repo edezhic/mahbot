@@ -5,9 +5,10 @@
 //! - `config_kv` — generic key-value string pairs for runtime configuration.
 //! - `config_model_routing` — per-model provider order.
 
-use crate::config::{
-    CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_VOICE_ENABLED, ModelRouting,
-};
+use crate::config::ModelRouting;
+// Both keys serve only `set_transcription_toggle` below.
+#[cfg(target_os = "macos")]
+use crate::config::{CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_VOICE_ENABLED};
 use crate::db::{self};
 use anyhow::Result;
 
@@ -119,6 +120,7 @@ impl ConfigStore {
     /// transcription OFF while wake word was on, `voice_enabled` is deleted in the
     /// same transaction — a failure then rolls back both keys, so the settings UI
     /// can never diverge from the DB.
+    #[cfg(target_os = "macos")]
     pub async fn set_transcription_toggle(
         &self,
         transcription_enabled: bool,

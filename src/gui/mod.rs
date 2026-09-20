@@ -52,6 +52,7 @@ use iced::{Alignment, Element, Length, Task};
 
 use crate::Role;
 use crate::Workspace;
+#[cfg(target_os = "macos")]
 use crate::audio::voice::VoiceStatus;
 
 use self::menus::ContextMenu;
@@ -383,6 +384,7 @@ pub enum Message {
     /// Close the diff modal.
     CloseDiffModal,
     /// TTS model download progress event.
+    #[cfg(target_os = "macos")]
     TtsDownloadEvent(crate::audio::tts::TtsDownloadEvent),
 }
 
@@ -621,6 +623,7 @@ pub struct Dashboard {
     // ── TTS download progress ───────────────────────────────────
     /// Current TTS download progress: (file_name, progress 0.0–1.0).
     /// `None` when no download is active.
+    #[cfg(target_os = "macos")]
     tts_download_progress: Option<(String, f32)>,
 }
 
@@ -656,6 +659,7 @@ impl Dashboard {
             settings_state: settings::SettingsState::new(),
             show_diff_modal: false,
             git_state: git::GitState::new(),
+            #[cfg(target_os = "macos")]
             tts_download_progress: None,
         }
     }
@@ -1429,11 +1433,13 @@ impl Dashboard {
                 Task::none()
             }
             Message::Nop => Task::none(),
+            #[cfg(target_os = "macos")]
             Message::TtsDownloadEvent(event) => self.handle_tts_download_event(event),
         }
     }
 
     /// Handle a TTS download progress event.
+    #[cfg(target_os = "macos")]
     #[expect(clippy::cast_precision_loss)]
     fn handle_tts_download_event(
         &mut self,
@@ -2226,6 +2232,7 @@ impl Dashboard {
             // re-render, driving the Running Agents page and footer.
             iced::Subscription::run(runtime_change_subscription),
             // TTS download progress subscription (always active while ready).
+            #[cfg(target_os = "macos")]
             iced::Subscription::run(tts_download_subscription).map(Message::TtsDownloadEvent),
             // Diff modal subscription (keyboard shortcuts, auto-refresh).
             // Only active when the modal is open to avoid intercepting
@@ -2269,6 +2276,7 @@ fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
 /// Unlike the hand-rolled channel loop this replaces, an uninitialized
 /// `DOWNLOAD_EVENTS` source yields an empty stream instead of panicking
 /// (unreachable in practice — `tts::init_global` precedes GUI startup).
+#[cfg(target_os = "macos")]
 fn tts_download_subscription()
 -> impl futures_util::Stream<Item = crate::audio::tts::TtsDownloadEvent> {
     use iced::futures::channel::mpsc;
@@ -3012,6 +3020,7 @@ impl Dashboard {
 
     /// Render the TTS download progress indicator in the centre of the footer bar.
     /// Shows the current file name and percentage (e.g. "duration_predictor.onnx 83%").
+    #[cfg(target_os = "macos")]
     fn render_tts_download_progress(&self) -> Element<'_, Message> {
         let Some((file_name, progress)) = &self.tts_download_progress else {
             return Space::new().width(0).into();
@@ -3028,6 +3037,7 @@ impl Dashboard {
     /// [`VoiceStatus::Disabled`] (which is hidden — voice is off).
     /// [`VoiceStatus::Error`] displays the actual error string rather than
     /// a hardcoded message.
+    #[cfg(target_os = "macos")]
     fn render_voice_status() -> Element<'static, Message> {
         let label: String = match crate::audio::voice::get_status() {
             // Hidden when voice is disabled.
@@ -3085,12 +3095,17 @@ impl Dashboard {
             .align_y(Alignment::Center);
 
         // TTS download progress and voice status indicator (center of footer bar)
+        #[cfg(target_os = "macos")]
         let center = row![
             self.render_tts_download_progress(),
             Self::render_voice_status(),
         ]
         .spacing(theme::SPACE_8)
         .align_y(Alignment::Center);
+        // Off macOS there is no audio subsystem, so the centre slot collapses to
+        // nothing — the footer row below is shared and stays untouched.
+        #[cfg(not(target_os = "macos"))]
+        let center = Space::new().width(0);
 
         let right = Row::with_children(
             [Self::render_active_agents(), Self::render_non_agent_calls()]
@@ -3115,6 +3130,7 @@ impl Dashboard {
 }
 
 /// Muted 12px status label with side padding, shown in the centre of the footer bar.
+#[cfg(target_os = "macos")]
 fn footer_status_label(label: String) -> Element<'static, Message> {
     container(
         text(label)

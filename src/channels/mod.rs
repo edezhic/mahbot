@@ -13,6 +13,8 @@ use crate::db;
 use crate::util::UnwrapPoison;
 use crate::{Channel, ChannelMessage, ChatDirection, SendMessage};
 use async_trait::async_trait;
+// The voice channel (macOS-only) is the only `Arc` user in this module.
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -91,10 +93,10 @@ impl BroadcastPersistEntry {
 /// agent responses — used by the per-agent consumer loop in
 /// [`crate::agent::message_router`] and by the raw reply-target delivery path.
 ///
-/// TTS audio playback is handled separately by [`crate::audio::tts::init_listener()`],
-/// which subscribes to [`CHAT_BROADCAST`](crate::CHAT_BROADCAST) and triggers
-/// speech for the admin's own assistant messages.  This function does not
-/// itself invoke any TTS logic.
+/// TTS audio playback is handled separately by `crate::audio::tts::init_listener()`
+/// (macOS-only), which subscribes to [`CHAT_BROADCAST`](crate::CHAT_BROADCAST)
+/// and triggers speech for the admin's own assistant messages.  This function
+/// does not itself invoke any TTS logic.
 ///
 /// Takes explicit `user_name` (canonical user name), `channel` (e.g. "telegram", "gui"),
 /// and primitive fields — does **not** depend on [`crate::SendMessage`], so it can be used
@@ -390,7 +392,10 @@ impl Channel for GuiChannel {
     }
 }
 
-// ── VoiceChannel ──────────────────────────────────────────
+// ── VoiceChannel (macOS-only) ─────────────────────────────
+// The voice channel is the transport for the macOS-only voice pipeline, which
+// is its only producer, so nothing resolves the `"voice"` channel name off
+// macOS — the whole section is gated with the audio subsystem it serves.
 
 /// The voice channel — registered so the message routing system can
 /// resolve the `"voice"` channel name when delivering agent responses.
@@ -403,8 +408,10 @@ impl Channel for GuiChannel {
 /// The voice pipeline runs its own mic-capture loop independently;
 /// `listen()` is a no-op because incoming voice commands flow through
 /// `crate::audio::voice::route_to_agent`, not through a channel listener.
+#[cfg(target_os = "macos")]
 struct VoiceChannel;
 
+#[cfg(target_os = "macos")]
 #[async_trait]
 impl Channel for VoiceChannel {
     /// No-op — voice has no outbound transport. Agent responses are
@@ -433,17 +440,13 @@ impl Channel for VoiceChannel {
 /// Called during bootstrap from `init_message_pipeline`. The channel
 /// registry must already be initialised — callers should ensure
 /// [`crate::CHANNEL_REGISTRY`] has been set before invoking this.
-///
-/// The `VoiceChannel` has a no-op `send()` (agent responses are
-/// delivered via broadcast+persist independently of the registry) and
-/// a no-op `listen()` (the voice pipeline runs its own mic-capture
-/// loop). Registration resolves the `"voice"` channel name so the
-/// message routing system can look it up when constructing replies.
+#[cfg(target_os = "macos")]
 pub fn register_global() {
     let channel: Arc<dyn Channel> = Arc::new(VoiceChannel);
     crate::channel_registry().register(channel);
 }
 
+#[cfg(target_os = "macos")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -22,6 +22,10 @@ exclude = [".DS_Store", "scripts", "benches"]
 # second full-program link that bench runs never exercise.
 default = ["full"]
 full = []
+# Audio dev/test markers. A feature cannot be platform-gated, so off macOS
+# these gate nothing at all: every `voice-tests`/`voice-debug` site lives
+# inside the macOS-only audio subsystem, and the wake-word bench they selected
+# compiles to an inert stub there (see `benches/wake_word.rs`).
 voice-tests = []
 voice-debug = []
 # Gates the grep-engine subprocess end-to-end harness (benches/grep_engine_e2e.rs):
@@ -102,8 +106,6 @@ anyhow = "1.0"
 # Self-replace for cross-platform binary swap during self-update
 self-replace = "1.5"
 
-rodio = { version = "0.22", default-features = false, features = ["playback", "hound"] }
-
 # Utils
 base64 = "0.22"
 # Local IPC for the mahbot debug read-only query endpoint (UDS on Unix,
@@ -161,19 +163,6 @@ strum = { version = "0.27", features = ["derive"] }
 tokenizers = "0.22"
 candle-core = "0.11.0"
 
-# Neural voice activity detection (replaces RMS-based VAD)
-earshot = "1.2"
-
-# Audio capture for voice assistant
-cpal = "0.18"
-
-# Audio decoding for local transcriber input (OGG/Opus → raw PCM)
-ogg = "0.9"
-opus-decoder = "0.1"
-
-# MP3 decoding
-minimp3 = "0.5"
-
 # Image decode/re-encode for reference-image compression (already compiled via
 # iced's image-without-codecs feature; promoted to a direct dependency for the
 # loader). Codec support is deliberately trimmed to PNG/JPEG/WebP only — gif
@@ -226,8 +215,26 @@ libc = "0.2"
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Console", "Win32_System_IO", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Acceleration-carrying candle for the embedder and the TTS ONNX runtime.
 candle-nn = { version = "0.11.0", features = ["accelerate"] }
+
+# ── Local audio subsystem (macOS only) ────────────────────────────────────
+# These exist only for `crate::audio`, which is itself macOS-only — the speech
+# engine behind local transcription and the wake word has no other platform
+# support, and no audio feature has a fallback anywhere. Linux and Windows
+# builds must not pull any of them in.
 qwen-asr = { version = "0.11.0", default-features = false, features = ["blas", "vdsp"] }
+# Read-aloud playback and the wake-word recording cues.
+rodio = { version = "0.22", default-features = false, features = ["playback", "hound"] }
+# Neural voice activity detection (replaces RMS-based VAD).
+earshot = "1.2"
+# Microphone capture for the voice assistant.
+cpal = "0.18"
+# Audio decoding for local transcriber input (OGG/Opus → raw PCM).
+ogg = "0.9"
+opus-decoder = "0.1"
+# MP3 decoding.
+minimp3 = "0.5"
 
 # Computer Use tool (GUI observe/act): accessibility (AXUIElement), input
 # synthesis (CGEvent) and capture (ScreenCaptureKit). Version-aligned objc2
@@ -257,13 +264,18 @@ zbus = "5"
 async-recursion = "1.1"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
+# Same candle, without the Apple-only `accelerate` backend. Needed by the
+# embedder (`src/embedder.rs`); the audio subsystem it also serves on macOS is
+# not built here at all.
 candle-nn = "0.11.0"
-qwen-asr = { version = "0.11.0", default-features = false }
 
 [dev-dependencies]
 http = "1.5"
 serial_test = "3"
 
+# macOS-only (the audio subsystem it exercises): `required-features` cannot be
+# platform-gated, so off macOS the bench target still builds but its file is an
+# inert stub — see benches/wake_word.rs.
 [[bench]]
 name = "wake_word"
 harness = false
@@ -283,18 +295,20 @@ codegen-units = 256
 [profile.dev.package."*"]
 debug = false
 
-# qwen-asr (local speech-to-text, macOS/Linux) is inference code: opt-level 3 +
-# codegen-units 1 keeps transcription fast enough for real-time voice use even
-# in dev builds, where the default opt-level 0 would make the ASR model
-# noticeably slower. This override is deliberately placed under `profile.dev`
-# (not `profile.test`): `[profile.test]` inherits `dev`, so test builds already
-# share the same optimized qwen-asr artifact. A separate `[profile.test.package.qwen-asr]`
+# qwen-asr (local speech-to-text — macOS only, like the rest of the audio
+# subsystem) is inference code: opt-level 3 + codegen-units 1 keeps
+# transcription fast enough for real-time voice use even in dev builds, where
+# the default opt-level 0 would make the ASR model noticeably slower. This
+# override is deliberately placed under `profile.dev` (not `profile.test`):
+# `[profile.test]` inherits `dev`, so test builds already share the same
+# optimized qwen-asr artifact. A separate `[profile.test.package.qwen-asr]`
 # override would produce a SECOND artifact fingerprint (2× disk, one-time full
 # recompile of qwen-asr per clean test run) without any runtime benefit — tests
 # exercise the same optimized code — and could regress warm test-cache reuse.
 # The dependency-compilation behavior of per-package test overrides was verified
 # empirically on cargo 1.97.1; the dev override already covers
 # tests, so no test override is added.
+# Inert on Linux/Windows, where the package is not in the graph at all.
 [profile.dev.package.qwen-asr]
 opt-level = 3
 codegen-units = 1

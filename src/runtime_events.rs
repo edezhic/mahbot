@@ -1,11 +1,11 @@
 //! Process-wide runtime-change events for the GUI dashboard.
 //!
 //! GUI pages read in-memory registries (running agents, non-agent LLM calls,
-//! live transcript snapshots) and the voice pipeline status at render time —
-//! there is no poll loop. When a mutation touches any of those in-memory
-//! sources it broadcasts a [`RuntimeEvent`] here and the dashboard re-renders
-//! on delivery. Emit sites are fire-and-forget; the receiver (the GUI) owns a
-//! coalescing stream so a burst of mutations settles into a single re-render.
+//! live transcript snapshots) at render time — there is no poll loop. When a
+//! mutation touches any of those in-memory sources it broadcasts a
+//! [`RuntimeEvent`] here and the dashboard re-renders on delivery. Emit sites
+//! are fire-and-forget; the receiver (the GUI) owns a coalescing stream so a
+//! burst of mutations settles into a single re-render.
 
 use std::sync::OnceLock;
 
@@ -16,6 +16,7 @@ pub(crate) enum RuntimeEvent {
     /// transcript content changed.
     Registries,
     /// The voice pipeline status value changed.
+    #[cfg(target_os = "macos")]
     VoiceStatus,
 }
 

@@ -664,7 +664,7 @@ async fn download_retry_loop() {
                 let dest_clone = dest.clone();
                 let expected = file.expected_sha256.to_string();
                 let checksum_ok = tokio::task::spawn_blocking(move || {
-                    crate::util::verify_sha256(&dest_clone, &expected).is_ok()
+                    crate::audio::util::verify_sha256(&dest_clone, &expected).is_ok()
                 })
                 .await
                 .unwrap_or_else(|join_err| {

@@ -200,8 +200,8 @@ fn build_provider_and_transcriber(
 /// [`PROVIDER`], hence the swap-before-warmup ordering.
 ///
 /// The local Qwen3-ASR transcriber init no longer lives here — the boot path
-/// spawns it separately (see
-/// [`crate::audio::local_transcriber::spawn_background_init_if_enabled`])
+/// spawns it separately (the macOS-only audio warm-up
+/// `crate::audio::local_transcriber::spawn_background_init_if_enabled`)
 /// after `config::reload_from_db` so its ~4 s load overlaps with the rest of
 /// boot instead of being awaited here.
 pub fn init_global() -> anyhow::Result<()> {
@@ -259,11 +259,15 @@ pub(crate) async fn warmup_provider_from_config(
 /// duplicate network call; the provider-key persist arm passes `true` so
 /// the new credential's pool is pre-warmed in the background.
 ///
-/// Also attempts to load the local Qwen3-ASR transcriber from cache if
-/// `audio_transcription_use_local` is enabled and the transcriber isn't
-/// already loaded. If cached files are missing, a background download is
+/// Also attempts to load the local Qwen3-ASR transcriber (macOS-only) from
+/// cache if `audio_transcription_use_local` is enabled and the transcriber
+/// isn't already loaded. If cached files are missing, a background download is
 /// spawned — subsequent transcription requests return a placeholder until
 /// the download completes.
+// The transcriber re-init is the only await. Where it does not exist the
+// function is still `async`: every caller awaits it on both platforms, and the
+// signature must not become platform-shaped.
+#[cfg_attr(not(target_os = "macos"), expect(clippy::unused_async))]
 pub(crate) async fn recreate_all(config: &crate::config::ConfigData, background_warmup: bool) {
     let (provider, media_transcriber) = build_provider_and_transcriber(config);
 
@@ -282,14 +286,18 @@ pub(crate) async fn recreate_all(config: &crate::config::ConfigData, background_
     }
 
     // Re-init local transcriber if config enables it and it's not already ready.
-    let use_local = config.audio_transcription_use_local.as_deref() != Some("false");
-    if use_local && !crate::audio::local_transcriber::is_loaded() {
-        if crate::audio::local_transcriber::try_init_from_cache().await {
-            tracing::info!("Local Qwen3-ASR transcriber loaded from cache after config reload");
-        } else {
-            tracing::info!(
-                "Local Qwen3-ASR transcriber will be downloaded in background after config reload"
-            );
+    // macOS-only — the local transcriber is part of the audio subsystem.
+    #[cfg(target_os = "macos")]
+    {
+        let use_local = config.audio_transcription_use_local.as_deref() != Some("false");
+        if use_local && !crate::audio::local_transcriber::is_loaded() {
+            if crate::audio::local_transcriber::try_init_from_cache().await {
+                tracing::info!("Local Qwen3-ASR transcriber loaded from cache after config reload");
+            } else {
+                tracing::info!(
+                    "Local Qwen3-ASR transcriber will be downloaded in background after config reload"
+                );
+            }
         }
     }
 }

@@ -113,10 +113,13 @@ pub async fn open_stores() -> anyhow::Result<Arc<crate::logs::LogStore>> {
     // but it is still a start-up failure and must be recorded, not lost.
     crate::agent::message_router::init_global()
         .map_err(|e| record_startup_failure("agent::message_router::init_global", e))?;
-    crate::audio::voice::init_global()
-        .map_err(|e| record_startup_failure("audio::voice::init_global", e))?;
-    crate::audio::tts::init_global()
-        .map_err(|e| record_startup_failure("audio::tts::init_global", e))?;
+    #[cfg(target_os = "macos")]
+    {
+        crate::audio::voice::init_global()
+            .map_err(|e| record_startup_failure("audio::voice::init_global", e))?;
+        crate::audio::tts::init_global()
+            .map_err(|e| record_startup_failure("audio::tts::init_global", e))?;
+    }
     crate::db::init_all_stores()
         .await
         .map_err(|e| record_bring_up_failure(&root, "core", e))?;

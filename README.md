@@ -11,7 +11,7 @@ Mahbot treats software development as a managed pipeline, not a chat session: yo
 Batteries included:
 - __Smooth native GUI__ for the core pipeline management as well as code editor, diff viewer and shell
 - __Telegram bot__ integration that allows you to easily manage the work from your smartphone
-- __Voice control__ using a CPU-optimized local speech-to-text model that turns babble into features (passive wake-word detection wip)
+- __Voice control__ (macOS only) using a CPU-optimized local speech-to-text model that turns babble into features (passive wake-word detection wip)
 - __Modern agentic__ adversarial analysis before dev, review and QA after dev
 - __Good old deterministic__ CI-style diagnostics after every dev round
 - __Background maintenance__ agentic process to clean up the usual videcoding bloat and other code quality issues
@@ -55,8 +55,14 @@ The rest of the setup will be explained and done through the agent. It will help
 
 Beware that as of now mahbot is only regularly tested on macos & linux, so it might still have unexpected bugs on other platforms.
 
+### Audio is macOS only
+
+Everything local about audio — the microphone button, wake-word detection and enrolment, voice commands, local transcription of incoming voice messages, read-aloud replies and audio cues — exists **only on macOS**. The speech engine behind it has no other platform support and nothing here has a fallback, so on Linux and Windows mahbot builds with no audio capability whatsoever: no audio dependency is compiled in, and nothing audio-shaped is offered — no microphone button, no recording popup, no audio section on the settings page, no voice status anywhere.
+
+On those platforms an incoming **voice message** is refused before anything is downloaded: the sender gets a notice saying voice messages are not supported there, and the agent gets an honest note instead of the contentless marker. A plain **sound file** is not refused — it is saved and handed to the agent like any other attachment. Nothing is transcribed from audio and there is no cloud transcription fallback.
+
+Any local model directory an earlier release downloaded on those platforms (`~/.mahbot/models/qwen3-asr-0.6b/` and `~/.mahbot/models/supertonic3/` on unix, the same paths under `%USERPROFILE%\.mahbot\` on Windows) is simply unreachable now. Nothing deletes it and no stored setting is purged; if you want the disk space back, remove those directories by hand.
+
 ### Building from source on Windows
 
-Windows is not a supported platform yet — a full build does not complete because the local speech-recognition dependency behind the voice features has no Windows support, and what to do about that is still an open decision.
-
-Building there from source otherwise needs a C/C++ toolchain plus the Windows SDK it links against (the Visual Studio Build Tools `Desktop development with C++` workload provides both), because several dependencies (ring, zstd-sys, libz-sys, onig_sys, minimp3-sys, libgit2-sys) compile C during the build. Our own source does type-check, lint and compile for Windows — `scripts/windows-cross-check.sh` in the repository verifies that by hand (dev-only tooling, not part of the published crate).
+Windows is not a supported platform yet, so expect rough edges. Building there from source needs a C/C++ toolchain plus the Windows SDK it links against (the Visual Studio Build Tools `Desktop development with C++` workload provides both), because several dependencies (ring, zstd-sys, libz-sys, onig_sys, libgit2-sys) compile C during the build. Our own source type-checks, lints and compiles for Windows — `scripts/windows-cross-check.sh` in the repository verifies that by hand (dev-only tooling, not part of the published crate). That check only compiles: nothing is linked into a runnable binary and nothing is executed, so it is not a claim that Windows actually works.

@@ -95,17 +95,20 @@ async fn bootstrap_mahbot() -> Result<()> {
         .await
         .map_err(|e| mahbot::boot::record_startup_failure("config::reload_from_db", e))?;
 
-    // Local Qwen3-ASR transcriber: start the load-or-download chain as a
-    // background task. Config is authoritative here (honors a user-set
+    // macOS-only local Qwen3-ASR transcriber: start the load-or-download chain
+    // as a background task. Config is authoritative here (honors a user-set
     // audio_transcription_use_local=false) and this runs BEFORE the provider
     // init below, so the ~4s model load overlaps with the rest of boot. Never
     // awaited — the app and background services start regardless.
+    #[cfg(target_os = "macos")]
     mahbot::audio::local_transcriber::spawn_background_init_if_enabled();
     mahbot::providers::init_global()
         .map_err(|e| mahbot::boot::record_startup_failure("providers::init_global", e))?;
 
-    // Try to load TTS models from cache; if not available, spawn background download.
-    // Only run when TTS is enabled in config to avoid unnecessary ~400 MB download.
+    // macOS-only TTS model load: try the cache first, otherwise spawn the
+    // background download. Only runs when TTS is enabled in config, to avoid an
+    // unnecessary ~400 MB download.
+    #[cfg(target_os = "macos")]
     if mahbot::audio::tts::is_config_enabled() {
         // Open the OS audio output device for a TTS-enabled boot (matches the
         // pre-change behavior where init_global opened it unconditionally).
@@ -349,8 +352,9 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::bun::run_bun_management(),
     );
 
-    // Voice assistant pipeline — runs in background, manages wake word
-    // detection, command recording, transcription, and routing.
+    // macOS-only voice-assistant pipeline: runs in the background, managing
+    // wake-word detection, command recording, transcription, and routing.
+    #[cfg(target_os = "macos")]
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -492,8 +496,9 @@ fn init_message_pipeline(
         .set(chat_tx)
         .expect("CHAT_BROADCAST already set — should be first init");
 
-    // Spawn the TTS listener which subscribes to CHAT_BROADCAST and triggers
-    // audio playback for matching agent responses.
+    // macOS-only TTS listener: subscribes to CHAT_BROADCAST and triggers audio
+    // playback for matching agent responses.
+    #[cfg(target_os = "macos")]
     mahbot::audio::tts::init_listener();
 
     // Initialize the channel registry (empty — channels register below).
@@ -541,10 +546,11 @@ fn init_message_pipeline(
         });
     }
 
-    // Always register the voice channel so the message routing system can
-    // resolve the "voice" channel name when delivering agent responses.
-    // There is no listener — the voice pipeline runs its own mic-capture
-    // loop managed by `run_voice_pipeline`.
+    // Register the voice channel so the message routing system can resolve the
+    // "voice" channel name when delivering agent responses. There is no
+    // listener — the voice pipeline runs its own mic-capture loop managed by
+    // `run_voice_pipeline` — and the whole voice pipeline is macOS-only.
+    #[cfg(target_os = "macos")]
     mahbot::channels::register_global();
 
     rx
@@ -1322,9 +1328,10 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     let original_content = msg.content.clone();
 
     // ── Media-marker enrichment (audio transcription, image processing) ──
-    // Runs BEFORE broadcast so the GUI receives transcription text instead
-    // of raw `[AUDIO:path]` markers.  Media-marker enrichment turns images
-    // into native data-URI parts carrying the original bytes (re-encoded to a
+    // Runs BEFORE broadcast so the GUI receives the enriched form instead of
+    // raw `[AUDIO:path]` markers (on macOS the transcription text, elsewhere the
+    // honest "not supported" note). Media-marker enrichment turns images into
+    // native data-URI parts carrying the original bytes (re-encoded to a
     // bounded JPEG only when they would exceed the encoded-payload cap) and
     // videos into a workspace copy + transcription. Link enrichment runs
     // separately AFTER broadcast to avoid showing AI-generated URL summaries in

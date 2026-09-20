@@ -3,6 +3,11 @@
 //! recording cues ([`cue`]).
 //!
 //! All audio-related modules are consolidated here under `crate::audio::*`.
+//! The whole subsystem is **macOS only** (see the `cfg` on the module in
+//! `lib.rs`): the speech engine it is built on has no other platform support,
+//! and nothing here has a fallback. Linux and Windows builds do not contain any
+//! of this, and the surfaces that used to reach into it either disappear or
+//! answer honestly instead (a voice message is refused at intake there).
 //!
 //! Wake word detection runs entirely on the shared Qwen3-ASR encoder
 //! ([`wake_word`]) — no separate embedding model, no trainable head, no
@@ -11,6 +16,7 @@
 pub(crate) mod cue;
 pub mod local_transcriber;
 pub mod tts;
+pub(crate) mod util;
 pub mod voice;
 pub(crate) mod wake_word;
 
@@ -142,7 +148,7 @@ pub(crate) async fn ensure_downloaded(
                 meta.len(),
                 path.display()
             );
-        } else if let Err(e) = crate::util::verify_sha256(path, sha256) {
+        } else if let Err(e) = crate::audio::util::verify_sha256(path, sha256) {
             warn!("{label} corrupt, re-downloading {}: {e}", path.display());
         } else {
             return Ok(false);

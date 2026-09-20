@@ -304,6 +304,8 @@ pub(crate) enum DownloadSizeCheck {
     /// Require downloaded bytes to equal the Content-Length header (when present).
     Exact,
     /// Require at least `min_bytes` downloaded (for servers that omit Content-Length).
+    /// Only the macOS-only TTS model download uses this policy.
+    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
     Min(u64),
     /// No size validation.
     None,
@@ -312,8 +314,8 @@ pub(crate) enum DownloadSizeCheck {
 /// Stream a file download with on-the-fly SHA256 verification and atomic
 /// tmp+rename — the single canonical path for model downloads.
 ///
-/// * `expected_sha256` — empty skips verification (same semantics as
-///   `verify_sha256`).
+/// * `expected_sha256` — empty skips verification (same semantics as the
+///   macOS-only `crate::audio::util::verify_sha256`).
 /// * `timeout` — per-request timeout; `None` defers to the client's.
 /// * `progress` — invoked `progress(0, total)` before the first byte
 ///   ("started"), then per chunk; callers throttle as needed. `total` is 0

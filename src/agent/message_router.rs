@@ -52,7 +52,7 @@ use crate::{Channel, ChatEvent, Role, SendMessage};
 /// shutdown.
 ///
 /// Known limitations:
-/// - Voice channel: TTS speaks this as "robot warning retry" (acceptable for now).
+/// - Voice channel (macOS): TTS speaks this as "robot warning retry" (acceptable for now).
 /// - Emoji rendering varies across terminals and clients.
 const AGENT_FAILURE_EMOJI: &str = "🤖⚠️🔄";
 

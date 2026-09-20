@@ -1042,9 +1042,8 @@ fn reset_vad() {
 ///
 /// On macOS, CoreAudio returns `kAudioUnitErr_NoConnection` (-10875)
 /// when the application has not been granted microphone access.  We
-/// also check for common cross-platform error-text patterns so the
-/// user sees a clear `MicPermissionDenied` status instead of a
-/// generic `MicDisconnected`.
+/// also check common error-text patterns so the user sees a clear
+/// `MicPermissionDenied` status instead of a generic `MicDisconnected`.
 fn is_mic_permission_error(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}");
     msg.contains("NoConnection")
@@ -1096,7 +1095,7 @@ fn convert_and_send_audio_to_pipeline<T, F>(
     let resampled = if sample_rate == SAMPLE_RATE {
         mono
     } else {
-        crate::util::resample_audio(&mono, sample_rate, SAMPLE_RATE)
+        super::util::resample_audio(&mono, sample_rate, SAMPLE_RATE)
     };
     // try_send: drop-newest policy when the bounded channel is full
     // (see MIC_CHANNEL_CAPACITY docs).
@@ -1323,7 +1322,7 @@ fn compute_utterance_quality(samples: &[f32], noise_rms: Option<f32>) -> Utteran
     // heuristic (estimate_snr_energy) which measures speech dynamic range
     // rather than true SNR.
     let snr_db = if let Some(noise_rms) = noise_rms {
-        let speech_rms = crate::util::compute_rms(samples);
+        let speech_rms = super::util::compute_rms(samples);
         if noise_rms > 1e-10 && speech_rms > noise_rms {
             20.0 * (speech_rms / noise_rms).log10()
         } else {
@@ -1394,7 +1393,7 @@ fn estimate_snr_energy(samples: &[f32]) -> f32 {
         if chunk.len() < FRAME_LENGTH / 2 {
             continue; // Skip partial trailing frames
         }
-        frame_rms.push(crate::util::compute_rms(chunk));
+        frame_rms.push(super::util::compute_rms(chunk));
     }
 
     if frame_rms.len() < 3 {
@@ -4217,7 +4216,7 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                     let pre_speech_end = ctx.audio_buffer.len().saturating_sub(speech_boundary);
                     if pre_speech_end > 0 {
                         // Shared RMS helper.
-                        let rms = crate::util::compute_rms(&ctx.audio_buffer[..pre_speech_end]);
+                        let rms = super::util::compute_rms(&ctx.audio_buffer[..pre_speech_end]);
                         ctx.noise_rms_estimate = Some(rms);
                     }
                 }
