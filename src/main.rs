@@ -624,10 +624,9 @@ fn main() -> Result<()> {
         }
     }
 
-    // Hidden grep-engine subcommand: served by the shell tool's read-only
+    // Hidden grep-engine subcommand: served by the shell tool's transparent
     // grep interception. Also dispatched before lock acquisition — the daemon
     // holds the flock, so a normally-dispatched second process would fail.
-    #[cfg(unix)]
     if std::env::args().nth(1).as_deref() == Some("__grep-engine") {
         let code = mahbot::run_grep_engine(&std::env::args().skip(2).collect::<Vec<_>>());
         std::process::exit(code);

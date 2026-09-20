@@ -36,6 +36,10 @@ use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 
 use super::scan::{self, CdScan};
+// The platform whose shell runs the validated command string, read from the
+// module tree's single source ([`crate::tools::shell::SHELL_PLATFORM`]) — the
+// guard's own reading, like the engine's, is that one value.
+use super::{SHELL_PLATFORM, ShellPlatform};
 
 mod windows;
 
@@ -47,23 +51,6 @@ pub enum ShellMode {
     /// Read-only shell — only inspection commands allowed.
     ReadOnly,
 }
-
-/// The platform whose shell runs the validated command string (`sh -c` on unix,
-/// `cmd.exe /C` on Windows). The guard's platform rules key on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ShellPlatform {
-    Unix,
-    Windows,
-}
-
-/// The running process's [`ShellPlatform`] — the single source every platform
-/// rule in this module reads. Its spawn side is [`super::build_shell_command`]
-/// (`cmd.exe /C` on Windows, `sh -c` elsewhere); the two must not drift.
-const SHELL_PLATFORM: ShellPlatform = if cfg!(windows) {
-    ShellPlatform::Windows
-} else {
-    ShellPlatform::Unix
-};
 
 // ── Const tables ─────────────────────────────────────────────────────────
 
@@ -263,9 +250,9 @@ impl CheckContext {
 
     /// [`Self::for_workspace`] with an explicit platform — the only production
     /// path is `for_workspace`, and this constructor exists so both platforms'
-    /// verdicts are drivable from any host's unit-test lane: the platform is a
-    /// value, never a `cfg` branch.
-    fn for_platform(workspace_root: &Path, platform: ShellPlatform) -> Self {
+    /// verdicts are drivable from any host's unit-test lane (and by the grep
+    /// engine's platform pins): the platform is a value, never a `cfg` branch.
+    pub(super) fn for_platform(workspace_root: &Path, platform: ShellPlatform) -> Self {
         Self {
             workspace_root: workspace_root.to_path_buf(),
             temp_roots: crate::tools::path::allowed_temp_roots(),
@@ -3117,8 +3104,11 @@ fn scan_time_operand_head<'a>(words: &[&'a str], mut i: usize) -> (usize, Vec<&'
 /// Shared with [`super::command_word_basename`]: the guard's dispatch and the
 /// profile/basename derivation must agree on what a literal command name is.
 pub(super) fn classify_verb_word(w: &str) -> VerbClass<'_> {
-    // Unix-only, like the engine rewrite this arm serves: elsewhere the
-    // accept-set must stay exactly as it was.
+    // Unix-only: this arm widens the accept-set for a single-quoted command
+    // word, which is the spelling the unix engine rewrite uses. On Windows the
+    // rewrite's double-quoted absolute path is read by this module's own
+    // [`resolve_unprovable_verb`] instead — it hands the word to the Windows
+    // layer's verb key — so no counterpart arm belongs here.
     #[cfg(unix)]
     if let Some((content, true)) = scan::strip_outer_quotes(w) {
         return if content.is_empty() {

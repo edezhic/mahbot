@@ -1,32 +1,82 @@
 //! Transparent grep/egrep/fgrep interception for the shell tool, in BOTH
 //! read-only and full modes (the engine itself is inherently read-only). The
 //! read-only branch re-validates the rewrite through `shell::readonly` before
-//! running it, and the rewrite's verb is a shell-quoted absolute path, so the
-//! guard must accept that spelling for the mode to serve anything at all.
+//! running it, and the rewrite's verb is a quoted absolute executable path
+//! (single-quoted on unix, double-quoted on Windows), so the guard must accept
+//! that spelling for the mode to serve anything at all.
 //!
-//! The shell guard passes commands to a real shell. Grep-family invocations
-//! that can be served are rewritten to a hidden `__grep-engine` subcommand of
-//! the current binary (dispatched before instance-lock acquisition in
-//! `main()`), which runs the ripgrep substrate (grep-regex/grep-searcher + the
-//! ignore crate for rg-default recursive-walk exclusions). Substitution is
-//! per-segment: an unservable grep (single-file perf gate, unsupported flag,
-//! compound/nested shape, …) is kept verbatim while a servable sibling grep
-//! elsewhere in the command is still served — one bad member no longer poisons
-//! the whole command. Anything not provably safe executes the original command
-//! unchanged (fallback); the engine itself re-validates and `exec`s the real
-//! grep on any runtime doubt.
+//! The shell guard passes commands to a real shell, so the analysis is per
+//! platform and reads the same single value the spawn side does
+//! ([`SHELL_PLATFORM`]): `sh -c` on unix, `cmd.exe /C` on Windows, whose
+//! segmenting, quoting, verb dispatch and `cd` grammar the `windows`
+//! submodule owns. Every platform *decision* reads that one runtime value —
+//! passed through the analysis as a parameter (so a host test lane can drive
+//! either platform) and read as the constant on the engine side — and every
+//! verb list is consulted through the platform's own key
+//! ([`list_key`]/[`windows::verb_key`]), so the interpreter's case- and
+//! `.exe`-insensitive dispatch applies wherever a verb is classified; only OS
+//! APIs (`exec`, `creation_flags`, the SIGPIPE disposition) are `#[cfg]`-gated.
+//! Grep-family invocations that can be served are rewritten to
+//! a hidden `__grep-engine` subcommand of the current binary (dispatched
+//! before instance-lock acquisition in `main()`), which runs the ripgrep
+//! substrate (grep-regex/grep-searcher + the ignore crate for rg-default
+//! recursive-walk exclusions). Substitution is per-segment: an unservable grep
+//! (single-file perf gate, unsupported flag, compound/nested shape, …) is kept
+//! verbatim while a servable sibling grep elsewhere in the command is still
+//! served. Anything not provably safe executes the original command unchanged
+//! (fallback).
+//!
+//! That per-segment tolerance is unix-only. On Windows an unserved member would
+//! be left to run a `grep` the platform does not have, and the interpreter's
+//! "not recognized" failure is the very status a "no match" produces elsewhere,
+//! so a command carrying a grep-family invocation is either fully served by the
+//! engine or refused as an explicit failure ([`unserved_failure`],
+//! [`GrepServe::refusal`]), except for the shapes listed below, which are left
+//! to the platform as written.
+//! That decision is fail-closed on *words*, not on meanings: a segment that
+//! merely carries a grep-family word in a followed program's argument list
+//! refuses too ([`GREP_INTRODUCERS`]) — unless that program owns the search
+//! itself ([`SEARCH_OWNING_VERBS`]) — and a line the cmd model cannot read at
+//! all refuses when a command-position search can still be seen in it
+//! ([`unreadable_line_search`]); both over-refusals are deliberate, and the
+//! loud failure names the cause. The shapes left to the platform carry no grep
+//! member in command position: a search another program owns
+//! ([`SEARCH_OWNING_VERBS`] — `git grep …`, `docker … grep …`,
+//! `ssh host grep …` — read as a skipped member, never claimed), one in the
+//! argument list of a program no list names (`foo grep x`), a command word that
+//! is no grep verb — a path-spelled program (`.\grep x f.txt`), a grep word
+//! glued to a leading `{` (`{grep x f.txt`; `{grep` is no shell verb on either
+//! platform, and its `(` spelling is refused as an unreadable line instead), or
+//! a redirect glued to the verb (`grep>x f.txt`) — and the
+//! `find … -exec grep … \;` spelling, whose unquoted `;` stops the cmd reading
+//! before any member exists. Those run the platform's own program and report
+//! that program's outcome — an error when it is missing or reads the spelling
+//! differently, never the engine's empty match set. The engine itself
+//! re-validates and hands the member back to the real grep on any runtime doubt
+//! — in place via `exec` on unix; on Windows, where there is no system `grep` to
+//! replace ourselves with, it reports the reason on stderr and exits with the
+//! sentinel code the parent refuses the call on, alongside
+//! [`ENGINE_REFUSAL_MARKER`] — the marker keeps that refusal recognisable when a
+//! pipeline tail masks the exit status.
 //!
 //! The engine enables the fast matcher (SIMD literal prefilter) and uses a
 //! parallel recursive walk, so cross-file output ordering may differ from the
 //! host BSD grep (in-file ordering is stable). The approved behavioral deltas:
 //! recursive walks skip hidden/gitignored content (rg defaults; a served tail
-//! like `grep -rn … | wc -l` sees that filtered stream), and `-o` + alternation
-//! stays fail-closed (a match-set/span difference, not an ordering one).
+//! like `grep -rn … | wc -l` sees that filtered stream), `-o` + alternation
+//! stays fail-closed (a match-set/span difference, not an ordering one), and a
+//! word with a redirect glued to it (`grep -rn x>log .`) is served with the
+//! operator inside the pattern and the redirect dropped, where `sh` splits the
+//! two and would search for `x` writing to `log` (Windows refuses that spelling
+//! instead — [`windows::has_glued_redirect`]).
 //!
 //! Parity target is the host BSD grep under the shell tool's pinned
 //! `LC_ALL=C.UTF-8`. The macOS-gated differential matrix is the authoritative
 //! parity gate; recursive-walk rows compare as sorted line-sets (parallel
-//! ordering), everything else byte-exact. Grep decisions are recorded in the
+//! ordering), everything else byte-exact. There is no such gate on Windows
+//! (no host, no system `grep`): that lane's reading is argued in `windows` and
+//! its one host-testable piece, [`windows::fnmatch`], is pinned differentially
+//! against this host's own `fnmatch`. Grep decisions are recorded in the
 //! dedicated `grep_telemetry` table (logs DB), not the general log stream.
 
 use std::fs;
@@ -38,9 +88,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::tools::path::shell_quote;
 use crate::tools::shell::SHELL_PIPE_READ_CAP;
+use crate::tools::shell::scan::CdScan;
 use crate::tools::shell::scan::strip_heredoc_bodies;
 use crate::util::UnwrapPoison;
 use crate::util::is_word_char;
+
+use super::{SHELL_PLATFORM, ShellPlatform};
+
+mod windows;
 
 // ── Protocol constants ────────────────────────────────────────────────────
 
@@ -58,13 +113,42 @@ const BINARY_WINDOW: usize = 32 * 1024;
 /// Engine self-cap on written output; the shell pipe reader caps at the same.
 const OUTPUT_CAP: usize = SHELL_PIPE_READ_CAP;
 /// Sentinel exit code: engine could not serve and could not exec grep either.
-/// The parent re-runs the original command on this code.
+/// Unix: the parent re-runs the original command on this code. Windows: the
+/// parent refuses the call — there is no system `grep` to re-run there — and
+/// reports the engine's own stderr reason to the agent.
 pub(super) const ENGINE_FAILED_EXIT: i32 = 3;
+/// Exit code for a member whose downstream pipe closed. On unix the default
+/// SIGPIPE disposition produces it (128 + SIGPIPE) and this constant is unused;
+/// on Windows there is no SIGPIPE, so the equivalent `BrokenPipe` write error
+/// exits with the same code — a `grep … | head` tail must stop the walk rather
+/// than let it scan the whole tree.
+#[cfg_attr(unix, expect(dead_code, reason = "the unix close path is SIGPIPE"))]
+const BROKEN_PIPE_EXIT: i32 = 128 + 13;
 /// Stderr signature of a stale self-update binary (one lacking the hidden
 /// subcommand) running full main() and dying at instance-lock acquisition —
-/// its exit 1 is a legitimate grep no-match code, so the parent re-runs on
-/// this message instead. Mirrors `self_update::acquire_lock`'s error text.
+/// its exit 1 is a legitimate grep no-match code, so the parent treats this
+/// message like the sentinel exit instead: unix re-runs the original command,
+/// Windows refuses the call. Mirrors `self_update::acquire_lock`'s error text.
 pub(super) const STALE_BINARY_LOCK_MSG: &str = "Another instance of mahbot is already running";
+/// Engine stderr marker on a run that could not serve its member. The parent
+/// refuses a Windows call on this marker even when the sentinel exit status was
+/// masked by a pipeline tail (`grep … | tail -1` carries the tail's status),
+/// which would otherwise reach the agent looking like an empty match set. It is
+/// emitted on its own line — the parent recognises it by line equality, never as
+/// a substring, so a served run whose matched line merely echoes the token is
+/// not mistaken for a refusal — so the parent's cause extraction still reads the
+/// human reason from the lines around it. Like the stream-size marker it rides
+/// stderr, so three member-side spellings lose it: merging stderr into the
+/// stream, redirecting fd 2 to a file (`grep … 2>err.txt | tail -1`), and a
+/// preceding member flooding the parent's first-256 KB stderr cap
+/// (`SHELL_PIPE_READ_CAP`) before the engine starts. Where the file swallows it
+/// and the tail's exit status masks the sentinel, an unserved search can still
+/// surface looking like an empty result. Accepted residual. A fourth loss is
+/// outside the engine: when cmd.exe cannot launch the program the rewrite names
+/// (this binary removed or quarantined after the probe accepted it), the run
+/// carries the interpreter's own "not recognized" status and no marker at all —
+/// also accepted, since the probe has just validated that path.
+pub(super) const ENGINE_REFUSAL_MARKER: &str = "__mahbot_grep_engine_unserved__";
 /// Engine stderr marker carrying the byte count consumed from a stdin-fed
 /// stream (best-effort: -m/-l early stops report the consumed prefix,
 /// SIGPIPE-killed chains may flush nothing, and member-side/shell-level
@@ -72,8 +156,14 @@ pub(super) const STALE_BINARY_LOCK_MSG: &str = "Another instance of mahbot is al
 /// agent-visible stderr and logs the count (per-call stream bytes are
 /// recorded nowhere else).
 const STREAM_SIZE_MARKER: &str = "__mahbot_stream_bytes__";
-/// Specs larger than this fall back (argv-size hygiene).
+/// Specs larger than this are not served on unix: the payload rides a single
+/// argv entry there (argv-size hygiene).
 const MAX_SPEC_JSON: usize = 64 * 1024;
+/// The Windows limit: the payload rides a scratch file, not the command line,
+/// so only a pathological expansion (a glob matching tens of thousands of
+/// operands) hits it — the argv bound above would refuse ordinary `grep -rn
+/// <pat> *` searches, whose expansion is large but perfectly servable.
+const MAX_SPEC_FILE: usize = 4 * 1024 * 1024;
 /// Searcher line-buffer cap; exceeding it is a grep-style error (exit 2).
 const HEAP_LIMIT: usize = 512 * 1024 * 1024;
 
@@ -98,7 +188,9 @@ struct EngineSpec {
     operands: Vec<Operand>,
     /// Expected canonical working directory (the parent's tracked cwd).
     cwd: String,
-    /// Original post-expansion argv for the exec-in-place fallback.
+    /// Original post-expansion argv for the exec-in-place fallback (unix only:
+    /// the Windows engine has no `grep` to replace itself with and exits on the
+    /// sentinel instead).
     fallback: Vec<String>,
     /// The member feeds a pipeline tail: its stdout must not be capped, so
     /// downstream members see the full stream (byte-identity with grep).
@@ -158,6 +250,35 @@ pub(super) struct GrepServe {
     pub rewritten: Option<String>,
     /// Per-grep-member decisions; empty when the command is not greppable.
     pub outcomes: Vec<GrepOutcome>,
+    /// Scratch spec files the rewrite refers to (the Windows hand-off — the
+    /// spec cannot ride on the cmd.exe command line); empty on unix. The
+    /// caller owns them and removes them when the call finishes.
+    pub spec_files: Vec<PathBuf>,
+    /// The short cause of the search this platform could not serve, when the
+    /// command does carry one. Always `None` on unix: an unserved member keeps
+    /// falling back to the real `grep` there, so nothing is refused. On Windows
+    /// the caller turns it into a tool error through [`unserved_failure`] — the
+    /// single place every refusal's agent-facing message is rendered.
+    pub refusal: Option<String>,
+}
+
+/// The agent-facing failure for a search the engine refuses to serve (the
+/// Windows value of [`GrepServe::refusal`]). It becomes the tool error, so it
+/// must be unmistakable for a result: it names the cause and says the search did
+/// not run rather than matched nothing. Every refusal path — the serve
+/// decision's own cause and the engine's reported one alike — renders its
+/// message through here, so those two guarantees cannot drift between them.
+///
+/// No remedy is offered: which commands the engine can serve, and this
+/// platform's quoting and `%` rules, are the shell description's business, and
+/// one repeated here would be wrong for the causes no rewrite can avoid (an
+/// unavailable engine, an unquotable hand-off path).
+pub(super) fn unserved_failure(reason: &str) -> String {
+    format!(
+        "Search not served: the built-in grep engine cannot serve this command \
+         on this platform, so the search did NOT run — this is not an empty \
+         match set (cause: {reason})."
+    )
 }
 
 /// Aggregate telemetry fields derived purely from the per-member outcomes
@@ -175,11 +296,15 @@ pub(super) struct GrepTelemetryShape {
 }
 
 impl GrepServe {
-    /// A serve decision that keeps the original command running (no rewrite).
-    fn not_rewritten(outcomes: Vec<GrepOutcome>) -> Self {
+    /// A serve decision that keeps the original command running (no rewrite):
+    /// every analyzed member stays as-is, and `refusal` carries the Windows
+    /// failure when the platform refuses the command instead of running it.
+    fn not_rewritten(outcomes: Vec<GrepOutcome>, refusal: Option<String>) -> Self {
         Self {
             rewritten: None,
             outcomes,
+            spec_files: Vec::new(),
+            refusal,
         }
     }
 
@@ -217,48 +342,157 @@ impl GrepServe {
     }
 }
 
-/// Try to rewrite `command` into an engine-served equivalent. Returns the
-/// rewritten command plus per-grep serve decisions (for telemetry). The
-/// engine is inherently read-only (it preserves non-grep segments verbatim),
-/// so the caller runs it in both ReadOnly and Full modes; Unix only.
+/// Try to rewrite `command` into an engine-served equivalent, using the
+/// running process's shell platform and engine probe. The engine is inherently
+/// read-only (it preserves non-grep segments verbatim), so the caller runs it
+/// in both ReadOnly and Full modes.
 pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> GrepServe {
-    let Some(home) = pinned_home() else {
-        return GrepServe::not_rewritten(Vec::new());
+    serve_command(
+        command,
+        workspace_root,
+        pinned_home().as_deref(),
+        SHELL_PLATFORM,
+        // The probe is deferred to the point where a member is servable (see
+        // `serve_command`), so a shell call carrying no search never spawns it.
+        engine_available,
+    )
+}
+
+/// The Windows refusal for a serve decision that keeps the original command
+/// running: the short cause of the search the command is known to carry, and
+/// always `None` on unix, where an unserved member keeps falling back to the
+/// real `grep`.
+fn refusal(platform: ShellPlatform, cause: Option<String>) -> Option<String> {
+    if platform == ShellPlatform::Windows {
+        cause
+    } else {
+        None
+    }
+}
+
+/// A serve decision demoted to the original command: no rewrite, every member
+/// marked not-served with `reason` (the row's served field must match the
+/// ACTUAL execution), and the platform's refusal — the command is known to
+/// carry a search at every call site.
+fn demoted(platform: ShellPlatform, mut outcomes: Vec<GrepOutcome>, reason: &str) -> GrepServe {
+    all_not_served(&mut outcomes, reason);
+    let refusal = refusal(platform, Some(reason.to_string()));
+    GrepServe::not_rewritten(outcomes, refusal)
+}
+
+/// The single routing decision for one command: a served rewrite, or the
+/// original command unchanged. The platform and the engine probe are explicit
+/// parameters so both platforms' routing — and every demotion path — is
+/// drivable from any host's unit-test lane.
+///
+/// The probe is a closure, not a result: answering it spawns the full binary,
+/// so it is asked only once a complete analysis has left something to serve. A
+/// command carrying no search never pays for it, and neither does one whose
+/// members all turned out unservable.
+///
+/// On unix an unserved member keeps falling back to the real `grep`, so only a
+/// produced rewrite ever changes what runs. On Windows a command carrying a
+/// grep-family invocation is either fully served or refused
+/// ([`GrepServe::refusal`]) — a half-served command would leave a member running
+/// a program the platform has not got, which the module header explains must
+/// never reach the shell.
+///
+/// `home` is the shell's pinned `$HOME`; `None` (no home directory resolved)
+/// means nothing that could resolve `~` is served — except on Windows, where
+/// nothing expands `~` at all and no analysis decision consults it, so the
+/// analysis proceeds without one.
+fn serve_command(
+    command: &str,
+    workspace_root: &Path,
+    home: Option<&Path>,
+    platform: ShellPlatform,
+    engine_ready: impl Fn() -> bool,
+) -> GrepServe {
+    let windows = platform == ShellPlatform::Windows;
+    let home = match home {
+        Some(home) => home,
+        // `resolve_operand`/`resolve_cd` never read `home` on Windows (their
+        // `~` arms are unix-only), so an empty placeholder is never consulted —
+        // the routing pin `windows_serves_without_a_home` holds this.
+        None if windows => Path::new(""),
+        None => return GrepServe::not_rewritten(Vec::new(), None),
     };
-    let (specs, shapes, rewritten, mut outcomes) =
-        match analyze_command(command, workspace_root, &home, false) {
-            Ok(v) => v,
-            Err(fail) => {
-                // Pre-analysis structural failures (NoGrep/Heredoc/SegmentEmpty)
-                // carry no grep member — no telemetry row is written. Otherwise
-                // the per-member outcomes are preserved so an all-skipped
-                // command still records its shape; a would-be serve discarded
-                // by a structural abort (untrackable `cd`) is demoted so the
-                // row's served field matches the ACTUAL (real-grep) execution.
-                if fail.outcomes.is_empty() {
-                    return GrepServe::not_rewritten(Vec::new());
-                }
-                tracing::debug!(command = command, %fail.reason, "grep engine: fallback");
-                let AnalyzeFailure {
-                    reason,
-                    mut outcomes,
-                } = fail;
-                if outcomes.iter().any(|o| o.served) {
-                    all_not_served(&mut outcomes, &reason.to_string());
-                }
-                return GrepServe::not_rewritten(outcomes);
+    // Single-file members are served on Windows: there is no host grep there to
+    // be faster than, so the perf gate that keeps them on the real binary on
+    // unix would only lose the serve.
+    let allow_single = windows;
+    let Analyzed {
+        specs,
+        shapes,
+        segments,
+        outcomes,
+        unserved,
+    } = match analyze_command(command, workspace_root, home, platform, allow_single) {
+        Ok(analyzed) => analyzed,
+        Err(fail) => {
+            let AnalyzeFailure {
+                reason,
+                mut outcomes,
+                unserved,
+            } = fail;
+            // The refusal cause: the member cause when a member exists, else —
+            // Windows only — the tolerant command-position scan, which decides
+            // whether a structural abort (`;`, heredoc, an unreadable line, a
+            // trailing connector, all of which abort before any member exists)
+            // even carried a search. A `NoGrep` line was read in full and has
+            // no search, however the naive split reads it.
+            let cause = unserved.or_else(|| {
+                (windows
+                    && !matches!(reason, Fallback::NoGrep)
+                    && unreadable_line_search(command, platform))
+                .then(|| reason.to_string())
+            });
+            // Pre-analysis structural failures carry no grep member — no
+            // telemetry row is written. Otherwise the per-member outcomes are
+            // preserved so an all-skipped command still records its shape; a
+            // would-be serve discarded by a structural abort (untrackable `cd`)
+            // is demoted so the row's served field matches the ACTUAL
+            // (fallback) execution.
+            if outcomes.is_empty() {
+                return GrepServe::not_rewritten(Vec::new(), refusal(platform, cause));
             }
-        };
-    if !engine_available() {
-        all_not_served(&mut outcomes, "engine unavailable");
-        return GrepServe::not_rewritten(outcomes);
-    }
-    for spec in &specs {
-        if !spec_json_ok(spec) {
-            all_not_served(&mut outcomes, "spec exceeds payload limit");
-            return GrepServe::not_rewritten(outcomes);
+            tracing::debug!(command = command, %reason, "grep engine: fallback");
+            if outcomes.iter().any(|o| o.served) {
+                all_not_served(&mut outcomes, &reason.to_string());
+            }
+            return GrepServe::not_rewritten(outcomes, refusal(platform, cause));
         }
+    };
+    // A member the engine cannot serve is kept verbatim in the rewrite. On unix
+    // that member is a real grep and the sibling serves still win; on Windows it
+    // would run a program the platform does not have, so the whole command is
+    // refused rather than half-served.
+    if let Some(cause) = unserved {
+        return demoted(platform, outcomes, &cause);
     }
+    if !engine_ready() {
+        return demoted(platform, outcomes, "engine unavailable");
+    }
+    // Serialized once per member: the same JSON is measured against the
+    // platform's payload bound here and rendered into the fragment below.
+    let jsons: Vec<String> = specs.iter().map(spec_json).collect();
+    let limit = match platform {
+        ShellPlatform::Unix => MAX_SPEC_JSON,
+        ShellPlatform::Windows => MAX_SPEC_FILE,
+    };
+    if jsons.iter().any(|json| json.len() > limit) {
+        return demoted(platform, outcomes, "spec exceeds payload limit");
+    }
+    // Only now — every analysis decision made, the whole command servable — is
+    // the rewrite rendered, so the Windows hand-off's scratch files cannot be
+    // created and then abandoned by a later demotion.
+    let (rewritten, spec_files) = match join_rewritten(&segments, &jsons, platform) {
+        Ok(rendered) => rendered,
+        Err(reason) => {
+            tracing::debug!(command = command, %reason, "grep engine: fallback");
+            return demoted(platform, outcomes, &reason.to_string());
+        }
+    };
     // Both served forms log at DEBUG — gate-relaxation volume telemetry is
     // too noisy for INFO (the dedicated telemetry table is the source of
     // truth). The stdin field marks producer-first stdin-fed serves.
@@ -280,8 +514,12 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> GrepSer
         }
     }
     GrepServe {
-        rewritten: (!specs.is_empty()).then_some(rewritten),
+        // `analyze_command` hands back `Err` when it served no member, so a
+        // rewritten command here always carries at least one.
+        rewritten: Some(rewritten),
         outcomes,
+        spec_files,
+        refusal: None,
     }
 }
 
@@ -364,18 +602,22 @@ fn lightweight_scan(command: &str) -> (bool, usize, String) {
     (recursive, operand_count, flag_str)
 }
 
-/// Rewrite `command` for a harness-supplied workspace/home. The production
-/// serve gate (`engine_available`) is deliberately bypassed so the parity and
-/// guard harnesses can drive the rewrite directly; the analyser's own
-/// fallbacks still apply, and so does the spec-size cap — enforced here, the
-/// way the production path enforces it in `try_serve_command`.
-#[cfg(any(test, feature = "grep-engine-e2e"))]
+/// Rewrite `command` for a harness-supplied workspace/home, on the unix
+/// platform the `sh`-driven e2e harness runs on. The production serve gate
+/// (`engine_available`) is deliberately bypassed so the harness can drive the
+/// rewrite directly; the analyser's own fallbacks still apply, and so does the
+/// spec-size cap — enforced here, the way the production path enforces it in
+/// [`serve_command`].
+#[cfg(feature = "grep-engine-e2e")]
 fn served_rewrite(command: &str, workspace_root: &Path, home: &Path) -> Option<String> {
-    let (specs, _, rewritten, _) = analyze_command(command, workspace_root, home, false).ok()?;
-    if specs.is_empty() || !specs.iter().all(spec_json_ok) {
-        return None;
-    }
-    Some(rewritten)
+    serve_command(
+        command,
+        workspace_root,
+        Some(home),
+        ShellPlatform::Unix,
+        || true,
+    )
+    .rewritten
 }
 
 #[cfg(feature = "grep-engine-e2e")]
@@ -392,9 +634,15 @@ pub fn grep_engine_rewrite_for_test(
 /// Whether a served spec exercises the parallel recursive directory walk
 /// (`-r`/`-R` with at least one directory operand). Cross-file worker ordering
 /// is non-deterministic for such rows, so parity comparisons relax to sorted
-/// line-sets; in-file ordering stays stable. Only the macOS parity tests and
-/// the e2e harness use this, so a plain build leaves it intentionally unused.
-#[cfg_attr(not(any(test, feature = "grep-engine-e2e")), allow(dead_code))]
+/// line-sets; in-file ordering stays stable. Only the macOS-gated parity matrix
+/// and the e2e harness use this, so every other lane leaves it unused.
+#[cfg_attr(
+    not(any(all(test, target_os = "macos"), feature = "grep-engine-e2e")),
+    expect(
+        dead_code,
+        reason = "used only by the macOS-gated parity matrix and the e2e harness"
+    )
+)]
 fn spec_uses_parallel_walk(spec: &EngineSpec) -> bool {
     spec.flags.r
         && spec
@@ -411,10 +659,11 @@ fn spec_uses_parallel_walk(spec: &EngineSpec) -> bool {
 #[doc(hidden)]
 #[must_use]
 pub fn served_spec_walks_directory(command: &str, workspace_root: &Path, home: &Path) -> bool {
-    let Ok((specs, _, _, _)) = analyze_command(command, workspace_root, home, false) else {
+    let Ok(analyzed) = analyze_command(command, workspace_root, home, ShellPlatform::Unix, false)
+    else {
         return false;
     };
-    specs.iter().any(spec_uses_parallel_walk)
+    analyzed.specs.iter().any(spec_uses_parallel_walk)
 }
 
 /// Split `bytes` on `\n`/`\0` record terminators and sort the non-empty records
@@ -438,9 +687,11 @@ fn pinned_home() -> Option<PathBuf> {
     directories::UserDirs::new().map(|d| d.home_dir().to_path_buf())
 }
 
-/// Spec JSON must stay within the argv-size hygiene bound.
-fn spec_json_ok(spec: &EngineSpec) -> bool {
-    serde_json::to_string(spec).is_ok_and(|j| j.len() <= MAX_SPEC_JSON)
+/// Serialize one spec for the hand-off. Never fails in practice (plain owned
+/// data), and one function so the payload bound and the rendered fragment are
+/// measured on the same string.
+fn spec_json(spec: &EngineSpec) -> String {
+    serde_json::to_string(spec).expect("spec serializes")
 }
 
 /// Remove engine stream-size marker line(s) from stderr; returns the last
@@ -486,41 +737,117 @@ pub(super) fn strip_stream_size_marker(stderr: &mut Vec<u8>) -> Option<u64> {
     last
 }
 
-/// Per-process probe result (cached — a probe spawns the full binary, so it
-/// must not run per call). Real stale-binary safety nets: the engine's version
-/// check + exec-in-place fallback, and the parent's lock-message re-run for
-/// binaries lacking the subcommand entirely (a probe-to-dispatch swap remains
-/// possible and is covered by those).
-static ENGINE_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// Process-lifetime mark that the engine has answered a probe: only THAT is
+/// cached. A probe spawns the full binary, so a success must not be paid for
+/// again — but a failure must be able to heal, because on Windows the result is
+/// load-bearing (no system `grep` to fall back to) and a one-shot failure (a
+/// spawn refused under resource pressure, the binary caught mid-swap during a
+/// self-update) would otherwise turn every later search into a hard refusal
+/// until the daemon restarts. A persistently stale binary then pays one probe
+/// per call that has something to serve — [`serve_command`] asks only after the
+/// analysis produced a servable member — and the engine's own version check and
+/// the parent's lock-message handling are that case's other safety nets.
+static ENGINE_AVAILABLE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 fn engine_available() -> bool {
-    *ENGINE_AVAILABLE.get_or_init(|| {
-        let Some(exe) = std::env::current_exe().ok() else {
-            return false;
-        };
-        std::process::Command::new(exe)
-            .arg(ENGINE_VERB)
-            .arg("--probe")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    })
+    if ENGINE_AVAILABLE.get().is_some() {
+        return true;
+    }
+    let available = probe_engine();
+    if available {
+        // Only success is cached — see the mark's doc.
+        let _ = ENGINE_AVAILABLE.set(());
+    }
+    available
 }
 
-/// Rewrite a spec into the shell command fragment the engine runs as.
-fn build_rewritten(spec: &EngineSpec) -> String {
-    let json = serde_json::to_string(spec).expect("spec serializes");
-    let exe = std::env::current_exe().expect("current exe resolved");
-    format!(
-        "{} {} {}",
-        shell_quote(&exe.to_string_lossy()),
-        ENGINE_VERB,
-        shell_quote(&json)
-    )
+fn probe_engine() -> bool {
+    let Some(exe) = std::env::current_exe().ok() else {
+        return false;
+    };
+    let mut probe = std::process::Command::new(exe);
+    probe
+        .arg(ENGINE_VERB)
+        .arg("--probe")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // No console window for the probe child (the daemon also has none).
+    // `creation_flags` is a Windows-only API, so this — unlike every platform
+    // *decision* in this module tree — has to be a `cfg`.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        probe.creation_flags(super::CREATE_NO_WINDOW);
+    }
+    probe.status().is_ok_and(|s| s.success())
+}
+
+/// Render one served grep member into the shell fragment that runs the engine:
+/// the current executable, the engine verb and the spec, plus the member's own
+/// redirect tokens kept verbatim.
+///
+/// The spec reaches the engine by argv on unix (`sh -c` puts no meaningful
+/// payload limit on it) and by scratch file on Windows ([`windows::write_spec_file`]):
+/// cmd.exe caps its command line at 8191 characters and re-parses it before the
+/// program sees the argv, so the JSON — which carries the agent's pattern and
+/// operands — cannot ride on it. That scratch file is pushed onto `files`, the
+/// caller's list of files to remove when the call finishes.
+///
+/// `exe` is this binary's path; it is an argument rather than a lookup so the
+/// one machine-dependent part of a rewrite (an installation path cmd.exe reads
+/// differently) is drivable from a test. `json` is the already-serialized spec —
+/// serializing it here as well would repeat the work for a large operand set,
+/// and the caller measures that same string against the payload bound.
+fn render_served(
+    json: &str,
+    redirects: &[String],
+    platform: ShellPlatform,
+    exe: &str,
+    files: &mut Vec<PathBuf>,
+) -> Result<String, Fallback> {
+    let mut fragment = String::new();
+    match platform {
+        ShellPlatform::Unix => {
+            fragment.push_str(&shell_quote(exe));
+            fragment.push(' ');
+            fragment.push_str(ENGINE_VERB);
+            fragment.push(' ');
+            fragment.push_str(&shell_quote(json));
+        }
+        ShellPlatform::Windows => {
+            // Quote and allocate before writing: a refused argument must not
+            // leave a scratch file behind (see [`join_rewritten`]). The
+            // allocated name goes onto `files` before the write: it is the
+            // caller's to remove whether or not the write completes, or a
+            // failed/partial write (ENOSPC/EIO) leaks the file it created.
+            let quoted_exe = windows::cmd_quote(exe).map_err(Fallback::Handoff)?;
+            let path = windows::spec_file_path();
+            let quoted_path =
+                windows::cmd_quote(&path.to_string_lossy()).map_err(Fallback::Handoff)?;
+            files.push(path.clone());
+            windows::write_spec_file(&path, json).map_err(Fallback::Handoff)?;
+            fragment.push_str(&quoted_exe);
+            fragment.push(' ');
+            fragment.push_str(ENGINE_VERB);
+            fragment.push(' ');
+            fragment.push_str(windows::SPEC_FILE_FLAG);
+            fragment.push(' ');
+            fragment.push_str(&quoted_path);
+        }
+    }
+    if !redirects.is_empty() {
+        fragment.push(' ');
+        fragment.push_str(&redirects.join(" "));
+    }
+    Ok(fragment)
 }
 
 /// Why a command was not served (telemetry + fail-closed decisions).
+///
+/// One enum for both platforms: the variants a platform cannot reach are simply
+/// never constructed on it — `CmdSyntax` and `Expansion` come from the cmd.exe
+/// model, `SingleFile` from the unix-only perf gate (Windows serves single-file
+/// lookups, having no host grep to prefer).
 #[derive(Debug)]
 enum Fallback {
     NoGrep,
@@ -539,6 +866,23 @@ enum Fallback {
     StdinOperands,
     StdinRecursive,
     SegmentEmpty,
+    /// A spelling of the command this module's cmd.exe reading cannot follow: a
+    /// `^`, a command group, an unbalanced quote, an empty member — all of them
+    /// spellings the interpreter itself reads — or a word whose glued operator
+    /// this engine's token classifier keeps inside the word
+    /// ([`windows::has_glued_redirect`]). The rendered cause names the engine as
+    /// the reader that cannot follow it, never the interpreter's syntax.
+    CmdSyntax(String),
+    /// A word of the member carries two or more `%`, so cmd.exe may expand a
+    /// `%…%` pair in it before any program sees its argv, and quoting cannot
+    /// prevent that ([`windows::has_percent_expansion`] documents the per-word
+    /// superset this test deliberately is — which is why the rendered cause
+    /// states the character count rather than an expansion: `100%%` carries no
+    /// pair).
+    Expansion(String),
+    /// The engine could not be handed what it needs: this binary's own path (any
+    /// platform) or the scratch file the Windows transport carries the spec in.
+    Handoff(String),
 }
 
 impl std::fmt::Display for Fallback {
@@ -560,18 +904,24 @@ impl std::fmt::Display for Fallback {
             Fallback::StdinOperands => write!(f, "stdin with operands"),
             Fallback::StdinRecursive => write!(f, "stdin with -r"),
             Fallback::SegmentEmpty => write!(f, "empty command or pipeline member"),
+            Fallback::CmdSyntax(s) => write!(f, "cmd.exe spelling the engine cannot read: {s}"),
+            Fallback::Expansion(s) => write!(f, "two `%` in {s}"),
+            Fallback::Handoff(s) => write!(f, "hand-off refused: {s}"),
         }
     }
 }
 
 /// A wholesale `analyze_command` failure: the command could not be served, so
-/// the whole original runs. `reason` names the cause; `outcomes` preserves the
-/// per-grep-member decisions collected before the abort (empty for pre-analysis
-/// structural failures like NoGrep/Heredoc/SegmentEmpty).
+/// the whole original runs (unix) or the call is refused (Windows). `reason`
+/// names the cause; `outcomes` preserves the per-grep-member decisions collected
+/// before the abort (empty for pre-analysis structural failures like
+/// NoGrep/Heredoc/SegmentEmpty); `unserved` is the first unserved search member
+/// (see [`Analyzed::unserved`]) — always `None` on unix.
 #[derive(Debug)]
 struct AnalyzeFailure {
     reason: Fallback,
     outcomes: Vec<GrepOutcome>,
+    unserved: Option<String>,
 }
 
 impl From<Fallback> for AnalyzeFailure {
@@ -579,6 +929,7 @@ impl From<Fallback> for AnalyzeFailure {
         AnalyzeFailure {
             reason,
             outcomes: Vec::new(),
+            unserved: None,
         }
     }
 }
@@ -595,27 +946,63 @@ fn all_not_served(outcomes: &mut [GrepOutcome], reason: &str) {
     }
 }
 
+/// One member of the rewritten command: the original text kept verbatim, or a
+/// served grep member (index into the analyzed specs) with the member-side
+/// redirect tokens preserved verbatim in its spelling.
+enum OutSegment {
+    Verbatim(String),
+    Served { spec: usize, redirects: Vec<String> },
+}
+
 /// Analyze output: one spec per served grep, the shape of every served
 /// multi-member pipeline (members, verbs — grep-family normalized to "grep",
-/// stdin-fed flag) for volume telemetry, the rewritten command, and the
+/// stdin-fed flag) for volume telemetry, the rewritten command's members with
+/// their original connectors (rendered by [`join_rewritten`], so no scratch
+/// file is created before the whole command is known to be servable), and the
 /// per-grep serve decisions (telemetry).
-type AnalyzeOutput = (
-    Vec<EngineSpec>,
-    Vec<(usize, String, bool)>,
-    String,
-    Vec<GrepOutcome>,
-);
+struct Analyzed {
+    specs: Vec<EngineSpec>,
+    shapes: Vec<(usize, String, bool)>,
+    segments: Vec<(OutSegment, String)>,
+    outcomes: Vec<GrepOutcome>,
+    /// Windows only (`None` on unix, where an unserved member simply falls back
+    /// to the real `grep`): the cause of the FIRST member the engine cannot
+    /// serve — see [`SEARCH_OWNING_VERBS`] for the one shape that is left
+    /// unserved-but-allowed. A non-`None` value refuses the whole command
+    /// ([`serve_command`]): a member kept verbatim in the rewrite would run a
+    /// `grep` this platform does not have.
+    unserved: Option<String>,
+}
+
+/// Record the first member this platform cannot serve. Windows only: there an
+/// unserved member refuses the whole command (the platform has no `grep` to
+/// fall back to), and the FIRST cause wins, naming the member the agent's
+/// rewrite should start from. A no-op on unix, where the member simply falls
+/// back to the real `grep`.
+fn note_unserved(platform: ShellPlatform, unserved: &mut Option<String>, reason: &str) {
+    if platform == ShellPlatform::Windows && unserved.is_none() {
+        *unserved = Some(reason.to_string());
+    }
+}
 
 /// Analyze a full shell command: segment it, track cds, serve every grep
-/// member, keep everything else verbatim. Returns the analyze output or the
-/// first fallback reason.
+/// member, keep everything else verbatim. Returns the [`Analyzed`] members or
+/// the first fallback reason.
 #[expect(clippy::too_many_lines)] // per-segment serve/skip decision loop
 fn analyze_command(
     command: &str,
     workspace_root: &Path,
     home: &Path,
+    platform: ShellPlatform,
     allow_single: bool,
-) -> Result<AnalyzeOutput, AnalyzeFailure> {
+) -> Result<Analyzed, AnalyzeFailure> {
+    // A `;` outside quotes is not a command separator to cmd.exe (several of its
+    // own commands read it as an argument delimiter), so the fragments around it
+    // are not the commands the agent may have meant: fail closed rather than
+    // serve a member whose reading the guard's own line scan disputes.
+    if platform == ShellPlatform::Windows && windows::unquoted_semicolon(command) {
+        return Err(Fallback::CmdSyntax("unquoted `;`".into()).into());
+    }
     let stripped = strip_heredoc_bodies(command);
     if stripped != command {
         // strip_heredoc_bodies drops the `<<` marker, body and terminator (they
@@ -623,7 +1010,7 @@ fn analyze_command(
         // leave a bare non-grep member reading inherited stdin — fail-closed.
         return Err(Fallback::Heredoc.into());
     }
-    let segments = split_segments(&stripped)?;
+    let segments = split_segments(&stripped, platform)?;
     if segments.is_empty() {
         return Err(Fallback::SegmentEmpty.into());
     }
@@ -632,7 +1019,8 @@ fn analyze_command(
     // pipeline-shape telemetry class with a mislabeled reason.
     if !segments.iter().any(|(seg, _)| {
         let verb = first_word(seg);
-        is_grep_verb(verb) || segment_contains_grep(seg, verb)
+        is_grep_verb(verb, platform)
+            || segment_contains_grep(seg, &list_key(verb, platform), platform)
     }) {
         return Err(Fallback::NoGrep.into());
     }
@@ -654,8 +1042,8 @@ fn analyze_command(
         i = j + 1;
     }
 
-    let mut cwd = canonical_or_lexical(workspace_root);
-    let mut rewritten: Vec<(String, String)> = Vec::new();
+    let mut cwd = canonical_or_lexical(workspace_root, platform);
+    let mut rewritten: Vec<(OutSegment, String)> = Vec::new();
     let mut specs: Vec<EngineSpec> = Vec::new();
     let mut shapes: Vec<(usize, String, bool)> = Vec::new();
     // A shell-level `exec` stderr redirect seen so far (greps after it cannot
@@ -670,6 +1058,10 @@ fn analyze_command(
     // so an all-skipped command still falls back wholesale with a cause.
     let mut outcomes: Vec<GrepOutcome> = Vec::new();
     let mut first_skip_reason: Option<Fallback> = None;
+    // Windows only: the cause of the first member the engine cannot serve (see
+    // [`Analyzed::unserved`]). `unix` never sets it: an unserved member keeps
+    // falling back to the real `grep` there.
+    let mut unserved: Option<String> = None;
     // Group depth across segments (unquoted `(`/`{` openers minus closers):
     // greps inside an open compound group are never served, even when the
     // segment splitter separated them from the group opener (e.g. `( cd d &&
@@ -683,30 +1075,45 @@ fn analyze_command(
         // included): second/third greps and grep introducers (xargs grep,
         // sh -c, cd) in tail positions are real tools on that stream.
         if tail_preserved[idx] {
-            rewritten.push((seg.clone(), conn.clone()));
+            // A second grep in the pipeline (`grep … | grep …`) is such a
+            // preserved member: it consumes the engine's stream through the
+            // pipeline. Windows has no program to run there, so the command is
+            // refused rather than left with a member nothing can execute.
+            if grep_family(first_word(seg), platform).is_some() {
+                note_unserved(platform, &mut unserved, &Fallback::NestedGrep.to_string());
+            }
+            rewritten.push((OutSegment::Verbatim(seg.clone()), conn.clone()));
             group_depth = (group_depth + delta).max(0);
             continue;
         }
         let verb = first_word(seg);
-        if is_cd_segment(verb) {
+        // Every verb list below is read through the platform's own key, so a
+        // verb classifies identically however the interpreter spells it.
+        let key = list_key(verb, platform);
+        if is_cd_segment(verb, platform) {
             if pstart[idx] != pend[idx] {
                 return Err(AnalyzeFailure {
                     reason: Fallback::CdUntrackable,
                     outcomes,
+                    unserved,
                 });
             }
-            let new_cwd = match resolve_cd(seg, &cwd, home) {
+            let new_cwd = match resolve_cd(seg, &cwd, home, platform) {
                 Ok(c) => c,
                 Err(reason) => {
-                    return Err(AnalyzeFailure { reason, outcomes });
+                    return Err(AnalyzeFailure {
+                        reason,
+                        outcomes,
+                        unserved,
+                    });
                 }
             };
             cwd = new_cwd;
-            rewritten.push((seg.clone(), conn.clone()));
+            rewritten.push((OutSegment::Verbatim(seg.clone()), conn.clone()));
             group_depth = (group_depth + delta).max(0);
             continue;
         }
-        if is_grep_verb(verb) {
+        if let Some(family) = grep_family(verb, platform) {
             // The first grep in a pipeline is served wherever it sits; a
             // non-first member is fed by the producer's stdout via stdin.
             // Later greps (grep-on-grep chains) are preserved verbatim.
@@ -727,26 +1134,31 @@ fn analyze_command(
                 if first_skip_reason.is_none() {
                     first_skip_reason = Some(Fallback::NestedGrep);
                 }
+                note_unserved(platform, &mut unserved, &Fallback::NestedGrep.to_string());
                 outcomes.push(skipped_grep_outcome(
                     Fallback::NestedGrep.to_string(),
                     seg,
                     ctx.piped,
                 ));
-                rewritten.push((seg.clone(), conn.clone()));
+                rewritten.push((OutSegment::Verbatim(seg.clone()), conn.clone()));
                 group_depth = (group_depth + delta).max(0);
                 continue;
             }
-            match serve_one_grep(seg, verb, &cwd, home, allow_single, ctx) {
-                Ok((spec, rewritten_seg)) => {
+            match serve_one_grep(seg, family, &cwd, home, platform, allow_single, ctx) {
+                Ok((spec, redirects)) => {
                     if ctx.piped {
                         tail_preserved[idx + 1..=pend[idx]].fill(true);
                         // Served-pipeline shape for volume telemetry; spans
                         // the full pipeline (producers, served grep, tail).
-                        let verbs: Vec<&str> = segments[pstart[idx]..=pend[idx]]
+                        let verbs: Vec<String> = segments[pstart[idx]..=pend[idx]]
                             .iter()
                             .map(|(s, _)| {
-                                let v = first_word(s);
-                                if is_grep_verb(v) { "grep" } else { v }
+                                let key = list_key(first_word(s), platform);
+                                if is_grep_verb(&key, platform) {
+                                    "grep".to_string()
+                                } else {
+                                    key
+                                }
                             })
                             .collect();
                         shapes.push((verbs.len(), verbs.join("|"), spec.stdin));
@@ -759,13 +1171,21 @@ fn analyze_command(
                         operand_count: spec.operands.len(),
                         flags: flags_surface(&spec.flags),
                     });
-                    rewritten.push((rewritten_seg, conn.clone()));
+                    rewritten.push((
+                        OutSegment::Served {
+                            spec: specs.len(),
+                            redirects,
+                        },
+                        conn.clone(),
+                    ));
                     specs.push(spec);
                 }
                 Err(e) => {
                     // Per-grep fallback: skip this segment (keep it verbatim),
                     // record the skip, and continue to the next — a servable
-                    // sibling elsewhere in the command is still served.
+                    // sibling elsewhere in the command is still served (unix;
+                    // on Windows the skipped member refuses the whole command —
+                    // see `Analyzed::unserved`).
                     let reason = e.to_string();
                     if ctx.piped {
                         tail_preserved[idx + 1..=pend[idx]].fill(true);
@@ -773,8 +1193,9 @@ fn analyze_command(
                     if first_skip_reason.is_none() {
                         first_skip_reason = Some(e);
                     }
+                    note_unserved(platform, &mut unserved, &reason);
                     outcomes.push(skipped_grep_outcome(reason, seg, ctx.piped));
-                    rewritten.push((seg.clone(), conn.clone()));
+                    rewritten.push((OutSegment::Verbatim(seg.clone()), conn.clone()));
                 }
             }
             group_depth = (group_depth + delta).max(0);
@@ -782,18 +1203,25 @@ fn analyze_command(
         }
         // Non-grep member: verbatim. In a pipeline it is a producer — the
         // first grep in that pipeline is served from its stdout. Indirect/
-        // compound grep invocations (xargs grep, git grep, sh -c, sudo, for
-        // bodies) are skipped per-segment (kept verbatim) rather than making
-        // the whole command fall back; a served sibling grep elsewhere in the
-        // command is still served.
-        if is_compound_segment(seg) || segment_contains_grep(seg, verb) {
+        // compound grep invocations (xargs grep, sh -c, sudo, for bodies) are
+        // skipped per-segment (kept verbatim) rather than making the whole
+        // command fall back; a served sibling grep elsewhere in the command is
+        // still served. `git grep`/`docker run … grep` are the introducer's own
+        // search, not one the engine could ever claim, so they are exempt from
+        // the Windows refusal ([`SEARCH_OWNING_VERBS`]).
+        let compound = is_compound_segment(seg, platform);
+        let carries_grep = segment_contains_grep(seg, &key, platform);
+        if compound || carries_grep {
             // A telemetry skip is recorded only when the segment actually
             // carries a grep member; bare construct keywords (`then`, `fi`,
             // `done`) and grep-less indirect prefixes must not inflate the
             // grep/skipped counts in the compound case.
-            if segment_contains_grep(seg, verb) {
+            if carries_grep {
                 if first_skip_reason.is_none() {
                     first_skip_reason = Some(Fallback::NestedGrep);
+                }
+                if !SEARCH_OWNING_VERBS.contains(&key.as_str()) {
+                    note_unserved(platform, &mut unserved, &Fallback::NestedGrep.to_string());
                 }
                 outcomes.push(skipped_grep_outcome(
                     Fallback::NestedGrep.to_string(),
@@ -801,11 +1229,11 @@ fn analyze_command(
                     pstart[idx] != pend[idx],
                 ));
             }
-            rewritten.push((seg.clone(), conn.clone()));
+            rewritten.push((OutSegment::Verbatim(seg.clone()), conn.clone()));
             group_depth = (group_depth + delta).max(0);
             continue;
         }
-        if verb == "exec" && (seg.contains("2>") || seg.contains("&>")) {
+        if key == "exec" && (seg.contains("2>") || seg.contains("&>")) {
             // `exec 2>&1`/`exec 2>…`/`exec &>…` moves the shell's stderr for
             // the rest of the command; fail-closed on the stream-size marker
             // for the greps that follow (it would leak into stdout or a file).
@@ -814,10 +1242,10 @@ fn analyze_command(
             // match `2>` and suppress unnecessarily (telemetry loss only).
             // Fail-open escapes (a stray marker line in stdout): env-prefixed
             // `FOO=1 exec 2>&1` and escaped-verb `\exec 2>&1` both miss the
-            // `verb == "exec"` check.
+            // folded-key check.
             exec_redirects_stderr = true;
         }
-        rewritten.push((seg.clone(), conn.clone()));
+        rewritten.push((OutSegment::Verbatim(seg.clone()), conn.clone()));
         group_depth = (group_depth + delta).max(0);
     }
 
@@ -831,36 +1259,111 @@ fn analyze_command(
         return Err(AnalyzeFailure {
             reason: first_skip_reason.unwrap_or(Fallback::NoGrep),
             outcomes,
+            unserved,
         });
     }
-    Ok((specs, shapes, join_rewritten(&rewritten), outcomes))
+    Ok(Analyzed {
+        specs,
+        shapes,
+        segments: rewritten,
+        outcomes,
+        unserved,
+    })
 }
 
-/// Join rewritten segments with their original connectors into one command.
-fn join_rewritten(segments: &[(String, String)]) -> String {
+/// Join the rewritten members with their connectors into one command — verbatim
+/// except that the Windows splitter's newline connector is re-emitted as `&` (see
+/// the loop) — rendering every served member through [`render_served`]. The
+/// rendered spec files are returned to the caller: on Windows they are the
+/// hand-off's scratch files, created here — the first point at which the whole
+/// command is known to be servable — and removed when the call finishes. A member
+/// whose hand-off fails takes the files already written by its predecessors with
+/// it: the command is demoted, so nobody else ever owns them.
+fn join_rewritten(
+    segments: &[(OutSegment, String)],
+    jsons: &[String],
+    platform: ShellPlatform,
+) -> Result<(String, Vec<PathBuf>), Fallback> {
     let mut out = String::new();
+    let mut files = Vec::new();
+    // A runtime doubt like any other: a rewrite cannot be rendered without the
+    // engine's own path, so the command is demoted (unix runs the original,
+    // Windows refuses the call) rather than panicking.
+    let exe = std::env::current_exe()
+        .map_err(|e| Fallback::Handoff(format!("no own executable path: {e}")))?;
+    let exe = exe.to_string_lossy();
     for (i, (seg, conn)) in segments.iter().enumerate() {
         if i > 0 {
             out.push(' ');
         }
-        out.push_str(seg);
+        match seg {
+            OutSegment::Verbatim(text) => out.push_str(text),
+            OutSegment::Served { spec, redirects } => {
+                match render_served(&jsons[*spec], redirects, platform, &exe, &mut files) {
+                    Ok(fragment) => out.push_str(&fragment),
+                    Err(reason) => {
+                        discard_spec_files(&files);
+                        return Err(reason);
+                    }
+                }
+            }
+        }
         if i + 1 < segments.len() {
             out.push(' ');
-            out.push_str(conn);
+            // The Windows splitter's newline connector: cmd.exe reads a bare
+            // newline as the same unconditional separator `&` spells, but the
+            // rewrite rides one `/C "…"` argument and whether cmd splits there
+            // is the one spelling this workspace cannot measure — getting it
+            // wrong costs every command after the first line. `&` is
+            // unambiguous, and the Windows splitter never emits an empty member
+            // (blank lines are skipped), so the substitution cannot create a
+            // syntax error.
+            if platform == ShellPlatform::Windows && conn == "\n" {
+                out.push('&');
+            } else {
+                out.push_str(conn);
+            }
         }
     }
-    out
+    Ok((out, files))
 }
 
-/// Split a command into (segment, following-connector) pairs. Connectors are
-/// `&&`, `||`, `;`, `|`, `|&`, `\n`, or `` (last). Quote- and
-/// substitution-aware, heredoc bodies already stripped. Empty segments before
-/// a connector (or a trailing `|`/`|&`/`||`/`&&`) are shell syntax errors;
-/// the rewriting would silently drop them into a VALID executed pipeline —
-/// fail-closed on the whole class. Blank lines (`\n` between commands) are
-/// valid sh and stay allowed.
-fn split_segments(command: &str) -> Result<Vec<(String, String)>, Fallback> {
-    super::segment_command(command, super::SegmentMode::Grep).ok_or(Fallback::SegmentEmpty)
+/// Remove scratch spec files, best-effort — the single home of that policy: the
+/// engine calls it when a hand-off abandons a rewrite (a later member's
+/// `render_served` failed), so a refused Windows search leaks none, and the
+/// shell's `SpecFiles` guard calls it on drop, owning the lifecycle point. A
+/// removal that fails is the temp cleaner's.
+pub(super) fn discard_spec_files(files: &[PathBuf]) {
+    for path in files {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Split a command into (segment, following-connector) pairs, in the spelling
+/// of `platform`'s own shell: `sh` connectors are `&&`, `||`, `;`, `|`, `|&`,
+/// `\n` or `` (last); cmd.exe's are `&&`, `||`, `&`, `|`, `\n` or `` (last) —
+/// `;` and `&` are not interchangeable between them, which is why the platform
+/// is a parameter rather than a `cfg` branch. Quote- and substitution-aware
+/// (per platform), heredoc bodies already stripped. Empty segments before a
+/// connector (or a trailing `|`/`|&`/`||`/`&&`, and on Windows a bare `&`) are
+/// shell syntax errors; the rewriting would silently drop them into a VALID
+/// executed pipeline — fail-closed on the whole class. Blank lines (`\n`
+/// between commands) are valid on both and stay allowed.
+fn split_segments(
+    command: &str,
+    platform: ShellPlatform,
+) -> Result<Vec<(String, String)>, Fallback> {
+    match platform {
+        ShellPlatform::Unix => {
+            super::segment_command(command, super::SegmentMode::Grep).ok_or(Fallback::SegmentEmpty)
+        }
+        // A line the cmd.exe model does not cover — a caret, a command group,
+        // an unbalanced quote, an empty member before a connector — leaves the
+        // whole line unread (the first three are spellings cmd.exe itself reads;
+        // the empty member mirrors the unix segmenter's own fail-closed policy).
+        ShellPlatform::Windows => windows::segment_command(command)
+            .ok_or_else(|| Fallback::CmdSyntax("the whole line".into())),
+    }
 }
 
 /// Net group-open delta contributed by one segment's unquoted `(`/`{` and
@@ -900,24 +1403,123 @@ fn first_word(segment: &str) -> &str {
     segment.split_whitespace().next().unwrap_or("")
 }
 
-fn is_grep_verb(verb: &str) -> bool {
-    matches!(verb, "grep" | "egrep" | "fgrep")
+/// The grep family `verb` names on `platform`, or `None` when it names another
+/// program: the literal `grep`/`egrep`/`fgrep` on unix, and on Windows whatever
+/// cmd.exe would dispatch to — case-insensitively, through the executable
+/// extension (see [`windows::grep_verb`]).
+fn grep_family(verb: &str, platform: ShellPlatform) -> Option<&'static str> {
+    match platform {
+        ShellPlatform::Unix => match verb {
+            "grep" => Some("grep"),
+            "egrep" => Some("egrep"),
+            "fgrep" => Some("fgrep"),
+            _ => None,
+        },
+        ShellPlatform::Windows => windows::grep_verb(verb),
+    }
 }
 
-fn is_cd_segment(verb: &str) -> bool {
-    verb == "cd"
+fn is_grep_verb(verb: &str, platform: ShellPlatform) -> bool {
+    grep_family(verb, platform).is_some()
+}
+
+/// The word a verb list is matched against on `platform`: cmd.exe dispatches
+/// case-insensitively and through an `.exe` suffix ([`windows::verb_key`], which
+/// reads one word), so `CMD /C`, `cmd /c` and `cmd.exe /c` must classify the
+/// same way — a raw first word would let a spelling other than the lower-case
+/// one slip past every list below (neither served nor refused, then reaching the
+/// agent as the interpreter's own "not recognized" text). unix verbs are the
+/// words themselves — a shell matches them case-sensitively — so nothing is
+/// folded, except the grep family, which [`grep_family`] folds itself.
+///
+/// This is the list-matching form of that key: `sh`'s builtins are not programs,
+/// so no `.exe`-folding applies on unix, and a word the platform would re-read
+/// (an unquotable spelling) folds to the empty key, which matches no list entry.
+fn list_key(verb: &str, platform: ShellPlatform) -> String {
+    match platform {
+        ShellPlatform::Unix => verb.to_string(),
+        ShellPlatform::Windows => windows::verb_key(verb).unwrap_or_default(),
+    }
+}
+
+/// True when the segment's first word names a cwd-changing builtin on
+/// `platform`: `cd` alone on unix, and cmd.exe's whole family on Windows —
+/// `cd`/`chdir` (the same builtin), `pushd` (changes to its target) and `popd`
+/// (returns to the directory `pushd` remembered) — read through [`list_key`]
+/// like every other verb list, which is the same `cd`/`chdir`/`popd`/`pushd`
+/// grouping the read-only guard's own `INTERNAL_VERBS` uses. Tracking only `cd`
+/// would leave the cwd stale for the rest of the family, and the engine's cwd
+/// gate would refuse the served member at runtime; the unix reading stays
+/// byte-exact.
+fn is_cd_segment(verb: &str, platform: ShellPlatform) -> bool {
+    match platform {
+        ShellPlatform::Unix => verb == "cd",
+        ShellPlatform::Windows => matches!(
+            list_key(verb, platform).as_str(),
+            "cd" | "chdir" | "popd" | "pushd"
+        ),
+    }
 }
 
 /// Command-introducer verbs whose argument list may contain a nested grep
-/// invocation (compounds, indirect invocations). A grep-family word in such a
-/// segment is kept verbatim — never served, since its semantics are uncertain —
-/// and the segment is recorded as a telemetry skip; a servable sibling grep
-/// elsewhere in the command is still served (per-segment substitution no longer
-/// falls the whole command back).
+/// invocation (compounds, indirect invocations), matched through [`list_key`]
+/// so a spelling like `CMD /C` or `cmd.exe /c` is the same introducer. A
+/// grep-family word in such a segment is kept verbatim — never served, since its
+/// semantics are uncertain — and the segment is recorded as a telemetry skip; a
+/// servable sibling grep elsewhere in the command is still served on unix,
+/// while on Windows the carried word refuses the whole command (nothing there
+/// could run the sibling the rewrite would leave behind). The other interpreters
+/// (`cmd`, `powershell`, `pwsh`) are listed beside the unix shells for the same
+/// reason: a grep inside another interpreter's command line is a nested search
+/// the engine cannot serve, so on Windows it is refused rather than left to run
+/// a `grep` the platform has not got. On unix those three names only add a
+/// recorded row (`cmd /c grep x f.txt` leaves a `grep_telemetry` skip entry),
+/// and neither the serve decision nor the command text changes there.
+///
+/// The match is the word, not the meaning: a segment that merely *carries* a
+/// grep-family word is refused on Windows even when it is not a search at all
+/// (`cmd /c del grep`). That fail-closed over-refusal is deliberate — the
+/// alternative is letting a real search through — and the loud failure names
+/// it; [`SEARCH_OWNING_VERBS`] is the one exemption. That list is the one to
+/// revisit with this one when a verb's classification changes.
 const GREP_INTRODUCERS: &[&str] = &[
-    "if", "while", "until", "case", "for", "select", "then", "else", "elif", "do", "!", "time",
-    "command", "builtin", "exec", "eval", "sudo", "env", "nice", "nohup", "xargs", "ssh", "sh",
-    "bash", "zsh", "ksh", "dash", "csh", "tcsh", "fish", "find", "git", "docker", "kubectl",
+    "if",
+    "while",
+    "until",
+    "case",
+    "for",
+    "select",
+    "then",
+    "else",
+    "elif",
+    "do",
+    "!",
+    "time",
+    "command",
+    "builtin",
+    "exec",
+    "eval",
+    "sudo",
+    "env",
+    "nice",
+    "nohup",
+    "xargs",
+    "ssh",
+    "sh",
+    "bash",
+    "zsh",
+    "ksh",
+    "dash",
+    "csh",
+    "tcsh",
+    "fish",
+    "cmd",
+    "powershell",
+    "pwsh",
+    "find",
+    "git",
+    "docker",
+    "kubectl",
     "podman",
 ];
 
@@ -931,41 +1533,187 @@ const COMPOUND_KEYWORDS: &[&str] = &[
 ];
 
 /// True when a segment opens a compound construct (keyword prefix or a `(`/`{`
-/// group opener) — such a command must not serve any grep.
-fn is_compound_segment(segment: &str) -> bool {
+/// group opener) — such a command must not serve any grep. The keyword list is
+/// read through [`list_key`], so cmd.exe's case-insensitive `IF`/`FOR` are the
+/// same construct as `if`/`for` there (on unix the words stand as written).
+fn is_compound_segment(segment: &str, platform: ShellPlatform) -> bool {
     let trimmed = segment.trim_start();
     match trimmed.chars().next() {
         Some('(' | '{') => true,
-        Some(c) if is_word_char(c) => COMPOUND_KEYWORDS.contains(&first_word(trimmed)),
+        Some(c) if is_word_char(c) => {
+            COMPOUND_KEYWORDS.contains(&list_key(first_word(trimmed), platform).as_str())
+        }
         _ => false,
     }
 }
 
 /// True when a non-grep segment could contain a grep invocation we would not
 /// serve (compound constructs, indirect invocation). Conservative: any
-/// grep-family word in an introducer segment, or an env-assignment verb.
-fn segment_contains_grep(segment: &str, verb: &str) -> bool {
+/// grep-family word in an introducer segment, or an env-assignment verb. `verb`
+/// is the segment's [`list_key`], so the lists are read the way the platform
+/// dispatches.
+///
+/// The words are the platform's own: cmd.exe's tokenizer on Windows, which keeps
+/// a quoted argument as the single word cmd.exe delivers. A quoted word's
+/// delivered text is then read as the command line it is, because that is what a
+/// wrapped interpreter receives — `cmd /c "grep -rn x ."` carries a search a
+/// whitespace split sees only as the unbalanced token `"grep`, which would leave
+/// the command neither served nor refused. unix keeps its own reading (a missed
+/// telemetry row for `sh -c 'grep …'`, never a serve decision: unix has the real
+/// `grep` to fall back to).
+fn segment_contains_grep(segment: &str, verb: &str, platform: ShellPlatform) -> bool {
     let suspicious = GREP_INTRODUCERS.contains(&verb) || verb.contains('=');
     if !suspicious {
         return false;
     }
-    segment.split_whitespace().any(|w| {
-        let bare = crate::tools::shell::scan::strip_quoted_word(w);
-        is_grep_verb(bare)
+    match platform {
+        ShellPlatform::Windows => {
+            windows::tokenize(segment).is_some_and(|words| words_nest_grep(&words))
+        }
+        ShellPlatform::Unix => segment
+            .split_whitespace()
+            .any(|w| is_grep_verb(crate::tools::shell::scan::strip_quoted_word(w), platform)),
+    }
+}
+
+/// [`segment_contains_grep`]'s word test for cmd.exe's own tokenizer output:
+/// any delivered word — or the command line inside a quoted word, which is what
+/// the wrapped interpreter receives — names the grep family. Recursion strips at
+/// least one quote pair per round, so it terminates.
+fn words_nest_grep(words: &[GrepWord]) -> bool {
+    words.iter().any(|w| {
+        is_grep_verb(&w.value, ShellPlatform::Windows)
+            || (w.value != w.raw
+                && windows::tokenize(&w.value).is_some_and(|inner| words_nest_grep(&inner)))
     })
 }
 
-/// Resolve a literal `cd` segment against the tracked cwd. Returns the new
-/// canonical cwd. Only statically-resolvable targets track; everything else
-/// falls back (fail-closed).
-fn resolve_cd(segment: &str, cwd: &Path, home: &Path) -> Result<PathBuf, Fallback> {
+/// Programs that own the search they run: `git grep`, `docker run … grep`,
+/// `kubectl exec … grep`, `podman … grep` are that program's own search — the
+/// engine never claims them and a `grep` word in their argument list is data,
+/// not a member to serve. `ssh` is here for the same reason from the other side:
+/// its argument list runs on another machine, so the local engine claiming the
+/// search would be claiming the wrong host's files — and refusing it would
+/// refuse a command this platform can perfectly well run.
+///
+/// A command whose ONLY grep word sits in one of these is left unserved but
+/// allowed on Windows, where the platform refusal ([`Analyzed::unserved`])
+/// applies to members the engine could otherwise serve. Matched through
+/// [`list_key`], like every other verb list. `find` is deliberately NOT here:
+/// `find … -exec grep …` would run the platform's own `grep`, which is what
+/// Windows does not have — the `\;` spelling reaches the platform only because
+/// its unquoted `;` aborts the analysis, and an abort is refused only when a
+/// command-position search is visible in the line (this spelling shows none).
+/// An accepted residual: the platform's own `find` and `grep` then run it their
+/// way, and what they report is never this engine's empty match set.
+/// [`GREP_INTRODUCERS`] is the list to revisit with this one when a verb's
+/// classification changes.
+const SEARCH_OWNING_VERBS: &[&str] = &["git", "docker", "kubectl", "podman", "ssh"];
+
+/// True when `command` carries a grep-family invocation in command position,
+/// by a deliberately tolerant scan: split on every separator cmd.exe acts on
+/// unconditionally (`&`, `|`, newlines) plus, over-wide on purpose, `;` — which
+/// cmd reads as ordinary text and the cmd model therefore refuses — with no
+/// quote handling at all, then strip the leading whitespace and any group opener
+/// (`(`/`{`) off each fragment and test its first word through the same verb
+/// predicate the analyzer uses. The opener is stripped rather than split on, so
+/// a `(grep …)` fragment is still read as the grep it is, while
+/// `echo (grep is a tool)` — a grep word in argument position — stays the plain
+/// echo it is.
+///
+/// It exists only to decide whether a line the cmd.exe model could not read AT
+/// ALL (a caret, a group, an unbalanced quote, a `;`, a trailing connector)
+/// should be refused on Windows: such a line aborts before any member exists, so
+/// the analyzer's own reading cannot say. The heuristic errs toward refusing an
+/// unreadable line, while leaving `git commit -m "grep fix"`, `echo grep` and a
+/// search-owning `git grep x` alone (their command words are not grep-family).
+///
+/// Being quote-blind it can also lift a grep word out of a quoted string and
+/// blame a line that carries no search (`echo "a; grep x" && cd /x` is refused
+/// with the cause of the abort that actually happened, not of a search). Fail
+/// closed, and accepted: a quote-aware scan would have to trust the quotes of a
+/// line it exists because it could not read.
+fn unreadable_line_search(command: &str, platform: ShellPlatform) -> bool {
+    command.split(['&', '|', ';', '\n']).any(|fragment| {
+        let fragment = fragment.trim_start_matches(['(', '{', ' ', '\t']);
+        grep_family(first_word(fragment), platform).is_some()
+    })
+}
+
+/// Resolve a literal cwd-family segment (see [`is_cd_segment`]) against the
+/// tracked cwd. Returns the new canonical cwd. Only statically-resolvable
+/// targets track; everything else falls back (fail-closed).
+///
+/// The grammar is the platform's own: `sh`'s option scan and `$HOME` target on
+/// unix, cmd.exe's `/d`-only, nothing-changes-on-bare-`cd` reading (where `~`
+/// is an ordinary directory name) on Windows. On Windows the family's other two
+/// halves are fail-closed: `popd` returns to a directory only the pushed stack
+/// knows, and a bare `pushd` pushes the cwd and changes to that drive's root —
+/// neither is modelled, so both leave [`Fallback::CdUntrackable`] rather than a
+/// wrong tracked cwd. `pushd <target>` is tracked exactly like `cd <target>`.
+///
+/// Two cmd.exe spellings stay outside this model, both refusing rather than
+/// tracking a wrong directory: a glued switch (`cd/d C:\ws`, which the read-only
+/// guard's own reader splits into `cd /d`), and a drive-relative target
+/// (`cd C:foo`, relative to that drive's remembered directory, not to the
+/// tracked cwd). Either way the served member's spec cwd and the engine's own
+/// cwd diverge and the engine's cwd gate refuses the call — a loud refusal of a
+/// command an agent could have meant, never a search of the wrong directory.
+fn resolve_cd(
+    segment: &str,
+    cwd: &Path,
+    home: &Path,
+    platform: ShellPlatform,
+) -> Result<PathBuf, Fallback> {
+    if platform == ShellPlatform::Windows {
+        // cmd.exe's own word reading, not a whitespace split: a quoted target
+        // keeps its inner spaces, and the spelling (quotes included) is what
+        // [`windows::cd_scan`] judges.
+        let words = windows::tokenize(segment).ok_or(Fallback::CdUntrackable)?;
+        let Some((verb, rest)) = words.split_first() else {
+            return Err(Fallback::CdUntrackable);
+        };
+        let verb = list_key(&verb.raw, platform);
+        let rest: Vec<&str> = rest.iter().map(|w| w.raw.as_str()).collect();
+        // The stack is what `popd` reads and this model does not keep, so its
+        // target (and therefore the cwd after it) is unknowable.
+        if verb == "popd" {
+            return Err(Fallback::CdUntrackable);
+        }
+        let (target, next) = match windows::cd_scan(&rest) {
+            CdScan::Target(target, next) => (target, next),
+            // A bare `cd`/`chdir` prints the cwd and changes nothing; a bare
+            // `pushd` is not that reading, and its effect here is not modelled
+            // — fail-closed.
+            CdScan::Bare => {
+                if verb == "pushd" {
+                    return Err(Fallback::CdUntrackable);
+                }
+                return Ok(cwd.to_path_buf());
+            }
+            // A switch-shaped word (`/x`) or a spelling cmd reads differently
+            // — fail-closed.
+            CdScan::BadOption => return Err(Fallback::CdUntrackable),
+        };
+        if rest.get(next).is_some() {
+            // Extra operands are shell-dependent — fail-closed.
+            return Err(Fallback::CdUntrackable);
+        }
+        if windows::has_percent_expansion(target) {
+            return Err(Fallback::CdUntrackable);
+        }
+        return Ok(canonical_or_lexical(
+            &absolute_or_cwd(cwd, target, platform),
+            platform,
+        ));
+    }
     let words: Vec<&str> = segment.split_whitespace().collect();
     let (target, next) = match super::scan::cd_target_after_options(&words, 1) {
-        super::scan::CdScan::Target(target, next) => (target, next),
+        CdScan::Target(target, next) => (target, next),
         // Bare `cd` → $HOME.
-        super::scan::CdScan::Bare => return Ok(canonical_or_lexical(home)),
+        CdScan::Bare => return Ok(canonical_or_lexical(home, platform)),
         // Invalid options (`cd -e`) error at runtime — fail-closed.
-        super::scan::CdScan::BadOption => return Err(Fallback::CdUntrackable),
+        CdScan::BadOption => return Err(Fallback::CdUntrackable),
     };
     if words.get(next).is_some() {
         // Extra operands are shell-dependent — fail-closed.
@@ -981,28 +1729,42 @@ fn resolve_cd(segment: &str, cwd: &Path, home: &Path) -> Result<PathBuf, Fallbac
     } else if target == "~" {
         home.to_path_buf()
     } else {
-        absolute_or_cwd(cwd, target)
+        absolute_or_cwd(cwd, target, platform)
     };
-    Ok(canonical_or_lexical(&resolved))
+    Ok(canonical_or_lexical(&resolved, platform))
 }
 
 /// Resolve a shell path word: absolute paths pass through verbatim, anything
-/// else is joined onto the tracked cwd.
-fn absolute_or_cwd(cwd: &Path, word: &str) -> PathBuf {
-    if word.starts_with('/') {
+/// else is joined onto the tracked cwd. Each platform reads its own absolute
+/// spelling (`/…` on unix; a drive root, a UNC share or a rooted separator on
+/// Windows).
+fn absolute_or_cwd(cwd: &Path, word: &str, platform: ShellPlatform) -> PathBuf {
+    let absolute = match platform {
+        ShellPlatform::Unix => word.starts_with('/'),
+        ShellPlatform::Windows => windows::is_absolute_word(word),
+    };
+    if absolute {
         PathBuf::from(word)
     } else {
         cwd.join(word)
     }
 }
 
-/// Canonicalize an existing path; lexically normalize otherwise. All inputs
-/// are already absolute, so `std::path::absolute` (purely lexical) is the
-/// exact fallback for `fs::canonicalize`.
-fn canonical_or_lexical(p: &Path) -> PathBuf {
-    fs::canonicalize(p)
+/// Canonicalize an existing path, falling back to a lexically absolute form
+/// (`std::path::absolute`, exact because every input is already absolute) and
+/// then to the path as given. On Windows the verbatim (`\?\`) prefix
+/// `fs::canonicalize` adds is stripped, so the tracked cwd, the spec's operand
+/// paths and the displayed paths carry the spelling cmd.exe itself reports —
+/// and the cwd gate then needs [`windows::same_directory`]'s
+/// spelling-insensitive comparison rather than byte equality.
+fn canonical_or_lexical(p: &Path, platform: ShellPlatform) -> PathBuf {
+    let canonical = fs::canonicalize(p)
         .or_else(|_| std::path::absolute(p))
-        .unwrap_or_else(|_| p.to_path_buf())
+        .unwrap_or_else(|_| p.to_path_buf());
+    match platform {
+        ShellPlatform::Unix => canonical,
+        ShellPlatform::Windows => crate::util::strip_verbatim_prefix(&canonical),
+    }
 }
 
 /// True when a raw shell word contains an expansion (`$`, backtick, `$(`,
@@ -1042,7 +1804,8 @@ enum MatchMode {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 // Lenient parse so a swapped binary's spec reaches the version check and
-// execs the real grep in place (the sentinel would need a parent re-run).
+// execs the real grep in place (the sentinel is reserved for a run that
+// already wrote output and cannot be handed back).
 #[serde(default)]
 #[expect(non_snake_case, clippy::struct_excessive_bools)] // flag-letter names, grep CLI surface
 struct GrepFlags {
@@ -1151,8 +1914,32 @@ struct GrepWord {
 
 /// Tokenize a grep segment (after the verb): quote-aware split, unquote,
 /// redirect classification (delegated to the read-only guard's token
-/// classifier — single source of truth for redirect-token semantics).
-fn grep_tokenize(segment: &str) -> Result<Vec<GrepWord>, Fallback> {
+/// classifier — single source of truth for redirect-token semantics). The
+/// reading is the platform shell's own: `sh`'s word splitting on unix and
+/// cmd.exe's (no escapes, `'` ordinary) on Windows.
+fn grep_tokenize(segment: &str, platform: ShellPlatform) -> Result<Vec<GrepWord>, Fallback> {
+    if platform == ShellPlatform::Windows {
+        let words = windows::tokenize(segment)
+            .ok_or_else(|| Fallback::CmdSyntax("unbalanced quotes".into()))?;
+        // cmd.exe splits a word at an unquoted redirect operator glued to it,
+        // while the shared classifier reads only an operator that OPENS the
+        // token — so a word like `x>out.txt` would be served as one pattern
+        // with the redirect dropped, a search of different text. Such a member
+        // is refused instead. An operator glued to the *verb* (`grep>x f.txt`)
+        // never reaches this test: `grep>x` is no grep verb, so the line carries
+        // no member to refuse and is left to the platform (the module header's
+        // exemption list). Windows only: bash splits the glued spelling too, but
+        // the unix lane reads the word whole (see the module header's approved
+        // deltas), and a member that is not served there still runs the real
+        // `grep`.
+        if let Some(word) = words
+            .iter()
+            .find(|w| !w.redirect && windows::has_glued_redirect(&w.raw))
+        {
+            return Err(Fallback::CmdSyntax(format!("redirect in `{}`", word.raw)));
+        }
+        return Ok(words);
+    }
     let mut out = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
@@ -1164,7 +1951,7 @@ fn grep_tokenize(segment: &str) -> Result<Vec<GrepWord>, Fallback> {
             return Ok(());
         }
         let raw = std::mem::take(current);
-        let value = unquote_word(&raw)?;
+        let value = unquote_word(&raw, platform)?;
         let (redirect, needs_target) = match super::scan::classify_shell_token(&raw) {
             super::scan::TokenKind::Regular => (false, false),
             super::scan::TokenKind::Redirect { needs_target } => (true, needs_target),
@@ -1207,7 +1994,14 @@ fn grep_tokenize(segment: &str) -> Result<Vec<GrepWord>, Fallback> {
 
 /// Unquote a raw shell word into its literal value; any expansion (unquoted
 /// or double-quoted `$`/backtick, ANSI-C `$'…'`) is a fallback.
-fn unquote_word(raw: &str) -> Result<String, Fallback> {
+///
+/// On Windows this is cmd.exe's own unquoting, which expands nothing: `$` and
+/// backticks stay literal (a `$` is a common ERE anchor) and the `%…%`
+/// reading belongs to the word scan, which fails closed on it separately.
+fn unquote_word(raw: &str, platform: ShellPlatform) -> Result<String, Fallback> {
+    if platform == ShellPlatform::Windows {
+        return Ok(windows::unquote_word(raw));
+    }
     if has_expansion(raw) {
         return Err(Fallback::UnresolvableOperand(raw.to_string()));
     }
@@ -1278,7 +2072,11 @@ struct ParsedGrep {
 /// GNU-style permutation, value-taking options consuming the rest of their
 /// token, last-wins -G/-E/-F, the macOS option cluster, and the verified flag
 /// surface only — anything else falls back.
-fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallback> {
+fn parse_grep_words(
+    words: &[GrepWord],
+    verb: &str,
+    platform: ShellPlatform,
+) -> Result<ParsedGrep, Fallback> {
     // Redirects (and their targets) are removed by the shell before grep sees
     // the argv; collect them verbatim for the rewrite.
     let mut argv: Vec<GrepWord> = Vec::new();
@@ -1295,6 +2093,19 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
             argv.push(words[i].clone());
         }
         i += 1;
+    }
+    // cmd.exe expands `%…%` before the program sees its argv — a pattern, an
+    // `-e` value and a filter spelling included, not just an operand — so a word
+    // carrying a pair cannot be served with its literal text (see
+    // [`windows::has_percent_expansion`] for the per-word reading and why it is
+    // enough here). A lone `%` and every `!` are ordinary characters here: the
+    // interpreter this process spawns is `cmd /C` without `/V:ON`. Redirects are
+    // exempt: the rewrite keeps them verbatim, so cmd.exe expands them exactly
+    // as it would have in the original command.
+    if platform == ShellPlatform::Windows
+        && let Some(word) = argv.iter().find(|w| windows::has_percent_expansion(&w.raw))
+    {
+        return Err(Fallback::Expansion(word.raw.clone()));
     }
 
     let mut mode = match verb {
@@ -1871,25 +2682,34 @@ struct PipelineCtx {
 }
 
 /// Serve one grep segment: parse, translate, resolve operands, apply the
-/// serve-worthiness gate, and build the spec + rewritten fragment. A
-/// non-first pipeline member (`ctx.stdin_fed`) is served from the producer's
-/// stdin when it has no operands and no -r (both stay on the fallback).
+/// serve-worthiness gate, and build the spec plus its member-side redirect
+/// tokens (rendered into the rewrite by [`join_rewritten`]). A non-first
+/// pipeline member (`ctx.stdin_fed`) is served from the producer's stdin when
+/// it has no operands and no -r (both stay on the fallback). `allow_single`
+/// bypasses the single-file perf gate: `serve_command` sets it on Windows, where
+/// there is no host grep to keep a single-file lookup on.
 fn serve_one_grep(
     segment: &str,
     verb: &str,
     cwd: &Path,
     home: &Path,
+    platform: ShellPlatform,
     allow_single: bool,
     ctx: PipelineCtx,
-) -> Result<(EngineSpec, String), Fallback> {
-    let mut words = grep_tokenize(segment)?;
+) -> Result<(EngineSpec, Vec<String>), Fallback> {
+    let mut words = grep_tokenize(segment, platform)?;
     // The segment starts with the verb; the parser sees only its arguments.
-    if words.first().is_some_and(|w| w.value == verb) {
+    // The comparison goes back through the family normalizer, since the verb
+    // arrived normalized (on Windows `GREP.EXE` is served as `grep`).
+    if words
+        .first()
+        .is_some_and(|w| grep_family(&w.value, platform) == Some(verb))
+    {
         words.remove(0);
     } else {
         return Err(Fallback::NestedGrep);
     }
-    let parsed = parse_grep_words(&words, verb)?;
+    let parsed = parse_grep_words(&words, verb, platform)?;
 
     let mut operands: Vec<Operand> = Vec::new();
     if parsed.operand_tokens.is_empty() {
@@ -1917,10 +2737,10 @@ fn serve_one_grep(
             return Err(Fallback::StdinOperands);
         }
         for tok in &parsed.operand_tokens {
-            if unquote_word(tok)? == "-" {
+            if unquote_word(tok, platform)? == "-" {
                 return Err(Fallback::StdinMode);
             }
-            let expanded = resolve_operand(tok, cwd, home)?;
+            let expanded = resolve_operand(tok, cwd, home, platform)?;
             if expanded.is_empty() {
                 return Err(Fallback::UnexpandableGlob);
             }
@@ -1929,7 +2749,9 @@ fn serve_one_grep(
     }
 
     // Serve gate: recursive walks (the expensive case), or multi-file
-    // invocations. Single-file lookups stay on the real grep (faster).
+    // invocations. A single-file lookup stays on the real grep on unix — the
+    // host binary is faster — and `allow_single` (Windows, where there is no
+    // host grep) is what serves it there instead.
     // stdin-fed serves bypass the gate (the stream size is unknowable and
     // the ~6 ms engine tax is invisible against the producer's run).
     let mut dir_count = 0usize;
@@ -1977,63 +2799,75 @@ fn serve_one_grep(
             && !parsed.redirects.iter().any(|r| redirect_merges_stderr(r)),
     };
 
-    let mut rewritten = build_rewritten(&spec);
-    if !parsed.redirects.is_empty() {
-        rewritten.push(' ');
-        rewritten.push_str(&parsed.redirects.join(" "));
-    }
-    Ok((spec, rewritten))
+    Ok((spec, parsed.redirects))
 }
 
 /// Resolve one raw operand token into concrete operands (tilde, glob
 /// expansion, relative-to-cwd). Quote/glob checks run on the token exactly
 /// as typed: quoted/escaped `~` and glob metacharacters are literal
 /// filenames to BSD grep and must not expand. Unresolvable forms fall back.
-fn resolve_operand(tok: &str, cwd: &Path, home: &Path) -> Result<Vec<Operand>, Fallback> {
-    if tok == "~" {
-        return Ok(vec![operand_from_path(
-            &home.to_string_lossy(),
-            home,
-            false,
-        )]);
+///
+/// The `~` arms are unix-only: cmd.exe expands no `~`, so on Windows it is an
+/// ordinary directory name and resolves relative to the cwd. The `%`/`!`
+/// reading is checked once, for every word of the member, in
+/// [`parse_grep_words`].
+fn resolve_operand(
+    tok: &str,
+    cwd: &Path,
+    home: &Path,
+    platform: ShellPlatform,
+) -> Result<Vec<Operand>, Fallback> {
+    if platform == ShellPlatform::Unix {
+        if tok == "~" {
+            return Ok(vec![operand_from_path(
+                &home.to_string_lossy(),
+                home,
+                false,
+            )]);
+        }
+        if tok.starts_with('~') && !tok.starts_with("~/") {
+            // `~user` home expansion is not statically resolvable — fail-closed.
+            return Err(Fallback::UnresolvableOperand(tok.to_string()));
+        }
     }
-    if tok.starts_with('~') && !tok.starts_with("~/") {
-        // `~user` home expansion is not statically resolvable — fail-closed.
-        return Err(Fallback::UnresolvableOperand(tok.to_string()));
-    }
-    if has_unquoted_glob(tok) {
-        let value = unquote_word(tok)?;
+    if has_unquoted_glob(tok, platform) {
+        let value = unquote_word(tok, platform)?;
         // `~/` expands to home only when the raw token opens with an unquoted
         // `~/`; `"~"/*.txt` (quoted tilde + unquoted glob) is a literal
         // cwd-relative path, and the unquoted value would wrongly home-strip.
-        let pattern = if tok.starts_with("~/") {
+        let pattern = if platform == ShellPlatform::Unix && tok.starts_with("~/") {
             home.join(&value[2..]).to_string_lossy().into_owned()
         } else {
             value
         };
-        let matches = expand_glob(&pattern, cwd)?;
+        let matches = expand_glob(&pattern, cwd, platform)?;
         if matches.is_empty() {
             return Err(Fallback::UnexpandableGlob);
         }
         return Ok(matches
             .iter()
             .map(|m| {
-                let abs = absolute_or_cwd(cwd, m);
+                let abs = absolute_or_cwd(cwd, m, platform);
                 operand_from_path(m, &abs, false)
             })
             .collect());
     }
-    if let Some(rest) = tok.strip_prefix("~/") {
-        let expanded = home.join(unquote_word(rest)?);
+    if platform == ShellPlatform::Unix
+        && let Some(rest) = tok.strip_prefix("~/")
+    {
+        let expanded = home.join(unquote_word(rest, platform)?);
         return Ok(vec![operand_from_path(
             &expanded.to_string_lossy(),
             &expanded,
             false,
         )]);
     }
-    let value = unquote_word(tok)?;
-    let trailing_slash = value.ends_with('/');
-    let abs = absolute_or_cwd(cwd, &value);
+    let value = unquote_word(tok, platform)?;
+    let trailing_slash = match platform {
+        ShellPlatform::Unix => value.ends_with('/'),
+        ShellPlatform::Windows => value.ends_with(['\\', '/']),
+    };
+    let abs = absolute_or_cwd(cwd, &value, platform);
     Ok(vec![operand_from_path(&value, &abs, trailing_slash)])
 }
 
@@ -2047,8 +2881,13 @@ fn operand_from_path(display: &str, resolved: &Path, trailing_slash: bool) -> Op
 
 /// True when the raw token has glob metacharacters outside quotes/escapes.
 /// Quote- and escape-aware via [`super::track_char_context`] — bash semantics:
-/// glob chars inside single OR double quotes are literal filenames.
-fn has_unquoted_glob(tok: &str) -> bool {
+/// glob chars inside single OR double quotes are literal filenames. Under
+/// cmd.exe only `"` quotes (and there is no escape character at all), so the
+/// Windows reading is the `windows` layer's.
+fn has_unquoted_glob(tok: &str, platform: ShellPlatform) -> bool {
+    if platform == ShellPlatform::Windows {
+        return windows::has_unquoted_glob(tok);
+    }
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
@@ -2062,11 +2901,36 @@ fn has_unquoted_glob(tok: &str) -> bool {
     false
 }
 
-/// Bash-style glob expansion for operand tokens: dotfile exclusion, bracket
+/// Shell-style glob expansion for operand tokens: dotfile exclusion, bracket
 /// expressions, no-match → empty (the caller falls back). The returned
 /// display strings match what the shell would pass to grep. Home expansion of
 /// `~/…` is applied by the caller (only for an unquoted leading `~/`).
-fn expand_glob(pattern: &str, cwd: &Path) -> Result<Vec<String>, Fallback> {
+///
+/// The walk root is the platform's own: `/` (or the cwd) and `/`-separated
+/// components on unix; a drive, UNC share or rooted separator (or the cwd) and
+/// `\`-separated components on Windows.
+fn expand_glob(
+    pattern: &str,
+    cwd: &Path,
+    platform: ShellPlatform,
+) -> Result<Vec<String>, Fallback> {
+    if platform == ShellPlatform::Windows {
+        if pattern.ends_with(['\\', '/']) {
+            return Err(Fallback::UnexpandableGlob);
+        }
+        let (prefix, comps) =
+            windows::split_components(pattern).ok_or(Fallback::UnexpandableGlob)?;
+        let base = if prefix.is_empty() {
+            cwd.to_path_buf()
+        } else {
+            PathBuf::from(&prefix)
+        };
+        let comps: Vec<&str> = comps.iter().map(String::as_str).collect();
+        let mut results = Vec::new();
+        glob_walk(&base, &prefix, &comps, &mut results, platform);
+        results.sort();
+        return Ok(results);
+    }
     if pattern.ends_with('/') {
         return Err(Fallback::UnexpandableGlob);
     }
@@ -2080,14 +2944,20 @@ fn expand_glob(pattern: &str, cwd: &Path) -> Result<Vec<String>, Fallback> {
         )
     };
     let mut results = Vec::new();
-    glob_walk(&base, display_prefix, &comps, &mut results);
+    glob_walk(&base, display_prefix, &comps, &mut results, platform);
     // The shell sorts glob expansions (LC_ALL=C.UTF-8 → byte order); grep
     // emits operands in command-line order, so operand order must match.
     results.sort();
     Ok(results)
 }
 
-fn glob_walk(dir: &Path, display: &str, comps: &[&str], results: &mut Vec<String>) {
+fn glob_walk(
+    dir: &Path,
+    display: &str,
+    comps: &[&str],
+    results: &mut Vec<String>,
+    platform: ShellPlatform,
+) {
     let Some((first, rest)) = comps.split_first() else {
         return;
     };
@@ -2097,38 +2967,47 @@ fn glob_walk(dir: &Path, display: &str, comps: &[&str], results: &mut Vec<String
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            // Bash glob semantics per component: fnmatch with FNM_PERIOD
+            // Shell glob semantics per component: fnmatch with FNM_PERIOD
             // (leading dot must match a literal dot).
-            if !fnmatch_flags(first, &name, libc::FNM_PERIOD) {
+            if !fnmatch_flags(first, &name, true, platform) {
                 continue;
             }
-            let child_display = join_display(display, &name);
+            let child_display = join_display(display, &name, platform);
             if rest.is_empty() {
                 results.push(child_display);
             } else if entry.path().is_dir() {
-                glob_walk(&entry.path(), &child_display, rest, results);
+                glob_walk(&entry.path(), &child_display, rest, results, platform);
             }
         }
     } else {
         let next = dir.join(first);
-        let child_display = join_display(display, first);
+        let child_display = join_display(display, first, platform);
         if rest.is_empty() {
             if next.exists() {
                 results.push(child_display);
             }
         } else if next.is_dir() {
-            glob_walk(&next, &child_display, rest, results);
+            glob_walk(&next, &child_display, rest, results, platform);
         }
     }
 }
 
-fn join_display(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else if prefix == "/" {
-        format!("/{name}")
-    } else {
-        format!("{prefix}/{name}")
+/// Join one glob component onto the display prefix it was matched under: with
+/// `/` on unix (where a lone `/` prefix is the root) and with `\` on Windows
+/// (where the prefix of [`windows::split_components`] already carries its own
+/// separator).
+fn join_display(prefix: &str, name: &str, platform: ShellPlatform) -> String {
+    match platform {
+        ShellPlatform::Windows => windows::join_display(prefix, name),
+        ShellPlatform::Unix => {
+            if prefix.is_empty() {
+                name.to_string()
+            } else if prefix == "/" {
+                format!("/{name}")
+            } else {
+                format!("{prefix}/{name}")
+            }
+        }
     }
 }
 
@@ -2136,61 +3015,117 @@ fn join_display(prefix: &str, name: &str) -> String {
 
 /// Entry point for the hidden `__grep-engine` subcommand (dispatched from
 /// `main()` before instance-lock acquisition). `--probe` answers whether the
-/// binary still carries the subcommand (self-update version skew). Any
-/// runtime doubt `exec`s the real grep in place; when even that fails, the
-/// sentinel exit code tells the parent to re-run the original command.
+/// binary still carries the subcommand (self-update version skew). Any runtime
+/// doubt hands the member back to the real grep — `exec`ing it in place on
+/// unix, and on Windows (where there is no system `grep` to replace ourselves
+/// with) reporting the reason and exiting with the sentinel code the parent
+/// refuses the call on.
 pub fn run_engine(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("--probe") {
         return 0;
     }
     // Rust ignores SIGPIPE by default; grep dies on a closed pipe (exit 141).
     // With the default disposition, `grep | head` would scan the whole input.
+    // Windows has no SIGPIPE — there the same closed pipe surfaces as the write
+    // error [`exit_on_broken_pipe`] turns into the same exit.
     // SAFETY: restoring the default SIGPIPE disposition is process-global and
     // idempotent; the engine process exists only to serve this one invocation.
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    let Some(json) = args.first() else {
-        eprintln!("grep: engine: missing spec");
-        return ENGINE_FAILED_EXIT;
+    let json = match read_spec(args) {
+        Ok(json) => json,
+        Err(message) => return engine_failed(Some(&message)),
     };
-    let spec: EngineSpec = match serde_json::from_str(json) {
+    let spec: EngineSpec = match serde_json::from_str(&json) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("grep: engine: bad spec: {e}");
-            return ENGINE_FAILED_EXIT;
-        }
+        Err(e) => return engine_failed(Some(&format!("grep: engine: bad spec: {e}"))),
     };
     if spec.version != PROTOCOL_VERSION {
         // Self-update swapped the binary mid-run: nothing is written yet, so
-        // exec the real grep in place — its exit code cannot be masked by a
-        // pipe member (unlike a sentinel exit).
-        return exec_grep(&spec.fallback);
+        // the real grep is the correct answer.
+        return cannot_serve(&spec, "spec version mismatch");
     }
-    let fallback = spec.fallback.clone();
     // `serve` itself reports panics: nothing-written-or-read panics return Err
-    // (exec grep in place); post-output panics return the sentinel. This outer
-    // catch_unwind is the last-resort net for panics outside `serve`'s scope.
+    // (the real grep is still available); post-output panics return the
+    // sentinel. This outer catch_unwind is the last-resort net for panics
+    // outside `serve`'s scope.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve(&spec)));
     match result {
-        Ok(Ok(code)) => code,
+        Ok(Ok(code)) if code != ENGINE_FAILED_EXIT => code,
         // Err only from pre-output checks (cwd mismatch, matcher build, or a
-        // panic before anything was written or read) — exec'ing the real grep
-        // is clean.
-        Ok(Err(())) => exec_grep(&fallback),
-        // A panic escaped `serve` mid-search: partial output may have been
-        // streamed; exec'ing grep would append to it (a false result). Exit
-        // with the sentinel instead: the parent discards and re-runs.
-        Err(_) => ENGINE_FAILED_EXIT,
+        // panic before anything was written or read) — the real grep is clean.
+        Ok(Err(reason)) => cannot_serve(&spec, reason),
+        // `serve` panicked with output already streamed (it reports the sentinel
+        // then), or a panic escaped it entirely: partial output may exist, so
+        // refusing is the only honest answer.
+        Ok(Ok(_)) | Err(_) => engine_failed(None),
     }
 }
 
-/// Replace the engine process with the real grep (PID/PGID preserved, so the
-/// shell tool's process-group timeout kill still applies). Re-exec is sound
-/// only while stdin was not yet consumed — the cwd/version/matcher pre-checks
-/// run before any stdin read; after the stdin head read, the producer's pipe
-/// is partially drained, so the engine exits sentinel-3 instead (the parent
-/// discards and re-runs the original command).
+/// Report an engine failure the parent must treat as an unserved search: the
+/// one-line `detail` (when there is one) and, on the platform whose parent
+/// reads it, [`ENGINE_REFUSAL_MARKER`] on a line of its own — so a refusal
+/// survives a pipeline tail masking the sentinel exit status.
+fn engine_failed(detail: Option<&str>) -> i32 {
+    if SHELL_PLATFORM == ShellPlatform::Windows {
+        // First, so a stream that hits the parent's stderr cap still carries it.
+        eprintln!("{ENGINE_REFUSAL_MARKER}");
+    }
+    if let Some(detail) = detail {
+        eprintln!("{detail}");
+    }
+    ENGINE_FAILED_EXIT
+}
+
+/// Read the spec JSON the member was invoked with: a bare JSON argument on
+/// unix, or the scratch file named by [`windows::SPEC_FILE_FLAG`] on Windows,
+/// where the command line cannot carry the payload (see the module header).
+/// The `Err` is the one-line reason printed before the sentinel exit.
+fn read_spec(args: &[String]) -> Result<String, String> {
+    match args {
+        [flag, path, ..] if flag == windows::SPEC_FILE_FLAG => {
+            fs::read_to_string(path).map_err(|e| format!("grep: engine: spec file {path}: {e}"))
+        }
+        [json, ..] => Ok(json.clone()),
+        [] => Err("grep: engine: missing spec".to_string()),
+    }
+}
+
+/// The real grep is about to produce the answer instead of the engine, because
+/// the engine cannot serve this spec (cwd divergence, matcher build failure,
+/// protocol mismatch, a panic before any output).
+///
+/// Unix: replace the process with the real grep — re-exec is sound only while
+/// stdin was not yet consumed (the cwd/version/matcher pre-checks run before
+/// any stdin read), and the PID/PGID are preserved, so the shell tool's
+/// process-group timeout kill still applies.
+///
+/// Windows: cmd.exe resolves `grep` through `PATHEXT` and its own cwd, and the
+/// engine has no way to re-exec the exact program the member would have run,
+/// so the reason goes to stderr and the sentinel exit refuses the call — the
+/// parent reports that line to the agent as the cause.
+///
+/// The `cfg` below is not a platform policy branch (that is
+/// [`SHELL_PLATFORM`]): it guards `exec`, an API the target simply does not
+/// have off unix.
+fn cannot_serve(spec: &EngineSpec, reason: &str) -> i32 {
+    #[cfg(unix)]
+    {
+        let _ = reason;
+        exec_grep(&spec.fallback)
+    }
+    #[cfg(not(unix))]
+    {
+        engine_failed(Some(&format!("{}: engine: {reason}", spec.verb)))
+    }
+}
+
+/// Replace the engine process with the real grep: PID/PGID preserved, so the
+/// shell tool's process-group timeout kill still applies. Unix-only — the
+/// Windows hand-back is the sentinel exit (see [`cannot_serve`]).
+#[cfg(unix)]
 fn exec_grep(argv: &[String]) -> i32 {
     use std::os::unix::process::CommandExt;
     let Some(first) = argv.first() else {
@@ -2205,20 +3140,34 @@ fn exec_grep(argv: &[String]) -> i32 {
 /// per-file grep semantics (or read stdin for stdin-fed members). Returns the
 /// aggregate exit code (0/1/2).
 ///
-/// `Err(())` means nothing was written and stdin was not consumed, so the
-/// caller can exec the real grep in place (cwd divergence, matcher build
-/// failure, or a panic before any input/output). A panic after output started
-/// or after the stdin head read returns `Ok(ENGINE_FAILED_EXIT)` — exec'ing
-/// grep then would append a false result or read the drained pipe remainder,
-/// so the parent re-runs.
-fn serve(spec: &EngineSpec) -> Result<i32, ()> {
-    let actual_cwd = std::env::current_dir().map_err(|_| ())?;
-    if actual_cwd != Path::new(&spec.cwd) {
-        // The cd chain diverged at runtime (e.g. `;`-joined failing cd) —
+/// `Err(reason)` means nothing was written and stdin was not consumed, so the
+/// caller can hand the member back to the real grep (cwd divergence, matcher
+/// build failure, or a panic before any input/output). A panic after output
+/// started or after the stdin head read returns `Ok(ENGINE_FAILED_EXIT)` —
+/// running grep then would append a false result or read the drained pipe
+/// remainder, so the parent re-runs.
+fn serve(spec: &EngineSpec) -> Result<i32, &'static str> {
+    let actual_cwd = std::env::current_dir().map_err(|_| "working directory unavailable")?;
+    // The parent's tracked cwd and this process's must name the same directory.
+    // Unix compares the two canonical spellings byte-exactly; Windows resolves
+    // this process's own cwd through the same canonicalization the parent used —
+    // the platform's path identity (case, separators, the verbatim prefix) plus
+    // the aliases `fs::canonicalize` follows (a junction or a `subst` drive would
+    // otherwise fail the gate for every member).
+    let same_cwd = match SHELL_PLATFORM {
+        ShellPlatform::Unix => actual_cwd == Path::new(&spec.cwd),
+        ShellPlatform::Windows => windows::same_directory(
+            &canonical_or_lexical(&actual_cwd, ShellPlatform::Windows),
+            Path::new(&spec.cwd),
+        ),
+    };
+    if !same_cwd {
+        // The cd chain diverged at runtime (e.g. a failing `cd` in a chain) —
         // the real grep in the actual cwd is the authentic result.
-        return Err(());
+        return Err("working directory diverged from the analyzed command");
     }
-    let matcher = build_matcher(&spec.patterns, spec.mode, &spec.flags).map_err(|_| ())?;
+    let matcher = build_matcher(&spec.patterns, spec.mode, &spec.flags)
+        .map_err(|_| "pattern could not be compiled")?;
     let mut out = Output::new(
         OutputSink::Stdout(io::BufWriter::with_capacity(16 * 1024, io::stdout())),
         output_limit(spec),
@@ -2235,10 +3184,13 @@ fn serve(spec: &EngineSpec) -> Result<i32, ()> {
         }
         // A panic before anything was written or read: exec'ing the real grep
         // is clean, and its exit code cannot be masked by a pipe member.
-        Err(_) if out.written == 0 && !stdin_consumed.get() => Err(()),
+        Err(_) if out.written == 0 && !stdin_consumed.get() => {
+            Err("engine panicked before producing output")
+        }
         // A panic mid-search may have streamed partial output or consumed the
         // producer's pipe; exec'ing grep would append a false result. Flush
-        // and return the sentinel: the parent discards this run and re-runs.
+        // and return the sentinel: the parent discards this run (unix re-runs
+        // the original command, Windows refuses the call).
         Err(_) => {
             out.finish();
             Ok(ENGINE_FAILED_EXIT)
@@ -2459,7 +3411,7 @@ fn process_operand(
                         emit_error(spec, out, display, "Is a directory");
                         return OperandResult::Error;
                     }
-                    if dir_excluded(display, &spec.exclude_dir) {
+                    if dir_excluded(display, &spec.exclude_dir, SHELL_PLATFORM) {
                         return OperandResult::NoMatch;
                     }
                     return walk_dir(op, spec, matcher, out, show_prefix);
@@ -2468,7 +3420,7 @@ fn process_operand(
                     emit_error(spec, out, display, "Not a directory");
                     return OperandResult::Error;
                 }
-                if !file_allowed_by_filters(display, spec) {
+                if !file_allowed_by_filters(display, spec, SHELL_PLATFORM) {
                     return OperandResult::NoMatch;
                 }
                 return search_file(path, display, spec, matcher, out, show_prefix);
@@ -2477,7 +3429,7 @@ fn process_operand(
     }
 
     if lmeta.is_dir() {
-        if dir_excluded(display, &spec.exclude_dir) {
+        if dir_excluded(display, &spec.exclude_dir, SHELL_PLATFORM) {
             return OperandResult::NoMatch;
         }
         if !spec.flags.r {
@@ -2493,7 +3445,7 @@ fn process_operand(
     }
     // Explicit file operands are always searched, subject to the BSD
     // --include/--exclude filters (which apply to explicit operands too).
-    if !file_allowed_by_filters(display, spec) {
+    if !file_allowed_by_filters(display, spec, SHELL_PLATFORM) {
         return OperandResult::NoMatch;
     }
     search_file(path, display, spec, matcher, out, show_prefix)
@@ -2502,13 +3454,13 @@ fn process_operand(
 /// BSD fnmatch semantics for --include/--exclude: patterns match the basename
 /// OR the full traversal path, `*` crosses `/`, anchored full-string, and the
 /// LAST matching pattern in command-line order decides (include vs exclude).
-fn file_allowed_by_filters(display: &str, spec: &EngineSpec) -> bool {
+fn file_allowed_by_filters(display: &str, spec: &EngineSpec, platform: ShellPlatform) -> bool {
     // One ordered list of include+exclude patterns; last match wins. Each
     // pattern matches the basename or the full traversal path.
-    let base = display.rsplit('/').next().unwrap_or(display);
+    let base = display_basename(display, platform);
     let mut last: Option<bool> = None;
     for (include, pat) in &spec.filters {
-        if fnmatch(pat, display) || fnmatch(pat, base) {
+        if fnmatch(pat, display, platform) || fnmatch(pat, base, platform) {
             last = Some(*include);
         }
     }
@@ -2520,30 +3472,57 @@ fn file_allowed_by_filters(display: &str, spec: &EngineSpec) -> bool {
 }
 
 /// `--exclude-dir` filter (basename or full traversal path).
-fn dir_excluded(display: &str, exclude_dir: &[String]) -> bool {
-    let base = display.rsplit('/').next().unwrap_or(display);
+fn dir_excluded(display: &str, exclude_dir: &[String], platform: ShellPlatform) -> bool {
+    let base = display_basename(display, platform);
     exclude_dir
         .iter()
-        .any(|pat| fnmatch(pat, base) || fnmatch(pat, display))
+        .any(|pat| fnmatch(pat, base, platform) || fnmatch(pat, display, platform))
 }
 
-/// Host fnmatch; `flags` mirror bash globbing (FNM_PERIOD excludes dotfiles)
-/// or BSD grep's --include/--exclude calls (0, no pathname semantics).
-fn fnmatch_flags(pattern: &str, s: &str, flags: i32) -> bool {
-    let Ok(p) = std::ffi::CString::new(pattern) else {
-        return false;
-    };
-    let Ok(n) = std::ffi::CString::new(s) else {
-        return false;
-    };
-    // SAFETY: both CStrings are NUL-free and outlive the call.
-    unsafe { libc::fnmatch(p.as_ptr(), n.as_ptr(), flags) == 0 }
+/// The basename of a displayed path, in the platform's own separator reading:
+/// `\` separates on Windows and is an ordinary filename character on unix.
+fn display_basename(display: &str, platform: ShellPlatform) -> &str {
+    match platform {
+        ShellPlatform::Unix => display.rsplit('/').next().unwrap_or(display),
+        ShellPlatform::Windows => display.rsplit(['/', '\\']).next().unwrap_or(display),
+    }
+}
+
+/// Shell glob matching, with `period` standing for `FNM_PERIOD` (a leading dot
+/// in the name must be matched by a literal dot): the host `fnmatch` on unix
+/// — bash globbing passes `FNM_PERIOD`, BSD grep's --include/--exclude calls
+/// pass no flags — and the pure-Rust [`windows::fnmatch`] on Windows, which has
+/// no libc to call. The two are pinned differentially against each other by
+/// the `windows_fnmatch_parity` tests, which run on a unix host — only there
+/// is the second implementation available.
+fn fnmatch_flags(pattern: &str, s: &str, period: bool, platform: ShellPlatform) -> bool {
+    if platform == ShellPlatform::Windows {
+        return windows::fnmatch(pattern, s, period);
+    }
+    #[cfg(unix)]
+    {
+        let Ok(p) = std::ffi::CString::new(pattern) else {
+            return false;
+        };
+        let Ok(n) = std::ffi::CString::new(s) else {
+            return false;
+        };
+        let flags = if period { libc::FNM_PERIOD } else { 0 };
+        // SAFETY: both CStrings are NUL-free and outlive the call.
+        unsafe { libc::fnmatch(p.as_ptr(), n.as_ptr(), flags) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        // No host matcher exists off unix; the unix platform is a test-lane
+        // value there, so nothing matches (fail-closed).
+        false
+    }
 }
 
 /// fnmatch without FNM_PATHNAME — exactly what BSD grep calls:
 /// `*`/`?` cross `/`, `[...]` classes (incl. POSIX names), anchored full-string.
-fn fnmatch(pattern: &str, s: &str) -> bool {
-    fnmatch_flags(pattern, s, 0)
+fn fnmatch(pattern: &str, s: &str, platform: ShellPlatform) -> bool {
+    fnmatch_flags(pattern, s, false, platform)
 }
 
 /// Recursive walk with rg-default exclusions (hidden, gitignore, .ignore, git
@@ -2556,7 +3535,10 @@ fn fnmatch(pattern: &str, s: &str) -> bool {
 /// under a brief mutex and the aggregate `OperandResult` is maxed. In-file
 /// order is preserved; cross-file output order is non-deterministic (the
 /// accepted worker-scheduling delta). The hidden/gitignore exclusion and the
-/// symlink skip are preserved unchanged by the builder configuration.
+/// symlink skip are preserved unchanged by the builder configuration. "Hidden"
+/// is the platform's own reading: a leading dot everywhere, plus the hidden
+/// file attribute on Windows (the `ignore` crate's rule), so a walk there can
+/// skip a file a unix one would search.
 fn walk_dir(
     op: &Operand,
     spec: &EngineSpec,
@@ -2578,8 +3560,13 @@ fn walk_dir(
         let root_display = root_display.clone();
         move |entry| {
             if entry.file_type().is_some_and(|t| t.is_dir()) && entry.depth() > 0 {
-                let display = traversal_display(&root_display, &root_for_filter, entry.path());
-                !dir_excluded(&display, &exclude_dir)
+                let display = traversal_display(
+                    &root_display,
+                    &root_for_filter,
+                    entry.path(),
+                    SHELL_PLATFORM,
+                );
+                !dir_excluded(&display, &exclude_dir, SHELL_PLATFORM)
             } else {
                 true
             }
@@ -2617,8 +3604,9 @@ fn walk_dir(
                     if ft.is_some_and(|t| t.is_symlink() || t.is_dir()) {
                         return ignore::WalkState::Continue; // grep -r skips symlinks; dirs traversed by the walk
                     }
-                    let display = traversal_display(root_display, root_abs, e.path());
-                    if !file_allowed_by_filters(&display, spec) {
+                    let display =
+                        traversal_display(root_display, root_abs, e.path(), SHELL_PLATFORM);
+                    if !file_allowed_by_filters(&display, spec, SHELL_PLATFORM) {
                         return ignore::WalkState::Continue;
                     }
                     let r = search_file(e.path(), &display, spec, matcher, &mut local, show_prefix);
@@ -2630,7 +3618,7 @@ fn walk_dir(
                     let (path, message) = walk_error_info(&e);
                     let display = path.as_deref().map_or_else(
                         || op.display.clone(),
-                        |p| traversal_display(&op.display, root_abs, p),
+                        |p| traversal_display(&op.display, root_abs, p, SHELL_PLATFORM),
                     );
                     emit_error(spec, &mut local, &display, &message);
                     let (buf, err) = local.take_stdio();
@@ -2654,14 +3642,24 @@ fn walk_dir(
     shared_result.into_inner().unwrap_poison()
 }
 
-/// Display path for a walked entry: the operand spelling + relative suffix.
-fn traversal_display(root_display: &str, root_abs: &Path, entry: &Path) -> String {
+/// Display path for a walked entry: the operand spelling + relative suffix,
+/// joined in the platform's separator so the displayed path is spelled the way
+/// the operand was.
+fn traversal_display(
+    root_display: &str,
+    root_abs: &Path,
+    entry: &Path,
+    platform: ShellPlatform,
+) -> String {
     let rel = entry.strip_prefix(root_abs).unwrap_or(entry);
     let rel = rel.to_string_lossy();
     if rel.is_empty() {
-        root_display.to_string()
-    } else {
-        format!("{}/{}", root_display.trim_end_matches('/'), rel)
+        return root_display.to_string();
+    }
+    match platform {
+        // `/`-joined, exactly as this has always rendered on unix.
+        ShellPlatform::Unix => format!("{}/{}", root_display.trim_end_matches('/'), rel),
+        ShellPlatform::Windows => windows::traversal_display(root_display, &rel),
     }
 }
 
@@ -2787,7 +3785,7 @@ impl grep_searcher::Sink for GrepSink<'_> {
             return Ok(false); // existence is enough
         }
         self.selected_any = true;
-        let content = trim_line_terminator(mat.bytes());
+        let content = trim_line_terminator(mat.bytes(), SHELL_PLATFORM);
         if self.spec.flags.o {
             // BSD -o never prints zero-length matches.
             let mut matches = Vec::new();
@@ -2820,7 +3818,7 @@ impl grep_searcher::Sink for GrepSink<'_> {
         if self.binary {
             return Ok(true); // binary files only emit the message
         }
-        let content = trim_line_terminator(ctx.bytes());
+        let content = trim_line_terminator(ctx.bytes(), SHELL_PLATFORM);
         self.write_prefix(ctx.line_number(), true);
         self.out.write_bytes(content);
         self.out.write_byte(b'\n');
@@ -2879,20 +3877,33 @@ impl GrepSink<'_> {
     }
 }
 
-fn trim_line_terminator(b: &[u8]) -> &[u8] {
-    b.strip_suffix(b"\n").unwrap_or(b)
+/// Drop a line's terminator. On Windows a CRLF line's `\r` goes with its `\n`,
+/// so a served grep never leaks carriage returns into agent-visible lines (the
+/// engine's own terminator stays `\n`, matching the real tool's output); a lone
+/// trailing `\r` is content, exactly as on unix — the pair is stripped as a
+/// pair.
+fn trim_line_terminator(b: &[u8], platform: ShellPlatform) -> &[u8] {
+    match platform {
+        ShellPlatform::Unix => b.strip_suffix(b"\n").unwrap_or(b),
+        ShellPlatform::Windows => b
+            .strip_suffix(b"\r\n")
+            .or_else(|| b.strip_suffix(b"\n"))
+            .unwrap_or(b),
+    }
 }
 
 // ── Output: bounded, self-capping writer ──────────────────────────────────
 
 /// Streams matched lines to stdout as they are produced (so an early-exit
-/// tail propagates via SIGPIPE like the real grep). Non-piped members
+/// tail stops the search the way it does for the real grep). Non-piped members
 /// self-cap at [`OUTPUT_CAP`] bytes after which writing stops but the search
 /// continues (exit codes stay correct for huge outputs); piped members are
 /// unbounded — the tail consumes the full stream, so truncation would be an
-/// invisible wrong answer. With SIGPIPE at its default disposition a write to
-/// a closed pipe kills the process — exactly like grep. Stderr is buffered
-/// (small, rare) and flushed on finish.
+/// invisible wrong answer. A write to a closed pipe kills the process: on unix
+/// SIGPIPE at its default disposition does it (exactly like grep), on Windows —
+/// which has no SIGPIPE — the `BrokenPipe` write error does (see
+/// [`exit_on_broken_pipe`]). Stderr is buffered (small, rare) and flushed on
+/// finish.
 struct Output {
     sink: OutputSink,
     err: Vec<u8>,
@@ -2906,6 +3917,22 @@ enum OutputSink {
     // In-memory sink: the parallel-walk per-worker buffers (production) and the
     // macOS-gated parity tests.
     Buffer(Vec<u8>),
+}
+
+/// The closed-pipe exit shared by both stdout writers: on unix SIGPIPE at its
+/// default disposition already ended the process (exactly like grep), so the
+/// write error is dropped; on Windows — which has no SIGPIPE — a `BrokenPipe`
+/// error is what a closed pipe surfaces as, and it kills the process with
+/// [`BROKEN_PIPE_EXIT`].
+fn exit_on_broken_pipe(result: &io::Result<()>) {
+    #[cfg(not(windows))]
+    let _ = result;
+    #[cfg(windows)]
+    if let Err(err) = result
+        && err.kind() == io::ErrorKind::BrokenPipe
+    {
+        std::process::exit(BROKEN_PIPE_EXIT);
+    }
 }
 
 impl Output {
@@ -2926,9 +3953,7 @@ impl Output {
             None => b.len(),
         };
         match &mut self.sink {
-            OutputSink::Stdout(w) => {
-                let _ = w.write_all(&b[..take]);
-            }
+            OutputSink::Stdout(w) => exit_on_broken_pipe(&w.write_all(&b[..take])),
             OutputSink::Buffer(v) => v.extend_from_slice(&b[..take]),
         }
         self.written += take;
@@ -2957,18 +3982,20 @@ impl Output {
         }
     }
 
-    /// Push buffered stdout to the pipe (per line) so `head` sees data and
-    /// its early exit reaches us via SIGPIPE.
+    /// Push buffered stdout to the pipe (per line) so `head` sees data and its
+    /// early exit reaches us, through [`exit_on_broken_pipe`].
     fn flush(&mut self) {
         if let OutputSink::Stdout(w) = &mut self.sink {
-            let _ = w.flush();
+            exit_on_broken_pipe(&w.flush());
         }
     }
 
-    /// Flush stdout and emit the buffered stderr.
+    /// Flush stdout and emit the buffered stderr. The stdout flush goes through
+    /// the same closed-pipe rule as every other write (the search is over by
+    /// now, so a break here cannot extend the walk, but the policy stays one).
     fn finish(self) {
         if let OutputSink::Stdout(mut w) = self.sink {
-            let _ = w.flush();
+            exit_on_broken_pipe(&w.flush());
         }
         let stderr = io::stderr();
         let mut lock = stderr.lock();
@@ -3158,12 +4185,13 @@ mod parity_tests {
     /// preserved verbatim in the rewrite); `real_run_shell` captures the
     /// stream from it. stdin-fed rows only.
     fn producer_command(command: &str) -> String {
-        let segments = split_segments(command).expect("segments");
+        let segments = split_segments(command, ShellPlatform::Unix).expect("segments");
         let gidx = segments
             .iter()
             .position(|(s, _)| {
                 let v = first_word(s);
-                is_grep_verb(v) || segment_contains_grep(s, v)
+                is_grep_verb(v, ShellPlatform::Unix)
+                    || segment_contains_grep(s, v, ShellPlatform::Unix)
             })
             .expect("grep member");
         let mut start = gidx;
@@ -3214,11 +4242,40 @@ mod parity_tests {
     /// The original command's text from its first `|`/`|&` connector on — the
     /// tail that must survive the rewrite verbatim (never analyzed).
     fn pipeline_tail(command: &str) -> Option<String> {
-        let segments = split_segments(command).ok()?;
+        let segments = split_segments(command, ShellPlatform::Unix).ok()?;
         let first = segments
             .iter()
             .position(|(_, c)| matches!(c.as_str(), "|" | "|&"))?;
         Some(rejoin_from(&segments, first))
+    }
+
+    /// The joined twin of [`Analyzed`]: the rewrite as one command.
+    type JoinedAnalyzeOutput = (
+        Vec<EngineSpec>,
+        Vec<(usize, String, bool)>,
+        String,
+        Vec<GrepOutcome>,
+    );
+
+    /// Analyze and join, exactly as the production caller does for the unix
+    /// platform this parity lane runs under, so the assertions below read one
+    /// command's rewrite.
+    fn analyze_joined(
+        command: &str,
+        ws: &Path,
+        home: &Path,
+        allow_single: bool,
+    ) -> Result<JoinedAnalyzeOutput, AnalyzeFailure> {
+        let analyzed = analyze_command(command, ws, home, ShellPlatform::Unix, allow_single)?;
+        let jsons: Vec<String> = analyzed.specs.iter().map(spec_json).collect();
+        let (rewritten, _) = join_rewritten(&analyzed.segments, &jsons, ShellPlatform::Unix)
+            .expect("the unix join never refuses");
+        Ok((
+            analyzed.specs,
+            analyzed.shapes,
+            rewritten,
+            analyzed.outcomes,
+        ))
     }
 
     /// Assert the engine's output/exit are byte-identical to the real grep.
@@ -3226,7 +4283,7 @@ mod parity_tests {
     /// differently across workers, so those are compared as sorted line-sets;
     /// everything else stays byte-exact (the fast matcher's ordering is pinned).
     fn assert_parity(command: &str, ws: &Path, home: &Path) {
-        let (specs, _, rewritten, _) = analyze_command(command, ws, home, true)
+        let (specs, _, rewritten, _) = analyze_joined(command, ws, home, true)
             .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
         assert_eq!(specs.len(), 1, "{command}: expected one grep member");
         if specs[0].stdin {
@@ -3278,10 +4335,10 @@ mod parity_tests {
     /// The members after the served grep member, rejoined with their
     /// connectors — must survive the rewrite verbatim (stdin-fed rows).
     fn grep_tail(command: &str) -> Option<String> {
-        let segments = split_segments(command).ok()?;
+        let segments = split_segments(command, ShellPlatform::Unix).ok()?;
         let gidx = segments.iter().position(|(s, _)| {
             let v = first_word(s);
-            is_grep_verb(v) || segment_contains_grep(s, v)
+            is_grep_verb(v, ShellPlatform::Unix) || segment_contains_grep(s, v, ShellPlatform::Unix)
         })?;
         if gidx + 1 >= segments.len() {
             return Some(String::new());
@@ -3340,15 +4397,15 @@ mod parity_tests {
     /// Assert the command falls back (original command untouched).
     fn assert_falls_back(command: &str, ws: &Path, home: &Path) {
         assert!(
-            analyze_command(command, ws, home, false).is_err(),
+            analyze_joined(command, ws, home, false).is_err(),
             "{command}: expected fallback, got served"
         );
     }
 
-    /// Assert the command falls back with a specific reason (pins the labels
-    /// the empty-member gate and early NoGrep check changed).
+    /// Assert the command falls back with a specific reason (pins the label
+    /// each row falls back with).
     fn assert_falls_back_reason(command: &str, ws: &Path, home: &Path, reason: &str) {
-        let err = analyze_command(command, ws, home, false)
+        let err = analyze_joined(command, ws, home, false)
             .err()
             .unwrap_or_else(|| panic!("{command}: expected fallback, got served"));
         assert_eq!(err.reason.to_string(), reason, "{command}");
@@ -3637,7 +4694,7 @@ mod parity_tests {
         // full scan would consume (and report) all of it.
         let (_tmp, ws, home) = fixture();
         let (specs, _, _, _) =
-            analyze_command("seq 1 100000 | grep -m1 5", &ws, &home, true).expect("servable");
+            analyze_joined("seq 1 100000 | grep -m1 5", &ws, &home, true).expect("servable");
         let (stream, _, _) = real_run_shell("seq 1 100000", &ws, &home);
         assert!(stream.len() > BINARY_WINDOW, "fixture stream too small");
         let (_, _, _, stream_bytes) = engine_run_with_stdin(&specs[0], &stream);
@@ -3742,12 +4799,12 @@ mod parity_tests {
 
     #[test]
     fn per_segment_skip_with_served_sibling() {
-        // A single-file grep (perf gate) no longer poisons a sibling servable
+        // A single-file grep (perf gate) does not poison a sibling servable
         // recursive grep: the unservable member is kept verbatim, the servable
         // one rewritten, and the whole command is served.
         let (_tmp, ws, home) = fixture();
         let (specs, _, rewritten, outcomes) =
-            analyze_command("grep x a.txt; grep -rn needle sub", &ws, &home, false)
+            analyze_joined("grep x a.txt; grep -rn needle sub", &ws, &home, false)
                 .expect("chain with a servable sibling served");
         assert_eq!(specs.len(), 1, "only the recursive grep is served");
         assert!(
@@ -3764,7 +4821,7 @@ mod parity_tests {
 
         // A compound (`if`) containing a grep is skipped (kept verbatim) while
         // a sibling recursive grep is served.
-        let (specs, _, rewritten, outcomes) = analyze_command(
+        let (specs, _, rewritten, outcomes) = analyze_joined(
             "grep -rn needle sub; if grep x a.txt; then echo hi; fi",
             &ws,
             &home,
@@ -3798,17 +4855,17 @@ mod parity_tests {
         // The serve→fallback direction of the same fix is a fallback_triggers
         // row (`echo $(echo \) ; grep x a.txt`).
         let (_tmp, ws, home) = fixture();
-        analyze_command("echo `a\\`b` ; grep x a.txt b.txt", &ws, &home, true)
+        analyze_joined("echo `a\\`b` ; grep x a.txt b.txt", &ws, &home, true)
             .expect("escaped backtick: trailing grep is a separate served member");
     }
 
     #[test]
     fn exclusion_delta_is_rg_default() {
-        // The one approved behavioral delta: recursive walks skip
+        // An approved behavioral delta: recursive walks skip
         // hidden/gitignored content; explicit file operands always searched.
         let (_tmp, ws, home) = fixture();
         let (specs, _, _, _) =
-            analyze_command("grep -r x ign", &ws, &home, true).expect("ign walk servable");
+            analyze_joined("grep -r x ign", &ws, &home, true).expect("ign walk servable");
         let (eout, _, ecode) = engine_run(&specs[0]);
         let text = String::from_utf8_lossy(&eout).to_string();
         assert_eq!(ecode, 0);
@@ -3818,7 +4875,7 @@ mod parity_tests {
 
         // Explicit file operands bypass the exclusion filters entirely.
         let (specs, _, _, _) =
-            analyze_command("grep -r x ign/.hidden.txt ign/skip.log", &ws, &home, true)
+            analyze_joined("grep -r x ign/.hidden.txt ign/skip.log", &ws, &home, true)
                 .expect("explicit operands servable");
         let (eout, _, ecode) = engine_run(&specs[0]);
         assert_eq!(ecode, 0);
@@ -3855,11 +4912,11 @@ mod redirect_token_pins {
     use super::*;
 
     fn redirects_of(segment: &str) -> (Vec<String>, Vec<String>) {
-        let mut words = grep_tokenize(segment).expect("tokenize");
+        let mut words = grep_tokenize(segment, ShellPlatform::Unix).expect("tokenize");
         if words.first().is_some_and(|w| w.value == "grep") {
             words.remove(0);
         }
-        let parsed = parse_grep_words(&words, "grep").expect("parse");
+        let parsed = parse_grep_words(&words, "grep", ShellPlatform::Unix).expect("parse");
         (parsed.redirects, parsed.operand_tokens)
     }
 
@@ -3926,18 +4983,70 @@ mod cd_scan_pins {
         fs::create_dir_all(&ws).expect("ws");
         fs::create_dir_all(&home).expect("home");
         assert_eq!(
-            resolve_cd("cd", &ws, &home).expect("bare cd"),
-            canonical_or_lexical(&home)
+            resolve_cd("cd", &ws, &home, ShellPlatform::Unix).expect("bare cd"),
+            canonical_or_lexical(&home, ShellPlatform::Unix)
         );
         assert_eq!(
-            resolve_cd("cd -P", &ws, &home).expect("flag-only cd"),
-            canonical_or_lexical(&home)
+            resolve_cd("cd -P", &ws, &home, ShellPlatform::Unix).expect("flag-only cd"),
+            canonical_or_lexical(&home, ShellPlatform::Unix)
         );
         for bad in ["cd -e sub", "cd -Pe sub", "cd sub extra", "cd -- -P extra"] {
             assert!(
-                matches!(resolve_cd(bad, &ws, &home), Err(Fallback::CdUntrackable)),
+                matches!(
+                    resolve_cd(bad, &ws, &home, ShellPlatform::Unix),
+                    Err(Fallback::CdUntrackable)
+                ),
                 "{bad}: expected CdUntrackable"
             );
+        }
+    }
+}
+
+// ── Windows fnmatch parity (host-differential) ───────────────────────────
+// The Windows matcher is pure Rust (no libc on that platform), so the host's
+// own `fnmatch` is the only oracle available for it. Both are the SAME
+// semantics the unix lane uses (the engine's filters and the shell's glob
+// expansion), so agreement here is what makes the Windows spelling trustworthy:
+// the cross-product below, malformed spellings included, is this matcher's
+// whole semantics pin.
+
+#[cfg(all(test, unix))]
+mod windows_fnmatch_parity {
+    use super::*;
+
+    /// This host's `libc::fnmatch`, called exactly as [`fnmatch_flags`] calls
+    /// it on unix.
+    fn host_fnmatch(pattern: &str, name: &str, period: bool) -> bool {
+        let p = std::ffi::CString::new(pattern).expect("pattern has no NUL");
+        let n = std::ffi::CString::new(name).expect("name has no NUL");
+        let flags = if period { libc::FNM_PERIOD } else { 0 };
+        // SAFETY: both CStrings are NUL-free and outlive the call.
+        unsafe { libc::fnmatch(p.as_ptr(), n.as_ptr(), flags) == 0 }
+    }
+
+    #[test]
+    fn windows_matcher_agrees_with_the_host() {
+        let patterns = [
+            "*", "?", "a*", "*a", "a?c", "*.txt", "*.*", "[abc]", "[abc]*", "[!abc]", "[^a]",
+            "[a-z]*", "a[b-d]e", "[a-]", "[]a]", r"\*", r"a\?c", ".*", ".x", "*[!.]*", "*x*",
+            // Malformed classes: an unterminated bracket and a reversed range,
+            // which the engine's glob walk must treat exactly as the host does.
+            "[abc", "a[", "[z-a]",
+        ];
+        let names = [
+            "", "a", "ab", "abc", "a.txt", "ab.txt", ".a", ".a.txt", ".hidden", ".", "..", "*",
+            "?", "\\", "a*c", "a?c", "a-b", "]", "a]", "ace", "axe", ".txt", "a/b", "abc ",
+        ];
+        for pattern in patterns {
+            for name in names {
+                for period in [false, true] {
+                    assert_eq!(
+                        windows::fnmatch(pattern, name, period),
+                        host_fnmatch(pattern, name, period),
+                        "fnmatch({pattern:?}, {name:?}, period={period})"
+                    );
+                }
+            }
         }
     }
 }
@@ -3982,48 +5091,973 @@ mod segmenter_pins {
             ("a |& grep x a.txt", &[("a", "|&"), ("grep x a.txt", "")]),
         ];
         for (input, expected) in grep_ok {
-            let got = split_segments(input).expect("expected segments");
+            let got = split_segments(input, ShellPlatform::Unix).expect("expected segments");
             let got: Vec<(&str, &str)> =
                 got.iter().map(|(s, c)| (s.as_str(), c.as_str())).collect();
             assert_eq!(got.as_slice(), *expected, "grep: {input:?}");
         }
         // `;;` outside a case: empty segment before `;` is a syntax error.
         assert!(
-            split_segments("echo a ;; echo b").is_err(),
+            split_segments("echo a ;; echo b", ShellPlatform::Unix).is_err(),
             "grep: ;; outside case"
         );
     }
 }
 
-// ── Read-only serve pin (no feature gate) ───────────────────────────────
+// ── Display-path pins (non-gated: the unix reading must not drift) ──────
+// The platform split in these helpers is what keeps a unix answer unix-shaped:
+// `\` is an ordinary filename character there, and a walked entry is always
+// `/`-joined.
 
-#[cfg(all(test, unix))]
-mod read_only_serve_pins {
-    use super::super::readonly::{CheckContext, check_command};
+#[cfg(test)]
+mod platform_string_pins {
     use super::*;
 
-    /// Pins the module-header invariant: a generated rewrite must pass the
-    /// read-only guard.
     #[test]
-    fn generated_rewrite_passes_the_read_only_guard() {
+    fn unix_display_paths_and_filters_read_only_slash() {
+        // A walked entry joins on `/`, including the degenerate empty operand
+        // spelling (which renders a leading separator).
+        assert_eq!(
+            traversal_display(
+                "/ws/src",
+                Path::new("/ws/src"),
+                Path::new("/ws/src/main.rs"),
+                ShellPlatform::Unix
+            ),
+            "/ws/src/main.rs"
+        );
+        assert_eq!(
+            traversal_display(
+                "",
+                Path::new("/ws"),
+                Path::new("/ws/main.rs"),
+                ShellPlatform::Unix
+            ),
+            "/main.rs"
+        );
+        // Only a trailing `/` is trimmed; a trailing `\` is part of the name.
+        assert_eq!(
+            traversal_display(
+                r"/ws\dir",
+                Path::new("/ws/dir"),
+                Path::new("/ws/dir/a.rs"),
+                ShellPlatform::Unix
+            ),
+            r"/ws\dir/a.rs"
+        );
+
+        // A basename splits on `/` alone: a filename may contain a backslash.
+        assert_eq!(display_basename("a/b/c.rs", ShellPlatform::Unix), "c.rs");
+        assert_eq!(display_basename(r"a\b", ShellPlatform::Unix), r"a\b");
+        assert_eq!(display_basename(r"a\b", ShellPlatform::Windows), "b");
+        assert_eq!(display_basename("a/b", ShellPlatform::Windows), "b");
+    }
+
+    /// A `\r` is dropped only as the `\n`'s own carriage return: a line whose
+    /// last byte is a bare `\r` (a file with no final newline) keeps it on both
+    /// platforms, exactly as the host grep delivers it.
+    #[test]
+    fn windows_strips_the_carriage_return_only_with_its_newline() {
+        assert_eq!(
+            trim_line_terminator(b"line\r\n", ShellPlatform::Windows),
+            b"line"
+        );
+        assert_eq!(
+            trim_line_terminator(b"line\n", ShellPlatform::Windows),
+            b"line"
+        );
+        assert_eq!(
+            trim_line_terminator(b"line\r", ShellPlatform::Windows),
+            b"line\r"
+        );
+        assert_eq!(
+            trim_line_terminator(b"line\r", ShellPlatform::Unix),
+            b"line\r"
+        );
+    }
+
+    /// One canonicalization for both sides of the cwd gate: on Windows the
+    /// verbatim (`\\?\`) prefix `fs::canonicalize` may add is stripped, so
+    /// tracked and displayed paths stay in the platform's natural spelling, and
+    /// a path that cannot be canonicalized falls back to its lexical spelling
+    /// rather than failing the analysis.
+    #[test]
+    fn canonical_or_lexical_strips_the_windows_verbatim_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let canonical = canonical_or_lexical(tmp.path(), ShellPlatform::Windows);
+        assert!(
+            !canonical.to_string_lossy().starts_with(r"\\?\"),
+            "{canonical:?}"
+        );
+        let missing = tmp.path().join("no-such-dir");
+        assert!(
+            canonical_or_lexical(&missing, ShellPlatform::Windows)
+                .to_string_lossy()
+                .contains("no-such-dir")
+        );
+    }
+}
+
+// ── Hand-off pins (non-gated: the rewrite's one machine-dependent part) ──
+// Both hand-offs are driven from this host: the spec rides on the command line
+// on unix and through a scratch file on Windows, and the Windows executable
+// quoting is the one part of a rewrite that depends on where the process was
+// installed.
+
+#[cfg(test)]
+mod handoff_pins {
+    use super::super::SpecFiles;
+    use super::*;
+
+    /// The Windows rewrite quotes the executable in place, and cmd.exe keeps
+    /// every metacharacter literal inside that quoting — an installation under
+    /// `C:\Program Files (x86)\…` is served, not disabled machine-wide. A path
+    /// carrying what cmd.exe rewrites even inside quotes is refused instead of
+    /// written out as a line cmd would read differently.
+    #[test]
+    fn windows_hand_off_quotes_the_executable_and_refuses_only_what_cmd_rewrites() {
+        let spec = render_only_json();
+        let mut files = Vec::new();
+        let fragment = render_served(
+            &spec,
+            &[],
+            ShellPlatform::Windows,
+            r"C:\Program Files (x86)\MahBot\mahbot.exe",
+            &mut files,
+        )
+        .expect("a programme path cmd.exe reads literally inside quotes");
+        assert!(
+            fragment.starts_with(r#""C:\Program Files (x86)\MahBot\mahbot.exe" "#),
+            "{fragment}"
+        );
+        assert!(fragment.contains(windows::SPEC_FILE_FLAG), "{fragment}");
+        assert_eq!(files.len(), 1, "the spec rides a scratch file");
+        assert!(files[0].exists(), "{:?}", files[0]);
+        let file = files[0].clone();
+        drop(SpecFiles(files));
+        assert!(!file.exists(), "the call's guard removes it: {file:?}");
+
+        for bad in [r"C:\Users\a%b\mahbot.exe", r"C:\Users\a!b\mahbot.exe"] {
+            let err = render_served(&spec, &[], ShellPlatform::Windows, bad, &mut Vec::new())
+                .expect_err("a path cmd.exe rewrites even inside quotes");
+            assert!(err.to_string().contains("hand-off refused"), "{err}");
+        }
+    }
+
+    /// On unix the executable's path is single-quoted for `sh` and the spec
+    /// rides the command line.
+    #[test]
+    fn unix_hand_off_keeps_the_argv_transport() {
+        let mut files = Vec::new();
+        let fragment = render_served(
+            &render_only_json(),
+            &["2>&1".into()],
+            ShellPlatform::Unix,
+            "/opt/it's here/mahbot",
+            &mut files,
+        )
+        .expect("unix hand-off");
+        assert!(files.is_empty(), "no scratch file on unix");
+        assert!(
+            fragment.starts_with("'/opt/it'\\''s here/mahbot' "),
+            "{fragment}"
+        );
+        assert!(fragment.contains(ENGINE_VERB), "{fragment}");
+        assert!(
+            fragment.ends_with(" 2>&1"),
+            "redirects stay verbatim: {fragment}"
+        );
+    }
+
+    /// The scratch-file transport's read half: the flag arm of [`read_spec`]
+    /// takes the file's contents (the flag itself is never parsed as JSON), the
+    /// argv arm still passes a bare spec straight through, and a path with
+    /// nothing behind it is an error — the member the engine refuses, and the
+    /// parent then refuses the call on.
+    ///
+    /// Driven at [`read_spec`] rather than through `run_engine`, which is not
+    /// callable from this lane at all: it puts the process-wide SIGPIPE
+    /// disposition back to its default, which this binary shares with tests
+    /// whose producer writes into a child pipe expecting `EPIPE` (a sibling
+    /// thread inside that window would be killed by SIGPIPE and take the whole
+    /// test run down with it), and on a cannot-serve path it replaces this
+    /// process with the real `grep`. Both forms reach `serve` as the same JSON
+    /// string, which the parity tests drive directly; the end-to-end transport
+    /// is covered by the manual smoke run of the built binary instead.
+    #[test]
+    fn the_spec_file_flag_reads_the_scratch_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("spec.json");
+        fs::write(&path, r#"{"version":1}"#).expect("spec file");
+        let file_args = |path: &Path| {
+            vec![
+                windows::SPEC_FILE_FLAG.to_string(),
+                path.to_string_lossy().into_owned(),
+                "grep".to_string(),
+            ]
+        };
+
+        assert_eq!(
+            read_spec(&file_args(&path)).expect("the flag reads the file"),
+            r#"{"version":1}"#
+        );
+        assert!(
+            read_spec(&file_args(&tmp.path().join("no-such-spec.json"))).is_err(),
+            "an unreadable spec file is an error, never a parse of the flag"
+        );
+        assert_eq!(
+            read_spec(&[r#"{"version":2}"#.to_string()]).expect("the argv arm passes it through"),
+            r#"{"version":2}"#
+        );
+    }
+}
+
+// ── Read-only serve pins (no feature gate) ──────────────────────────────
+// Both platforms are driven from this host: the platform is a value, and the
+// guard reads it from its own context. The unix rows pin the argv hand-off and
+// the single-file perf gate; the Windows rows pin the scratch-file hand-off.
+
+// One gate for the whole harness: the pin modules below (and the platform
+// readers they drive) share these fixtures, re-exported into file scope so each
+// row names them directly.
+#[cfg(test)]
+use self::test_support::{render_only_json, serve_fixture, served, spec_cwd};
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    /// The temp tree the platform pin modules serve against: a workspace holding
+    /// the operand paths their rows name, and a home tree beside it. Bind the
+    /// returned `TempDir` for the whole test — dropping it deletes the trees.
+    pub(super) fn serve_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws = tmp.path().join("ws");
         let home = tmp.path().join("home");
-        fs::create_dir_all(&ws).expect("ws");
+        fs::create_dir_all(ws.join("src")).expect("ws/src");
         fs::create_dir_all(&home).expect("home");
+        fs::write(ws.join("f.txt"), "needle\n").expect("f.txt");
+        fs::write(ws.join("src/main.rs"), "fn needle() {}\n").expect("main.rs");
+        (tmp, ws, home)
+    }
 
-        let rewritten =
-            served_rewrite("grep -rn needle .", &ws, &home).expect("a recursive grep is servable");
+    /// Serve `command` on `platform` with the engine probe bypassed and require a
+    /// rewrite with no refusal — the one "this command is served" primitive both
+    /// platform pin modules build on (they add the guard check and the refusal
+    /// inversion respectively). Returns the rewrite and the scratch spec files,
+    /// which the caller owns through [`SpecFiles`].
+    pub(super) fn served(
+        command: &str,
+        ws: &Path,
+        home: &Path,
+        platform: ShellPlatform,
+    ) -> (String, Vec<PathBuf>) {
+        let mut serve = serve_command(command, ws, Some(home), platform, || true);
+        assert!(
+            serve.refusal.is_none(),
+            "{command}: served, not refused: {:?}",
+            serve.refusal
+        );
+        let rewritten = serve
+            .rewritten
+            .take()
+            .unwrap_or_else(|| panic!("{command}: expected a rewrite"));
+        (rewritten, serve.spec_files)
+    }
+
+    /// A spec whose rendering needs no operand on disk — the fixture for the
+    /// hand-off and guard pins that drive [`render_served`] with an executable
+    /// path of their own. Returned serialized, the form the renderer takes.
+    pub(super) fn render_only_json() -> String {
+        spec_json(&EngineSpec {
+            version: PROTOCOL_VERSION,
+            verb: "grep".into(),
+            mode: MatchMode::Basic,
+            flags: GrepFlags::default(),
+            filters: Vec::new(),
+            exclude_dir: Vec::new(),
+            patterns: vec!["needle".into()],
+            operands: vec![Operand {
+                display: ".".into(),
+                resolved: "/ws".into(),
+                trailing_slash: false,
+            }],
+            cwd: "/ws".into(),
+            fallback: vec!["grep".into()],
+            piped: false,
+            stdin: false,
+            report_stream_bytes: false,
+        })
+    }
+
+    /// The tracked cwd recorded in a Windows rewrite's scratch spec — the cwd
+    /// the engine's own gate compares against. `files` is the rewrite's
+    /// spec-file list.
+    pub(super) fn spec_cwd(files: &[PathBuf]) -> String {
+        let path = files.first().expect("the rewrite scratched a spec file");
+        let json = fs::read_to_string(path).expect("spec file readable");
+        let spec: EngineSpec = serde_json::from_str(&json).expect("spec parses");
+        spec.cwd
+    }
+}
+
+#[cfg(test)]
+mod read_only_serve_pins {
+    use super::super::SpecFiles;
+    use super::super::readonly::{CheckContext, check_command};
+    use super::*;
+
+    /// Serve `command` on `platform` and assert the read-only guard accepts the
+    /// rewrite. Returns the rewrite and the scratch spec files the caller must
+    /// drop.
+    fn served_and_guard_accepted(
+        command: &str,
+        ws: &Path,
+        home: &Path,
+        platform: ShellPlatform,
+    ) -> (String, Vec<PathBuf>) {
+        let (rewritten, files) = served(command, ws, home, platform);
         assert!(rewritten.contains(ENGINE_VERB), "{rewritten}");
+        let ctx = CheckContext::for_platform(ws, platform);
+        assert!(
+            check_command(&rewritten, &ctx).is_ok(),
+            "read-only guard rejected the {platform:?} engine rewrite: {rewritten}"
+        );
+        (rewritten, files)
+    }
+
+    /// Pins the module-header invariant: a generated rewrite must pass the
+    /// read-only guard, whichever hand-off the platform uses.
+    #[test]
+    fn generated_rewrite_passes_the_read_only_guard() {
+        let (_tmp, ws, home) = serve_fixture();
+
+        // Unix: the spec rides on the command line as a single-quoted argv.
+        let (rewritten, files) =
+            served_and_guard_accepted("grep -rn needle .", &ws, &home, ShellPlatform::Unix);
         assert!(
             rewritten.starts_with('\''),
             "rewrite quotes the executable path: {rewritten}"
         );
+        assert!(files.is_empty(), "unix serves the spec by argv");
 
-        let ctx = CheckContext::for_workspace(&ws);
+        // Windows: cmd.exe cannot carry the spec, so the rewrite names a
+        // scratch file it must be able to read.
+        let (rewritten, files) = served_and_guard_accepted(
+            "grep -n needle src/main.rs",
+            &ws,
+            &home,
+            ShellPlatform::Windows,
+        );
+        assert_eq!(files.len(), 1, "one spec file per served member");
+        assert!(rewritten.contains(windows::SPEC_FILE_FLAG), "{rewritten}");
+        let json = fs::read_to_string(&files[0]).expect("spec file readable");
+        let spec: serde_json::Value = serde_json::from_str(&json).expect("spec parses as JSON");
+        assert_eq!(spec["verb"], "grep");
+        let file = files[0].clone();
+        drop(SpecFiles(files));
         assert!(
-            check_command(&rewritten, &ctx).is_ok(),
-            "read-only guard rejected the engine rewrite: {rewritten}"
+            !file.exists(),
+            "the shell call's guard removes it: {file:?}"
+        );
+
+        // One scratch file per served member, all owned by the same guard: a
+        // two-member command scratches two, and both go when the call ends.
+        let (rewritten, files) = served_and_guard_accepted(
+            "grep -n a f.txt && grep -n b g.txt",
+            &ws,
+            &home,
+            ShellPlatform::Windows,
+        );
+        assert_eq!(files.len(), 2, "one spec file per served member");
+        assert_eq!(
+            rewritten.matches(windows::SPEC_FILE_FLAG).count(),
+            2,
+            "both members hand their spec over by file: {rewritten}"
+        );
+        drop(SpecFiles(files.clone()));
+        for path in &files {
+            assert!(
+                !path.exists(),
+                "the guard removes every spec file: {path:?}"
+            );
+        }
+    }
+
+    /// The serve gate follows the platform: on Windows there is no host grep to
+    /// be faster than, so a single-file member is served there and stays on the
+    /// real grep on unix.
+    #[test]
+    fn single_file_members_are_served_on_windows_only() {
+        let (_tmp, ws, home) = serve_fixture();
+        let command = "grep -n needle src/main.rs";
+
+        let windows = serve_command(command, &ws, Some(&home), ShellPlatform::Windows, || true);
+        assert!(
+            windows.rewritten.is_some(),
+            "single-file serving on Windows"
+        );
+        drop(SpecFiles(windows.spec_files));
+
+        let unix = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+        assert!(unix.rewritten.is_none(), "the unix perf gate stays");
+        assert_eq!(unix.outcomes.len(), 1);
+        assert_eq!(unix.outcomes[0].reason, "single file");
+    }
+
+    /// The shapes a read-only Windows role actually issues must clear the guard
+    /// too: the engine verb is a path-qualified, quoted, extension-qualified
+    /// word there, and the rewrite keeps the agent's own `cd`, glob and
+    /// redirect text — a `cd <dir> && grep …` search (the dominant live shape)
+    /// is served like the plain one.
+    #[test]
+    fn the_shapes_a_read_only_windows_role_issues_are_served() {
+        let (_tmp, ws, home) = serve_fixture();
+        for command in [
+            "grep -rn needle .",
+            "cd src && grep -n needle main.rs",
+            "grep -rn --include=*.rs needle .",
+            "grep -rn needle *",
+            "grep \".\" src/main.rs",
+        ] {
+            let (rewritten, files) =
+                served_and_guard_accepted(command, &ws, &home, ShellPlatform::Windows);
+            assert!(rewritten.contains(ENGINE_VERB), "{command}: {rewritten}");
+            drop(SpecFiles(files));
+        }
+    }
+
+    /// cmd.exe's cwd family is tracked the way `cd` is — `pushd <dir>` and
+    /// `chdir <dir>` both change to that directory — so a search after one is
+    /// served against the right cwd. Tracking only `cd` would leave the cwd
+    /// stale and the engine's own cwd gate would refuse the serve at runtime.
+    /// The verb is read through the same folded key as every other list, so the
+    /// interpreter's own spellings (`CD`, and a quoted verb, which cmd.exe
+    /// strips) are that same builtin.
+    #[test]
+    fn windows_tracks_pushd_and_chdir_like_cd() {
+        let (_tmp, ws, home) = serve_fixture();
+        for command in [
+            "pushd src && grep -rn needle .",
+            "chdir src && grep -rn needle .",
+            "CD src && grep -rn needle .",
+            r#""cd" src && grep -rn needle ."#,
+        ] {
+            let (rewritten, files) =
+                served_and_guard_accepted(command, &ws, &home, ShellPlatform::Windows);
+            assert!(rewritten.contains(ENGINE_VERB), "{command}: {rewritten}");
+            let cwd = spec_cwd(&files);
+            assert!(
+                cwd.ends_with("src"),
+                "{command}: tracked cwd must be inside src: {cwd}"
+            );
+            drop(SpecFiles(files));
+        }
+    }
+
+    /// A quoted `cd` target keeps its inner spaces: the member is read with
+    /// cmd.exe's own tokenizer, so `cd "my dir"` tracks that directory instead
+    /// of being refused as untrackable — which on this platform would refuse a
+    /// servable search outright, for any workspace whose path has a space in it.
+    #[test]
+    fn windows_tracks_a_quoted_cd_target() {
+        let (_tmp, ws, home) = serve_fixture();
+        fs::create_dir_all(ws.join("my dir")).expect("my dir");
+        let (rewritten, files) = served_and_guard_accepted(
+            "cd \"my dir\" && grep -rn needle .",
+            &ws,
+            &home,
+            ShellPlatform::Windows,
+        );
+        assert!(rewritten.contains(ENGINE_VERB), "{rewritten}");
+        let cwd = spec_cwd(&files);
+        assert!(
+            cwd.ends_with("my dir"),
+            "tracked cwd must be inside `my dir`: {cwd}"
+        );
+        drop(SpecFiles(files));
+    }
+
+    /// The segmenter's newline connector is re-emitted as `&`: the rewrite rides
+    /// a single `/C "…"` argument, where a literal newline is the one spelling
+    /// this workspace cannot measure (see the `windows` module header).
+    #[test]
+    fn a_newline_connector_joins_the_members_with_an_ampersand() {
+        let (_tmp, ws, home) = serve_fixture();
+        let (rewritten, files) = served_and_guard_accepted(
+            "cd src\ngrep -rn needle .",
+            &ws,
+            &home,
+            ShellPlatform::Windows,
+        );
+        assert!(
+            !rewritten.contains('\n'),
+            "newline in the rewrite: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(" & "),
+            "members joined with `&`: {rewritten}"
+        );
+        let cwd = spec_cwd(&files);
+        assert!(
+            cwd.ends_with("src"),
+            "tracked cwd must be inside src: {cwd}"
+        );
+        drop(SpecFiles(files));
+    }
+
+    /// The executable spelling a real Windows install has — a space and
+    /// parentheses — must clear the guard too; the pins above only ever feed
+    /// this binary's POSIX-shaped path.
+    #[test]
+    fn the_guard_accepts_a_windows_installed_executable_spelling() {
+        let (_tmp, ws, _home) = serve_fixture();
+        let mut files = Vec::new();
+        let fragment = render_served(
+            &render_only_json(),
+            &[],
+            ShellPlatform::Windows,
+            r"C:\Program Files (x86)\MahBot\mahbot.exe",
+            &mut files,
+        )
+        .expect("the install spelling is a quotable argument");
+        let ctx = CheckContext::for_platform(&ws, ShellPlatform::Windows);
+        let verdict = check_command(&fragment, &ctx);
+        drop(SpecFiles(files));
+        assert!(
+            verdict.is_ok(),
+            "read-only guard rejected the installed-executable rewrite {fragment}: {verdict:?}"
+        );
+    }
+}
+
+// ── Refusal pins (both platforms, no feature gate) ───────────────────────
+// On Windows a command carrying a grep-family invocation is either served or
+// refused; on unix an unserved member keeps falling back to the real grep, so
+// nothing is refused there. Both verdicts are drivable from this host: the
+// platform and the engine probe are explicit arguments (see [`serve_command`]).
+
+#[cfg(test)]
+mod refusal_pins {
+    use super::super::SpecFiles;
+    use super::*;
+
+    /// Serve `command` on Windows (probe bypassed) and require a refusal whose
+    /// message names its cause and says the search did not run. Returns the
+    /// cause.
+    fn refused(command: &str, ws: &Path, home: &Path) -> String {
+        let mut serve = serve_command(command, ws, Some(home), ShellPlatform::Windows, || true);
+        assert!(
+            serve.rewritten.is_none(),
+            "{command}: expected no rewrite (got {:?})",
+            serve.rewritten
+        );
+        let cause = serve
+            .refusal
+            .take()
+            .unwrap_or_else(|| panic!("{command}: expected a refusal"));
+        let message = unserved_failure(&cause);
+        assert!(!cause.is_empty(), "{command}: a cause is named");
+        assert!(
+            message.contains("did NOT run"),
+            "{command}: the message must say the search did not run: {message}"
+        );
+        assert!(
+            message.contains(&cause),
+            "{command}: the message must name the cause {cause:?}: {message}"
+        );
+        assert!(
+            serve.spec_files.is_empty(),
+            "{command}: a refused command scratches no spec file"
+        );
+        cause
+    }
+
+    /// The probe is asked once a complete analysis has left something to serve,
+    /// and a probe that answers "no" demotes exactly those members: a command
+    /// carrying no search never spawns it (the reason it is a closure rather
+    /// than a result), and an unavailable engine leaves the analysed member
+    /// unserved with that cause instead of producing a rewrite.
+    #[test]
+    fn the_engine_probe_is_asked_only_when_there_is_something_to_serve() {
+        let (_tmp, ws, home) = serve_fixture();
+        let asked = std::cell::Cell::new(0usize);
+        let probe = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+
+        let no_search = serve_command("echo hi", &ws, Some(&home), ShellPlatform::Unix, probe);
+        assert!(no_search.rewritten.is_none());
+        assert_eq!(asked.get(), 0, "a command with no search must not probe");
+
+        let servable = serve_command("grep -rn x .", &ws, Some(&home), ShellPlatform::Unix, probe);
+        assert_eq!(asked.get(), 1, "a servable member asks exactly once");
+        assert!(servable.rewritten.is_some());
+
+        let unavailable = serve_command(
+            "grep -rn x .",
+            &ws,
+            Some(&home),
+            ShellPlatform::Unix,
+            || false,
+        );
+        assert!(unavailable.rewritten.is_none());
+        assert_eq!(unavailable.outcomes.len(), 1, "the member is analysed");
+        assert!(!unavailable.outcomes[0].served);
+        assert_eq!(unavailable.outcomes[0].reason, "engine unavailable");
+    }
+
+    #[test]
+    fn windows_refuses_every_version_of_an_unserved_search() {
+        let (_tmp, ws, home) = serve_fixture();
+        let rows: &[(&str, &str)] = &[
+            // A member in grep-verb position the serve decision rejected.
+            ("grep -P x f.txt", "unsupported flag -P"),
+            // A `;` outside quotes: cmd.exe reads it as an argument delimiter,
+            // so the cmd.exe model refuses the line before any member exists.
+            ("echo a; grep x f.txt", "unquoted `;`"),
+            // A caret outside quotes: unmodellable, and a search is present.
+            ("grep ^fn src/main.rs", "the whole line"),
+            // A nested/compound member the engine never claims.
+            ("xargs grep x f.txt", "nested grep"),
+            // A `cd` the tracked-cwd model cannot resolve (`/x` is switch-shaped
+            // to cmd.exe; a `-x` target would be an ordinary directory name
+            // there, served statically and diverging only at runtime, where the
+            // engine's own sentinel refuses).
+            ("cd /x && grep x f.txt", "cd untrackable"),
+            // The family's untrackable halves: `popd` returns to a directory
+            // only the pushed stack knows, and a bare `pushd` is not `cd`'s
+            // no-op. Neither is modelled, so the cwd after them is unknown.
+            ("popd && grep -rn x .", "cd untrackable"),
+            ("pushd && grep -rn x .", "cd untrackable"),
+            // A command group, which cmd.exe parses itself (and which the
+            // group tracking below never sees: the line is unreadable first).
+            ("(grep x f.txt)", "the whole line"),
+            // One servable member plus one the engine cannot serve: the whole
+            // command is refused rather than half-served.
+            ("grep -rn needle . && xargs grep x f.txt", "nested grep"),
+            // A second grep in a pipeline consumes the engine's stream through
+            // a program this platform does not have.
+            ("grep -rn needle . | grep -v skip", "nested grep"),
+            // A grep inside another interpreter's command line: that
+            // interpreter's own reading of the payload, which the engine can
+            // neither serve nor hand back to a real `grep` on this platform.
+            // Every spelling of a verb is one verb (case and `.exe` folded):
+            // the switch's spelling does not decide whether the search is seen.
+            ("cmd /c grep -rn x .", "nested grep"),
+            ("CMD /C GREP -rn x .", "nested grep"),
+            ("cmd.exe /c grep -rn x .", "nested grep"),
+            // A wrapped interpreter receives its payload as ONE quoted word:
+            // the quoted content is the command line it will read, so a search
+            // there is the same nested search however the quotes are placed.
+            (r#"cmd /c "grep -rn x .""#, "nested grep"),
+            ("powershell -c \"git log | grep x\"", "nested grep"),
+            // A redirect glued to a word: cmd.exe splits `x>out.txt` into the
+            // argument `x` plus a redirect, while the shared token classifier
+            // reads an operator only where it OPENS the word — so serving it
+            // would search for different text and drop the redirect. The
+            // segmenter's `>&` reading (`a>&echo`) lands in the same class.
+            ("grep -n x>out.txt f.txt", "redirect in `x>out.txt`"),
+            ("grep -rn x>log .", "redirect in `x>log`"),
+            ("grep a>&echo done", "redirect in `a>&echo`"),
+            // `%…%` is expanded by cmd.exe before any program sees its argv —
+            // an undefined name expands to nothing — so a pattern or a filter
+            // spelling a pair cannot be served literally either. The reading is
+            // per word and counts `%` characters, so `100%%` is refused too.
+            ("grep -n %TEMP% f.txt", "two `%` in %TEMP%"),
+            ("grep -n x --include=%x% f.txt", "two `%` in --include=%x%"),
+            ("grep -n 100%% f.txt", "two `%` in 100%%"),
+        ];
+        for (command, cause) in rows {
+            let reason = refused(command, &ws, &home);
+            assert!(
+                reason.contains(cause),
+                "{command}: reason {reason:?} lacks {cause:?}"
+            );
+        }
+    }
+
+    /// The narrowing: a lone `%` and every `!` are ordinary characters to the
+    /// interpreter this process spawns (`cmd /C`, no `/V:ON`), so the searches
+    /// they appear in are served rather than refused.
+    #[test]
+    fn windows_serves_the_lone_percent_and_bang_searches() {
+        let (_tmp, ws, home) = serve_fixture();
+        for command in [
+            r#"grep -rn "!=" src/main.rs"#,
+            r#"grep -n "50%" src/main.rs"#,
+            r#"grep -rn "!important" ."#,
+        ] {
+            let (_rewritten, files) = served(command, &ws, &home, ShellPlatform::Windows);
+            drop(SpecFiles(files));
+        }
+    }
+
+    /// The glued form is the refused one: a redirect word of its own is kept
+    /// verbatim (cmd.exe parses it, and the shape is the interpreter's own), and
+    /// a `>` inside quotes is ordinary text to the program that receives the
+    /// word — the served member's text rides the spec file, never this command
+    /// line.
+    #[test]
+    fn windows_serves_the_readable_redirect_shapes() {
+        let (_tmp, ws, home) = serve_fixture();
+        for command in [
+            "grep -n needle f.txt > out.txt",
+            "grep -n needle f.txt 2>&1",
+            r#"grep -n "a>b" f.txt"#,
+        ] {
+            let (rewritten, files) = served(command, &ws, &home, ShellPlatform::Windows);
+            assert!(rewritten.contains(ENGINE_VERB), "{command}: {rewritten}");
+            drop(SpecFiles(files));
+        }
+    }
+
+    /// The tolerant command-position scan reads command separators and a
+    /// leading group opener, so a grep word in ARGUMENT position (`echo (grep
+    /// is a tool)`) is not the search the class refuses.
+    #[test]
+    fn windows_does_not_refuse_a_grep_word_in_argument_position() {
+        let (_tmp, ws, home) = serve_fixture();
+        for command in ["echo hi & echo (grep is a tool)", "echo (grep x f.txt)"] {
+            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Windows, || true);
+            assert!(
+                serve.refusal.is_none(),
+                "{command}: must not be refused: {:?}",
+                serve.refusal
+            );
+            assert!(serve.rewritten.is_none(), "{command}: nothing to serve");
+        }
+    }
+
+    /// The double-quoted spelling of the same search is readable (the caret is
+    /// inside quotes), so it is served, not refused.
+    #[test]
+    fn windows_serves_the_quoted_caret_spelling() {
+        let (_tmp, ws, home) = serve_fixture();
+        let mut serve = serve_command(
+            "grep \"^fn \" src/main.rs",
+            &ws,
+            Some(&home),
+            ShellPlatform::Windows,
+            || true,
+        );
+        assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
+        assert!(serve.rewritten.is_some(), "a serveable search");
+        drop(SpecFiles(std::mem::take(&mut serve.spec_files)));
+    }
+
+    /// The Windows exemption list of the module header: the shapes left to the
+    /// platform as written — neither served nor refused, so the platform's own
+    /// program is what runs.
+    #[test]
+    fn windows_leaves_every_exempt_shape_alone() {
+        let (_tmp, ws, home) = serve_fixture();
+        for command in [
+            "echo hi",
+            "git commit -m \"grep fix\"",
+            "echo grep",
+            // A program spelled with a path is a file, not this platform's
+            // `grep` verb, so the segment runs as written — the reading unix
+            // gives `./grep` (the engine cannot tell whether such a program
+            // exists, and the interpreter's own error names it if it does not).
+            r".\grep -n x f.txt",
+            r"C:\tools\grep.exe -rn x .",
+            // The search-owning list is folded like every other verb list, so
+            // the exemption holds for any spelling of the program.
+            "GIT GREP x",
+            // A grep word glued to a leading `{`: `{grep` names no command on
+            // either platform, so the line carries no invocation to claim.
+            "{grep x f.txt",
+            // A redirect glued to the verb extends the command word (`grep>x`),
+            // which names no search either.
+            "grep>x f.txt",
+            // An unlisted program's argument list is data to this reading.
+            "foo grep x",
+            // The `\;` spelling stops the cmd reading before any member exists;
+            // the `+` spelling of the same `find` refuses instead.
+            r"find . -exec grep x {} \;",
+        ] {
+            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Windows, || true);
+            assert!(
+                serve.refusal.is_none(),
+                "{command}: must not be refused: {:?}",
+                serve.refusal
+            );
+            assert!(serve.rewritten.is_none(), "{command}: nothing to serve");
+        }
+
+        // `git grep x` is git's own search: recorded as a skipped member, and
+        // deliberately left unserved-but-allowed rather than refused.
+        let serve = serve_command(
+            "git grep x",
+            &ws,
+            Some(&home),
+            ShellPlatform::Windows,
+            || true,
+        );
+        assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
+        assert!(serve.rewritten.is_none());
+        assert_eq!(serve.outcomes.len(), 1, "recorded as a skipped member");
+        assert!(!serve.outcomes[0].served);
+
+        // `ssh host grep …` searches another machine: again no member to serve
+        // and, crucially, nothing to refuse — this platform can run the command
+        // as written.
+        let serve = serve_command(
+            "ssh host grep -rn x /srv",
+            &ws,
+            Some(&home),
+            ShellPlatform::Windows,
+            || true,
+        );
+        assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
+        assert!(serve.rewritten.is_none());
+        assert_eq!(serve.outcomes.len(), 1, "recorded as a skipped member");
+    }
+
+    /// Unix never refuses and never produces a rewrite for these rows: the
+    /// member the engine cannot serve keeps running the real `grep`.
+    #[test]
+    fn unix_keeps_the_fallback_and_never_refuses() {
+        let (_tmp, ws, home) = serve_fixture();
+        let rows = [
+            "grep -P x f.txt",
+            "echo a; grep x f.txt",
+            "grep ^fn src/main.rs",
+            "xargs grep x f.txt",
+            "cd /x && grep x f.txt",
+            "(grep x f.txt)",
+            "git grep x",
+        ];
+        for command in rows {
+            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+            assert!(
+                serve.refusal.is_none(),
+                "{command}: unix keeps the fallback: {:?}",
+                serve.refusal
+            );
+            assert!(
+                serve.rewritten.is_none(),
+                "{command}: nothing to serve (got {:?})",
+                serve.rewritten
+            );
+        }
+    }
+
+    /// The routing hands the analysis no home on Windows — nothing there
+    /// expands `~`, so the `home` arms of `resolve_operand`/`resolve_cd` are
+    /// unreachable — and the placeholder it substitutes for the one the analysis
+    /// takes must therefore never be consulted: a member whose cwd tracking and
+    /// operands resolve statically is served with no home at all. Unix keeps its
+    /// documented reading of the same absence (nothing that could expand `~` is
+    /// served, and nothing is refused either).
+    #[test]
+    fn windows_serves_without_a_home() {
+        let (_tmp, ws, _home) = serve_fixture();
+        let mut windows = serve_command(
+            "cd src && grep -n needle main.rs",
+            &ws,
+            None,
+            ShellPlatform::Windows,
+            || true,
+        );
+        assert!(windows.refusal.is_none(), "{:?}", windows.refusal);
+        let rewritten = windows.rewritten.take().expect("served with no home");
+        assert!(rewritten.contains(ENGINE_VERB), "{rewritten}");
+        let cwd = spec_cwd(&windows.spec_files);
+        assert!(cwd.ends_with("src"), "tracked cwd: {cwd}");
+        drop(SpecFiles(windows.spec_files));
+
+        let unix = serve_command("grep -rn needle .", &ws, None, ShellPlatform::Unix, || true);
+        assert!(unix.rewritten.is_none(), "unix demotes without a home");
+        assert!(unix.refusal.is_none(), "and refuses nothing there");
+    }
+
+    /// The interpreter names `cmd`, `powershell` and `pwsh` are list entries on
+    /// unix too: a `cmd /c grep …` line records a skipped member there and still
+    /// refuses nothing, since nothing about its serve decision or its text
+    /// changes.
+    #[test]
+    fn unix_records_a_wrapped_interpreter_as_a_skip_without_refusing() {
+        let (_tmp, ws, home) = serve_fixture();
+        let serve = serve_command(
+            "cmd /c grep x f.txt",
+            &ws,
+            Some(&home),
+            ShellPlatform::Unix,
+            || true,
+        );
+        assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
+        assert!(serve.rewritten.is_none());
+        assert_eq!(serve.outcomes.len(), 1);
+        assert!(!serve.outcomes[0].served);
+        assert_eq!(serve.outcomes[0].reason, "nested grep");
+    }
+
+    /// The unix twin of the mixed row above: the servable member is still
+    /// served while the rejected sibling runs the real `grep`.
+    #[test]
+    fn unix_still_serves_a_sibling_of_a_rejected_member() {
+        let (_tmp, ws, home) = serve_fixture();
+        let mut serve = serve_command(
+            "grep -rn needle . && xargs grep x f.txt",
+            &ws,
+            Some(&home),
+            ShellPlatform::Unix,
+            || true,
+        );
+        assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
+        let rewritten = serve.rewritten.take().expect("the sibling is served");
+        assert!(rewritten.contains(ENGINE_VERB), "{rewritten}");
+        assert!(rewritten.contains("xargs grep x f.txt"), "{rewritten}");
+    }
+
+    /// The `%…%` reading is the cmd.exe one alone: on unix a `%` and a `!`
+    /// are ordinary characters, so every one of these is served — including the
+    /// rows Windows still refuses for their `%` pair.
+    #[test]
+    fn unix_serves_the_percent_and_bang_searches() {
+        let (_tmp, ws, home) = serve_fixture();
+        for command in [
+            "grep -rn %TEMP% .",
+            "grep -rn x --include=%x% .",
+            "grep -rn \"a!b\" .",
+        ] {
+            let mut serve = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+            assert!(serve.refusal.is_none(), "{command}: {:?}", serve.refusal);
+            assert!(
+                serve.rewritten.is_some(),
+                "{command}: served on unix (got {:?})",
+                serve.rewritten
+            );
+            drop(SpecFiles(std::mem::take(&mut serve.spec_files)));
+        }
+    }
+
+    /// The unix reading of a word with a redirect glued to it — an approved
+    /// divergence (the module header's delta list): `sh` splits the operator out
+    /// and searches for `x` writing to `log`, while the engine reads the word
+    /// whole, so the pattern IS `x>log` and the redirect is dropped. Windows
+    /// refuses that spelling rather than serve a search of different text
+    /// ([`windows::has_glued_redirect`]).
+    #[test]
+    fn unix_serves_a_glued_redirect_as_part_of_the_pattern() {
+        let (_tmp, ws, home) = serve_fixture();
+        let analyzed = analyze_command("grep -rn x>log .", &ws, &home, ShellPlatform::Unix, false)
+            .expect("the unix reading serves the row");
+        assert_eq!(analyzed.specs.len(), 1, "one served member");
+        assert_eq!(
+            analyzed.specs[0].patterns.as_slice(),
+            ["x>log"],
+            "the operator rides the pattern"
+        );
+        let OutSegment::Served { redirects, .. } = &analyzed.segments[0].0 else {
+            panic!("expected a served member");
+        };
+        assert!(
+            redirects.is_empty(),
+            "the redirect is dropped: {redirects:?}"
         );
     }
 }

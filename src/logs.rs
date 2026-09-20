@@ -83,8 +83,8 @@ pub static LOG_STORE: OnceCell<LogStore> = OnceCell::const_new();
 /// `grep_telemetry` table (self-contained — no tool_calls.id correlation).
 /// Bundled into a struct so the writer's signature stays shallow; the caller
 /// constructs the row from the serve outcomes + the runtime facts (actual apply,
-/// sentinel re-run, duration, exit). Only the Unix grep engine reports telemetry.
-#[cfg_attr(not(unix), expect(dead_code))]
+/// sentinel re-run, duration, exit). Every platform's grep engine reports
+/// telemetry (the interception runs on both shells).
 #[derive(Debug)]
 pub(crate) struct GrepTelemetryRow<'a> {
     pub command: &'a str,
@@ -241,7 +241,6 @@ impl LogStore {
     /// Persist one greppable shell call's grep-engine decision to the dedicated
     /// `grep_telemetry` table. Metadata only; the caller treats failures as
     /// fail-open. Self-contained for grep-specific analysis.
-    #[cfg_attr(not(unix), expect(dead_code))]
     pub(crate) async fn record_grep_telemetry(
         &self,
         row: GrepTelemetryRow<'_>,

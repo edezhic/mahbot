@@ -12,6 +12,13 @@
 //! which scans the whole tree and checks the platform itself) and, behind its
 //! own platform branch, for every command segment ([`check_segment`]).
 //!
+//! `grep_engine/windows.rs` is the sibling cmd.exe reader — the grep
+//! interception's own, with its own fail-closed policy — so a cmd.exe rule
+//! change belongs in both: its verb reading (the tables below on this side,
+//! `grep_verb` on the other's) and the `%` expansion, which the two sides read
+//! on purpose by different rules ([`expand_percent_vars`] here against the
+//! engine's coarse `grep_engine::windows::has_percent_expansion`).
+//!
 //! # Refused
 //!
 //! [`DENIED_VERBS`], [`TEMP_GATED_VERBS`], [`CWD_DESTINATION_VERBS`],
@@ -305,6 +312,15 @@ const CLOCK_VERBS: &[&str] = &["time", "date"];
 /// them) and `set`. The rest of the `cmd /?` list either already sits in a
 /// [`VERB_TABLES`] entry or has no verdict the glue split could change — `del`,
 /// `date` and `assoc` are the table verbs' own spellings.
+///
+/// The four cwd spellings are one family HERE because the guard only needs to
+/// admit them; the engine's own reading of the same family differs by what it
+/// does with each — `grep_engine::is_cd_segment` recognises all four so none is
+/// left with a stale tracked cwd, while `grep_engine::resolve_cd` tracks
+/// `cd`/`chdir`/`pushd` as navigation and refuses `popd` fail-closed, since the
+/// directory it returns to lives only in the pushed stack that model does not
+/// keep. A change to either side — the family, or what a member of it does to
+/// the cwd — is checked against the other.
 const INTERNAL_VERBS: &[&str] = &["cd", "chdir", "popd", "pushd", "set"];
 
 // ── Verb key ─────────────────────────────────────────────────────────────
@@ -662,6 +678,16 @@ fn strip_verbatim(canonical: &str) -> String {
 /// cannot see. A `%` with no partner, or with a non-name between, stays literal
 /// — an argued reading of cmd's expansion, not a measured one (an accepted
 /// limit; see the module doc).
+///
+/// The pairing above is this reader's, and the interception reads the same
+/// character with a coarser rule of its own: `grep_engine::windows::has_percent_expansion`
+/// refuses any word carrying two `%` at all, whatever sits between them. That is
+/// a deliberate superset, not an older draft of this function — a served
+/// member's text rides its spec file and never reaches cmd.exe's command line,
+/// so the engine only needs to know whether an expansion could change what the
+/// program receives, while this reader must decide what the expansion IS (an
+/// operand path, or an unprovable one). The two readings answer different
+/// questions and are not to be reconciled into one.
 fn expand_percent_vars(word: &str, ctx: &CheckContext) -> Option<String> {
     let mut out = String::with_capacity(word.len());
     let mut rest = word;

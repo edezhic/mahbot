@@ -17,7 +17,6 @@ use crate::util::scrub_credentials;
 use crate::util::strip_ansi_escapes;
 
 mod bg;
-#[cfg(unix)]
 pub(crate) mod grep_engine;
 mod profiles;
 mod readonly;
@@ -27,6 +26,28 @@ pub(crate) use self::bg::BackgroundSessions;
 use self::profiles::{CARGO_COMPILE_PREFIXES, GEN_FALLBACK, PROFILES, Profile};
 pub use self::readonly::ShellMode;
 use self::readonly::check_command;
+
+/// The shell that runs a validated command string (`sh -c` on unix,
+/// `cmd.exe /C` on Windows). Every platform rule in this module tree reads
+/// this one value — the spawn side ([`build_shell_command`]), the read-only
+/// guard's tables and the grep engine's command model — as a runtime value
+/// rather than a `cfg` branch, so both platforms' behaviour is drivable from
+/// any host's unit-test lane. Only the value's own definition branches on the
+/// target ([`SHELL_PLATFORM`] is one `if cfg!(windows)` constant); every
+/// consumer takes it as data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ShellPlatform {
+    Unix,
+    Windows,
+}
+
+/// The running process's [`ShellPlatform`]; its spawn side is
+/// [`build_shell_command`] — the two must not drift.
+pub(super) const SHELL_PLATFORM: ShellPlatform = if cfg!(windows) {
+    ShellPlatform::Windows
+} else {
+    ShellPlatform::Unix
+};
 
 /// Shell builtins/prefixes to skip when extracting the primary command.
 /// NOTE: `su` is intentionally NOT in this list. It can be used to run
@@ -101,6 +122,9 @@ const DRAIN_CANCEL_GRACE: Duration = Duration::from_secs(2);
 const SHELL_PIPE_READ_CAP: usize = 256 * 1024;
 /// Max chars of partial output included in timeout error messages.
 const TIMEOUT_OUTPUT_TAIL_CHARS: usize = 2_000;
+/// Max chars of the engine's own stderr line quoted as the cause of a refused
+/// Windows search (see [`engine_cause`]).
+const ENGINE_FAILURE_DETAIL_CHARS: usize = 200;
 
 /// Environment variables safe to pass to shell commands.
 ///
@@ -176,7 +200,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// PGID from `sh`, preventing orphaned CPU-consuming process trees when a
 /// shell command times out.
 fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::Command {
-    // The spawn side of `readonly::SHELL_PLATFORM`; the two must not drift.
+    // The spawn side of [`SHELL_PLATFORM`]; the two must not drift.
     #[cfg(not(target_os = "windows"))]
     let mut process = {
         let mut p = tokio::process::Command::new("sh");
@@ -193,7 +217,20 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
     #[cfg(target_os = "windows")]
     let mut process = {
         let mut p = tokio::process::Command::new("cmd.exe");
-        p.arg("/C").arg(command).creation_flags(CREATE_NO_WINDOW);
+        // `raw_arg`, not `arg`: std's argument escaping belongs to the
+        // `CommandLineToArgvW` convention `cmd.exe` does not follow (see
+        // `Command::raw_arg`'s own doc). It would re-escape the command's quotes
+        // to `\"`, which cmd.exe keeps literally — it has no backslash escape —
+        // so a command whose first word is a quoted path (every engine rewrite
+        // is, and an install under `C:\Program Files\…` needs it) would name a
+        // program cmd.exe cannot resolve.
+        //
+        // The command goes inside the extra quote pair cmd.exe documents for
+        // this hand-off (`cmd /?`, "the remainder of the command line after the
+        // switch"): its quote processing strips that pair, so the command
+        // arrives verbatim — whatever quotes it carries of its own.
+        p.raw_arg(format!("/C \"{command}\""));
+        p.creation_flags(CREATE_NO_WINDOW);
         p
     };
 
@@ -394,6 +431,118 @@ fn kill_process_group(pid: u32, signal: libc::c_int) {
     }
 }
 
+/// The lifecycle point of the grep engine's scratch spec files: Windows serves a
+/// member's spec through a file (cmd.exe cannot carry the payload on its command
+/// line), and every exit path from the serve decision — including the validation
+/// `bail!`s and a cancellation drop — must clean it up. The removal itself, and
+/// its best-effort policy, are the engine's ([`grep_engine::discard_spec_files`],
+/// which the engine also calls inline when a hand-off abandons a rewrite); this
+/// guard owns only the point. A killed daemon still leaves a file behind; the
+/// temp cleaner is the backstop.
+struct SpecFiles(Vec<PathBuf>);
+
+impl Drop for SpecFiles {
+    fn drop(&mut self) {
+        grep_engine::discard_spec_files(&self.0);
+    }
+}
+
+/// The refusal this shell call must fail with, if any: the serve decision's own
+/// refusal ([`grep_engine::GrepServe::refusal`] — a Windows-only value), or a
+/// produced-but-unapplied rewrite, i.e. one the read-only guard rejected.
+/// Returns the short cause; the agent-facing message is rendered from it by
+/// [`grep_engine::unserved_failure`] at the bail site, the way the engine's own
+/// cause is.
+///
+/// `applied` is whether the rewrite reached the shell (`exec_str !=
+/// command_str`). The platform is tested first: on unix neither case refuses —
+/// the original command runs and its `grep` is the real one — while on Windows
+/// an unserved search must not come back looking like an empty result (see
+/// [`grep_engine::unserved_failure`]).
+fn unserved_refusal(
+    platform: ShellPlatform,
+    grep_serve: &grep_engine::GrepServe,
+    applied: bool,
+) -> Option<String> {
+    if platform != ShellPlatform::Windows {
+        return None;
+    }
+    grep_serve.refusal.clone().or_else(|| {
+        (!applied && grep_serve.rewritten.is_some()).then(|| GUARD_REJECTED_REASON.to_string())
+    })
+}
+
+/// The grep telemetry cause for a rewrite that was produced but never applied
+/// (the read-only guard rejected it), spelled once so the refusal's cause and
+/// the stored row's reason cannot drift apart.
+const GUARD_REJECTED_REASON: &str = "read-only guard rejected rewrite";
+
+/// What a completed run's engine failure means to this platform.
+enum EngineFailure {
+    /// The engine could not serve and reported no account to render: the
+    /// original command is re-run, so the agent gets the authentic answer (the
+    /// platform with a real `grep` to re-run).
+    ReRun,
+    /// The engine's own short account of the failure (the platform that refuses
+    /// the call instead of re-running it).
+    Refused(String),
+}
+
+/// Classify a completed run: `Some` when it is the engine failing to serve —
+/// the sentinel exit code, the stale-binary lock message, or, on the platform
+/// that refuses rather than re-runs, the engine's refusal marker on a line of
+/// its own, which survives a pipeline tail masking the exit status. `None` when
+/// the run is not an engine failure.
+///
+/// The marker is recognised by line equality, never as a substring: a served
+/// run's stderr may echo the token inside a matched line, and a result is not a
+/// refusal. Only the refusing platform carries a cause; on the other one the
+/// marker is not even scanned and [`EngineFailure::ReRun`] says all that
+/// platform's caller needs.
+fn engine_failure(
+    status_code: Option<i32>,
+    stderr: &[u8],
+    platform: ShellPlatform,
+) -> Option<EngineFailure> {
+    let text = String::from_utf8_lossy(stderr);
+    let marked = platform == ShellPlatform::Windows
+        && text
+            .lines()
+            .any(|line| line.trim() == grep_engine::ENGINE_REFUSAL_MARKER);
+    if status_code != Some(grep_engine::ENGINE_FAILED_EXIT)
+        && !text.contains(grep_engine::STALE_BINARY_LOCK_MSG)
+        && !marked
+    {
+        return None;
+    }
+    if platform != ShellPlatform::Windows {
+        return Some(EngineFailure::ReRun);
+    }
+    Some(EngineFailure::Refused(engine_cause(&text, marked)))
+}
+
+/// The engine's own short account of a failure it reported: the detail it wrote
+/// after the refusal marker, which it emits first — so this is the engine's own
+/// line and never a served member's stderr earlier in the stream — else the
+/// run's first non-blank line (a stale binary's lock message), else a generic
+/// cause for a failure that carried none. Trimmed and length-capped;
+/// [`grep_engine::unserved_failure`] renders the agent-facing message from it.
+fn engine_cause(text: &str, marked: bool) -> String {
+    let mut lines = text.lines().map(str::trim);
+    let detail = if marked {
+        lines
+            .by_ref()
+            .skip_while(|line| *line != grep_engine::ENGINE_REFUSAL_MARKER)
+            .nth(1)
+    } else {
+        lines.find(|line| !line.is_empty())
+    };
+    detail.map_or_else(
+        || "engine could not serve the search".to_string(),
+        |line| crate::util::truncate(line, ENGINE_FAILURE_DETAIL_CHARS),
+    )
+}
+
 /// Kill-on-drop guard for an in-flight shell child: if the surrounding future
 /// is dropped before the child is reaped (agent task aborted at drain-cap
 /// expiry, panic in a sibling tool, runtime teardown), the process group is
@@ -565,7 +714,13 @@ async fn run_command_with_timeout(
             // (which includes wait()) were called before the PGID kill, the
             // child's PID could be reused before we can signal its group.
             //
-            // On non-Unix platforms the simpler child.kill() suffices.
+            // On non-Unix platforms the simpler child.kill() suffices — there is
+            // no process group to signal, so a grandchild survives. A served
+            // search is such a grandchild (the shell's child spawns the grep
+            // engine), and on Windows that is the shape of every search: a
+            // timed-out search leaves the engine process alive until
+            // it finishes or exits on its own. Accepted (containment on this
+            // platform is the documented asymmetry, see `bg`'s module docs).
             #[cfg(unix)]
             {
                 // PID must be available — child.id() returns Some after spawn.
@@ -1025,24 +1180,25 @@ impl ShellTool {
         // Read-only mode: validate command before execution.
         // The grep engine interception runs in BOTH modes (read-only for the
         // validation path, full for the inherent read-only engine) — see below.
-        #[cfg_attr(not(unix), expect(unused_mut))] // the rewrite below is Unix-only
         let mut exec_str = command_str.to_string();
 
         // Capture the grep-engine serve decision once, before the mode branch;
         // reused by both branches for the rewrite and by the telemetry write
         // after execution.
-        #[cfg(unix)]
-        let grep_serve = grep_engine::try_serve_command(command_str, ws.as_path());
+        let mut grep_serve = grep_engine::try_serve_command(command_str, ws.as_path());
+        // The rewrite may name scratch spec files (the Windows hand-off); the
+        // guard removes them on every exit path below, `bail!`s included.
+        let _spec_files = SpecFiles(std::mem::take(&mut grep_serve.spec_files));
 
         if self.mode == ShellMode::ReadOnly {
             let ctx = self::readonly::CheckContext::for_workspace(ws.as_path());
             if let Err(rejection) = check_command(command_str, &ctx) {
                 anyhow::bail!("{rejection}");
             }
-            #[cfg(unix)]
             if let Some(rewritten) = grep_serve.rewritten.as_deref() {
                 // The engine verb is an unlisted literal and passes validation;
-                // on the off chance it does not, keep the original command.
+                // on the off chance it does not, keep the original command (on
+                // Windows the refusal below reports it instead).
                 if check_command(rewritten, &ctx).is_ok() {
                     exec_str = rewritten.to_string();
                 }
@@ -1052,10 +1208,23 @@ impl ShellTool {
             // read-only and preserves non-grep (incl. mutating) segments
             // verbatim. Background-mode Full greps are deliberately NOT served
             // (the early return above keeps them on the original command).
-            #[cfg(unix)]
             if let Some(rewritten) = grep_serve.rewritten.as_deref() {
                 exec_str = rewritten.to_string();
             }
+        }
+
+        // ── Windows: an unserved search is a tool error ──
+        // The deliberate, documented exception to "a completed command is never
+        // a tool error" (the engine module header states why): an unserved grep
+        // member, or a produced rewrite the read-only guard rejected, would
+        // otherwise reach the agent as interpreter noise under a status it
+        // cannot tell from "no match". On unix `unserved_refusal` is `None` and
+        // the original command runs.
+        if let Some(cause) = unserved_refusal(SHELL_PLATFORM, &grep_serve, exec_str != command_str)
+        {
+            self.write_grep_telemetry(ws, command_str, &grep_serve, false, &cause, None)
+                .await;
+            anyhow::bail!("{}", grep_engine::unserved_failure(&cause));
         }
 
         // Execute with timeout to prevent hanging commands. `exec_str` may be
@@ -1073,7 +1242,6 @@ impl ShellTool {
         let timeout = Duration::from_secs(timeout_secs);
         let drain_limit = output_drain_timeout();
 
-        #[cfg_attr(not(unix), expect(unused_mut))] // non-unix never mutates `result`
         let mut result = run_command_with_timeout(&mut cmd, timeout, drain_limit).await;
 
         // Stream-size marker: the engine reports stdin-fed stream bytes
@@ -1084,7 +1252,6 @@ impl ShellTool {
         // stdout or a file — beyond this strip's reach. Runs on timeout output
         // too — the marker is flushed before the engine exits, so a later-member
         // hang would otherwise surface it.
-        #[cfg(unix)]
         match &mut result {
             ShellRunResult::Completed { stderr, .. }
             | ShellRunResult::TimedOut { stderr, .. }
@@ -1097,41 +1264,68 @@ impl ShellTool {
         }
 
         // Grep-engine failure containment: the sentinel exit code means the
-        // engine could neither serve nor exec the real grep — re-run the
-        // original command so the agent sees the authentic result. A stale
+        // engine could neither serve nor exec the real grep, and a stale
         // self-update binary (one lacking the hidden subcommand) runs full
-        // main() and dies at instance-lock with the lock message; that
-        // signature re-runs too. In Full mode the re-run re-executes the whole
-        // original command, including any preserved mutation segments
-        // (mv/cp/mkdir/…) kept verbatim in the rewrite — documented behavior:
-        // a mid-command engine failure may repeat them. Residual: a
-        // mid-search panic after output
-        // was streamed exits sentinel-3, but a pipe/chain member's exit
+        // main() and dies at instance-lock with the lock message — its exit 1
+        // is a legitimate grep no-match code, so the message is treated the
+        // same. On unix the original command is re-run so the agent sees the
+        // authentic result: in Full mode that re-executes the whole original
+        // command, including any preserved mutation segments (mv/cp/mkdir/…)
+        // kept verbatim in the rewrite — documented behavior: a mid-command
+        // engine failure may repeat them. Residual: a mid-search panic after
+        // output was streamed exits sentinel-3, but a pipe/chain member's exit
         // status masks it — aggregation tails (`grep | wc -l`, `grep | sort`)
         // are the worst case, turning the partial stream into authoritative-
         // looking wrong answers — so the agent sees the partial output.
-        #[cfg(unix)]
-        let sentinel_rerun = exec_str != command_str
-            && matches!(
-                &result,
-                ShellRunResult::Completed { status, stderr, .. }
-                    if status.code() == Some(grep_engine::ENGINE_FAILED_EXIT)
-                        || stderr
-                            .windows(grep_engine::STALE_BINARY_LOCK_MSG.len())
-                            .any(|w| w == grep_engine::STALE_BINARY_LOCK_MSG.as_bytes())
-            );
-        #[cfg(unix)]
-        let result = if sentinel_rerun {
-            let mut original = build_shell_command(command_str, ws.as_path());
-            run_command_with_timeout(&mut original, timeout, drain_limit).await
-        } else {
-            result
+        //
+        // On Windows the same signatures are the engine failing to serve a
+        // search the platform cannot run itself: telemetry is recorded and the
+        // call is refused (the Windows-only exception above), with the engine's
+        // own stderr line — where it wrote why it could not serve — as the
+        // named cause. There the refusal marker covers the pipe/chain case the
+        // exit status would otherwise mask. Timed-out/drain-timeout/spawn-failed
+        // results are not sentinel cases and keep their own handling below.
+        //
+        // Accepted limit of reading exit 3 as the engine's on both platforms: on
+        // Windows that refuses the call, so a SERVED multi-member command whose
+        // last verbatim member legitimately exits 3 (`grep -rn x . &&
+        // something-that-exits-3`, or `grep … | tail -1` with a tail that exits
+        // 3) is refused even though the search ran — with the run's stderr read
+        // as the cause, the generic line when it holds none. On unix the same
+        // false trigger only re-runs the original command. The parent reads the
+        // run's one composed status, never a per-member one, so a member-3 is
+        // not told apart from an engine-3 here.
+        let engine_failure = match &result {
+            ShellRunResult::Completed { status, stderr, .. } if exec_str != command_str => {
+                engine_failure(status.code(), stderr, SHELL_PLATFORM)
+            }
+            _ => None,
+        };
+        let mut sentinel_rerun = false;
+        let result = match engine_failure {
+            Some(EngineFailure::Refused(cause)) => {
+                self.write_grep_telemetry(
+                    ws,
+                    command_str,
+                    &grep_serve,
+                    false,
+                    &cause,
+                    Some(&result),
+                )
+                .await;
+                anyhow::bail!("{}", grep_engine::unserved_failure(&cause));
+            }
+            Some(EngineFailure::ReRun) => {
+                sentinel_rerun = true;
+                let mut original = build_shell_command(command_str, ws.as_path());
+                run_command_with_timeout(&mut original, timeout, drain_limit).await
+            }
+            None => result,
         };
 
-        // Criterion 11: record the served invocation's exit code at DEBUG
-        // (filtered from the general log stream). The dedicated
-        // `grep_telemetry` table is the source of truth for grep decisions;
-        // this line is observability only.
+        // Record the served invocation's exit code at DEBUG (filtered from the
+        // general log stream). The dedicated `grep_telemetry` table is the
+        // source of truth for grep decisions; this line is observability only.
         if exec_str != command_str {
             let exit_code = match &result {
                 ShellRunResult::Completed { status, .. } => status.code(),
@@ -1147,78 +1341,44 @@ impl ShellTool {
         // Grep-engine telemetry: one row per greppable call lands in the
         // dedicated `grep_telemetry` table, keeping the general `logs` stream
         // clean of grep detail. Best-effort/fail-open — a telemetry failure
-        // never affects the shell result.
-        #[cfg(unix)]
-        if !grep_serve.outcomes.is_empty() {
-            // `applied` is the ground truth of whether the shell was rewritten
-            // to the engine. The analysis outcomes can report served even when
-            // no engine ran (engine unavailable, spec too large, ReadOnly
-            // rejection) — and a sentinel re-run replaced the engine with a
-            // real-grep run — so the row's served flag must reflect the ACTUAL
-            // execution. The engine-internal `exec_grep` path (cwd mismatch,
-            // matcher-build failure, version mismatch) re-execs real grep in
-            // place, which is NOT observable from the parent; that residual is
-            // documented rather than fixed.
-            let applied = exec_str != command_str;
-            let served = applied && !sentinel_rerun;
-            let reason = if sentinel_rerun {
-                "engine sentinel re-run (real grep)"
-            } else if !applied && grep_serve.rewritten.is_some() {
-                // The rewrite was produced but ReadOnly validation rejected it —
-                // the whole command ran real grep. Per-member skip reasons
-                // describe the analysis, not why real grep ran.
-                "read-only guard rejected rewrite"
-            } else if applied {
-                grep_serve
-                    .outcomes
-                    .iter()
-                    .find(|o| !o.served)
-                    .map(|o| o.reason.as_str())
-                    .unwrap_or_default()
-            } else {
-                // No rewrite at all (engine unavailable / spec too large / only
-                // skipped members): the outcomes carry the concrete reason.
-                grep_serve
-                    .outcomes
-                    .iter()
-                    .find(|o| !o.reason.is_empty())
-                    .map_or("no rewrite produced", |o| o.reason.as_str())
-            };
-            let shape = grep_serve.telemetry_shape(served);
-            let mode = match self.mode {
-                ShellMode::ReadOnly => "ReadOnly",
-                ShellMode::Full => "Full",
-            };
-            let workspace = ws.as_path().to_string_lossy().into_owned();
-            let (elapsed, exit_code) = match &result {
-                ShellRunResult::Completed {
-                    elapsed, status, ..
-                } => (*elapsed, status.code()),
-                ShellRunResult::TimedOut { elapsed, .. }
-                | ShellRunResult::DrainTimedOut { elapsed, .. } => (*elapsed, None),
-                ShellRunResult::SpawnFailed(_) => (std::time::Duration::ZERO, None),
-            };
-            let duration_ms = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
-            if let Some(store) = crate::logs::LOG_STORE.get() {
-                let row = crate::logs::GrepTelemetryRow {
-                    command: command_str,
-                    served,
-                    reason,
-                    recursive: shape.recursive,
-                    piped: shape.piped,
-                    operand_count: shape.operand_count,
-                    flags: shape.flags.as_str(),
-                    mode,
-                    workspace: workspace.as_str(),
-                    grep_count: shape.grep_count,
-                    served_count: shape.served_count,
-                    skipped_count: shape.skipped_count,
-                    duration_ms: Some(duration_ms),
-                    exit_code,
-                };
-                let _ = store.record_grep_telemetry(row).await;
-            }
-        }
+        // never affects the shell result. `applied` is the ground truth of
+        // whether the shell was rewritten to the engine: the analysis outcomes
+        // can report served even when no engine ran (engine unavailable, spec
+        // too large, ReadOnly rejection) — and a sentinel re-run replaced the
+        // engine with a real-grep run — so the row's served flag must reflect
+        // the ACTUAL execution. The engine-internal `exec_grep` path (cwd
+        // mismatch, matcher-build failure, version mismatch) re-execs real grep
+        // in place, which is NOT observable from the parent; that residual is
+        // documented rather than fixed.
+        let applied = exec_str != command_str;
+        let served = applied && !sentinel_rerun;
+        let reason = if sentinel_rerun {
+            "engine sentinel re-run (real grep)"
+        } else if !applied && grep_serve.rewritten.is_some() {
+            // The rewrite was produced but ReadOnly validation rejected it —
+            // the whole command ran real grep. Per-member skip reasons
+            // describe the analysis, not why real grep ran. (On Windows this
+            // case never reaches the row: it is refused above, under the same
+            // cause.)
+            GUARD_REJECTED_REASON
+        } else if applied {
+            grep_serve
+                .outcomes
+                .iter()
+                .find(|o| !o.served)
+                .map(|o| o.reason.as_str())
+                .unwrap_or_default()
+        } else {
+            // No rewrite at all (engine unavailable / spec too large / only
+            // skipped members): the outcomes carry the concrete reason.
+            grep_serve
+                .outcomes
+                .iter()
+                .find(|o| !o.reason.is_empty())
+                .map_or("no rewrite produced", |o| o.reason.as_str())
+        };
+        self.write_grep_telemetry(ws, command_str, &grep_serve, served, reason, Some(&result))
+            .await;
 
         match result {
             ShellRunResult::Completed {
@@ -1235,7 +1395,8 @@ impl ShellTool {
 
                 // All completed commands return output with exit info,
                 // regardless of exit code. Only actual execution failures
-                // (timeout, process launch failure) are tool errors.
+                // (timeout, process launch failure) are tool errors — plus the
+                // Windows unserved search refused above.
                 let processed = process_shell_output(
                     command_str,
                     &stdout,
@@ -1298,6 +1459,80 @@ impl ShellTool {
                  command: {command_str}\n\
                  reason: {e}"
             ),
+        }
+    }
+
+    /// Persist one grep-engine telemetry row, best-effort (fail-open: a
+    /// telemetry failure never affects the shell result). One helper because
+    /// the record is required on every platform and on every outcome — the
+    /// post-execution decision as well as the two Windows failure paths, which
+    /// bail with the row's `reason` before ever running a command.
+    ///
+    /// `served` is the ground truth of the actual engine execution and `reason`
+    /// the decision's cause; `result` is the run the row describes (`None` for
+    /// a call that bailed before executing, so its elapsed time and exit code
+    /// are empty). A command the analysis never reached a grep member in writes
+    /// no row — except a refused Windows search, which is recorded precisely
+    /// because it must not be invisible (the shape fields stay empty).
+    async fn write_grep_telemetry(
+        &self,
+        ws: &Workspace,
+        command: &str,
+        grep_serve: &grep_engine::GrepServe,
+        served: bool,
+        reason: &str,
+        result: Option<&ShellRunResult>,
+    ) {
+        if grep_serve.outcomes.is_empty() && grep_serve.refusal.is_none() {
+            return;
+        }
+        let shape = grep_serve.telemetry_shape(served);
+        let mode = match self.mode {
+            ShellMode::ReadOnly => "ReadOnly",
+            ShellMode::Full => "Full",
+        };
+        let workspace = ws.as_path().to_string_lossy().into_owned();
+        let (duration_ms, exit_code) = match result {
+            Some(ShellRunResult::Completed {
+                elapsed, status, ..
+            }) => (
+                Some(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)),
+                status.code(),
+            ),
+            Some(
+                ShellRunResult::TimedOut { elapsed, .. }
+                | ShellRunResult::DrainTimedOut { elapsed, .. },
+            ) => (
+                Some(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)),
+                None,
+            ),
+            // A spawn failure has an attempt behind it but no clock to read: the
+            // duration is the placeholder zero, and the absent exit status is
+            // what marks the row.
+            Some(ShellRunResult::SpawnFailed(_)) => (Some(0), None),
+            // A call that bailed before running has nothing to measure: the row
+            // carries no timing at all, rather than a zero that would read as a
+            // genuine zero-duration run.
+            None => (None, None),
+        };
+        if let Some(store) = crate::logs::LOG_STORE.get() {
+            let row = crate::logs::GrepTelemetryRow {
+                command,
+                served,
+                reason,
+                recursive: shape.recursive,
+                piped: shape.piped,
+                operand_count: shape.operand_count,
+                flags: shape.flags.as_str(),
+                mode,
+                workspace: workspace.as_str(),
+                grep_count: shape.grep_count,
+                served_count: shape.served_count,
+                skipped_count: shape.skipped_count,
+                duration_ms,
+                exit_code,
+            };
+            let _ = store.record_grep_telemetry(row).await;
         }
     }
 }
@@ -1583,10 +1818,9 @@ fn inherited_env_value(name: &str) -> Option<String> {
 /// other's sessions (the same reason `crate::temp`'s temp-cleanup renderer
 /// selects its tool block).
 fn render_readonly_banner() -> String {
-    let platform_checks = crate::prompt::load_prompt(if cfg!(windows) {
-        "tool/shell_readonly_banner_windows.md"
-    } else {
-        "tool/shell_readonly_banner_unix.md"
+    let platform_checks = crate::prompt::load_prompt(match SHELL_PLATFORM {
+        ShellPlatform::Windows => "tool/shell_readonly_banner_windows.md",
+        ShellPlatform::Unix => "tool/shell_readonly_banner_unix.md",
     });
     crate::prompt::substitute(
         &crate::prompt::load_prompt("tool/shell_readonly_banner.md"),
@@ -1594,6 +1828,24 @@ fn render_readonly_banner() -> String {
             ("{{temp_root}}", &crate::temp::shell_tmpdir()),
             ("{{platform_checks}}", platform_checks.trim_end()),
         ],
+    )
+}
+
+/// The grep-engine disclosure: the shared skeleton with the session platform's
+/// fragment substituted in — the engine serves the same searches here as
+/// everywhere, but what a platform does with the ones it cannot serve, and what
+/// it has to fall back on, differs. Both renderers read [`SHELL_PLATFORM`], the
+/// same value the guard and the engine's command model read, so a Windows
+/// session is never told about a system `grep` and a unix one never about its
+/// absence.
+fn render_grep_notes() -> String {
+    let platform_notes = crate::prompt::load_prompt(match SHELL_PLATFORM {
+        ShellPlatform::Windows => "tool/shell_grep_notes_windows.md",
+        ShellPlatform::Unix => "tool/shell_grep_notes_unix.md",
+    });
+    crate::prompt::substitute(
+        &crate::prompt::load_prompt("tool/shell_grep_notes.md"),
+        &[("{{platform_notes}}", platform_notes.trim_end())],
     )
 }
 
@@ -1606,16 +1858,15 @@ impl Tool for ShellTool {
     fn description(&self) -> String {
         // The base description and the grep-engine disclosure are shared
         // verbatim between the modes (a single copy each, so the two
-        // descriptions cannot drift); only the read-only banner and the
-        // full-mode sections are mode-specific.
+        // descriptions cannot drift); only the read-only banner, the full-mode
+        // sections and the platform's grep notes are mode-/platform-specific.
         let base = crate::prompt::load_prompt("tool/shell.md");
-        let notes = crate::prompt::load_prompt("tool/shell_grep_notes.md");
         let sections: [String; 3] = match self.mode {
-            ShellMode::ReadOnly => [render_readonly_banner(), base, notes],
+            ShellMode::ReadOnly => [render_readonly_banner(), base, render_grep_notes()],
             ShellMode::Full => [
                 base,
                 crate::prompt::load_prompt("tool/shell_full.md"),
-                notes,
+                render_grep_notes(),
             ],
         };
         sections.map(|s| s.trim_end().to_owned()).join("\n\n")
@@ -5259,31 +5510,172 @@ mod tests {
         ]);
     }
 
-    /// Both platform fragments of the read-only banner must be embedded, and
-    /// must carry no placeholder of their own: `substitute` does not rescan a
-    /// replacement value. The shared skeleton must keep exactly the two keys the
-    /// renderer supplies — a stray one would render literally into every agent's
-    /// banner. The renderer picks the fragment with `cfg!`, so a typo in the
-    /// Windows key would otherwise panic on a Windows host only.
+    /// Both platform fragments of the read-only banner and the grep notes must
+    /// be embedded, and must carry no placeholder of their own: `substitute`
+    /// does not rescan a replacement value. Each shared skeleton must keep
+    /// exactly the keys its renderer supplies — a stray one would render
+    /// literally into every agent's description. The renderers pick the
+    /// fragment through `SHELL_PLATFORM`, so a typo in a key would otherwise
+    /// panic on that platform's host only.
     #[test]
-    fn read_only_banner_assets_are_embedded() {
-        let shared = crate::prompt::load_prompt("tool/shell_readonly_banner.md");
-        for key in ["{{temp_root}}", "{{platform_checks}}"] {
-            assert!(shared.contains(key), "the shared banner lost {key}");
-        }
-        let rest = shared
-            .replace("{{temp_root}}", "")
-            .replace("{{platform_checks}}", "");
-        assert!(
-            !rest.contains("{{"),
-            "the shared banner carries an unrendered key"
-        );
-        for asset in [
-            "tool/shell_readonly_banner_unix.md",
-            "tool/shell_readonly_banner_windows.md",
+    fn platform_prompt_assets_are_embedded() {
+        for (skeleton, keys, fragments) in [
+            (
+                "tool/shell_readonly_banner.md",
+                ["{{temp_root}}", "{{platform_checks}}"].as_slice(),
+                [
+                    "tool/shell_readonly_banner_unix.md",
+                    "tool/shell_readonly_banner_windows.md",
+                ]
+                .as_slice(),
+            ),
+            (
+                "tool/shell_grep_notes.md",
+                ["{{platform_notes}}"].as_slice(),
+                [
+                    "tool/shell_grep_notes_unix.md",
+                    "tool/shell_grep_notes_windows.md",
+                ]
+                .as_slice(),
+            ),
         ] {
-            let text = crate::prompt::load_prompt(asset);
-            assert!(!text.contains("{{"), "{asset} carries a placeholder");
+            let shared = crate::prompt::load_prompt(skeleton);
+            let mut rest = shared.clone();
+            for key in keys {
+                assert!(shared.contains(key), "{skeleton} lost {key}");
+                rest = rest.replace(key, "");
+            }
+            assert!(!rest.contains("{{"), "{skeleton} carries an unrendered key");
+            for asset in fragments {
+                let text = crate::prompt::load_prompt(asset);
+                assert!(!text.contains("{{"), "{asset} carries a placeholder");
+            }
+        }
+    }
+
+    /// The Windows-only refusal decision, driven directly: the serve decision's
+    /// own refusal, a produced rewrite the read-only guard rejected, and `None`
+    /// everywhere else — on unix in particular, where the original command runs.
+    #[test]
+    fn unserved_refusal_is_windows_only_and_covers_both_cases() {
+        let produced = grep_engine::GrepServe {
+            rewritten: Some("engine".into()),
+            outcomes: Vec::new(),
+            spec_files: Vec::new(),
+            refusal: None,
+        };
+        // An applied rewrite is never a refusal; on unix neither case refuses.
+        assert!(unserved_refusal(ShellPlatform::Unix, &produced, true).is_none());
+        assert!(unserved_refusal(ShellPlatform::Unix, &produced, false).is_none());
+        assert!(unserved_refusal(ShellPlatform::Windows, &produced, true).is_none());
+
+        // Produced but not applied (the read-only guard rejected it): refused
+        // on Windows, with the guard rejection named as the cause.
+        let guard = unserved_refusal(ShellPlatform::Windows, &produced, false)
+            .expect("a rejected rewrite is refused on Windows");
+        assert!(guard.contains("read-only guard"), "{guard}");
+
+        // A serve decision that carries its own refusal reports that cause.
+        let refused = grep_engine::GrepServe {
+            rewritten: None,
+            outcomes: Vec::new(),
+            spec_files: Vec::new(),
+            refusal: Some("nested grep".into()),
+        };
+        assert_eq!(
+            unserved_refusal(ShellPlatform::Windows, &refused, false).as_deref(),
+            Some("nested grep")
+        );
+    }
+
+    /// An engine failure must be recognised from a completed run, and on
+    /// Windows from the refusal marker alone: a pipeline tail (`grep … | tail
+    /// -1`) carries the tail's exit status, so the sentinel code is masked
+    /// there and the run would otherwise look like an empty match set. On unix
+    /// the same run re-runs the original command, so the marker is ignored.
+    #[test]
+    fn engine_failure_covers_the_masked_windows_sentinel() {
+        let marker = grep_engine::ENGINE_REFUSAL_MARKER;
+        let reason = "grep: engine: working directory diverged from the analyzed command";
+        // The engine's own emission order: the marker first, then the detail.
+        let masked = format!("{marker}\n{reason}\n");
+
+        let Some(EngineFailure::Refused(cause)) =
+            engine_failure(Some(0), masked.as_bytes(), ShellPlatform::Windows)
+        else {
+            panic!("the marker refuses the Windows call");
+        };
+        assert!(cause.contains("diverged"), "{cause}");
+        assert!(
+            !cause.contains(marker),
+            "the marker is not agent-facing: {cause}"
+        );
+        assert!(
+            engine_failure(Some(0), masked.as_bytes(), ShellPlatform::Unix).is_none(),
+            "unix re-runs the original command instead of refusing"
+        );
+
+        // Only a line that IS the marker counts: a served run whose matched
+        // line merely echoes the token is a result, not a refusal.
+        let echoed = format!("f.txt:{marker}\n");
+        assert!(
+            engine_failure(Some(0), echoed.as_bytes(), ShellPlatform::Windows).is_none(),
+            "a matched line carrying the token is not a refusal: {echoed:?}"
+        );
+
+        // The cause is the line after the marker, never a served member's own
+        // stderr line that happens to come first.
+        let noisy = format!("f.txt: a line mentioning {reason}\n{marker}\nengine detail\n");
+        assert!(
+            matches!(
+                engine_failure(Some(0), noisy.as_bytes(), ShellPlatform::Windows),
+                Some(EngineFailure::Refused(cause)) if cause == "engine detail"
+            ),
+            "the marker's own detail line is the cause"
+        );
+
+        // A sentinel exit needs no marker, and a marker with no detail line
+        // still yields a refusal with a generic cause.
+        assert!(matches!(
+            engine_failure(
+                Some(grep_engine::ENGINE_FAILED_EXIT),
+                reason.as_bytes(),
+                ShellPlatform::Unix
+            ),
+            Some(EngineFailure::ReRun)
+        ));
+        let bare = engine_failure(
+            Some(0),
+            format!("{marker}\n").as_bytes(),
+            ShellPlatform::Windows,
+        );
+        let Some(EngineFailure::Refused(bare)) = bare else {
+            panic!("a marker alone is a refusal");
+        };
+        assert!(bare.contains("could not serve"), "{bare}");
+
+        // A stale self-update binary is recognised by its own message on both
+        // platforms (its exit 1 is a legitimate grep no-match code) — with its
+        // message as the cause where the platform renders one.
+        assert!(matches!(
+            engine_failure(
+                Some(1),
+                grep_engine::STALE_BINARY_LOCK_MSG.as_bytes(),
+                ShellPlatform::Unix
+            ),
+            Some(EngineFailure::ReRun)
+        ));
+        assert!(matches!(
+            engine_failure(
+                Some(1),
+                grep_engine::STALE_BINARY_LOCK_MSG.as_bytes(),
+                ShellPlatform::Windows
+            ),
+            Some(EngineFailure::Refused(cause)) if cause.contains(grep_engine::STALE_BINARY_LOCK_MSG)
+        ));
+        // A served run is not a refusal: exit 0/1 with no engine complaint.
+        for code in [0, 1] {
+            assert!(engine_failure(Some(code), b"", ShellPlatform::Windows).is_none());
         }
     }
 }

@@ -49,9 +49,8 @@ pub(crate) mod vector;
 pub mod workspace;
 
 /// Hidden grep-engine subcommand entry (dispatched from `main()` before the
-/// instance lock; the shell tool's read-only grep interception rewrites
+/// instance lock; the shell tool's transparent grep interception rewrites
 /// served invocations to this subcommand of the current binary).
-#[cfg(unix)]
 pub use tools::shell::grep_engine::run_engine as run_grep_engine;
 
 /// `mahbot chrome` subcommand entry (dispatched from `main()` before the

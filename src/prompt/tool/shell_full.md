@@ -12,4 +12,4 @@ For long-running non-interactive commands (e.g. starting a dev server that must 
 
 Caveats: output is unbounded — a command that prints forever will fill the temp disk. Prefer commands that write modest output, and tail large outputs via the shell tool (the read tool caps text files at 10 MB). Output files persist in the temp area until the periodic temp cleaner or the OS temp sweep reclaims them (the daemon performs no startup purge).
 
-Background-mode greps are NOT served by the engine — `background: true` runs the real system `grep`, so the Grep notes below do not apply to it.
+Background-mode greps are NOT served by the engine — `background: true` bypasses the interception, so the Grep notes below do not apply to it: the `grep` that runs is the host's own, if the host has one.
