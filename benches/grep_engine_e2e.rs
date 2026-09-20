@@ -148,11 +148,66 @@ fn run_matrix() -> i32 {
         "grep -cl --null foo a.txt b.txt",
         "grep -lr --null x plain",
         "grep -cr --null x plain",
+        // ── Backgrounded searches ──
+        // Pin that a backgrounded search is served and that everything after its
+        // `&` survives the rewrite verbatim (`wait` keeps the output in order;
+        // the `AFTER` line is missing if the `&` swallowed the rest of the line).
+        "grep -rn x plain & wait",
+        "grep -rn x plain & wait; echo AFTER",
+        // A trailing `&` backgrounds the LAST member: the shell's own status
+        // (0) must be what the call reports, so the no-match row fails if the
+        // rewrite drops the `&` and the search runs in the foreground.
+        "grep -rn x plain &",
+        "grep -rn zzz plain &",
+        // `sh`'s comment: the member before the `#` is served (on exactly the
+        // separated spelling's words) and everything after it — the `&` and the
+        // echo included — is never run, so the row fails if the rewrite prints
+        // TAIL-RAN or feeds the comment to grep's argv.
+        "grep -rn x plain # note & echo TAIL-RAN",
     ];
 
     let mut failures = 0;
     for row in rows {
         match check_row(row, &ws, &home) {
+            Ok(()) => println!("PASS: {row}"),
+            Err(msg) => {
+                println!("FAIL: {row}: {msg}");
+                failures += 1;
+            }
+        }
+    }
+
+    // Glued redirect operators: the rewrite hands the raw spelling back and the
+    // surrounding `sh` performs the write, so the file must hold the served
+    // member's own stream (the `2>` row's file holds grep's stderr message, and
+    // the backgrounded row's the stdout of a still-served search).
+    for (row, target) in [
+        (
+            "grep -n x a.txt b.txt>redirect-glued.txt",
+            "redirect-glued.txt",
+        ),
+        (
+            "grep -n x a.txt b.txt>>redirect-glued-append.txt",
+            "redirect-glued-append.txt",
+        ),
+        (
+            "grep -n x a.txt b.txt&>redirect-glued-both.txt",
+            "redirect-glued-both.txt",
+        ),
+        (
+            "grep -n x missing.txt a.txt 2>redirect-glued-fd.txt",
+            "redirect-glued-fd.txt",
+        ),
+        (
+            "grep -rn x plain>redirect-glued-walk.txt",
+            "redirect-glued-walk.txt",
+        ),
+        (
+            "grep -rn x plain>redirect-glued-bg.txt & wait",
+            "redirect-glued-bg.txt",
+        ),
+    ] {
+        match check_redirect_row(row, target, &ws, &home) {
             Ok(()) => println!("PASS: {row}"),
             Err(msg) => {
                 println!("FAIL: {row}: {msg}");
@@ -168,6 +223,7 @@ fn run_matrix() -> i32 {
         ("stdin-fed with file operands", "cat a.txt | grep foo b.txt"),
         ("stdin-fed -r without operands", "printf 'x' | grep -r foo"),
         ("stdin-fed with a '-' operand", "cat a.txt | grep foo -"),
+        ("process substitution", "grep -rn needle <(cat a.txt)"),
     ] {
         match check_fallback(row, &ws, &home) {
             Ok(()) => println!("PASS (fallback): {row}"),
@@ -345,6 +401,58 @@ fn check_row(row: &str, ws: &Path, home: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&real_out.0)
         ))
     }
+}
+
+/// The shell half of a redirect row, observed end-to-end: the shell performs the
+/// write the command spelled, so the served rewrite and the ORIGINAL command
+/// must leave the same bytes in the file the redirect names. Both runs start
+/// from a deleted target, so an `>>` row never appends to the other run's file.
+/// Parallel-walk rows relax to sorted record sets, exactly as [`check_row`] does
+/// (the member's stream reaches the target in cross-file worker order).
+fn check_redirect_row(row: &str, target: &str, ws: &Path, home: &Path) -> Result<(), String> {
+    let rewritten = mahbot::grep_engine_rewrite_for_test(row, ws, home)
+        .ok_or_else(|| "not servable".to_string())?;
+    let path = ws.join(target);
+    let engine = run_redirect_case(&rewritten, &path, ws)?;
+    let real = run_redirect_case(row, &path, ws)?;
+    let same: fn(&[u8], &[u8]) -> bool = if mahbot::served_spec_walks_directory(row, ws, home) {
+        |a, b| mahbot::grep_sorted_lines(a) == mahbot::grep_sorted_lines(b)
+    } else {
+        |a, b| a == b
+    };
+    if !same(&engine.0, &real.0) {
+        return Err(format!(
+            "redirect stdout engine {:?} != real {:?}",
+            String::from_utf8_lossy(&engine.0),
+            String::from_utf8_lossy(&real.0)
+        ));
+    }
+    if engine.1 != real.1 {
+        return Err(format!("exit {} != real {}", engine.1, real.1));
+    }
+    if !same(&engine.2, &real.2) {
+        return Err(format!(
+            "{target} engine {:?} != real {:?}",
+            String::from_utf8_lossy(&engine.2),
+            String::from_utf8_lossy(&real.2)
+        ));
+    }
+    Ok(())
+}
+
+/// Run one redirect row in `ws` and read what its shell left in `target`:
+/// `(stdout, exit code, file bytes)`. The target is deleted first so a `>>` run
+/// starts from an empty file.
+fn run_redirect_case(
+    command: &str,
+    target: &Path,
+    ws: &Path,
+) -> Result<(Vec<u8>, i32, Vec<u8>), String> {
+    let _ = fs::remove_file(target);
+    let (out, code) = run_sh(command, ws)?;
+    let written = fs::read(target)
+        .map_err(|e| format!("redirect target {} not written: {e}", target.display()))?;
+    Ok((out, code, written))
 }
 
 /// The leading pipeline member of a shell command (up to the first top-level

@@ -63,12 +63,19 @@
 //! parallel recursive walk, so cross-file output ordering may differ from the
 //! host BSD grep (in-file ordering is stable). The approved behavioral deltas:
 //! recursive walks skip hidden/gitignored content (rg defaults; a served tail
-//! like `grep -rn … | wc -l` sees that filtered stream), `-o` + alternation
-//! stays fail-closed (a match-set/span difference, not an ordering one), and a
-//! word with a redirect glued to it (`grep -rn x>log .`) is served with the
-//! operator inside the pattern and the redirect dropped, where `sh` splits the
-//! two and would search for `x` writing to `log` (Windows refuses that spelling
-//! instead — [`windows::has_glued_redirect`]).
+//! like `grep -rn … | wc -l` sees that filtered stream) and `-o` + alternation
+//! stays fail-closed (a match-set/span difference, not an ordering one).
+//!
+//! On unix the segment and word reading is the shell's own: an unquoted,
+//! unescaped `<`/`>` ends the word before it and starts a redirection (the
+//! digits before the operator belong to it only when everything before it is
+//! digits), `&>` is one operator with the word before it kept, a bare `&`
+//! backgrounds the member, an unquoted `#` opening a word takes the rest of
+//! its line out of the command, and `>(…)`/`<(…)` is process substitution,
+//! never a redirect (that member stays on the real `grep`). Each recognized
+//! operator's raw spelling rides the rewrite verbatim, so the surrounding `sh`
+//! performs the write or the backgrounding. Windows refuses the glued spelling
+//! instead ([`windows::has_glued_redirect`]).
 //!
 //! Parity target is the host BSD grep under the shell tool's pinned
 //! `LC_ALL=C.UTF-8`. The macOS-gated differential matrix is the authoritative
@@ -485,8 +492,15 @@ fn serve_command(
     }
     // Only now — every analysis decision made, the whole command servable — is
     // the rewrite rendered, so the Windows hand-off's scratch files cannot be
-    // created and then abandoned by a later demotion.
-    let (rewritten, spec_files) = match join_rewritten(&segments, &jsons, platform) {
+    // created and then abandoned by a later demotion. The engine's own path is
+    // part of that rendering: without it there is no rewrite, so a runtime doubt
+    // demotes the command (unix runs the original, Windows refuses the call)
+    // rather than panicking.
+    let rendered = std::env::current_exe()
+        .map(|exe| exe.to_string_lossy().into_owned())
+        .map_err(|e| Fallback::Handoff(format!("no own executable path: {e}")))
+        .and_then(|exe| join_rewritten(&segments, &jsons, platform, &exe));
+    let (rewritten, spec_files) = match rendered {
         Ok(rendered) => rendered,
         Err(reason) => {
             tracing::debug!(command = command, %reason, "grep engine: fallback");
@@ -861,6 +875,11 @@ enum Fallback {
     CompileFailure(String),
     UnresolvableOperand(String),
     UnexpandableGlob,
+    /// An unquoted `>(…)`/`<(…)`: process substitution is a word the shell
+    /// builds from a command's output (or a pipe it feeds), never a
+    /// redirection, and nothing about it resolves statically — the member
+    /// stays on the real `grep`.
+    ProcessSubstitution,
     SingleFile,
     CdUntrackable,
     StdinOperands,
@@ -899,6 +918,7 @@ impl std::fmt::Display for Fallback {
             Fallback::CompileFailure(s) => write!(f, "compile failure: {s}"),
             Fallback::UnresolvableOperand(s) => write!(f, "unresolvable operand: {s}"),
             Fallback::UnexpandableGlob => write!(f, "unexpandable glob"),
+            Fallback::ProcessSubstitution => write!(f, "process substitution"),
             Fallback::SingleFile => write!(f, "single file"),
             Fallback::CdUntrackable => write!(f, "cd untrackable"),
             Fallback::StdinOperands => write!(f, "stdin with operands"),
@@ -1279,19 +1299,18 @@ fn analyze_command(
 /// command is known to be servable — and removed when the call finishes. A member
 /// whose hand-off fails takes the files already written by its predecessors with
 /// it: the command is demoted, so nobody else ever owns them.
+///
+/// `exe` is this binary's path — a parameter for the same reason
+/// [`render_served`] takes it, so a test can drive the rendered command without
+/// naming an installed executable.
 fn join_rewritten(
     segments: &[(OutSegment, String)],
     jsons: &[String],
     platform: ShellPlatform,
+    exe: &str,
 ) -> Result<(String, Vec<PathBuf>), Fallback> {
     let mut out = String::new();
     let mut files = Vec::new();
-    // A runtime doubt like any other: a rewrite cannot be rendered without the
-    // engine's own path, so the command is demoted (unix runs the original,
-    // Windows refuses the call) rather than panicking.
-    let exe = std::env::current_exe()
-        .map_err(|e| Fallback::Handoff(format!("no own executable path: {e}")))?;
-    let exe = exe.to_string_lossy();
     for (i, (seg, conn)) in segments.iter().enumerate() {
         if i > 0 {
             out.push(' ');
@@ -1299,7 +1318,7 @@ fn join_rewritten(
         match seg {
             OutSegment::Verbatim(text) => out.push_str(text),
             OutSegment::Served { spec, redirects } => {
-                match render_served(&jsons[*spec], redirects, platform, &exe, &mut files) {
+                match render_served(&jsons[*spec], redirects, platform, exe, &mut files) {
                     Ok(fragment) => out.push_str(&fragment),
                     Err(reason) => {
                         discard_spec_files(&files);
@@ -1323,6 +1342,15 @@ fn join_rewritten(
             } else {
                 out.push_str(conn);
             }
+        } else if conn == "&" {
+            // The last member's connector is normally a no-op (`;`, a newline)
+            // and is dropped with its trailing position. A trailing `&`
+            // backgrounds the member instead: dropping it would run the served
+            // search in the foreground, under the member's own exit status
+            // rather than the shell's. Windows never produces one — its
+            // splitter fails closed on a trailing connector.
+            out.push(' ');
+            out.push_str(conn);
         }
     }
     Ok((out, files))
@@ -1341,14 +1369,15 @@ pub(super) fn discard_spec_files(files: &[PathBuf]) {
 
 /// Split a command into (segment, following-connector) pairs, in the spelling
 /// of `platform`'s own shell: `sh` connectors are `&&`, `||`, `;`, `|`, `|&`,
-/// `\n` or `` (last); cmd.exe's are `&&`, `||`, `&`, `|`, `\n` or `` (last) —
-/// `;` and `&` are not interchangeable between them, which is why the platform
+/// `&`, `\n` or `` (last); cmd.exe's are `&&`, `||`, `&`, `|`, `\n` or `` (last)
+/// — `;` and `&` are not interchangeable between them, which is why the platform
 /// is a parameter rather than a `cfg` branch. Quote- and substitution-aware
 /// (per platform), heredoc bodies already stripped. Empty segments before a
 /// connector (or a trailing `|`/`|&`/`||`/`&&`, and on Windows a bare `&`) are
 /// shell syntax errors; the rewriting would silently drop them into a VALID
 /// executed pipeline — fail-closed on the whole class. Blank lines (`\n`
-/// between commands) are valid on both and stay allowed.
+/// between commands) are valid on both and stay allowed, as is a trailing `&`
+/// (a backgrounded member).
 fn split_segments(
     command: &str,
     platform: ShellPlatform,
@@ -1912,6 +1941,27 @@ struct GrepWord {
     needs_target: bool,
 }
 
+/// True when `token` already opens a redirect spelling `sh` reads as one
+/// operator plus target — an optional fd digit prefix included. A later
+/// operator byte inside such a token stays in it: the rewrite re-emits the raw
+/// spelling verbatim, so the shell re-reads it exactly as it read the original
+/// line. The canonical full-token reading is [`super::scan::classify_shell_token`]
+/// (which the tokenizer's flush calls); this is the partial-token test the
+/// mid-word arms need, and it must keep answering the same syntax — the
+/// tokenizer's redirect pins catch the drift.
+fn opens_redirect(token: &str) -> bool {
+    let rest = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    if rest.len() == token.len() {
+        // No fd prefix: the token opens with the operator as written (`&>` is
+        // one operator of its own).
+        token.starts_with(['<', '>']) || token.starts_with("&>")
+    } else {
+        // An fd prefix: only `<`/`>` may follow it — `2&>log` is the word `2`
+        // plus `&>log`, bash's own reading of that spelling.
+        rest.starts_with(['<', '>'])
+    }
+}
+
 /// Tokenize a grep segment (after the verb): quote-aware split, unquote,
 /// redirect classification (delegated to the read-only guard's token
 /// classifier — single source of truth for redirect-token semantics). The
@@ -1928,10 +1978,9 @@ fn grep_tokenize(segment: &str, platform: ShellPlatform) -> Result<Vec<GrepWord>
         // is refused instead. An operator glued to the *verb* (`grep>x f.txt`)
         // never reaches this test: `grep>x` is no grep verb, so the line carries
         // no member to refuse and is left to the platform (the module header's
-        // exemption list). Windows only: bash splits the glued spelling too, but
-        // the unix lane reads the word whole (see the module header's approved
-        // deltas), and a member that is not served there still runs the real
-        // `grep`.
+        // exemption list). Windows only: the unix lane splits the glued spelling
+        // out of the word itself (the module header's word reading), which cmd's
+        // own reader is not modelled for.
         if let Some(word) = words
             .iter()
             .find(|w| !w.redirect && windows::has_glued_redirect(&w.raw))
@@ -1983,6 +2032,42 @@ fn grep_tokenize(segment: &str, platform: ShellPlatform) -> Result<Vec<GrepWord>
             }
             if c.is_whitespace() {
                 flush(&mut current, &mut out)?;
+                continue;
+            }
+            // An unquoted, unescaped `<`/`>` ends the word before it and starts
+            // a redirection, exactly as `sh` reads it. The raw spelling then
+            // rides the rewrite verbatim, so the shell performs the write.
+            if c == '<' || c == '>' {
+                // `>(…)`/`<(…)` is process substitution: a word the shell
+                // builds from a command, never a redirect this engine could
+                // resolve — the member stays on the real `grep`.
+                if chars.peek() == Some(&'(') {
+                    return Err(Fallback::ProcessSubstitution);
+                }
+                // POSIX IO_NUMBER: the digits before the operator belong to it
+                // only when the whole word so far is digits (`2>log` redirects
+                // fd 2; `x2>log` is the word `x2` plus a redirect). An empty
+                // word (the operator opens the token) is vacuously all digits:
+                // there is nothing to flush either way.
+                let all_digits = current.bytes().all(|b| b.is_ascii_digit());
+                if !all_digits && !opens_redirect(&current) {
+                    flush(&mut current, &mut out)?;
+                }
+                current.push(c);
+                // A glued `&` (`>&`, `<&`) needs no arm of its own: `&` is never
+                // a word boundary here, so it rides the ordinary path into the
+                // same token — as does the second operator byte of `>&>`, which
+                // the `&>` arm below keeps in it through `opens_redirect`.
+                continue;
+            }
+            // `&>` (and `&>>`) is one bash operator; the word before it stays
+            // part of the search.
+            if c == '&' && chars.peek() == Some(&'>') {
+                if !opens_redirect(&current) {
+                    flush(&mut current, &mut out)?;
+                }
+                current.push(c);
+                current.push(chars.next().expect("peeked `>`"));
                 continue;
             }
         }
@@ -4009,6 +4094,7 @@ impl Output {
 
 #[cfg(all(test, target_os = "macos"))]
 mod parity_tests {
+    use super::test_support::{engine_run, engine_run_with_stdin};
     use super::*;
     use std::process::Command;
 
@@ -4092,38 +4178,6 @@ mod parity_tests {
         fs::create_dir_all(&home).expect("home");
         build_fixture(&ws, &home);
         (tmp, ws, home)
-    }
-
-    /// Run the engine in-process on one spec; returns (stdout, stderr, code).
-    /// stdin-fed specs get an empty reader — never the test process's stdin.
-    fn engine_run(spec: &EngineSpec) -> (Vec<u8>, Vec<u8>, i32) {
-        let (out, err, code, _) = engine_run_with_stdin(spec, &[]);
-        (out, err, code)
-    }
-
-    /// Run the engine in-process feeding explicit stdin bytes (stdin-fed rows).
-    /// Returns (stdout, stderr, code, stripped stream-byte count): the last
-    /// pins the stream-size marker chain (None when no marker was emitted).
-    fn engine_run_with_stdin(
-        spec: &EngineSpec,
-        stdin: &[u8],
-    ) -> (Vec<u8>, Vec<u8>, i32, Option<u64>) {
-        let matcher =
-            build_matcher(&spec.patterns, spec.mode, &spec.flags).expect("matcher builds");
-        let mut out = Output::new(OutputSink::Buffer(Vec::new()), output_limit(spec));
-        let consumed = std::cell::Cell::new(false);
-        let code = serve_into(spec, &matcher, &mut out, io::Cursor::new(stdin), &consumed);
-        let Output {
-            sink: OutputSink::Buffer(buf),
-            mut err,
-            ..
-        } = out
-        else {
-            unreachable!("buffered sink")
-        };
-        // The parent strips the stream-size marker from stderr; mirror that.
-        let stream_bytes = strip_stream_size_marker(&mut err);
-        (buf, err, code, stream_bytes)
     }
 
     /// Run the ORIGINAL command through a real shell (the authentic reference —
@@ -4259,7 +4313,8 @@ mod parity_tests {
 
     /// Analyze and join, exactly as the production caller does for the unix
     /// platform this parity lane runs under, so the assertions below read one
-    /// command's rewrite.
+    /// command's rewrite. Nothing here executes a rewrite, so the executable
+    /// path it names is a stand-in.
     fn analyze_joined(
         command: &str,
         ws: &Path,
@@ -4268,8 +4323,9 @@ mod parity_tests {
     ) -> Result<JoinedAnalyzeOutput, AnalyzeFailure> {
         let analyzed = analyze_command(command, ws, home, ShellPlatform::Unix, allow_single)?;
         let jsons: Vec<String> = analyzed.specs.iter().map(spec_json).collect();
-        let (rewritten, _) = join_rewritten(&analyzed.segments, &jsons, ShellPlatform::Unix)
-            .expect("the unix join never refuses");
+        let (rewritten, _) =
+            join_rewritten(&analyzed.segments, &jsons, ShellPlatform::Unix, "/mahbot")
+                .expect("the unix join never refuses");
         Ok((
             analyzed.specs,
             analyzed.shapes,
@@ -4392,6 +4448,47 @@ mod parity_tests {
         assert_eq!(eout, rout, "stdout mismatch for {command}");
         assert_eq!(eerr, rerr, "stderr mismatch for {command}");
         assert_eq!(ecode, rcode, "exit mismatch for {command}");
+    }
+
+    /// A member whose output `sh` sends to a file: the engine's own stdout —
+    /// which the rewrite hands to the same redirect — must be byte-identical to
+    /// what the ORIGINAL command's shell left in `target`, and the other stream
+    /// must reach both sides' capture identically. Output redirects only
+    /// (`>`, `>>`, `&>`; a `2>` row's shell half is pinned by
+    /// `unix_operator_pins`), and stderr-free rows, so a merged `&>` file is the
+    /// member's stdout alone.
+    fn assert_redirect_parity(command: &str, target: &str, ws: &Path, home: &Path) {
+        let (specs, _, rewritten, _) = analyze_joined(command, ws, home, false)
+            .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
+        assert_eq!(specs.len(), 1, "{command}: expected one grep member");
+        assert!(
+            rewritten.ends_with(target),
+            "{command}: the redirect rides the rewrite verbatim: {rewritten}"
+        );
+        let (eout, eerr, ecode) = engine_run(&specs[0]);
+        let path = ws.join(target);
+        let _ = fs::remove_file(&path);
+        let (rout, rerr, rcode) = real_run_shell(command, ws, home);
+        assert!(
+            rout.is_empty(),
+            "{command}: the original's stdout went to {target}"
+        );
+        let written = fs::read(&path)
+            .unwrap_or_else(|e| panic!("{command}: the original's shell wrote {target}: {e}"));
+        if spec_uses_parallel_walk(&specs[0]) {
+            assert_eq!(
+                sorted_lines(&eout),
+                sorted_lines(&written),
+                "{command}: the engine's stream must be what the original wrote to {target}"
+            );
+        } else {
+            assert_eq!(
+                eout, written,
+                "{command}: the engine's stream must be what the original wrote to {target}"
+            );
+        }
+        assert_eq!(eerr, rerr, "{command}: stderr");
+        assert_eq!(ecode, rcode, "{command}: exit");
     }
 
     /// Assert the command falls back (original command untouched).
@@ -4684,6 +4781,64 @@ mod parity_tests {
             "parity failures:\n  {}",
             failures.join("\n  ")
         );
+    }
+
+    /// The glued spellings, observed end-to-end: the served rewrite's own stream
+    /// lands in the file the command glued the operator to (the shell performs
+    /// the write), and a backgrounded search keeps what follows its `&`.
+    #[test]
+    fn glued_operator_and_background_parity() {
+        let (_tmp, ws, home) = fixture();
+
+        // A glued target (`>file`, `>>file`, `&>file`), the spaced spelling as
+        // the control, and the recursive shape the agents actually issue.
+        for (command, target) in [
+            (
+                "grep -n x a.txt b.txt>redirect-glued.txt",
+                "redirect-glued.txt",
+            ),
+            (
+                "grep -n x a.txt b.txt>>redirect-glued-append.txt",
+                "redirect-glued-append.txt",
+            ),
+            (
+                "grep -n x a.txt b.txt&>redirect-glued-both.txt",
+                "redirect-glued-both.txt",
+            ),
+            (
+                "grep -n x a.txt b.txt > redirect-closed.txt",
+                "redirect-closed.txt",
+            ),
+            (
+                "grep -rn x plain>redirect-glued-walk.txt",
+                "redirect-glued-walk.txt",
+            ),
+        ] {
+            assert_redirect_parity(command, target, &ws, &home);
+        }
+
+        // A backgrounded search: served, with everything after its `&` left to
+        // the shell verbatim.
+        for (command, tail) in [
+            ("grep -rn x plain & wait", "& wait"),
+            // The join spaces the `;` connector out, hence the tail's spelling.
+            ("grep -rn x plain & wait; echo AFTER", "& wait ; echo AFTER"),
+        ] {
+            let (specs, _, rewritten, _) = analyze_joined(command, &ws, &home, false)
+                .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
+            assert_eq!(specs.len(), 1, "{command}: the search is served");
+            assert!(
+                rewritten.ends_with(tail),
+                "{command}: the tail after `&` survives verbatim: {rewritten}"
+            );
+        }
+        assert_parity("grep -rn x plain & wait", &ws, &home);
+
+        // A comment takes the rest of its line with it: the served search is the
+        // separated spelling's word set (nothing the comment names reaches
+        // grep's argv) and the original's own `sh` runs nothing after the `#`,
+        // so the two streams still have to agree byte for byte.
+        assert_parity("grep -rn x plain # note & echo TAIL-RAN", &ws, &home);
     }
 
     #[test]
@@ -5073,6 +5228,9 @@ mod segmenter_pins {
             ("a |& b", &["a", "& b"]),
             // `;;` outside a case: two `;` separators, empty segment skipped.
             ("echo a ;; echo b", &["echo a", "echo b"]),
+            // `sh`'s comment is ordinary text to the profile splitter, which
+            // never runs a rewrite: the `&` inside it is not a separator either.
+            ("grep x a.txt # c & echo A", &["grep x a.txt # c & echo A"]),
         ];
         for (input, expected) in profile_rows {
             let segs = extract_command_segments(input);
@@ -5089,6 +5247,13 @@ mod segmenter_pins {
             ("grep \\*.txt a.txt", &[("grep \\*.txt a.txt", "")]),
             // `|&` is a single compound connector (stderr merge).
             ("a |& grep x a.txt", &[("a", "|&"), ("grep x a.txt", "")]),
+            // An unquoted `#` comments out the rest of its line only: neither
+            // the `&` inside the comment nor the member after it survives as a
+            // connector or a command, while the line below still does.
+            (
+                "grep x a.txt # c & echo A\nls -la",
+                &[("grep x a.txt", "\n"), ("ls -la", "")],
+            ),
         ];
         for (input, expected) in grep_ok {
             let got = split_segments(input, ShellPlatform::Unix).expect("expected segments");
@@ -5365,6 +5530,46 @@ mod test_support {
         (rewritten, serve.spec_files)
     }
 
+    /// Run the engine in-process on one spec; returns (stdout, stderr, code).
+    /// stdin-fed specs get an empty reader — never the test process's stdin.
+    /// `run_engine` (the child-side entry) is deliberately not used: it puts the
+    /// process-wide SIGPIPE disposition back to its default, which this binary
+    /// shares with tests whose producer writes into a child pipe expecting
+    /// `EPIPE`, and on a cannot-serve path it replaces the process with the real
+    /// `grep`. Unix-gated with its rows: the Windows lane's reading is argued in
+    /// `windows`, never run in-process here.
+    #[cfg(unix)]
+    pub(super) fn engine_run(spec: &EngineSpec) -> (Vec<u8>, Vec<u8>, i32) {
+        let (out, err, code, _) = engine_run_with_stdin(spec, &[]);
+        (out, err, code)
+    }
+
+    /// Run the engine in-process feeding explicit stdin bytes (stdin-fed rows).
+    /// Returns (stdout, stderr, code, stripped stream-byte count): the last
+    /// pins the stream-size marker chain (None when no marker was emitted).
+    #[cfg(unix)]
+    pub(super) fn engine_run_with_stdin(
+        spec: &EngineSpec,
+        stdin: &[u8],
+    ) -> (Vec<u8>, Vec<u8>, i32, Option<u64>) {
+        let matcher =
+            build_matcher(&spec.patterns, spec.mode, &spec.flags).expect("matcher builds");
+        let mut out = Output::new(OutputSink::Buffer(Vec::new()), output_limit(spec));
+        let consumed = std::cell::Cell::new(false);
+        let code = serve_into(spec, &matcher, &mut out, io::Cursor::new(stdin), &consumed);
+        let Output {
+            sink: OutputSink::Buffer(buf),
+            mut err,
+            ..
+        } = out
+        else {
+            unreachable!("buffered sink")
+        };
+        // The parent strips the stream-size marker from stderr; mirror that.
+        let stream_bytes = strip_stream_size_marker(&mut err);
+        (buf, err, code, stream_bytes)
+    }
+
     /// A spec whose rendering needs no operand on disk — the fixture for the
     /// hand-off and guard pins that drive [`render_served`] with an executable
     /// path of their own. Returned serialized, the form the renderer takes.
@@ -5440,6 +5645,23 @@ mod read_only_serve_pins {
             "rewrite quotes the executable path: {rewritten}"
         );
         assert!(files.is_empty(), "unix serves the spec by argv");
+
+        // The operator shapes the unix word reading hands back to the shell must
+        // clear the guard too: a rewrite it rejects is silently dropped and the
+        // read-only lane would run the real `grep` instead.
+        for (command, tail) in [
+            ("grep -rn needle . & echo done", "& echo done"),
+            ("grep -rn needle . &", " &"),
+            ("grep -rn needle<f.txt .", "<f.txt"),
+        ] {
+            let (rewritten, files) =
+                served_and_guard_accepted(command, &ws, &home, ShellPlatform::Unix);
+            assert!(
+                rewritten.ends_with(tail),
+                "{command}: the operator rides the rewrite: {rewritten}"
+            );
+            drop(SpecFiles(files));
+        }
 
         // Windows: cmd.exe cannot carry the spec, so the rewrite names a
         // scratch file it must be able to read.
@@ -6034,30 +6256,370 @@ mod refusal_pins {
             drop(SpecFiles(std::mem::take(&mut serve.spec_files)));
         }
     }
+}
 
-    /// The unix reading of a word with a redirect glued to it — an approved
-    /// divergence (the module header's delta list): `sh` splits the operator out
-    /// and searches for `x` writing to `log`, while the engine reads the word
-    /// whole, so the pattern IS `x>log` and the redirect is dropped. Windows
-    /// refuses that spelling rather than serve a search of different text
-    /// ([`windows::has_glued_redirect`]).
-    #[test]
-    fn unix_serves_a_glued_redirect_as_part_of_the_pattern() {
-        let (_tmp, ws, home) = serve_fixture();
-        let analyzed = analyze_command("grep -rn x>log .", &ws, &home, ShellPlatform::Unix, false)
-            .expect("the unix reading serves the row");
-        assert_eq!(analyzed.specs.len(), 1, "one served member");
-        assert_eq!(
-            analyzed.specs[0].patterns.as_slice(),
-            ["x>log"],
-            "the operator rides the pattern"
-        );
+// ── The unix word/operator reading (unix-gated: parsing plus a real `sh` run) ─
+// The reading the module header states, observed from both sides: which text
+// the member is served on, and that the operator is handed back to the shell
+// to perform. The wider differential rows live in the parity matrix and the
+// e2e bench.
+
+#[cfg(all(test, unix))]
+mod unix_operator_pins {
+    use super::test_support::engine_run;
+    use super::*;
+    use std::process::Command;
+
+    /// What the served member was read as, in one labelled line: the text it
+    /// searches, the raw redirect spellings returned to the shell for it, and
+    /// its operands. A row is one spelling, so the family reads as a table and
+    /// a mismatch names the field it came from.
+    fn reading(command: &str, ws: &Path, home: &Path) -> String {
+        let analyzed = analyze_command(command, ws, home, ShellPlatform::Unix, false)
+            .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
+        assert_eq!(analyzed.specs.len(), 1, "{command}: one served member");
         let OutSegment::Served { redirects, .. } = &analyzed.segments[0].0 else {
-            panic!("expected a served member");
+            panic!("{command}: expected a served member");
         };
+        let operands: Vec<&str> = analyzed.specs[0]
+            .operands
+            .iter()
+            .map(|o| o.display.as_str())
+            .collect();
+        format!(
+            "search={} redirect={} operands={}",
+            analyzed.specs[0].patterns.join(" "),
+            redirects.join(" "),
+            operands.join(" ")
+        )
+    }
+
+    /// `sh`'s comment, read as the comment it is: an unquoted `#` opening a word
+    /// comments out the rest of its line, so the search before it is served on
+    /// exactly the words the shell would have passed and everything inside the
+    /// comment — a backgrounding `&` included — goes with it, while the lines
+    /// below still run.
+    #[test]
+    fn the_comment_takes_the_rest_of_its_line_out_of_the_command() {
+        let (tmp, ws, home) = serve_fixture();
+        // (command, what the member was read as): the comment is neither a word
+        // of the search nor an operator to hand back.
+        let rows: &[(&str, &str)] = &[
+            // The `&` and the echo after the `#` are comment text: what is left
+            // to serve is the search alone.
+            (
+                "grep -rn needle . # note & echo TAIL-RAN",
+                "search=needle redirect= operands=.",
+            ),
+            // An unbalanced quote inside a comment is inert, as it is in `sh`.
+            (
+                "grep -rn needle . # don't",
+                "search=needle redirect= operands=.",
+            ),
+            // A `#` that opens no word stays ordinary text: the mid-word, quoted
+            // and escaped spellings are all the same word to `sh`.
+            ("grep -rn a#b .", "search=a#b redirect= operands=."),
+            ("grep -rn 'a#b' .", "search=a#b redirect= operands=."),
+            (r"grep -rn a\#b .", "search=a#b redirect= operands=."),
+        ];
+        for (command, expected) in rows {
+            assert_eq!(reading(command, &ws, &home), *expected, "{command}");
+        }
+
+        // The other side of the reading, under a real `sh` with a stand-in for
+        // the engine: nothing the comment swallowed is ever run, the `&` inside
+        // it never backgrounds the member — the call reports the member's own
+        // status (`ENGINE_EXIT`) — and the line below the comment still runs.
+        // The middle row is the same line without the comment, where the tail
+        // really does run.
+        let engine = engine_stub(tmp.path());
+        // (command, stdout, status, whether the swallowed tail survives)
+        let rows: &[(&str, &str, i32, bool)] = &[
+            (
+                "grep -rn needle . # note & echo TAIL-RAN",
+                "ENGINE-OUT\n",
+                ENGINE_EXIT,
+                false,
+            ),
+            (
+                "grep -rn needle . & wait; echo TAIL-RAN",
+                "ENGINE-OUT\nTAIL-RAN\n",
+                0,
+                true,
+            ),
+            (
+                "grep -rn needle . # note & echo TAIL-RAN\nls f.txt",
+                "ENGINE-OUT\nf.txt\n",
+                0,
+                false,
+            ),
+        ];
+        for (command, stdout, status, tail_kept) in rows {
+            let analyzed = analyze_command(command, &ws, &home, ShellPlatform::Unix, false)
+                .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
+            let jsons: Vec<String> = analyzed.specs.iter().map(spec_json).collect();
+            let (rewritten, _) =
+                join_rewritten(&analyzed.segments, &jsons, ShellPlatform::Unix, &engine)
+                    .expect("the unix join never refuses");
+            assert_eq!(
+                rewritten.contains("TAIL-RAN"),
+                *tail_kept,
+                "{command}: the comment takes the tail with it ({rewritten})"
+            );
+            let out = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&rewritten)
+                .current_dir(&ws)
+                .output()
+                .expect("sh runs");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                *stdout,
+                "{command}: stdout (rewrite: {rewritten})"
+            );
+            assert_eq!(
+                out.status.code(),
+                Some(*status),
+                "{command}: status (rewrite: {rewritten})"
+            );
+        }
+    }
+
+    /// The whole glued-operator family, read the way `sh` reads it: the operator
+    /// ends the word before it (or takes that word's digits as an fd prefix) and
+    /// is handed back to the shell verbatim, while quoted and escaped operators
+    /// stay ordinary text.
+    #[test]
+    fn the_glued_operator_family_is_read_the_way_sh_reads_it() {
+        let (_tmp, ws, home) = serve_fixture();
+        let rows: &[(&str, &str)] = &[
+            // The separated spellings the glued rows must land on.
+            (
+                "grep -rn needle > out.txt .",
+                "search=needle redirect=> out.txt operands=.",
+            ),
+            (
+                "grep -rn needle 2> out.txt .",
+                "search=needle redirect=2> out.txt operands=.",
+            ),
+            (
+                "grep -rn needle>out.txt .",
+                "search=needle redirect=>out.txt operands=.",
+            ),
+            (
+                "grep -rn needle>>out.txt .",
+                "search=needle redirect=>>out.txt operands=.",
+            ),
+            (
+                "grep -rn needle<f.txt .",
+                "search=needle redirect=<f.txt operands=.",
+            ),
+            (
+                "grep -rn needle>&1 .",
+                "search=needle redirect=>&1 operands=.",
+            ),
+            // `<&` is the input-side fd dup: one operator too.
+            (
+                "grep -rn needle . <&2",
+                "search=needle redirect=<&2 operands=.",
+            ),
+            (
+                "grep -rn 2<&1 needle .",
+                "search=needle redirect=2<&1 operands=.",
+            ),
+            // `&>` is one operator, and the word before it stays part of the
+            // search (unlike an fd prefix).
+            (
+                "grep -rn needle&>out.txt .",
+                "search=needle redirect=&>out.txt operands=.",
+            ),
+            (
+                "grep -rn needle&>>out.txt .",
+                "search=needle redirect=&>>out.txt operands=.",
+            ),
+            // The digits belong to the operator only when everything before it
+            // is digits: `2>log` redirects fd 2, `needle2>log` is the word
+            // `needle2` plus a redirect to `log`.
+            (
+                "grep -rn 2>out.txt needle .",
+                "search=needle redirect=2>out.txt operands=.",
+            ),
+            (
+                "grep -rn 10>out.txt needle .",
+                "search=needle redirect=10>out.txt operands=.",
+            ),
+            (
+                "grep -rn needle2>out.txt .",
+                "search=needle2 redirect=>out.txt operands=.",
+            ),
+            // Quoted and escaped operators are ordinary text.
+            ("grep -rn 'a>b' .", "search=a>b redirect= operands=."),
+            ("grep -rn \"x>log\" .", "search=x>log redirect= operands=."),
+            (r"grep -rn a\>b .", "search=a>b redirect= operands=."),
+        ];
+        for (command, expected) in rows {
+            assert_eq!(reading(command, &ws, &home), *expected, "{command}");
+        }
+    }
+
+    /// The member searches exactly the text the same search spelled with the
+    /// operator separate searches — the words `sh` would have passed to `grep`,
+    /// with the operator gone from the argv.
+    #[test]
+    fn the_engine_searches_the_text_the_separated_spelling_searches() {
+        let (_tmp, ws, home) = serve_fixture();
+        let expected = "f.txt:needle\nsrc/main.rs:fn needle() {}\n";
+        for command in [
+            "grep needle f.txt src/main.rs",
+            "grep needle>out.txt f.txt src/main.rs",
+            "grep needle>>out.txt f.txt src/main.rs",
+            "grep needle<f.txt f.txt src/main.rs",
+            "grep needle&>out.txt f.txt src/main.rs",
+            "grep 2>out.txt needle f.txt src/main.rs",
+        ] {
+            let analyzed = analyze_command(command, &ws, &home, ShellPlatform::Unix, false)
+                .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
+            let (out, err, code) = engine_run(&analyzed.specs[0]);
+            assert_eq!(code, 0, "{command}: exit");
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                expected,
+                "{command}: searched text"
+            );
+            assert!(err.is_empty(), "{command}: stderr: {err:?}");
+        }
+    }
+
+    const ENGINE_OUT: &str = "ENGINE-OUT";
+    const ENGINE_ERR: &str = "ENGINE-ERR";
+    /// The stand-in's own exit status: a row can tell whether the shell waited
+    /// for the member or left it running.
+    const ENGINE_EXIT: i32 = 7;
+
+    /// A stand-in for the engine binary the rewrite names — the renderer takes
+    /// that path as an argument — answering on both streams so a row can see
+    /// which stream the shell routed where.
+    fn engine_stub(dir: &Path) -> String {
+        let path = dir.join("mahbot-engine-stub");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' {ENGINE_OUT}\nprintf '%s\\n' {ENGINE_ERR} >&2\nexit {ENGINE_EXIT}\n"
+            ),
+        )
+        .expect("stub written");
+        let mut perms = fs::metadata(&path).expect("stub").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&path, perms).expect("stub executable");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The other side of the reading, observed by running the rendered rewrite
+    /// under a real `sh`: the shell performs the operator the command spelled —
+    /// the member's stream lands in the file it named — and a backgrounded
+    /// member leaves the commands after its `&` running.
+    #[test]
+    fn the_shell_performs_the_write_and_keeps_the_backgrounded_tail() {
+        let (tmp, ws, home) = serve_fixture();
+        let engine = engine_stub(tmp.path());
+        // (command, target, what the target receives, stdout)
+        let rows: &[(&str, &str, &str, &str)] = &[
+            ("grep -rn needle>out.txt .", "out.txt", "ENGINE-OUT\n", ""),
+            ("grep -rn needle>>out.txt .", "out.txt", "ENGINE-OUT\n", ""),
+            (
+                "grep -rn 2>err.txt needle .",
+                "err.txt",
+                "ENGINE-ERR\n",
+                "ENGINE-OUT\n",
+            ),
+            (
+                "grep -rn needle>out.txt . & wait; echo AFTER",
+                "out.txt",
+                "ENGINE-OUT\n",
+                "AFTER\n",
+            ),
+        ];
+        for (command, target, in_target, stdout) in rows {
+            let _ = fs::remove_file(ws.join(target));
+            let analyzed = analyze_command(command, &ws, &home, ShellPlatform::Unix, false)
+                .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
+            let jsons: Vec<String> = analyzed.specs.iter().map(spec_json).collect();
+            let (rewritten, _) =
+                join_rewritten(&analyzed.segments, &jsons, ShellPlatform::Unix, &engine)
+                    .expect("the unix join never refuses");
+            let out = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&rewritten)
+                .current_dir(&ws)
+                .output()
+                .expect("sh runs");
+            assert_eq!(
+                fs::read_to_string(ws.join(target)).unwrap_or_default(),
+                *in_target,
+                "{command}: `sh` writes the member's stream into {target} (rewrite: {rewritten})"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                *stdout,
+                "{command}: stdout (rewrite: {rewritten})"
+            );
+        }
+    }
+
+    /// A member backgrounded as the last thing in its line: the `&` itself
+    /// reaches the shell, so the call returns on the shell's own status rather
+    /// than the member's — the stand-in exits 7, which a foregrounded member
+    /// would report.
+    #[test]
+    fn a_trailing_ampersand_backgrounds_the_served_member() {
+        let (tmp, ws, home) = serve_fixture();
+        let engine = engine_stub(tmp.path());
+        let command = "grep -rn needle . &";
+        let analyzed = analyze_command(command, &ws, &home, ShellPlatform::Unix, false)
+            .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
+        let jsons: Vec<String> = analyzed.specs.iter().map(spec_json).collect();
+        let (rewritten, _) =
+            join_rewritten(&analyzed.segments, &jsons, ShellPlatform::Unix, &engine)
+                .expect("the unix join never refuses");
         assert!(
-            redirects.is_empty(),
-            "the redirect is dropped: {redirects:?}"
+            rewritten.ends_with(" &"),
+            "the `&` rides the rewrite: {rewritten}"
         );
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&rewritten)
+            .current_dir(&ws)
+            .output()
+            .expect("sh runs");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "the shell's status, not the backgrounded member's: {rewritten}"
+        );
+    }
+
+    /// `>(…)`/`<(…)` is process substitution — a word the shell builds from a
+    /// command — never a redirection: the member stays on the real `grep`
+    /// rather than being served on a word nothing can resolve.
+    #[test]
+    fn process_substitution_is_never_a_redirect() {
+        let (_tmp, ws, home) = serve_fixture();
+        for command in [
+            "grep -rn needle <(cat f.txt) .",
+            "grep -rn needle . >(cat f.txt)",
+        ] {
+            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+            assert!(serve.refusal.is_none(), "{command}: unix never refuses");
+            assert!(
+                serve.rewritten.is_none(),
+                "{command}: nothing to serve (got {:?})",
+                serve.rewritten
+            );
+            assert_eq!(serve.outcomes.len(), 1, "{command}: one analyzed member");
+            assert_eq!(
+                serve.outcomes[0].reason, "process substitution",
+                "{command}"
+            );
+        }
     }
 }

@@ -2214,14 +2214,17 @@ fn extract_command_segments(command: &str) -> Vec<String> {
 
 /// Splitting policy of the shared segmenter core ([`segment_command`]): the
 /// profile-selection and grep-interception splitters had already drifted
-/// apart silently (backslash handling); both run this core, and these two
-/// policies are the entire divergence. Unifying them is a separate decision.
+/// apart silently (backslash handling); both run this core, and the divergence
+/// is these policies plus, in grep mode, `sh`'s bare-`&` separator and its
+/// unquoted-`#` comment. Unifying them is a separate decision.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SegmentMode {
     /// Empty segments silently skipped; backslash dropped before ordinary chars.
     Profile,
     /// Empty segments before a connector are syntax errors, except blank
-    /// lines and `;;` case-arm terminators; backslash always preserved.
+    /// lines and `;;` case-arm terminators; backslash always preserved; an
+    /// unquoted `#` opening a word comments out the rest of its line (see the
+    /// arm).
     Grep,
 }
 
@@ -2243,6 +2246,25 @@ const fn is_escape_sensitive(c: char) -> bool {
     )
 }
 
+/// True when the raw text accumulated for the current segment ends where a word
+/// could open — nothing yet, or an unescaped whitespace. `\ ` is an escaped
+/// space and stays inside its word, so the backslash run before the whitespace
+/// decides; quotes need no handling here (a closing quote is not whitespace, so
+/// `f" "#c` counts as mid-word, as `sh` reads it).
+fn at_word_start(segment: &str) -> bool {
+    match segment.chars().next_back() {
+        None => true,
+        Some(c) if !c.is_whitespace() => false,
+        Some(_) => segment
+            .chars()
+            .rev()
+            .skip(1)
+            .take_while(|c| *c == '\\')
+            .count()
+            .is_multiple_of(2),
+    }
+}
+
 /// True when `keyword` (e.g. `case` when opening, `esac` when closing a
 /// `case` statement) appears in command position: first word of the segment,
 /// or second after a block keyword that introduces commands.
@@ -2256,9 +2278,13 @@ fn segment_command_word(segment: &str, keyword: &str) -> bool {
 }
 
 /// Shared quote/substitution-aware segmenter core: split an already-heredoc-
-/// stripped command into (segment, connector) pairs. Returns `None` when a
-/// connector follows an empty segment in a mode that errors on it (grep;
-/// blank-line and case-arm `;;` exceptions apply).
+/// stripped command into (segment, connector) pairs. Grep mode also reads
+/// `sh`'s bare `&` as the separator it is (`&>` and a `>&` dup stay inside
+/// their token) and its unquoted `#` as the comment it is (dropped with
+/// everything inside it, to the end of its line); the profile splitter sees
+/// both as ordinary text. Returns `None` when a connector follows an empty
+/// segment in a mode that errors on it (grep; blank-line and case-arm `;;`
+/// exceptions apply).
 #[expect(clippy::too_many_lines)] // quote/substitution state machine
 pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(String, String)>> {
     let mut out: Vec<(String, String)> = Vec::new();
@@ -2320,6 +2346,29 @@ pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(S
                     }
                     continue;
                 }
+                // An unquoted `<`/`>` keeps a glued `&` inside its token: `>&`
+                // and `<&` are one fd-dup operator each (`2>&1`, `<&2`,
+                // `2<&1`) and must not split at that `&`. Only that `&` is
+                // consumed: every other character — a second `<`/`>`, a pipe —
+                // still takes the path it took before.
+                '<' | '>' if mode == SegmentMode::Grep => {
+                    current.push(c);
+                    if chars.peek() == Some(&'&') {
+                        current.push(chars.next().expect("peeked `&`"));
+                    }
+                    continue;
+                }
+                // A bare `&` backgrounds the command before it — `sh`'s own
+                // separator, like `;` but asynchronous. Everything after it
+                // belongs to the next command and must survive the rewrite
+                // verbatim. `&>` is the bash redirect operator, not a
+                // backgrounding, and stays inside its token.
+                '&' if mode == SegmentMode::Grep && chars.peek() != Some(&'>') => {
+                    if !flush(&mut current, &mut out, "&", base, &mut in_case) {
+                        return None;
+                    }
+                    continue;
+                }
                 // `>|` is one compound redirect, not a pipe (bare `>` misread).
                 '|' if current.trim_end().ends_with('>') => {
                     current.push(c);
@@ -2363,6 +2412,25 @@ pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(S
                     // mode and is silently skipped in profile mode.
                     if mode == SegmentMode::Grep && in_case && chars.peek() == Some(&';') {
                         chars.next();
+                    }
+                    continue;
+                }
+                // An unquoted `#` opening a word starts `sh`'s comment, which
+                // ends at the newline. The comment text is dropped with
+                // everything inside it (`&`, `;` and `|` are ordinary characters
+                // there, and a search spelled after it never runs), and the
+                // line's own connector is that newline, so the lines below are
+                // still segmented — and served.
+                '#' if mode == SegmentMode::Grep && at_word_start(&current) => {
+                    let _ = chars.find(|c| *c == '\n');
+                    if !flush(
+                        &mut current,
+                        &mut out,
+                        "\n",
+                        EmptySegPolicy::Skip,
+                        &mut in_case,
+                    ) {
+                        return None;
                     }
                     continue;
                 }
