@@ -1041,6 +1041,7 @@ fn format_timeout_error(
 }
 
 fn format_drain_timeout_error(
+    mode: ShellMode,
     command: &str,
     elapsed: Duration,
     drain_limit: Duration,
@@ -1068,11 +1069,19 @@ fn format_drain_timeout_error(
         };
         let _ = write!(msg, "\nkilled {scope}: {p}");
     }
-    msg.push_str(
-        "\nhint: the tool does not support processes that outlive the command; \
-         keep launched processes inside the command's lifetime. \
-         If background execution is genuinely required, state that in your final response.",
-    );
+    msg.push_str(match mode {
+        // Full mode has the mechanism this error is asking for — point at it
+        // instead of telling the agent it does not exist.
+        ShellMode::Full => {
+            "\nhint: launch long-running processes with `background: true` and \
+             stop them with `stop`, instead of letting a child outlive the command."
+        }
+        ShellMode::ReadOnly => {
+            "\nhint: the tool does not support processes that outlive the command; \
+             keep launched processes inside the command's lifetime. \
+             If background execution is genuinely required, state that in your final response."
+        }
+    });
 
     append_output_tail(&mut msg, "stdout", stdout);
     append_output_tail(&mut msg, "stderr", stderr);
@@ -1474,6 +1483,7 @@ impl ShellTool {
                     "Shell command output drain timed out — leftover process held the pipes"
                 );
                 let msg = format_drain_timeout_error(
+                    self.mode,
                     command_str,
                     elapsed,
                     drain_limit,
@@ -4583,6 +4593,7 @@ mod tests {
         );
 
         let msg = format_drain_timeout_error(
+            ShellMode::ReadOnly,
             "test",
             elapsed,
             Duration::from_millis(150),

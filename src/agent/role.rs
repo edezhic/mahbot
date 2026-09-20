@@ -259,13 +259,16 @@ use crate::tools::{
 };
 
 impl Role {
-    /// Core read/search tools — plus the read-only shell when `shell` is set —
-    /// for inspector-style roles (Analyst, QA, Reviewer, Discovery, Maintainer).
-    fn readonly_core_tools(shell: bool) -> Vec<Box<dyn Tool>> {
+    /// Core read/search tools — plus the shell in `shell` mode when one is
+    /// requested — for the inspector roles (Analyst, QA, Reviewer, Discovery,
+    /// Maintainer). None of them may mutate the workspace, so none gets `edit`;
+    /// they differ only in the shell mode, and an Analyst in a guest's personal
+    /// workspace loses the shell entirely (see [`Self::analyst_shell_allowed`]).
+    fn inspector_core_tools(shell: Option<ShellMode>) -> Vec<Box<dyn Tool>> {
         let mut tools: Vec<Box<dyn Tool>> =
             vec![Box::new(ReadTool::general()), Box::new(SearchTool)];
-        if shell {
-            tools.push(Box::new(ShellTool::new(ShellMode::ReadOnly)));
+        if let Some(mode) = shell {
+            tools.push(Box::new(ShellTool::new(mode)));
         }
         tools
     }
@@ -351,12 +354,20 @@ impl Role {
                 ]
             }
             Role::Analyst => {
-                let mut t = Self::readonly_core_tools(Self::analyst_shell_allowed(ws));
+                let shell = Self::analyst_shell_allowed(ws).then_some(ShellMode::ReadOnly);
+                let mut t = Self::inspector_core_tools(shell);
                 t.push(Box::new(ChromeTool::new(chrome_sessions)));
                 t
             }
             Role::Coder => Self::full_core_tools(),
-            Role::Qa | Role::Reviewer | Role::Discovery => Self::readonly_core_tools(true),
+            // QA runs the build roles' unrestricted shell so it can start the
+            // product or its service and observe it while it runs. The mode is
+            // the only thing it shares with them: no `edit`, and the
+            // no-mutation rule lives in `prompt/role/qa.md`.
+            Role::Qa => Self::inspector_core_tools(Some(ShellMode::Full)),
+            Role::Reviewer | Role::Discovery => {
+                Self::inspector_core_tools(Some(ShellMode::ReadOnly))
+            }
             Role::Sanitation => {
                 // Sanitation deliberately has NO search tools (local `search`
                 // or `web_search`): the role inspects and cleans specific
@@ -371,7 +382,7 @@ impl Role {
                 ]
             }
             Role::Maintainer => {
-                let mut t = Self::readonly_core_tools(true);
+                let mut t = Self::inspector_core_tools(Some(ShellMode::ReadOnly));
                 t.push(Box::new(AnalyzeTool::new(
                     DispatchMode::Sync,
                     Role::Maintainer,
@@ -589,6 +600,45 @@ mod tests {
             names,
             ["read", "shell"],
             "Sanitation toolset must be exactly read + read-only shell, got: {names:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
+    fn qa_toolset_is_the_build_shell_without_edit() {
+        // Acceptance pin: QA verifies runtime behaviour by starting the product
+        // or its service, so it runs the engineer/coder shell (Full mode,
+        // background included) — but it must not change the workspace, so it
+        // gets no `edit`. The prohibition itself is prompt text
+        // (`prompt/role/qa.md`), not a tool restriction.
+        let snapshot = crate::config::CONFIG.snapshot();
+        crate::config::CONFIG.swap(crate::config::ConfigData::STRUCT_FIELDS_DEFAULT);
+        let ws = crate::workspace::test_ws("test");
+        let qa = crate::Role::Qa.tools(&ws, false, test_sessions());
+        let engineer = crate::Role::Engineer.tools(&ws, false, test_sessions());
+        crate::config::CONFIG.swap(snapshot);
+
+        let names: Vec<&str> = qa.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            names,
+            ["read", "search", "shell"],
+            "QA toolset must be exactly read + search + the unrestricted shell, got: {names:?}"
+        );
+        let qa_shell = qa.iter().find(|t| t.name() == "shell").expect("QA shell");
+        let engineer_shell = engineer
+            .iter()
+            .find(|t| t.name() == "shell")
+            .expect("engineer shell");
+        assert_eq!(
+            qa_shell.description(),
+            engineer_shell.description(),
+            "QA must run the same shell the engineer gets"
+        );
+        assert!(
+            qa_shell.parameters_schema()["properties"]
+                .as_object()
+                .is_some_and(|props| props.contains_key("background")),
+            "QA's shell must advertise the background argument"
         );
     }
 
