@@ -117,6 +117,27 @@ pub struct ShellState {
     last_seen_layout_size: Option<Size>,
 }
 
+/// The command interpreter a Shell-page terminal starts.
+///
+/// Unix starts the program `$SHELL` names. Windows has no `$SHELL`: it is unset
+/// on a native launch, and a POSIX layer that does export it names a `/usr/bin/…`
+/// path the native spawn cannot resolve — so Windows starts
+/// [`crate::tools::shell::WINDOWS_COMMAND_INTERPRETER`], the same program the
+/// agent-facing shell spawns. `%COMSPEC%` is deliberately not consulted: the
+/// terminal crate assembles the ConPTY command line without quoting, so an
+/// interpreter installed under a path with spaces would name a program Windows
+/// cannot find.
+fn terminal_program() -> Result<String, String> {
+    if cfg!(windows) {
+        return Ok(crate::tools::shell::WINDOWS_COMMAND_INTERPRETER.into());
+    }
+    match std::env::var("SHELL") {
+        Ok(shell) if !shell.is_empty() => Ok(shell),
+        Ok(_) => Err("$SHELL is empty".into()),
+        Err(_) => Err("$SHELL not set".into()),
+    }
+}
+
 impl ShellState {
     #[must_use]
     pub fn new() -> Self {
@@ -174,11 +195,7 @@ impl ShellState {
         label: &str,
         working_dir: Option<String>,
     ) -> Result<ShellTab, String> {
-        let shell = match std::env::var("SHELL") {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => return Err("$SHELL is empty".into()),
-            Err(_) => return Err("$SHELL not set".into()),
-        };
+        let shell = terminal_program()?;
 
         let id = *next_id;
         *next_id += 1;

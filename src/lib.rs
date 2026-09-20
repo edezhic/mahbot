@@ -322,11 +322,10 @@ impl Workspace {
 }
 
 /// The path a [`Workspace`] built from a filesystem path stores: canonicalized,
-/// so `is_path_safe_for_workspace` (lexical `starts_with`) is correct even when
-/// the base is behind a symlink (`/tmp` → `/private/tmp` on macOS), and with the
-/// platform's verbatim prefix dropped (`std::fs::canonicalize` yields
-/// `\\?\C:\…` on Windows, a spelling the shell, the prompts and
-/// [`crate::tools::path`] should not have to carry). Falls back to the raw path
+/// so containment stays correct even when the base is behind a symlink (`/tmp` →
+/// `/private/tmp` on macOS), and with the platform's verbatim prefix dropped (see
+/// [`crate::util::strip_verbatim_prefix`]) — the spelling the shell, the prompts
+/// and [`crate::tools::path`] should not have to carry. Falls back to the raw path
 /// when the directory does not exist yet.
 fn stored_workspace_path(path: &Path) -> PathBuf {
     crate::util::with_block_in_place(|| {

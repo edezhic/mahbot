@@ -1659,8 +1659,8 @@ fn test_rename_mutual_exclusion_cancelled_by_other_modals() {
 // ── rekey helpers ──────────────────────────────────────────
 
 #[test]
-fn test_rekey_keys() {
-    // (name, old_prefix, new_prefix, keys, expected pairs)
+fn test_rebase_tree_key() {
+    // (name, old_prefix, new_prefix, keys, expected rebased keys)
     #[rustfmt::skip]
     #[expect(clippy::type_complexity)]
     let cases: &[(&str, &str, &str, &[&str], &[(&str, &str)])] = &[
@@ -1676,18 +1676,58 @@ fn test_rekey_keys() {
         ("exact_prefix", "dir", "newdir", &["dir"], &[("dir", "newdir")]),
     ];
     for &(name, old_prefix, new_prefix, keys, expected) in cases {
-        let mut pairs = rekey_keys(
-            old_prefix,
-            new_prefix,
-            keys.iter().map(std::string::ToString::to_string),
-        );
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        let got: Vec<(&str, &str)> = pairs
+        let mut pairs: Vec<(&str, String)> = keys
             .iter()
-            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .filter_map(|k| Some((*k, rebase_tree_key(k, old_prefix, new_prefix)?)))
             .collect();
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let got: Vec<(&str, &str)> = pairs.iter().map(|(a, b)| (*a, b.as_str())).collect();
         assert_eq!(got, expected, "case: {name}");
     }
+}
+
+/// The absolute helpers split paths into components, so a base carrying the
+/// trailing separator a stored workspace root comes with still contains its own
+/// files. Cases use forward slashes so they read the same on every host;
+/// expectations go through the same `join` that inserts the native separator.
+#[test]
+fn test_abs_path_helpers_are_component_wise() {
+    assert!(is_within_abs("C:/ws/a.txt", "C:/ws/"));
+
+    let moved = |rest: &str| {
+        Path::new("C:/moved")
+            .join(rest)
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    assert_eq!(
+        rebase_abs_path("C:/ws/a.txt", "C:/ws", "C:/moved"),
+        Some(moved("a.txt"))
+    );
+    assert_eq!(
+        rebase_abs_path("C:/ws", "C:/ws", "C:/moved"),
+        Some("C:/moved".to_string())
+    );
+    assert_eq!(rebase_abs_path("C:/other/a.txt", "C:/ws", "C:/moved"), None);
+
+    let mut map = HashMap::from([
+        ("C:/ws/a.txt".to_string(), 1),
+        ("C:/other.txt".to_string(), 2),
+    ]);
+    rekey_abs_map(&mut map, "C:/ws", "C:/moved");
+    assert_eq!(
+        map,
+        HashMap::from([(moved("a.txt"), 1), ("C:/other.txt".to_string(), 2)]),
+        "only what lies under the moved directory is re-keyed"
+    );
+
+    let mut toasts = HashSet::from(["C:/ws/a.txt".to_string(), "C:/other".to_string()]);
+    rekey_abs_set(&mut toasts, "C:/ws", "C:/moved");
+    assert_eq!(
+        toasts,
+        HashSet::from([moved("a.txt"), "C:/other".to_string()])
+    );
 }
 
 #[test]

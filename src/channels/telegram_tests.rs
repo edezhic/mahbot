@@ -1,4 +1,5 @@
 use super::*;
+use crate::util::test::canonical_without_verbatim_prefix;
 
 /// Create a Telegram Update JSON with sensible defaults, then apply
 /// shallow top-level overrides for test-specific fields.
@@ -475,7 +476,7 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     // Inside the workspace: delivered as a document with the canonical path.
     let pdf = dir.path().join("specs.pdf");
     std::fs::write(&pdf, b"fake-pdf").unwrap();
-    let canonical = std::fs::canonicalize(&pdf).unwrap();
+    let canonical = canonical_without_verbatim_prefix(&pdf);
     let (cleaned, att, refusals) =
         parse_attachment_markers(&format!("Here: [FILE:{}]", pdf.display()), &roots);
     assert_eq!(cleaned, "Here:");
@@ -506,7 +507,7 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     assert_eq!(att.len(), 1);
     assert_eq!(
         att[0].target,
-        std::fs::canonicalize(&relayed).unwrap().to_string_lossy()
+        canonical_without_verbatim_prefix(&relayed).to_string_lossy()
     );
 
     // An existing file outside the roots is refused by name.

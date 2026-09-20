@@ -50,6 +50,11 @@ pub(super) const SHELL_PLATFORM: ShellPlatform = if cfg!(windows) {
     ShellPlatform::Unix
 };
 
+/// The Windows command interpreter, named once so the spawn side
+/// ([`build_shell_command`]) and the GUI Shell page's terminal
+/// (`gui::shell::terminal_program`) cannot start different programs.
+pub(crate) const WINDOWS_COMMAND_INTERPRETER: &str = "cmd.exe";
+
 /// Shell builtins/prefixes to skip when extracting the primary command.
 /// NOTE: `su` is intentionally NOT in this list. It can be used to run
 /// commands as another user (e.g., `su -c "rm -rf /"`), which would bypass
@@ -217,7 +222,7 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
 
     #[cfg(target_os = "windows")]
     let mut process = {
-        let mut p = tokio::process::Command::new("cmd.exe");
+        let mut p = tokio::process::Command::new(WINDOWS_COMMAND_INTERPRETER);
         // `raw_arg`, not `arg`: std's argument escaping belongs to the
         // `CommandLineToArgvW` convention `cmd.exe` does not follow (see
         // `Command::raw_arg`'s own doc). It would re-escape the command's quotes

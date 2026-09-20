@@ -37,7 +37,9 @@ pub(crate) fn shell_quote(s: &str) -> String {
 /// yet for write operations).
 ///
 /// Returns an error if `path` has no parent or file_name component, or if
-/// [`tokio::fs::canonicalize`] fails on the parent directory.
+/// [`tokio::fs::canonicalize`] fails on the parent directory. The verbatim prefix
+/// is dropped (see [`crate::util::strip_verbatim_prefix`]), so the tool hands on
+/// the plain spelling.
 async fn canonicalize_parent_and_join(path: &Path) -> std::io::Result<PathBuf> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent directory")
@@ -46,7 +48,7 @@ async fn canonicalize_parent_and_join(path: &Path) -> std::io::Result<PathBuf> {
         .file_name()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
     let canon_parent = tokio::fs::canonicalize(parent).await?;
-    Ok(canon_parent.join(name))
+    Ok(crate::util::strip_verbatim_prefix(&canon_parent).join(name))
 }
 
 /// Fallback directory resolution when full-path [`canonicalize`] fails with
@@ -178,7 +180,7 @@ pub(crate) async fn resolve_read_target(
     // Canonicalize full path (file must exist). Resolves symlinks,
     // so the post-canonicalization check catches escapes.
     let resolved_path = match tokio::fs::canonicalize(&full_path).await {
-        Ok(resolved) => resolved,
+        Ok(resolved) => crate::util::strip_verbatim_prefix(&resolved),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             resolve_directory_read_fallback(&full_path)
                 .await
@@ -220,11 +222,9 @@ pub(crate) async fn resolve_read_target(
 /// - Does not resolve symlinks. If a symlink within an allowed root
 ///   points outside the root, lexical normalization cannot detect the
 ///   escape — only filesystem-level canonicalization can.
-/// - Windows prefix semantics (e.g. `C:\` vs `\\?\`) are handled
-///   passably for typical paths but edge cases involving prefix + root
-///   ordering may produce unexpected results. This codebase targets
-///   Unix-like systems (macOS, Linux) where `Prefix` components do not
-///   occur.
+/// - A Windows `Prefix` component (`C:`, `\\?\C:`) is carried through as an
+///   absolute anchor — `..` cannot escape past it — and is otherwise left
+///   untouched, verbatim spelling included.
 #[must_use]
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     use std::path::Component;
@@ -285,13 +285,16 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
 /// canonicalization). In that case the `~` is expanded to the user's
 /// home directory before comparing against the (already-expanded) roots.
 ///
-/// The input path is normalized (`.`, `..` resolved) *after* tilde expansion
-/// so that `../` segments introduced by tilde expansion or present in the
-/// original path cannot escape the allowed roots via lexical traversal.
+/// The path is normalized (`.`, `..` resolved) *after* tilde expansion so that
+/// `../` segments introduced by tilde expansion or present in the original path
+/// cannot escape the allowed roots via lexical traversal. The comparison itself is
+/// [`crate::util::is_within`], which settles the spelling on both sides.
 pub(crate) fn is_path_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
     let expanded = crate::util::expand_tilde(&path.to_string_lossy());
     let normalized = normalize_path(&expanded);
-    roots.iter().any(|root| normalized.starts_with(root))
+    roots
+        .iter()
+        .any(|root| crate::util::is_within(&normalized, root))
 }
 
 /// The canonical allowed temp/scratch roots (shared by the read-path
@@ -899,10 +902,9 @@ static EXTRA_READ_ALLOWED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
 /// escapes. The caller is responsible for that post-canonicalization validation
 /// (see [`resolve_read_target`] and [`resolve_write_target`]).
 ///
-/// The workspace comparison is made on the normalised spellings of both sides
-/// (see [`crate::util::strip_verbatim_prefix`]), so a stored root and a
-/// canonicalized candidate that differ only by the Windows verbatim prefix
-/// still match.
+/// The workspace comparison runs through [`crate::util::is_within`], so a stored
+/// root and a canonicalized candidate that differ only by the Windows verbatim
+/// prefix still match.
 #[must_use]
 fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     let path = path.trim();
@@ -936,26 +938,11 @@ fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
         // this is harmless: agents use relative paths, and the post-canonicalization
         // checks in resolve_read_target / resolve_write_target catch any symlink
         // escapes that would bypass this pre-check.
-        workspace_prefix_matches(&expanded_path, workspace_root)
+        crate::util::is_within(&expanded_path, workspace_root)
     } else {
         // Relative path without parent-dir components — always safe
         true
     }
-}
-
-/// Lexical workspace-prefix comparison, run on the normalised spelling of both
-/// sides (see [`crate::util::strip_verbatim_prefix`]).
-///
-/// On Windows `std::fs::canonicalize` yields verbatim (`\\?\C:\…`) paths while a
-/// stored workspace root may be spelled either way, and
-/// `Prefix(VerbatimDisk('C'))` never equals `Prefix(Disk('C'))` — so an `edit`
-/// inside an ephemeral run root, and any absolute read against a
-/// verbatim-stored root, would be refused without the normalisation. Identity
-/// for every unix path.
-#[must_use]
-fn workspace_prefix_matches(candidate: &Path, workspace_root: &Path) -> bool {
-    crate::util::strip_verbatim_prefix(candidate)
-        .starts_with(crate::util::strip_verbatim_prefix(workspace_root))
 }
 
 /// Resolve a user path segment against `workspace_root`.
@@ -977,6 +964,7 @@ fn resolve_tool_path_with_base(path: &str, workspace_root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::test::canonical_without_verbatim_prefix;
     use tempfile::TempDir;
 
     // ── Path validation: is_path_safe_for_workspace ─────────────────────
@@ -1216,26 +1204,50 @@ mod tests {
         }
     }
 
-    /// The workspace prefix check runs on the normalised spellings, so a
-    /// candidate that differs from the root only by the Windows verbatim prefix
-    /// is still accepted — in both directions.
+    /// Containment is judged in one spelling, so a candidate that differs from
+    /// the root only by the Windows verbatim prefix is still accepted — in both
+    /// directions — while a path outside the root is still refused. The
+    /// separator is a forward slash so the assertion means the same thing on
+    /// both platforms (Windows accepts either separator), which is what makes
+    /// it host-runnable evidence for the comparison logic.
     #[test]
-    fn workspace_prefix_matches_ignores_the_verbatim_prefix() {
-        assert!(workspace_prefix_matches(
+    fn containment_accepts_either_spelling_but_is_case_sensitive() {
+        assert!(crate::util::is_within(
             Path::new("C:/ws/a/b"),
             Path::new(r"\\?\C:/ws")
         ));
-        assert!(workspace_prefix_matches(
+        assert!(crate::util::is_within(
             Path::new(r"\\?\C:/ws/a/b"),
             Path::new("C:/ws")
         ));
-        assert!(!workspace_prefix_matches(
+        assert!(!crate::util::is_within(
             Path::new(r"\\?\C:/other"),
             Path::new("C:/ws")
+        ));
+        // Ordinary name components are compared exactly — no case folding — so a
+        // differently-cased directory is a sibling of the base, not inside it. The
+        // drive letter cannot witness this: Windows folds it while parsing a path,
+        // while unix compares it as an ordinary name component, so a drive-case
+        // assertion holds on one host and fails on the other.
+        assert!(!crate::util::is_within(
+            Path::new("C:/ws/Docs/a"),
+            Path::new("C:/ws/docs")
         ));
     }
 
     // ── is_path_under_roots / allowed_temp_roots tests ───────────────────
+
+    /// The roots gate settles the verbatim spelling the way containment does: a
+    /// root stored in either form is honoured, while a sibling directory that
+    /// merely shares the name prefix is not.
+    #[test]
+    fn verbatim_root_spelling_is_settled_by_the_roots_gate() {
+        let roots = [PathBuf::from("C:/ws")];
+        let verbatim_roots = [PathBuf::from(r"\\?\C:/ws")];
+        assert!(is_path_under_roots(Path::new(r"\\?\C:/ws/a/b"), &roots));
+        assert!(is_path_under_roots(Path::new("C:/ws/a/b"), &verbatim_roots));
+        assert!(!is_path_under_roots(Path::new("C:/ws-other"), &roots));
+    }
 
     #[test]
     fn is_path_under_allowed_temp_covers_common_roots() {
@@ -1818,8 +1830,11 @@ mod tests {
             result.err()
         );
         let resolved = result.unwrap();
-        let canonical = tokio::fs::canonicalize(&file_path).await.unwrap();
-        assert_eq!(resolved, canonical, "should resolve to the canonical path");
+        assert_eq!(
+            resolved,
+            canonical_without_verbatim_prefix(&file_path),
+            "should resolve to the canonical path"
+        );
     }
 
     #[tokio::test]
@@ -1838,8 +1853,7 @@ mod tests {
             result.err()
         );
         let resolved = result.unwrap();
-        let canonical = tokio::fs::canonicalize(&sub).await.unwrap();
-        assert_eq!(resolved, canonical);
+        assert_eq!(resolved, canonical_without_verbatim_prefix(&sub));
     }
 
     #[tokio::test]
@@ -1894,8 +1908,11 @@ mod tests {
         assert!(result.is_ok(), "Should resolve symlink: {:?}", result.err());
 
         let resolved = result.unwrap();
-        let canonical = tokio::fs::canonicalize(&link).await.unwrap();
-        assert_eq!(resolved, canonical, "should resolve to the canonical path");
+        assert_eq!(
+            resolved,
+            canonical_without_verbatim_prefix(&link),
+            "should resolve to the canonical path"
+        );
     }
 
     #[tokio::test]
@@ -1997,7 +2014,10 @@ mod tests {
             result.err()
         );
         let resolved = result.unwrap();
-        assert!(resolved.starts_with(&ws), "Path should be within workspace");
+        assert!(
+            crate::util::is_within(&resolved, &ws),
+            "Path should be within workspace: {resolved:?}"
+        );
         assert_eq!(resolved.file_name().unwrap(), "new_file.rs");
         // The file should NOT exist yet
         assert!(!resolved.exists(), "File should not exist yet");
@@ -2014,7 +2034,10 @@ mod tests {
             result.err()
         );
         let resolved = result.unwrap();
-        assert!(resolved.starts_with(&ws), "Path should be within workspace");
+        assert!(
+            crate::util::is_within(&resolved, &ws),
+            "Path should be within workspace: {resolved:?}"
+        );
         assert_eq!(resolved.file_name().unwrap(), "new_file.rs");
         // Parent chain should exist
         assert!(

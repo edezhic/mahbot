@@ -1161,9 +1161,13 @@ pub(crate) async fn resolve_local_media_path(
     ws: &Workspace,
     kind: &str,
 ) -> anyhow::Result<PathBuf> {
-    let canonical = tokio::fs::canonicalize(input)
-        .await
-        .with_context(|| format!("Local {kind} not found: {input}"))?;
+    // The plain spelling, not the platform's verbatim form: this value is read by
+    // the callers and echoed into the refusal text the agent sees.
+    let canonical = crate::util::strip_verbatim_prefix(
+        &tokio::fs::canonicalize(input)
+            .await
+            .with_context(|| format!("Local {kind} not found: {input}"))?,
+    );
     let roots: Vec<PathBuf> = ["uploads", "generated"]
         .iter()
         .map(|d| ws.as_path().join(d))

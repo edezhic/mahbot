@@ -401,6 +401,11 @@ pub(crate) fn wide_path(path: &Path) -> Option<Vec<u16>> {
 /// from those yields a relative path, which is worse than a verbatim one.
 /// Identity for a path without the prefix, and for one that cannot be spelled
 /// exactly (unpaired surrogates are not rewritten lossily into a different path).
+///
+/// The trade-off is deliberate: a child process (the shell, the pipeline's git)
+/// cannot reach past the platform's classic path-length limit once the verbatim
+/// form is gone, which is accepted rather than worked around by handing the
+/// service form to a consumer.
 #[must_use]
 pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     let Some(raw) = path.to_str() else {
@@ -416,6 +421,17 @@ pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
         return PathBuf::from(rest);
     }
     path.to_path_buf()
+}
+
+/// Whether `candidate` is `base` itself or lies below it, compared after both
+/// sides have dropped the Windows verbatim prefix (see
+/// [`strip_verbatim_prefix`]) — that strip is what makes a canonicalized candidate
+/// and a stored base comparable. Lexical, component-wise and case-sensitive (a
+/// drive letter's case is folded by the platform while a path is parsed, not
+/// here), so a sibling directory that merely shares a name prefix stays outside.
+#[must_use]
+pub(crate) fn is_within(candidate: &Path, base: &Path) -> bool {
+    strip_verbatim_prefix(candidate).starts_with(strip_verbatim_prefix(base))
 }
 
 #[cfg(test)]
@@ -434,6 +450,12 @@ mod verbatim_prefix_tests {
         assert_eq!(
             strip_verbatim_prefix(Path::new(r"\\?\C:\a\b")),
             PathBuf::from(r"C:\a\b")
+        );
+        // A volume root keeps its separator: `C:\` is drive `C:`'s root, while
+        // shortening it to `C:` would make the path drive-RELATIVE.
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\")),
+            PathBuf::from(r"C:\")
         );
         // UNC form: `\\?\UNC\srv\share` is the verbatim spelling of `\\srv\share`.
         assert_eq!(

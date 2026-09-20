@@ -1370,3 +1370,9 @@ pub fn noisy_png(width: u32, height: u32) -> Vec<u8> {
         .unwrap();
     out
 }
+
+/// The canonical path as the resolvers hand it on: the platform's
+/// [`std::fs::canonicalize`] with the Windows verbatim prefix stripped.
+pub fn canonical_without_verbatim_prefix(path: &Path) -> PathBuf {
+    crate::util::strip_verbatim_prefix(&std::fs::canonicalize(path).expect("canonicalize"))
+}

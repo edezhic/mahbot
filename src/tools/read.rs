@@ -1813,11 +1813,11 @@ mod tests {
         assert_eq!(payload.width, 4, "unexpected payload width");
         assert_eq!(payload.height, 4, "unexpected payload height");
         assert_eq!(payload.format, "PNG", "unexpected payload format");
-        // `payload.path` is the canonicalized resolved path (resolve_read_target
-        // canonicalizes, which on macOS resolves the /tmp → /private/tmp symlink).
-        let expected_path = tokio::fs::canonicalize(ws_path.join("tiny.png"))
-            .await
-            .unwrap();
+        // `payload.path` is the resolved path: canonicalized (which on macOS
+        // resolves the /tmp → /private/tmp symlink) in the spelling the tool
+        // hands on.
+        let expected_path =
+            crate::util::test::canonical_without_verbatim_prefix(&ws_path.join("tiny.png"));
         assert_eq!(
             payload.path,
             expected_path.display().to_string(),

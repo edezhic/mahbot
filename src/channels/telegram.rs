@@ -853,7 +853,9 @@ fn resolve_file_target(target: &str, file_roots: &[PathBuf]) -> Result<PathBuf, 
         ));
     }
 
-    Ok(canonical)
+    // The plain spelling, not the platform's verbatim form: this value becomes
+    // the attachment's `target`, which reaches the delivery log.
+    Ok(crate::util::strip_verbatim_prefix(&canonical))
 }
 
 /// Parse `[KIND:path]` media markers from a message, returning cleaned text

@@ -641,7 +641,7 @@ mod tests {
             .expect("canonical workspace")
             .join("uploads");
         assert!(
-            Path::new(&image.path).starts_with(&uploads),
+            crate::util::is_within(Path::new(&image.path), &uploads),
             "a restricted read must place artifacts where it can open them: {}",
             image.path
         );

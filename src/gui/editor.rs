@@ -706,79 +706,110 @@ fn validate_item_name(name: &str) -> Option<&'static str> {
     None
 }
 
-// ── Helpers — prefix-based collection re-keying ───────────────────
+// ── Helpers — collection re-keying ────────────────────────────────
+//
+// One applier pair (`rekey_map`, `rekey_set`) drives both key families: the
+// `/`-joined relative keys of the file tree (`rebase_tree_key`) and the
+// absolute filesystem paths of the open tabs and their caches
+// (`rebase_abs_path`). Only how a key is rebased differs.
 
-/// Join a `rest` portion (already stripped of the old prefix) with
-/// `new_prefix` to form the new key.  `rest` is the portion of the
-/// original key after the removed prefix; callers obtain it via
-/// `strip_prefix` before calling this function.
-fn rekey_compute_new_key(rest: &str, new_prefix: &str) -> String {
-    if rest.is_empty() {
+/// The new key for a *relative* file-tree key that lies under `old_prefix`, or
+/// `None` when it does not. `old_prefix` carries the trailing separator (e.g.
+/// `"dir/sub/"`); a key that equals it exactly maps to `new_prefix`.
+fn rebase_tree_key(key: &str, old_prefix: &str, new_prefix: &str) -> Option<String> {
+    let rest = key.strip_prefix(old_prefix)?;
+    Some(if rest.is_empty() {
         new_prefix.to_string()
     } else {
         format!("{new_prefix}/{rest}")
+    })
+}
+
+/// Re-key every entry of `map` whose key `rebase` accepts, running `modify` on
+/// the value on the way across. The keys are collected first — the map cannot be
+/// mutated while it is being iterated.
+fn rekey_map<V>(
+    map: &mut HashMap<String, V>,
+    rebase: impl Fn(&str) -> Option<String>,
+    modify: impl Fn(&mut V),
+) {
+    for old_key in map.keys().cloned().collect::<Vec<_>>() {
+        let Some(new_key) = rebase(&old_key) else {
+            continue;
+        };
+        if let Some(mut value) = map.remove(&old_key) {
+            modify(&mut value);
+            map.insert(new_key, value);
+        }
     }
 }
 
-/// Collect all keys matching `old_prefix` and compute their new key with
-/// `new_prefix` substituted.  Returns a vec of `(old_key, new_key)` pairs.
-/// Used by [`rekey_map_prefix`] and [`rekey_set_prefix`] to avoid
-/// duplicating the filter-and-collect logic.
-fn rekey_keys(
-    old_prefix: &str,
-    new_prefix: &str,
-    keys: impl IntoIterator<Item = String>,
-) -> Vec<(String, String)> {
-    keys.into_iter()
-        .filter_map(|k| {
-            let rest = k.strip_prefix(old_prefix)?;
-            let new_key = rekey_compute_new_key(rest, new_prefix);
-            Some((k, new_key))
-        })
-        .collect()
+/// [`rekey_map`] for a `HashSet`.
+fn rekey_set(set: &mut HashSet<String>, rebase: impl Fn(&str) -> Option<String>) {
+    for old_key in set.iter().cloned().collect::<Vec<_>>() {
+        let Some(new_key) = rebase(&old_key) else {
+            continue;
+        };
+        set.remove(&old_key);
+        set.insert(new_key);
+    }
 }
 
-/// Re-key entries in a `HashMap<String, V>` whose keys start with
-/// `old_prefix` to use `new_prefix` instead.  Each value passes through
-/// `modify` before re-insertion (use `|_| {}` when no modification is
-/// needed).  The old prefix should include a trailing separator (e.g.
-/// `"old_dir/"`), and `rest` is the portion of the key after it; the
-/// new key is `"{new_prefix}/{rest}"` (or just `new_prefix` when
-/// `rest` is empty — i.e. when the key exactly equals `old_prefix`).
+/// Re-key the relative file-tree keys of `map` that live under `old_prefix` to
+/// live under `new_prefix` instead, running `modify` on each moved value (use
+/// `|_| {}` when no modification is needed).
 fn rekey_map_prefix<V>(
     map: &mut HashMap<String, V>,
     old_prefix: &str,
     new_prefix: &str,
     modify: impl Fn(&mut V),
 ) {
-    let key_pairs = rekey_keys(old_prefix, new_prefix, map.keys().cloned());
-    for (old_key, new_key) in key_pairs {
-        if let Some(mut v) = map.remove(&old_key) {
-            modify(&mut v);
-            map.insert(new_key, v);
-        }
-    }
+    rekey_map(map, |k| rebase_tree_key(k, old_prefix, new_prefix), modify);
 }
 
-/// Re-key entries in a `HashSet<String>` whose keys start with
-/// `old_prefix` to use `new_prefix` instead.  Same prefix conventions
-/// as [`rekey_map_prefix`].
+/// [`rekey_map_prefix`] for a `HashSet`.
 fn rekey_set_prefix(set: &mut HashSet<String>, old_prefix: &str, new_prefix: &str) {
-    let key_pairs = rekey_keys(old_prefix, new_prefix, set.iter().cloned());
-    for (old_key, new_key) in key_pairs {
-        set.remove(&old_key);
-        set.insert(new_key);
+    rekey_set(set, |k| rebase_tree_key(k, old_prefix, new_prefix));
+}
+
+/// Re-key a single [`FsEntry`]'s `full_path` for a directory rename, the way
+/// [`rebase_tree_key`] re-keys the collections the entry lives in.
+fn update_entry_path(entry: &mut FsEntry, old_prefix: &str, new_prefix: &str) {
+    if let Some(new_path) = rebase_tree_key(&entry.full_path, old_prefix, new_prefix) {
+        entry.full_path = new_path;
     }
 }
 
-/// Update the `full_path` of a single [`FsEntry`] by replacing `old_prefix`
-/// with `new_prefix` when the path starts with `old_prefix`.  Used during
-/// directory-rename migrations to keep `FsEntry` paths in sync with their
-/// new directory key.
-fn update_entry_path(entry: &mut FsEntry, old_prefix: &str, new_prefix: &str) {
-    if let Some(rest) = entry.full_path.strip_prefix(old_prefix) {
-        entry.full_path = rekey_compute_new_key(rest, new_prefix);
-    }
+/// Rebase an absolute workspace path from `old_dir` into `new_dir`,
+/// returning `None` when it does not live below `old_dir`. Compared and
+/// rebuilt through [`Path`], so the platform's separator (and a trailing
+/// separator on either side) cannot make the match miss.
+fn rebase_abs_path(path: &str, old_dir: &str, new_dir: &str) -> Option<String> {
+    let rest = Path::new(path).strip_prefix(old_dir).ok()?;
+    Some(if rest.as_os_str().is_empty() {
+        new_dir.to_string()
+    } else {
+        Path::new(new_dir).join(rest).to_string_lossy().into_owned()
+    })
+}
+
+/// Re-key the absolute filesystem paths of `map` that live under `old_dir` to
+/// live under `new_dir`; the values carry over unchanged, which is all any
+/// absolute-key call site needs.
+fn rekey_abs_map<V>(map: &mut HashMap<String, V>, old_dir: &str, new_dir: &str) {
+    rekey_map(map, |k| rebase_abs_path(k, old_dir, new_dir), |_| {});
+}
+
+/// [`rekey_abs_map`] for a `HashSet`.
+fn rekey_abs_set(set: &mut HashSet<String>, old_dir: &str, new_dir: &str) {
+    rekey_set(set, |k| rebase_abs_path(k, old_dir, new_dir));
+}
+
+/// Whether the absolute workspace path `path` is `dir` itself or lies within it:
+/// [`crate::util::is_within`], so the test is component-wise and the trailing
+/// separator a stored workspace root carries is tolerated rather than doubled.
+fn is_within_abs(path: &str, dir: &str) -> bool {
+    crate::util::is_within(Path::new(path), Path::new(dir))
 }
 
 // ── Helpers — async I/O ──────────────────────────────────────────
@@ -1593,18 +1624,16 @@ impl EditorState {
         self.all_workspace_files.retain(|p| !within_rel(p));
 
         // Absolute-path-keyed caches (workspace filesystem paths). For the
-        // root case the prefix is the workspace root itself, so every file
+        // root case the directory is the workspace root itself, so every file
         // under the workspace is pruned — consistent with "all descendants".
-        // (Path::join("") would append a trailing slash, so build the root
-        // prefix directly to avoid a doubled separator.)
-        let abs_prefix = if is_root {
-            self.selected_workspace_path
-                .as_ref()
-                .map(|ws| format!("{ws}/"))
+        // Membership is component-wise, so the workspace root's spelling
+        // (Windows separators, any trailing slash) need not be guessed at.
+        let abs_dir = if is_root {
+            self.selected_workspace_path.clone()
         } else {
-            self.abs_path(dir_path).map(|p| format!("{p}/"))
+            self.abs_path(dir_path)
         };
-        let within_abs = |p: &str| abs_prefix.as_deref().is_some_and(|pfx| p.starts_with(pfx));
+        let within_abs = |p: &str| abs_dir.as_deref().is_some_and(|dir| is_within_abs(p, dir));
         self.file_generations.retain(|p, _| !within_abs(p));
         self.file_mtimes.retain(|p, _| !within_abs(p));
         self.deleted_file_toasted.retain(|p| !within_abs(p));
@@ -3501,12 +3530,11 @@ impl EditorState {
         let Some(abs_path) = self.abs_path(&path) else {
             return Task::none();
         };
-        let abs_prefix = format!("{abs_path}/");
 
         // Count open tabs that are inside this directory.
         let mut dirty_count = 0;
         for tab in &self.tabs {
-            if tab.path.starts_with(&abs_prefix) {
+            if is_within_abs(&tab.path, &abs_path) {
                 if tab.is_dirty {
                     dirty_count += 1;
                 }
@@ -3770,14 +3798,11 @@ impl EditorState {
                     return Task::none();
                 };
 
-                // Build a prefix-based replacement for directory renames.
+                // Rebase absolute paths under the renamed directory.
                 if is_dir {
-                    let old_prefix = format!("{old_abs}/");
                     for tab in &mut self.tabs {
-                        if tab.path.starts_with(&old_prefix) {
-                            let rest = tab.path.strip_prefix(&old_prefix).unwrap();
-
-                            tab.path = format!("{new_abs}/{rest}");
+                        if let Some(new_tab_path) = rebase_abs_path(&tab.path, &old_abs, &new_abs) {
+                            tab.path = new_tab_path;
                             tab.file_name = Path::new(&tab.path)
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
@@ -3785,12 +3810,7 @@ impl EditorState {
                         }
                     }
                     // Re-key tab_contents for affected files.
-                    rekey_map_prefix(
-                        &mut self.tab_contents,
-                        &format!("{old_abs}/"),
-                        &new_abs,
-                        |_| {},
-                    );
+                    rekey_abs_map(&mut self.tab_contents, &old_abs, &new_abs);
 
                     // Update expanded_dirs to replace old_path with new_path.
                     if self.file_tree.expanded_dirs.remove(old_path) {
@@ -3853,15 +3873,9 @@ impl EditorState {
                 // path so auto-refresh doesn't spuriously stat the old path
                 // and in-flight FileLoaded results are properly validated.
                 if is_dir {
-                    let old_abs_prefix = format!("{old_abs}/");
-                    rekey_map_prefix(&mut self.file_mtimes, &old_abs_prefix, &new_abs, |_| {});
-                    rekey_set_prefix(&mut self.deleted_file_toasted, &old_abs_prefix, &new_abs);
-                    rekey_map_prefix(
-                        &mut self.file_generations,
-                        &old_abs_prefix,
-                        &new_abs,
-                        |_| {},
-                    );
+                    rekey_abs_map(&mut self.file_mtimes, &old_abs, &new_abs);
+                    rekey_abs_set(&mut self.deleted_file_toasted, &old_abs, &new_abs);
+                    rekey_abs_map(&mut self.file_generations, &old_abs, &new_abs);
                 } else {
                     // File rename — migrate single entry.
                     if let Some(mtime) = self.file_mtimes.remove(&old_abs) {
@@ -5491,14 +5505,12 @@ impl EditorState {
     /// [`EditorMessage::DirDeleted`]) so a failed delete — e.g. permission
     /// denied — leaves a still-existing directory fully intact in the tree.
     fn perform_dir_delete(&mut self, target: &DeleteConfirmTarget) -> Task<EditorMessage> {
-        let abs_prefix = format!("{}/", target.abs_path);
-
         // Collect open tabs inside this directory (close in reverse order).
         let mut affected_indices: Vec<usize> = self
             .tabs
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.path.starts_with(&abs_prefix))
+            .filter(|(_, t)| is_within_abs(&t.path, &target.abs_path))
             .map(|(i, _)| i)
             .collect();
         affected_indices.sort_unstable_by(|a, b| b.cmp(a));

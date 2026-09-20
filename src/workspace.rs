@@ -903,16 +903,23 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ensure a directory path string ends with a single `/`.
-fn ensure_trailing_slash(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    format!("{trimmed}/")
+/// Append the platform's separator to a registered root unless it already ends
+/// with one, so a registered root reads the way it always has. A drive or volume
+/// root already carries one, and that separator is what keeps it absolute rather
+/// than drive-relative (`C:\`, not `C:`).
+fn ensure_trailing_separator(mut path: String) -> String {
+    if !path.ends_with(std::path::MAIN_SEPARATOR) {
+        path.push(std::path::MAIN_SEPARATOR);
+    }
+    path
 }
 
 /// Canonicalize a user-provided path for workspace storage.
 ///
-/// Expands `~` to the user's home directory, then uses
-/// [`std::fs::canonicalize`] to resolve relative segments and symlinks.
+/// Expands `~` to the user's home directory, resolves the path with
+/// [`std::fs::canonicalize`] (relative segments and symlinks), drops the
+/// platform's verbatim prefix via [`crate::util::strip_verbatim_prefix`], and
+/// appends the trailing separator a registered root has always been shown with.
 /// Returns a clear error message on failure so callers can surface it
 /// to the user (e.g. "Path does not exist" or "Not a directory").
 fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
@@ -932,7 +939,11 @@ fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
         return Err(format!("Path is not a directory: {}", canonical.display()));
     }
 
-    Ok(canonical.to_string_lossy().to_string())
+    Ok(ensure_trailing_separator(
+        crate::util::strip_verbatim_prefix(&canonical)
+            .to_string_lossy()
+            .to_string(),
+    ))
 }
 
 fn workspace_from_row(row: &db::Row) -> anyhow::Result<Workspace> {
@@ -994,8 +1005,7 @@ impl WorkspaceStore {
         validate_name(name)?;
 
         // Canonicalize and validate the path so bad paths never enter the system.
-        let canonical = canonicalize_workspace_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let path = ensure_trailing_slash(&canonical);
+        let path = canonicalize_workspace_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
         let now = db::now();
         let pending = WorkspaceStatus::Pending.to_string();
         let ws = self
@@ -2297,11 +2307,11 @@ mod tests {
         );
     }
 
-    // ── Integration: add() returns paused: true ──────────────────
+    // ── Integration: add() persists and returns the workspace row ─
 
     #[tokio::test]
     #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
-    async fn add_returns_paused_true() {
+    async fn add_persists_and_returns_the_workspace_row() {
         let (store, _tmp) = test_store().await;
         let dir = TempDir::new().expect("temp dir for workspace path");
 
@@ -2334,6 +2344,29 @@ mod tests {
         assert!(
             !ws.maintenance_enabled,
             "add() must return a Workspace with maintenance_enabled = false"
+        );
+
+        // Judged through the OS, not against the constructor that produced it:
+        // the platform must resolve the stored root back to the registered
+        // directory, keep the separator a registered root is shown with, and
+        // never hand a consumer the verbatim form. Only the no-verbatim check
+        // needs a Windows host to fail: a verbatim root still resolves, separator
+        // and all, so the other two see nothing there.
+        assert_eq!(
+            std::fs::canonicalize(&ws.path).expect("the platform must resolve the stored root"),
+            std::fs::canonicalize(dir.path()).expect("canonicalize the registered dir"),
+            "the stored root must resolve to the registered directory"
+        );
+        assert!(
+            !ws.path.contains(r"\\?\"),
+            "no consumer may receive the platform's verbatim form: {:?}",
+            ws.path
+        );
+        assert!(
+            ws.path.ends_with(std::path::MAIN_SEPARATOR),
+            "a registered root keeps the trailing separator it has always been \
+             shown with: {:?}",
+            ws.path
         );
 
         // Also verify via get_by_name.

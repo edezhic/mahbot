@@ -173,10 +173,15 @@ pub async fn run_git_show(
 /// Deliberately does NOT use `git rev-parse --show-toplevel`: repo discovery
 /// itself runs the dubious-ownership check this exists to satisfy, so it would
 /// recurse into the same failure (circular). Canonicalizes the resolved path
-/// where possible so the value matches git's own realpath-normalized discovery.
+/// where possible so the value matches git's own realpath-normalized discovery,
+/// and drops the Windows verbatim prefix for the same reason — the value is
+/// handed to git ([`inject_safe_directory`]) and must be spelled the way git
+/// spells it, not the way `std::fs::canonicalize` does on Windows.
 pub(crate) fn resolve_git_top_level(repo_path: &Path) -> Option<PathBuf> {
     let dir = repo_path.ancestors().find(|dir| is_git_repo(dir))?;
-    Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
+    Some(crate::util::strip_verbatim_prefix(
+        &std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
+    ))
 }
 
 /// Inject the repo top-level into git's per-process config as `safe.directory`.
@@ -1127,8 +1132,12 @@ mod tests {
     #[test]
     fn resolve_git_top_level_repo_root() {
         let (_dir, repo_path) = init_temp_repo();
-        let expected = std::fs::canonicalize(&repo_path).expect("canonicalize repo");
-        assert_eq!(resolve_git_top_level(&repo_path), Some(expected));
+        assert_eq!(
+            resolve_git_top_level(&repo_path),
+            Some(crate::util::test::canonical_without_verbatim_prefix(
+                &repo_path
+            ))
+        );
     }
 
     #[test]
@@ -1136,8 +1145,12 @@ mod tests {
         let (_dir, repo_path) = init_temp_repo();
         let subdir = repo_path.join("src");
         std::fs::create_dir(&subdir).expect("create subdir");
-        let expected = std::fs::canonicalize(&repo_path).expect("canonicalize repo");
-        assert_eq!(resolve_git_top_level(&subdir), Some(expected));
+        assert_eq!(
+            resolve_git_top_level(&subdir),
+            Some(crate::util::test::canonical_without_verbatim_prefix(
+                &repo_path
+            ))
+        );
     }
 
     #[test]
@@ -1156,8 +1169,12 @@ mod tests {
         // A `.git` *file* (linked worktree / submodule marker) is sufficient —
         // the walk uses `exists()`, not `is_dir()`.
         std::fs::write(dir.path().join(".git"), b"gitdir: /elsewhere").expect("write .git file");
-        let expected = std::fs::canonicalize(dir.path()).expect("canonicalize dir");
-        assert_eq!(resolve_git_top_level(dir.path()), Some(expected));
+        assert_eq!(
+            resolve_git_top_level(dir.path()),
+            Some(crate::util::test::canonical_without_verbatim_prefix(
+                dir.path()
+            ))
+        );
     }
 
     // ── Safe.directory injection (dubious-ownership fix) ──────────
