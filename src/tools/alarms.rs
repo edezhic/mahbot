@@ -159,6 +159,13 @@ impl Tool for ListAlarmsTool {
         false // read-only listing
     }
 
+    fn preserve_full_output(&self) -> bool {
+        // The Assistant asks to see its alarms, so the whole listing must reach
+        // it: sandwich-truncating would drop every alarm between the head and
+        // the tail, invisibly to both the Assistant and the user.
+        true
+    }
+
     async fn execute(&self, _ws: &Workspace, _args: serde_json::Value) -> Result<String> {
         let session_id = identity()?.agent_id;
         let alarms = list_alarms(&session_id).await?;

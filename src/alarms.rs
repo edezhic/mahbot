@@ -171,7 +171,7 @@ fn stored_trigger(row: &db::Row) -> Result<Option<StoredTrigger>, ::turso::Error
 }
 
 /// Maximum number of active alarms allowed per session.
-const MAX_ACTIVE_ALARMS: i64 = 10;
+const MAX_ACTIVE_ALARMS: i64 = 50;
 
 /// Upper bound on an alarm's whole stored trigger — the tool's name together
 /// with its arguments — in characters. Keeps an over-eagerly-large trigger from
@@ -269,7 +269,7 @@ pub(crate) async fn add_alarm(
     let count: i64 = rows.first().map(|r| r.get(0)).transpose()?.unwrap_or(0);
     anyhow::ensure!(
         count < MAX_ACTIVE_ALARMS,
-        "Alarm limit reached (maximum 10 active alarms)"
+        "Alarm limit reached (maximum {MAX_ACTIVE_ALARMS} active alarms)"
     );
 
     let id = crate::generate_id();
@@ -869,7 +869,7 @@ mod tests {
     async fn add_alarm_enforces_active_cap() {
         crate::util::test::init_test_stores().await;
         let session = "cap-session";
-        for i in 0..10 {
+        for i in 0..MAX_ACTIVE_ALARMS {
             let fire = format!("2099-01-01T00:00:{i:02}Z");
             add_alarm(
                 session,
@@ -885,14 +885,18 @@ mod tests {
         let err = add_alarm(
             session,
             "alice",
-            "eleventh",
+            "one too many",
             Some("2099-01-01T00:01:00Z"),
             None,
             None,
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("limit reached"), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains(&format!("maximum {MAX_ACTIVE_ALARMS}")),
+            "got: {err}"
+        );
     }
 
     /// A trigger's args, as the map `json!` builds for them.

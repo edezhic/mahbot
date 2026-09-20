@@ -9,4 +9,4 @@ Optional `trigger` — schedule a check instead of only delivering the reminder:
 
 A triggered alarm wakes you only when the check reported something: any output wakes you, and a check that printed nothing at all stays silent. Any outcome that is not a clean run wakes you with the reason and removes the alarm — a non-zero exit, a timeout, a failure to start, a tool that is no longer available to you or no longer usable, arguments the tool no longer accepts, or a missing runtime — so a broken check never keeps firing.
 
-A maximum of 10 active alarms may exist for you; adding beyond that fails.
+A maximum of 50 active alarms may exist for you; adding beyond that fails.
