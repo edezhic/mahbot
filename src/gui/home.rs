@@ -1910,14 +1910,14 @@ mod tests {
     fn make_home_state(workspace: &str) -> HomeState {
         let mut state = HomeState::new();
         // Hermetic draft store bound to a throwaway temp dir so tests never
-        // touch the real `~/.mahbot/chat-draft.json`.
+        // touch the real draft file.
         state.drafts = hermetic_draft_store();
         state.selected_workspace = Some(workspace.to_string());
         state
     }
 
     /// A draft store backed by a unique throwaway file under one shared test
-    /// temp dir, so tests never touch the real `~/.mahbot/chat-draft.json`.
+    /// temp dir, so tests never touch the real draft file.
     fn hermetic_draft_store() -> Arc<crate::channels::chat_draft::DraftStore> {
         static DIR: std::sync::LazyLock<tempfile::TempDir> =
             std::sync::LazyLock::new(|| tempfile::tempdir().unwrap());

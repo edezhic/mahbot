@@ -745,8 +745,7 @@ impl Dashboard {
         iced::Theme::Dark
     }
 
-    /// Persist the current window position and size to
-    /// `~/.mahbot/window-state.json`.
+    /// Persist the current window position and size.
     fn persist_window_state(&self) {
         save_window_state(self.last_position, self.last_size);
     }
@@ -3170,21 +3169,22 @@ impl Default for WindowState {
     }
 }
 
-/// Read persisted window state from `~/.mahbot/window-state.json`.
-/// Returns defaults if the file is missing or unreadable.
+/// The window geometry file in the storage root.
+const WINDOW_STATE_FILE: &str = "window-state.json";
+
+/// Read persisted window state, falling back to defaults when it is missing or unreadable.
 #[must_use]
 pub fn read_window_state() -> WindowState {
-    let dir = std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".mahbot"))
-        .ok();
-    let path = dir.map(|d| d.join("window-state.json"));
-    path.as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+    let Ok(dir) = crate::config::default_config_dir() else {
+        return WindowState::default();
+    };
+    std::fs::read_to_string(dir.join(WINDOW_STATE_FILE))
+        .ok()
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default()
 }
 
-/// Save current window geometry to `~/.mahbot/window-state.json`.
+/// Save current window geometry.
 #[expect(clippy::cast_possible_truncation)]
 fn save_window_state(pos: iced::Point, size: iced::Size) {
     let state = serde_json::json!({
@@ -3193,14 +3193,9 @@ fn save_window_state(pos: iced::Point, size: iced::Size) {
         "x": pos.x as i32,
         "y": pos.y as i32,
     });
-    if let Ok(dir) = std::env::var("HOME") {
-        let path = std::path::PathBuf::from(dir)
-            .join(".mahbot")
-            .join("window-state.json");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&path, state.to_string());
+    if let Ok(dir) = crate::config::default_config_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(WINDOW_STATE_FILE), state.to_string());
     }
 }
 

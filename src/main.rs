@@ -557,8 +557,11 @@ fn init_message_pipeline(
 }
 
 async fn shutdown_after_dashboard() {
-    // Names the last stop request the platform recorded; when nothing was recorded,
-    // the line keeps the wording it always had.
+    // The stop trace: names the last stop request the platform recorded, and keeps "the
+    // window closed" wording when nothing was recorded. It is a log line, and log delivery is
+    // already gone by this point — the batching writer lives on the iced runtime this runs
+    // after — so it is dropped outright: a stop's reason is in the logs store at all only
+    // where an earlier line named it and that line's batch beat the runtime's teardown.
     info!(
         "{} — shutting down",
         mahbot::shutdown::exit_trigger().unwrap_or("Dashboard window closed")
@@ -572,8 +575,9 @@ async fn shutdown_after_dashboard() {
 
     let release = mahbot::tools::chrome_release::flush_and_close_all_chrome_sessions();
     match mahbot::shutdown::urgent_release_budget() {
-        // Only an urgent stop (a Windows console close) bounds the stage before the
-        // checkpoint; a cut is best-effort and the exit path carries on to it.
+        // Only a stop the platform gave a kill deadline to (a Windows console close or
+        // session end) bounds the stage before the checkpoint; a cut is best-effort and
+        // the exit path carries on to it.
         Some(budget) => {
             if tokio::time::timeout(budget, release).await.is_err() {
                 warn!("urgent shutdown: browser session release cut at its {budget:?} budget");
@@ -679,9 +683,12 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    // Subscribe to Windows console stop requests before boot — the handler needs no
-    // runtime, it queues for the protocol loop. No-op on macOS/Linux.
+    // Subscribe to Windows stop requests before boot: the console control handler (Ctrl+C,
+    // Ctrl+Break, console close) and the session-end listener (log-off, shutdown, restart).
+    // The handler queues for the protocol loop and the listener forces the stop directly —
+    // neither needs a runtime. No-op on macOS/Linux.
     mahbot::shutdown::install_console_stop_handler();
+    mahbot::shutdown::install_session_end_listener();
 
     // Consolidate ALL daemon temp files under one private root
     // (`/tmp/mahbot`, mode 0700; `<user temp>\mahbot` on Windows) and pin the

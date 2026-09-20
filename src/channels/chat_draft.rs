@@ -18,7 +18,7 @@ use crate::util::{UnwrapPoison, unix_millis};
 /// Hard bound on the number of (`user`, `workspace`) draft entries persisted —
 /// the map is pruned to the most recently saved on every write.
 const MAX_PERSISTED_ENTRIES: usize = 64;
-/// File name inside `~/.mahbot/` holding the draft map.
+/// File name inside the storage root holding the draft map.
 const DRAFT_FILE_NAME: &str = "chat-draft.json";
 
 /// A single persisted composer draft for one (`user`, workspace) context.
@@ -48,21 +48,20 @@ type DraftFile = BTreeMap<String, BTreeMap<String, DraftEntry>>;
 
 /// The shared composer-draft store.
 ///
-/// `path: None` marks the store disabled (HOME unresolvable) — all ops no-op.
+/// `path: None` marks the store disabled (no resolvable storage root) — all ops no-op.
 pub(crate) struct DraftStore {
     path: Option<PathBuf>,
     entries: Mutex<DraftFile>,
 }
 
 impl DraftStore {
-    /// Resolve the on-disk draft path from `$HOME` (None when unset/empty).
+    /// Resolve the on-disk draft path from the storage root (`None` when it cannot be
+    /// resolved), the same root every other daemon file lives in.
     #[must_use]
     fn file_path() -> Option<PathBuf> {
-        let home = std::env::var("HOME").ok()?;
-        if home.is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".mahbot").join(DRAFT_FILE_NAME))
+        crate::config::default_config_dir()
+            .ok()
+            .map(|dir| dir.join(DRAFT_FILE_NAME))
     }
 
     /// Load the draft file (missing/corrupt → empty map, fail-open).

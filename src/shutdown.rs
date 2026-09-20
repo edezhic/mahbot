@@ -149,7 +149,9 @@ pub(crate) async fn drain_wait() {
 ///
 /// Unix has two, on an async signal stream. Windows has three, from the console
 /// control handler below, and they are not the same request: only Ctrl+C is the
-/// platform's "wind down" gesture.
+/// platform's "wind down" gesture. A session end (log-off, shutdown, restart) is a stop
+/// request too, but not one of these and not a drain: it comes from the window listener
+/// ([`install_session_end_listener`]).
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StopRequest {
@@ -200,21 +202,28 @@ fn stop_action(request: StopRequest, draining: bool) -> StopAction {
     }
 }
 
-/// The instant the platform's close grace expires: the close event's delivery plus
-/// the grace it grants, from the first close that reported one.
-static CLOSE_DEADLINE: OnceLock<Instant> = OnceLock::new();
+/// The instant the platform's stop deadline expires: when a stop that carries a grace
+/// arrived (a Windows console close or session end) plus the grace it grants. `None`
+/// until such a stop arrives.
+static STOP_DEADLINE: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// Record the platform's close grace for the exit path's budget (first close wins)
-/// and return the deadline this event grants, which its handler thread holds until —
-/// returning earlier would kill the process sooner than the platform would.
+/// The grace assumed for a stop whose own value cannot be read: the documented default of
+/// `SPI_GETHUNGAPPTIMEOUT`, the user-settable parameter behind a console close. A session
+/// end has no readable equivalent, so it takes the same conservative bound.
 #[cfg(windows)]
-fn record_close_grace(grace: Duration) -> Instant {
-    let deadline = Instant::now() + grace;
-    let _ = CLOSE_DEADLINE.set(deadline);
-    deadline
+const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// Record the deadline a stop has to finish before, for the exit path's budget. The
+/// earliest one wins: that is the kill the process must beat.
+#[cfg(windows)]
+fn record_stop_deadline(deadline: Instant) {
+    let mut recorded = STOP_DEADLINE.lock().unwrap_poison();
+    if recorded.is_none_or(|current| deadline < current) {
+        *recorded = Some(deadline);
+    }
 }
 
-/// The exit path's budget from the platform's close deadline and the moment a stage
+/// The exit path's budget from the platform's stop deadline and the moment a stage
 /// starts: half the grace still left, so the checkpoint keeps the rest. A deadline that
 /// has passed leaves nothing.
 #[must_use]
@@ -223,35 +232,90 @@ fn stage_budget(deadline: Instant, now: Instant) -> Duration {
 }
 
 /// The bound on the exit path's stage before the store checkpoint, for a stop that
-/// runs under the platform's own kill deadline (a Windows console close) — `None`
-/// for every other stop, whose stage stays unbounded (macOS/Linux, a dashboard
-/// window close, a first Ctrl+C).
+/// runs under the platform's own kill deadline (a Windows console close or session
+/// end) — `None` for every other stop, whose stage stays unbounded (macOS/Linux, a
+/// dashboard window close, a first Ctrl+C).
 ///
-/// Sampled once, when that stage starts, from the deadline fixed by the first close
-/// (see [`stage_budget`]): the later in the exit path the stage starts, the less of that
-/// deadline is still left for it. The checkpoint that follows is never bounded — it is
-/// the durable step the exit path exists for — so the rest of the grace is left for it.
-/// What the bound cuts loses nothing durable: the browser releases a cut flush did not
+/// Sampled once, when that stage starts, from the deadline the platform's stops recorded
+/// (`record_stop_deadline` keeps the earliest — the kill the process must beat);
+/// [`stage_budget`] then takes half of what is still left of it, so the later in the exit
+/// path the stage starts, the less it gets. The checkpoint that follows is never bounded —
+/// it is the durable step the exit path exists for — so the rest of the grace is left for
+/// it. What the bound cuts loses nothing durable: the browser releases a cut flush did not
 /// settle are durable records retried at boot, and its closing sweep is best-effort by
 /// design.
 #[must_use]
 pub fn urgent_release_budget() -> Option<Duration> {
-    CLOSE_DEADLINE
-        .get()
-        .map(|deadline| stage_budget(*deadline, Instant::now()))
+    STOP_DEADLINE
+        .lock()
+        .unwrap_poison()
+        .map(|deadline| stage_budget(deadline, Instant::now()))
 }
 
-/// The last stop request the platform delivered, for the exit path's log lines — `None`
-/// when nothing was recorded, since nothing else writes one, and the line then keeps the
-/// wording it always had. A `Mutex`, not a `OnceLock`: each request overwrites the record
-/// as the console protocol loop acts on it, so the last write names the last request that
-/// loop acted on.
+/// The last stop request the platform delivered — recorded by the Windows stop deliveries
+/// (the console protocol loop and the session-end listener, the only ones that name a
+/// request), `None` when nothing was recorded, since nothing else writes one, and the line
+/// then keeps the wording it always had. A `Mutex`, not a `OnceLock`: each request overwrites
+/// the record as it is acted on, so the last write names the last request.
 static EXIT_TRIGGER: Mutex<Option<&'static str>> = Mutex::new(None);
+
+/// Record the stop request the exit path is running for, so the exit path names it in its line.
+#[cfg(windows)]
+fn record_exit_trigger(label: &'static str) {
+    *EXIT_TRIGGER.lock().unwrap_poison() = Some(label);
+}
 
 /// The last recorded stop request, if the platform recorded one.
 #[must_use]
 pub fn exit_trigger() -> Option<&'static str> {
     *EXIT_TRIGGER.lock().unwrap_poison()
+}
+
+// ── Windows session end (log-off, shutdown, restart) ──────────────────────
+
+/// The name of the session end a `WM_ENDSESSION` notification reports — `None` for a
+/// notification this daemon must not act on.
+///
+/// The platform announces a session end twice: first the preliminary question
+/// (`WM_QUERYENDSESSION`), which is answered affirmatively and never acted on, then the
+/// final notification. `ending` is that notification's `wParam`: it is false when a
+/// shutdown that had started is cancelled, so only a true one may stop the daemon.
+/// `closes_app_only` is its `lParam`'s `ENDSESSION_CLOSEAPP` bit — the platform asking this
+/// application alone to close so that an update can proceed, which ends no session and
+/// whose stop would leave the daemon down on a session that continues — and `log_off` is
+/// its `ENDSESSION_LOGOFF` bit; without it the end is a machine shutdown or restart, which
+/// the flags do not tell apart. The critical end sets neither bit and is a session end like
+/// any other.
+#[cfg(any(windows, test))]
+#[must_use]
+fn session_end_label(ending: bool, closes_app_only: bool, log_off: bool) -> Option<&'static str> {
+    if !ending || closes_app_only {
+        return None;
+    }
+    Some(if log_off {
+        "Windows log-off"
+    } else {
+        "Windows shutdown/restart"
+    })
+}
+
+/// Act on a session end: name it for the exit path, bound the stages before the exit-time
+/// checkpoint, and force the stop.
+///
+/// Forced, not drained: the seconds the platform allows cannot hold the graceful drain, so
+/// waiting would leave the stop unfinished when the platform ends the process. Nothing is
+/// waited for either, and nothing is asked of the platform (no shutdown-blocking reason is
+/// declared, which is the one way to ask for more time): this runs on the listener's own
+/// thread and returns at once, so the shutdown is never slowed down and no "this program is
+/// preventing shutdown" surface can appear. The stop sequence itself (the dashboard's draft
+/// and geometry flush, the browser release, the journal checkpoint) then runs where it always
+/// does, inside the time the platform already grants.
+#[cfg(windows)]
+fn stop_for_session_end(label: &'static str) {
+    record_exit_trigger(label);
+    record_stop_deadline(Instant::now() + DEFAULT_STOP_GRACE);
+    info!("{label} — forcing the stop: the platform's seconds cannot hold a drain");
+    force_cancel();
 }
 
 // ── Signal handling ───────────────────────────────────────────────────────
@@ -270,7 +334,9 @@ pub fn exit_trigger() -> Option<&'static str> {
 /// the handler queues it here and, for a closing console, holds that thread; the
 /// `console` module documents the platform rules and what start-up does before this
 /// loop exists). Ctrl+C is the drain request, a second Ctrl+C force-cancels, and
-/// Ctrl+Break and a console close are force-cancel class outright.
+/// Ctrl+Break and a console close are force-cancel class outright. The session end
+/// (log-off, shutdown, restart) is not a console event and does not come through here at
+/// all — it is force-cancel class on its own terms, in [`install_session_end_listener`].
 ///
 /// The "second request" is read off the global drain flag rather than a per-source
 /// count, so a first Ctrl+C that follows a drain begun elsewhere — the dashboard
@@ -317,7 +383,7 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
         loop {
             let request = console::next_request().await?;
             let label = request.label();
-            *EXIT_TRIGGER.lock().unwrap_poison() = Some(label);
+            record_exit_trigger(label);
             match stop_action(request, is_draining()) {
                 StopAction::Drain => {
                     info!("Received {label} — draining (a second request force-cancels)");
@@ -341,6 +407,18 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
 pub fn install_console_stop_handler() {
     #[cfg(windows)]
     console::install();
+}
+
+/// Install the Windows session-end listener (log-off, shutdown, restart) — a no-op on
+/// macOS/Linux.
+///
+/// Called from `main` before boot, next to [`install_console_stop_handler`]: the platform
+/// may end the session at any time, and the listener needs no runtime (it forces the stop
+/// synchronously, see the `session_end` module). A failure to bring it up is reported, never
+/// fatal: the daemon then keeps exactly the stop requests it had.
+pub fn install_session_end_listener() {
+    #[cfg(windows)]
+    session_end::install();
 }
 
 /// The Windows console control handler — the platform's stop-request source.
@@ -373,14 +451,17 @@ pub fn install_console_stop_handler() {
 ///   that is never observed is not a defect. Every event the handler does receive is
 ///   queued on its own.
 ///
+/// # Session end is not a console event
+///
+/// `CTRL_LOGOFF_EVENT` and `CTRL_SHUTDOWN_EVENT` are not delivered to a console
+/// application that loads the GUI libraries (user32 and gdi32, as this one does for its
+/// dashboard): once user32 is loaded, the platform treats the process as one that owns a
+/// window and tells it about a log-off, shutdown or restart through window messages
+/// instead. This handler therefore declines both events, and the daemon hears a session
+/// end through its own hidden window — the `session_end` module below.
+///
 /// # Accepted dead ends (documented, deliberately not fixed)
 ///
-/// - Log-off and machine shutdown: `CTRL_LOGOFF_EVENT` and `CTRL_SHUTDOWN_EVENT` are
-///   not delivered to a console application that loads the GUI libraries (user32 and
-///   gdi32, as this one does for its dashboard) — Windows treats it as a Windows
-///   application — and are otherwise received only by services. So the handler
-///   declines them and the default termination stands; the daemon is deliberately not
-///   registered as a service either.
 /// - External termination (the task manager's "end process", `TerminateProcess`): no
 ///   process can intercept it. Its "end task" is a different command, raises the
 ///   close event, and does become graceful here.
@@ -412,12 +493,13 @@ pub fn install_console_stop_handler() {
 ///
 /// Those the dead ends above name, plus a stop request that arrives with the handler
 /// unregistered (Ctrl+C alone still reaches tokio's handler then) and a close during a
-/// start-up that never reached the loop. The detached instance after a self-update
-/// receives no console events at all, so it keeps today's triggers: the dashboard
-/// window close and the self-update path.
+/// start-up that never reached the loop. A session end is not among them: it reaches the
+/// process through its own window whether or not this handler is registered — the detached
+/// instance a self-update leaves behind has no console for console events, but it owns a
+/// window just the same.
 #[cfg(windows)]
 mod console {
-    use super::{StopRequest, record_close_grace};
+    use super::{DEFAULT_STOP_GRACE, StopRequest, record_stop_deadline};
     use crate::util::UnwrapPoison;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -431,9 +513,6 @@ mod console {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         SPI_GETHUNGAPPTIMEOUT, SystemParametersInfoW,
     };
-
-    /// The documented default of `SPI_GETHUNGAPPTIMEOUT`, used when it cannot be read.
-    const DEFAULT_CLOSE_GRACE: Duration = Duration::from_secs(5);
 
     /// Requests queued by handler threads, drained in order by the protocol loop.
     static REQUESTS: Mutex<VecDeque<StopRequest>> = Mutex::new(VecDeque::new());
@@ -475,19 +554,19 @@ mod console {
     /// and, for a close, holds this thread (see the module docs).
     extern "system" fn handler(event: u32) -> i32 {
         let Some(request) = request_for(event) else {
-            // CTRL_LOGOFF_EVENT / CTRL_SHUTDOWN_EVENT and anything else: not ours,
-            // so the default handler's termination stands — the dead end documented
-            // on this module.
+            // CTRL_LOGOFF_EVENT / CTRL_SHUTDOWN_EVENT: not ours (see the section above — a
+            // session end arrives as a window message, which the `session_end` module takes),
+            // so the default handler's termination stands.
             return FALSE;
         };
-        // A close event starts the platform's countdown now, so its grace is read
-        // here rather than by the async side, and this thread holds until then.
+        // A close event starts the platform's countdown now, so its grace is read here
+        // rather than by the async side, and this thread holds until then.
         let close = request == StopRequest::ConsoleClose;
-        let deadline = close.then(|| record_close_grace(close_grace()));
+        let deadline = close.then(close_deadline);
         // A close brings a deadline the platform charges for either way, so it is
         // queued even before the loop exists; a request that carries none is left to
         // the platform (see the dead ends on this module).
-        if !LOOP_RUNNING.load(Ordering::SeqCst) && !close {
+        if !close && !LOOP_RUNNING.load(Ordering::SeqCst) {
             return FALSE;
         }
         // `unwrap_poison` rather than a panic: a panic on a control-handler thread
@@ -534,6 +613,15 @@ mod console {
         }
     }
 
+    /// The instant this process's closing console stops granting time: the grace read now
+    /// (see the module docs), recorded for the exit path's budget and held by this handler
+    /// thread until it.
+    fn close_deadline() -> Instant {
+        let deadline = Instant::now() + close_grace();
+        record_stop_deadline(deadline);
+        deadline
+    }
+
     /// The grace this process's closing console grants (see the module docs). A stored
     /// `0` is taken at face value — no grace at all, i.e. today's hard kill — so the
     /// exit path cannot run past a deadline that has already passed.
@@ -544,10 +632,214 @@ mod console {
         let read =
             unsafe { SystemParametersInfoW(SPI_GETHUNGAPPTIMEOUT, 0, (&raw mut millis).cast(), 0) };
         if read == 0 {
-            DEFAULT_CLOSE_GRACE
+            DEFAULT_STOP_GRACE
         } else {
             Duration::from_millis(u64::from(millis))
         }
+    }
+}
+
+// ── Windows session-end listener ──────────────────────────────────────────
+
+/// The session-end listener — the platform's stop request for a log-off, shutdown or
+/// restart, delivered to a window of this daemon's own.
+///
+/// # Why a window of its own
+///
+/// Windows announces a session end through a process's top-level windows, with
+/// `WM_QUERYENDSESSION` and then `WM_ENDSESSION` (see the section on the console module
+/// above for why the console events do not carry this news here). Nothing in the windowing
+/// stack this daemon draws with handles either message and neither offers a hook to borrow
+/// the dashboard window's procedure — winit, which iced draws with, sends both to the
+/// default procedure, which answers the question with "yes" and ignores the end, leaving
+/// the process to be terminated silently. So the daemon creates its own window: hidden, on
+/// its own thread, but a real top-level window — which is what the platform's broadcast
+/// reaches. A message-only window (`HWND_MESSAGE`) is not a candidate: the broadcast never
+/// reaches one.
+///
+/// # What it does
+///
+/// - Answers the preliminary question with "go ahead" (a true `BOOL`) and does nothing else
+///   with it — [`session_end_label`] says why acting there would be wrong.
+/// - On the final notification for a session that really is ending, forces the stop and
+///   returns — [`stop_for_session_end`], which owns the platform rules this must respect.
+/// - Hands every other message to `DefWindowProcW`: a window procedure that swallowed
+///   messages would fail window creation (the window has to answer messages of its own to
+///   be created at all) and would refuse the shutdown by answering the question with "no".
+///
+/// # The time available
+///
+/// The platform allows seconds — fewer during a critical shutdown — before it ends a process
+/// that has not finished, so the stop steps can still be cut off mid-way, the exit-time
+/// checkpoint that runs last most of all. What the bound cuts loses nothing durable (see
+/// [`urgent_release_budget`]) and in-flight agent work is cut exactly as it is on the other
+/// platforms; a process ended by the platform at its deadline is the same class as today's
+/// silent hard death.
+///
+/// # Accepted, deliberately not fixed
+///
+/// - A session end before the dashboard is ready: the dashboard subscribes to shutdown only
+///   once boot has succeeded and nothing else produces its exit request, so the forced stop is
+///   not consumed and the platform ends the process as today. A boot that finishes inside the
+///   platform's grace does exit properly (the token stays fired for the subscription that then
+///   appears); one that fails never does.
+/// - A session end while a self-update is finalizing: the update's exit path wins, spawn
+///   included. The replacement it starts into a session that is ending is cut off with the
+///   session like any other in-flight work, and the next start recovers. Deliberately no guard
+///   against that spawn.
+/// - Bringing the listener up can fail (the window class cannot be registered, the window
+///   cannot be created, the thread cannot be spawned). It is reported through the boot
+///   diagnostics and the daemon starts and runs with the stop requests it always had; it
+///   must never be fatal.
+/// - Fast user switching: it ends no session and sends no notification, so nothing here
+///   runs for it and the daemon is meant to keep running.
+/// - The stop trace: best-effort, not a durable record — the listener's line can still be
+///   flushed before the iced runtime is torn down, the exit path's own line is dropped
+///   outright (the exit path's note in `main.rs` says why).
+#[cfg(windows)]
+mod session_end {
+    use super::{session_end_label, stop_for_session_end};
+    use std::io::Error;
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, ENDSESSION_CLOSEAPP, ENDSESSION_LOGOFF,
+        GetMessageW, MSG, RegisterClassExW, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSEXW,
+    };
+    use windows_sys::w;
+
+    /// The window class this listener registers. Nothing looks it up by name: a class needs one.
+    const WINDOW_CLASS: windows_sys::core::PCWSTR = w!("MahBotSessionEnd");
+
+    /// Bring the listener up on a thread of its own, which is never joined: a window's
+    /// messages are dispatched to the thread that created it, and none of this may run on
+    /// the dashboard's thread. A failure is reported, never fatal (see the module docs).
+    pub(super) fn install() {
+        if let Err(e) = std::thread::Builder::new()
+            .name("session-end-listener".to_string())
+            .spawn(listen)
+        {
+            report("thread not spawned", &e);
+        }
+    }
+
+    /// The listener thread: create the window, then pump its messages for the life of the
+    /// process.
+    fn listen() {
+        // SAFETY: a null module name asks for this process's own module, which every
+        // process has; the window class below needs an instance to own its procedure.
+        let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        // SAFETY: zeroed is the documented "no icon, no cursor, no background, no menu"
+        // for the fields set here, and the class is fully described for its `cbSize` by
+        // the assignments.
+        let mut class: WNDCLASSEXW = unsafe { zeroed() };
+        // `cbSize` must report this structure's size: that is how the platform tells which
+        // of the two structures it is being handed. `allow`, not `expect` — the cast cannot
+        // truncate on a 32-bit target, and an unfired expectation is itself a warning.
+        #[allow(clippy::cast_possible_truncation)]
+        let class_size = size_of::<WNDCLASSEXW>() as u32;
+        class.cbSize = class_size;
+        class.lpfnWndProc = Some(window_proc);
+        class.hInstance = instance;
+        class.lpszClassName = WINDOW_CLASS;
+        // SAFETY: the class lives for the duration of the call and describes itself
+        // completely, which is all the registration reads it for; the procedure it names
+        // lives for the life of the process.
+        if unsafe { RegisterClassExW(&raw const class) } == 0 {
+            report("window class not registered", &Error::last_os_error());
+            return;
+        }
+        // SAFETY: the class is registered to this module, the style is "nothing", the caption
+        // is null (never shown), and the parent is null — which is what makes this a hidden
+        // *top-level* window, the kind the session-end broadcast reaches (a message-only parent
+        // would exclude it). The window is never shown, moved or resized, and it is never
+        // destroyed: it lasts as long as the process.
+        let window = unsafe {
+            CreateWindowExW(
+                0,
+                WINDOW_CLASS,
+                std::ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                instance,
+                std::ptr::null(),
+            )
+        };
+        if window == 0 {
+            report("window not created", &Error::last_os_error());
+            return;
+        }
+        // SAFETY: zeroed is a valid initial `MSG`; every field is written by the call
+        // below.
+        let mut message: MSG = unsafe { zeroed() };
+        loop {
+            // SAFETY: the buffer is `MSG`-sized and lives on this thread's stack; the
+            // filter arguments ask for every message of this thread. The retrieval is also
+            // what dispatches messages *sent* to the window from another thread — which is
+            // how the platform delivers the two this listener exists for.
+            let retrieved = unsafe { GetMessageW(&raw mut message, 0, 0, 0) };
+            if retrieved == 0 {
+                // `WM_QUIT` — nothing posts one to this thread.
+                break;
+            }
+            if retrieved < 0 {
+                report("message loop failed", &Error::last_os_error());
+                break;
+            }
+            // SAFETY: `message` was filled by the call above; the two notifications arrive
+            // sent, not queued, so this serves whatever else the window is posted.
+            unsafe { DispatchMessageW(&raw const message) };
+        }
+    }
+
+    /// The listener window's procedure: the two session-end notifications, and the default
+    /// handling for everything else (see the module docs for why that is not optional).
+    extern "system" fn window_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            // The preliminary question, always answered "go ahead" (a true `BOOL`): this
+            // daemon never holds up the platform. Never acted on — see the module docs.
+            WM_QUERYENDSESSION => LRESULT::from(true),
+            WM_ENDSESSION => {
+                // The flags are a 32-bit field in the parameter's low half, which the
+                // platform may have sign-extended into the parameter's own width. `allow`,
+                // not `expect`: the sign-loss lint fires on every target but the truncation
+                // one only where the parameter is wider than the field, and an unfired
+                // expectation is itself a warning.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let flags = lparam as u32;
+                let ending = wparam != 0;
+                let closes_app_only = flags & ENDSESSION_CLOSEAPP != 0;
+                let log_off = flags & ENDSESSION_LOGOFF != 0;
+                if let Some(label) = session_end_label(ending, closes_app_only, log_off) {
+                    stop_for_session_end(label);
+                }
+                0
+            }
+            // SAFETY: the procedure delegates with its own arguments untouched, on the
+            // thread the platform called it on.
+            _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        }
+    }
+
+    /// Report a failure to bring the listener up. Through the boot diagnostic rather than
+    /// `warn!`, because this may run before boot opens the stores: it reaches stderr now
+    /// and the logs store once tracing exists.
+    fn report(what: &str, detail: &Error) {
+        crate::boot::boot_diagnostic(format!(
+            "session-end listener: {what}: {detail} — a Windows log-off, shutdown or restart \
+             will end the daemon without its stop steps"
+        ));
     }
 }
 
@@ -632,8 +924,6 @@ pub fn install_panic_hook() {
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 
-/// The decision logic above is platform-independent by construction, so the host
-/// lane can exercise it even though only the Windows branch calls it.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,6 +942,26 @@ mod tests {
                 "{request:?}, draining={draining}"
             );
         }
+    }
+
+    #[test]
+    fn only_the_final_session_end_notification_stops_the_daemon() {
+        // The final notification for a session that really is ending — a log-off, or a
+        // shutdown/restart (a critical shutdown carries neither flag).
+        assert_eq!(
+            session_end_label(true, false, true),
+            Some("Windows log-off")
+        );
+        assert_eq!(
+            session_end_label(true, false, false),
+            Some("Windows shutdown/restart")
+        );
+        // The question's "not ending" answer: a shutdown under way was cancelled, so a
+        // stop here would leave the daemon half-stopped for a session that continues.
+        assert_eq!(session_end_label(false, false, false), None);
+        // `ENDSESSION_CLOSEAPP`: the platform asking this application alone to close so
+        // that an update can proceed, which ends no session.
+        assert_eq!(session_end_label(true, true, false), None);
     }
 
     #[test]
