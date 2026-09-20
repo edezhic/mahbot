@@ -5796,8 +5796,9 @@ mod tests {
 
     // ── reset_pipeline_state level tests ──────────────────────────────────
     // These test the three ResetLevel variants against a PipelineCtx with
-    // non-default field values.  Tests that touch global voice state (Full,
-    // Cancel) use #[serial_test::serial(voice)].
+    // non-default field values.  The group is serialized on the voice key
+    // because the tests seed/assert the process-global enrollment accumulators
+    // and Full resets the shared VAD detector.
 
     /// Helper: build a PipelineCtx with non-default values in all mutable
     /// fields that reset_pipeline_state may touch.
@@ -5904,9 +5905,13 @@ mod tests {
         let _ = init_global();
         let mut ctx = ctx_with_populated_buffers();
 
-        // Pre-populate global enrollment state.
+        // Establish this test's own baseline: the accumulators are
+        // process-global and the Soft-reset test leaves its own entries behind
+        // (both levels preserve them by design) — clear them through the
+        // module's reset before seeding the entries asserted below.
         {
             let mut state = voice_state().write().unwrap_poison();
+            state.reset_enrollment();
             state.enrollment_embeddings.push(vec![0.5; 1024]);
             state.negative_audio_chunks.push(vec![0.5; 100]);
         }
