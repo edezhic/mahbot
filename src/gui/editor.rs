@@ -2050,20 +2050,26 @@ impl EditorState {
             .collect()
     }
 
-    /// Open a file by its workspace-relative path.
+    /// Open a file by its workspace-relative path (or an already-absolute path).
     /// If the file is already open in a tab, switches to that tab.
     /// Otherwise loads the file and adds a new tab.
     fn open_file_in_editor(&mut self, path: &str) -> Task<EditorMessage> {
         let Some(ws) = self.workspace_root() else {
             return Task::none();
         };
-        let abs_path = if path.starts_with('/') {
+        // `Path::is_absolute` is the platform's own absoluteness predicate (on
+        // Unix a leading `/`; on Windows a drive/UNC/verbatim prefix). On
+        // Windows a path like `C:\p`, `C:/p` or `\\?\C:\p` is now kept as-is
+        // rather than joined onto the workspace root, while a drive-rooted `/p`
+        // is treated as relative. On macOS/Linux the old leading-`/` test agrees
+        // with it, so nothing changes there. Both branches currently yield the
+        // same string for every path the editor can receive, but the decision
+        // stays explicit rather than resting on `PathBuf::push` discarding the
+        // base when the appended path is absolute.
+        let abs_path = if Path::new(path).is_absolute() {
             path.to_string()
         } else {
-            std::path::Path::new(&ws)
-                .join(path)
-                .to_string_lossy()
-                .to_string()
+            Path::new(&ws).join(path).to_string_lossy().to_string()
         };
 
         // If already open, just switch to that tab.
