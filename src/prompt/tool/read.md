@@ -1,6 +1,6 @@
 Read file contents with line numbers. Preferred over shell `cat` for reading files — it provides line numbers for reference, supports offset/limit for partial reads, and can list code structure via AST symbols.
 
-When the path is a directory, the tool lists its contents (using `ls -lA`) instead of returning an error. The directory listing groups subdirectories and files with sizes and an extension summary. Note that `mode`, `offset`, and `limit` parameters only apply to file reads — they are silently ignored when a directory is passed.
+When the path is a directory, the tool lists its contents instead of returning an error. The directory listing groups subdirectories and files with sizes and an extension summary. Note that `mode`, `offset`, and `limit` parameters only apply to file reads — they are silently ignored when a directory is passed.
 
 Modes:
 - `content` (default): Outputs a file or a range (using `offset`+`limit`) with line numbers. Large outputs are truncated to a small budget (~5 KB) — for big files, read in slices with `offset`/`limit`, or navigate via `symbols`/`zoom`. Handles any file type; binary files are read with lossy UTF-8 conversion, except the document containers converted below. When the path is a directory, lists the directory contents.
@@ -38,7 +38,7 @@ The read tool can access dependency source code from common package manager cach
 
 When `CARGO_HOME`, `RUSTUP_HOME`, `GOMODCACHE`, `GOPATH`, `GRADLE_USER_HOME`, `JAVA_HOME`, or `GOROOT` is set, the relocated root is honored alongside the HOME default. `XDG_CACHE_HOME`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME` are honored for the `~/.cache/`, `~/.config/`, `~/.local/share/`, `~/.local/state/` entries.
 
-To discover the exact path for a specific dependency, use the shell tool's `ls` to list package directories (the search tool is workspace-scoped and won't find packages in dependency caches). For example: `ls ~/.cargo/registry/src/*/` to find all cached crate sources.
+To discover the exact path for a specific dependency, list the package directory with the read tool (the search tool is workspace-scoped and won't find packages in dependency caches). For example, read `~/.cargo/registry/src` to find the cached crate sources.
 
 ## Protected credentials
 

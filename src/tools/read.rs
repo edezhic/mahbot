@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::time::Duration;
 
-use super::path::shell_quote;
-use crate::tools::{ShellMode, ShellTool, search::SearchTool};
+use super::listing::{ListingEntry, format_listing, human_readable_size};
+use crate::tools::search::SearchTool;
+use crate::tools::shell::try_spill_to_file;
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 use crate::util::tree_sitter::supported_extensions;
 use crate::{Tool, Workspace};
@@ -413,7 +414,7 @@ impl Tool for ReadTool {
             if let Some(out) = super::read_document::read_document(ws, &res, self.strict).await? {
                 return Ok(out);
             }
-            let text = read_resolved(ws, &res, &args).await?;
+            let text = read_resolved(&res, &args).await?;
             return Ok(super::with_image_payload(self, text, ws, &args).await);
         }
         // The ordinary read, and the payload the default hook pairs with it —
@@ -503,45 +504,29 @@ fn finish_read_body(resolved_path: &Path, body: String, recovery_note: Option<&s
 /// of a non-document read: [`execute_read`] and the document hook both return
 /// through it for a file the converter did not take, so a step added to one
 /// reaches the other.
-async fn read_resolved(
-    ws: &Workspace,
-    res: &ResolvedRead,
-    args: &serde_json::Value,
-) -> anyhow::Result<String> {
+async fn read_resolved(res: &ResolvedRead, args: &serde_json::Value) -> anyhow::Result<String> {
     let resolved_path = res.path.as_path();
     let recovery_note = res.recovery_note.as_deref();
-    match tokio::fs::metadata(resolved_path).await {
-        Ok(meta) => {
-            if meta.is_dir() {
-                return list_directory(resolved_path, ws).await;
-            }
-            super::check_size_within(&meta, super::MAX_FILE_SIZE_BYTES, "File too large")?;
-            // FIFOs are streams, not seekable files — read them with a
-            // bounded non-blocking wait so a missing writer cannot hang
-            // the tool (see read_fifo). Other modes (symbols/zoom) make no
-            // sense on a pipe, so content is always used.
-            #[cfg(unix)]
-            if std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()) {
-                let bytes = read_fifo(resolved_path, fifo_read_timeout()).await?;
-                let contents = String::from_utf8_lossy(&bytes);
-                return Ok(finish_read_body(
-                    resolved_path,
-                    format_content(&contents, args)?,
-                    recovery_note,
-                ));
-            }
-        }
-        Err(e) => match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                anyhow::bail!("File not found: {}", resolved_path.display());
-            }
-            std::io::ErrorKind::PermissionDenied => {
-                anyhow::bail!("Permission denied: {}", resolved_path.display());
-            }
-            _ => {
-                anyhow::bail!("Failed to read file metadata: {e}");
-            }
-        },
+    let meta = tokio::fs::metadata(resolved_path)
+        .await
+        .map_err(|e| path_io_error(resolved_path, &e, "Failed to read file metadata"))?;
+    if meta.is_dir() {
+        return list_directory(resolved_path).await;
+    }
+    super::check_size_within(&meta, super::MAX_FILE_SIZE_BYTES, "File too large")?;
+    // FIFOs are streams, not seekable files — read them with a
+    // bounded non-blocking wait so a missing writer cannot hang
+    // the tool (see read_fifo). Other modes (symbols/zoom) make no
+    // sense on a pipe, so content is always used.
+    #[cfg(unix)]
+    if std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()) {
+        let bytes = read_fifo(resolved_path, fifo_read_timeout()).await?;
+        let contents = String::from_utf8_lossy(&bytes);
+        return Ok(finish_read_body(
+            resolved_path,
+            format_content(&contents, args)?,
+            recovery_note,
+        ));
     }
 
     let body = match read_mode(args) {
@@ -748,7 +733,7 @@ async fn execute_read(
     }
 
     let res = resolve_content_read(ws, &path, strict).await?;
-    read_resolved(ws, &res, &args).await
+    read_resolved(&res, &args).await
 }
 
 /// Format file contents for content-mode output (line numbering + offset/limit).
@@ -1206,22 +1191,75 @@ fn parse_header_line_count(header: &str) -> usize {
     0
 }
 
-/// Delegate directory listing to [`ShellTool`] when [`ReadTool`] receives a
-/// directory path.
+/// List the directory at `dir` in-process, on every platform: the format is
+/// [`format_listing`]'s, which the shell's own `ls` profile renders too, and no
+/// Unix listing program is involved (Windows has none on the shells' path).
 ///
-/// Constructs a `ls -lA -- <quoted_path>` command and executes it in read-only
-/// mode. The result goes through `process_shell_output` which applies
-/// compact_ls formatting (directory/file separation, sizes, extension
-/// summaries), timing, and spill-to-file for large listings.
+/// Classification comes from non-following metadata, so a link is a file entry
+/// carrying the link's own size and never a directory entry:
 ///
-/// The `--` separator prevents directory names starting with `-` from being
-/// misinterpreted as flags. The path is shell-quoted via [`shell_quote`] to
-/// handle special characters.
-async fn list_directory(resolved_path: &std::path::Path, ws: &Workspace) -> anyhow::Result<String> {
-    let quoted = shell_quote(&resolved_path.to_string_lossy());
-    let command = format!("ls -lA -- {quoted}");
-    let shell_tool = ShellTool::new(ShellMode::ReadOnly);
-    shell_tool.execute(ws, json!({"command": command})).await
+/// * Unix — `DirEntry::file_type` reads `d_type` (falling back to `lstat`) and
+///   `DirEntry::metadata` is an `lstat`, so a symlink is `S_IFLNK`, i.e. not a
+///   directory, and its size is the length of its target path.
+/// * Windows — both read the values the directory scan already returned
+///   (`FindNextFile`), so neither call can fail: a link's size is the reparse
+///   point's own recorded size (0 B for a symlink), and `FileType::is_dir` is
+///   false for a symlink there too. std counts a junction as a symlink as well
+///   (both reparse tags carry the name-surrogate bit), so it is a file entry
+///   too; a non-name-surrogate reparse point (a cloud placeholder, say) is an
+///   ordinary entry.
+///
+/// A failed call is a Unix-only race that leaves an entry uninspectable: it is
+/// still listed, as a file with an unknown size, and only a directory the
+/// process cannot read at all is a failure.
+async fn list_directory(dir: &Path) -> anyhow::Result<String> {
+    let mut reader = tokio::fs::read_dir(dir)
+        .await
+        .map_err(|e| path_io_error(dir, &e, "Failed to list directory"))?;
+    let mut entries: Vec<ListingEntry> = Vec::new();
+    while let Some(entry) = reader
+        .next_entry()
+        .await
+        .map_err(|e| path_io_error(dir, &e, "Failed to list directory"))?
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_dir = entry
+            .file_type()
+            .await
+            .is_ok_and(|file_type| file_type.is_dir());
+        // A directory's size is never printed, so only a file is measured. A
+        // failed measurement keeps the entry, with its size unknown.
+        let size = if is_dir {
+            None
+        } else {
+            entry.metadata().await.ok().map(|meta| meta.len())
+        };
+        entries.push(ListingEntry {
+            name,
+            is_dir,
+            size: size.map(human_readable_size),
+        });
+    }
+    // Byte order — what `ls` printed under a `C` collation — never the
+    // filesystem's own enumeration order, so the listing is deterministic.
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(try_spill_to_file(
+        format_listing(&entries),
+        TOOL_OUTPUT_BUDGET_BYTES,
+    ))
+}
+
+/// The error to report for an I/O failure on `path`: the wording the read tool
+/// uses for a missing path and for a denied one, and `context` with the path
+/// and the raw cause otherwise.
+fn path_io_error(path: &Path, err: &std::io::Error, context: &str) -> anyhow::Error {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => anyhow::anyhow!("File not found: {}", path.display()),
+        std::io::ErrorKind::PermissionDenied => {
+            anyhow::anyhow!("Permission denied: {}", path.display())
+        }
+        _ => anyhow::anyhow!("{context} {}: {err}", path.display()),
+    }
 }
 
 #[cfg(test)]
@@ -2091,21 +2129,20 @@ mod utils;
     /// Directory listing returns file names instead of erroring.
     #[tokio::test]
     async fn directory_listing_returns_contents() {
-        let (_dir, ws_path) = temp_workspace(&[("a.txt", "alpha"), ("b.rs", "beta")]);
+        let (_dir, ws_path) =
+            temp_workspace(&[("a.txt", "alpha"), ("b.rs", "beta"), (".hidden", "h")]);
         tokio::fs::create_dir(ws_path.join("sub")).await.unwrap();
 
         let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": "."}))
             .await;
         assert!(result.is_ok(), "dir listing should succeed: {result:?}");
-        let output = result.unwrap();
-        // Should contain file names
-        assert!(output.contains("a.txt"), "should list a.txt: {output}");
-        assert!(output.contains("b.rs"), "should list b.rs: {output}");
-        // Should contain subdirectory name with trailing slash
-        assert!(output.contains("sub/"), "should list sub/: {output}");
-        // Should NOT be the old error message
-        assert!(!output.contains("Path is a directory"), "should not error");
+        // Directories first with a mark, then files in byte order with their
+        // size — hidden entries included — and the extension summary.
+        assert_eq!(
+            result.unwrap(),
+            "sub/\n.hidden  1B\na.txt  5B\nb.rs  4B\nSummary: 3 files, 1 dirs (1 .hidden, 1 .rs, 1 .txt)\n"
+        );
     }
 
     /// Subdirectories without a trailing slash should list contents, not error.
@@ -2131,7 +2168,7 @@ mod utils;
         );
     }
 
-    /// Directory listing shows "(empty)" for empty directories.
+    /// An empty directory is reported as empty, never as a failed listing.
     #[tokio::test]
     async fn directory_listing_empty() {
         let (_dir, ws_path) = temp_workspace(&[]);
@@ -2143,11 +2180,92 @@ mod utils;
             result.is_ok(),
             "empty dir listing should succeed: {result:?}"
         );
-        let output = result.unwrap();
-        // compact_ls preserves "total 0" for empty directories with no entries
+        assert_eq!(result.unwrap(), "(empty)\n");
+    }
+
+    /// A directory the process cannot read is a failed listing, not an empty one.
+    /// (Skipped for a supervisor user, who can read a `0o000` directory.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn directory_listing_unreadable_is_a_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_dir, ws_path) = temp_workspace(&[("sub/locked.txt", "x")]);
+        let locked = ws_path.join("sub");
+        tokio::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .await
+            .unwrap();
+
+        let result = tool()
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "sub"}))
+            .await;
+
+        // Restore the mode before asserting, so the temp dir can still be cleaned.
+        tokio::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        let err = format!(
+            "{}",
+            result.expect_err("a denied directory must not read as an empty listing")
+        );
+        assert!(err.contains("Permission denied"), "unexpected error: {err}");
+    }
+
+    /// An entry the platform cannot inspect is still listed — in the files
+    /// group, with an unknown size — instead of silently disappearing.
+    /// (Skipped for a supervisor user, who can inspect a `0o444` directory.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn directory_listing_uninspectable_entry_is_listed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_dir, ws_path) = temp_workspace(&[("sub/inside.txt", "x")]);
+        let unsearchable = ws_path.join("sub");
+        // Readable (the names can still be listed) but not searchable, so
+        // nothing inside it can be measured.
+        tokio::fs::set_permissions(&unsearchable, std::fs::Permissions::from_mode(0o444))
+            .await
+            .unwrap();
+
+        let result = tool()
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "sub"}))
+            .await;
+
+        // Restore the mode before asserting, so the temp dir can still be cleaned.
+        tokio::fs::set_permissions(&unsearchable, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.expect("unmeasured entries must not fail the listing"),
+            "inside.txt  ?\nSummary: 1 files, 0 dirs (1 .txt)\n"
+        );
+    }
+
+    /// A listing too large for the tool output budget is spilled to a file with
+    /// the usual hint, so the full listing stays recoverable.
+    #[tokio::test]
+    async fn directory_listing_large_spills_to_file() {
+        let names: Vec<String> = (0..600).map(|i| format!("file_{i:03}.txt")).collect();
+        let refs: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "x")).collect();
+        let (_dir, ws_path) = temp_workspace(&refs);
+
+        let output = tool()
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "."}))
+            .await
+            .unwrap();
         assert!(
-            output.contains("total 0") || output.contains("(empty)"),
-            "empty dir should indicate emptiness: {output}"
+            output.contains("[Output saved to"),
+            "expected a spill: {output}"
+        );
+        assert!(
+            output.contains("[view with: read "),
+            "expected a read hint: {output}"
         );
     }
 
@@ -2200,6 +2318,31 @@ mod utils;
         assert!(
             output.contains("nested.txt"),
             "should list nested file: {output}"
+        );
+    }
+
+    /// A link *inside* a listing is a file entry carrying the link's own size —
+    /// never a directory entry, and without its target appended.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn directory_listing_link_entry_is_a_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().to_path_buf();
+        tokio::fs::create_dir(ws_path.join("real")).await.unwrap();
+        let target = PathBuf::from("real");
+        symlink(&target, ws_path.join("link")).unwrap();
+
+        let output = tool()
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "."}))
+            .await
+            .unwrap();
+        // `link` is a file entry whose size is the target path's length (4),
+        // while `real` is the directory of the listing.
+        assert_eq!(
+            output,
+            "real/\nlink  4B\nSummary: 1 files, 1 dirs (1 no ext)\n"
         );
     }
 

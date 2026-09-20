@@ -13,6 +13,7 @@ pub(crate) mod custom;
 pub(crate) mod edit;
 pub(crate) mod image_gen;
 pub(crate) mod implement;
+pub(crate) mod listing;
 pub(crate) mod mahbot_config;
 pub(crate) mod mahbot_debug;
 pub(crate) mod manager_chat;

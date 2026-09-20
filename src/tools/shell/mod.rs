@@ -11,6 +11,7 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use super::listing::{ListingEntry, format_listing, human_readable_size};
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 use crate::util::UnwrapPoison;
 use crate::util::scrub_credentials;
@@ -2762,8 +2763,10 @@ pub(super) fn filter_cargo_test_output(output: &str, exit_code: i32) -> String {
     }
 }
 
-/// Parse a single `ls -l` line. Returns `(file_type, size, name)` on success.
-fn parse_ls_line(line: &str) -> Option<(char, String, String)> {
+/// Parse a single `ls -l` line into its listing entry. Returns `None` for the
+/// `total` header, blank lines, the `.`/`..` entries, and anything that is not
+/// an `ls -l` row.
+fn parse_ls_line(line: &str) -> Option<ListingEntry> {
     if line.starts_with("total ") || line.trim().is_empty() {
         return None;
     }
@@ -2776,11 +2779,19 @@ fn parse_ls_line(line: &str) -> Option<(char, String, String)> {
     {
         return None;
     }
-    let file_type = permissions.chars().next()?;
+    // `l` (a link) is a file entry: a link is never grouped with directories.
+    let is_dir = permissions.starts_with('d');
     parts.next(); // link count
     parts.next(); // owner
     parts.next(); // group
-    let size = parts.next()?.to_string();
+    // `ls -l` prints bytes, which the listing renders human-readable. A `-h`
+    // listing's `1.0K` and the `?` of an entry `ls` itself could not stat are
+    // already display text and pass through unchanged.
+    let size = parts.next()?;
+    let size = size
+        .parse::<u64>()
+        .ok()
+        .map_or_else(|| size.to_string(), human_readable_size);
     parts.next(); // month
     parts.next(); // day
     parts.next(); // time or year
@@ -2797,29 +2808,15 @@ fn parse_ls_line(line: &str) -> Option<(char, String, String)> {
     if name.is_empty() {
         return None;
     }
-    Some((file_type, size, name))
+    Some(ListingEntry {
+        name,
+        is_dir,
+        // A directory never carries a size (see `ListingEntry::size`).
+        size: if is_dir { None } else { Some(size) },
+    })
 }
 
-/// Format a raw byte count into a human-readable size string.
-#[expect(clippy::cast_precision_loss)]
-fn human_readable_size(size: &str) -> String {
-    if let Ok(bytes) = size.parse::<u64>() {
-        if bytes >= 1_000_000_000 {
-            format!("{:.1}G", bytes as f64 / 1_000_000_000.0)
-        } else if bytes >= 1_000_000 {
-            format!("{:.1}M", bytes as f64 / 1_000_000.0)
-        } else if bytes >= 1_000 {
-            format!("{:.1}K", bytes as f64 / 1_000.0)
-        } else {
-            format!("{bytes}B")
-        }
-    } else {
-        size.to_string() // already human-readable
-    }
-}
-
-/// Compress `ls -l` output into a compact directory listing.
-/// Groups directories and files, shows sizes, and includes an extension summary.
+/// Compress `ls -l` output into the compact listing ([`format_listing`]).
 ///
 /// Non-`-l` output (without a `total N` header) passes through unchanged.
 pub(super) fn compact_ls(output: &str, _exit_code: i32) -> String {
@@ -2830,9 +2827,7 @@ pub(super) fn compact_ls(output: &str, _exit_code: i32) -> String {
         return output.to_string();
     }
 
-    let mut dirs: Vec<String> = Vec::new();
-    let mut files: Vec<(String, String)> = Vec::new();
-    let mut ext_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut entries: Vec<ListingEntry> = Vec::new();
     let mut lines_seen = 0usize;
 
     for line in output.lines() {
@@ -2840,64 +2835,17 @@ pub(super) fn compact_ls(output: &str, _exit_code: i32) -> String {
             continue;
         }
         lines_seen += 1;
-
-        let Some((file_type, size, name)) = parse_ls_line(line) else {
-            continue;
-        };
-
-        if file_type == 'd' {
-            dirs.push(name);
-        } else {
-            let ext = if let Some((_, e)) = name.rsplit_once('.') {
-                format!(".{e}")
-            } else {
-                "no ext".to_string()
-            };
-            *ext_counts.entry(ext).or_insert(0) += 1;
-            let human = human_readable_size(&size);
-            files.push((name, human));
+        if let Some(entry) = parse_ls_line(line) {
+            entries.push(entry);
         }
     }
 
-    if dirs.is_empty() && files.is_empty() {
-        if lines_seen > 0 {
-            return "(empty)\n".to_string();
-        }
+    if lines_seen == 0 {
+        // Only the header of an empty `-A` listing: it stays as printed.
         return output.to_string();
     }
 
-    let mut entries = String::new();
-
-    for d in &dirs {
-        let _ = writeln!(entries, "{d}/");
-    }
-
-    for (name, size) in &files {
-        let _ = writeln!(entries, "{name}  {size}");
-    }
-
-    let _ = write!(
-        entries,
-        "Summary: {} files, {} dirs",
-        files.len(),
-        dirs.len()
-    );
-    if !ext_counts.is_empty() {
-        let mut sorted: Vec<_> = ext_counts.iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(a.1));
-        let parts: Vec<String> = sorted
-            .iter()
-            .take(5)
-            .map(|(ext, count)| format!("{count} {ext}"))
-            .collect();
-        let _ = write!(entries, " ({})", parts.join(", "));
-        if sorted.len() > 5 {
-            let _ = write!(entries, ", +{} more", sorted.len() - 5);
-        }
-    }
-    entries.push('\n');
-
-    entries
+    format_listing(&entries)
 }
 
 /// Main entry point for shell output processing.
