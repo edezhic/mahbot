@@ -22,11 +22,13 @@ pub(crate) mod grep_engine;
 mod profiles;
 mod readonly;
 mod scan;
+mod tree;
 
 pub(crate) use self::bg::BackgroundSessions;
 use self::profiles::{CARGO_COMPILE_PREFIXES, GEN_FALLBACK, PROFILES, Profile};
 pub use self::readonly::ShellMode;
 use self::readonly::check_command;
+use self::tree::{RunOwner, Tree};
 
 /// The shell that runs a validated command string (`sh -c` on unix,
 /// `cmd.exe /C` on Windows). Every platform rule in this module tree reads
@@ -205,6 +207,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Grandchildren (e.g., `cargo test` or long-running `sleep`) inherit the new
 /// PGID from `sh`, preventing orphaned CPU-consuming process trees when a
 /// shell command times out.
+///
+/// On Windows the child is what the runner puts under a job object right after
+/// the spawn — the platform's own whole-tree mechanism ([`tree`]).
 fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::Command {
     // The spawn side of [`SHELL_PLATFORM`]; the two must not drift.
     #[cfg(not(target_os = "windows"))]
@@ -249,7 +254,8 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
 /// shell syntax (unlike [`build_shell_command`], whose string is parsed by
 /// `sh -c`). Containment is otherwise identical: the workspace root as cwd,
 /// a cleared environment re-populated from [`SAFE_ENV_VARS`], and (Unix) the
-/// child leading its own process group.
+/// child leading its own process group; on Windows the runner's job is the
+/// platform's side of that containment ([`tree`]).
 fn build_program_command(
     program: &Path,
     args: &[String],
@@ -289,7 +295,9 @@ enum ShellRunResult {
         elapsed: Duration,
     },
     /// The main process exited but leftover processes kept the output pipes
-    /// open past the drain bound, so EOF never arrived.
+    /// open past the drain bound, so EOF never arrived. `pid` is the containment
+    /// root's when the containment ended the tree, and `None` otherwise — the
+    /// error names it as killed only in the former case.
     DrainTimedOut {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
@@ -412,7 +420,8 @@ fn output_drain_timeout() -> Duration {
 /// Also used by [`self::bg`] for the two-stage background-session stop
 /// (SIGTERM then SIGKILL) and the teardown kill; there the target is the
 /// background watcher's PID (the group leader), which stays alive for the
-/// whole session, so the group always exists when the signal is sent.
+/// whole session, so the group always exists when the signal is sent. The unix
+/// arm of [`tree`]'s containment is this same call.
 ///
 /// Note on ordering: the timeout path deliberately kills before reaping the
 /// child (see [`run_command_with_timeout`]) to avoid a PID-reuse race; the
@@ -549,21 +558,27 @@ fn engine_cause(text: &str, marked: bool) -> String {
     )
 }
 
-/// Kill-on-drop guard for an in-flight shell child: if the surrounding future
-/// is dropped before the child is reaped (agent task aborted at drain-cap
-/// expiry, panic in a sibling tool, runtime teardown), the process group is
-/// killed — no orphaned children/grandchildren. Disarmed once the child has
-/// been reaped (the group leader is gone; a post-reap kill risks PID reuse,
-/// which is why the guard must not fire on the normal-completion paths).
-#[cfg_attr(not(unix), allow(dead_code))]
+/// Ends a run's whole process tree if the run is dropped before a stop path or
+/// the successful-completion path has taken responsibility for it — an expired
+/// drain cap aborting the task, a panic in a sibling tool, runtime teardown. The
+/// tree is the platform's ([`Tree`]): the child's process group on unix, the job
+/// on Windows.
+///
+/// It must be disarmed on every path where the child is reaped or the tree is
+/// handed on: after a unix child is reaped a group kill risks PID reuse, and a
+/// Windows job retained for the process lifetime must not be ended by this guard.
+///
+/// It holds only the tree, never the child, so it has no fallback when
+/// [`Tree::terminate`] reports `false` — a Windows run with no job (fail-open,
+/// see [`tree`]) kills nothing here, just as it did before this guard existed.
 struct KillOnDrop {
-    pid: u32,
+    tree: Tree,
     armed: bool,
 }
 
 impl KillOnDrop {
-    fn new(pid: u32) -> Self {
-        Self { pid, armed: true }
+    fn new(tree: Tree) -> Self {
+        Self { tree, armed: true }
     }
 
     fn disarm(&mut self) {
@@ -574,8 +589,7 @@ impl KillOnDrop {
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         if self.armed {
-            #[cfg(unix)]
-            kill_process_group(self.pid, libc::SIGKILL);
+            self.tree.terminate();
         }
     }
 }
@@ -636,15 +650,25 @@ async fn drain_pipe_readers(
 /// `drain_limit` — a leftover backgrounded process holding the pipes open
 /// turns the drain into a bounded [`ShellRunResult::DrainTimedOut`] instead
 /// of an indefinite hang.
+///
+/// `owner` decides the run's whole-tree containment ([`tree`]): unix contains
+/// every run the same way — the process group the child leads — while Windows
+/// gives a job object only to an agent's run.
 async fn run_command_with_timeout(
     cmd: &mut tokio::process::Command,
     timeout: Duration,
     drain_limit: Duration,
+    owner: RunOwner,
 ) -> ShellRunResult {
     let start = std::time::Instant::now();
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+
+    // The run's containment, created before the spawn so the child can be put
+    // under it the moment it exists; the window between the two is the accepted
+    // limitation `tree` documents.
+    let mut tree = Tree::new(owner);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -652,10 +676,13 @@ async fn run_command_with_timeout(
     };
 
     let pid = child.id();
+    if let Some(pid) = pid {
+        tree.attach(pid);
+    }
     // Kill-on-drop: an aborted task (drain-cap force-cancel, panic, runtime
-    // teardown) must not orphan the child's process group. Disarmed on every
-    // path where the child is reaped — post-reap kills risk PID reuse.
-    let mut kill_guard = pid.map(KillOnDrop::new);
+    // teardown) must not orphan the run's tree. Disarmed on every path where
+    // the child is reaped or the tree is handed on.
+    let mut kill_guard = KillOnDrop::new(tree.clone());
     // Stdio::piped() was set above, so the handles are always present.
     let stdout_pipe = child.stdout.take().expect("stdout piped");
     let stderr_pipe = child.stderr.take().expect("stderr piped");
@@ -666,32 +693,34 @@ async fn run_command_with_timeout(
 
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => {
-            // Child reaped — the guard must not fire (the group leader is
-            // gone; a post-reap kill would risk PID reuse).
-            if let Some(guard) = &mut kill_guard {
-                guard.disarm();
-            }
+            // Child reaped — the guard must not fire: on unix the group leader
+            // is gone and a post-reap kill would risk PID reuse, while a Windows
+            // job retained for the process lifetime must not be ended here.
+            kill_guard.disarm();
             // Child exited naturally — drain remaining output with a bound.
             // A leftover backgrounded process that inherited the pipes prevents
             // EOF; without the bound the drain would hang the tool forever.
             match drain_pipe_readers(&mut stdout_handle, &mut stderr_handle, drain_limit).await {
-                DrainOutcome::Both(stdout, stderr) => ShellRunResult::Completed {
-                    stdout,
-                    stderr,
-                    status,
-                    elapsed: start.elapsed(),
-                },
+                DrainOutcome::Both(stdout, stderr) => {
+                    // The run ended on its own — not a stop, so nothing is killed
+                    // here and the job is kept rather than closed (`tree`).
+                    tree.retain_after_completion();
+                    ShellRunResult::Completed {
+                        stdout,
+                        stderr,
+                        status,
+                        elapsed: start.elapsed(),
+                    }
+                }
                 DrainOutcome::Partial { stdout, stderr } => {
                     // Drain bound exceeded: a leftover process still holds the
-                    // pipes. Kill its process group (mirroring the timeout
-                    // path), cancel the readers, and collect partial output so
+                    // pipes. End the tree the run is contained in — the process
+                    // group on unix, the job on Windows — mirroring the timeout
+                    // path, then cancel the readers and collect partial output so
                     // the caller gets a visible, recoverable error instead of
                     // a hang. Readers that already completed keep their output
                     // (a completed JoinHandle must not be re-awaited).
-                    #[cfg(unix)]
-                    if let Some(pid) = pid {
-                        kill_process_group(pid, libc::SIGKILL);
-                    }
+                    let ended = tree.terminate();
                     cancel.cancel();
                     let (stdout, stderr) = tokio::join!(
                         finish_partial_reader(stdout, stdout_handle, "stdout"),
@@ -700,7 +729,9 @@ async fn run_command_with_timeout(
                     ShellRunResult::DrainTimedOut {
                         stdout,
                         stderr,
-                        pid,
+                        // Named as killed only when the tree really was ended (see
+                        // the variant).
+                        pid: pid.filter(|_| ended),
                         elapsed: start.elapsed(),
                     }
                 }
@@ -708,46 +739,23 @@ async fn run_command_with_timeout(
         }
         Ok(Err(e)) => ShellRunResult::SpawnFailed(e),
         Err(_) => {
-            // Kill the entire process tree (child + grandchildren) on timeout.
+            // Kill the entire process tree (child + grandchildren) on timeout:
+            // the run's containment, plus a signal to the direct child itself
+            // first, so the reap below cannot wait on a child the containment
+            // termination failed to reach.
             //
-            // Strategy (Unix only): send SIGKILL to the direct child without
-            // waiting (start_kill), then kill the process group via
-            // libc::kill(-pgid, SIGKILL) to terminate any grandchildren
-            // (e.g. `cargo test` or `sleep` inherited the child's PGID from
-            // process_group(0) in build_shell_command), then reap the child.
-            //
-            // This ordering avoids a PID-reuse race: if child.kill().await
-            // (which includes wait()) were called before the PGID kill, the
-            // child's PID could be reused before we can signal its group.
-            //
-            // On non-Unix platforms the simpler child.kill() suffices — there is
-            // no process group to signal, so a grandchild survives. A served
-            // search is such a grandchild (the shell's child spawns the grep
-            // engine), and on Windows that is the shape of every search: a
-            // timed-out search leaves the engine process alive until
-            // it finishes or exits on its own. Accepted (containment on this
-            // platform is the documented asymmetry, see `bg`'s module docs).
-            #[cfg(unix)]
-            {
-                // PID must be available — child.id() returns Some after spawn.
-                let pid = pid.expect("PID is available after successful spawn");
-                // Fire-and-forget SIGKILL to the direct child.
-                let _ = child.start_kill();
-                // Kill the entire process group.
-                // pgid == pid because build_shell_command calls
-                // process_group(0), making the child a PG leader.
-                kill_process_group(pid, libc::SIGKILL);
-                // Reap the child (now dead from one or both kills).
-                let _ = child.wait().await;
-                // Reaped — disarm the guard (the explicit kill already ran).
-                if let Some(guard) = &mut kill_guard {
-                    guard.disarm();
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = child.kill().await;
-            }
+            // Order matters on unix: `start_kill` (fire-and-forget SIGKILL)
+            // precedes the group kill, because `child.kill().await` — which
+            // includes `wait()` — would let the child's PID be reused before we
+            // could signal the group it leads (`process_group(0)` in
+            // [`build_shell_command`]). On Windows the direct kill is the
+            // fallback for a run whose containment could not be established (see
+            // `tree`) and for a job termination that failed.
+            let _ = child.start_kill();
+            tree.terminate();
+            let _ = child.wait().await;
+            // Reaped — disarm the guard (the explicit kill already ran).
+            kill_guard.disarm();
             cancel.cancel();
 
             // Give readers a grace window to notice cancellation and return
@@ -810,25 +818,33 @@ fn program_outcome(success: bool, detail: String, stdout: &[u8], stderr: &[u8]) 
 
 /// Run `program` with `args` (argv — never a shell command string) in `ws` and
 /// return the raw run result. The single place that decides how a direct run is
-/// contained: the sanitized environment, [`DEFAULT_SHELL_TIMEOUT_SECS`] with a
-/// process-group kill on unix, the per-pipe output cap and the post-exit drain
-/// bound.
-async fn run_program(ws: &Workspace, program: &Path, args: &[String]) -> ShellRunResult {
+/// bounded: the sanitized environment, [`DEFAULT_SHELL_TIMEOUT_SECS`], the
+/// per-pipe output cap and the post-exit drain bound. `owner` travels to
+/// [`run_command_with_timeout`] and decides the run's containment.
+async fn run_program(
+    ws: &Workspace,
+    program: &Path,
+    args: &[String],
+    owner: RunOwner,
+) -> ShellRunResult {
     let timeout = Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS);
     let mut cmd = build_program_command(program, args, ws.as_path());
-    run_command_with_timeout(&mut cmd, timeout, output_drain_timeout()).await
+    run_command_with_timeout(&mut cmd, timeout, output_drain_timeout(), owner).await
 }
 
 /// Run `program` with `args` in `ws` and report the run as an outcome instead
 /// of folding a non-zero exit into an error: a run that did not complete is a
 /// failed outcome, never an `Err`, because the caller's rule is about what the
 /// run reported rather than about this layer's error type.
+///
+/// The run is a service launch rather than an agent's work, so Windows gives it
+/// no job ([`RunOwner::Service`] — see [`tree`]).
 pub(crate) async fn run_program_outcome(
     ws: &Workspace,
     program: &Path,
     args: &[String],
 ) -> ProgramOutcome {
-    match run_program(ws, program, args).await {
+    match run_program(ws, program, args, RunOwner::Service).await {
         ShellRunResult::Completed {
             stdout,
             stderr,
@@ -865,8 +881,8 @@ pub(crate) async fn run_program_outcome(
 }
 
 /// Run `program` with `args` (argv — never a shell command string) in `ws`,
-/// under the containment and standard bounds [`run_program`] applies to a
-/// direct run.
+/// under the bounds [`run_program`] applies to a direct run, contained as an
+/// agent's command (see [`RunOwner::Agent`]).
 ///
 /// `label` names what the caller asked to run and is what the failure prose
 /// talks about, so the model reads back the thing it called rather than the
@@ -886,7 +902,7 @@ pub(crate) async fn run_program_with_timeout(
     args: &[String],
     label: &str,
 ) -> anyhow::Result<String> {
-    match run_program(ws, program, args).await {
+    match run_program(ws, program, args, RunOwner::Agent).await {
         ShellRunResult::Completed {
             stdout,
             stderr,
@@ -904,8 +920,8 @@ pub(crate) async fn run_program_with_timeout(
         // not complete), but a typed one-liner carrying the output tail rather
         // than the shell's structured block: a direct run has no per-call knob
         // to raise, so nothing here may advertise the `timeout_secs` escape
-        // hatch. The kill is not called a process-group one: only unix puts the
-        // child in its own group.
+        // hatch, and it does not name what the kill ended the way the tool's
+        // block does.
         ShellRunResult::TimedOut {
             stdout,
             stderr,
@@ -1043,9 +1059,14 @@ fn format_drain_timeout_error(
         drain_limit.as_secs_f64(),
     );
     if let Some(p) = pid {
-        // The main command's PID doubles as its process-group id; the group
-        // (not the already-reaped command) is what the drain timeout killed.
-        let _ = write!(msg, "\nkilled process group: {p}");
+        // The pid is the run's containment root — what the drain timeout ended —
+        // not the already-reaped command, and it is named in this platform's own
+        // terms: a process group on unix, the process tree of the job on Windows.
+        let scope = match SHELL_PLATFORM {
+            ShellPlatform::Unix => "process group",
+            ShellPlatform::Windows => "process tree",
+        };
+        let _ = write!(msg, "\nkilled {scope}: {p}");
     }
     msg.push_str(
         "\nhint: the tool does not support processes that outlive the command; \
@@ -1103,9 +1124,10 @@ impl ShellTool {
         ))
     }
 
-    /// Stop a background session by its output-file path (Full mode only).
-    /// Two-stage SIGTERM → grace → SIGKILL; stopping an already-finished
-    /// session is a no-op.
+    /// Stop a background session by its output-file path (Full mode only):
+    /// two-stage SIGTERM → grace → SIGKILL on unix, the session's whole process
+    /// tree ended at once on Windows (see [`self::bg`] for the mechanism);
+    /// stopping an already-finished session is a no-op.
     async fn stop_background(&self, stop_path: &str) -> anyhow::Result<(String, Option<i32>)> {
         let sessions = Self::background_sessions_handle()?;
         let path = PathBuf::from(stop_path);
@@ -1248,7 +1270,8 @@ impl ShellTool {
         let timeout = Duration::from_secs(timeout_secs);
         let drain_limit = output_drain_timeout();
 
-        let mut result = run_command_with_timeout(&mut cmd, timeout, drain_limit).await;
+        let mut result =
+            run_command_with_timeout(&mut cmd, timeout, drain_limit, RunOwner::Agent).await;
 
         // Stream-size marker: the engine reports stdin-fed stream bytes
         // consumed via a stderr marker; strip it from the agent-visible stderr.
@@ -1324,7 +1347,7 @@ impl ShellTool {
             Some(EngineFailure::ReRun) => {
                 sentinel_rerun = true;
                 let mut original = build_shell_command(command_str, ws.as_path());
-                run_command_with_timeout(&mut original, timeout, drain_limit).await
+                run_command_with_timeout(&mut original, timeout, drain_limit, RunOwner::Agent).await
             }
             None => result,
         };
@@ -1827,12 +1850,14 @@ fn render_readonly_banner() -> String {
     let platform_checks = crate::prompt::load_prompt(match SHELL_PLATFORM {
         ShellPlatform::Windows => "tool/shell_readonly_banner_windows.md",
         ShellPlatform::Unix => "tool/shell_readonly_banner_unix.md",
-    });
+    })
+    .trim()
+    .to_owned();
     crate::prompt::substitute(
         &crate::prompt::load_prompt("tool/shell_readonly_banner.md"),
         &[
             ("{{temp_root}}", &crate::temp::shell_tmpdir()),
-            ("{{platform_checks}}", platform_checks.trim_end()),
+            ("{{platform_checks}}", &platform_checks),
         ],
     )
 }
@@ -1848,11 +1873,37 @@ fn render_grep_notes() -> String {
     let platform_notes = crate::prompt::load_prompt(match SHELL_PLATFORM {
         ShellPlatform::Windows => "tool/shell_grep_notes_windows.md",
         ShellPlatform::Unix => "tool/shell_grep_notes_unix.md",
-    });
+    })
+    .trim()
+    .to_owned();
     crate::prompt::substitute(
         &crate::prompt::load_prompt("tool/shell_grep_notes.md"),
-        &[("{{platform_notes}}", platform_notes.trim_end())],
+        &[("{{platform_notes}}", &platform_notes)],
     )
+}
+
+/// The full-mode notes: the shared skeleton with this platform's stop semantics
+/// substituted in. What stopping a session does is the one thing the two
+/// platforms do differently, and a session must never be promised a mechanism
+/// its platform does not have — [`tree`] is where the mechanisms themselves are.
+fn render_full_mode_notes() -> String {
+    let stop = stop_semantics();
+    crate::prompt::substitute(
+        &crate::prompt::load_prompt("tool/shell_full.md"),
+        &[("{{stop_semantics}}", &stop)],
+    )
+}
+
+/// What stopping a run does on this platform — one text for both the tool
+/// description's stop bullet and the `stop` argument's schema entry, so the two
+/// cannot promise different mechanisms.
+fn stop_semantics() -> String {
+    crate::prompt::load_prompt(match SHELL_PLATFORM {
+        ShellPlatform::Windows => "tool/shell_full_stop_windows.md",
+        ShellPlatform::Unix => "tool/shell_full_stop_unix.md",
+    })
+    .trim()
+    .to_owned()
 }
 
 #[async_trait]
@@ -1865,15 +1916,12 @@ impl Tool for ShellTool {
         // The base description and the grep-engine disclosure are shared
         // verbatim between the modes (a single copy each, so the two
         // descriptions cannot drift); only the read-only banner, the full-mode
-        // sections and the platform's grep notes are mode-/platform-specific.
+        // sections (stop semantics included) and the platform's grep notes are
+        // mode-/platform-specific.
         let base = crate::prompt::load_prompt("tool/shell.md");
         let sections: [String; 3] = match self.mode {
             ShellMode::ReadOnly => [render_readonly_banner(), base, render_grep_notes()],
-            ShellMode::Full => [
-                base,
-                crate::prompt::load_prompt("tool/shell_full.md"),
-                render_grep_notes(),
-            ],
+            ShellMode::Full => [base, render_full_mode_notes(), render_grep_notes()],
         };
         sections.map(|s| s.trim_end().to_owned()).join("\n\n")
     }
@@ -1920,7 +1968,16 @@ impl Tool for ShellTool {
                     },
                     "stop": {
                         "type": "string",
-                        "description": "Output-file path of a background session (as returned by a background launch) to stop. The process group is stopped two-stage (SIGTERM, ~5s grace, SIGKILL). Pass only `stop` with the exact path — a `command` is not needed and is ignored if present, and `background` must NOT be combined with `stop` (the tool rejects the combination). Stopping an already-finished session is a no-op."
+                        // The platform's own stop text (`stop_semantics`) — the
+                        // same text the description's stop bullet carries.
+                        "description": format!(
+                            "Output-file path of a background session (as returned by a \
+                             background launch) to stop. {} Pass only `stop` with the exact \
+                             path — a `command` is not needed and is ignored if present, and \
+                             `background` must NOT be combined with `stop` (the tool rejects \
+                             the combination). Stopping an already-finished session is a no-op.",
+                            stop_semantics()
+                        )
                     },
                 }),
                 &[],
@@ -4271,9 +4328,13 @@ mod tests {
     async fn run_command_with_timeout_kills_long_sleep() {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg("sleep 10");
-        let result =
-            run_command_with_timeout(&mut cmd, Duration::from_secs(1), Duration::from_secs(10))
-                .await;
+        let result = run_command_with_timeout(
+            &mut cmd,
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            RunOwner::Agent,
+        )
+        .await;
         match result {
             ShellRunResult::TimedOut { elapsed, .. } => {
                 assert!(
@@ -4301,9 +4362,13 @@ mod tests {
     async fn run_command_with_timeout_captures_partial_stdout() {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg("echo started; sleep 60");
-        let result =
-            run_command_with_timeout(&mut cmd, Duration::from_secs(2), Duration::from_secs(10))
-                .await;
+        let result = run_command_with_timeout(
+            &mut cmd,
+            Duration::from_secs(2),
+            Duration::from_secs(10),
+            RunOwner::Agent,
+        )
+        .await;
         match result {
             ShellRunResult::TimedOut { stdout, .. } => {
                 let s = String::from_utf8_lossy(&stdout);
@@ -4333,9 +4398,13 @@ mod tests {
     async fn shell_timeout_error_includes_diagnostics() {
         let tmp = TempDir::new().expect("tempdir");
         let mut cmd = build_shell_command("echo before-timeout; sleep 30", tmp.path());
-        let result =
-            run_command_with_timeout(&mut cmd, Duration::from_secs(1), Duration::from_secs(10))
-                .await;
+        let result = run_command_with_timeout(
+            &mut cmd,
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            RunOwner::Agent,
+        )
+        .await;
         let ShellRunResult::TimedOut {
             stdout,
             stderr,
@@ -4383,67 +4452,96 @@ mod tests {
         );
     }
 
-    /// Verify that grandchildren are killed when the shell command times out.
-    ///
-    /// After [`build_shell_command`] applies `process_group(0)`, background
-    /// processes spawned by `sh` inherit the same PGID. When the timeout fires,
-    /// [`run_command_with_timeout`] sends SIGKILL to the entire process group
-    /// via `libc::kill(-pgid, SIGKILL)`, which terminates grandchildren
-    /// (e.g. the `sleep` in this test) in addition to the direct `sh` child.
-    ///
-    /// This test is `#[ignore]` by default because it waits out a real 2 s command timeout plus a 500 ms kill-delivery grace against live processes. Run it
-    /// explicitly with:
-    ///
-    /// ```sh
-    /// cargo test process_group_kills_grandchildren_on_timeout -- --ignored --nocapture
-    /// ```
-    #[ignore = "waits out real command timeouts against live processes (hardcoded waits); runs only when explicitly invoked"]
+    /// Wait — briefly — for a pid to stop existing. `kill(pid, 0)` is the
+    /// existence probe: it sends no signal.
+    #[cfg(unix)]
+    async fn wait_for_death(pid: i32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            // SAFETY: signal 0 performs the permission/existence check only.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("pid {pid} is still alive");
+    }
+
+    /// A run that can only end by being stopped: `sh` backgrounds a long sleep —
+    /// which inherits sh's process group — then waits, writing the sleep's pid to
+    /// `grandchild.pid` in `dir`. Returns that file and the prepared command.
+    #[cfg(unix)]
+    fn run_with_backgrounded_sleep(dir: &TempDir) -> (std::path::PathBuf, tokio::process::Command) {
+        let pid_path = dir.path().join("grandchild.pid");
+        let cmd_str = format!(
+            "sleep 999 & echo $! > {}; wait",
+            pid_path.to_str().expect("valid utf-8 path")
+        );
+        (pid_path, build_shell_command(&cmd_str, dir.path()))
+    }
+
+    /// The pid the shell wrote for that sleep, once the run has been stopped.
+    #[cfg(unix)]
+    fn stopped_grandchild(pid_path: &std::path::Path) -> i32 {
+        std::fs::read_to_string(pid_path)
+            .expect("grandchild PID file must exist — grandchild was launched")
+            .trim()
+            .parse()
+            .expect("valid PID from file")
+    }
+
+    /// A stop ends the command's whole process tree, not only its direct child:
+    /// the timeout path ends the run's containment, so a grandchild the command
+    /// backgrounded dies with it. This is the unix arm of [`Tree::terminate`];
+    /// Windows reaches the same outcome through its job object, which only a
+    /// Windows host can exercise.
     #[cfg(unix)]
     #[tokio::test]
-    async fn process_group_kills_grandchildren_on_timeout() {
-        // Create a script that launches a long-running background grandchild,
-        // records its PID so we can verify it's dead after the timeout.
+    async fn timeout_kills_the_command_process_tree() {
         let dir = TempDir::new().expect("tempdir");
-        let pid_path = dir.path().join("grandchild.pid");
-        let pid_path_str = pid_path.to_str().expect("valid utf-8 path");
+        let (pid_path, mut cmd) = run_with_backgrounded_sleep(&dir);
 
-        // Command: start sleep in background, capture its PID, then wait.
-        // The grandchild inherits the process group from sh (set by
-        // build_shell_command → process_group(0)).
-        let cmd_str = format!("sleep 999 & echo $! > {pid_path_str}; wait");
-        let mut cmd = build_shell_command(&cmd_str, dir.path());
-
-        let result =
-            run_command_with_timeout(&mut cmd, Duration::from_secs(2), Duration::from_secs(10))
-                .await;
+        let result = run_command_with_timeout(
+            &mut cmd,
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            RunOwner::Agent,
+        )
+        .await;
         assert!(
             matches!(result, ShellRunResult::TimedOut { .. }),
             "expected TimedOut, got {result:?}"
         );
 
-        // Give the kernel time to deliver SIGKILL and reap the processes.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        wait_for_death(stopped_grandchild(&pid_path)).await;
+    }
 
-        // Read the grandchild PID from the file the script wrote.
-        // The background `echo $!` runs immediately after the `sleep 999 &`
-        // fork, so the file must exist after a 2-second timeout + 500ms grace.
-        let pid_content = std::fs::read_to_string(&pid_path)
-            .expect("grandchild PID file must exist — grandchild was launched");
-        let pid: i32 = pid_content.trim().parse().expect("valid PID from file");
+    /// A run that is torn down (its future dropped — an abandoned tool call, a
+    /// force-cancelled drain) takes its whole process tree with it: the
+    /// kill-on-drop guard fires.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_run_kills_the_command_process_tree() {
+        let dir = TempDir::new().expect("tempdir");
+        let (pid_path, mut cmd) = run_with_backgrounded_sleep(&dir);
 
-        // Verify the grandchild is no longer alive.
-        // kill(pid, 0) checks existence without sending a real signal.
-        let ret = unsafe { libc::kill(pid, 0) };
-        let err = std::io::Error::last_os_error();
-        assert_eq!(
-            ret, -1,
-            "grandchild (pid={pid}) should be dead after PGID kill, err: {err:?}"
+        // The timeout drops the run's future, exactly as an aborted task does.
+        let dropped = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_command_with_timeout(
+                &mut cmd,
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+                RunOwner::Agent,
+            ),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the run must still be live when it is dropped"
         );
-        assert_eq!(
-            err.raw_os_error(),
-            Some(libc::ESRCH),
-            "expected ESRCH (no such process) for grandchild pid={pid}, got: {err:?}"
-        );
+
+        wait_for_death(stopped_grandchild(&pid_path)).await;
     }
 
     /// A leftover backgrounded process holding the output pipes open must not
@@ -4465,6 +4563,7 @@ mod tests {
             &mut cmd,
             Duration::from_secs(30),
             Duration::from_millis(150),
+            RunOwner::Agent,
         )
         .await;
         let ShellRunResult::DrainTimedOut {
@@ -4494,25 +4593,13 @@ mod tests {
         assert!(msg.contains("drain"), "msg: {msg}");
         assert!(msg.contains("before-drain"), "msg: {msg}");
 
-        // The leftover grandchild must be dead (PGID kill). Poll briefly —
-        // SIGKILL delivery + reap is immediate, but the kernel may lag under load.
+        // The leftover grandchild must be dead (the drain path ends the run's
+        // containment). Poll briefly — SIGKILL delivery + reap is immediate, but
+        // the kernel may lag under load.
         let pid_content = std::fs::read_to_string(&pid_path)
             .expect("grandchild PID file must exist — grandchild was launched");
         let pid: i32 = pid_content.trim().parse().expect("valid PID from file");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut alive = true;
-        while std::time::Instant::now() < deadline {
-            // kill(pid, 0) checks existence without sending a real signal.
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                alive = false;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(
-            !alive,
-            "leftover (pid={pid}) should be dead after PGID kill"
-        );
+        wait_for_death(pid).await;
     }
 
     /// Short-lived backgrounded jobs that finish within the drain bound keep
@@ -4522,9 +4609,13 @@ mod tests {
     async fn output_drain_completes_for_short_lived_background_job() {
         let dir = TempDir::new().expect("tempdir");
         let mut cmd = build_shell_command("echo done; sleep 0.2 &", dir.path());
-        let result =
-            run_command_with_timeout(&mut cmd, Duration::from_secs(30), Duration::from_secs(5))
-                .await;
+        let result = run_command_with_timeout(
+            &mut cmd,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            RunOwner::Agent,
+        )
+        .await;
         let ShellRunResult::Completed { stdout, .. } = result else {
             panic!("expected Completed, got {result:?}");
         };
@@ -4545,6 +4636,7 @@ mod tests {
             &mut cmd,
             Duration::from_secs(30),
             Duration::from_millis(150),
+            RunOwner::Agent,
         )
         .await;
         let ShellRunResult::DrainTimedOut { stdout, .. } = result else {
@@ -5491,6 +5583,15 @@ mod tests {
                 ]
                 .as_slice(),
             ),
+            (
+                "tool/shell_full.md",
+                ["{{stop_semantics}}"].as_slice(),
+                [
+                    "tool/shell_full_stop_unix.md",
+                    "tool/shell_full_stop_windows.md",
+                ]
+                .as_slice(),
+            ),
         ] {
             let shared = crate::prompt::load_prompt(skeleton);
             let mut rest = shared.clone();
@@ -5504,6 +5605,49 @@ mod tests {
                 assert!(!text.contains("{{"), "{asset} carries a placeholder");
             }
         }
+    }
+
+    /// The stop text is one text: the tool description's stop bullet and the `stop`
+    /// argument's own schema entry must both carry this platform's sentence, and
+    /// only this platform's — a session must never be promised a mechanism its
+    /// platform does not have (see `tree`).
+    #[test]
+    fn stop_text_is_this_platforms_own() {
+        let (this, other) = match SHELL_PLATFORM {
+            ShellPlatform::Unix => (
+                "tool/shell_full_stop_unix.md",
+                "tool/shell_full_stop_windows.md",
+            ),
+            ShellPlatform::Windows => (
+                "tool/shell_full_stop_windows.md",
+                "tool/shell_full_stop_unix.md",
+            ),
+        };
+        let this = crate::prompt::load_prompt(this).trim().to_owned();
+        let other = crate::prompt::load_prompt(other).trim().to_owned();
+
+        let full = ShellTool::new(ShellMode::Full);
+        let description = full.description();
+        assert!(
+            description.contains(&this),
+            "the description must carry this platform's stop text"
+        );
+        assert!(
+            !description.contains(&other),
+            "the description must not promise the other platform's stop text"
+        );
+        let schema = full.parameters_schema();
+        let stop = schema["properties"]["stop"]["description"]
+            .as_str()
+            .expect("the stop argument carries a description");
+        assert!(
+            stop.contains(&this),
+            "the stop schema must carry this platform's stop text"
+        );
+        assert!(
+            !stop.contains(&other),
+            "the stop schema must not promise the other platform's stop text"
+        );
     }
 
     /// The Windows-only refusal decision, driven directly: the serve decision's

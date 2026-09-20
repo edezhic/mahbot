@@ -617,7 +617,9 @@ impl Drop for Agent {
         // Teardown kill: the agent's background shell sessions must not
         // outlive it. Force-kill only (no grace), mirroring the existing
         // teardown-kill behavior for in-flight shell children. Synchronous —
-        // SIGKILL to each live process group.
+        // SIGKILL to each live process group on unix, one TerminateJobObject per
+        // session on Windows ("end the tree", no grace — see
+        // `tools::shell::tree`).
         self.background_sessions.terminate_all();
     }
 }

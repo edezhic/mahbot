@@ -31,16 +31,23 @@
 //!
 //! # Windows
 //!
-//! No watchdog and no process-group kill: the direct child is killed on stop
-//! and teardown, and grandchildren survive (accepted asymmetry — documented
-//! per the spec).
+//! There is no watchdog and no process group: a session's whole process tree is
+//! held in a job object instead ([`super::tree::Tree`]) — created at launch,
+//! inherited by every descendant, ended on stop and on teardown, and ended by
+//! the OS as well when the daemon dies abruptly, because the handle the job
+//! hangs on goes with the process (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`). The
+//! job also ends the tree when the command exits on its own, which is what the
+//! unix watcher's group kill at the end of a session does. A job that could not
+//! be created or assigned leaves the session with exactly the treatment it had
+//! before jobs existed — the direct child alone; `tree` records that fail-open
+//! policy and the accepted limitations.
 //!
 //! The launch-failure probe is Unix-shell-specific as well: cmd.exe exits 1
 //! (not 126/127) for a missing or non-executable command, so on Windows a
 //! failed launch surfaces as a successful background session whose output
 //! file holds the cmd.exe error and `[exit status: 1]` — the synchronous
 //! launch-error path is Unix-only (accepted deviation from the launch-failure
-//! contract, mirroring the kill asymmetry above).
+//! contract).
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -52,6 +59,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(not(unix))]
+use super::tree::{RunOwner, Tree};
 use crate::util::UnwrapPoison;
 
 /// Watcher script: ignore SIGTERM (the daemon owns the graceful two-stage
@@ -87,7 +96,7 @@ const FAILURE_OUTPUT_PREFIX_BYTES: usize = 400;
 /// Result of [`BackgroundSessions::stop`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StopResult {
-    /// The two-stage stop ran (or the process was already dead).
+    /// The stop ran (or the process was already dead).
     Stopped,
     /// The session had already finished before the stop arrived — no-op.
     AlreadyFinished,
@@ -113,13 +122,19 @@ impl Default for BackgroundSessions {
 /// One live (or finished) background session, keyed by its output-file path.
 struct SessionEntry {
     /// The launched command child, shared with the waiter task (which reaps
-    /// it) and the stop/teardown paths (which signal it on Windows). Never
-    /// taken out after launch — the waiter polls `try_wait` in place. A
-    /// `std::sync::Mutex` is sufficient: every critical section (try_wait,
-    /// start_kill) is a short synchronous call and is never held across an
-    /// await, so blocking here cannot stall the runtime (and makes the
-    /// synchronous teardown kill reliable — no try_lock to fail silently).
+    /// it) and the stop/teardown paths (which signal it only as the fallback
+    /// for a session whose job did not end its tree). Never taken out after
+    /// launch — the waiter polls `try_wait` in place. A `std::sync::Mutex` is
+    /// sufficient: every critical section (try_wait, start_kill) is a short
+    /// synchronous call and is never held across an await, so blocking here
+    /// cannot stall the runtime (and makes the synchronous teardown kill
+    /// reliable — no try_lock to fail silently).
     command: Arc<std::sync::Mutex<tokio::process::Child>>,
+    /// Windows: the job the session's whole process tree is in — ended on stop
+    /// and teardown, ended by the OS if the daemon dies, and ended by the waiter
+    /// when the command exits (the watcher's counterpart — see the module docs).
+    #[cfg(not(unix))]
+    tree: Tree,
     /// Watcher child (Unix), reaped by the waiter after the command exits.
     #[cfg(unix)]
     watcher: Option<tokio::process::Child>,
@@ -144,8 +159,10 @@ impl BackgroundSessions {
     ///
     /// The command is spawned detached from the tool call: stdout and stderr
     /// are redirected (RAW) into the output file, stdin is null (strictly
-    /// non-interactive), and the command runs in its own process group whose
-    /// lifetime is bounded by the agent (teardown kill) and the watchdog.
+    /// non-interactive), and the command's whole process tree is contained —
+    /// in its own process group on Unix, whose lifetime is bounded by the agent
+    /// (teardown kill) and the watchdog, and in a job object on Windows (see
+    /// the module docs).
     ///
     /// Launch failures (command not found / not executable, detected via the
     /// bounded early-exit probe) are returned as `Err` synchronously — never
@@ -161,7 +178,7 @@ impl BackgroundSessions {
         // Owner-deletes-at-end: attribute the output file to the calling agent
         // (the CURRENT_TOOL_AGENT_ID task-local is set during tool execution)
         // so `run_agent`'s end-of-run cleanup removes it alongside the spill
-        // files — `terminate_all` kills the process group but leaves the file.
+        // files — `terminate_all` kills the process tree but leaves the file.
         super::record_spill_owner(output_path.clone());
 
         // ── Command child ──
@@ -177,6 +194,12 @@ impl BackgroundSessions {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::from(stdout_file));
         cmd.stderr(Stdio::from(stderr_file));
+
+        // Windows: the session's whole-tree containment, created before the
+        // spawn and dropped on every launch path that never registers the
+        // session — which ends whatever had already been started (`tree`).
+        #[cfg(not(unix))]
+        let mut tree = Tree::new(RunOwner::Agent);
 
         #[cfg(unix)]
         let watchdog = match WatchdogSetup::spawn(&mut cmd, &output_path) {
@@ -196,6 +219,11 @@ impl BackgroundSessions {
                 return Err(format!("Failed to start background command: {e}"));
             }
         };
+
+        #[cfg(not(unix))]
+        if let Some(pid) = cmd_child.id() {
+            tree.attach(pid);
+        }
 
         // ── Bounded early-exit launch probe ──
         // Note: the 126/127 detection is Unix-shell-specific — cmd.exe on
@@ -239,6 +267,8 @@ impl BackgroundSessions {
             write_end: Some(watchdog.write_end),
             #[cfg(unix)]
             pgid: watchdog.pgid,
+            #[cfg(not(unix))]
+            tree,
             early_status,
             finished: Arc::new(AtomicBool::new(false)),
         };
@@ -250,10 +280,11 @@ impl BackgroundSessions {
         Ok(output_path)
     }
 
-    /// Two-stage stop of the session whose output file is `output_path`:
-    /// SIGTERM → grace (~5s) → SIGKILL to the process group. Stopping an
-    /// already-finished session is a no-op guarded by the per-session
-    /// finished flag (PID-reuse safety).
+    /// Stop the session whose output file is `output_path`. On Unix that is a
+    /// two-stage stop: SIGTERM → grace (~5s) → SIGKILL to the process group. On
+    /// Windows there is no graceful request to make — the stop ends the whole
+    /// process tree at once. Stopping an already-finished session is a no-op
+    /// guarded by the per-session finished flag (PID-reuse safety).
     pub(crate) async fn stop(self: &Arc<Self>, output_path: &Path) -> Result<StopResult, String> {
         #[cfg(unix)]
         {
@@ -289,7 +320,7 @@ impl BackgroundSessions {
         }
         #[cfg(not(unix))]
         {
-            let (command, finished) = {
+            let (command, tree, finished) = {
                 let guard = self.inner.lock().unwrap_poison();
                 let entry = guard.get(output_path).ok_or_else(|| {
                     format!(
@@ -297,15 +328,22 @@ impl BackgroundSessions {
                         output_path.display()
                     )
                 })?;
-                (entry.command.clone(), entry.finished.clone())
+                (
+                    entry.command.clone(),
+                    entry.tree.clone(),
+                    entry.finished.clone(),
+                )
             };
             if finished.load(Ordering::SeqCst) {
                 return Ok(StopResult::AlreadyFinished);
             }
-            // Windows: no SIGTERM equivalent — terminate the direct child
-            // (grandchildren survive; accepted asymmetry). The scoped block
-            // keeps the `!Send` guard out of the await below.
-            {
+            // Windows has no SIGTERM equivalent: a stop ends the whole tree at
+            // once and gives no grace. The direct child is the fallback for a
+            // session whose job did not end its tree — no job (the assignment was
+            // refused, see `tree`) or a failed termination — exactly as a stop
+            // worked before jobs existed. The scoped block keeps the `!Send`
+            // guard out of the await below.
+            if !tree.terminate() {
                 let mut g = command.lock().unwrap_poison();
                 let _ = g.start_kill();
             }
@@ -331,7 +369,7 @@ impl BackgroundSessions {
                     }
                     #[cfg(not(unix))]
                     {
-                        (e.command.clone(),)
+                        (e.command.clone(), e.tree.clone())
                     }
                 })
                 .collect()
@@ -346,14 +384,15 @@ impl BackgroundSessions {
             }
             #[cfg(not(unix))]
             {
-                // Blocking lock: every critical section on this mutex is a
-                // short synchronous try_wait/start_kill call (never held
-                // across an await), so this cannot deadlock — and a try_lock
-                // that fails while the waiter polls would silently leak the
-                // direct child past teardown (no watchdog on Windows to cover
-                // it).
-                let mut g = target.0.lock().unwrap_poison();
-                let _ = g.start_kill();
+                // Blocking lock: every critical section on this mutex is a short
+                // synchronous try_wait/start_kill call (never held across an
+                // await), so this cannot deadlock — and a try_lock that fails
+                // while the waiter polls would silently leak the direct child of a
+                // session whose job did not end its tree.
+                if !target.1.terminate() {
+                    let mut g = target.0.lock().unwrap_poison();
+                    let _ = g.start_kill();
+                }
             }
         }
     }
@@ -378,23 +417,34 @@ impl BackgroundSessions {
 
     /// Spawn the per-session waiter task: poll the command child until it
     /// exits, append the unconditional exit-status annotation to the output
-    /// file, set the finished flag, close the lifeline write end (the watcher
-    /// then kills any leftover group members and exits), and reap the
-    /// watcher child. Detached — it outlives the agent by a few instants on
-    /// teardown to reap the children the teardown kill just signalled.
+    /// file, set the finished flag, end whatever the session left behind (the
+    /// Unix watcher, whose lifeline write end is closed here, kills the
+    /// leftover group members and exits; Windows ends the tree — see the module
+    /// docs), and reap the watcher child. Detached — it outlives the agent by a
+    /// few instants on teardown to reap the children the teardown kill just
+    /// signalled.
     fn spawn_waiter(self: &Arc<Self>, output_path: &Path) {
+        // The waiter outlives the agent on teardown (it still has to reap what
+        // the teardown kill signalled), so it holds its own handle on the
+        // registry — the unix arm needs it below, for the watcher and the lifeline.
         #[cfg(unix)]
         let sessions = self.clone();
         let output_path = output_path.to_path_buf();
-        let (command, finished, early_status) = {
-            let guard = self.inner.lock().unwrap_poison();
-            let entry = guard.get(&output_path).expect("session just registered");
-            (
-                entry.command.clone(),
-                entry.finished.clone(),
-                entry.early_status,
-            )
-        };
+        // Everything the waiter needs up front: the shared command and finished
+        // handles, and — Windows — the job, which the waiter itself has to own,
+        // since terminating it is what ends whatever the session left behind when
+        // its command exits on its own (the watcher's counterpart, see the module
+        // docs). The unix arm takes the watcher and its lifeline from the entry
+        // later; nothing else is read from it again.
+        let guard = self.inner.lock().unwrap_poison();
+        let entry = guard.get(&output_path).expect("session just registered");
+        let command = entry.command.clone();
+        let finished = entry.finished.clone();
+        let early_status = entry.early_status;
+        #[cfg(not(unix))]
+        let tree = entry.tree.clone();
+        drop(guard);
+
         tokio::spawn(async move {
             // Wait for the command to exit (or reuse the probe's early result).
             let mut status = early_status;
@@ -433,6 +483,12 @@ impl BackgroundSessions {
                     let _ = w.wait().await;
                 }
             }
+
+            // Windows: the command exited on its own, so — like the unix
+            // watcher's group kill when its lifeline closes — nothing the session
+            // left behind runs on.
+            #[cfg(not(unix))]
+            tree.terminate();
         });
     }
 }
@@ -655,6 +711,21 @@ mod tests {
     use crate::workspace::test_ws;
     use tempfile::TempDir;
 
+    /// A command that runs until something stops it — the only kind of launch the
+    /// stop and teardown tests can end themselves.
+    #[cfg(unix)]
+    const LONG_RUNNING: &str = "sleep 30";
+    #[cfg(not(unix))]
+    const LONG_RUNNING: &str = "ping -n 30 127.0.0.1";
+
+    /// What a stopped session's output file ends with: unix kills the group with a
+    /// signal, Windows ends the tree and reports a plain non-zero code (see
+    /// `tree`).
+    #[cfg(unix)]
+    const STOPPED_ANNOTATION: &str = "[exit status: terminated by signal]";
+    #[cfg(not(unix))]
+    const STOPPED_ANNOTATION: &str = "[exit status: 1]";
+
     /// Wait for a session's finished flag with a generous bound.
     async fn wait_finished(sessions: &BackgroundSessions, path: &Path, bound: Duration) -> bool {
         let deadline = Instant::now() + bound;
@@ -825,7 +896,7 @@ mod tests {
         let sessions = Arc::new(BackgroundSessions::default());
 
         let path = sessions
-            .launch("sleep 30", ws.as_path())
+            .launch(LONG_RUNNING, ws.as_path())
             .await
             .expect("launch succeeds");
         assert!(
@@ -846,10 +917,7 @@ mod tests {
             "stopped session should finish"
         );
         let out = read_file(&path);
-        assert!(
-            out.contains("[exit status: terminated by signal]"),
-            "output: {out}"
-        );
+        assert!(out.contains(STOPPED_ANNOTATION), "output: {out}");
     }
 
     /// Two-stage stop must not SIGKILL after the command exited during the
@@ -931,11 +999,11 @@ mod tests {
         let sessions = Arc::new(BackgroundSessions::default());
 
         let p1 = sessions
-            .launch("sleep 30", ws.as_path())
+            .launch(LONG_RUNNING, ws.as_path())
             .await
             .expect("launch 1");
         let p2 = sessions
-            .launch("sleep 30", ws.as_path())
+            .launch(LONG_RUNNING, ws.as_path())
             .await
             .expect("launch 2");
         assert_eq!(sessions.inner.lock().unwrap_poison().len(), 2);
@@ -951,10 +1019,7 @@ mod tests {
             "session 2 killed by teardown"
         );
         let o1 = read_file(&p1);
-        assert!(
-            o1.contains("[exit status: terminated by signal]"),
-            "output 1: {o1}"
-        );
+        assert!(o1.contains(STOPPED_ANNOTATION), "output 1: {o1}");
     }
 
     /// The watchdog: closing the daemon-side write end (simulating a hard

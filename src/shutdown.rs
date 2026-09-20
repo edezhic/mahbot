@@ -384,9 +384,12 @@ pub fn install_console_stop_handler() {
 /// - External termination (the task manager's "end process", `TerminateProcess`): no
 ///   process can intercept it. Its "end task" is a different command, raises the
 ///   close event, and does become graceful here.
-/// - Process-tree containment: children the daemon starts (shells, the browser CLI)
-///   survive a stop when they are not stopped with it. That asymmetry belongs to
-///   those subsystems, not to termination, and is left alone.
+/// - Process-tree containment: a stop that ends the daemon takes the command trees
+///   it started with it — a job object's handles go with the process
+///   (`tools::shell::tree`) — while the launches it detaches on purpose (the
+///   browser, the browser-automation CLI, the replacement instance of a
+///   self-update) survive it. That boundary belongs to those subsystems, not to
+///   termination, and is left alone.
 /// - Ctrl+C and Ctrl+Break before the loop exists: nothing can act on them, so they
 ///   keep today's platform default handling, as macOS/Linux does before its signal
 ///   task registers its streams. Swallowing them instead would make Ctrl+C a dead key
