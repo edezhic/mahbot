@@ -635,6 +635,19 @@ pub async fn run_update_availability_refresh() {
 /// via [`try_lock`](Mutex::try_lock).
 static UPDATE_MUTEX: Mutex<()> = Mutex::const_new(());
 
+// ── Telegram update notifications ─────────────────────────────────────────
+
+/// Local-checkout build done; the restart is reported by [`UPDATE_RESTART_MSG`].
+pub(crate) const UPDATE_BUILD_COMPLETE_MSG: &str = "✅ Build complete.";
+
+/// Registry install done; the restart is reported by [`UPDATE_RESTART_MSG`].
+pub(crate) const UPDATE_INSTALL_COMPLETE_MSG: &str = "✅ Update installed from crates.io.";
+
+/// Sent as the restart phase begins — nothing has restarted yet when this goes
+/// out.
+pub(crate) const UPDATE_RESTART_MSG: &str =
+    "🔄 Waiting for work in progress to finish before the restart…";
+
 // ── Execute update ────────────────────────────────────────────────────────
 
 /// Set while [`execute_update`] runs its finalizing window (drain through
@@ -786,7 +799,10 @@ async fn execute_local_update() -> Result<()> {
         &crate::config::CONFIG.global_storage_root(),
         Duration::from_hours(1),
         "cargo install --path --locked",
-        "Build",
+        &CargoStep {
+            toast_head: "Build failed",
+            admin_head: "Failed to build from source",
+        },
     )
     .await?;
 
@@ -795,7 +811,7 @@ async fn execute_local_update() -> Result<()> {
     finalize_install(
         &fresh_binary,
         admin_target.as_deref(),
-        "✅ Build complete. Restarting…",
+        UPDATE_BUILD_COMPLETE_MSG,
         vec![install_root, build_dir],
     )
     .await
@@ -844,7 +860,10 @@ async fn execute_registry_update() -> Result<()> {
         &crate::config::CONFIG.global_storage_root(),
         Duration::from_hours(1),
         &format!("cargo install {crate_name} --force"),
-        "Update",
+        &CargoStep {
+            toast_head: "Update failed",
+            admin_head: "Failed to install from crates.io",
+        },
     )
     .await?;
 
@@ -853,7 +872,7 @@ async fn execute_registry_update() -> Result<()> {
     finalize_install(
         &fresh_binary,
         admin_target.as_deref(),
-        "✅ Update installed from crates.io. Restarting…",
+        UPDATE_INSTALL_COMPLETE_MSG,
         vec![install_root],
     )
     .await
@@ -879,13 +898,14 @@ fn temp_bin_path(install_root: &Path) -> PathBuf {
 /// 3. Swap the running binary with the fresh one via `self_replace`. The source
 ///    differs from the running exe (it lives in the temp root), which
 ///    self-replace requires on Windows.
-/// 4. Notify `completion_msg` (mode-specific "build complete" / "installed").
+/// 4. Notify `completion_msg` (mode-specific: [`UPDATE_BUILD_COMPLETE_MSG`] /
+///    [`UPDATE_INSTALL_COMPLETE_MSG`]).
 /// 5. Refresh the PATH-visible cargo bin copy (sourced from the freshly-swapped
 ///    `current_exe`, so the manual-remediation source survives temp-root
 ///    cleanup), skipping the copy when already running from the cargo bin path
 ///    (`copy_to_cargo_bin`'s rename would otherwise fail on a Windows binary
 ///    locked in place).
-/// 6. Notify "starting new instance" (Telegram channel must still be live).
+/// 6. Notify [`UPDATE_RESTART_MSG`] (Telegram channel must still be live).
 /// 7. Hand off to [`finalize_update_and_restart`] for the drain → checkpoint →
 ///    temp-root cleanup → unlock → spawn-from-`current_exe` → exit.
 ///
@@ -926,9 +946,9 @@ async fn finalize_install(
     //    remediation in `stale_binary_notification` points at a surviving path.
     refresh_cargo_bin(&current_exe, admin_target).await;
 
-    // 6. Notify: starting new instance (MUST be before the shutdown in
+    // 6. Notify: wrapping up before the restart (MUST be before the shutdown in
     //    finalize_update_and_restart — the Telegram channel must still be live).
-    notify_admin("🔄 Starting new instance…", admin_target).await;
+    notify_admin(UPDATE_RESTART_MSG, admin_target).await;
 
     // 7. Shared finalize tail. The temp roots are removed in the tail (before
     //    the instance-lock release and spawn) rather than by RAII: `exit(0)`
@@ -1036,6 +1056,46 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
+/// The two heads a cargo step's failure is reported under; see
+/// [`CargoStepFailure`].
+struct CargoStep {
+    toast_head: &'static str,
+    admin_head: &'static str,
+}
+
+impl CargoStep {
+    /// The failure for a step that reported `body` — the text after the head,
+    /// separator included.
+    fn failure(&self, body: String) -> anyhow::Error {
+        anyhow::Error::new(CargoStepFailure {
+            toast_head: self.toast_head,
+            admin_head: self.admin_head,
+            body,
+        })
+    }
+}
+
+/// A failed cargo step of an update: one `body`, rendered under two heads.
+///
+/// [`Display`](std::fmt::Display) is the text the desktop toast has always
+/// shown; [`update_failure_notification`] composes the Telegram line, whose
+/// head names the step that failed.
+#[derive(Debug)]
+struct CargoStepFailure {
+    toast_head: &'static str,
+    admin_head: &'static str,
+    /// The captured output of a failed run (`:\n```…````), or why there is none.
+    body: String,
+}
+
+impl std::fmt::Display for CargoStepFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.toast_head, self.body)
+    }
+}
+
+impl std::error::Error for CargoStepFailure {}
+
 /// Run a long-running cargo subcommand with a timeout. Shared by the
 /// local-build and registry-install update paths (the only differences are the
 /// arguments, working directory, timeout, and user-facing labels).
@@ -1044,8 +1104,8 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
 /// as `&OsStr` so paths and flags pass through without Unicode assumption),
 /// `cwd` the working directory, `timeout` the hard deadline, `label` a
 /// short human-readable description used in logs and error messages (e.g.
-/// "cargo install --path --locked"), and `failure_kind` the noun used in
-/// failure messages ("Build" / "Update").
+/// "cargo install --path --locked"), and `step` the two heads a failure of this
+/// step is reported under.
 ///
 /// `CARGO_TARGET_DIR` is stripped so `cargo install` (registry mode, which
 /// passes no `--target-dir`) never redirects its build into an uncleaned tree;
@@ -1060,7 +1120,7 @@ async fn run_cargo_with_timeout(
     cwd: &Path,
     timeout: Duration,
     label: &str,
-    failure_kind: &str,
+    step: &CargoStep,
 ) -> Result<()> {
     info!("Starting {label} in {}", cwd.display());
     let cargo_result = tokio::time::timeout(
@@ -1086,21 +1146,17 @@ async fn run_cargo_with_timeout(
     .await;
 
     match cargo_result {
-        Err(_elapsed) => {
-            anyhow::bail!(
-                "{failure_kind} failed: {label} timed out after {} minutes",
-                timeout.as_secs() / 60
-            );
-        }
-        Ok(Err(e)) => {
-            anyhow::bail!("{failure_kind} failed: could not start cargo: {e}");
-        }
+        Err(_elapsed) => Err(step.failure(format!(
+            ": {label} timed out after {} minutes",
+            timeout.as_secs() / 60
+        ))),
+        Ok(Err(e)) => Err(step.failure(format!(": could not start cargo: {e}"))),
         Ok(Ok(output)) if !output.status.success() => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             let combined = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
             let truncated = truncate_to_last_64k(&combined);
-            anyhow::bail!("{failure_kind} failed:\n```\n{truncated}\n```");
+            Err(step.failure(format!(":\n```\n{truncated}\n```")))
         }
         Ok(Ok(_)) => {
             info!("{label} completed successfully");
@@ -1144,6 +1200,21 @@ pub async fn notify_admin(message: &str, target: Option<&str>) {
     {
         error!(error = %e, "Failed to send update notification to admin");
     }
+}
+
+/// Compose the Telegram failure text: the marker plus one plain statement of
+/// what failed. A failed cargo step names itself (see [`CargoStepFailure`]);
+/// every other failure reports its own error text.
+///
+/// Shared by both entry points, so the `/update` command and the window's Update
+/// button report the same line. The desktop toast composes its own (see the
+/// error's [`Display`](std::fmt::Display)).
+pub(crate) fn update_failure_notification(err: &anyhow::Error) -> String {
+    let statement = match err.downcast_ref::<CargoStepFailure>() {
+        Some(failure) => format!("{}{}", failure.admin_head, failure.body),
+        None => format!("{err:#}"),
+    };
+    format!("❌ {statement}")
 }
 
 /// Reply used when a command requires the admin. Used by both
@@ -1204,9 +1275,9 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
 
     // Atomically claim the in-progress flag before spawning. This closes the
     // TOCTOU where a concurrent `/update` could pass the pre-check above, then
-    // lose `UPDATE_MUTEX.try_lock` inside `execute_update` and be misreported
-    // as "Update failed: An update is already in progress." `execute_update`
-    // keeps the flag set and clears it on failure.
+    // lose `UPDATE_MUTEX.try_lock` inside `execute_update` and be reported
+    // through the failure message as "An update is already in progress."
+    // `execute_update` keeps the flag set and clears it on failure.
     if update_cache()
         .in_progress
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1231,7 +1302,7 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
         if let Err(e) = execute_update().await {
             // Single failure report: the admin's bound Telegram target (the normal update
             // notification path), plus the invoking admin when they differ.
-            let failure = format!("❌ Update failed:\n{e:#}");
+            let failure = update_failure_notification(&e);
             let admin_target = resolve_update_admin_target().await;
             notify_admin(&failure, admin_target.as_deref()).await;
             if admin_target.as_deref() != Some(invoker_target.as_str()) {

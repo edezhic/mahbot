@@ -1332,11 +1332,15 @@ impl Dashboard {
                                     // the GUI toast, preserving the prior behavior
                                     // where the update path notified on failure.
                                     // `execute_update` no longer notifies; each caller
-                                    // is the single failure reporter.
+                                    // composes its own failure text.
                                     let msg = format!("❌ Update failed:\n{e:#}");
                                     let target =
                                         crate::self_update::resolve_admin_telegram_target().await;
-                                    crate::self_update::notify_admin(&msg, target.as_deref()).await;
+                                    crate::self_update::notify_admin(
+                                        &crate::self_update::update_failure_notification(&e),
+                                        target.as_deref(),
+                                    )
+                                    .await;
                                     Err(msg)
                                 }
                             }

@@ -2895,3 +2895,33 @@ async fn user_command_entries_reflect_admin_state() {
     })
     .await;
 }
+
+// ── Self-update notification texts ─────────────────────────────────────────
+
+/// The self-update notifications must reach the admin as plain, single
+/// messages: no character may be turned into markup, and none may be split by
+/// the chunker (a split message reads as several notifications).
+#[test]
+fn test_update_notification_texts_render_as_plain_single_messages() {
+    for text in [
+        crate::self_update::UPDATE_BUILD_COMPLETE_MSG,
+        crate::self_update::UPDATE_INSTALL_COMPLETE_MSG,
+        crate::self_update::UPDATE_RESTART_MSG,
+    ] {
+        assert_eq!(to_telegram_html(text), text, "not plain text: {text}");
+        assert_eq!(
+            split_message_for_telegram(text).len(),
+            1,
+            "split into several messages: {text}"
+        );
+    }
+
+    // A failure's lead line is plain text like the notifications above; only the
+    // detail under it (the captured build/install output) becomes a code block.
+    let failure = crate::self_update::update_failure_notification(&anyhow::anyhow!(
+        "Failed to build from source:\n```\nboom\n```"
+    ));
+    let html = to_telegram_html(&failure);
+    assert_eq!(html.lines().next(), failure.lines().next());
+    assert_eq!(split_message_for_telegram(&html).len(), 1);
+}
