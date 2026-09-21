@@ -3521,9 +3521,11 @@ pub(crate) mod test_support {
     /// checkpoint on drop), with the main file then truncated to 0 bytes.
     ///
     /// The engine that reopens it sees an empty database — `sqlite_schema` is
-    /// empty, so the fixture's rows are NOT readable in this state — while the
-    /// journal holds the only copy of the committed frames, which a reclaiming
-    /// checkpoint would discard.
+    /// empty, so the fixture's rows are NOT readable in this state — and discards
+    /// the orphan journal as it opens the store: turso 0.8.0 answers 0 pages and
+    /// empties a journal it cannot apply to an empty main file. The state is a
+    /// boot refusal, and this fixture pins that it never reaches a reclaiming
+    /// round (see the checkpoint tests).
     pub(crate) async fn build_empty_main_file_store(db_path: &Path) {
         create_fixture_store(db_path).await;
         let wal = super::wal_path(db_path);

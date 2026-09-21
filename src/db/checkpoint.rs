@@ -2671,37 +2671,39 @@ mod tests {
         );
     }
 
-    /// The gate's destructive state A end to end through the real reclaiming
-    /// round: an empty main file with a non-empty journal. Not one byte moves and
-    /// the store keeps the engine's lock, though the engine resolves an empty
-    /// database in this state (`sqlite_schema` is empty, so the fixture's rows are
-    /// NOT readable), so the demonstration rests on the files' bytes, the locked
-    /// store and the row-free statement that still runs — exactly what the fixture
-    /// builder documents. The closing proof, last because it destroys the fixture,
-    /// shows what the refusal withheld: an ungated reclaiming checkpoint truncates
-    /// the journal that holds the only copy of the committed frames.
+    /// The gate's destructive state A — an empty main file with a non-empty
+    /// journal — never reaches a reclaiming round on this engine. A machine that
+    /// finds such a store refuses to start: the boot pre-flight classifies the
+    /// shape before the store is opened (asserted here). Opening it anyway, which
+    /// only a test can do, makes the engine discard the orphan journal as it
+    /// resolves the empty main file (turso 0.8.0 leaves the main file at 0 bytes
+    /// and empties the journal it cannot apply), so a round finds nothing left to
+    /// destroy and files nothing. The gate's rule for the state is pinned by its
+    /// own answer-table tests; the two states the engine *does* present run end to
+    /// end below.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
-    async fn empty_main_file_with_a_journal_is_refused_end_to_end() {
+    async fn empty_main_file_with_a_journal_is_refused_at_boot_and_never_reaches_a_round() {
         crate::shutdown::drain_clear();
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let db_path = crate::db::store_db_path(tmp.path(), "core");
         let wal = crate::db::wal_path(&db_path);
         build_empty_main_file_store(&db_path).await;
-        let before_main = std::fs::read(&db_path).expect("read the fixture main file");
-        let before_wal = std::fs::read(&wal).expect("read the fixture journal");
+        let journal_bytes = std::fs::metadata(&wal)
+            .expect("stat the fixture journal")
+            .len();
         assert!(
-            before_main.is_empty(),
-            "the fixture must leave an empty main file, found {} bytes",
-            before_main.len(),
+            journal_bytes > crate::db::wal_guard::WAL_HEADER_BYTES,
+            "the fixture must leave committed frames in its journal, found \
+             {journal_bytes} bytes",
         );
-        // The boot pre-flight keeps refusing this file on its own terms: the gate
-        // adds no rule of its own about what a store may look like.
-        let verdict = crate::db::wal_guard::classify_store_shape(&db_path);
+
+        // The product's own door is closed on this store before the gate could
+        // ever be asked: the boot pre-flight refuses the shape.
         assert_eq!(
-            verdict,
+            crate::db::wal_guard::classify_store_shape(&db_path),
             StoreShape::Unusable(ShapeDefect::ZeroBytes),
-            "an empty main file must stay a boot refusal, not a gate finding",
+            "an empty main file must stay a boot refusal",
         );
 
         let conn = Connection::open(&db_path)
@@ -2712,33 +2714,16 @@ mod tests {
             0,
             "the engine must answer no pages for the empty main file",
         );
-
-        periodic_checkpoint("core", &conn, true, Some(tmp.path())).await;
-
-        assert_refusal_recorded(tmp.path());
-        let schema_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sqlite_schema", (), |r| {
-                r.get::<i64>(0)
-            })
-            .await
-            .expect("the refused round must leave the store serving");
         assert_eq!(
-            schema_rows, 0,
-            "the engine resolves an empty database in this state",
+            std::fs::metadata(&wal).expect("stat the journal").len(),
+            0,
+            "the engine must discard the orphan journal as it opens the empty store",
         );
 
-        assert_store_untouched_by_the_refusal(&db_path, &before_main, &before_wal, verdict);
-
-        conn.checkpoint_ungated()
-            .await
-            .expect("run the ungated reclaiming checkpoint");
-        let journal_len = std::fs::metadata(&wal)
-            .expect("stat the fixture journal")
-            .len();
-        assert_eq!(
-            journal_len, 0,
-            "an ungated reclaiming checkpoint must truncate the journal that holds the only \
-             copy of the committed frames, left {journal_len} bytes",
+        periodic_checkpoint("core", &conn, true, Some(tmp.path())).await;
+        assert!(
+            !tmp.path().join("error.log").exists(),
+            "a round with nothing left to destroy files no refusal",
         );
     }
 
