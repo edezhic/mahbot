@@ -566,11 +566,11 @@ async fn shutdown_after_dashboard() {
         "{} — shutting down",
         mahbot::shutdown::exit_trigger().unwrap_or("Dashboard window closed")
     );
-    // No shutdown() here — the token is already fired whenever the iced runtime
-    // exits: the shutdown subscription emits Message::Shutdown only after token
-    // cancellation, and the UpdateResult-failure exit (save_and_exit) runs only
-    // after the update's finalizing drain fired it. A future exit path that
-    // drops the runtime without firing the token would break this invariant.
+    // No shutdown() here — the token is already cancelled whenever this function
+    // runs: every in-app exit goes through `save_and_exit`, which fires it before
+    // exiting (the drain paths arrive with it fired already). A future exit path
+    // that drops the runtime without firing the token would break this
+    // invariant.
     mahbot::agent::registry::AGENT_REGISTRY.shutdown_all();
 
     let release = mahbot::tools::chrome_release::flush_and_close_all_chrome_sessions();

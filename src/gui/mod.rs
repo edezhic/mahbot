@@ -74,6 +74,14 @@ use futures_util::StreamExt;
 /// cards and footer responsive.
 const RUNTIME_REFRESH_COALESCE: Duration = Duration::from_millis(250);
 
+/// How long a close requested before boot finished waits for the boot task to
+/// deliver its result before the exit path runs anyway. The boot is the only
+/// writer to the stores until then, and a store left before its first catalog
+/// run is refused on the next start (`db::has_product_schema`) — so waiting is
+/// the normal case (a boot takes well under a second), and this limit covers
+/// only a start that never finishes, which must stay closable.
+const BOOT_EXIT_WAIT: Duration = Duration::from_secs(15);
+
 // ── Global log broadcast for live streaming ──────────────────────
 
 /// Global broadcast sender for live log streaming. Set during `startup()`.
@@ -306,6 +314,8 @@ pub enum Message {
     /// the drain completes (the token fires).
     DrainStarted,
     /// Window close button pressed — persist position and size before exiting.
+    /// Once boot has finished this begins the graceful drain; before it, the
+    /// close runs the exit path directly (see the arm).
     CloseRequested(window::Id),
     /// Window geometry event (move/resize) — tracks state for persist-on-close.
     WindowEvent(window::Id, window::Event),
@@ -343,6 +353,9 @@ pub enum Message {
         restored_name: String,
         generation: u64,
     },
+    /// The wait for a still-running boot expired ([`BOOT_EXIT_WAIT`], a start
+    /// that hangs): run the exit path for the close that was waiting.
+    BootExitWaitExpired,
     /// Full workspace map reloaded from the store (CDC workspaces event,
     /// stream lag, toggle completion, or a settings add/delete). The handler
     /// re-resolves the live selection against this fresh map — falling back to
@@ -550,6 +563,10 @@ pub static BOOT_LOG_STORE: OnceLock<LogStore> = OnceLock::new();
 pub struct Dashboard {
     ready: bool,
     boot_error: Option<String>,
+    /// A close requested while the boot task was still running: the exit waits
+    /// for the boot's result (bounded by [`BOOT_EXIT_WAIT`]) instead of
+    /// interrupting the store bring-up. See the `CloseRequested` arm.
+    exit_after_boot: bool,
     page: Page,
     log_store: Option<LogStore>,
 
@@ -633,6 +650,7 @@ impl Dashboard {
         Self {
             ready: false,
             boot_error: None,
+            exit_after_boot: false,
             page: Page::Home,
             log_store: None,
             last_size: iced::Size::new(1500.0, 800.0),
@@ -750,6 +768,8 @@ impl Dashboard {
         save_window_state(self.last_position, self.last_size);
     }
 
+    /// The one exit path: flush the draft, record the window geometry, fire the
+    /// shutdown token, then leave the iced runtime.
     fn save_and_exit(&self) -> Task<Message> {
         crate::channels::chat_draft::flush_global();
         self.persist_window_state();
@@ -764,6 +784,12 @@ impl Dashboard {
             // and honors the close.
             return Task::none();
         }
+        // Fire the token before the runtime drops — `shutdown_after_dashboard`
+        // relies on it being cancelled by then (see its note in main.rs), and a
+        // close that arrives before boot finished reaches here with no drain to
+        // have fired it. Idempotent: every other arrival has it cancelled
+        // already.
+        crate::shutdown::force_cancel();
         // The checkpoint is deliberately NOT run here: it relocated to
         // shutdown_after_dashboard, which runs after the iced runtime drops —
         // genuinely single-writer (today's in-iced checkpoint ran while
@@ -1095,7 +1121,21 @@ impl Dashboard {
 
         match message {
             // ── Pre-ready handlers (execute regardless of ready state) ──
-            Message::Boot(result) => self.finish_boot(result),
+            Message::Boot(result) => {
+                // A close that arrived while the boot was still writing the
+                // stores takes effect now — the boot has stopped, so it cannot
+                // be left mid-bring-up (see the CloseRequested arm).
+                if std::mem::take(&mut self.exit_after_boot) {
+                    return self.save_and_exit();
+                }
+                self.finish_boot(result)
+            }
+            Message::BootExitWaitExpired => {
+                // The boot did not deliver a result within [`BOOT_EXIT_WAIT`] (a
+                // start that hangs): the close that was waiting ends the
+                // process anyway.
+                self.save_and_exit()
+            }
             Message::BootWorkspaces {
                 workspaces,
                 restored_name,
@@ -1111,6 +1151,30 @@ impl Dashboard {
                     self.persist_window_state();
                     self.exit_requested_during_update = true;
                     Task::none()
+                } else if !self.ready {
+                    // A close before boot finished has no drain to complete: the
+                    // drain-watch, and the shutdown subscription that turns the
+                    // token into an exit, both exist only after a successful
+                    // boot — so the exit path runs directly. Not while the boot
+                    // is still writing the stores, though: a store left before
+                    // its first catalog run is refused on the next start
+                    // (`db::has_product_schema`), so a close that arrives
+                    // mid-boot waits for the boot's result instead, and
+                    // [`BOOT_EXIT_WAIT`] bounds that wait so a start which never
+                    // finishes stays closable. A repeat close changes nothing:
+                    // that exit is already pending.
+                    if self.boot_error.is_some() {
+                        // The start failed, so the boot stopped with it: nothing
+                        // is writing the stores any more.
+                        self.save_and_exit()
+                    } else if self.exit_after_boot {
+                        Task::none()
+                    } else {
+                        self.exit_after_boot = true;
+                        Task::perform(async { tokio::time::sleep(BOOT_EXIT_WAIT).await }, |()| {
+                            Message::BootExitWaitExpired
+                        })
+                    }
                 } else if crate::shutdown::is_draining() {
                     // Window-close during drain = second signal: force-cancel
                     // (fires the token → Message::Shutdown → exit path).
@@ -2131,26 +2195,26 @@ fn group_section<'a>(
 
 impl Dashboard {
     pub fn subscription(&self) -> iced::Subscription<Message> {
-        // Window events are subscribed from the start, before boot completes.
-        // Pre-boot Resized/Moved events update last_size/last_position, which
-        // are persisted to window-state.json on close — without them, closing
-        // a never-resized window would overwrite the restored geometry with
-        // the hardcoded defaults (iced does not replay missed window events).
-        // Close-request handling stays behind the readiness gate so the
-        // shutdown/checkpoint path never runs before stores are initialized.
+        // Window events are subscribed from the start, before boot completes —
+        // a close request included: it must reach the dashboard in every state
+        // (see the CloseRequested arm). Pre-boot Resized/Moved events update
+        // last_size/last_position, which are persisted to window-state.json on
+        // close — without them, closing a never-resized window would overwrite
+        // the restored geometry with the hardcoded defaults (iced does not
+        // replay missed window events).
         let window_events = iced::Subscription::batch([
             window::resize_events()
                 .map(|(id, size)| Message::WindowEvent(id, window::Event::Resized(size))),
             window::events().filter_map(|(id, event)| {
                 matches!(&event, window::Event::Moved(_)).then_some(Message::WindowEvent(id, event))
             }),
+            window::close_requests().map(Message::CloseRequested),
         ]);
         if !self.ready {
             return window_events;
         }
         iced::Subscription::batch([
             window_events,
-            window::close_requests().map(Message::CloseRequested),
             keyboard::listen().filter_map(|event| {
                 use keyboard::Key;
                 let (key, modifiers, physical_key) = parse_key_press(event)?;

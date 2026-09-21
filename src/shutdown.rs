@@ -475,7 +475,7 @@ pub fn install_session_end_listener() {
 ///   keep today's platform default handling, as macOS/Linux does before its signal
 ///   task registers its streams. Swallowing them instead would make Ctrl+C a dead key
 ///   wherever boot never reaches the loop — the start-failure screen, which consumes
-///   neither the drain flag nor the token.
+///   neither the drain flag nor the token (only its own window's close).
 /// - Once the loop exists the handler suppresses the default handling for Ctrl+C and
 ///   Ctrl+Break, so those would be inert if that loop died while the process lived. Unix
 ///   is no better: tokio keeps its handler installed for the whole process even once the
@@ -492,11 +492,13 @@ pub fn install_session_end_listener() {
 /// # Remaining silent hard deaths
 ///
 /// Those the dead ends above name, plus a stop request that arrives with the handler
-/// unregistered (Ctrl+C alone still reaches tokio's handler then) and a close during a
-/// start-up that never reached the loop. A session end is not among them: it reaches the
-/// process through its own window whether or not this handler is registered — the detached
-/// instance a self-update leaves behind has no console for console events, but it owns a
-/// window just the same.
+/// unregistered (Ctrl+C alone still reaches tokio's handler then) and a console close
+/// during a start-up that never reached the loop — a console event has no consumer while
+/// that loop does not exist, and none is added for it. The dashboard's own window close
+/// is not among them: the dashboard consumes it in every state, whether or not boot
+/// finished. A session end is not among them: it reaches the process through its own window
+/// whether or not this handler is registered — the detached instance a self-update leaves
+/// behind has no console for console events, but it owns a window just the same.
 #[cfg(windows)]
 mod console {
     use super::{DEFAULT_STOP_GRACE, StopRequest, record_stop_deadline};
@@ -679,10 +681,11 @@ mod console {
 /// # Accepted, deliberately not fixed
 ///
 /// - A session end before the dashboard is ready: the dashboard subscribes to shutdown only
-///   once boot has succeeded and nothing else produces its exit request, so the forced stop is
-///   not consumed and the platform ends the process as today. A boot that finishes inside the
-///   platform's grace does exit properly (the token stays fired for the subscription that then
-///   appears); one that fails never does.
+///   once boot has succeeded and nothing else consumes the forced stop, so the platform ends
+///   the process as today — unless the owner closes the window during the grace, which the
+///   dashboard consumes in every state and which runs the same exit path. A boot that
+///   finishes inside the platform's grace does exit properly (the token stays fired for the
+///   subscription that then appears); one that fails never does.
 /// - A session end while a self-update is finalizing: the update's exit path wins, spawn
 ///   included. The replacement it starts into a session that is ending is cut off with the
 ///   session like any other in-flight work, and the next start recovers. Deliberately no guard
