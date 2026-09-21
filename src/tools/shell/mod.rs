@@ -19,6 +19,7 @@ use crate::util::strip_ansi_escapes;
 
 mod bg;
 pub(crate) mod grep_engine;
+mod mem;
 mod profiles;
 mod readonly;
 mod scan;
@@ -118,6 +119,11 @@ const DEFAULT_OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 10;
 /// Grace window given to pipe readers to notice cancellation and return
 /// buffered partial output after a process-group kill.
 const DRAIN_CANCEL_GRACE: Duration = Duration::from_secs(2);
+/// How often a running command's whole process tree is sampled for resident
+/// memory ([`mem`]) — modest, since every sample walks the tree and reads
+/// each process in it. A run always takes at least one sample: the interval's
+/// first tick is immediate.
+const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 /// Cap bytes collected from each pipe during command execution (including timeouts).
 ///
 /// # Truncation safety
@@ -304,7 +310,33 @@ enum ShellRunResult {
         pid: Option<u32>,
         elapsed: Duration,
     },
+    /// The run's whole process tree grew past the memory ceiling and was
+    /// ended like a timeout — `used` is the sample that tripped the watchdog
+    /// and `limit` the ceiling it crossed. A variant of its own rather than a
+    /// `TimedOut` with a reason: a run ended for memory must be impossible to
+    /// mistake for one that ran out of time.
+    MemoryExceeded {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        pid: Option<u32>,
+        elapsed: Duration,
+        used: u64,
+        limit: u64,
+    },
     SpawnFailed(std::io::Error),
+}
+
+/// How the wait inside [`run_command_with_timeout`] ended — the three bounds
+/// it watches at once.
+enum WaitOutcome {
+    /// The child exited (or the wait itself failed): the result is handed on
+    /// exactly as `child.wait()` produced it.
+    Exited(std::io::Result<std::process::ExitStatus>),
+    /// The timeout expired — a stop.
+    TimedOut,
+    /// A memory sample crossed the ceiling — a stop, carrying the sample and
+    /// the ceiling so the failure can report both.
+    MemoryExceeded { used: u64, limit: u64 },
 }
 
 /// Read from an async stream up to `cap` bytes, then continue reading and
@@ -651,6 +683,10 @@ async fn drain_pipe_readers(
 /// turns the drain into a bounded [`ShellRunResult::DrainTimedOut`] instead
 /// of an indefinite hang.
 ///
+/// While the child runs, its whole process tree is also sampled for resident
+/// memory ([`mem`]); a sample over `memory_limit` ends the run the way the
+/// timeout does and reports [`ShellRunResult::MemoryExceeded`].
+///
 /// `owner` decides the run's whole-tree containment ([`tree`]): unix contains
 /// every run the same way — the process group the child leads — while Windows
 /// gives a job object only to an agent's run.
@@ -658,6 +694,7 @@ async fn run_command_with_timeout(
     cmd: &mut tokio::process::Command,
     timeout: Duration,
     drain_limit: Duration,
+    memory_limit: Option<u64>,
     owner: RunOwner,
 ) -> ShellRunResult {
     let start = std::time::Instant::now();
@@ -691,8 +728,8 @@ async fn run_command_with_timeout(
     let mut stdout_handle = spawn_pipe_reader(stdout_pipe, cancel.clone());
     let mut stderr_handle = spawn_pipe_reader(stderr_pipe, cancel.clone());
 
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => {
+    match await_run_end(&mut child, timeout, memory_limit, pid).await {
+        WaitOutcome::Exited(Ok(status)) => {
             // Child reaped — the guard must not fire: on unix the group leader
             // is gone and a post-reap kill would risk PID reuse, while a Windows
             // job retained for the process lifetime must not be ended here.
@@ -737,41 +774,15 @@ async fn run_command_with_timeout(
                 }
             }
         }
-        Ok(Err(e)) => ShellRunResult::SpawnFailed(e),
-        Err(_) => {
-            // Kill the entire process tree (child + grandchildren) on timeout:
-            // the run's containment, plus a signal to the direct child itself
-            // first, so the reap below cannot wait on a child the containment
-            // termination failed to reach.
-            //
-            // Order matters on unix: `start_kill` (fire-and-forget SIGKILL)
-            // precedes the group kill, because `child.kill().await` — which
-            // includes `wait()` — would let the child's PID be reused before we
-            // could signal the group it leads (`process_group(0)` in
-            // [`build_shell_command`]). On Windows the direct kill is the
-            // fallback for a run whose containment could not be established (see
-            // `tree`) and for a job termination that failed.
-            let _ = child.start_kill();
-            tree.terminate();
-            let _ = child.wait().await;
-            // Reaped — disarm the guard (the explicit kill already ran).
-            kill_guard.disarm();
-            cancel.cancel();
-
-            // Give readers a grace window to notice cancellation and return
-            // their buffers. If a reader takes longer than 2 s (e.g. because
-            // a grandchild keeps the pipe open), we still get partial data
-            // from the buffer it returns after noticing cancellation.
-            let stdout = await_pipe_reader_with_cancellation_timeout(
+        WaitOutcome::Exited(Err(e)) => ShellRunResult::SpawnFailed(e),
+        WaitOutcome::TimedOut => {
+            let (stdout, stderr) = stop_and_collect(
+                &mut child,
+                &tree,
+                &mut kill_guard,
+                &cancel,
                 stdout_handle,
-                "stdout",
-                DRAIN_CANCEL_GRACE,
-            )
-            .await;
-            let stderr = await_pipe_reader_with_cancellation_timeout(
                 stderr_handle,
-                "stderr",
-                DRAIN_CANCEL_GRACE,
             )
             .await;
             ShellRunResult::TimedOut {
@@ -781,7 +792,113 @@ async fn run_command_with_timeout(
                 elapsed: start.elapsed(),
             }
         }
+        WaitOutcome::MemoryExceeded { used, limit } => {
+            let (stdout, stderr) = stop_and_collect(
+                &mut child,
+                &tree,
+                &mut kill_guard,
+                &cancel,
+                stdout_handle,
+                stderr_handle,
+            )
+            .await;
+            ShellRunResult::MemoryExceeded {
+                stdout,
+                stderr,
+                pid,
+                elapsed: start.elapsed(),
+                used,
+                limit,
+            }
+        }
     }
+}
+
+/// Wait for the run to end on the first of its three bounds — the child
+/// exiting, `timeout`, or the resident memory its whole tree has grown to
+/// above `memory_limit` — and say which one fired. The memory sample rides
+/// the runtime path the wait already occupies: a sample is a handful of
+/// syscalls, no thread of its own.
+async fn await_run_end(
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+    memory_limit: Option<u64>,
+    pid: Option<u32>,
+) -> WaitOutcome {
+    let wait = child.wait();
+    tokio::pin!(wait);
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut sample = tokio::time::interval(MEMORY_SAMPLE_INTERVAL);
+    sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut measure_failed = false;
+    loop {
+        tokio::select! {
+            biased;
+            status = &mut wait => return WaitOutcome::Exited(status),
+            () = &mut deadline => return WaitOutcome::TimedOut,
+            _ = sample.tick() => {
+                if let (Some(limit), Some(pid)) = (memory_limit, pid) {
+                    match mem::tree_rss(pid) {
+                        Some(used) if used > limit => {
+                            return WaitOutcome::MemoryExceeded { used, limit };
+                        }
+                        // Fail open, loudly once: a watchdog that killed a
+                        // command it could not measure would be worse than the
+                        // unbounded command it exists to stop.
+                        None if !measure_failed => {
+                            measure_failed = true;
+                            tracing::warn!(
+                                ?pid,
+                                "memory watchdog cannot measure the command's tree; \
+                                 the run continues without a memory bound"
+                            );
+                        }
+                        Some(_) | None => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// End a run's tree the way the timeout does and collect the output the pipe
+/// readers still hold — the one stop path the timeout and the memory watchdog
+/// share, so the watchdog cannot grow a second kill mechanism.
+///
+/// The direct child is signalled first, then the containment: on unix
+/// `start_kill` (fire-and-forget SIGKILL) precedes the group kill, because
+/// `child.kill().await` — which includes `wait()` — would let the child's pid
+/// be reused before the group it leads could be signalled (`process_group(0)`
+/// in [`build_shell_command`]). On Windows the direct kill is the fallback for
+/// a run whose containment could not be established (see `tree`) and for a job
+/// termination that failed.
+async fn stop_and_collect(
+    child: &mut tokio::process::Child,
+    tree: &Tree,
+    kill_guard: &mut KillOnDrop,
+    cancel: &tokio_util::sync::CancellationToken,
+    stdout_handle: tokio::task::JoinHandle<Vec<u8>>,
+    stderr_handle: tokio::task::JoinHandle<Vec<u8>>,
+) -> (Vec<u8>, Vec<u8>) {
+    let _ = child.start_kill();
+    tree.terminate();
+    let _ = child.wait().await;
+    // Reaped — disarm the guard (the explicit kill already ran).
+    kill_guard.disarm();
+    cancel.cancel();
+
+    // Give readers a grace window to notice cancellation and return their
+    // buffers. If a reader takes longer than 2 s (e.g. because a grandchild
+    // keeps the pipe open), we still get partial data from the buffer it
+    // returns after noticing cancellation.
+    let stdout =
+        await_pipe_reader_with_cancellation_timeout(stdout_handle, "stdout", DRAIN_CANCEL_GRACE)
+            .await;
+    let stderr =
+        await_pipe_reader_with_cancellation_timeout(stderr_handle, "stderr", DRAIN_CANCEL_GRACE)
+            .await;
+    (stdout, stderr)
 }
 
 /// Outcome of a direct program run (argv — never a shell command string), used
@@ -829,7 +946,14 @@ async fn run_program(
 ) -> ShellRunResult {
     let timeout = Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS);
     let mut cmd = build_program_command(program, args, ws.as_path());
-    run_command_with_timeout(&mut cmd, timeout, output_drain_timeout(), owner).await
+    run_command_with_timeout(
+        &mut cmd,
+        timeout,
+        output_drain_timeout(),
+        mem::default_limit(),
+        owner,
+    )
+    .await
 }
 
 /// Run `program` with `args` in `ws` and report the run as an outcome instead
@@ -874,6 +998,13 @@ pub(crate) async fn run_program_outcome(
             &stdout,
             &stderr,
         ),
+        ShellRunResult::MemoryExceeded {
+            stdout,
+            stderr,
+            used,
+            limit,
+            ..
+        } => program_outcome(false, mem::exceeded_failure(used, limit), &stdout, &stderr),
         ShellRunResult::SpawnFailed(e) => {
             program_outcome(false, format!("failed to start: {e}"), &[], &[])
         }
@@ -894,8 +1025,8 @@ pub(crate) async fn run_program_outcome(
 /// Returns the run's combined output, annotated the way the shell annotates a
 /// failure: the `[exit status: …]` note is appended as its own paragraph for
 /// anything but a clean exit. `Err` is a run that could not complete — spawn
-/// failure, timeout or drain overrun — never a non-zero exit, so a script's
-/// own failure stays the script's output.
+/// failure, timeout, drain overrun or the memory ceiling — never a non-zero
+/// exit, so a script's own failure stays the script's output.
 pub(crate) async fn run_program_with_timeout(
     ws: &Workspace,
     program: &Path,
@@ -940,6 +1071,18 @@ pub(crate) async fn run_program_with_timeout(
             "timeout: {label} exited but a leftover process kept its output pipes open \
              past the drain limit — hint: keep any process the script launches inside its \
              own lifetime\n{}",
+            program_error_tail(elapsed, &stdout, &stderr),
+        )),
+        ShellRunResult::MemoryExceeded {
+            stdout,
+            stderr,
+            elapsed,
+            used,
+            limit,
+            ..
+        } => Err(anyhow::anyhow!(
+            "{label} {}\n{}",
+            mem::exceeded_failure(used, limit),
             program_error_tail(elapsed, &stdout, &stderr),
         )),
         ShellRunResult::SpawnFailed(e) => Err(anyhow::anyhow!(
@@ -1033,6 +1176,46 @@ fn format_timeout_error(
     msg.push_str("\nreason: command was killed after exceeding the timeout");
     msg.push_str(
         "\nhint: for known-long commands, pass a larger per-call timeout via the `timeout_secs` tool argument (max 3600s).",
+    );
+
+    append_output_tail(&mut msg, "stdout", stdout);
+    append_output_tail(&mut msg, "stderr", stderr);
+    msg
+}
+
+/// The memory failure's structured block, in the shape of
+/// [`format_timeout_error`]: the same fields and output tails, a reason that
+/// names the memory ceiling rather than the timeout, and a hint pointing at
+/// the one thing an agent can do about it. It never says "timed out" — a run
+/// ended for memory must be impossible to mistake for one that ran out of
+/// time. The amount is weighed against the machine's RAM in the first line,
+/// and the ceiling that was crossed is named as its own field, as
+/// `timeout_limit` is for a timeout.
+fn format_memory_error(
+    command: &str,
+    elapsed: Duration,
+    used: u64,
+    limit: u64,
+    pid: Option<u32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> String {
+    let mut msg = format!(
+        "Shell command {}.\n\
+         command: {command}\n\
+         elapsed: {:.1}s\n\
+         memory_limit: {}",
+        mem::exceeded_failure(used, limit),
+        elapsed.as_secs_f64(),
+        mem::gib(limit),
+    );
+    if let Some(p) = pid {
+        let _ = write!(msg, "\npid: {p}");
+    }
+    msg.push_str("\nreason: command was killed after exceeding the memory limit");
+    msg.push_str(
+        "\nhint: the command's whole process tree grew past the ceiling — bound the \
+         input it reads or split it into smaller commands.",
     );
 
     append_output_tail(&mut msg, "stdout", stdout);
@@ -1279,8 +1462,14 @@ impl ShellTool {
         let timeout = Duration::from_secs(timeout_secs);
         let drain_limit = output_drain_timeout();
 
-        let mut result =
-            run_command_with_timeout(&mut cmd, timeout, drain_limit, RunOwner::Agent).await;
+        let mut result = run_command_with_timeout(
+            &mut cmd,
+            timeout,
+            drain_limit,
+            mem::default_limit(),
+            RunOwner::Agent,
+        )
+        .await;
 
         // Stream-size marker: the engine reports stdin-fed stream bytes
         // consumed via a stderr marker; strip it from the agent-visible stderr.
@@ -1293,7 +1482,8 @@ impl ShellTool {
         match &mut result {
             ShellRunResult::Completed { stderr, .. }
             | ShellRunResult::TimedOut { stderr, .. }
-            | ShellRunResult::DrainTimedOut { stderr, .. } => {
+            | ShellRunResult::DrainTimedOut { stderr, .. }
+            | ShellRunResult::MemoryExceeded { stderr, .. } => {
                 if exec_str != command_str {
                     grep_engine::strip_stream_size_marker(stderr);
                 }
@@ -1356,7 +1546,14 @@ impl ShellTool {
             Some(EngineFailure::ReRun) => {
                 sentinel_rerun = true;
                 let mut original = build_shell_command(command_str, ws.as_path());
-                run_command_with_timeout(&mut original, timeout, drain_limit, RunOwner::Agent).await
+                run_command_with_timeout(
+                    &mut original,
+                    timeout,
+                    drain_limit,
+                    mem::default_limit(),
+                    RunOwner::Agent,
+                )
+                .await
             }
             None => result,
         };
@@ -1493,6 +1690,28 @@ impl ShellTool {
                 );
                 anyhow::bail!("{msg}");
             }
+            ShellRunResult::MemoryExceeded {
+                stdout,
+                stderr,
+                pid,
+                elapsed,
+                used,
+                limit,
+            } => {
+                tracing::info!(
+                    command = command_str,
+                    elapsed_secs = elapsed.as_secs_f64(),
+                    ?pid,
+                    used = used,
+                    limit = limit,
+                    stdout_bytes = stdout.len(),
+                    stderr_bytes = stderr.len(),
+                    "Shell command terminated: exceeded memory limit"
+                );
+                let msg =
+                    format_memory_error(command_str, elapsed, used, limit, pid, &stdout, &stderr);
+                anyhow::bail!("{msg}");
+            }
             ShellRunResult::SpawnFailed(e) => anyhow::bail!(
                 "Failed to start shell command.\n\
                  command: {command_str}\n\
@@ -1540,7 +1759,8 @@ impl ShellTool {
             ),
             Some(
                 ShellRunResult::TimedOut { elapsed, .. }
-                | ShellRunResult::DrainTimedOut { elapsed, .. },
+                | ShellRunResult::DrainTimedOut { elapsed, .. }
+                | ShellRunResult::MemoryExceeded { elapsed, .. },
             ) => (
                 Some(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)),
                 None,
@@ -4410,6 +4630,7 @@ mod tests {
             &mut cmd,
             Duration::from_secs(1),
             Duration::from_secs(10),
+            mem::default_limit(),
             RunOwner::Agent,
         )
         .await;
@@ -4444,6 +4665,7 @@ mod tests {
             &mut cmd,
             Duration::from_secs(2),
             Duration::from_secs(10),
+            mem::default_limit(),
             RunOwner::Agent,
         )
         .await;
@@ -4480,6 +4702,7 @@ mod tests {
             &mut cmd,
             Duration::from_secs(1),
             Duration::from_secs(10),
+            mem::default_limit(),
             RunOwner::Agent,
         )
         .await;
@@ -4568,6 +4791,76 @@ mod tests {
             .expect("valid PID from file")
     }
 
+    /// A run whose tree outgrows the memory ceiling is ended like a stop and
+    /// reported as a memory failure — never as a timeout. The ceiling is a tiny
+    /// injected value, never the real 80%, and the memory is allocated inside the
+    /// command (a shell variable holding a few tens of MiB), so the test process
+    /// itself allocates nothing near physical RAM.
+    ///
+    /// The memory lives in a backgrounded *subshell*, not in the run's direct
+    /// child, so the sample has to reach a descendant to find it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_over_the_memory_ceiling_is_killed_and_reported() {
+        /// The injected ceiling: small enough that the command below crosses it
+        /// long before the test machine's own 80% could be relevant.
+        const CEILING: u64 = 16 * 1024 * 1024;
+        /// What the subshell holds in a variable — 64 MiB, four times the
+        /// ceiling, and nothing at all against physical RAM. Non-NUL bytes
+        /// matter: a NUL is dropped by the shell and would never be counted.
+        const PAYLOAD: usize = 64 * 1024 * 1024;
+
+        let dir = TempDir::new().expect("tempdir");
+        let mut cmd = build_shell_command(
+            &format!("(x=$(yes x | head -c {PAYLOAD}); sleep 30) & wait"),
+            dir.path(),
+        );
+
+        let result = run_command_with_timeout(
+            &mut cmd,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            Some(CEILING),
+            RunOwner::Agent,
+        )
+        .await;
+
+        let ShellRunResult::MemoryExceeded {
+            used,
+            limit,
+            elapsed,
+            ..
+        } = result
+        else {
+            panic!("expected MemoryExceeded, got {result:?}");
+        };
+        assert_eq!(limit, CEILING);
+        assert!(
+            used > limit,
+            "the sample that tripped the watchdog must exceed the ceiling: {used} > {limit}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "the watchdog must not wait out the command: {elapsed:?}"
+        );
+
+        // The reported failure's shape: the memory sentence first, then the
+        // timeout block's own fields, and never a timeout's wording.
+        let msg = format_memory_error("test", elapsed, used, limit, None, &[], &[]);
+        assert!(
+            msg.starts_with("Shell command terminated: exceeded memory limit (used ~"),
+            "msg: {msg}"
+        );
+        assert!(msg.contains("\ncommand: test"), "msg: {msg}");
+        assert!(msg.contains("\nelapsed: "), "msg: {msg}");
+        assert!(msg.contains("\nmemory_limit: "), "msg: {msg}");
+        assert!(
+            msg.contains("\nreason: command was killed after exceeding the memory limit"),
+            "msg: {msg}"
+        );
+        assert!(!msg.contains("timed out"), "msg: {msg}");
+    }
+
     /// A stop ends the command's whole process tree, not only its direct child:
     /// the timeout path ends the run's containment, so a grandchild the command
     /// backgrounded dies with it. This is the unix arm of [`Tree::terminate`];
@@ -4583,6 +4876,7 @@ mod tests {
             &mut cmd,
             Duration::from_secs(2),
             Duration::from_secs(5),
+            mem::default_limit(),
             RunOwner::Agent,
         )
         .await;
@@ -4610,6 +4904,7 @@ mod tests {
                 &mut cmd,
                 Duration::from_secs(30),
                 Duration::from_secs(5),
+                mem::default_limit(),
                 RunOwner::Agent,
             ),
         )
@@ -4641,6 +4936,7 @@ mod tests {
             &mut cmd,
             Duration::from_secs(30),
             Duration::from_millis(150),
+            mem::default_limit(),
             RunOwner::Agent,
         )
         .await;
@@ -4692,6 +4988,7 @@ mod tests {
             &mut cmd,
             Duration::from_secs(30),
             Duration::from_secs(5),
+            mem::default_limit(),
             RunOwner::Agent,
         )
         .await;
@@ -4715,6 +5012,7 @@ mod tests {
             &mut cmd,
             Duration::from_secs(30),
             Duration::from_millis(150),
+            mem::default_limit(),
             RunOwner::Agent,
         )
         .await;
