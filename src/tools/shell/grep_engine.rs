@@ -63,8 +63,15 @@
 //! parallel recursive walk, so cross-file output ordering may differ from the
 //! host BSD grep (in-file ordering is stable). The approved behavioral deltas:
 //! recursive walks skip hidden/gitignored content (rg defaults; a served tail
-//! like `grep -rn … | wc -l` sees that filtered stream) and `-o` + alternation
-//! stays fail-closed (a match-set/span difference, not an ordering one).
+//! like `grep -rn … | wc -l` sees that filtered stream), `-o` + alternation
+//! stays fail-closed (a match-set/span difference, not an ordering one), and a
+//! redirected walk hands an entry over in runs of [`WALK_CHUNK`], with the
+//! entry's tail at its end, so an entry with more than a chunk of matches has
+//! its records split by another file's — the cross-file order the walk rows
+//! already relax, at chunk instead of file grain (an entry under the chunk stays
+//! contiguous, and in-file order is stable throughout). Not buffering a whole
+//! file's matches is what buys the finer grain: a serial walk measured 2-4.5x
+//! the wall time (≈105 ms vs ≈31 ms for `grep -rn … src > file`).
 //!
 //! On unix the segment and word reading is the shell's own: an unquoted,
 //! unescaped `<`/`>` ends the word before it and starts a redirection (the
@@ -76,6 +83,10 @@
 //! operator's raw spelling rides the rewrite verbatim, so the surrounding `sh`
 //! performs the write or the backgrounding. Windows refuses the glued spelling
 //! instead ([`windows::has_glued_redirect`]).
+//!
+//! Because that write is the shell's, the engine's own writer decisions follow
+//! [`StdoutDest`], which reads the member's real destination — so a redirect into
+//! a file is complete however it is spelled (`exec > file` included).
 //!
 //! Parity target is the host BSD grep under the shell tool's pinned
 //! `LC_ALL=C.UTF-8`. The macOS-gated differential matrix is the authoritative
@@ -117,7 +128,8 @@ const ENGINE_VERB: &str = "__grep-engine";
 const PROTOCOL_VERSION: u32 = 5;
 /// NUL-detection window for binary files (FreeBSD grep reads 32 KiB).
 const BINARY_WINDOW: usize = 32 * 1024;
-/// Engine self-cap on written output; the shell pipe reader caps at the same.
+/// Engine self-cap on written output, applied where the shell pipe reader caps
+/// at the same value — i.e. on a captured member (see [`StdoutDest`]).
 const OUTPUT_CAP: usize = SHELL_PIPE_READ_CAP;
 /// Sentinel exit code: engine could not serve and could not exec grep either.
 /// Unix: the parent re-runs the original command on this code. Windows: the
@@ -200,7 +212,10 @@ struct EngineSpec {
     /// sentinel instead).
     fallback: Vec<String>,
     /// The member feeds a pipeline tail: its stdout must not be capped, so
-    /// downstream members see the full stream (byte-identity with grep).
+    /// downstream members see the full stream (byte-identity with grep). The
+    /// other two destinations a member can have — the shell tool's capture, or a
+    /// file the command redirects into — are read on the engine side from its own
+    /// fd 1 (see [`StdoutDest`]), not carried here.
     #[serde(default)] // lenient: a swapped-binary spec reaches the version check
     piped: bool,
     /// The member is a non-first pipeline member fed by a producer's stdout
@@ -214,11 +229,80 @@ struct EngineSpec {
     report_stream_bytes: bool,
 }
 
-/// Output cap handed to the writer: unpiped serves self-cap at OUTPUT_CAP,
-/// piped members are capped by the shell pipe reader instead (byte-identity
-/// with grep).
-fn output_limit(spec: &EngineSpec) -> Option<usize> {
-    if spec.piped { None } else { Some(OUTPUT_CAP) }
+/// Where the member's stdout actually goes — the one fact every writer decision
+/// follows, read once from this process's fd 1 plus the spec's pipeline
+/// membership. Asking the destination rather than the command's redirect
+/// spellings covers every spelling by construction (a line-wide `exec > file`
+/// included), needs no protocol field, and keeps the read-only guard's own
+/// redirect model out of the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdoutDest {
+    /// The shell tool's own capture pipe: `piped` is false, so [`OUTPUT_CAP`]
+    /// mirrors the parent's cap there.
+    Capture,
+    /// A pipeline tail: uncapped, because the tail consumes the whole stream.
+    Tail,
+    /// A file (or device) the shell redirected into — the member's real output,
+    /// which the user reads back as it stands. Uncapped: a cut here is an
+    /// invisible wrong answer.
+    File,
+}
+
+impl StdoutDest {
+    /// This member's destination. fd 1 separates a pipe from any real sink
+    /// ([`stdout_is_pipe`]); `piped` says which pipe a pipe is.
+    fn of(spec: &EngineSpec, fd1_is_pipe: bool) -> Self {
+        if !fd1_is_pipe {
+            StdoutDest::File
+        } else if spec.piped {
+            StdoutDest::Tail
+        } else {
+            StdoutDest::Capture
+        }
+    }
+
+    /// Cap on written stdout bytes; `None` = unbounded.
+    fn limit(self) -> Option<usize> {
+        match self {
+            StdoutDest::Capture => Some(OUTPUT_CAP),
+            StdoutDest::Tail | StdoutDest::File => None,
+        }
+    }
+}
+
+/// Whether fd 1 is a pipe (`run_command_with_timeout` spawns the shell with
+/// `Stdio::piped()`, and the shell's own `|` gives a pipe too). Every other
+/// stdout is a sink the user reads, so the engine must write all of it.
+///
+/// A redirect whose target is itself a pipe reads as a pipe here — one fd cannot
+/// tell the shell tool's capture pipe from a named one — so such a member keeps
+/// the cap a captured member has.
+///
+/// A `fstat`/`GetFileType` that cannot answer reads as a pipe: the capped,
+/// flush-per-line behaviour is the conservative answer, never a licence to write
+/// unbounded.
+#[cfg(unix)]
+fn stdout_is_pipe() -> bool {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fstat` writes only through the pointer it is given, and on
+    // success initialises the whole `stat`.
+    if unsafe { libc::fstat(libc::STDOUT_FILENO, st.as_mut_ptr()) } != 0 {
+        return true;
+    }
+    // SAFETY: the call above returned 0, so `st` is initialised.
+    let mode = unsafe { st.assume_init() }.st_mode;
+    mode & libc::S_IFMT == libc::S_IFIFO
+}
+
+#[cfg(windows)]
+fn stdout_is_pipe() -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, FILE_TYPE_UNKNOWN, GetFileType};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+    // SAFETY: both are queries on this process's own standard handle.
+    let kind = unsafe { GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) };
+    // An unusable handle answers FILE_TYPE_UNKNOWN, which is no licence to write
+    // unbounded: the capped behaviour is the conservative reading.
+    kind == FILE_TYPE_PIPE || kind == FILE_TYPE_UNKNOWN
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3255,7 +3339,7 @@ fn serve(spec: &EngineSpec) -> Result<i32, &'static str> {
         .map_err(|_| "pattern could not be compiled")?;
     let mut out = Output::new(
         OutputSink::Stdout(io::BufWriter::with_capacity(16 * 1024, io::stdout())),
-        output_limit(spec),
+        StdoutDest::of(spec, stdout_is_pipe()),
     );
     let stdin_consumed = std::cell::Cell::new(false);
     let stdin = io::stdin();
@@ -3378,7 +3462,7 @@ fn search_stream<R: io::Read>(
     show_prefix: bool,
     binary: bool,
     input: &mut R,
-    out: &mut Output,
+    out: &mut dyn LineOut,
 ) -> (Result<(), io::Error>, bool) {
     let search_matcher = SearchMatcher {
         inner: matcher.clone(),
@@ -3416,7 +3500,7 @@ fn search_stream<R: io::Read>(
 fn serve_stdin<R: io::Read>(
     spec: &EngineSpec,
     matcher: &grep_regex::RegexMatcher,
-    out: &mut Output,
+    out: &mut dyn LineOut,
     mut stdin: R,
     stdin_consumed: &std::cell::Cell<bool>,
 ) -> i32 {
@@ -3624,6 +3708,10 @@ fn fnmatch(pattern: &str, s: &str, platform: ShellPlatform) -> bool {
 /// is the platform's own reading: a leading dot everywhere, plus the hidden
 /// file attribute on Windows (the `ignore` crate's rule), so a walk there can
 /// skip a file a unix one would search.
+///
+/// A redirected member ([`StdoutDest::File`]) is handed a [`ChunkedOut`] instead
+/// of the per-file buffer: the walk's memory then follows the chunk, not the
+/// (arbitrarily large) result.
 fn walk_dir(
     op: &Operand,
     spec: &EngineSpec,
@@ -3635,7 +3723,10 @@ fn walk_dir(
     let root_display = op.display.clone();
     let exclude_dir = spec.exclude_dir.clone();
     let root_for_filter = root_abs.clone();
-    let limit = output_limit(spec);
+    // What one worker holds of a file before handing it over: a whole file's
+    // matches (the shape every other destination has always used, bounded by the
+    // member's own cap when it is captured) or a fixed chunk.
+    let dest = out.dest;
 
     let mut builder = ignore::WalkBuilder::new(&root_abs);
     builder.filter_entry({
@@ -3658,21 +3749,18 @@ fn walk_dir(
         }
     });
 
-    // Shared output + aggregate result; search runs per-file into a buffer, the
-    // merge lock is held only for the buffer copy (streams per file, and
-    // cross-file order is non-deterministic — the accepted parallel-walk delta).
-    // The worker closures capture these OWNED state pieces by reference so the
-    // per-thread builder closure can be invoked more than once.
+    // Shared output + aggregate result; the search runs outside the lock, the
+    // merge lock is held only for the hand-off. The worker closures capture
+    // these OWNED state pieces by reference so the per-thread builder closure can
+    // be invoked more than once.
     //
-    // Accepted parallel-walk trade-offs (documented, not errors): (1) when a
-    // recursive walk's total output exceeds OUTPUT_CAP, which files' lines
-    // survive the cap is non-deterministic across workers — only the count is
-    // preserved, not operand-order; (2) a piped member (limit None) buffers a
-    // single file's matches in the worker buffer before releasing them, so per
-    // worker memory is bounded by ONE matching file's output (not a constant),
-    // where the serial path streamed per-line. Both are rare (the dominant
-    // target/ timeout is a non-piped walk, and `| head` ends the walk early via
-    // SIGPIPE once tail-prefixed output is flushed).
+    // Accepted parallel-walk trade-offs (documented, not errors), unchanged for
+    // the destinations that keep the per-file buffer: (1) when a captured walk's
+    // total output exceeds OUTPUT_CAP, which files' lines survive the cap is
+    // non-deterministic across workers — only the count is preserved, not
+    // operand-order; (2) a *piped* walk is uncapped, so a worker holds one whole
+    // matching file's output (the dominant `| head` case ends the walk early via
+    // SIGPIPE instead).
     let shared_out = std::sync::Mutex::new(&mut *out);
     let shared_result = std::sync::Mutex::new(OperandResult::NoMatch);
     let root_abs = &root_abs;
@@ -3680,51 +3768,146 @@ fn walk_dir(
     let out_ref = &shared_out;
     let result_ref = &shared_result;
 
-    builder.build_parallel().run(|| {
-        let mut local = Output::new(OutputSink::Buffer(Vec::new()), limit);
-        Box::new(move |entry| {
-            let (buf, err, r) = match entry {
-                Ok(e) => {
-                    let ft = e.file_type();
-                    if ft.is_some_and(|t| t.is_symlink() || t.is_dir()) {
-                        return ignore::WalkState::Continue; // grep -r skips symlinks; dirs traversed by the walk
-                    }
-                    let display =
-                        traversal_display(root_display, root_abs, e.path(), SHELL_PLATFORM);
-                    if !file_allowed_by_filters(&display, spec, SHELL_PLATFORM) {
-                        return ignore::WalkState::Continue;
-                    }
-                    let r = search_file(e.path(), &display, spec, matcher, &mut local, show_prefix);
-                    let (buf, err) = local.take_stdio();
-                    (buf, err, r)
+    // The per-entry rules both walk shapes share: what to skip, how to spell the
+    // path, and how a traversal error is reported.
+    let visit = |entry: Result<ignore::DirEntry, ignore::Error>, sink: &mut dyn LineOut| {
+        match entry {
+            Ok(e) => {
+                let ft = e.file_type();
+                if ft.is_some_and(|t| t.is_symlink() || t.is_dir()) {
+                    return OperandResult::NoMatch; // grep -r skips symlinks; dirs traversed by the walk
                 }
-                Err(e) => {
-                    // Unreadable dir/file during traversal → grep-style error.
-                    let (path, message) = walk_error_info(&e);
-                    let display = path.as_deref().map_or_else(
-                        || op.display.clone(),
-                        |p| traversal_display(&op.display, root_abs, p, SHELL_PLATFORM),
-                    );
-                    emit_error(spec, &mut local, &display, &message);
-                    let (buf, err) = local.take_stdio();
-                    (buf, err, OperandResult::Error)
+                let display = traversal_display(root_display, root_abs, e.path(), SHELL_PLATFORM);
+                if !file_allowed_by_filters(&display, spec, SHELL_PLATFORM) {
+                    return OperandResult::NoMatch;
                 }
-            };
-            let mut guard = out_ref.lock().unwrap_poison();
-            guard.write_bytes(&buf);
-            for chunk in err.chunks(4096) {
-                guard.write_err(&String::from_utf8_lossy(chunk));
+                search_file(e.path(), &display, spec, matcher, sink, show_prefix)
             }
-            // Flush so a piped tail (`| head`) sees data as each file completes.
-            guard.flush();
-            drop(guard);
-            let mut gr = result_ref.lock().unwrap_poison();
-            *gr = (*gr).max(r);
-            ignore::WalkState::Continue
-        })
-    });
+            Err(e) => {
+                // Unreadable dir/file during traversal → grep-style error.
+                let (path, message) = walk_error_info(&e);
+                let display = path.as_deref().map_or_else(
+                    || op.display.clone(),
+                    |p| traversal_display(&op.display, root_abs, p, SHELL_PLATFORM),
+                );
+                emit_error(spec, sink, &display, &message);
+                OperandResult::Error
+            }
+        }
+    };
+
+    if dest == StdoutDest::File {
+        builder.build_parallel().run(|| {
+            let mut local = ChunkedOut::new(out_ref);
+            Box::new(move |entry| {
+                let r = visit(entry, &mut local);
+                local.hand_off(); // this entry's tail: nothing outlives its file
+                let mut gr = result_ref.lock().unwrap_poison();
+                *gr = (*gr).max(r);
+                ignore::WalkState::Continue
+            })
+        });
+    } else {
+        builder.build_parallel().run(|| {
+            let mut local = Output::new(OutputSink::Buffer(Vec::new()), dest);
+            Box::new(move |entry| {
+                let r = visit(entry, &mut local);
+                let (buf, err) = local.take_stdio();
+                // An entry that wrote nothing (a directory, a symlink, a
+                // filter-rejected file) never reaches the lock — the same rule the
+                // redirected branch's sink holds. `take_stdio` still runs above:
+                // it resets the per-file cap accounting.
+                if !buf.is_empty() || !err.is_empty() {
+                    merge_worker_output(&mut out_ref.lock().unwrap_poison(), &buf, &err);
+                }
+                let mut gr = result_ref.lock().unwrap_poison();
+                *gr = (*gr).max(r);
+                ignore::WalkState::Continue
+            })
+        });
+    }
 
     shared_result.into_inner().unwrap_poison()
+}
+
+/// Hand a walk worker's matches and stderr to the member's sink under its lock,
+/// then flush: a piped tail (`| head`) sees the data as it lands, and a
+/// redirected member's file has nothing to pace.
+fn merge_worker_output(guard: &mut Output, buf: &[u8], err: &[u8]) {
+    guard.write_bytes(buf);
+    for chunk in err.chunks(4096) {
+        guard.write_err(&String::from_utf8_lossy(chunk));
+    }
+    guard.flush();
+}
+
+/// Bytes of one entry's output a redirected walk's worker holds in memory before
+/// handing them over at the next record end.
+const WALK_CHUNK: usize = 64 * 1024;
+
+/// The sink of a redirected walk's worker: it accumulates one entry's records in
+/// a chunk of memory and hands them over once the chunk is full — at a record end,
+/// or between the records of one [`LineOut::flush`] — plus the entry's tail when
+/// the entry ends, so a worker holds [`WALK_CHUNK`] of the output rather than a
+/// whole file's matches. An entry whose own output exceeds the chunk therefore
+/// reaches the sink as several runs, which other workers' runs may interleave:
+/// the cross-file ordering the walk rows already relax, at chunk instead of file
+/// grain (in-file order is preserved).
+struct ChunkedOut<'a> {
+    shared: &'a std::sync::Mutex<&'a mut Output>,
+    buf: Vec<u8>,
+    err: Vec<u8>,
+}
+
+impl<'a> ChunkedOut<'a> {
+    fn new(shared: &'a std::sync::Mutex<&'a mut Output>) -> Self {
+        ChunkedOut {
+            shared,
+            buf: Vec::new(),
+            err: Vec::new(),
+        }
+    }
+
+    /// Give everything this worker holds to the member's sink (one lock hold).
+    /// Both callers (a record end and an entry end) are record boundaries, so
+    /// what goes out is always whole records — another worker can hand off
+    /// between records, never inside one. An entry that wrote nothing (a
+    /// directory, a filtered file) holds nothing and never reaches the lock.
+    fn hand_off(&mut self) {
+        if self.buf.is_empty() && self.err.is_empty() {
+            return;
+        }
+        merge_worker_output(
+            &mut self.shared.lock().unwrap_poison(),
+            &self.buf,
+            &self.err,
+        );
+        self.buf.clear();
+        self.err.clear();
+    }
+}
+
+impl LineOut for ChunkedOut<'_> {
+    fn write_bytes(&mut self, b: &[u8]) {
+        self.buf.extend_from_slice(b);
+    }
+
+    fn write_err(&mut self, s: &str) {
+        self.err.extend_from_slice(s.as_bytes());
+    }
+
+    /// The Sink flushes at record ends only, so this is where a full chunk goes.
+    fn flush(&mut self) {
+        self.hand_off_if_full();
+    }
+
+    /// Hold at most [`WALK_CHUNK`]: a shape that writes several records under one
+    /// [`flush`] (the `-o` per-match loop) calls this between them.
+    fn hand_off_if_full(&mut self) {
+        if self.buf.len() >= WALK_CHUNK {
+            self.hand_off();
+        }
+    }
 }
 
 /// Display path for a walked entry: the operand spelling + relative suffix,
@@ -3782,7 +3965,7 @@ fn search_file(
     display: &str,
     spec: &EngineSpec,
     matcher: &grep_regex::RegexMatcher,
-    out: &mut Output,
+    out: &mut dyn LineOut,
     show_prefix: bool,
 ) -> OperandResult {
     let mut file = match fs::File::open(path) {
@@ -3816,7 +3999,7 @@ fn search_file(
     }
 }
 
-fn emit_error(spec: &EngineSpec, out: &mut Output, display: &str, message: &str) {
+fn emit_error(spec: &EngineSpec, out: &mut dyn LineOut, display: &str, message: &str) {
     if !spec.flags.s {
         // io errors carry a " (os error N)" suffix; BSD grep prints the bare
         // message ("No such file or directory", "Permission denied", …).
@@ -3841,7 +4024,7 @@ struct GrepSink<'a> {
     /// Selected-line count for -c/-l (capped by -m, or at 1 by the -l stop).
     count: u64,
     matcher: &'a SearchMatcher,
-    out: &'a mut Output,
+    out: &'a mut dyn LineOut,
 }
 
 impl grep_searcher::Sink for GrepSink<'_> {
@@ -3883,12 +4066,15 @@ impl grep_searcher::Sink for GrepSink<'_> {
             for (start, end) in matches {
                 self.write_prefix(mat.line_number(), false);
                 self.out.write_bytes(&content[start..end]);
-                self.out.write_byte(b'\n');
+                self.out.write_bytes(b"\n");
+                // One flush covers the whole line's match set, so a chunk filled
+                // inside it is handed over here rather than held to the line's end.
+                self.out.hand_off_if_full();
             }
         } else {
             self.write_prefix(mat.line_number(), false);
             self.out.write_bytes(content);
-            self.out.write_byte(b'\n');
+            self.out.write_bytes(b"\n");
         }
         self.out.flush();
         Ok(true)
@@ -3906,7 +4092,7 @@ impl grep_searcher::Sink for GrepSink<'_> {
         let content = trim_line_terminator(ctx.bytes(), SHELL_PLATFORM);
         self.write_prefix(ctx.line_number(), true);
         self.out.write_bytes(content);
-        self.out.write_byte(b'\n');
+        self.out.write_bytes(b"\n");
         self.out.flush();
         Ok(true)
     }
@@ -3931,11 +4117,11 @@ impl GrepSink<'_> {
             } else {
                 b':'
             };
-            self.out.write_byte(sep);
+            self.out.write_bytes(&[sep]);
         }
         if let Some(n) = lineno {
             self.out.write_bytes(n.to_string().as_bytes());
-            self.out.write_byte(if is_context { b'-' } else { b':' });
+            self.out.write_bytes(if is_context { b"-" } else { b":" });
         }
     }
 
@@ -3948,15 +4134,15 @@ impl GrepSink<'_> {
         if self.spec.flags.c {
             if self.show_prefix {
                 self.out.write_bytes(self.display.as_bytes());
-                self.out.write_byte(b':');
+                self.out.write_bytes(b":");
             }
             self.out.write_bytes(self.count.to_string().as_bytes());
-            self.out.write_byte(b'\n');
+            self.out.write_bytes(b"\n");
         }
         if self.spec.flags.l && self.selected_any {
             self.out.write_bytes(self.display.as_bytes());
             self.out
-                .write_byte(if self.spec.flags.null { 0 } else { b'\n' });
+                .write_bytes(if self.spec.flags.null { b"\0" } else { b"\n" });
         }
         self.out.flush();
     }
@@ -3977,31 +4163,85 @@ fn trim_line_terminator(b: &[u8], platform: ShellPlatform) -> &[u8] {
     }
 }
 
-// ── Output: bounded, self-capping writer ──────────────────────────────────
+// ── Output: the member's own writer ───────────────────────────────────────
 
 /// Streams matched lines to stdout as they are produced (so an early-exit
-/// tail stops the search the way it does for the real grep). Non-piped members
-/// self-cap at [`OUTPUT_CAP`] bytes after which writing stops but the search
-/// continues (exit codes stay correct for huge outputs); piped members are
-/// unbounded — the tail consumes the full stream, so truncation would be an
-/// invisible wrong answer. A write to a closed pipe kills the process: on unix
-/// SIGPIPE at its default disposition does it (exactly like grep), on Windows —
-/// which has no SIGPIPE — the `BrokenPipe` write error does (see
-/// [`exit_on_broken_pipe`]). Stderr is buffered (small, rare) and flushed on
-/// finish.
+/// tail stops the search the way it does for the real grep). A captured member
+/// self-caps at [`OUTPUT_CAP`] bytes after which writing stops but the search
+/// continues (exit codes stay correct for huge outputs); an unbounded member —
+/// piped, or redirected into a file — streams the whole result ([`StdoutDest`]
+/// owns the reading). A write to a closed
+/// pipe kills the process: on unix SIGPIPE at its default disposition does it
+/// (exactly like grep), on Windows — which has no SIGPIPE — the `BrokenPipe`
+/// write error does (see [`exit_on_broken_pipe`]). Stderr is buffered (small,
+/// rare) and flushed on finish.
 struct Output {
     sink: OutputSink,
     err: Vec<u8>,
     written: usize,
-    /// Cap on written stdout bytes; `None` = unbounded (piped member).
-    limit: Option<usize>,
+    dest: StdoutDest,
 }
 
 enum OutputSink {
     Stdout(io::BufWriter<io::Stdout>),
-    // In-memory sink: the parallel-walk per-worker buffers (production) and the
-    // macOS-gated parity tests.
+    // In-memory sink: the parallel-walk per-worker buffers (production) and every
+    // in-process pin that runs the engine without a real stdout.
     Buffer(Vec<u8>),
+}
+
+/// The write side of a served search: the member's own sink ([`Output`]) or a
+/// walk worker's ([`ChunkedOut`]). Only writing is abstract — where the bytes
+/// end up is the sink's business, not the search's.
+trait LineOut {
+    fn write_bytes(&mut self, b: &[u8]);
+    fn write_err(&mut self, s: &str);
+    /// Show what is written to the consumer, per record, so a closed pipe stops
+    /// the search early.
+    fn flush(&mut self);
+    /// Hand over what this sink holds once a chunk has accumulated. Only the
+    /// walk's chunk sink holds anything (every other sink writes straight
+    /// through, so this does nothing) and it also hands over at every entry's end;
+    /// this is the hand-off point *inside* a run of records that one
+    /// [`flush`](Self::flush) covers — `-o` writes a record per match of a line
+    /// — so a chunk filled there is handed over rather than held to the run's
+    /// end.
+    fn hand_off_if_full(&mut self) {}
+}
+
+impl LineOut for Output {
+    fn write_bytes(&mut self, b: &[u8]) {
+        let take = match self.dest.limit() {
+            Some(limit) if self.written < limit => (limit - self.written).min(b.len()),
+            Some(_) => return,
+            None => b.len(),
+        };
+        match &mut self.sink {
+            OutputSink::Stdout(w) => exit_on_broken_pipe(&w.write_all(&b[..take])),
+            OutputSink::Buffer(v) => v.extend_from_slice(&b[..take]),
+        }
+        self.written += take;
+    }
+
+    /// Error message (stderr) — bounded.
+    fn write_err(&mut self, s: &str) {
+        if self.err.len() < 64 * 1024 {
+            self.err.extend_from_slice(s.as_bytes());
+        }
+    }
+
+    /// Push buffered stdout out (per line) so `head` sees data and its early exit
+    /// reaches us, through [`exit_on_broken_pipe`]. A file destination needs no
+    /// pacing (nothing downstream consumes the stream as it is produced) and
+    /// rides the buffer, so a huge redirected result pays no syscall per line
+    /// ([`Output::finish`] flushes the tail).
+    fn flush(&mut self) {
+        if self.dest == StdoutDest::File {
+            return;
+        }
+        if let OutputSink::Stdout(w) = &mut self.sink {
+            exit_on_broken_pipe(&w.flush());
+        }
+    }
 }
 
 /// The closed-pipe exit shared by both stdout writers: on unix SIGPIPE at its
@@ -4021,31 +4261,13 @@ fn exit_on_broken_pipe(result: &io::Result<()>) {
 }
 
 impl Output {
-    /// New sink with an optional stdout cap (`None` = unbounded piped member).
-    fn new(sink: OutputSink, limit: Option<usize>) -> Self {
+    fn new(sink: OutputSink, dest: StdoutDest) -> Self {
         Output {
             sink,
             err: Vec::new(),
             written: 0,
-            limit,
+            dest,
         }
-    }
-
-    fn write_bytes(&mut self, b: &[u8]) {
-        let take = match self.limit {
-            Some(limit) if self.written < limit => (limit - self.written).min(b.len()),
-            Some(_) => return,
-            None => b.len(),
-        };
-        match &mut self.sink {
-            OutputSink::Stdout(w) => exit_on_broken_pipe(&w.write_all(&b[..take])),
-            OutputSink::Buffer(v) => v.extend_from_slice(&b[..take]),
-        }
-        self.written += take;
-    }
-
-    fn write_byte(&mut self, b: u8) {
-        self.write_bytes(&[b]);
     }
 
     /// Drain the buffered stdout and stderr, leaving the sink empty. For the
@@ -4057,21 +4279,6 @@ impl Output {
         match &mut self.sink {
             OutputSink::Buffer(v) => (std::mem::take(v), std::mem::take(&mut self.err)),
             OutputSink::Stdout(_) => (Vec::new(), std::mem::take(&mut self.err)),
-        }
-    }
-
-    /// Error message (stderr) — bounded.
-    fn write_err(&mut self, s: &str) {
-        if self.err.len() < 64 * 1024 {
-            self.err.extend_from_slice(s.as_bytes());
-        }
-    }
-
-    /// Push buffered stdout to the pipe (per line) so `head` sees data and its
-    /// early exit reaches us, through [`exit_on_broken_pipe`].
-    fn flush(&mut self) {
-        if let OutputSink::Stdout(w) = &mut self.sink {
-            exit_on_broken_pipe(&w.flush());
         }
     }
 
@@ -4456,7 +4663,11 @@ mod parity_tests {
     /// must reach both sides' capture identically. Output redirects only
     /// (`>`, `>>`, `&>`; a `2>` row's shell half is pinned by
     /// `unix_operator_pins`), and stderr-free rows, so a merged `&>` file is the
-    /// member's stdout alone.
+    /// member's stdout alone. This reproduces the shell's own write only while
+    /// the row's result stays below [`OUTPUT_CAP`]; a redirected result above it
+    /// is pinned by the e2e redirect lane in `benches/grep_engine_e2e.rs`, not
+    /// here (the in-process harness can never select [`StdoutDest::File`], so an
+    /// oversized row would compare a capped stream against the whole file).
     fn assert_redirect_parity(command: &str, target: &str, ws: &Path, home: &Path) {
         let (specs, _, rewritten, _) = analyze_joined(command, ws, home, false)
             .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
@@ -4475,6 +4686,11 @@ mod parity_tests {
         );
         let written = fs::read(&path)
             .unwrap_or_else(|e| panic!("{command}: the original's shell wrote {target}: {e}"));
+        assert!(
+            eout.len() < OUTPUT_CAP && written.len() < OUTPUT_CAP,
+            "{command}: a result at or above OUTPUT_CAP is pinned by the e2e redirect \
+             lane in benches/grep_engine_e2e.rs, not this capped in-process harness"
+        );
         if spec_uses_parallel_walk(&specs[0]) {
             assert_eq!(
                 sorted_lines(&eout),
@@ -4512,7 +4728,6 @@ mod parity_tests {
     #[expect(clippy::too_many_lines)] // differential parity matrix
     fn differential_parity_matrix() {
         let (_tmp, ws, home) = fixture();
-
         let rows: &[&str] = &[
             // ── BRE translation ──
             "grep -n 'foo\\|bar' a.txt",
@@ -5477,6 +5692,184 @@ mod handoff_pins {
     }
 }
 
+// ── Writer pins (no feature gate: the writer branches on the destination's
+//    value, never on the host) ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod writer_pins {
+    use super::*;
+
+    /// The redirected walk's hand-off points (the one path where the engine
+    /// writes a result it cannot hold): a full chunk goes at a record end, a run
+    /// of records under one flush (`-o`) hands over between them, and the entry
+    /// end hands over whatever is left — nothing outlives its file, nothing is
+    /// dropped, and a half-record is never handed over, because another worker's
+    /// bytes would be interleaved with it.
+    #[test]
+    fn chunked_walk_sink_hands_off_whole_records_at_record_and_entry_ends() {
+        let mut member = Output::new(OutputSink::Buffer(Vec::new()), StdoutDest::File);
+        let shared = std::sync::Mutex::new(&mut member);
+        let mut out = ChunkedOut::new(&shared);
+        let sink = |shared: &std::sync::Mutex<&mut Output>| {
+            let guard = shared.lock().unwrap_poison();
+            let OutputSink::Buffer(bytes) = &guard.sink else {
+                unreachable!("buffered sink")
+            };
+            bytes.clone()
+        };
+        let line = b"bigdir/file.txt:12345:needle\n";
+
+        // Sub-chunk holds ride the entry end: two records of one entry with
+        // different terminators (`-c -l --null`: a newline-ended zero count, then
+        // a NUL-ended name) both go out there.
+        out.write_bytes(b"path:0\n");
+        out.write_bytes(b"path\0");
+        out.flush();
+        assert!(
+            sink(&shared).is_empty(),
+            "a sub-chunk buffer waits for the entry end, not a record end"
+        );
+        out.hand_off();
+        assert_eq!(sink(&shared), b"path:0\npath\0");
+
+        // Above the chunk: handed over at the record end that follows, so the
+        // worker stays bounded by the chunk plus the record it is inside.
+        let mut expected = sink(&shared);
+        for _ in 0..(2 * WALK_CHUNK / line.len()) {
+            out.write_bytes(line);
+            out.flush();
+            assert!(
+                out.buf.len() < WALK_CHUNK + line.len(),
+                "a worker hands off as it fills instead of holding the result"
+            );
+            expected.extend_from_slice(line);
+        }
+        out.hand_off();
+        assert!(out.buf.is_empty());
+        assert_eq!(sink(&shared), expected);
+
+        // A chunk filled mid-record waits: no flush happens inside a record.
+        let before = expected.len();
+        let filler = vec![b'x'; WALK_CHUNK + 1];
+        let tail = b":needle\n";
+        out.write_bytes(&filler);
+        assert_eq!(
+            sink(&shared).len(),
+            before,
+            "a chunk filled mid-record waits for the record's end"
+        );
+        out.write_bytes(tail);
+        out.flush();
+        assert!(out.buf.is_empty());
+        assert_eq!(sink(&shared).len(), before + filler.len() + tail.len());
+
+        // A run of records under one flush (`-o`) hands over as it fills, so the
+        // worker stays at the chunk however long the run is.
+        let start = sink(&shared).len();
+        let group = 8 * WALK_CHUNK / line.len();
+        for _ in 0..group {
+            out.write_bytes(line);
+            out.hand_off_if_full();
+            assert!(
+                out.buf.len() < WALK_CHUNK + line.len(),
+                "a hand-off inside a record run keeps the worker at the chunk"
+            );
+        }
+        assert_eq!(
+            sink(&shared).len() + out.buf.len(),
+            start + group * line.len(),
+            "a run's records are handed over as they fill, none lost"
+        );
+        out.hand_off();
+        assert_eq!(sink(&shared).len(), start + group * line.len());
+    }
+
+    /// The destination decides what the result is worth — not the search. A
+    /// captured member stops at [`OUTPUT_CAP`] bytes (the parent's pipe reader
+    /// caps at the same value); a file the command redirects into gets the whole
+    /// stream. Both are observed here on the engine's own writer; the e2e lane
+    /// observes the fd-1 reading that picks between them.
+    #[test]
+    fn the_destination_decides_whether_the_result_is_cut() {
+        // ~380 KiB of matches in lines far shorter than the cap: long enough to
+        // cross it, short enough that the cut lands mid-line either way.
+        const LINES: usize = 4000;
+        let (_tmp, ws, _home) = serve_fixture();
+        let line = "needle ".to_string() + &"x".repeat(90) + "\n";
+        let huge = ws.join("huge.txt");
+        fs::write(&huge, line.repeat(LINES)).expect("huge fixture");
+        let other = ws.join("nomatch.txt");
+        fs::write(&other, "nothing here\n").expect("second operand");
+
+        // The spec is written here rather than analyzed: this pin is about the
+        // writer, and its two operands are read straight off the disk. `-h` keeps
+        // the rendered length equal to the matching lines.
+        let operand = |name: &str, path: &Path| Operand {
+            display: name.to_string(),
+            resolved: path.to_string_lossy().into_owned(),
+            trailing_slash: false,
+        };
+        let spec = EngineSpec {
+            version: PROTOCOL_VERSION,
+            verb: "grep".into(),
+            mode: MatchMode::Basic,
+            flags: GrepFlags {
+                h: true,
+                ..GrepFlags::default()
+            },
+            filters: Vec::new(),
+            exclude_dir: Vec::new(),
+            patterns: vec!["needle".into()],
+            operands: vec![operand("huge.txt", &huge), operand("nomatch.txt", &other)],
+            cwd: ws.to_string_lossy().into_owned(),
+            fallback: Vec::new(),
+            piped: false,
+            stdin: false,
+            report_stream_bytes: false,
+        };
+        let as_pipeline_member = EngineSpec {
+            piped: true,
+            ..spec.clone()
+        };
+        let matcher = build_matcher(&spec.patterns, spec.mode, &spec.flags).expect("matcher");
+        let run = |dest: StdoutDest| {
+            let mut out = Output::new(OutputSink::Buffer(Vec::new()), dest);
+            let consumed = std::cell::Cell::new(false);
+            let code = serve_into(&spec, &matcher, &mut out, io::Cursor::new(&[]), &consumed);
+            let Output {
+                sink: OutputSink::Buffer(bytes),
+                ..
+            } = out
+            else {
+                unreachable!("buffered sink")
+            };
+            (bytes, code)
+        };
+
+        // Which destination a member has: what fd 1 is, plus what the member's
+        // stdout feeds (only the pipe the shell tool captures is capped).
+        assert_eq!(StdoutDest::of(&spec, true), StdoutDest::Capture);
+        assert_eq!(StdoutDest::of(&as_pipeline_member, true), StdoutDest::Tail);
+        assert_eq!(StdoutDest::of(&spec, false), StdoutDest::File);
+        assert_eq!(StdoutDest::of(&as_pipeline_member, false), StdoutDest::File);
+
+        let (captured, code) = run(StdoutDest::Capture);
+        assert_eq!(
+            captured.len(),
+            OUTPUT_CAP,
+            "the captured result stops at the cap"
+        );
+        assert_eq!(code, 0);
+        let (written, code) = run(StdoutDest::File);
+        assert_eq!(
+            written.len(),
+            line.len() * LINES,
+            "a redirected member's file takes every match, none cut"
+        );
+        assert_eq!(code, 0);
+    }
+}
+
 // ── Read-only serve pins (no feature gate) ──────────────────────────────
 // Both platforms are driven from this host: the platform is a value, and the
 // guard reads it from its own context. The unix rows pin the argv hand-off and
@@ -5554,7 +5947,10 @@ mod test_support {
     ) -> (Vec<u8>, Vec<u8>, i32, Option<u64>) {
         let matcher =
             build_matcher(&spec.patterns, spec.mode, &spec.flags).expect("matcher builds");
-        let mut out = Output::new(OutputSink::Buffer(Vec::new()), output_limit(spec));
+        // The Buffer sink stands in for a pipe on fd 1 (the engine reads its own),
+        // so only the spec's pipeline membership decides here.
+        let dest = StdoutDest::of(spec, true);
+        let mut out = Output::new(OutputSink::Buffer(Vec::new()), dest);
         let consumed = std::cell::Cell::new(false);
         let code = serve_into(spec, &matcher, &mut out, io::Cursor::new(stdin), &consumed);
         let Output {

@@ -216,6 +216,58 @@ fn run_matrix() -> i32 {
         }
     }
 
+    // ── Redirected searches whose result is larger than OUTPUT_CAP (256 KiB) ──
+    // The engine's stdout bound mirrors the shell tool's own pipe capture, so a
+    // redirect the SHELL performs must leave the complete stream in the file.
+    // Both spellings of the
+    // destination are pinned — the operator attached to the member and the
+    // line-wide `exec >` — over a multi-operand (byte-exact, operand order) and a
+    // recursive (sorted record-set, the accepted cross-file order) search, plus
+    // the `--null` record shape, whose in-record NUL separator must not be taken
+    // for a record end (a hand-off there splits records across workers).
+    for (row, target) in [
+        (
+            "grep -n needle bigdir/big.txt bigdir/mixed.txt > redirect-large.txt",
+            "redirect-large.txt",
+        ),
+        (
+            "grep -rn needle bigdir > redirect-large-walk.txt",
+            "redirect-large-walk.txt",
+        ),
+        (
+            "grep -rn --null needle bigdir > redirect-large-null.txt",
+            "redirect-large-null.txt",
+        ),
+        (
+            "exec > redirect-large-exec.txt; grep -n needle bigdir/big.txt bigdir/mixed.txt",
+            "redirect-large-exec.txt",
+        ),
+    ] {
+        match check_redirect_row(row, target, &ws, &home) {
+            Ok(()) => println!("PASS: {row}"),
+            Err(msg) => {
+                println!("FAIL: {row}: {msg}");
+                failures += 1;
+            }
+        }
+    }
+
+    // A redirected walk whose entries end in a count line and (for a match) a
+    // NUL-terminated name: `plain` holds only non-matching files, so the
+    // `path:0` count records ARE the whole result, and `sub`'s matching files
+    // add NUL-terminated `-l` names. The count line a file ends with (its zero
+    // count included) and its name are two records of one entry, so the entry's
+    // tail must be released with the entry — a hold-back that waits for the next
+    // record boundary would drop it.
+    let count_row = "grep -rcl --null needle plain sub > redirect-walk-count-null.txt";
+    match check_redirect_row(count_row, "redirect-walk-count-null.txt", &ws, &home) {
+        Ok(()) => println!("PASS: {count_row}"),
+        Err(msg) => {
+            println!("FAIL: {count_row}: {msg}");
+            failures += 1;
+        }
+    }
+
     // Fail-closed rows: the parent must NOT rewrite these (the original
     // command — a shell syntax error / a real grep pipeline — runs instead).
     for (label, row) in [
@@ -388,19 +440,49 @@ fn check_row(row: &str, ws: &Path, home: &Path) -> Result<(), String> {
         {
             Ok(())
         } else {
-            Err(format!(
-                "engine {:?} != real {:?} (parallel-walk ordering)",
-                String::from_utf8_lossy(&engine_member.0),
-                String::from_utf8_lossy(&real_member.0)
+            Err(mismatch(
+                "engine member (parallel-walk ordering)",
+                &engine_member.0,
+                &real_member.0,
             ))
         }
     } else {
-        Err(format!(
-            "engine {:?} != real {:?}",
-            String::from_utf8_lossy(&engine_out.0),
-            String::from_utf8_lossy(&real_out.0)
-        ))
+        Err(mismatch("stdout", &engine_out.0, &real_out.0))
     }
+}
+
+/// Values up to this many bytes are dumped whole by [`mismatch`]; a larger result
+/// is reported by size instead.
+const INLINE_DUMP_MAX: usize = 256;
+
+/// A bounded mismatch report: small values dump whole, a larger result (the
+/// redirect rows) reports sizes plus the first differing byte — the truncation
+/// this lane guards against shows up as a size gap, and a multi-megabyte inline
+/// dump is unreadable.
+fn mismatch(what: &str, engine: &[u8], real: &[u8]) -> String {
+    if engine.len() <= INLINE_DUMP_MAX && real.len() <= INLINE_DUMP_MAX {
+        return format!(
+            "{what} engine {:?} != real {:?}",
+            String::from_utf8_lossy(engine),
+            String::from_utf8_lossy(real)
+        );
+    }
+    let note = match engine.iter().zip(real).position(|(a, b)| a != b) {
+        Some(i) => {
+            let tail = |b: &[u8]| String::from_utf8_lossy(&b[i..b.len().min(i + 32)]).into_owned();
+            format!(
+                ", first difference at byte {i}: engine {:?} real {:?}",
+                tail(engine),
+                tail(real)
+            )
+        }
+        None => String::new(),
+    };
+    format!(
+        "{what} engine {} bytes != real {} bytes{note}",
+        engine.len(),
+        real.len()
+    )
 }
 
 /// The shell half of a redirect row, observed end-to-end: the shell performs the
@@ -421,21 +503,13 @@ fn check_redirect_row(row: &str, target: &str, ws: &Path, home: &Path) -> Result
         |a, b| a == b
     };
     if !same(&engine.0, &real.0) {
-        return Err(format!(
-            "redirect stdout engine {:?} != real {:?}",
-            String::from_utf8_lossy(&engine.0),
-            String::from_utf8_lossy(&real.0)
-        ));
+        return Err(mismatch("redirect stdout", &engine.0, &real.0));
     }
     if engine.1 != real.1 {
         return Err(format!("exit {} != real {}", engine.1, real.1));
     }
     if !same(&engine.2, &real.2) {
-        return Err(format!(
-            "{target} engine {:?} != real {:?}",
-            String::from_utf8_lossy(&engine.2),
-            String::from_utf8_lossy(&real.2)
-        ));
+        return Err(mismatch(target, &engine.2, &real.2));
     }
     Ok(())
 }
