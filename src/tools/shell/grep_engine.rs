@@ -69,9 +69,12 @@
 //! entry's tail at its end, so an entry with more than a chunk of matches has
 //! its records split by another file's — the cross-file order the walk rows
 //! already relax, at chunk instead of file grain (an entry under the chunk stays
-//! contiguous, and in-file order is stable throughout). Not buffering a whole
-//! file's matches is what buys the finer grain: a serial walk measured 2-4.5x
-//! the wall time (≈105 ms vs ≈31 ms for `grep -rn … src > file`).
+//! contiguous, and in-file order is stable throughout). A context search's
+//! between-files `--` separator rides an entry's first hand-off, so it takes that
+//! relaxation with the entry: its count (one per printing entry, minus the first)
+//! stays exact, its placement against other entries' records does not. Not
+//! buffering a whole file's matches is what buys the finer grain: a serial walk
+//! measured 2-4.5x the wall time (≈105 ms vs ≈31 ms for `grep -rn … src > file`).
 //!
 //! On unix the segment and word reading is the shell's own: an unquoted,
 //! unescaped `<`/`>` ends the word before it and starts a redirection (the
@@ -1948,6 +1951,14 @@ impl GrepFlags {
     fn count_mode(&self) -> bool {
         self.c || self.l
     }
+
+    /// Whether the search prints context lines: the only mode where the host
+    /// command separates the blocks of different files with a `--` line
+    /// (counting and listing modes ignore the context flags, and zero context
+    /// prints none).
+    fn context_active(&self) -> bool {
+        !self.count_mode() && (self.before > 0 || self.after > 0)
+    }
 }
 
 /// Normalized single-string flag surface for a served grep (telemetry),
@@ -2415,14 +2426,13 @@ fn parse_grep_words(
     if flags.v {
         flags.o = false; // -v -o behaves as plain -v
     }
-    let count_mode = flags.count_mode();
-    if flags.v && (flags.before > 0 || flags.after > 0) && !count_mode {
+    if flags.v && flags.context_active() {
         return Err(Fallback::UnsupportedFlag("-v+context".into()));
     }
-    if flags.o && (flags.before > 0 || flags.after > 0) && !count_mode {
+    if flags.o && flags.context_active() {
         return Err(Fallback::UnsupportedFlag("-o+context".into()));
     }
-    if flags.o && flags.m.is_some() && !count_mode {
+    if flags.o && flags.m.is_some() && !flags.count_mode() {
         return Err(Fallback::UnsupportedFlag("-m+-o".into()));
     }
 
@@ -2458,7 +2468,7 @@ fn parse_grep_words(
     // no alternation operator, so a literal `|` stays servable. -o is inert
     // under -c/-l, so the divergence cannot surface there.
     if flags.o
-        && !count_mode
+        && !flags.count_mode()
         && mode != MatchMode::Fixed
         && engine_patterns.iter().any(|p| has_alternation(p))
     {
@@ -3429,24 +3439,22 @@ fn read_binary_head<R: io::Read>(src: &mut R) -> io::Result<(Vec<u8>, bool)> {
 }
 
 /// Searcher with the spec's matching surface. Context flags are suppressed in
-/// count modes; -m caps matches (stopping input consumption on streams).
+/// count modes ([`GrepFlags::context_active`]); -m caps matches (stopping input
+/// consumption on streams).
 fn build_searcher(spec: &EngineSpec) -> (grep_searcher::Searcher, bool) {
     let mut sb = grep_searcher::SearcherBuilder::new();
     sb.line_number(spec.flags.n)
         .invert_match(spec.flags.v)
         .binary_detection(grep_searcher::BinaryDetection::none())
         .heap_limit(Some(HEAP_LIMIT));
-    let count_mode = spec.flags.count_mode();
-    if !count_mode && spec.flags.before > 0 {
-        sb.before_context(spec.flags.before);
-    }
-    if !count_mode && spec.flags.after > 0 {
-        sb.after_context(spec.flags.after);
+    if spec.flags.context_active() {
+        sb.before_context(spec.flags.before)
+            .after_context(spec.flags.after);
     }
     if let Some(m) = spec.flags.m {
         sb.max_matches(Some(m));
     }
-    (sb.build(), count_mode)
+    (sb.build(), spec.flags.count_mode())
 }
 
 /// Search a (possibly non-seekable) stream with the spec's BSD sink; `binary`
@@ -3478,6 +3486,7 @@ fn search_stream<R: io::Read>(
             binary: binary && !spec.flags.a,
             message_emitted: false,
             selected_any: false,
+            block_pending: true,
             count: 0,
             matcher: &search_matcher,
             out,
@@ -3809,16 +3818,21 @@ fn walk_dir(
         });
     } else {
         builder.build_parallel().run(|| {
-            let mut local = Output::new(OutputSink::Buffer(Vec::new()), dest);
+            let mut local = PerFileOut::new(dest);
             Box::new(move |entry| {
                 let r = visit(entry, &mut local);
-                let (buf, err) = local.take_stdio();
+                let (buf, err, block_pending) = local.take_stdio();
                 // An entry that wrote nothing (a directory, a symlink, a
                 // filter-rejected file) never reaches the lock — the same rule the
                 // redirected branch's sink holds. `take_stdio` still runs above:
                 // it resets the per-file cap accounting.
                 if !buf.is_empty() || !err.is_empty() {
-                    merge_worker_output(&mut out_ref.lock().unwrap_poison(), &buf, &err);
+                    merge_worker_output(
+                        &mut out_ref.lock().unwrap_poison(),
+                        &buf,
+                        &err,
+                        block_pending,
+                    );
                 }
                 let mut gr = result_ref.lock().unwrap_poison();
                 *gr = (*gr).max(r);
@@ -3832,8 +3846,15 @@ fn walk_dir(
 
 /// Hand a walk worker's matches and stderr to the member's sink under its lock,
 /// then flush: a piped tail (`| head`) sees the data as it lands, and a
-/// redirected member's file has nothing to pace.
-fn merge_worker_output(guard: &mut Output, buf: &[u8], err: &[u8]) {
+/// redirected member's file has nothing to pace. `block_pending` marks the
+/// hand-off carrying the entry's first content record: the separator the member
+/// may owe it is written here — under that same lock, immediately before those
+/// bytes, which is why a walk worker only records the decision
+/// ([`LineOut::file_block`]).
+fn merge_worker_output(guard: &mut Output, buf: &[u8], err: &[u8], block_pending: bool) {
+    if block_pending {
+        guard.file_block();
+    }
     guard.write_bytes(buf);
     for chunk in err.chunks(4096) {
         guard.write_err(&String::from_utf8_lossy(chunk));
@@ -3857,6 +3878,7 @@ struct ChunkedOut<'a> {
     shared: &'a std::sync::Mutex<&'a mut Output>,
     buf: Vec<u8>,
     err: Vec<u8>,
+    block_pending: bool,
 }
 
 impl<'a> ChunkedOut<'a> {
@@ -3865,22 +3887,26 @@ impl<'a> ChunkedOut<'a> {
             shared,
             buf: Vec::new(),
             err: Vec::new(),
+            block_pending: false,
         }
     }
 
     /// Give everything this worker holds to the member's sink (one lock hold).
     /// Both callers (a record end and an entry end) are record boundaries, so
     /// what goes out is always whole records — another worker can hand off
-    /// between records, never inside one. An entry that wrote nothing (a
-    /// directory, a filtered file) holds nothing and never reaches the lock.
+    /// between records, never inside one.
     fn hand_off(&mut self) {
+        // An entry that wrote nothing (a directory, a filtered file) hands
+        // nothing over and opens no block.
         if self.buf.is_empty() && self.err.is_empty() {
             return;
         }
+        let block_pending = std::mem::take(&mut self.block_pending);
         merge_worker_output(
             &mut self.shared.lock().unwrap_poison(),
             &self.buf,
             &self.err,
+            block_pending,
         );
         self.buf.clear();
         self.err.clear();
@@ -3907,6 +3933,55 @@ impl LineOut for ChunkedOut<'_> {
         if self.buf.len() >= WALK_CHUNK {
             self.hand_off();
         }
+    }
+
+    fn file_block(&mut self) {
+        self.block_pending = true;
+    }
+}
+
+/// A captured or piped walk's worker sink: one entry's per-file buffer, bounded
+/// by the member's own cap, recording the block opening ([`LineOut::file_block`])
+/// instead of writing a separator like the member's sink does. The pending flag
+/// lives here rather than on [`Output`] so the member's writer carries only its
+/// own answered latch.
+struct PerFileOut {
+    out: Output,
+    block_pending: bool,
+}
+
+impl PerFileOut {
+    fn new(dest: StdoutDest) -> Self {
+        PerFileOut {
+            out: Output::new(OutputSink::Buffer(Vec::new()), dest),
+            block_pending: false,
+        }
+    }
+
+    /// The entry's stdout/stderr and whether those bytes open a block. The
+    /// per-file cap accounting resets here, exactly as it did on `Output`.
+    fn take_stdio(&mut self) -> (Vec<u8>, Vec<u8>, bool) {
+        let block_pending = std::mem::take(&mut self.block_pending);
+        let (buf, err) = self.out.take_stdio();
+        (buf, err, block_pending)
+    }
+}
+
+impl LineOut for PerFileOut {
+    fn write_bytes(&mut self, b: &[u8]) {
+        self.out.write_bytes(b);
+    }
+
+    fn write_err(&mut self, s: &str) {
+        self.out.write_err(s);
+    }
+
+    fn flush(&mut self) {
+        self.out.flush();
+    }
+
+    fn file_block(&mut self) {
+        self.block_pending = true;
     }
 }
 
@@ -4013,6 +4088,10 @@ fn emit_error(spec: &EngineSpec, out: &mut dyn LineOut, display: &str, message: 
 
 // ── Sink: BSD-grep-compatible output formatting ───────────────────────────
 
+/// The line the host command prints between the blocks of different files — and
+/// between the groups of one file — in a context search.
+const BLOCK_SEPARATOR: &[u8] = b"--\n";
+
 #[expect(clippy::struct_excessive_bools)] // grep CLI flag surface
 struct GrepSink<'a> {
     spec: &'a EngineSpec,
@@ -4021,6 +4100,8 @@ struct GrepSink<'a> {
     binary: bool,
     message_emitted: bool,
     selected_any: bool,
+    /// This file has still to print its first block of lines.
+    block_pending: bool,
     /// Selected-line count for -c/-l (capped by -m, or at 1 by the -l stop).
     count: u64,
     matcher: &'a SearchMatcher,
@@ -4053,6 +4134,7 @@ impl grep_searcher::Sink for GrepSink<'_> {
             return Ok(false); // existence is enough
         }
         self.selected_any = true;
+        self.open_block();
         let content = trim_line_terminator(mat.bytes(), SHELL_PLATFORM);
         if self.spec.flags.o {
             // BSD -o never prints zero-length matches.
@@ -4089,6 +4171,7 @@ impl grep_searcher::Sink for GrepSink<'_> {
         if self.binary {
             return Ok(true); // binary files only emit the message
         }
+        self.open_block();
         let content = trim_line_terminator(ctx.bytes(), SHELL_PLATFORM);
         self.write_prefix(ctx.line_number(), true);
         self.out.write_bytes(content);
@@ -4098,12 +4181,20 @@ impl grep_searcher::Sink for GrepSink<'_> {
     }
 
     fn context_break(&mut self, _searcher: &grep_searcher::Searcher) -> Result<bool, io::Error> {
-        self.out.write_bytes(b"--\n");
+        self.out.write_bytes(BLOCK_SEPARATOR);
         Ok(true)
     }
 }
 
 impl GrepSink<'_> {
+    /// The file's first match or context line: tell the sink that a block starts
+    /// here, once per file ([`LineOut::file_block`]).
+    fn open_block(&mut self) {
+        if std::mem::take(&mut self.block_pending) && self.spec.flags.context_active() {
+            self.out.file_block();
+        }
+    }
+
     /// Write the line prefix: `path` + separator + `lineno` + separator.
     /// Match lines use `:` (path separator replaced by NUL with --null);
     /// context lines use `-` (the path separator is still NUL with --null).
@@ -4180,6 +4271,9 @@ struct Output {
     err: Vec<u8>,
     written: usize,
     dest: StdoutDest,
+    /// Whether a block of some file's lines has been printed by this member: the
+    /// next file's first block is separated from it by [`BLOCK_SEPARATOR`].
+    block_printed: bool,
 }
 
 enum OutputSink {
@@ -4206,6 +4300,16 @@ trait LineOut {
     /// — so a chunk filled there is handed over rather than held to the run's
     /// end.
     fn hand_off_if_full(&mut self) {}
+
+    /// The file's first printed block starts here — its match or context lines,
+    /// never the binary notice. With context in effect
+    /// ([`GrepFlags::context_active`]) the host command opens a further file's
+    /// block with [`BLOCK_SEPARATOR`], and that is the signal to do it. Each sink
+    /// answers it its own way: the member's sink writes the separator before the
+    /// block's own bytes (so it precedes the block's before-context lines), a
+    /// walk worker's sink only records that this hand-off opens a block, for the
+    /// merge point to act on ([`merge_worker_output`]).
+    fn file_block(&mut self);
 }
 
 impl LineOut for Output {
@@ -4242,6 +4346,12 @@ impl LineOut for Output {
             exit_on_broken_pipe(&w.flush());
         }
     }
+
+    fn file_block(&mut self) {
+        if std::mem::replace(&mut self.block_printed, true) {
+            self.write_bytes(BLOCK_SEPARATOR);
+        }
+    }
 }
 
 /// The closed-pipe exit shared by both stdout writers: on unix SIGPIPE at its
@@ -4267,6 +4377,7 @@ impl Output {
             err: Vec::new(),
             written: 0,
             dest,
+            block_printed: false,
         }
     }
 
@@ -4364,6 +4475,14 @@ mod parity_tests {
         // Subdirectory for cd chains.
         fs::create_dir_all(ws.join("sub")).unwrap();
         fs::write(ws.join("sub/s.txt"), "needle\n").unwrap();
+        // Walk tree for context rows: two entries whose `-C1` output exceeds the
+        // redirected walk's hand-off chunk (so the chunked destination really
+        // interleaves), plus a small entry for the files-with-output count.
+        fs::create_dir_all(ws.join("walkctx")).unwrap();
+        let walk_block = "needle\nfiller\nfiller\nfiller\nfiller\n".repeat(1000);
+        fs::write(ws.join("walkctx/one.txt"), &walk_block).unwrap();
+        fs::write(ws.join("walkctx/two.txt"), &walk_block).unwrap();
+        fs::write(ws.join("walkctx/small.txt"), "x\nneedle\nx\n").unwrap();
         // Literal filename operands for quoted/escaped glob and ~ forms:
         // BSD grep searches these literally when the shell quotes/escapes
         // the metacharacters.
@@ -4767,8 +4886,25 @@ mod parity_tests {
             "fgrep -o 'a|b' pipe.txt a.txt", // fixed mode: literal `|` stays served
             "grep -n -A1 -B1 d ctx.txt",
             "grep -A1 -B1 'd\\|h' ctx.txt",
-            "grep -A1 -B1 d a.txt b.txt",
+            "grep -A1 -B1 foo a.txt b.txt",
             "grep -n -A1 b a.txt",
+            // ── Between-files separator of a context search (`--`) ──
+            "grep -C1 foo a.txt b.txt", // both operands print: one separator, byte for byte
+            "grep -h -C1 foo a.txt b.txt", // no path prefix: the separator is still printed
+            // an in-file break (`--` between the groups of one file) and a
+            // cross-file one in the same result
+            "grep -n -A1 -B1 'b\\|h' ctx.txt a.txt",
+            "grep -C0 foo a.txt b.txt", // zero context: no separator
+            // counting and listing modes print none either (their contexts are
+            // accepted but ignored) — pinned with the -c/-l rows below
+            // binary notices: neither printed around one nor counting as printed output
+            "grep -C1 needle sub/s.txt bindir/bin1.dat bindir/bin4.dat", // notices after a block: none at all
+            "grep -C1 needle bindir/bin1.dat sub/s.txt", // a notice first: none before the block
+            "grep -C1 needle sub/s.txt bindir/bin1.dat walkctx/small.txt", // notice between: one, before the last block
+            // recursive walks, matches from several files (captured destination)
+            "grep -rn -C1 x plain",
+            "grep -rn -C1 'x1\\|x3' plain",
+            "grep -rn -C1 needle walkctx",
             // ── -v / -i / unicode / invalid UTF-8 ──
             "grep -v foo a.txt",
             "grep -v -o foo a.txt",
@@ -5699,24 +5835,29 @@ mod handoff_pins {
 mod writer_pins {
     use super::*;
 
+    /// The member's buffered stdout as it stands — the merged stream every
+    /// worker's hand-off lands in.
+    fn member_stdout(shared: &std::sync::Mutex<&mut Output>) -> Vec<u8> {
+        let guard = shared.lock().unwrap_poison();
+        let OutputSink::Buffer(bytes) = &guard.sink else {
+            unreachable!("buffered sink")
+        };
+        bytes.clone()
+    }
+
     /// The redirected walk's hand-off points (the one path where the engine
     /// writes a result it cannot hold): a full chunk goes at a record end, a run
     /// of records under one flush (`-o`) hands over between them, and the entry
     /// end hands over whatever is left — nothing outlives its file, nothing is
     /// dropped, and a half-record is never handed over, because another worker's
-    /// bytes would be interleaved with it.
+    /// bytes would be interleaved with it. No block is opened here (`file_block`
+    /// is never called), so the merge adds no separator: every byte asserted
+    /// below is a record's own.
     #[test]
     fn chunked_walk_sink_hands_off_whole_records_at_record_and_entry_ends() {
         let mut member = Output::new(OutputSink::Buffer(Vec::new()), StdoutDest::File);
         let shared = std::sync::Mutex::new(&mut member);
         let mut out = ChunkedOut::new(&shared);
-        let sink = |shared: &std::sync::Mutex<&mut Output>| {
-            let guard = shared.lock().unwrap_poison();
-            let OutputSink::Buffer(bytes) = &guard.sink else {
-                unreachable!("buffered sink")
-            };
-            bytes.clone()
-        };
         let line = b"bigdir/file.txt:12345:needle\n";
 
         // Sub-chunk holds ride the entry end: two records of one entry with
@@ -5726,15 +5867,15 @@ mod writer_pins {
         out.write_bytes(b"path\0");
         out.flush();
         assert!(
-            sink(&shared).is_empty(),
+            member_stdout(&shared).is_empty(),
             "a sub-chunk buffer waits for the entry end, not a record end"
         );
         out.hand_off();
-        assert_eq!(sink(&shared), b"path:0\npath\0");
+        assert_eq!(member_stdout(&shared), b"path:0\npath\0");
 
         // Above the chunk: handed over at the record end that follows, so the
         // worker stays bounded by the chunk plus the record it is inside.
-        let mut expected = sink(&shared);
+        let mut expected = member_stdout(&shared);
         for _ in 0..(2 * WALK_CHUNK / line.len()) {
             out.write_bytes(line);
             out.flush();
@@ -5746,7 +5887,7 @@ mod writer_pins {
         }
         out.hand_off();
         assert!(out.buf.is_empty());
-        assert_eq!(sink(&shared), expected);
+        assert_eq!(member_stdout(&shared), expected);
 
         // A chunk filled mid-record waits: no flush happens inside a record.
         let before = expected.len();
@@ -5754,18 +5895,21 @@ mod writer_pins {
         let tail = b":needle\n";
         out.write_bytes(&filler);
         assert_eq!(
-            sink(&shared).len(),
+            member_stdout(&shared).len(),
             before,
             "a chunk filled mid-record waits for the record's end"
         );
         out.write_bytes(tail);
         out.flush();
         assert!(out.buf.is_empty());
-        assert_eq!(sink(&shared).len(), before + filler.len() + tail.len());
+        assert_eq!(
+            member_stdout(&shared).len(),
+            before + filler.len() + tail.len()
+        );
 
         // A run of records under one flush (`-o`) hands over as it fills, so the
         // worker stays at the chunk however long the run is.
-        let start = sink(&shared).len();
+        let start = member_stdout(&shared).len();
         let group = 8 * WALK_CHUNK / line.len();
         for _ in 0..group {
             out.write_bytes(line);
@@ -5776,12 +5920,53 @@ mod writer_pins {
             );
         }
         assert_eq!(
-            sink(&shared).len() + out.buf.len(),
+            member_stdout(&shared).len() + out.buf.len(),
             start + group * line.len(),
             "a run's records are handed over as they fill, none lost"
         );
         out.hand_off();
-        assert_eq!(sink(&shared).len(), start + group * line.len());
+        assert_eq!(member_stdout(&shared).len(), start + group * line.len());
+    }
+
+    /// The between-files separator is decided at the merge point, under the
+    /// member's lock: the opening hand-off is what asks for it, so the member's
+    /// first block is never preceded by one, a further file's block always is,
+    /// and the rest of that file's chunks (which open nothing) add none — two
+    /// workers can never both judge themselves the first block.
+    #[test]
+    fn the_merge_point_owns_the_between_files_separator() {
+        let mut member = Output::new(OutputSink::Buffer(Vec::new()), StdoutDest::File);
+        let shared = std::sync::Mutex::new(&mut member);
+        let mut out = ChunkedOut::new(&shared);
+
+        // The member's first block: nothing precedes it.
+        out.file_block();
+        out.write_bytes(b"one:needle\n");
+        out.hand_off();
+        assert_eq!(member_stdout(&shared), b"one:needle\n");
+
+        // A further file's opening: the separator goes before that block's bytes.
+        out.file_block();
+        out.write_bytes(b"two:needle\n");
+        out.hand_off();
+        assert_eq!(member_stdout(&shared), b"one:needle\n--\ntwo:needle\n");
+
+        // The rest of the same file's chunks: its block is already open.
+        out.write_bytes(b"two:more\n");
+        out.hand_off();
+        assert_eq!(
+            member_stdout(&shared),
+            b"one:needle\n--\ntwo:needle\ntwo:more\n"
+        );
+
+        // An entry that writes only stderr opens no block: no separator, and the
+        // member's stdout is untouched.
+        out.write_err("grep: gone.txt: No such file or directory\n");
+        out.hand_off();
+        assert_eq!(
+            member_stdout(&shared),
+            b"one:needle\n--\ntwo:needle\ntwo:more\n"
+        );
     }
 
     /// The destination decides what the result is worth — not the search. A

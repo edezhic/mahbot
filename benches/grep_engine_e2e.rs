@@ -53,9 +53,22 @@ fn run_matrix() -> i32 {
         "grep -rn needle bindir/bin5.dat bindir/bin4.dat",
         "grep x missing.txt a.txt",
         "grep -on o a.txt b.txt",
-        "grep -n -A1 -B1 'd\\|h' ctx.txt a.txt",
+        "grep -n -A1 -B1 'b\\|h' ctx.txt a.txt",
         "grep -x foo x1.txt a.txt",
         "grep -v foo a.txt b.txt",
+        // ── Between-files separator of a context search (`--`) ──
+        "grep -C1 foo a.txt b.txt", // both operands print: one separator
+        "grep -h -C1 foo a.txt b.txt", // no path prefix: the separator is still printed
+        "grep -C0 foo a.txt b.txt", // zero context: no separator
+        "grep -c -C1 foo a.txt b.txt", // counting mode: no separator
+        "grep -l -C1 foo a.txt b.txt", // listing mode: no separator
+        // binary notices: neither printed around one nor counting as printed output
+        "grep -C1 needle sub/s.txt bindir/bin1.dat bindir/bin4.dat", // notices after a block: none at all
+        "grep -C1 needle bindir/bin1.dat sub/s.txt", // a notice first: none before the block
+        "grep -C1 needle sub/s.txt bindir/bin1.dat walkctx/small.txt", // notice between: one, before the last block
+        "grep -rn -C1 x plain",
+        "grep -rn -C1 needle walkctx",
+        "grep -rn -C1 needle walkctx | wc -l", // the piped destination carries the separator too
         "grep -m2 a m.txt c.txt",
         "grep -rn x plain | head -3",
         // ── Raw-token operands: quoted globs/~ stay literal (multi-operand,
@@ -206,6 +219,16 @@ fn run_matrix() -> i32 {
             "grep -rn x plain>redirect-glued-bg.txt & wait",
             "redirect-glued-bg.txt",
         ),
+        (
+            "grep -C1 foo a.txt b.txt > redirect-ctx-multi.txt",
+            "redirect-ctx-multi.txt",
+        ),
+        (
+            // Per-entry context output above WALK_CHUNK: the chunked destination
+            // really interleaves (compared as sorted record sets, walk rows).
+            "grep -rn -C1 needle walkctx > redirect-walk-ctx.txt",
+            "redirect-walk-ctx.txt",
+        ),
     ] {
         match check_redirect_row(row, target, &ws, &home) {
             Ok(()) => println!("PASS: {row}"),
@@ -348,6 +371,14 @@ fn build_fixture(ws: &Path, home: &Path) {
     fs::write(ws.join("bindir/bin5.dat"), b"\xff\x00needle\n").unwrap();
     fs::create_dir_all(ws.join("sub")).unwrap();
     fs::write(ws.join("sub/s.txt"), "needle\n").unwrap();
+    // Walk tree for context rows: two entries whose `-C1` output exceeds the
+    // redirected walk's hand-off chunk (so the chunked destination really
+    // interleaves), plus a small entry for the files-with-output count.
+    fs::create_dir_all(ws.join("walkctx")).unwrap();
+    let walk_block = "needle\nfiller\nfiller\nfiller\nfiller\n".repeat(1000);
+    fs::write(ws.join("walkctx/one.txt"), &walk_block).unwrap();
+    fs::write(ws.join("walkctx/two.txt"), &walk_block).unwrap();
+    fs::write(ws.join("walkctx/small.txt"), "x\nneedle\nx\n").unwrap();
     fs::write(ws.join("-x1"), "x\n").unwrap();
     fs::create_dir_all(home.join("htree")).unwrap();
     fs::write(home.join("htree/f.txt"), "needle\n").unwrap();
