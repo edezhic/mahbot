@@ -713,11 +713,16 @@ async fn upsert_user_column(
     field: &str,
     value: Option<&str>,
 ) -> Result<()> {
-    let sql = format!(
-        "INSERT INTO users (name, {field}) VALUES (?1, ?2) \
-         ON CONFLICT(name) DO UPDATE SET {field} = excluded.{field}"
-    );
-    tx.execute(&sql, db::params![name, value]).await?;
+    tx.upsert_row(
+        &format!("UPDATE users SET {field} = ?1 WHERE name = ?2"),
+        || db::params![value, name],
+        &format!(
+            "INSERT INTO users (name, {field}) VALUES (?1, ?2) \
+             ON CONFLICT(name) DO NOTHING"
+        ),
+        db::params![name, value],
+    )
+    .await?;
     Ok(())
 }
 

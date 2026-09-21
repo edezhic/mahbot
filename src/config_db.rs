@@ -57,8 +57,10 @@ fn kv_from_row(row: &db::Row) -> Result<(String, String), ::turso::Error> {
 
 // ── UPSERT SQL constants ──────────────────────────────────
 
-const SET_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+const UPDATE_KV_SQL: &str = "UPDATE config_kv SET value = ?1 WHERE key = ?2";
+
+const INSERT_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
+     ON CONFLICT(key) DO NOTHING";
 
 const DELETE_KV_SQL: &str = "DELETE FROM config_kv WHERE key = ?1";
 
@@ -67,9 +69,12 @@ const MIGRATE_KV_IF_EQUALS_SQL: &str = "UPDATE config_kv SET value = ?3 \
 
 // ── Per-row UPSERT / DELETE (config_model_routing) ──
 
-const UPSERT_MODEL_ROUTING_SQL: &str = "INSERT INTO config_model_routing (model, provider_order) \
+const UPDATE_MODEL_ROUTING_SQL: &str =
+    "UPDATE config_model_routing SET provider_order = ?1 WHERE model = ?2";
+
+const INSERT_MODEL_ROUTING_SQL: &str = "INSERT INTO config_model_routing (model, provider_order) \
      VALUES (?1, ?2) \
-     ON CONFLICT(model) DO UPDATE SET provider_order = excluded.provider_order";
+     ON CONFLICT(model) DO NOTHING";
 
 const DELETE_MODEL_ROUTING_SQL: &str = "DELETE FROM config_model_routing WHERE model = ?1";
 
@@ -79,7 +84,12 @@ impl ConfigStore {
     /// Upsert a key-value pair.
     pub async fn set_kv(&self, key: &str, value: &str) -> Result<()> {
         self.conn
-            .execute(SET_KV_SQL, db::params![key, value])
+            .upsert_row(
+                UPDATE_KV_SQL,
+                || db::params![value, key],
+                INSERT_KV_SQL,
+                db::params![key, value],
+            )
             .await?;
         Ok(())
     }
@@ -134,8 +144,10 @@ impl ConfigStore {
             )
             .await?;
         } else {
-            tx.execute(
-                SET_KV_SQL,
+            tx.upsert_row(
+                UPDATE_KV_SQL,
+                || db::params!["false", CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL],
+                INSERT_KV_SQL,
                 db::params![CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, "false"],
             )
             .await?;
@@ -199,7 +211,12 @@ impl ConfigStore {
                 .await?;
         } else {
             self.conn
-                .execute(UPSERT_MODEL_ROUTING_SQL, db::params![model, provider_order])
+                .upsert_row(
+                    UPDATE_MODEL_ROUTING_SQL,
+                    || db::params![provider_order, model],
+                    INSERT_MODEL_ROUTING_SQL,
+                    db::params![model, provider_order],
+                )
                 .await?;
         }
         Ok(())

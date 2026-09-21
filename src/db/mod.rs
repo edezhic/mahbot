@@ -904,6 +904,43 @@ impl Connection {
         }
     }
 
+    /// Upsert one row without the engine's `INSERT ... ON CONFLICT ... DO UPDATE`
+    /// form: `update_sql` runs first, and when it matched no row `insert_sql`
+    /// creates one.
+    ///
+    /// `insert_sql` must be an `INSERT ... ON CONFLICT ... DO NOTHING`, so a row
+    /// created by another writer in between is not an error; that insert then
+    /// reports zero rows and the update runs once more, so the caller's values
+    /// win. `update_params` is a closure because the update can run twice.
+    /// Callers that need the pair to be atomic run it inside a transaction (both
+    /// `session_metadata` paths do).
+    ///
+    /// The upsert form is unusable on turso 0.8.0: with change capture enabled
+    /// (`PRAGMA capture_data_changes_conn`) it aborts the statement with a
+    /// record-decode error (`Payload too small for indicated header size`,
+    /// `Invalid Text value`, `TEXT value contains invalid UTF-8`) whenever the
+    /// target row sits on a page that carries free space.
+    /// See `INCIDENT-2026-09-21-DATA-LOSS.md`.
+    pub async fn upsert_row<U, I>(
+        &self,
+        update_sql: &str,
+        update_params: impl Fn() -> U,
+        insert_sql: &str,
+        insert_params: I,
+    ) -> turso::Result<()>
+    where
+        U: IntoParams + Send + 'static,
+        I: IntoParams + Send + 'static,
+    {
+        if self.execute(update_sql, update_params()).await? > 0 {
+            return Ok(());
+        }
+        if self.execute(insert_sql, insert_params).await? == 0 {
+            self.execute(update_sql, update_params()).await?;
+        }
+        Ok(())
+    }
+
     pub async fn execute(
         &self,
         sql: &str,
@@ -1444,6 +1481,43 @@ pub(crate) struct TxGuard<'a> {
 }
 
 impl TxGuard<'_> {
+    /// Upsert one row without the engine's `INSERT ... ON CONFLICT ... DO UPDATE`
+    /// form: `update_sql` runs first, and when it matched no row `insert_sql`
+    /// creates one.
+    ///
+    /// `insert_sql` must be an `INSERT ... ON CONFLICT ... DO NOTHING`, so a row
+    /// created by another writer in between is not an error; that insert then
+    /// reports zero rows and the update runs once more, so the caller's values
+    /// win. `update_params` is a closure because the update can run twice.
+    /// Callers that need the pair to be atomic run it inside a transaction (both
+    /// `session_metadata` paths do).
+    ///
+    /// The upsert form is unusable on turso 0.8.0: with change capture enabled
+    /// (`PRAGMA capture_data_changes_conn`) it aborts the statement with a
+    /// record-decode error (`Payload too small for indicated header size`,
+    /// `Invalid Text value`, `TEXT value contains invalid UTF-8`) whenever the
+    /// target row sits on a page that carries free space.
+    /// See `INCIDENT-2026-09-21-DATA-LOSS.md`.
+    pub async fn upsert_row<U, I>(
+        &self,
+        update_sql: &str,
+        update_params: impl Fn() -> U,
+        insert_sql: &str,
+        insert_params: I,
+    ) -> turso::Result<()>
+    where
+        U: IntoParams + Send + 'static,
+        I: IntoParams + Send + 'static,
+    {
+        if self.execute(update_sql, update_params()).await? > 0 {
+            return Ok(());
+        }
+        if self.execute(insert_sql, insert_params).await? == 0 {
+            self.execute(update_sql, update_params()).await?;
+        }
+        Ok(())
+    }
+
     pub async fn execute(
         &self,
         sql: &str,

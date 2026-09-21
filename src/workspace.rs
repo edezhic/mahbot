@@ -1439,10 +1439,13 @@ impl WorkspaceStore {
     async fn set_context(&self, name: &str, role: &str, content: &str) -> Result<()> {
         let now = db::now();
         self.conn
-            .execute(
+            .upsert_row(
+                "UPDATE workspace_contexts SET content = ?1, created_at = ?2 \
+                 WHERE workspace_name = ?3 AND role = ?4",
+                || db::params![content, now.as_str(), name, role],
                 "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(workspace_name, role) DO UPDATE SET content = excluded.content, created_at = excluded.created_at",
-                db::params![name, role, content, now],
+                 ON CONFLICT(workspace_name, role) DO NOTHING",
+                db::params![name, role, content, now.as_str()],
             )
             .await?;
         Ok(())
@@ -1465,10 +1468,13 @@ impl WorkspaceStore {
     async fn set_general_context(&self, name: &str, content: &str) -> Result<()> {
         let now = db::now();
         self.conn
-            .execute(
+            .upsert_row(
+                "UPDATE workspace_contexts SET content = ?1, created_at = ?2 \
+                 WHERE workspace_name = ?3 AND role IS NULL",
+                || db::params![content, now.as_str(), name],
                 "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) VALUES (?1, NULL, ?2, ?3) \
-                 ON CONFLICT(workspace_name) WHERE role IS NULL DO UPDATE SET content = excluded.content, created_at = excluded.created_at",
-                db::params![name, content, now],
+                 ON CONFLICT(workspace_name) WHERE role IS NULL DO NOTHING",
+                db::params![name, content, now.as_str()],
             )
             .await?;
         Ok(())

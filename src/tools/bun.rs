@@ -51,8 +51,9 @@ pub(crate) fn bun_binary_path() -> Option<PathBuf> {
 
 /// Bun release-asset platform tag, e.g. `darwin-x64` or `linux-x64-musl`.
 /// `None` on platform/arch combos the vendor does not publish. Mirrors bun's
-/// official install.sh mapping; the `-baseline` suffix marks an AVX2-less x64
-/// build (only x64 ships baseline builds — aarch64 has none).
+/// official installer mapping, Windows on ARM included; the `-baseline` suffix
+/// marks an AVX2-less x64 build (only x64 ships baseline builds, so aarch64 has
+/// none on any platform).
 #[must_use]
 fn bun_asset_target(os: &str, arch: &str, musl: bool, avx2: bool) -> Option<String> {
     let base = match (os, arch, musl) {
@@ -63,6 +64,11 @@ fn bun_asset_target(os: &str, arch: &str, musl: bool, avx2: bool) -> Option<Stri
         ("linux", "aarch64", false) => "linux-aarch64",
         ("linux", "aarch64", true) => "linux-aarch64-musl",
         ("windows", "x86_64", _) => "windows-x64",
+        // Windows on ARM: the vendor's own arm64 build (`bun-windows-aarch64.zip`,
+        // first published in bun v1.3.10) — there is no `-baseline` variant of it.
+        ("windows", "aarch64", _) => "windows-aarch64",
+        // Everything else — Windows' half-way `arm64ec` arch included — stays
+        // unsupported rather than taking another processor's build.
         _ => return None,
     };
     let asset = if !avx2 && arch == "x86_64" {
@@ -382,9 +388,15 @@ mod tests {
             bun_asset_target("windows", "x86_64", false, true).as_deref(),
             Some("windows-x64")
         );
-        // Unsupported platform/arch combos return None.
+        assert_eq!(
+            bun_asset_target("windows", "aarch64", false, true).as_deref(),
+            Some("windows-aarch64")
+        );
+        // Unsupported platform/arch combos return None — including an arch that
+        // could be mistaken for the Windows ARM one above.
         assert_eq!(bun_asset_target("freebsd", "x86_64", false, true), None);
         assert_eq!(bun_asset_target("linux", "arm", false, true), None);
+        assert_eq!(bun_asset_target("windows", "arm64ec", false, true), None);
     }
 
     #[test]
@@ -397,10 +409,15 @@ mod tests {
             bun_asset_target("macos", "x86_64", false, false).as_deref(),
             Some("darwin-x64-baseline")
         );
-        // aarch64 ships no baseline split (the AVX2 value is unused there).
+        // aarch64 ships no baseline split on any platform (the AVX2 value is
+        // unused there) — Windows on ARM included.
         assert_eq!(
             bun_asset_target("linux", "aarch64", false, false).as_deref(),
             Some("linux-aarch64")
+        );
+        assert_eq!(
+            bun_asset_target("windows", "aarch64", false, false).as_deref(),
+            Some("windows-aarch64")
         );
     }
 

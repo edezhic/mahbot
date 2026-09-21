@@ -296,7 +296,7 @@ async fn insert_messages_in_transaction(
     // prompts, tool-call frames, and tool results all count — one row per
     // message, matching the historical COUNT(s.id) list semantics). On a
     // fresh metadata row the INSERT branch carries the batch length directly;
-    // on an existing row the ON CONFLICT branch adds (append) or overwrites
+    // on an existing row the update branch adds (append) or overwrites
     // (replace). The INSERT branches rely on the `NOT NULL DEFAULT 0`
     // declaration for rows created by other paths (e.g. `set_token_length`).
     let count = i64::try_from(messages.len()).context("message batch exceeds i64")?;
@@ -307,28 +307,36 @@ async fn insert_messages_in_transaction(
             // the ON CONFLICT DO UPDATE clause below.
             let created_at = now.clone();
             let count_clause = message_count_clause(replace);
-            tx.execute(
+            tx.upsert_row(
                 &format!(
-                    "INSERT INTO session_metadata (agent_id, last_activity, message_count, \
-                     channel, user_name, workspace_name, role, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                     ON CONFLICT(agent_id) DO UPDATE SET \
-                     last_activity = excluded.last_activity, \
-                     channel = excluded.channel, \
-                     user_name = excluded.user_name, \
-                     workspace_name = excluded.workspace_name, \
-                     role = excluded.role, \
-                     {count_clause}"
+                    "UPDATE session_metadata SET last_activity = ?2, channel = ?4, \
+                     user_name = ?5, workspace_name = ?6, role = ?7, {count_clause} \
+                     WHERE agent_id = ?1"
                 ),
+                || {
+                    params![
+                        agent_id,
+                        now.as_str(),
+                        count,
+                        channel,
+                        user_name,
+                        workspace_name,
+                        role,
+                    ]
+                },
+                "INSERT INTO session_metadata (agent_id, last_activity, message_count, \
+                 channel, user_name, workspace_name, role, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(agent_id) DO NOTHING",
                 params![
                     agent_id,
-                    now,
+                    now.as_str(),
                     count,
                     channel,
                     user_name,
                     workspace_name,
                     role,
-                    created_at,
+                    created_at.as_str(),
                 ],
             )
             .await?;
@@ -338,16 +346,17 @@ async fn insert_messages_in_transaction(
     Ok(())
 }
 
-/// The `ON CONFLICT` message-count clause shared by both `session_metadata`
-/// upserts: `replace=true` overwrites (the old rows were already deleted, so
-/// a shared increment would double-count), `replace=false` appends. This must
-/// stay separate from the [`SessionStore::set_metadata_value`] upsert, which deliberately
+/// The message-count clause shared by both `session_metadata` write paths:
+/// `replace=true` overwrites (the old rows were already deleted, so
+/// a shared increment would double-count), `replace=false` appends. The batch
+/// length is bound as `?3` on both paths. This must
+/// stay separate from the [`SessionStore::set_metadata_value`] write, which deliberately
 /// never touches `last_activity`.
 fn message_count_clause(replace: bool) -> &'static str {
     if replace {
-        "message_count = excluded.message_count"
+        "message_count = ?3"
     } else {
-        "message_count = message_count + excluded.message_count"
+        "message_count = message_count + ?3"
     }
 }
 
@@ -355,7 +364,7 @@ fn message_count_clause(replace: bool) -> &'static str {
 /// stamped, `message_count` is added on append/settle (`replace=false`) or
 /// overwritten on the replace path (`replace=true`). `created_at` is
 /// INSERT-only: it stamps the session's creation time and is never touched
-/// by the ON CONFLICT clause.
+/// by the update.
 async fn upsert_message_count(
     tx: &TxGuard<'_>,
     agent_id: &str,
@@ -364,14 +373,15 @@ async fn upsert_message_count(
     replace: bool,
 ) -> Result<()> {
     let count_clause = message_count_clause(replace);
-    tx.execute(
+    tx.upsert_row(
         &format!(
-            "INSERT INTO session_metadata (agent_id, last_activity, message_count, created_at) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(agent_id) DO UPDATE SET \
-             last_activity = excluded.last_activity, \
-             {count_clause}"
+            "UPDATE session_metadata SET last_activity = ?2, {count_clause} \
+             WHERE agent_id = ?1"
         ),
+        || params![agent_id, now, count],
+        "INSERT INTO session_metadata (agent_id, last_activity, message_count, created_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(agent_id) DO NOTHING",
         params![agent_id, now, count, now],
     )
     .await?;
@@ -1058,13 +1068,17 @@ impl SessionStore {
         let now = db::now();
         // `created_at` is stamped only on row creation (never on conflict).
         let created_at = now.clone();
-        let sql = format!(
-            "INSERT INTO session_metadata (agent_id, last_activity, {col}, created_at) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(agent_id) DO UPDATE SET {col} = excluded.{col}"
-        );
         self.conn
-            .execute(&sql, params![agent_id, now, value, created_at])
+            .upsert_row(
+                &format!("UPDATE session_metadata SET {col} = ?1 WHERE agent_id = ?2"),
+                || params![value.clone(), agent_id],
+                &format!(
+                    "INSERT INTO session_metadata (agent_id, last_activity, {col}, created_at) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(agent_id) DO NOTHING"
+                ),
+                params![agent_id, now.as_str(), value.clone(), created_at.as_str()],
+            )
             .await?;
         Ok(())
     }
