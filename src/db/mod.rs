@@ -47,7 +47,7 @@ pub(crate) fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::Pars
 }
 
 /// Feature names for experimental Turso database features that must be enabled
-/// consistently by the main daemon and the debug CLI.
+/// consistently by the running instance and the debug CLI.
 ///
 /// These correspond to the `with_*()` methods / public fields of
 /// [`turso::core::DatabaseOpts`] — see [`experimental_database_opts`] for
@@ -271,7 +271,7 @@ fn init_cell<T>(cell: &tokio::sync::OnceCell<T>, value: T, name: &str) -> anyhow
 /// [`Connection::open`] reads its builder calls from this function, and
 /// [`EXPERIMENTAL_FEATURES`] lists the feature names for test verification.
 ///
-/// The daemon runs in **default single-process mode**: there is no
+/// The instance runs in **default single-process mode**: there is no
 /// `multiprocess_wal` coordination.
 ///
 /// Forensic-family reads (`mahbot debug --family`, via `open_readonly` in
@@ -563,43 +563,77 @@ const OPEN_LOCK_RETRY_ATTEMPTS: usize = 10;
 /// Delay between open-time store-lock retries.
 const OPEN_LOCK_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// Step prefix of [turso_core]'s locking-error variant as it survives into the
+/// rendered message: the variant's `Display` prefix (`Locking error:`) followed
+/// by the failing step. It covers the two steps that take the open-time lock
+/// (`Failed locking file…`, `Failed locking shared WAL coordination file…`) and
+/// excludes the variant's other uses, which take no lock never mind contention
+/// (`mmap shared WAL coordination file failed`, `Failed to release file lock`).
+/// `turso_sdk_kit` collapses the typed `LimboError::LockingError` variant into a
+/// plain message string (`TursoError::Error(value.to_string())`), so a step
+/// prefix is the most the predicate can key on.
+///
+/// [turso_core]: https://github.com/tursodatabase/turso
+const LOCK_STEP_PREFIX: &str = "Locking error: Failed locking";
+
+/// The engine's wording for a lock *contended* by another process, on the paths
+/// where the conflict reaches it as an `ErrorKind::WouldBlock` (a `fcntl`
+/// `F_SETLK` returning `EAGAIN`).
+const LOCK_CONTENTION_MARKER: &str = "File is locked by another process";
+
+/// Windows' contention code, as it reaches us inside the engine's message.
+///
+/// `LockFileEx` reports `ERROR_LOCK_VIOLATION` (33) when another process holds
+/// the range, and std maps that code to `ErrorKind::Uncategorized` — not to
+/// `WouldBlock` — so the engine takes its other branch and echoes the OS text:
+/// `"Failed locking file, <localised OS text> (os error 33)"`. The OS text is
+/// localised, the trailing code is not, and code 33 is the same discriminator
+/// std's own Windows `try_lock` matches on.
+const WINDOWS_LOCK_VIOLATION_CODE: &str = "(os error 33)";
+
 /// Whether an error is the transient open-time store lock from [turso_core].
 ///
 /// Turso's [`turso::Builder::build`] takes a whole-file fcntl `F_SETLK`
 /// `F_WRLCK` record lock on the store files it opens read-write while the
 /// database is opened — the main file and its `-wal` (see `wal_guard`'s lock
-/// rule). When another process already holds that lock (e.g. the previous
-/// daemon process during a self-update restart), the open fails with a
-/// `WouldBlock` that [turso_core] folds into [`turso::Error::Error`] via the
-/// catch-all `From` impl, surfacing as a `"Locking error: Failed locking file
-/// '...'. File is locked by another process"` message. [`Connection::open`]'s
-/// `busy_timeout` does **not** cover this open-time lock — it only governs
-/// per-statement waits after the handle is connected.
+/// rule). When another process already holds that lock the open fails;
+/// [`Connection::open`]'s `busy_timeout` does **not** cover this open-time
+/// lock — it only governs per-statement waits after the handle is connected.
 ///
-/// The predicate is deliberately narrow: it requires both the `"Locking
-/// error:"` and `"File is locked by another process"` substrings, so it never
-/// treats generic `"database is locked"` / "table is locked" busy errors
-/// (which have their own retry/backoff semantics) or unrelated corruption or
-/// I/O messages as this transient condition.
+/// The predicate is the conjunction of [`LOCK_STEP_PREFIX`] and one contention
+/// token ([`LOCK_CONTENTION_MARKER`] or [`WINDOWS_LOCK_VIOLATION_CODE`]). Both
+/// halves are load-bearing: the step alone would also retry uncontended
+/// lock-open failures and then report them as "locked by another process", while
+/// the `WouldBlock` wording alone would never match on Windows.
+/// `Busy("database is locked")` and table-level lock errors have their own retry
+/// semantics and are never this condition; any other lock/busy wording stays
+/// actionable through [`is_actionable_signal`], it is simply not retried.
 ///
-/// This is narrower than [`has_lock_signal`]: it gates the bounded open retry
-/// (the departing process's brief hold during a self-update handoff), so it
-/// demands that exact pair. Any other lock/busy wording is still actionable
-/// through [`is_actionable_signal`] — it is simply not retried.
+/// Guarding this is asymmetric by platform, and worth knowing when trusting it:
+/// `db::store_lock_check`'s `a_store_held_by_another_process_refuses_the_boot`
+/// drives a real contended open across two processes, so the Unix half fails
+/// loudly on an engine-wording change — that module is Unix-only, and the
+/// Windows token has no such witness beyond the literal in
+/// `open_time_lock_error_predicate`. The engine's opt-in IOCP backend is covered
+/// only half-way: its shared-WAL path reuses the marker, but its main-file path
+/// renders the contention as `"Locking error: The process cannot access the file
+/// because another process has locked a portion of the file."` — neither our
+/// step prefix nor a code — so selecting that vfs would silently disable the
+/// retry for the main file.
 ///
 /// [turso_core]: https://github.com/tursodatabase/turso
 fn is_open_time_lock_error(err: &turso::Error) -> bool {
-    matches!(
-        err,
-        turso::Error::Error(msg)
-            if msg.contains("Locking error:") && msg.contains("File is locked by another process")
-    )
+    let turso::Error::Error(msg) = err else {
+        return false;
+    };
+    msg.contains(LOCK_STEP_PREFIX)
+        && (msg.contains(LOCK_CONTENTION_MARKER) || msg.contains(WINDOWS_LOCK_VIOLATION_CODE))
 }
 
 /// True when `e`, or any cause beneath it, is [the open-time store lock]:
-/// another process holds a store this process is trying to open. The daemon's
-/// store bring-up records its refusal through this; the repair path decides
-/// through [`is_actionable_signal`] instead.
+/// another instance holds a store this process is trying to open. Store
+/// bring-up records its refusal through this; the repair path decides through
+/// [`is_actionable_signal`] instead.
 ///
 /// [the open-time store lock]: is_open_time_lock_error
 pub(crate) fn is_store_lock_error(e: &anyhow::Error) -> bool {
@@ -658,16 +692,15 @@ impl std::fmt::Display for StoreRefusal {
 
 impl std::error::Error for StoreRefusal {}
 
-/// Retries `attempt` only for the transient open-time store lock.
+/// Retries `attempt` only for the transient open-time store lock
+/// ([`is_open_time_lock_error`] is the sole test).
 ///
 /// The previous process still holds the store locks briefly during a
 /// self-update restart; this bounded retry (a few seconds total) absorbs that
 /// race without masking any other open failure. `attempts` is the number of
 /// retries *after* the first try, so the maximum number of total tries is
-/// `attempts + 1`. A non-[open-time lock] error is returned on the first
-/// encounter and never retried.
-///
-/// [open-time lock]: is_open_time_lock_error
+/// `attempts + 1`; any other error is returned on the first encounter and never
+/// retried.
 async fn with_open_lock_retry<T, F, Fut>(
     attempts: usize,
     delay: Duration,
@@ -725,7 +758,7 @@ impl Connection {
         // compound SELECTs, window functions, CREATE INDEX, sorter/hash-join
         // spills — stays in RAM and never touches a temp dir. turso_core's
         // tempdir creation has no parent-creation and no fallback chain, and
-        // resolves through $TMPDIR, which the daemon pins to its private
+        // resolves through $TMPDIR, which the instance pins to its private
         // root: a missing root used to fail every eager-temp statement with
         // "I/O error (tempdir): entity not found". The PRAGMA maps to the
         // per-connection set_temp_store (turso_core translate/pragma.rs);
@@ -920,7 +953,7 @@ impl Connection {
     /// panic, or a failure to roll a leaked transaction back, flags
     /// `has_dangling_tx` so the next access attempts a rollback; a non-panic
     /// `query_only=0` failure only surfaces an error. Either way a failed
-    /// `query_only=0` leaves `query_only=1` (rejecting daemon writes) — loud,
+    /// `query_only=0` leaves `query_only=1` (rejecting instance writes) — loud,
     /// with no automatic recovery. Bounds the result set to `row_limit` rows
     /// using LIMIT+1 semantics (a result of exactly `row_limit` rows is NOT
     /// flagged truncated; the `row_limit + 1`-th row flags it). Returns column
@@ -941,11 +974,11 @@ impl Connection {
                         .catch_unwind()
                         .await;
                 // Always restore the shared connection to its normal state (query_only
-                // off, autocommit) so daemon writes are never left disabled. The
+                // off, autocommit) so instance writes are never left disabled. The
                 // `query_only` reset happens first; then a transaction-control statement
                 // (BEGIN/SAVEPOINT) that a raw IPC client could send — not re-validated
-                // daemon-side — is rolled back to autocommit, since an open transaction
-                // on the shared connection would poison subsequent daemon writes. The
+                // instance-side — is rolled back to autocommit, since an open transaction
+                // on the shared connection would poison subsequent instance writes. The
                 // whole reset is also panic-guarded: a turso engine panic here must not
                 // unwind (leaving query_only=1), so the caller gets an error instead.
                 let (reset, tx_reset) = match AssertUnwindSafe(async {
@@ -964,7 +997,7 @@ impl Connection {
                         // The reset panicked: the connection state is unknown (`query_only`
                         // may still be 1 and/or a transaction may be open). Flag it so the
                         // next `lock_and_cleanup` attempts a rollback, and surface the error
-                        // rather than leaving daemon writes silently blocked.
+                        // rather than leaving instance writes silently blocked.
                         dangling.store(true, Ordering::SeqCst);
                         return Err(turso::Error::Error(format!(
                             "the database engine panicked while resetting the read-only query state: {}",
@@ -975,17 +1008,17 @@ impl Connection {
                 if let Err(e) = &reset {
                     tracing::error!(
                         error = %e,
-                        "query_readonly: failed to reset PRAGMA query_only — daemon writes may \
+                        "query_readonly: failed to reset PRAGMA query_only — instance writes may \
                          be left disabled on the shared connection"
                     );
                 }
                 if let Err(e) = &tx_reset {
                     // Flag the leaked transaction so the next `lock_and_cleanup` retries
-                    // the rollback before a daemon write reuses the connection.
+                    // the rollback before an instance write reuses the connection.
                     dangling.store(true, Ordering::SeqCst);
                     tracing::error!(
                         error = %e,
-                        "query_readonly: failed to roll back a leaked transaction — daemon writes may \
+                        "query_readonly: failed to roll back a leaked transaction — instance writes may \
                          be left disabled on the shared connection"
                     );
                 }
@@ -1740,7 +1773,7 @@ async fn rebuild_ticket_title_fts(
 /// (a panicking turso op re-enters the caller via `run_detached`'s
 /// `resume_unwind`). A panicking probe is itself corruption evidence — the
 /// rebuild is still attempted; a panicking rebuild is logged loudly and boot
-/// continues. The daemon must never crash-loop over this path, and detection
+/// continues. The instance must never crash-loop over this path, and detection
 /// must never be silently skipped.
 ///
 /// `store` and `root` are the refusal record's identity and artifact directory:
@@ -2029,9 +2062,10 @@ fn has_resource_signal(lower: &str) -> bool {
 
 /// Lock/busy contention keywords for [`is_actionable_signal`]. The engine
 /// reports another process holding a store as the open-time whole-file lock
-/// (`Locking error: … File is locked by another process`), a locked table, or a
-/// busy database. All of them are one external condition — never damage, and
-/// never silently ignored.
+/// (the `Locking error:` step marker, whatever the platform's contention
+/// wording — see [`is_open_time_lock_error`]), a locked table, or a busy
+/// database. All of them are one external condition — never damage, and never
+/// silently ignored.
 const LOCK_SIGNAL_KEYWORDS: [&str; 3] = ["locking", "locked", "busy"];
 
 fn has_lock_signal(lower: &str) -> bool {
@@ -4704,14 +4738,25 @@ mod tests {
     #[test]
     fn open_time_lock_error_predicate() {
         let lock = |msg: &str| turso::Error::Error(msg.to_string());
-        // The real open-time fcntl `F_SETLK` WouldBlock folded into the
-        // generic Error variant by turso_core's catch-all From impl.
+        // The Unix open-time fcntl `F_SETLK` WouldBlock folded into the generic
+        // Error variant by turso_core's catch-all From impl — the message
+        // observed on this host while another process held a store.
         assert!(is_open_time_lock_error(&lock(
             "Locking error: Failed locking file '/x/logs.db-wal'. File is locked by another process"
+        )));
+        // The same lock's wording on the engine's async-handle IO paths.
+        assert!(is_open_time_lock_error(&lock(
+            "Locking error: Failed locking file. File is locked by another process"
         )));
         // The shared-WAL coordination file variant of the same open-time lock.
         assert!(is_open_time_lock_error(&lock(
             "Locking error: Failed locking shared WAL coordination file. File is locked by another process"
+        )));
+        // Windows reports `ERROR_LOCK_VIOLATION` (33), which std does not map to
+        // `WouldBlock`, so the engine echoes the OS text plus the code — the
+        // code is what carries the contention there.
+        assert!(is_open_time_lock_error(&lock(
+            "Locking error: Failed locking file, The process cannot access the file because another process has locked a portion of the file. (os error 33)"
         )));
         // A statement-level busy error is NOT the open-time lock.
         assert!(!is_open_time_lock_error(&turso::Error::Busy(
@@ -4720,6 +4765,24 @@ mod tests {
         // A table-level lock surfaced as a generic Error is NOT the open-time lock.
         assert!(!is_open_time_lock_error(&lock(
             "Runtime error: database table is locked"
+        )));
+        // The engine's other `LockingError` uses do not open a lock.
+        assert!(!is_open_time_lock_error(&lock(
+            "Locking error: mmap shared WAL coordination file failed: boom (offset=0)"
+        )));
+        assert!(!is_open_time_lock_error(&lock(
+            "Locking error: Failed to release file lock: not locked"
+        )));
+        // A lock-open failure with no contention in it must not be retried, nor
+        // reported as "another process holds the store".
+        assert!(!is_open_time_lock_error(&lock(
+            "Locking error: Failed locking file '/x/core.db', Too many open files (os error 24)"
+        )));
+        // An I/O completion error is not the open-time lock: it carries the kind
+        // of a failed read/write, never the engine's `lock_file` step.
+        assert!(!is_open_time_lock_error(&turso::Error::IoError(
+            std::io::ErrorKind::WouldBlock,
+            "read"
         )));
         // Corruption and I/O-class messages must not be treated as this race.
         assert!(!is_open_time_lock_error(&lock(

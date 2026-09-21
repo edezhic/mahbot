@@ -23,9 +23,11 @@
 //!
 //! After the swap the fresh binary is also copied to the cargo install bin path
 //! (`$CARGO_HOME/bin` / `~/.cargo/bin`) so PATH invocations of `mahbot` stay
-//! fresh even when the daemon runs from a different path (e.g. the repo's
-//! `target/release`). Uses `flock()` for single-instance enforcement. The WAL
-//! checkpoint before `exit(0)` is a clean store handoff: `std::process::exit(0)`
+//! fresh even when the instance runs from a different path (e.g. the repo's
+//! `target/release`). Single-instance enforcement is an exclusive whole-file
+//! lock on `mahbot.lock`, released explicitly before the hand-off spawn — see
+//! [`acquire_lock`] and [`crate::util::lock`]. The WAL checkpoint before
+//! `exit(0)` is a clean store handoff: `std::process::exit(0)`
 //! bypasses all Rust destructors, so Turso connections are never properly
 //! closed. The TRUNCATE leaves an empty WAL; committed data is already
 //! fsync-durable at COMMIT.
@@ -64,16 +66,41 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── File-lock based single-instance guard ─────────────────────────────────
 
-/// Acquire an exclusive lock on the global lock file, returning an error
-/// if another instance holds it.
+/// Environment marker the updating parent sets (to `"1"`) on the replacement
+/// instance it spawns; [`acquire_lock`] owns what it does. Nothing else sets it,
+/// and it is inherited only where the environment is: the agent-facing shell and
+/// git children run with a cleared environment (`tools::shell::apply_safe_env`),
+/// while the GUI Shell tab's PTY does not, so a `mahbot` launched from the
+/// replacement instance's own terminal takes the hand-off wait once before the
+/// ordinary refusal.
+const HANDOFF_ENV: &str = "MAHBOT_UPDATE_HANDOFF";
+
+/// How long a hand-off-marked instance waits for the previous instance to
+/// release the location before refusing ([`acquire_lock`]).
+const HANDOFF_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// Poll interval of the hand-off wait ([`acquire_lock`]).
+const HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Acquire an exclusive whole-file lock on `mahbot.lock`, returning an error if
+/// another instance holds it.
 ///
 /// `storage_root` is the directory where `mahbot.lock` is created — typically
 /// [`crate::config::default_config_dir`].
 ///
-/// The returned guard is stored in `INSTANCE_LOCK` for the process lifetime.
-/// The kernel automatically releases the lock on process termination
-/// (including `exit(0)`), and [`execute_update`] releases it explicitly during
-/// self-update so the child can re-acquire on restart.
+/// The returned guard is stored in `INSTANCE_LOCK` for the process lifetime,
+/// and released on process termination (`exit(0)` included) unless
+/// [`FlockGuard::release`] did so first — `util::lock` owns that story.
+///
+/// # Update hand-off
+///
+/// The updating parent marks the replacement instance it spawns with
+/// [`HANDOFF_ENV`], and this function then *waits* for a held location instead
+/// of refusing: the parent releases the lock before spawning, but the child can
+/// reach this point before that release is visible, and refusing there would
+/// abandon a completed update's restart. The wait is bounded by
+/// [`HANDOFF_LOCK_WAIT`] and falls through to the ordinary refusal. An unmarked
+/// process (a genuine second launch) is refused immediately — no sleeps.
 ///
 /// # Panics
 ///
@@ -87,37 +114,70 @@ pub fn acquire_lock(storage_root: &Path) -> Result<()> {
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
-    match try_acquire_lock(&lock_path)? {
-        Some(file) => {
-            info!(path = %lock_path.display(), "Acquired instance lock");
-
-            let guard = FlockGuard {
-                file: Some(file),
-                lock_path,
-            };
-            INSTANCE_LOCK
-                .set(Mutex::new(guard))
-                .expect("acquire_lock called more than once");
-            Ok(())
+    let file = match try_acquire_lock(&lock_path)? {
+        Some(file) => file,
+        None if std::env::var(HANDOFF_ENV).is_ok_and(|v| v == "1") => {
+            crate::boot::boot_diagnostic(format!(
+                "update hand-off: the instance lock is still held — waiting up to {}s for the \
+                 previous instance to release it",
+                HANDOFF_LOCK_WAIT.as_secs()
+            ));
+            wait_for_handoff(&lock_path)?
         }
-        None => Err(anyhow!(
-            "Another instance of mahbot is already running (lock file: {}). \
-             The lock is a kernel flock released automatically when that instance exits.",
-            lock_path.display()
-        )),
+        None => return Err(second_instance_refusal(&lock_path)),
+    };
+
+    info!(path = %lock_path.display(), "Acquired instance lock");
+
+    let guard = FlockGuard {
+        file: Some(file),
+        lock_path,
+    };
+    INSTANCE_LOCK
+        .set(Mutex::new(guard))
+        .expect("acquire_lock called more than once");
+    Ok(())
+}
+
+/// Poll for the previous instance's release until [`HANDOFF_LOCK_WAIT`] expires,
+/// then fall back to the ordinary second-instance refusal.
+///
+/// Only reached by a hand-off-marked instance (see [`HANDOFF_ENV`]) whose
+/// immediate attempt already failed.
+fn wait_for_handoff(lock_path: &Path) -> Result<File> {
+    let deadline = std::time::Instant::now() + HANDOFF_LOCK_WAIT;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(HANDOFF_POLL_INTERVAL);
+        if let Some(file) = try_acquire_lock(lock_path)? {
+            return Ok(file);
+        }
     }
+    Err(second_instance_refusal(lock_path))
+}
+
+/// The error a launch gets when another instance holds the location.
+///
+/// The wording is a matched surface — the grep engine recognises a stale
+/// self-update binary by it (`shell::grep_engine::STALE_BINARY_LOCK_MSG`) — so
+/// it must not change.
+fn second_instance_refusal(lock_path: &Path) -> anyhow::Error {
+    anyhow!(
+        "Another instance of mahbot is already running (lock file: {}). \
+         The lock is a kernel flock released automatically when that instance exits.",
+        lock_path.display()
+    )
 }
 
 /// Attempt to acquire an exclusive lock on the given file path.
 ///
-/// Opens the file (creating it if necessary) and tries `flock(LOCK_EX|LOCK_NB)`.
-/// Returns immediately if another process holds the lock.
+/// Opens the file (creating it if necessary) and calls [`try_flock`], which takes
+/// an exclusive whole-file lock without blocking. Returns immediately if another
+/// process holds the lock.
 ///
 /// # Returns
 ///
 /// - `Ok(Some(file))` — lock acquired successfully. **The caller must keep the
-///   returned `File` alive for the lifetime of the lock** — dropping it releases
-///   the kernel-level lock.
+///   returned `File` alive for the lifetime of the lock.**
 /// - `Ok(None)` — another process holds the lock.
 /// - `Err(...)` — a non-retryable OS error occurred (propagated from [`try_flock`]
 ///   or file open).
@@ -132,15 +192,15 @@ pub fn acquire_lock(storage_root: &Path) -> Result<()> {
 ///   before calling this helper.
 /// - **Idempotency guard**: both callers check whether the lock is already held
 ///   before calling this helper. Calling this helper while already holding the
-///   lock via a different `File` would fail with `EAGAIN` (the two file
-///   descriptors are independent from the kernel's perspective).
+///   lock via a different `File` would fail (the two file descriptors are
+///   independent from the kernel's perspective).
 /// - **Error messages**: each caller formats its own success/failure messages.
 fn try_acquire_lock(path: &Path) -> Result<Option<File>> {
     let file = open_lock_file(path)
         .with_context(|| format!("failed to open lock file {}", path.display()))?;
 
     if crate::util::lock::try_flock(&file)
-        .with_context(|| format!("flock failed on lock file {}", path.display()))?
+        .with_context(|| format!("failed to lock {}", path.display()))?
     {
         Ok(Some(file))
     } else {
@@ -165,9 +225,11 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
 
 /// A guard holding the instance lock file.
 ///
-/// The lock is released via [`release`](FlockGuard::release) (or on drop).
-/// Re-acquisition after release is handled by [`reacquire_instance_lock`] —
-/// needed when a self-update spawn fails and the current process stays alive.
+/// The lock is released via [`release`](FlockGuard::release) — an explicit
+/// unlock of the file, then closing the handle — or, at the latest, when the
+/// guard is dropped. Re-acquisition after release is handled by
+/// [`reacquire_instance_lock`] — needed when a self-update spawn fails and the
+/// current process stays alive.
 struct FlockGuard {
     file: Option<File>,
     lock_path: PathBuf,
@@ -183,10 +245,21 @@ impl std::fmt::Debug for FlockGuard {
 }
 
 impl FlockGuard {
-    /// Release the lock by closing the underlying file descriptor.
+    /// Release the lock: explicitly unlock the file, then close the handle.
     /// Idempotent — no-op if already released.
+    ///
+    /// The explicit unlock is what the update hand-off relies on — see
+    /// `util::lock`'s module doc for why the close-time release is not enough. A
+    /// failed unlock only warns: the close still releases the lock.
     fn release(&mut self) {
-        if self.file.take().is_some() {
+        if let Some(file) = self.file.take() {
+            if let Err(e) = file.unlock() {
+                warn!(
+                    error = %e,
+                    path = %self.lock_path.display(),
+                    "Failed to unlock instance lock file — the close still releases it"
+                );
+            }
             info!(path = %self.lock_path.display(), "Released instance lock");
         }
     }
@@ -198,8 +271,8 @@ static INSTANCE_LOCK: OnceLock<Mutex<FlockGuard>> = OnceLock::new();
 
 /// Release the instance lock so a child process can acquire it on startup.
 ///
-/// Called just before spawning the new instance during self-update.
-/// No-op if the lock is not initialized or already released.
+/// Called just before spawning the new instance during self-update. No-op if the
+/// lock is not initialized or already released.
 async fn release_instance_lock() {
     if let Some(mutex) = INSTANCE_LOCK.get() {
         let mut guard = mutex.lock().await;
@@ -654,11 +727,11 @@ pub(crate) const UPDATE_RESTART_MSG: &str =
 /// `exit(0)`). During this window the update path owns the process:
 /// the GUI exit path waits ([`update_is_finalizing`]) instead of exiting, so a
 /// window close or SIGINT cannot abort the update's checkpoint on the iced
-/// runtime and leave the daemon down without a replacement.
+/// runtime and leave the instance down without a replacement.
 static UPDATE_FINALIZING: AtomicBool = AtomicBool::new(false);
 
-/// True while [`execute_update`] is in its finalizing window (daemon shut
-/// down; checkpoint, temp-root cleanup, lock release, spawn, and `exit(0)`
+/// True while [`execute_update`] is in its finalizing window (the instance is
+/// shut down; checkpoint, temp-root cleanup, lock release, spawn, and `exit(0)`
 /// pending).
 #[must_use]
 pub fn update_is_finalizing() -> bool {
@@ -892,7 +965,7 @@ fn temp_bin_path(install_root: &Path) -> PathBuf {
 /// the fresh binary at `<temp_install>/bin/mahbot`.
 ///
 /// 1. Validate that the fresh binary exists and is non-empty (bail otherwise —
-///    a silent empty swap would strand the daemon).
+///    a silent empty swap would strand the instance).
 /// 2. Capture `current_exe()` BEFORE the swap — it is always the restart
 ///    target (self_replace rewrites it in place, wherever it lives).
 /// 3. Swap the running binary with the fresh one via `self_replace`. The source
@@ -995,8 +1068,9 @@ async fn finalize_install(
 ///    never a temp root — so cleanup can never delete the binary the child is
 ///    validating; macOS syspolicyd SIGKILLs children whose binary is deleted
 ///    during async code-signature validation, and that invariant must hold.
-/// 4. Release the instance lock so the child process can acquire it on startup.
-/// 5. Spawn the new instance. On macOS, posix_spawn triggers asynchronous
+/// 4. Release the instance lock so the child can acquire it.
+/// 5. Spawn the new instance, marked as the update hand-off ([`HANDOFF_ENV`] —
+///    see [`acquire_lock`]). On macOS, posix_spawn triggers asynchronous
 ///    Gatekeeper code signature validation. The spawn target is never a temp
 ///    root (see step 3), so the cleanup cannot race the validation.
 /// 6. `exit(0)`.
@@ -1032,10 +1106,11 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
         }
     }
 
-    // 4. Release instance lock so the child process can acquire it on startup.
+    // 4. Release the instance lock so the child can acquire it on startup.
     release_instance_lock().await;
 
-    // 5. Spawn the new instance from the determined spawn path.
+    // 5. Spawn the new instance from the determined spawn path, marked as the
+    //    update hand-off.
     if let Err(e) = spawn_new_instance_from(spawn_path) {
         // Spawn failed — the process stays alive (unless a genuine window
         // close was requested during the finalizing window, in which case the
@@ -1135,7 +1210,7 @@ async fn run_cargo_with_timeout(
             // kill_on_drop: if the timeout fires, the cargo child must die
             // too rather than keep compiling in the background. For
             // `cargo install` an orphaned child could even complete and swap
-            // the binary after the daemon reported "timed out", racing a
+            // the binary after the instance reported "timed out", racing a
             // user retry.
             .kill_on_drop(true)
             .stdin(Stdio::null())
@@ -1324,8 +1399,8 @@ fn resolve_cargo_bin_path() -> Option<PathBuf> {
 }
 
 /// Copy the freshly built binary to the PATH-visible cargo bin path, so a
-/// `mahbot` invoked from PATH runs the new version even when the daemon started
-/// from a different path (e.g. the repo's `target/release`).
+/// `mahbot` invoked from PATH runs the new version even when the instance
+/// started from a different path (e.g. the repo's `target/release`).
 ///
 /// The source is the freshly-swapped `current_exe` (the running binary after
 /// `self_replace`), which persists across the temp-root cleanup — so the manual
@@ -1467,6 +1542,9 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
 /// The `binary_path` must point to an existing, executable binary — always the
 /// captured `current_exe()` after the swap in the unified update flow.
 ///
+/// The child is marked as the update hand-off ([`HANDOFF_ENV`] — see
+/// [`acquire_lock`]).
+///
 /// On Unix: null stdin/stdout, stderr → update.log. On Windows: same + `DETACHED_PROCESS | CREATE_NO_WINDOW`.
 /// On spawn failure the error is returned (no admin notification — the caller
 /// [`finalize_update_and_restart`] owns failure reporting); the process keeps
@@ -1489,6 +1567,8 @@ fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
 
     let mut cmd = std::process::Command::new(binary_path);
     cmd.args(&args);
+    // The update hand-off mark — see `acquire_lock`.
+    cmd.env(HANDOFF_ENV, "1");
 
     let update_log = OpenOptions::new()
         .create(true)
@@ -1568,7 +1648,7 @@ mod tests {
     #[test]
     fn test_try_acquire_lock_held_free() {
         let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("mahbot.lock");
+        let lock_path = lock_file_path(dir.path());
 
         // Direct primitives (open_lock_file + try_flock): hold the lock, then
         // verify a second fd on the same file cannot flock while it is held.
@@ -1586,14 +1666,65 @@ mod tests {
             "Should return None when lock is held"
         );
 
-        // Dropping the holder must release the lock — through the production
-        // helper, which is the same builder + `flock` pair asserted on above.
+        // The explicit release (what the update hand-off relies on) frees the
+        // lock while the holder's handle is still open.
+        holder.unlock().expect("unlock the held lock file");
+        assert!(
+            try_flock(&contender).unwrap(),
+            "After the explicit unlock, the contender must acquire the lock"
+        );
+
+        // Dropping the handles must release the lock — through the production
+        // helper, which opens the file the same way.
         drop(holder);
         drop(contender);
         assert!(
             lock_becomes_free(&lock_path).expect("lock the released lock file"),
             "After release, the lock must be acquirable again"
         );
+    }
+
+    /// The update hand-off wait: a marked instance must take the location once
+    /// the outgoing instance releases it, and the release it waits for is the
+    /// explicit `unlock` with the handle still open — exactly what
+    /// [`FlockGuard::release`] does, and the reason it does not rely on the
+    /// close.
+    #[test]
+    fn wait_for_handoff_takes_the_released_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lock_file_path(dir.path());
+        let holder = open_lock_file(&path).unwrap();
+        assert!(
+            try_flock(&holder).unwrap(),
+            "the outgoing instance must hold the location"
+        );
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(HANDOFF_POLL_INTERVAL * 2);
+            holder.unlock().expect("release the location");
+            holder
+        });
+
+        let taken =
+            wait_for_handoff(&path).expect("a marked instance must take the released location");
+        assert!(
+            location_is_held(&path),
+            "the wait must leave the location held"
+        );
+
+        // The outgoing handle is closed only now: the lock the wait took is on
+        // its own handle and must survive that close.
+        drop(releaser.join().unwrap());
+        assert!(
+            location_is_held(&path),
+            "the lock taken by the wait must survive the outgoing handle's close"
+        );
+        drop(taken);
+    }
+
+    /// Whether a fresh handle on the location finds it locked by someone else.
+    fn location_is_held(path: &Path) -> bool {
+        !try_flock(&open_lock_file(path).unwrap()).unwrap()
     }
 
     /// Poll for `path` to become lockable again, for up to ~2s.

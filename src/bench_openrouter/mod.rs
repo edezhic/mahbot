@@ -1,10 +1,12 @@
 //! `mahbot bench-openrouter` — standalone OpenRouter provider benchmark CLI.
 //!
 //! Dispatched from `main()` BEFORE the instance flock is acquired (like
-//! `debug` and `__grep-engine`), so it runs while the live daemon holds the
-//! lock. It never opens a live mahbot store for writing: the only database
-//! touch is a read-only (ReadOnly|NoLock) config-store lookup for the worker
-//! model / provider key fallback, identical in spirit to `mahbot debug`.
+//! `debug` and `__grep-engine`), so it runs while an instance holds the
+//! storage location. It never opens a live store: when the location is held it
+//! resolves the worker model / provider key through that instance's debug
+//! channel, only when nothing holds it does it read the config store directly
+//! (ReadOnly|NoLock) — the same routing `mahbot debug` uses — and a probe that
+//! cannot tell whether the location is held refuses instead of opening.
 //!
 //! # Modes
 //!
@@ -44,10 +46,11 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use serde_json::json;
 
 use crate::util::UnwrapPoison;
+use crate::util::lock::InstanceLockState;
 
 mod classify;
 mod discovery;
@@ -304,7 +307,14 @@ fn model_from_env_or_config() -> String {
         return m;
     }
     if let Ok(root) = crate::config::default_config_dir()
-        && let Some(m) = read_config_kv(&root, "worker_model")
+        && let Some(m) = read_config_kv(
+            &root,
+            "worker_model",
+            &format!(
+                "the default worker model ({})",
+                crate::config::DEFAULT_WORKER_MODEL
+            ),
+        )
         && !m.is_empty()
     {
         return m;
@@ -332,7 +342,7 @@ fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> 
         return Ok((k, "env"));
     }
     if let Ok(root) = crate::config::default_config_dir()
-        && let Some(k) = read_config_kv(&root, "provider_key")
+        && let Some(k) = read_config_kv(&root, "provider_key", "no usable API key")
         && !k.is_empty()
     {
         return Ok((k, "config"));
@@ -348,21 +358,26 @@ fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> 
 
 /// Read one `config_kv` value from the live config store, read-only.
 ///
-/// When the daemon is up it holds the single-process instance lock, so the
-/// lookup is routed through the debug IPC endpoint (the same query-only
-/// guard `mahbot debug` uses). When the daemon is down the consolidated
-/// `core.db` is opened directly with `ReadOnly|NoLock`
-/// and never creates or mutates files. Any failure — missing file, unreadable
-/// store, missing row, IPC hiccup — degrades to `None` with a
-/// `tracing::warn`: this is a fallback resolution path, never fatal.
-fn read_config_kv(storage_root: &Path, key: &str) -> Option<String> {
+/// A store is never opened while an instance holds the storage location: when
+/// the settled instance-lock probe reports the location
+/// [`Held`](InstanceLockState::Held) the lookup is routed through the debug IPC
+/// endpoint (the same query-only guard `mahbot debug` uses), and a probe that
+/// could not tell ([`Unknown`](InstanceLockState::Unknown)) refuses instead of
+/// opening. Only a definitively [`Free`](InstanceLockState::Free) location is
+/// opened directly with `ReadOnly|NoLock`, which never creates or mutates files.
+///
+/// Any failure — unreadable store, a refused probe, an unreachable channel —
+/// degrades to `None` instead of failing the run, but never silently: this
+/// subcommand's log is not live this early, so the failure and the `fallback`
+/// the caller continues on go to stderr. A not-yet-created config store is
+/// `Ok(None)`, i.e. not a failure.
+fn read_config_kv(storage_root: &Path, key: &str, fallback: &str) -> Option<String> {
     match read_config_kv_inner(storage_root, key) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(
-                key,
-                error = %e,
-                "bench-openrouter: read-only config lookup failed; ignoring"
+            eprintln!(
+                "Warning: could not read '{key}' from the mahbot configuration store: {e:#}; \
+                 continuing with {fallback}"
             );
             None
         }
@@ -376,30 +391,32 @@ fn read_config_kv_inner(storage_root: &Path, key: &str) -> anyhow::Result<Option
     if !db_path.exists() {
         return Ok(None);
     }
-    // When the daemon holds the instance lock it is the single-process writer;
-    // `bench-openrouter` must NOT open a second connection to the live store.
-    // Route the lookup through the debug IPC endpoint (same query-only guard as
-    // `mahbot debug`). When the daemon is down, open the store directly in
-    // single-process mode (ReadOnly|NoLock reads committed WAL frames). The
-    // settled lock probe also avoids a direct open mid self-update handoff.
-    if crate::util::lock::daemon_holds_lock_settled(storage_root) {
-        let req = crate::db::ipc::QueryRequest {
-            store: "core".to_string(),
-            sql: "SELECT value FROM config_kv WHERE key = ?1".to_string(),
-            params: vec![crate::db::ipc::WireValue::Text(key.to_string())],
-        };
-        let resp = crate::db::ipc::ipc_query_sync(storage_root, &req)
-            .with_context(|| format!("daemon IPC config lookup failed for '{key}'"))?;
-        if let Some(err) = &resp.error {
-            bail!("daemon IPC config lookup error: {err}");
+    // Routing, and why it is fail-closed, is in the caller's doc.
+    match crate::util::lock::instance_lock_state_settled(storage_root) {
+        InstanceLockState::Held => {
+            let req = crate::db::ipc::QueryRequest {
+                store: "core".to_string(),
+                sql: "SELECT value FROM config_kv WHERE key = ?1".to_string(),
+                params: vec![crate::db::ipc::WireValue::Text(key.to_string())],
+            };
+            let resp = crate::db::ipc::ipc_query_sync(storage_root, &req)?;
+            if let Some(err) = &resp.error {
+                bail!("the instance's channel reported a query error: {err}");
+            }
+            let value = resp.rows.first().and_then(|r| r.first()).map(|v| match v {
+                crate::db::ipc::WireValue::Null => String::new(),
+                other => other.format(),
+            });
+            Ok(value.filter(|v| !v.is_empty()))
         }
-        let value = resp.rows.first().and_then(|r| r.first()).map(|v| match v {
-            crate::db::ipc::WireValue::Null => String::new(),
-            other => other.format(),
-        });
-        return Ok(value.filter(|v| !v.is_empty()));
+        InstanceLockState::Free => read_config_kv_file(&db_path, key),
+        InstanceLockState::Unknown(e) => {
+            bail!(
+                "{}",
+                crate::util::lock::lock_state_unknown(storage_root, &e)
+            )
+        }
     }
-    read_config_kv_file(&db_path, key)
 }
 
 fn read_config_kv_file(db_path: &Path, key: &str) -> anyhow::Result<Option<String>> {
@@ -756,7 +773,7 @@ async fn full_run(opts: &BenchOptions) -> i32 {
         bundle,
     } = preamble;
 
-    // 5. The bench's own run lock (never the daemon's mahbot.lock).
+    // 5. The bench's own run lock (never the instance's mahbot.lock).
     let _run_lock = match report::acquire_run_lock(&opts.output_dir) {
         Ok(file) => file,
         Err(e) => {

@@ -8,25 +8,33 @@
 //! sections. `-h`/`--help` prints usage (with the live database list) and
 //! exits 0. Skips tracing initialization and GUI startup.
 //!
-//! ## Daemon-up IPC routing
+//! ## Instance-up IPC routing
 //!
-//! Since `multiprocess_wal` was removed, the daemon is the single-process
-//! writer and holds the instance flock while it runs. `mahbot debug` must
-//! never open a second physical instance of a live store, so when the daemon
-//! holds the lock ([`crate::util::lock::daemon_holds_lock_settled`]) the CLI
-//! routes queries through the daemon's local IPC endpoint (`crate::db::ipc`)
-//! instead — [`query_over_ipc`] for a query and [`dump_over_ipc`] for a schema
-//! dump. The endpoint applies the same `PRAGMA query_only=ON` guard as the
-//! daemon's own read-only path.
+//! Since `multiprocess_wal` was removed, an instance is the single-process
+//! writer and holds the instance lock while it runs. `mahbot debug` must never
+//! open a store an instance holds, so when the settled instance-lock probe
+//! ([`crate::util::lock::instance_lock_state_settled`]) reports the location
+//! [`Held`](crate::util::lock::InstanceLockState::Held) the CLI routes queries
+//! through the instance's local IPC endpoint (`crate::db::ipc`) instead —
+//! [`query_over_ipc`] for a query and [`dump_over_ipc`] for a schema dump. The
+//! endpoint is scoped to this storage location, so two instances with different
+//! locations never address each other. It applies the same
+//! `PRAGMA query_only=ON` guard as the instance's own read-only path.
 //!
-//! ## Daemon-down direct open
+//! ## No-instance direct open
 //!
-//! When the daemon is down (no lock held) the CLI opens each store directly in
-//! single-process read-only mode via `turso::core::Database::open_file_with_flags`
-//! with `OpenFlags::ReadOnly | OpenFlags::NoLock`. This cannot create or
-//! mutate files (the SDK `Builder` has no read-only option and always passes
+//! When no instance holds the location ([`Free`](crate::util::lock::InstanceLockState::Free))
+//! the CLI opens each store directly in single-process read-only mode via
+//! `turso::core::Database::open_file_with_flags` with
+//! `OpenFlags::ReadOnly | OpenFlags::NoLock`. This cannot create or mutate
+//! files (the SDK `Builder` has no read-only option and always passes
 //! `OpenFlags::Create`, which would create a missing `-wal`), and it reads
 //! committed WAL frames in single-process mode.
+//!
+//! The routing is fail-closed ([`Unknown`](crate::util::lock::InstanceLockState::Unknown)
+//! is never read as "no instance is running"): the CLI refuses outright and
+//! opens nothing, so a live store is never opened directly while an instance may
+//! hold it.
 //!
 //! Two defense-in-depth layers remain on top of the read-only open: an
 //! upfront file-existence check and a SQL validator (mutation-keyword
@@ -50,9 +58,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::db as turso_mod;
 use crate::db::ipc;
 use crate::db::wal_guard;
+use crate::util::lock::InstanceLockState;
 
 /// Row limit per query to prevent unbounded output. Same LIMIT+1 semantic as
-/// the daemon-side IPC bound (`ipc::IPC_ROW_LIMIT`) so the two never drift.
+/// the instance-side IPC bound (`ipc::IPC_ROW_LIMIT`) so the two never drift.
 const ROW_LIMIT: usize = ipc::IPC_ROW_LIMIT;
 
 /// Mutation keywords blocked by the read-only validator.
@@ -469,7 +478,7 @@ fn execute_family_query(family_id: &str, sql: &str, root: &Path) -> Result<Strin
     }
     // Snapshot semantics: the main file must be a regular file — a symlink
     // could redirect the open to a live store, bypassing the read-only IPC
-    // routing / daemon-down validation the `--db` path applies.
+    // routing / no-instance validation the `--db` path applies.
     let md = std::fs::symlink_metadata(&db_path)
         .with_context(|| format!("cannot stat forensic family '{family_id}'"))?;
     if !md.file_type().is_file() {
@@ -569,14 +578,23 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
 
     let db_list = resolve_db_list(db_name, &mahbot_home)?;
 
-    // Routing hinges on whether the daemon is the single-process writer right
-    // now: if it holds the instance flock the CLI must NOT open the live store
-    // directly, so it goes through the debug IPC endpoint; if the daemon is
-    // down, a direct read-only open is safe. `daemon_holds_lock_settled`
-    // re-checks over a short window so a self-update handoff (flock momentarily
-    // free between the old daemon's release and the new daemon's re-acquire)
-    // never falls through to a concurrent direct open.
-    let daemon_up = crate::util::lock::daemon_holds_lock_settled(&mahbot_home);
+    // Routing hinges on whether an instance is the single-process writer right
+    // now: if it holds the instance lock the CLI must NOT open the live store
+    // directly, so it goes through the debug IPC endpoint (scoped to this
+    // storage location); if no instance holds it, a direct read-only open is
+    // safe. `instance_lock_state_settled` re-checks over a short window so a
+    // self-update handoff (the lock momentarily free between the old instance's
+    // release and the new instance's re-acquire) never falls through to a
+    // concurrent direct open. The third state refuses — see the module doc's
+    // fail-closed rule.
+    let route_via_channel = match crate::util::lock::instance_lock_state_settled(&mahbot_home) {
+        InstanceLockState::Held => true,
+        InstanceLockState::Free => false,
+        InstanceLockState::Unknown(e) => bail!(
+            "{}. Re-run when no instance is running.",
+            crate::util::lock::lock_state_unknown(&mahbot_home, &e)
+        ),
+    };
 
     let mut failures = 0usize;
     for (label, file_path) in &db_list {
@@ -591,15 +609,16 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
             .and_then(|s| s.to_str())
             .map_or_else(|| label.clone(), str::to_string);
 
-        let result = if daemon_up {
+        let result = if route_via_channel {
             match sql {
                 Some(sql) => query_over_ipc(&mahbot_home, &physical, sql).await,
                 None => dump_over_ipc(&mahbot_home, &physical, label).await,
             }
         } else {
-            // Daemon down — direct single-process read-only open.
-            // Pre-existence check: the read-only open fails on a non-existent
-            // file, but we check existence upfront for a better error message.
+            // No instance holds the location — direct single-process read-only
+            // open. Pre-existence check: the read-only open fails on a
+            // non-existent file, but we check existence upfront for a better
+            // error message.
             if !file_path.exists() {
                 if db_name == "all" {
                     eprintln!(
@@ -642,7 +661,7 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
 }
 
 /// Open one store read-only and run `sql` (pipe-delimited output) — the
-/// daemon-down direct path (a single-process read-only open).
+/// no-instance direct path (a single-process read-only open).
 fn query_one_store(file_path: &Path, sql: &str) -> Result<()> {
     open_and_query_readonly(file_path, sql)
 }
@@ -655,7 +674,7 @@ fn dump_one_store(file_path: &Path, label: &str) -> Result<()> {
     open_and_dump_readonly(file_path, label)
 }
 
-/// Run one read-only SQL query through the daemon's debug IPC endpoint,
+/// Run one read-only SQL query through the instance's debug IPC endpoint,
 /// returning the response or the endpoint's error.
 async fn ipc_query_readonly(root: &Path, store: &str, sql: &str) -> Result<ipc::QueryResponse> {
     let req = ipc::QueryRequest {
@@ -670,9 +689,9 @@ async fn ipc_query_readonly(root: &Path, store: &str, sql: &str) -> Result<ipc::
     Ok(resp)
 }
 
-/// Query a live store through the daemon's debug IPC endpoint (used when the
-/// daemon holds the instance lock and the CLI must not open the store
-/// directly). `physical` is the physical store name the endpoint keys on
+/// Query a live store through the instance's debug IPC endpoint (used when it
+/// holds the storage location and the CLI must not open the store directly).
+/// `physical` is the physical store name the endpoint keys on
 /// ("core" or "logs").
 async fn query_over_ipc(root: &Path, physical: &str, sql: &str) -> Result<()> {
     let resp = ipc_query_readonly(root, physical, sql).await?;
@@ -690,7 +709,7 @@ async fn query_over_ipc(root: &Path, physical: &str, sql: &str) -> Result<()> {
     write_stdout(&out)
 }
 
-/// Schema dump of a live store through the daemon's debug IPC endpoint.
+/// Schema dump of a live store through the instance's debug IPC endpoint.
 async fn dump_over_ipc(root: &Path, physical: &str, label: &str) -> Result<()> {
     use std::fmt::Write as _;
     let tables_sql = USER_TABLES_SQL.replace("{filter}", turso_mod::USER_OBJECT_FILTER);
@@ -803,7 +822,7 @@ pub(crate) fn open_readonly(
 /// runs with in-memory temp storage, so no statement or transaction can
 /// ever fail because a temp directory is missing. turso_core's tempdir
 /// creation has no parent-creation and no fallback chain, and resolves
-/// through `$TMPDIR`, which the daemon pins to its private root; a missing
+/// through `$TMPDIR`, which the service pins to its private root; a missing
 /// root used to fail every eager-temp statement (RETURNING buffers, ORDER
 /// BY/LIMIT heap sorts, DISTINCT, subqueries, window functions, spills)
 /// with "I/O error (tempdir): entity not found". The PRAGMA maps to the
@@ -1985,12 +2004,12 @@ mod tests {
             .expect("legacy store family must be filterable by --db");
     }
 
-    /// End-to-end daemon-down path: a row committed to the WAL (the store is
+    /// End-to-end no-instance path: a row committed to the WAL (the store is
     /// dropped without a checkpoint) is visible through the direct
-    /// single-process read-only open — no IPC, no live daemon.
+    /// single-process read-only open — no IPC, no running instance.
     #[tokio::test]
     #[serial_test::serial(family)]
-    async fn run_debug_daemon_down_reads_committed_wal() {
+    async fn run_debug_without_an_instance_reads_committed_wal() {
         let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         store
             .conn
@@ -2004,8 +2023,11 @@ mod tests {
         drop(store);
 
         assert!(
-            !crate::util::lock::daemon_holds_lock(dir.path()),
-            "temp root has no mahbot.lock — daemon must be considered down"
+            matches!(
+                crate::util::lock::instance_lock_state_settled(dir.path()),
+                InstanceLockState::Free
+            ),
+            "temp root has no mahbot.lock — no instance must be considered to hold it"
         );
         let args = vec![
             "mahbot".to_string(),
@@ -2016,7 +2038,7 @@ mod tests {
         ];
         run_debug_with_args(args, Some(dir.path().to_path_buf()))
             .await
-            .expect("daemon-down read of committed WAL rows must succeed");
+            .expect("direct read of committed WAL rows must succeed");
 
         // Prove the WAL-only row is actually visible via the direct open.
         let db_path = dir.path().join("db").join("logs.db");
@@ -2028,5 +2050,120 @@ mod tests {
             out, "COUNT(*)\n1\n",
             "WAL-only committed row must be visible"
         );
+    }
+
+    /// Take the location for the duration of a test: an exclusive lock on the
+    /// standard lock file path, exactly what the CLI's settled probe observes as
+    /// [`InstanceLockState::Held`].
+    fn hold_location(root: &Path) -> std::fs::File {
+        let lock = std::fs::File::create(crate::util::lock::lock_file_path(root))
+            .expect("create the lock file");
+        assert!(
+            crate::util::lock::try_flock(&lock).expect("lock the location"),
+            "the test must hold the location"
+        );
+        lock
+    }
+
+    /// While an instance holds the storage location, the CLI must reach it
+    /// through the channel instead of opening the store: the CLI's own root
+    /// holds no openable store here, so a successful read can only have come
+    /// from the running instance's endpoint.
+    #[serial_test::serial(family)]
+    #[tokio::test]
+    async fn run_debug_reaches_a_held_location_through_the_channel() {
+        // The instance side: a live store in a root of its own.
+        let (store, _store_dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO logs (timestamp, level, target, message) \
+                 VALUES ('2026-01-01T00:00:00Z', 'INFO', 'test', 'ipc-row')",
+            )
+            .await
+            .expect("insert a committed row");
+
+        // The CLI side: the location is held, and its store file is NOT a store
+        // — a direct open would fail, so the answer can only come over IPC.
+        let root = tempfile::TempDir::new().unwrap();
+        let db_dir = root.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::write(db_dir.join("logs.db"), b"not a store").unwrap();
+        let _held = hold_location(root.path());
+
+        let listener_root = root.path().to_path_buf();
+        let listener = tokio::spawn(async move {
+            crate::db::ipc::run_ipc_listener(&listener_root, std::sync::Arc::new(store)).await;
+        });
+        // No wait for the endpoint to be bound: the CLI's own channel-bound
+        // retry covers a late bind, which is what makes this test portable.
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "--db".to_string(),
+            "logs".to_string(),
+            "SELECT COUNT(*) FROM logs".to_string(),
+        ];
+        run_debug_with_args(args, Some(root.path().to_path_buf()))
+            .await
+            .expect("a held location must be queried through the instance's channel");
+        listener.abort();
+    }
+
+    /// While an instance holds the storage location but its channel cannot be
+    /// reached, the CLI must refuse with its own sentence and leave the store
+    /// alone. The store here is a real one the CLI could read directly, so an
+    /// `Ok` would mean it opened the live store behind the instance's back.
+    #[tokio::test]
+    // `ipc_bound` is shared with the IPC e2e test: shrinking the bound below
+    // would make its bounded retry give up.
+    #[serial_test::serial(family, ipc_bound)]
+    async fn run_debug_refuses_a_held_location_without_a_channel() {
+        // 0 = give up after the first attempt, so the refusal is immediate
+        // instead of waiting out the default channel-bound window.
+        let _env = crate::util::test::set_env_var("MAHBOT_IPC_BOUND_TIMEOUT_SECS", Some("0"));
+        let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let _held = hold_location(dir.path());
+
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "--db".to_string(),
+            "logs".to_string(),
+            "SELECT COUNT(*) FROM logs".to_string(),
+        ];
+        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("a held location without a reachable channel must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("instance is running"), "got: {msg}");
+        assert!(msg.contains("left untouched"), "got: {msg}");
+    }
+
+    /// The probe's third state is also a refusal: when the CLI cannot tell
+    /// whether an instance holds the location (here the lock file exists but
+    /// cannot be opened), it must refuse and leave the store alone rather than
+    /// treat the failed probe as "no instance is running".
+    #[tokio::test]
+    #[serial_test::serial(family)]
+    async fn run_debug_refuses_when_the_lock_probe_cannot_tell() {
+        let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        // A directory where the lock file belongs: the probe cannot open it.
+        std::fs::create_dir(crate::util::lock::lock_file_path(dir.path()))
+            .expect("occupy the lock file path");
+
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "--db".to_string(),
+            "logs".to_string(),
+            "SELECT COUNT(*) FROM logs".to_string(),
+        ];
+        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("an undecidable lock probe must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cannot tell whether"), "got: {msg}");
+        assert!(msg.contains("left untouched"), "got: {msg}");
     }
 }

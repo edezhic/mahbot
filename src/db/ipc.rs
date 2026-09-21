@@ -2,7 +2,7 @@
 //!
 //! After `multiprocess_wal` was removed, the debug CLI can no longer open a
 //! second physical instance of a live store's database (single-process mode
-//! holds the flock). Instead the daemon exposes a local IPC endpoint
+//! holds the flock). Instead the running instance exposes a local IPC endpoint
 //! (a Unix-domain socket on Unix, a named pipe on Windows) that accepts
 //! read-only SQL queries and returns the rows. The debug CLI connects to it
 //! instead of opening the database directly.
@@ -31,16 +31,24 @@ pub(crate) const IPC_ROW_LIMIT: usize = 10_000;
 /// Socket file name for the debug IPC endpoint (a filesystem socket on Unix).
 #[cfg(not(windows))]
 const IPC_SOCKET_FILE_NAME: &str = "mahbot-debug.sock";
-/// Windows named-pipe name. Named pipes live in a global `\\.\pipe\` namespace
-/// with no per-directory scope, and the `GenericFilePath` name type only
-/// accepts `\\.\pipe\`-prefixed paths there — so this is not derived from the
-/// storage root. The instance lock already guarantees a single daemon.
+/// Prefix of the Windows named-pipe name. Named pipes live in a global
+/// `\\.\pipe\` namespace with no per-directory scope, and the `GenericFilePath`
+/// name type only accepts `\\.\pipe\`-prefixed paths there — the location
+/// digest is appended below.
 #[cfg(windows)]
-const IPC_PIPE_NAME: &str = r"\\.\pipe\mahbot-debug";
+const IPC_PIPE_PREFIX: &str = r"\\.\pipe\mahbot-debug-";
 
-/// Total wall-clock bound for the daemon-up-but-socket-not-bound retry
-/// (flock held before the listener binds during boot / self-update handoff).
-const IPC_BOUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Total wall-clock bound for the instance-up-but-channel-not-bound retry
+/// (lock held before the listener binds during boot / self-update hand-off).
+const IPC_BOUND_TIMEOUT_SECS: u64 = 15;
+
+/// [`IPC_BOUND_TIMEOUT_SECS`], overridable with `MAHBOT_IPC_BOUND_TIMEOUT_SECS`
+/// (0 = give up after the first attempt) — the same env-override pattern the
+/// other bounded waits use, and what lets a test exercise the refusal without
+/// waiting out the default.
+fn ipc_bound_timeout() -> std::time::Duration {
+    crate::util::env_duration_secs("MAHBOT_IPC_BOUND_TIMEOUT_SECS", IPC_BOUND_TIMEOUT_SECS)
+}
 
 /// Retry backoff schedule (ms) for the IPC socket-not-yet-bound window.
 const IPC_RETRY_BACKOFF_MS: [u64; 6] = [50, 100, 200, 400, 800, 1600];
@@ -50,22 +58,37 @@ const FRAME_LEN: usize = std::mem::size_of::<u32>();
 
 /// Upper bound (bytes) on a single IPC frame payload, enforced on read so a
 /// same-user misbehaving client cannot trigger a multi-GiB allocation and OOM
-/// the daemon. Requests are a few KB; responses are bounded by
+/// the instance. Requests are a few KB; responses are bounded by
 /// [`IPC_ROW_LIMIT`], so this is far beyond legitimate use.
 const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 /// Resolve the IPC socket name.
 ///
 /// On Unix this is a filesystem socket file under the storage root. On Windows
-/// it is the named-pipe name (see [`IPC_PIPE_NAME`]) — a global namespace, not
-/// a path under the storage root. Both the listener and the clients call this
-/// so they agree on the endpoint name.
+/// it is a named pipe scoped to that storage location: the pipe namespace is
+/// global, so a machine-wide name would let one instance reach another
+/// instance's data. Both the listener and the clients call this so they agree
+/// on the endpoint name.
 #[must_use]
 fn socket_path(storage_root: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        let _ = storage_root;
-        std::path::PathBuf::from(IPC_PIPE_NAME)
+        use sha2::{Digest, Sha256};
+
+        // A digest of the location, not the path itself: a pipe name may not
+        // contain a backslash, must stay well under the 256-char limit, and is
+        // case-insensitive. `canonicalize` gives the real spelling of an
+        // existing directory (both sides derive the root from the same
+        // `default_config_dir`), falling back to the given path when that
+        // directory does not exist yet — no instance can be running there;
+        // lowercasing removes case-only differences, and SHA-256 truncated to
+        // 16 hex chars keeps the name short and collision-free.
+        let resolved =
+            std::fs::canonicalize(storage_root).unwrap_or_else(|_| storage_root.to_path_buf());
+        let digest = crate::util::hex_string(&Sha256::digest(
+            resolved.to_string_lossy().to_lowercase().as_bytes(),
+        ));
+        PathBuf::from(format!("{IPC_PIPE_PREFIX}{}", &digest[..16]))
     }
     #[cfg(not(windows))]
     {
@@ -79,8 +102,8 @@ pub(crate) enum WireValue {
     Null,
     Integer(i64),
     /// serde_json serializes non-finite floats as `null`; `de_real` maps it
-    /// back to `NaN` so the IPC path round-trips them like the daemon-down
-    /// path renders them ("NaN").
+    /// back to `NaN` so the IPC path round-trips them like the direct
+    /// (no-instance) read path renders them ("NaN").
     Real(#[serde(deserialize_with = "de_real")] f64),
     Text(String),
     /// Base64-encoded blob.
@@ -257,7 +280,7 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Spawn the daemon-side IPC listener. Call after `DOMAIN_CONN` / `LOG_STORE`
+/// Spawn the instance-side IPC listener. Call after `DOMAIN_CONN` / `LOG_STORE`
 /// are set. Exits (dropping the listener) on shutdown.
 pub async fn run_ipc_listener(
     storage_root: &std::path::Path,
@@ -286,7 +309,7 @@ pub async fn run_ipc_listener(
             warn!(
                 error = %e,
                 socket = %socket.display(),
-                "ipc: socket already in use (another daemon?); debug IPC disabled"
+                "ipc: socket already in use (another instance?); debug IPC disabled"
             );
             return;
         }
@@ -299,7 +322,7 @@ pub async fn run_ipc_listener(
             return;
         }
     };
-    // Restrictive perms: only the daemon user can connect. `ListenerOptions::mode`
+    // Restrictive perms: only the instance's user can connect. `ListenerOptions::mode`
     // is NOT used — it calls `fchmod` on the socket fd, which returns
     // EINVAL→Unsupported on macOS UDS; `chmod` via the path works everywhere.
     #[cfg(unix)]
@@ -341,7 +364,7 @@ pub async fn run_ipc_listener(
     }
 }
 
-/// Client helper: connect to the daemon's IPC socket and run a read-only query.
+/// Client helper: connect to the instance's IPC socket and run a read-only query.
 pub(crate) async fn ipc_query(
     storage_root: &Path,
     req: QueryRequest,
@@ -350,7 +373,7 @@ pub(crate) async fn ipc_query(
     let name = socket
         .as_path()
         .to_fs_name::<GenericFilePath>()
-        .map_err(|e| anyhow::anyhow!("daemon IPC endpoint not reachable: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("instance IPC endpoint not reachable: {e}"))?;
 
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let mut stream = LocalSocketStream::connect(name).await?;
@@ -361,7 +384,7 @@ pub(crate) async fn ipc_query(
         Ok::<QueryResponse, anyhow::Error>(resp)
     })
     .await
-    .map_err(|_| anyhow::anyhow!("daemon IPC endpoint timed out"))??;
+    .map_err(|_| anyhow::anyhow!("instance IPC endpoint timed out"))??;
 
     Ok(result)
 }
@@ -371,16 +394,31 @@ fn retry_backoff(attempt: usize) -> Duration {
     Duration::from_millis(IPC_RETRY_BACKOFF_MS[attempt.min(IPC_RETRY_BACKOFF_MS.len() - 1)])
 }
 
-/// Bounded-retry async client used by `mahbot debug` when the daemon holds the
-/// instance lock but the IPC socket is not yet bound (the daemon is between
-/// lock-acquire and listener-bind, e.g. boot or self-update handoff). The
-/// caller must only use this when [`crate::util::lock::daemon_holds_lock_settled`]
-/// is true — otherwise the retry would mask a genuinely-down daemon.
+/// Refusal wording for the client side when an instance holds the storage
+/// location but its debug channel cannot be reached. Callers only get here after
+/// the probe reported the location held, so a bare OS error ("connection
+/// refused", "no such file") would read as "the store is gone" instead of "an
+/// instance is running and its store was deliberately left alone".
+fn channel_unreachable(socket: &Path) -> String {
+    format!(
+        "a mahbot instance is running against this storage location and holds its stores, but its \
+         debug channel at {} could not be reached — the live store was left untouched",
+        socket.display()
+    )
+}
+
+/// Bounded-retry async client used by `mahbot debug` when an instance holds the
+/// storage location but the IPC socket is not yet bound (it is between
+/// lock-acquire and listener-bind, e.g. boot or self-update hand-off). The
+/// caller must only use this when [`crate::util::lock::instance_lock_state_settled`]
+/// reports the location [`Held`](crate::util::lock::InstanceLockState::Held) —
+/// otherwise the retry would mask a genuinely-down instance.
 pub(crate) async fn ipc_query_with_wait(
     storage_root: &Path,
     req: &QueryRequest,
 ) -> anyhow::Result<QueryResponse> {
-    let deadline = std::time::Instant::now() + IPC_BOUND_TIMEOUT;
+    let socket = socket_path(storage_root);
+    let deadline = std::time::Instant::now() + ipc_bound_timeout();
     let mut attempt = 0usize;
     loop {
         match ipc_query(storage_root, req.clone()).await {
@@ -389,19 +427,21 @@ pub(crate) async fn ipc_query_with_wait(
                 tokio::time::sleep(retry_backoff(attempt)).await;
                 attempt += 1;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.context(channel_unreachable(&socket))),
         }
     }
 }
 
 /// Synchronous bounded-retry client used by `bench-openrouter`'s synchronous
 /// config-resolution path (which cannot await the async [`ipc_query_with_wait`];
-/// the call blocks the current thread).
+/// the call blocks the current thread). Like the async client, the caller must
+/// only use it after the instance-lock probe reported the location held.
 pub(crate) fn ipc_query_sync(
     storage_root: &Path,
     req: &QueryRequest,
 ) -> std::io::Result<QueryResponse> {
-    let deadline = std::time::Instant::now() + IPC_BOUND_TIMEOUT;
+    let socket = socket_path(storage_root);
+    let deadline = std::time::Instant::now() + ipc_bound_timeout();
     let mut attempt = 0usize;
     loop {
         match ipc_query_sync_once(storage_root, req) {
@@ -410,7 +450,15 @@ pub(crate) fn ipc_query_sync(
                 std::thread::sleep(retry_backoff(attempt));
                 attempt += 1;
             }
-            Err(e) => return Err(e),
+            // The bare OS text would read as "the store is gone"; our sentence
+            // says the instance is running and its store was left alone. The
+            // failure kind is not carried through — no caller distinguishes it.
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "{}: {e}",
+                    channel_unreachable(&socket)
+                )));
+            }
         }
     }
 }
@@ -420,7 +468,7 @@ fn ipc_query_sync_once(storage_root: &Path, req: &QueryRequest) -> std::io::Resu
     let name = socket
         .as_path()
         .to_fs_name::<GenericFilePath>()
-        .map_err(|e| std::io::Error::other(format!("daemon IPC endpoint not reachable: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("instance IPC endpoint not reachable: {e}")))?;
     // `Stream::connect` is an associated function on the sync `Stream` trait,
     // not the enum — call it fully-qualified so `Self` resolves to the enum.
     let mut stream =
@@ -498,9 +546,13 @@ mod tests {
         }
     }
 
-    /// End-to-end: the daemon-side listener serves a read-only query over the
-    /// local socket, returning column names + rows (the daemon-up IPC path that
-    /// `mahbot debug` uses when the instance lock is held).
+    /// End-to-end: the instance-side listener serves a read-only query over the
+    /// local socket, returning column names + rows (the IPC path `mahbot debug`
+    /// uses when an instance holds the location). `serial(ipc_bound)`: this
+    /// relies on the bounded retry (the listener task may bind after the first
+    /// attempt) and must not overlap the tests that shrink that bound through
+    /// `MAHBOT_IPC_BOUND_TIMEOUT_SECS`.
+    #[serial_test::serial(ipc_bound)]
     #[tokio::test]
     async fn ipc_query_serves_readonly_queries_end_to_end() {
         let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
@@ -550,7 +602,7 @@ mod tests {
         );
 
         // The shared connection's query_only must be reset after the query so
-        // daemon writes are never left disabled.
+        // the instance's writes are never left disabled.
         let reset_check = crate::db::ipc::ipc_query_with_wait(
             &root,
             &QueryRequest {

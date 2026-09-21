@@ -60,7 +60,7 @@ pub(crate) fn run_dir_name(now: &chrono::DateTime<chrono::Utc>) -> String {
 
 /// Acquire the bench's own run lock: `<output_dir>/bench-openrouter.lock`.
 ///
-/// This is the bench's OWN lock — it never touches the daemon's
+/// This is the bench's OWN lock — it never touches the instance's
 /// `mahbot.lock`. Creates `output_dir` first; returns the locked [`File`],
 /// which the caller keeps alive for the run duration (the kernel releases the
 /// lock when the file is closed / the process exits). Bails when another
@@ -69,7 +69,8 @@ pub(crate) fn run_dir_name(now: &chrono::DateTime<chrono::Utc>) -> String {
 /// # Errors
 ///
 /// Fails when the directory cannot be created, the file cannot be opened, or
-/// `flock` itself errors (as opposed to reporting "already locked").
+/// [`try_flock`](crate::util::lock::try_flock) itself errors (as opposed to
+/// reporting "already locked").
 pub(crate) fn acquire_run_lock(output_dir: &Path) -> anyhow::Result<std::fs::File> {
     std::fs::create_dir_all(output_dir)?;
     let path = output_dir.join("bench-openrouter.lock");

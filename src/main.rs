@@ -275,8 +275,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
 
     // Debug IPC query endpoint: `mahbot debug` connects to this local socket
     // (UDS on Unix, named pipe on Windows) to run read-only SQL against the
-    // live stores while the daemon holds the instance lock. Binds after the
-    // stores (DOMAIN_CONN + LOG_STORE) are up.
+    // live stores while an instance holds the lock. Binds after the stores
+    // (DOMAIN_CONN + LOG_STORE) are up.
     let ipc_root = mahbot::config::CONFIG.global_storage_root();
     spawn_cancellable(&mut tasks, &shutdown_token, "debug-ipc", async move {
         mahbot::db::ipc::run_ipc_listener(&ipc_root, log_store.clone()).await;
@@ -618,9 +618,9 @@ fn main() -> Result<()> {
     mahbot::shutdown::install_fatal_signal_handlers();
     mahbot::shutdown::install_panic_hook();
 
-    // Debug subcommand: run SQL query directly, skip all GUI/daemon setup.
+    // Debug subcommand: run SQL query directly, skip all GUI/instance setup.
     // Must be checked before lock acquisition so the debug tool can query
-    // databases while the daemon is running. No tracing init, no Iced.
+    // databases while an instance is running. No tracing init, no Iced.
     if std::env::args().nth(1).as_deref() == Some("debug") {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -635,16 +635,19 @@ fn main() -> Result<()> {
     }
 
     // Hidden grep-engine subcommand: served by the shell tool's transparent
-    // grep interception. Also dispatched before lock acquisition — the daemon
-    // holds the flock, so a normally-dispatched second process would fail.
+    // grep interception. Also dispatched before lock acquisition — an instance
+    // holds the lock, so a normally-dispatched second process would fail.
     if std::env::args().nth(1).as_deref() == Some("__grep-engine") {
         let code = mahbot::run_grep_engine(&std::env::args().skip(2).collect::<Vec<_>>());
         std::process::exit(code);
     }
 
     // bench-openrouter subcommand: standalone OpenRouter provider benchmark.
-    // Dispatched before lock acquisition — must run while the daemon holds the
-    // flock. Never touches live stores (config-store reads are read-only).
+    // Dispatched before lock acquisition — it must work while another instance
+    // holds the lock. It never opens a live store: the config-store lookup goes
+    // through that instance's debug channel while the location is held, is
+    // skipped with a printed notice when the location may be held but the channel
+    // cannot be reached, and reads the store directly only when nothing holds it.
     if std::env::args().nth(1).as_deref() == Some("bench-openrouter") {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -655,7 +658,7 @@ fn main() -> Result<()> {
 
     // `mahbot chrome` subcommand: browser automation CLI over the
     // shared chrome core. Dispatched before lock acquisition + temp-root init
-    // so it can run alongside the daemon (it uses its own session namespace);
+    // so it can run alongside the instance (it uses its own session namespace);
     // chrome-use binary resolution falls back to PATH/home locations.
     if std::env::args().nth(1).as_deref() == Some("chrome") {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -667,8 +670,8 @@ fn main() -> Result<()> {
     }
 
     // Top-level help/version flags: print and exit before temp-root init and
-    // lock acquisition, so they work while the daemon holds the instance flock
-    // (and when it doesn't — without this they would boot the GUI daemon).
+    // lock acquisition, so they work while an instance holds the lock (and when
+    // it doesn't — without this they would boot the GUI).
     // Only exact argv[1] tokens are matched; subcommand-level flags
     // (`mahbot chrome -h` etc.) keep routing to their own CLI handlers.
     match std::env::args().nth(1).as_deref() {
@@ -690,7 +693,7 @@ fn main() -> Result<()> {
     mahbot::shutdown::install_console_stop_handler();
     mahbot::shutdown::install_session_end_listener();
 
-    // Consolidate ALL daemon temp files under one private root
+    // Consolidate ALL instance temp files under one private root
     // (`/tmp/mahbot`, mode 0700; `<user temp>\mahbot` on Windows) and pin the
     // platform's temp variables to it — BEFORE any temp use (config, logs,
     // stores, shell children). The debug, __grep-engine, bench-openrouter and
