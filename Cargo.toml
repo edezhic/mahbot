@@ -128,7 +128,7 @@ tar = "0.4"
 # Memory / persistence
 # Pinned exactly: the storage layer drives CDC capture (blob-encoding) and the
 # read-only debug/bench paths, so it must not drift under them.
-turso = { version = "=0.7.2", default-features = false, features = ["fts"] }
+turso = { version = "=0.8.0-pre.11", default-features = false, features = ["fts"] }
 
 # Lock-free read-only snapshot holder for running-agent live transcripts
 # (ArcSwap<TranscriptSnapshot> published by Session, read by the GUI).

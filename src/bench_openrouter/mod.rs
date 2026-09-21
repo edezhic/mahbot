@@ -448,7 +448,11 @@ fn read_config_kv_file(db_path: &Path, key: &str) -> anyhow::Result<Option<Strin
                 });
             }
             Ok(turso::core::StepResult::Done) => return Ok(None),
-            Ok(turso::core::StepResult::IO | turso::core::StepResult::Yield) => {
+            Ok(
+                turso::core::StepResult::IO
+                | turso::core::StepResult::Yield
+                | turso::core::StepResult::Sleep { .. },
+            ) => {
                 io.step()
                     .map_err(|e| anyhow::anyhow!("config read I/O step failed: {e}"))?;
             }

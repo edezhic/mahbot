@@ -788,13 +788,48 @@ impl Connection {
 
     /// Owned-handle variant of [`Self::lock_and_cleanup`] for the detached
     /// task in [`Self::run_detached`].
+    ///
+    /// A transaction left open on the shared connection MUST be rolled back
+    /// before the connection is reused: the engine holds its written pages in
+    /// the shared page cache for as long as the transaction is open, and a WAL
+    /// checkpoint refuses to clear a page cache with dirty pages in it
+    /// (`Failed to clear page cache: Dirty { pgno: … }`) — every later write
+    /// then fails and the WAL keeps the uncommitted frames.
+    ///
+    /// Two sources of an open transaction are covered: the deferred arm
+    /// ([`TxGuard::drop`] and [`Self::begin_tx`]) and the connection's own
+    /// autocommit state, which catches a transaction the arm never saw. A
+    /// failed rollback keeps the arm set, so the next access retries it —
+    /// one failure must not lose the orphan.
     async fn lock_and_cleanup_owned<'a>(
         conn: &'a tokio::sync::Mutex<turso::Connection>,
         has_dangling_tx: &'a AtomicBool,
     ) -> tokio::sync::MutexGuard<'a, turso::Connection> {
         let guard = conn.lock().await;
-        if has_dangling_tx.swap(false, Ordering::SeqCst) {
-            let _ = guard.execute("ROLLBACK", ()).await;
+        let armed = has_dangling_tx.swap(false, Ordering::SeqCst);
+        // The engine's autocommit state decides. `Ok(true)` means nothing is
+        // open, so there is nothing to roll back and a stale arm is only
+        // cleared — a doomed ROLLBACK ("cannot rollback - no transaction is
+        // active") would keep the arm set for every later access. An open
+        // transaction, or a probe that failed, is rolled back; that is the same
+        // rule the `query_only` reset in `query_readonly` uses.
+        if !matches!(guard.is_autocommit(), Ok(true)) {
+            match guard.execute("ROLLBACK", ()).await {
+                Ok(_) => tracing::warn!(
+                    armed,
+                    "rolled back a transaction left open on the shared connection"
+                ),
+                Err(e) => {
+                    // Keep the arm: one failed rollback must not lose the orphan.
+                    has_dangling_tx.store(true, Ordering::SeqCst);
+                    tracing::warn!(
+                        error = %e,
+                        armed,
+                        "failed to roll back a transaction left open on the shared connection — \
+                         the next access retries it"
+                    );
+                }
+            }
         }
         guard
     }
@@ -907,7 +942,15 @@ impl Connection {
     /// until the transaction is committed or rolled back.
     pub async fn begin_tx(&self) -> turso::Result<TxGuard<'_>> {
         let conn = self.lock_and_cleanup().await;
+        // Arm the flag BEFORE `BEGIN` is awaited: this statement runs in the
+        // caller's future, so an error, a dropped future (cancel, timeout,
+        // shutdown cut) or a panic would otherwise leave the transaction open
+        // with nothing armed to roll it back.
+        self.has_dangling_tx.store(true, Ordering::SeqCst);
         conn.execute("BEGIN", ()).await?;
+        // No await between the successful `BEGIN` and this store, so the clear
+        // cannot be cut short and leave a live transaction behind.
+        self.has_dangling_tx.store(false, Ordering::SeqCst);
         Ok(TxGuard {
             conn,
             has_dangling_tx: Some(self.has_dangling_tx.clone()),
@@ -4405,6 +4448,121 @@ mod tests {
             .await
             .expect("INDEXED BY must resolve");
         assert_eq!(n, 2);
+    }
+
+    // ── An open transaction must not survive into the next access ──────
+
+    /// Open a one-column store for the orphan-transaction tests below.
+    async fn open_orphan_tx_store() -> (tempfile::TempDir, Connection) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = open_with_schema(&tmp.path().join("t.db"), "CREATE TABLE t (a INTEGER);")
+            .await
+            .expect("open test store");
+        (tmp, conn)
+    }
+
+    /// The rows currently in `t`, in order.
+    async fn orphan_tx_rows(conn: &Connection) -> Vec<i64> {
+        conn.query_map_strict("SELECT a FROM t ORDER BY a", (), |row| row.get::<i64>(0))
+            .await
+            .expect("query t")
+    }
+
+    /// Whether the connection is in autocommit (no transaction open) — probed
+    /// under the connection's own lock, so the probe cleans nothing up itself.
+    async fn orphan_tx_autocommit(conn: &Connection) -> bool {
+        conn.conn
+            .lock()
+            .await
+            .is_autocommit()
+            .expect("probe autocommit")
+    }
+
+    /// Window (a): a transaction abandoned without commit, rolled back by the
+    /// deferred arm — the guard is dropped and the next access must undo the
+    /// still-open write before reusing the connection.
+    #[tokio::test]
+    async fn an_abandoned_transaction_is_rolled_back_before_the_connection_is_reused() {
+        let (_tmp, conn) = open_orphan_tx_store().await;
+
+        {
+            let tx = conn.begin_tx().await.expect("begin tx");
+            tx.execute("INSERT INTO t VALUES (1)", ())
+                .await
+                .expect("insert in the abandoned tx");
+        }
+        assert!(
+            conn.has_dangling_tx.load(Ordering::SeqCst),
+            "an abandoned transaction must leave the deferred arm set"
+        );
+
+        conn.execute("INSERT INTO t VALUES (2)", ())
+            .await
+            .expect("write after the abandon");
+        assert_eq!(
+            orphan_tx_rows(&conn).await,
+            vec![2],
+            "the abandoned insert must be rolled back, not committed into the new one"
+        );
+        assert!(
+            orphan_tx_autocommit(&conn).await,
+            "the connection must be in autocommit before it is reused"
+        );
+    }
+
+    /// Window (b) — the incident: a transaction the arm never saw (`BEGIN`
+    /// reached the engine, nothing was flagged) must still be rolled back
+    /// before the connection is reused.
+    #[tokio::test]
+    async fn an_open_transaction_the_arm_never_saw_is_rolled_back_before_reuse() {
+        let (_tmp, conn) = open_orphan_tx_store().await;
+
+        // Drive the state directly on the connection, under its own lock: a raw
+        // `BEGIN` plus a write, so the insert really lands inside the orphan
+        // transaction and the arm stays false.
+        {
+            let raw = conn.conn.lock().await;
+            raw.execute("BEGIN", ()).await.expect("raw BEGIN");
+            raw.execute("INSERT INTO t VALUES (1)", ())
+                .await
+                .expect("insert in the orphan tx");
+        }
+        assert!(
+            !conn.has_dangling_tx.load(Ordering::SeqCst),
+            "the arm must be false — that is the missed window"
+        );
+
+        conn.execute("INSERT INTO t VALUES (2)", ())
+            .await
+            .expect("write after the orphan tx");
+        // A committed insert into the orphan transaction would leave both rows.
+        assert_eq!(
+            orphan_tx_rows(&conn).await,
+            vec![2],
+            "the orphan transaction must be rolled back before the connection is reused"
+        );
+        assert!(
+            orphan_tx_autocommit(&conn).await,
+            "the connection must be in autocommit before it is reused"
+        );
+    }
+
+    /// A stale arm with nothing open — what an interrupted `begin_tx` leaves
+    /// before its `BEGIN` runs, or `BEGIN` failing — must be cleared, not kept
+    /// alive by a doomed ROLLBACK that would repeat on every later access.
+    #[tokio::test]
+    async fn a_stale_arm_without_an_open_transaction_is_cleared() {
+        let (_tmp, conn) = open_orphan_tx_store().await;
+
+        conn.has_dangling_tx.store(true, Ordering::SeqCst);
+        conn.execute("INSERT INTO t VALUES (1)", ())
+            .await
+            .expect("write after a stale arm");
+        assert!(
+            !conn.has_dangling_tx.load(Ordering::SeqCst),
+            "nothing was open, so the arm must be cleared rather than kept"
+        );
+        assert_eq!(orphan_tx_rows(&conn).await, vec![1]);
     }
 
     // ── Overflow-aliasing rebuild (data-preserving migration) ─────────

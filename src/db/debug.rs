@@ -802,6 +802,7 @@ pub(crate) fn open_readonly(
         turso::core::OpenFlags::ReadOnly | turso::core::OpenFlags::NoLock,
         opts,
         None,
+        std::sync::Arc::new(turso::core::SqliteDialect),
     )
     .map_err(|e| {
         anyhow!(
@@ -1040,7 +1041,9 @@ fn step_rows<T>(
             .map_err(|e| anyhow!("SQL query failed on '{}': {e}", db_path.display()))?
         {
             turso::core::StepResult::Done => break,
-            turso::core::StepResult::IO | turso::core::StepResult::Yield => {
+            turso::core::StepResult::IO
+            | turso::core::StepResult::Yield
+            | turso::core::StepResult::Sleep { .. } => {
                 io.step()
                     .map_err(|e| anyhow!("SQL query failed on '{}': {e}", db_path.display()))?;
             }
