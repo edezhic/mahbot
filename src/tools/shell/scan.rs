@@ -1,6 +1,6 @@
 //! Frozen shell text-scanning helpers shared by out-of-scope consumers
-//! (grep engine, output segmentation) and the read-only guard's keep-set
-//! predicates.
+//! (grep engine, output segmentation, the plan runner's redirect application)
+//! and the read-only guard's keep-set predicates.
 //!
 //! These helpers are **frozen**: the AST-based read-only guard does not rely
 //! on them for command structure (heredoc stripping, quote handling, cd-option
@@ -43,6 +43,28 @@ pub(super) fn strip_outer_quotes(word: &str) -> Option<(&str, bool)> {
 /// Strip balanced surrounding quotes, keeping the raw word when unbalanced.
 pub(super) fn strip_quoted_word(word: &str) -> &str {
     strip_outer_quotes(word).map_or(word, |(c, _)| c)
+}
+
+// ── cmd.exe null device ─────────────────────────────────────────────────
+
+/// The platform's null device in the spellings cmd.exe accepts, matched
+/// case-insensitively: `nul`, `nul:` and the extension-qualified `nul.txt`
+/// (drop any `:…` stream suffix and any `.…` extension), double-quoted or bare.
+/// A separator or a quote character cmd does not interpret makes the spelling an
+/// ordinary path in the cwd, not the device.
+pub(super) fn is_null_device(target: &str) -> bool {
+    // cmd.exe quotes only with `"`, so the single-quoted inner text
+    // [`strip_outer_quotes`] returns is not a spelling cmd delivers — it is an
+    // ordinary path, never the device.
+    let Some((word, single)) = strip_outer_quotes(target) else {
+        return false;
+    };
+    if single || word.is_empty() || word.contains(['\\', '/']) {
+        return false;
+    }
+    let name = word.split(':').next().unwrap_or_default();
+    let name = name.split('.').next().unwrap_or_default();
+    name.eq_ignore_ascii_case("nul")
 }
 
 // ── cd option policy ────────────────────────────────────────────────────

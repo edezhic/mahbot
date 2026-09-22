@@ -515,6 +515,39 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+// ── Person-facing output ─────────────────────────────────────────────────
+
+/// Write `text` followed by one newline to stdout. A failed write is discarded.
+///
+/// **Policy — a notice is never a panic.** The prints that belong to a launch — the
+/// top-level usage and version notices, and the line the binary prints for a
+/// subcommand that returned an error — go through these two rather than through the
+/// standard print macros, which panic on a write that really fails (a closed pipe, a
+/// full disk). The subcommand CLIs that always run with wired stdio (the `debug`
+/// verb's own usage and argument errors, chrome, the benchmark) still print through
+/// the macros: a failed write there can only reach a caller that stopped reading.
+///
+/// A windowed launch may also have been given no standard streams at all (its parent
+/// passed none): the library discards a write to an absent handle itself
+/// (`std::io::stdio`'s `handle_ebadf`), so that case is a lost notice, never a fatal
+/// one — while a windowed launch started from a console inherits its handles and
+/// prints there like any other process. `print_stderr` is also the panic hook's
+/// writer and what everything printed before tracing exists goes through
+/// (`boot::timestamped_stderr`), where a panic would abort instead of unwinding.
+#[doc(hidden)]
+pub fn print_stdout(text: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stdout(), "{text}");
+}
+
+/// Write `text` followed by one newline to stderr — byte for byte the contract of
+/// [`print_stdout`] (the policy is on it).
+#[doc(hidden)]
+pub fn print_stderr(text: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{text}");
+}
+
 /// Log panics/cancellations from a `join_all`-aggregated batch of spawned
 /// task results, keeping the enclosing loop alive.
 pub(crate) fn log_join_failures(

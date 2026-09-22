@@ -721,23 +721,6 @@ fn is_var_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// The platform's null device in the spellings cmd.exe accepts, matched
-/// case-insensitively: `nul`, `nul:` and the extension-qualified `nul.txt`
-/// (drop any `:…` stream suffix and any `.…` extension), double-quoted or bare.
-/// A separator or a quote character cmd does not interpret makes the spelling an
-/// ordinary path in the cwd, not the device.
-pub(super) fn is_null_device(target: &str) -> bool {
-    let Some(word) = cmd_token(target) else {
-        return false;
-    };
-    if word.is_empty() || word.contains(['\\', '/']) {
-        return false;
-    }
-    let name = word.split(':').next().unwrap_or_default();
-    let name = name.split('.').next().unwrap_or_default();
-    name.eq_ignore_ascii_case("nul")
-}
-
 /// The whole-line Windows divergences — a comment, an unquoted `;` and a
 /// heredoc — checked once over the whole syntax tree, before the walk. Each is a
 /// property of the LINE for cmd.exe rather than of a nesting position (see the

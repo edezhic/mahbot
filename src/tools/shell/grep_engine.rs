@@ -16,6 +16,16 @@
 //! ([`list_key`]/[`windows::verb_key`]), so the interpreter's case- and
 //! `.exe`-insensitive dispatch applies wherever a verb is classified; only OS
 //! APIs (`exec`, `creation_flags`, the SIGPIPE disposition) are `#[cfg]`-gated.
+//!
+//! On Windows the rendered rewrite is not handed to `cmd.exe` as one line: this
+//! service is a windowed program, and the shell does not wait for such an image,
+//! so the members that run it are spawned and waited for by the runner itself
+//! ([`plan`]). The same per-member decisions are rendered twice — as the line the
+//! shell would have run, and as that plan — and a plan and a line that disagreed
+//! about a member would be a search whose output came from somewhere the agent
+//! did not look (the drift guard in this module's `plan_pins` holds them
+//! together).
+//!
 //! Grep-family invocations that can be served are rewritten to
 //! a hidden `__grep-engine` subcommand of the current binary (dispatched
 //! before instance-lock acquisition in `main()`), which runs the ripgrep
@@ -32,7 +42,9 @@
 //! so a command carrying a grep-family invocation is either fully served by the
 //! engine or refused as an explicit failure ([`unserved_failure`],
 //! [`GrepServe::refusal`]), except for the shapes listed below, which are left
-//! to the platform as written.
+//! to the platform as written. A member the runner cannot take over refuses the
+//! same way — a redirect it cannot apply to a member it spawns itself, or a fold
+//! that names this service's own image ([`plan`]).
 //! That decision is fail-closed on *words*, not on meanings: a segment that
 //! merely carries a grep-family word in a followed program's argument list
 //! refuses too ([`GREP_INTRODUCERS`]) — unless that program owns the search
@@ -109,6 +121,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::tools::path::shell_quote;
 use crate::tools::shell::SHELL_PIPE_READ_CAP;
+use crate::tools::shell::plan::{self, Plan};
 use crate::tools::shell::scan::CdScan;
 use crate::tools::shell::scan::strip_heredoc_bodies;
 use crate::util::UnwrapPoison;
@@ -116,7 +129,10 @@ use crate::util::is_word_char;
 
 use super::{SHELL_PLATFORM, ShellPlatform};
 
-mod windows;
+/// The cmd.exe line model, read by the runner's own decomposition too
+/// ([`super::plan`]), which is why the module and the words it hands out are
+/// visible to its siblings.
+pub(super) mod windows;
 
 // ── Protocol constants ────────────────────────────────────────────────────
 
@@ -274,8 +290,9 @@ impl StdoutDest {
 }
 
 /// Whether fd 1 is a pipe (`run_command_with_timeout` spawns the shell with
-/// `Stdio::piped()`, and the shell's own `|` gives a pipe too). Every other
-/// stdout is a sink the user reads, so the engine must write all of it.
+/// `Stdio::piped()`, a plan run spawns each member that way — [`plan`] — and the
+/// shell's own `|` gives a pipe too). Every other stdout is a sink the user
+/// reads, so the engine must write all of it.
 ///
 /// A redirect whose target is itself a pipe reads as a pipe here — one fd cannot
 /// tell the shell tool's capture pipe from a named one — so such a member keeps
@@ -340,7 +357,9 @@ pub(super) struct GrepOutcome {
 /// Result of analyzing a shell command for grep serving.
 #[derive(Debug)]
 pub(super) struct GrepServe {
-    /// The rewritten command; `None` when no grep was served (original runs).
+    /// The rewritten command; `None` when no grep was served, which leaves the
+    /// original to run — through the shell, except where a demotion on Windows
+    /// carries a cause and the caller refuses it ([`GrepServe::refusal`]).
     pub rewritten: Option<String>,
     /// Per-grep-member decisions; empty when the command is not greppable.
     pub outcomes: Vec<GrepOutcome>,
@@ -348,6 +367,16 @@ pub(super) struct GrepServe {
     /// spec cannot ride on the cmd.exe command line); empty on unix. The
     /// caller owns them and removes them when the call finishes.
     pub spec_files: Vec<PathBuf>,
+    /// The rewritten line decomposed into steps the runner spawns itself. `Some`
+    /// only on Windows and only when a rewrite was actually produced: a demotion
+    /// (an unserved member, an unavailable engine, a payload too large, a plan
+    /// shape the runner refuses) carries no rewrite and so no plan, and on Windows
+    /// the caller refuses it when it carries a cause — the original runs through
+    /// the shell only on unix or for a demotion with no cause
+    /// ([`GrepServe::refusal`]). A plan exists because the shell does not wait for
+    /// this service's own image — see [`plan`] for the guarantee and for what is
+    /// deliberately refused.
+    pub plan: Option<Plan>,
     /// The short cause of the search this platform could not serve, when the
     /// command does carry one. Always `None` on unix: an unserved member keeps
     /// falling back to the real `grep` there, so nothing is refused. On Windows
@@ -356,22 +385,35 @@ pub(super) struct GrepServe {
     pub refusal: Option<String>,
 }
 
-/// The agent-facing failure for a search the engine refuses to serve (the
-/// Windows value of [`GrepServe::refusal`]). It becomes the tool error, so it
-/// must be unmistakable for a result: it names the cause and says the search did
-/// not run rather than matched nothing. Every refusal path — the serve
-/// decision's own cause and the engine's reported one alike — renders its
-/// message through here, so those two guarantees cannot drift between them.
+/// The frame every refusal of a run opens with — the cause follows, then the
+/// consequence that belongs to the entry point that refused. Spelled once here so
+/// [`unserved_failure`] and the plan runner's `plan::refusal_message` cannot word
+/// one cause two ways.
+pub(super) const REFUSAL_FRAME: &str = "Command not run: ";
+
+/// The agent-facing failure for a command the engine or the runner refuses on
+/// Windows (the value of [`GrepServe::refusal`] and the engine's own reported
+/// failure). It becomes the tool error, so it must be unmistakable for a result:
+/// it names the cause and says nothing ran rather than that the search matched
+/// nothing. Every refusal path renders its message through here, so those two
+/// guarantees cannot drift between them.
 ///
-/// No remedy is offered: which commands the engine can serve, and this
-/// platform's quoting and `%` rules, are the shell description's business, and
-/// one repeated here would be wrong for the causes no rewrite can avoid (an
-/// unavailable engine, an unquotable hand-off path).
+/// The frame is shared with the runner's own refusal
+/// ([`plan::refusal_message`]): [`REFUSAL_FRAME`] is the same sentence
+/// either way, and only the consequence after it belongs to the entry point —
+/// here, that a search reporting nothing is not an empty match set. The cause
+/// names which component refused (an unserved search, a rewrite the read-only
+/// guard rejected, a member the runner cannot run at all), as the shell
+/// description does.
+///
+/// No remedy is offered: which commands can be served, and this platform's quoting
+/// and `%` rules, are the shell description's business, and one repeated here would
+/// be wrong for the causes no rewrite can avoid (an unavailable engine, an
+/// unquotable hand-off path).
 pub(super) fn unserved_failure(reason: &str) -> String {
     format!(
-        "Search not served: the built-in grep engine cannot serve this command \
-         on this platform, so the search did NOT run — this is not an empty \
-         match set (cause: {reason})."
+        "{REFUSAL_FRAME}{reason}. The search did NOT run — this is not an empty \
+         match set."
     )
 }
 
@@ -398,6 +440,7 @@ impl GrepServe {
             rewritten: None,
             outcomes,
             spec_files: Vec::new(),
+            plan: None,
             refusal,
         }
     }
@@ -520,6 +563,7 @@ fn serve_command(
         shapes,
         segments,
         outcomes,
+        root_cwd,
         unserved,
     } = match analyze_command(command, workspace_root, home, platform, allow_single) {
         Ok(analyzed) => analyzed,
@@ -582,12 +626,18 @@ fn serve_command(
     // created and then abandoned by a later demotion. The engine's own path is
     // part of that rendering: without it there is no rewrite, so a runtime doubt
     // demotes the command (unix runs the original, Windows refuses the call)
-    // rather than panicking.
+    // rather than panicking. Each reader looks the path up for itself — the probe
+    // here, this rendering, and the plan's own dispatch — and all of them read the
+    // same process's own image, so they cannot name different programs.
     let rendered = std::env::current_exe()
         .map(|exe| exe.to_string_lossy().into_owned())
         .map_err(|e| Fallback::Handoff(format!("no own executable path: {e}")))
-        .and_then(|exe| join_rewritten(&segments, &jsons, platform, &exe));
-    let (rewritten, spec_files) = match rendered {
+        .and_then(|exe| join_rewritten(&segments, &specs, &jsons, platform, &exe, &root_cwd));
+    let Joined {
+        text: rewritten,
+        spec_files,
+        plan,
+    } = match rendered {
         Ok(rendered) => rendered,
         Err(reason) => {
             tracing::debug!(command = command, %reason, "grep engine: fallback");
@@ -620,6 +670,7 @@ fn serve_command(
         rewritten: Some(rewritten),
         outcomes,
         spec_files,
+        plan,
         refusal: None,
     }
 }
@@ -883,6 +934,19 @@ fn probe_engine() -> bool {
     probe.status().is_ok_and(|s| s.success())
 }
 
+/// One served member rendered for both of its consumers: the shell fragment the
+/// rewrite carries, and the argv that spawns the same program when the runner
+/// runs it itself ([`super::plan`]'s `Run::Own`).
+struct ServedMember {
+    /// The fragment as the shell must run it — cmd.exe's own quoting on the
+    /// Windows hand-off, `sh` quoting on unix.
+    text: String,
+    /// The argv after the image path, on the platform whose runner spawns the
+    /// member itself. `None` on unix, where the shell runs the fragment as
+    /// written and no plan exists — the spec rides the command line there.
+    argv: Option<Vec<String>>,
+}
+
 /// Render one served grep member into the shell fragment that runs the engine:
 /// the current executable, the engine verb and the spec, plus the member's own
 /// redirect tokens kept verbatim.
@@ -892,21 +956,24 @@ fn probe_engine() -> bool {
 /// cmd.exe caps its command line at 8191 characters and re-parses it before the
 /// program sees the argv, so the JSON — which carries the agent's pattern and
 /// operands — cannot ride on it. That scratch file is pushed onto `files`, the
-/// caller's list of files to remove when the call finishes.
+/// caller's list of files to remove when the call finishes, and is the same file
+/// the returned argv names.
 ///
-/// `exe` is this binary's path; it is an argument rather than a lookup so the
-/// one machine-dependent part of a rewrite (an installation path cmd.exe reads
-/// differently) is drivable from a test. `json` is the already-serialized spec —
-/// serializing it here as well would repeat the work for a large operand set,
-/// and the caller measures that same string against the payload bound.
+/// `exe` is this binary's path (`current_exe()`); it is an argument rather than
+/// a lookup so the one machine-dependent part of a rewrite (an installation path
+/// cmd.exe reads differently) is drivable from a test. `json` is the
+/// already-serialized spec — serializing it here as well would repeat the work for
+/// a large operand set, and the caller measures that same string against the
+/// payload bound.
 fn render_served(
     json: &str,
     redirects: &[String],
     platform: ShellPlatform,
     exe: &str,
     files: &mut Vec<PathBuf>,
-) -> Result<String, Fallback> {
+) -> Result<ServedMember, Fallback> {
     let mut fragment = String::new();
+    let mut argv = None;
     match platform {
         ShellPlatform::Unix => {
             fragment.push_str(&shell_quote(exe));
@@ -934,13 +1001,23 @@ fn render_served(
             fragment.push_str(windows::SPEC_FILE_FLAG);
             fragment.push(' ');
             fragment.push_str(&quoted_path);
+            // The runner's own spelling of the same call: argv, so nothing on
+            // the line re-reads the words the way cmd.exe reads them.
+            argv = Some(vec![
+                ENGINE_VERB.to_string(),
+                windows::SPEC_FILE_FLAG.to_string(),
+                path.to_string_lossy().into_owned(),
+            ]);
         }
     }
     if !redirects.is_empty() {
         fragment.push(' ');
         fragment.push_str(&redirects.join(" "));
     }
-    Ok(fragment)
+    Ok(ServedMember {
+        text: fragment,
+        argv,
+    })
 }
 
 /// Why a command was not served (telemetry + fail-closed decisions).
@@ -949,8 +1026,12 @@ fn render_served(
 /// never constructed on it — `CmdSyntax` and `Expansion` come from the cmd.exe
 /// model, `SingleFile` from the unix-only perf gate (Windows serves single-file
 /// lookups, having no host grep to prefer).
+///
+/// Visible to this module tree because [`resolve_cd`] returns it and the runner's
+/// own decomposition reads that function ([`plan`]'s `tracked_cd`); it never
+/// matches a variant, mapping any failure to the plan's own refusal instead.
 #[derive(Debug)]
-enum Fallback {
+pub(super) enum Fallback {
     NoGrep,
     NestedGrep,
     Heredoc,
@@ -989,6 +1070,19 @@ enum Fallback {
     /// The engine could not be handed what it needs: this binary's own path (any
     /// platform) or the scratch file the Windows transport carries the spec in.
     Handoff(String),
+    /// A member the runner has to spawn itself is in a shape the plan cannot run:
+    /// a spelling of this service's own image the shell does not wait for, a
+    /// redirect the runner cannot apply to a member it spawns, or a line the
+    /// decomposition cannot represent ([`plan::build`]). The reason is
+    /// [`plan::Refusal`]'s own, so the cause reaching the agent is the one the
+    /// decomposition refused with rather than a second rendering of it.
+    PlanRefusal(String),
+}
+
+impl From<plan::Refusal> for Fallback {
+    fn from(refusal: plan::Refusal) -> Self {
+        Fallback::PlanRefusal(refusal.to_string())
+    }
 }
 
 impl std::fmt::Display for Fallback {
@@ -1014,6 +1108,7 @@ impl std::fmt::Display for Fallback {
             Fallback::CmdSyntax(s) => write!(f, "cmd.exe spelling the engine cannot read: {s}"),
             Fallback::Expansion(s) => write!(f, "two `%` in {s}"),
             Fallback::Handoff(s) => write!(f, "hand-off refused: {s}"),
+            Fallback::PlanRefusal(s) => write!(f, "{s}"),
         }
     }
 }
@@ -1072,6 +1167,10 @@ struct Analyzed {
     shapes: Vec<(usize, String, bool)>,
     segments: Vec<(OutSegment, String)>,
     outcomes: Vec<GrepOutcome>,
+    /// The cwd the line starts in — the canonicalized workspace root, which the
+    /// cwd tracking below walks forward from. Carried rather than recomputed so
+    /// the plan's first step and the analyzer's own cwd cannot disagree.
+    root_cwd: PathBuf,
     /// Windows only (`None` on unix, where an unserved member simply falls back
     /// to the real `grep`): the cause of the FIRST member the engine cannot
     /// serve — see [`SEARCH_OWNING_VERBS`] for the one shape that is left
@@ -1149,7 +1248,8 @@ fn analyze_command(
         i = j + 1;
     }
 
-    let mut cwd = canonical_or_lexical(workspace_root, platform);
+    let root_cwd = canonical_or_lexical(workspace_root, platform);
+    let mut cwd = root_cwd.clone();
     let mut rewritten: Vec<(OutSegment, String)> = Vec::new();
     let mut specs: Vec<EngineSpec> = Vec::new();
     let mut shapes: Vec<(usize, String, bool)> = Vec::new();
@@ -1357,8 +1457,9 @@ fn analyze_command(
     }
 
     // Served iff at least one grep was served. If none was, the command falls
-    // back wholesale (the original runs) with the first per-segment skip
-    // reason naming the cause — a pure-skip command must not run the engine.
+    // back wholesale with the first per-segment skip reason naming the cause — a
+    // pure-skip command must not run the engine, and whether the original then
+    // runs at all is the platform's and the cause's ([`GrepServe::refusal`]).
     // The collected per-member outcomes are preserved (the caller records the
     // shape; a would-be serve demoted by the whole-command abort is handled at
     // the call site).
@@ -1374,8 +1475,28 @@ fn analyze_command(
         shapes,
         segments: rewritten,
         outcomes,
+        root_cwd,
         unserved,
     })
+}
+
+/// One analysis rendered for both of its consumers: the single command line the
+/// shell was going to run, and — on the platform whose shell does not wait for
+/// this service's own image — the plan its runner executes instead
+/// ([`super::plan`]).
+struct Joined {
+    /// The rewrite as one command, verbatim except that the Windows splitter's
+    /// newline connector is re-emitted as `&` (see the loop).
+    text: String,
+    /// Scratch spec files the rewrite names, for the caller to remove when the
+    /// call finishes.
+    spec_files: Vec<PathBuf>,
+    /// The runner's own decomposition of the same members: `Some` only when a
+    /// rewrite was produced on the platform that needs one. A demotion produces no
+    /// rewrite and so no plan, and on Windows one carrying a cause is refused
+    /// rather than run, so the original reaches the shell only on unix or with no
+    /// cause ([`GrepServe::refusal`]).
+    plan: Option<Plan>,
 }
 
 /// Join the rewritten members with their connectors into one command — verbatim
@@ -1387,26 +1508,51 @@ fn analyze_command(
 /// whose hand-off fails takes the files already written by its predecessors with
 /// it: the command is demoted, so nobody else ever owns them.
 ///
+/// The same traversal collects the [`Plan`]'s members, so the text and the plan
+/// are two renderings of ONE per-member decision and cannot drift apart; a plan
+/// that failed to build demotes the command through the same `Fallback` arm a
+/// rendering failure does.
+///
 /// `exe` is this binary's path — a parameter for the same reason
 /// [`render_served`] takes it, so a test can drive the rendered command without
-/// naming an installed executable.
+/// naming an installed executable. `root_cwd` is the analyzer's initial cwd: the
+/// cwd the line's own tracking starts from, and the cwd of every member up to the
+/// first served one.
 fn join_rewritten(
     segments: &[(OutSegment, String)],
+    specs: &[EngineSpec],
     jsons: &[String],
     platform: ShellPlatform,
     exe: &str,
-) -> Result<(String, Vec<PathBuf>), Fallback> {
+    root_cwd: &Path,
+) -> Result<Joined, Fallback> {
     let mut out = String::new();
     let mut files = Vec::new();
+    let mut members: Vec<(plan::Member, String)> = Vec::new();
     for (i, (seg, conn)) in segments.iter().enumerate() {
         if i > 0 {
             out.push(' ');
         }
         match seg {
-            OutSegment::Verbatim(text) => out.push_str(text),
+            OutSegment::Verbatim(text) => {
+                out.push_str(text);
+                members.push((plan::Member::Shell { text: text.clone() }, conn.clone()));
+            }
             OutSegment::Served { spec, redirects } => {
                 match render_served(&jsons[*spec], redirects, platform, exe, &mut files) {
-                    Ok(fragment) => out.push_str(&fragment),
+                    Ok(rendered) => {
+                        out.push_str(&rendered.text);
+                        if let Some(argv) = rendered.argv {
+                            members.push((
+                                plan::Member::Own {
+                                    argv,
+                                    redirects: redirects.clone(),
+                                    cwd: PathBuf::from(&specs[*spec].cwd),
+                                },
+                                conn.clone(),
+                            ));
+                        }
+                    }
                     Err(reason) => {
                         discard_spec_files(&files);
                         return Err(reason);
@@ -1440,14 +1586,38 @@ fn join_rewritten(
             out.push_str(conn);
         }
     }
-    Ok((out, files))
+    // The plan is the Windows decomposition (see [`plan`]): the platform whose
+    // shell does not wait for this service's own image is the only one that has
+    // one, and the members above were collected on that platform alone. It reads
+    // the line's cwd itself, tracking every member's `cd` the way the analyzer
+    // did, so the text here and the plan cannot disagree about a directory either.
+    let plan = match platform {
+        ShellPlatform::Windows => {
+            match plan::build(&members, Path::new(exe), root_cwd) {
+                Ok(plan) => Some(plan),
+                // A refused line runs nothing, so its already-written scratch
+                // spec files must go too.
+                Err(refusal) => {
+                    discard_spec_files(&files);
+                    return Err(Fallback::from(refusal));
+                }
+            }
+        }
+        ShellPlatform::Unix => None,
+    };
+    Ok(Joined {
+        text: out,
+        spec_files: files,
+        plan,
+    })
 }
 
 /// Remove scratch spec files, best-effort — the single home of that policy: the
 /// engine calls it when a hand-off abandons a rewrite (a later member's
-/// `render_served` failed), so a refused Windows search leaks none, and the
-/// shell's `SpecFiles` guard calls it on drop, owning the lifecycle point. A
-/// removal that fails is the temp cleaner's.
+/// `render_served` failed, or the plan refused the line the member was rendered
+/// for), so a refused Windows search leaks none, and the shell's `SpecFiles` guard
+/// calls it on drop, owning the lifecycle point. A removal that fails is the temp
+/// cleaner's.
 pub(super) fn discard_spec_files(files: &[PathBuf]) {
     for path in files {
         let _ = fs::remove_file(path);
@@ -1564,10 +1734,15 @@ fn list_key(verb: &str, platform: ShellPlatform) -> String {
 /// (returns to the directory `pushd` remembered) — read through [`list_key`]
 /// like every other verb list, which is the same `cd`/`chdir`/`popd`/`pushd`
 /// grouping the read-only guard's own `INTERNAL_VERBS` uses. Tracking only `cd`
-/// would leave the cwd stale for the rest of the family, and the engine's cwd
-/// gate would refuse the served member at runtime; the unix reading stays
-/// byte-exact.
-fn is_cd_segment(verb: &str, platform: ShellPlatform) -> bool {
+/// would leave the cwd stale for the rest of the family, which is a wrong
+/// directory rather than a missing one: on unix the engine's cwd gate refuses the
+/// served member at runtime, and on Windows [`plan`]'s own decomposition refuses
+/// the line before it runs. The unix reading stays byte-exact.
+///
+/// [`plan`]'s `tracked_cd` asks this too, so both readings of a `cd` agree on
+/// which members move the tracked cwd — and [`is_cd_spelling`] is the other half,
+/// for the cmd.exe spellings this key does not know.
+pub(super) fn is_cd_segment(verb: &str, platform: ShellPlatform) -> bool {
     match platform {
         ShellPlatform::Unix => verb == "cd",
         ShellPlatform::Windows => matches!(
@@ -1575,6 +1750,33 @@ fn is_cd_segment(verb: &str, platform: ShellPlatform) -> bool {
             "cd" | "chdir" | "popd" | "pushd"
         ),
     }
+}
+
+/// True when a command word is a spelling of cmd.exe's cwd family that
+/// [`is_cd_segment`] does not follow — the other half of that reading, for a
+/// caller that must refuse rather than track what it cannot follow.
+///
+/// cmd ends an internal command's name at the first character that cannot be part
+/// of it, so `cd..`, `cd\Users`, `cd/d` and the `@`-prefixed `@cd` are all the
+/// `cd` builtin with its target or switch fused to the name, while `cdrecord` is a
+/// program of its own and a path-qualified word (`C:\ws\cd.exe`) names that file
+/// rather than the builtin. A dot ends the name too — the same rule that makes
+/// `cd.` the builtin and `echo.` the `echo` builtin — so `cd.txt` is `cd` with the
+/// target `.txt`. The whole family, because the tracking follows all of
+/// it: a spelling this answers for and [`is_cd_segment`] does not is a directory
+/// change no tracked cwd accounts for. Unix has no such spelling — `cd..` there is
+/// a command named `cd..` — so this is Windows-only, like every cmd.exe reading.
+#[must_use]
+pub(super) fn is_cd_spelling(word: &str, platform: ShellPlatform) -> bool {
+    if platform != ShellPlatform::Windows {
+        return false;
+    }
+    let word = word.strip_prefix('@').unwrap_or(word);
+    let name = word.split(['\\', '/', '.']).next().unwrap_or("");
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "cd" | "chdir" | "popd" | "pushd"
+    )
 }
 
 /// Command-introducer verbs whose argument list may contain a nested grep
@@ -1768,14 +1970,19 @@ fn unreadable_line_search(command: &str, platform: ShellPlatform) -> bool {
 /// neither is modelled, so both leave [`Fallback::CdUntrackable`] rather than a
 /// wrong tracked cwd. `pushd <target>` is tracked exactly like `cd <target>`.
 ///
-/// Two cmd.exe spellings stay outside this model, both refusing rather than
-/// tracking a wrong directory: a glued switch (`cd/d C:\ws`, which the read-only
-/// guard's own reader splits into `cd /d`), and a drive-relative target
-/// (`cd C:foo`, relative to that drive's remembered directory, not to the
-/// tracked cwd). Either way the served member's spec cwd and the engine's own
-/// cwd diverge and the engine's cwd gate refuses the call — a loud refusal of a
-/// command an agent could have meant, never a search of the wrong directory.
-fn resolve_cd(
+/// Two cmd.exe spellings stay outside this model, both leaving
+/// [`Fallback::CdUntrackable`] rather than tracking a wrong directory: a glued
+/// switch (`cd/d C:\ws`, which the read-only guard's own reader splits into
+/// `cd /d` — and which [`is_cd_spelling`] refuses before this is asked), and a
+/// drive-relative target (`cd C:foo`, relative to that drive's remembered
+/// directory, not to the tracked cwd). A wrong tracked cwd is a wrong answer, not a
+/// missing one: the served member would carry a spec cwd the shell never uses, so
+/// the command is refused instead of served.
+///
+/// The runner's own decomposition of a line the serve decision did not plan reads
+/// a `cd` through this function too ([`plan`]'s `tracked_cd`), so a member after a
+/// `cd` runs in the directory this tracking named.
+pub(super) fn resolve_cd(
     segment: &str,
     cwd: &Path,
     home: &Path,
@@ -1816,6 +2023,12 @@ fn resolve_cd(
             return Err(Fallback::CdUntrackable);
         }
         if windows::has_percent_expansion(target) {
+            return Err(Fallback::CdUntrackable);
+        }
+        // A drive-relative target (`cd C:foo`) is the cwd of ANOTHER drive, which
+        // this model does not keep: joining it onto this cwd would track a
+        // directory cmd.exe never uses.
+        if windows::is_drive_relative(target) {
             return Err(Fallback::CdUntrackable);
         }
         return Ok(canonical_or_lexical(
@@ -1871,9 +2084,13 @@ fn absolute_or_cwd(cwd: &Path, word: &str, platform: ShellPlatform) -> PathBuf {
 /// then to the path as given. On Windows the verbatim (`\?\`) prefix
 /// `fs::canonicalize` adds is stripped, so the tracked cwd, the spec's operand
 /// paths and the displayed paths carry the spelling cmd.exe itself reports —
-/// and the cwd gate then needs [`windows::same_directory`]'s
+/// and the cwd gate then needs [`windows::same_spelling`]'s
 /// spelling-insensitive comparison rather than byte equality.
-fn canonical_or_lexical(p: &Path, platform: ShellPlatform) -> PathBuf {
+///
+/// The runner's own cwd tracking starts here too ([`plan::build`]'s `root_cwd`,
+/// and the canonicalization the plan's own line reading performs), so a plan's
+/// first step and the analyzer's tracking name the same directory.
+pub(super) fn canonical_or_lexical(p: &Path, platform: ShellPlatform) -> PathBuf {
     let canonical = fs::canonicalize(p)
         .or_else(|_| std::path::absolute(p))
         .unwrap_or_else(|_| p.to_path_buf());
@@ -2026,14 +2243,18 @@ fn flags_surface(flags: &GrepFlags) -> String {
 }
 
 /// A word from the grep segment: its unquoted value plus redirect metadata.
+///
+/// Read by the runner's own decomposition too ([`super::plan`]), which is why
+/// the word and its fields are shell-visible: the plan's cwd/argv/redirect
+/// reading is the same cmd.exe reading the analyzer's is.
 #[derive(Clone)]
-struct GrepWord {
+pub(super) struct GrepWord {
     /// Unquoted value (expansions already rejected).
-    value: String,
+    pub(super) value: String,
     /// Raw spelling for redirects preserved verbatim in the rewrite.
-    raw: String,
-    redirect: bool,
-    needs_target: bool,
+    pub(super) raw: String,
+    pub(super) redirect: bool,
+    pub(super) needs_target: bool,
 }
 
 /// True when `token` already opens a redirect spelling `sh` reads as one
@@ -2280,8 +2501,12 @@ fn parse_grep_words(
     // [`windows::has_percent_expansion`] for the per-word reading and why it is
     // enough here). A lone `%` and every `!` are ordinary characters here: the
     // interpreter this process spawns is `cmd /C` without `/V:ON`. Redirects are
-    // exempt: the rewrite keeps them verbatim, so cmd.exe expands them exactly
-    // as it would have in the original command.
+    // exempt from this argv check: on unix the rewrite re-emits their tokens
+    // verbatim for `sh`, which expands them exactly as it would have in the
+    // original command; on Windows the runner applies them itself from those same
+    // tokens ([`super::plan::apply_redirects`]), which is why `parse_redirects`
+    // refuses a target carrying a `%…%` pair rather than expanding it — a shape
+    // the argv check alone would have let through.
     if platform == ShellPlatform::Windows
         && let Some(word) = argv.iter().find(|w| windows::has_percent_expansion(&w.raw))
     {
@@ -3335,7 +3560,7 @@ fn serve(spec: &EngineSpec) -> Result<i32, &'static str> {
     // otherwise fail the gate for every member).
     let same_cwd = match SHELL_PLATFORM {
         ShellPlatform::Unix => actual_cwd == Path::new(&spec.cwd),
-        ShellPlatform::Windows => windows::same_directory(
+        ShellPlatform::Windows => windows::same_spelling(
             &canonical_or_lexical(&actual_cwd, ShellPlatform::Windows),
             Path::new(&spec.cwd),
         ),
@@ -4649,13 +4874,19 @@ mod parity_tests {
     ) -> Result<JoinedAnalyzeOutput, AnalyzeFailure> {
         let analyzed = analyze_command(command, ws, home, ShellPlatform::Unix, allow_single)?;
         let jsons: Vec<String> = analyzed.specs.iter().map(spec_json).collect();
-        let (rewritten, _) =
-            join_rewritten(&analyzed.segments, &jsons, ShellPlatform::Unix, "/mahbot")
-                .expect("the unix join never refuses");
+        let joined = join_rewritten(
+            &analyzed.segments,
+            &analyzed.specs,
+            &jsons,
+            ShellPlatform::Unix,
+            "/mahbot",
+            &analyzed.root_cwd,
+        )
+        .expect("the unix join never refuses");
         Ok((
             analyzed.specs,
             analyzed.shapes,
-            rewritten,
+            joined.text,
             analyzed.outcomes,
         ))
     }
@@ -5734,7 +5965,7 @@ mod handoff_pins {
     fn windows_hand_off_quotes_the_executable_and_refuses_only_what_cmd_rewrites() {
         let spec = render_only_json();
         let mut files = Vec::new();
-        let fragment = render_served(
+        let ServedMember { text, argv } = render_served(
             &spec,
             &[],
             ShellPlatform::Windows,
@@ -5743,10 +5974,25 @@ mod handoff_pins {
         )
         .expect("a programme path cmd.exe reads literally inside quotes");
         assert!(
-            fragment.starts_with(r#""C:\Program Files (x86)\MahBot\mahbot.exe" "#),
-            "{fragment}"
+            text.starts_with(r#""C:\Program Files (x86)\MahBot\mahbot.exe" "#),
+            "{text}"
         );
-        assert!(fragment.contains(windows::SPEC_FILE_FLAG), "{fragment}");
+        assert!(text.contains(windows::SPEC_FILE_FLAG), "{text}");
+        // The same member's argv — what the runner spawns the image with — names
+        // the same words the fragment spells, with the spec's own path bare
+        // (argv needs no quoting) and cmd.exe's own text out of the way.
+        assert_eq!(
+            argv.as_deref(),
+            Some(
+                [
+                    ENGINE_VERB.to_string(),
+                    windows::SPEC_FILE_FLAG.to_string(),
+                    files[0].to_string_lossy().into_owned(),
+                ]
+                .as_slice()
+            ),
+            "the plan's argv names the scratch file the fragment does"
+        );
         assert_eq!(files.len(), 1, "the spec rides a scratch file");
         assert!(files[0].exists(), "{:?}", files[0]);
         let file = files[0].clone();
@@ -5755,17 +6001,20 @@ mod handoff_pins {
 
         for bad in [r"C:\Users\a%b\mahbot.exe", r"C:\Users\a!b\mahbot.exe"] {
             let err = render_served(&spec, &[], ShellPlatform::Windows, bad, &mut Vec::new())
-                .expect_err("a path cmd.exe rewrites even inside quotes");
+                .err()
+                .expect("a path cmd.exe rewrites even inside quotes");
             assert!(err.to_string().contains("hand-off refused"), "{err}");
         }
     }
 
     /// On unix the executable's path is single-quoted for `sh` and the spec
-    /// rides the command line.
+    /// rides the command line. The member carries no argv: nothing spawns it
+    /// there, and the spec — a word on the line, not a file — would be an
+    /// argument the runner never needs.
     #[test]
     fn unix_hand_off_keeps_the_argv_transport() {
         let mut files = Vec::new();
-        let fragment = render_served(
+        let member = render_served(
             &render_only_json(),
             &["2>&1".into()],
             ShellPlatform::Unix,
@@ -5773,16 +6022,12 @@ mod handoff_pins {
             &mut files,
         )
         .expect("unix hand-off");
+        assert!(member.argv.is_none(), "unix builds no own-image argv");
+        let text = member.text;
         assert!(files.is_empty(), "no scratch file on unix");
-        assert!(
-            fragment.starts_with("'/opt/it'\\''s here/mahbot' "),
-            "{fragment}"
-        );
-        assert!(fragment.contains(ENGINE_VERB), "{fragment}");
-        assert!(
-            fragment.ends_with(" 2>&1"),
-            "redirects stay verbatim: {fragment}"
-        );
+        assert!(text.starts_with("'/opt/it'\\''s here/mahbot' "), "{text}");
+        assert!(text.contains(ENGINE_VERB), "{text}");
+        assert!(text.ends_with(" 2>&1"), "redirects stay verbatim: {text}");
     }
 
     /// The scratch-file transport's read half: the flag arm of [`read_spec`]
@@ -6423,7 +6668,8 @@ mod read_only_serve_pins {
             r"C:\Program Files (x86)\MahBot\mahbot.exe",
             &mut files,
         )
-        .expect("the install spelling is a quotable argument");
+        .expect("the install spelling is a quotable argument")
+        .text;
         let ctx = CheckContext::for_platform(&ws, ShellPlatform::Windows);
         let verdict = check_command(&fragment, &ctx);
         drop(SpecFiles(files));
@@ -6511,6 +6757,44 @@ mod refusal_pins {
         assert_eq!(unavailable.outcomes[0].reason, "engine unavailable");
     }
 
+    /// A line that runs this service's own program beside a search is served like
+    /// any other rewritten line: the call is not the shell's to run — the shell
+    /// does not wait for a windowed image — so [`plan`] makes it a step the runner
+    /// spawns itself, and the search beside it is served as usual. This is the
+    /// shape a rewritten `mahbot … && grep …` has, and the reason it is a plan
+    /// rather than a refusal.
+    #[test]
+    fn windows_serves_a_line_that_runs_the_own_image_beside_a_search() {
+        let (_tmp, ws, home) = serve_fixture();
+        let exe = std::env::current_exe().expect("this process's own path");
+        let image = exe.display().to_string();
+        let mut files = Vec::new();
+        for command in [
+            format!("{image} debug --db board && grep -rn needle ."),
+            format!("grep -rn needle . && {image} --version"),
+            format!("{image} -V | grep needle"),
+            format!("echo hi && {image} -V && grep -rn needle ."),
+        ] {
+            let mut serve =
+                serve_command(&command, &ws, Some(&home), ShellPlatform::Windows, || true);
+            assert!(
+                serve.refusal.is_none(),
+                "{command}: must be served, not refused: {:?}",
+                serve.refusal
+            );
+            assert!(serve.rewritten.is_some(), "{command}: a rewrite");
+            files.append(&mut serve.spec_files);
+            let plan = serve.plan.take().expect("a served rewrite has a plan");
+            let own = plan
+                .steps
+                .iter()
+                .filter(|step| matches!(step.run, plan::Run::Own { .. }))
+                .count();
+            assert!(own >= 1, "{command}: the image's call is an own step");
+        }
+        drop(SpecFiles(files));
+    }
+
     #[test]
     fn windows_refuses_every_version_of_an_unserved_search() {
         let (_tmp, ws, home) = serve_fixture();
@@ -6579,6 +6863,34 @@ mod refusal_pins {
                 "{command}: reason {reason:?} lacks {cause:?}"
             );
         }
+        // A member that names this service's own program in a shape the runner
+        // cannot run as one plain call of it refuses the whole line too, so a
+        // search beside it is never run without it: a launcher spelling, and a
+        // relative spelling of this image's own file name. Both are built from
+        // this process's path — the name the comparison rests on is the one this
+        // test binary actually has.
+        let exe = std::env::current_exe().expect("this process's own path");
+        let name = exe
+            .file_name()
+            .expect("an executable has a file name")
+            .to_string_lossy()
+            .to_string();
+        for (command, cause) in [
+            (
+                format!("start {} -V && grep -rn needle .", exe.display()),
+                "runs `mahbot` itself",
+            ),
+            (
+                format!(r".\{name} -V && grep -rn needle ."),
+                "names `mahbot`'s file name",
+            ),
+        ] {
+            let reason = refused(&command, &ws, &home);
+            assert!(
+                reason.contains(cause),
+                "{command}: reason {reason:?} lacks {cause:?}"
+            );
+        }
     }
 
     /// The narrowing: a lone `%` and every `!` are ordinary characters to the
@@ -6597,22 +6909,104 @@ mod refusal_pins {
         }
     }
 
-    /// The glued form is the refused one: a redirect word of its own is kept
-    /// verbatim (cmd.exe parses it, and the shape is the interpreter's own), and
-    /// a `>` inside quotes is ordinary text to the program that receives the
-    /// word — the served member's text rides the spec file, never this command
-    /// line.
+    /// The redirect shapes the runner applies by itself are served: a `>`
+    /// target word of its own is kept verbatim (the runner opens the file the
+    /// shell would have opened), a target glued to its operator is the same
+    /// redirect, a `2>&1` is the merge it performs at the member's stdout
+    /// destination, and a `>` inside quotes is ordinary text to the program that
+    /// receives the word — the served member's text rides the spec file, never
+    /// this command line. A redirect the runner cannot apply is refused instead;
+    /// [`windows_refuses_a_redirect_the_runner_cannot_apply`] holds that half.
     #[test]
     fn windows_serves_the_readable_redirect_shapes() {
         let (_tmp, ws, home) = serve_fixture();
         for command in [
             "grep -n needle f.txt > out.txt",
+            "grep -n needle f.txt >> out.txt",
+            "grep -n needle f.txt 2> err.txt",
+            "grep -n needle f.txt < f.txt",
             "grep -n needle f.txt 2>&1",
+            "grep -n needle f.txt 2>&1 | head -2",
             r#"grep -n "a>b" f.txt"#,
+            // The glued spellings: cmd.exe splits neither the operator from its
+            // target nor the word they follow.
+            "grep -n needle f.txt >out.txt",
+            "grep -n needle f.txt >>log.txt",
+            "grep -n needle f.txt 2>err.txt",
+            "grep -n needle f.txt 2>>log.txt",
+            "grep -n needle f.txt <in.txt",
+            "grep -n needle f.txt 1>0",
         ] {
             let (rewritten, files) = served(command, &ws, &home, ShellPlatform::Windows);
             assert!(rewritten.contains(ENGINE_VERB), "{command}: {rewritten}");
             drop(SpecFiles(files));
+        }
+    }
+
+    /// A served member's redirect spelling the runner cannot apply to a member it
+    /// spawns itself refuses the whole command on Windows — never a member run
+    /// under a stream the runner has silently approximated. The refusal names the
+    /// spelling, and no rewrite is produced (so no spec file is either).
+    #[test]
+    fn windows_refuses_a_redirect_the_runner_cannot_apply() {
+        let (_tmp, ws, home) = serve_fixture();
+        let rows: &[(&str, &str)] = &[
+            ("grep -n needle f.txt >&2", "`>&2`"),
+            ("grep -n needle f.txt 1>&2", "`1>&2`"),
+            ("grep -n needle f.txt 3>&1", "`3>&1`"),
+            ("grep -n needle f.txt 10> out.txt", "`10>`"),
+            ("grep -n needle f.txt 10>out.txt", "`10>out.txt`"),
+            ("grep -n needle f.txt <>f.txt", "`<>f.txt`"),
+            // The rest of the runner's closed set's refusals: descriptor dups that
+            // are not the stdout merge, a redirect with no target word, and a target
+            // cmd.exe would have expanded before the member ran — refused, never
+            // expanded.
+            ("grep -n needle f.txt >& out.txt", "`>&`"),
+            ("grep -n needle f.txt 2>>&1", "`2>>&1`"),
+            ("grep -n needle f.txt >", "its target word is missing"),
+            ("grep -n needle f.txt > %TMPOUT%", "`%TMPOUT%`"),
+            // A drive-relative target names the current directory of another
+            // drive, which the runner does not track.
+            ("grep -n needle f.txt > C:out.txt", "`C:out.txt`"),
+        ];
+        for (command, cause) in rows {
+            let reason = refused(command, &ws, &home);
+            assert!(
+                reason.contains(cause),
+                "{command}: reason {reason:?} lacks {cause:?}"
+            );
+            assert!(
+                reason.contains("cannot apply the redirection"),
+                "{command}: the cause explains the refusal: {reason:?}"
+            );
+        }
+    }
+
+    /// A directory change cmd.exe reads and the tracking cannot follow refuses the
+    /// whole command on Windows: the search after it would otherwise run in the
+    /// directory the line was in before that change — the runner spawns every step
+    /// itself, so nothing downstream could still notice the divergence. Two rows
+    /// pin the served path's own wiring; the family's spellings, and the pipeline
+    /// case, are pinned once in the plan module's own refusal test.
+    #[test]
+    fn windows_refuses_a_cd_the_runner_cannot_follow() {
+        let (_tmp, ws, home) = serve_fixture();
+        let rows: &[(&str, &str)] = &[
+            // cmd.exe's own spelling of the builtin with its target or switch fused
+            // to the name: the plan's own reading refuses it, naming the member.
+            ("cd.. && grep -rn needle .", "`cd` member"),
+            // A `cd` inside one of the shell's own keyword forms: whether it runs is
+            // the keyword's condition to decide, which the plan refuses.
+            ("if exist x cd sub && grep -rn needle .", "keyword form"),
+            // A target the shared resolver refuses, before any plan is built.
+            ("cd C:ws && grep -rn needle .", "cd untrackable"),
+        ];
+        for (command, cause) in rows {
+            let reason = refused(command, &ws, &home);
+            assert!(
+                reason.contains(cause),
+                "{command}: reason {reason:?} lacks {cause:?}"
+            );
         }
     }
 
@@ -6839,6 +7233,250 @@ mod refusal_pins {
     }
 }
 
+// ── Plan pins (the runner's own decomposition of a Windows rewrite) ──────
+// The rewrite and the plan are two renderings of one per-member decision
+// ([`super::super::plan`]). The guard that matters is that they agree: a plan
+// whose members were not the line's would be a search whose output came from
+// somewhere the agent did not ask about.
+
+#[cfg(test)]
+mod plan_pins {
+    use super::super::SpecFiles;
+    use super::super::plan::{Plan, Run};
+    use super::*;
+
+    /// The rewrite, the plan and the scratch spec files for `command` on
+    /// Windows, with the engine probe bypassed. The platform and the probe are
+    /// arguments, so the whole decomposition is drivable from this host.
+    fn served_with_plan(command: &str, ws: &Path, home: &Path) -> (String, Plan, Vec<PathBuf>) {
+        let mut serve = serve_command(command, ws, Some(home), ShellPlatform::Windows, || true);
+        assert!(
+            serve.refusal.is_none(),
+            "{command}: served, not refused: {:?}",
+            serve.refusal
+        );
+        let rewritten = serve
+            .rewritten
+            .take()
+            .unwrap_or_else(|| panic!("{command}: expected a rewrite"));
+        let plan = serve
+            .plan
+            .take()
+            .unwrap_or_else(|| panic!("{command}: a produced Windows rewrite carries a plan"));
+        (rewritten, plan, serve.spec_files)
+    }
+
+    /// One member of the plan, flattened out of its step: a fold's text splits
+    /// back into the members cmd.exe reads, an own-image step is one member
+    /// compared by the argv it is spawned with.
+    enum Planned {
+        Shell(String),
+        Own(Vec<String>, Vec<String>),
+    }
+
+    /// The plan's members with the connector that follows each — what the
+    /// rewrite must spell, member for member.
+    fn planned_members(plan: &Plan) -> Vec<(Planned, String)> {
+        let mut members = Vec::new();
+        for (index, step) in plan.steps.iter().enumerate() {
+            // The connector after a step is the next step's own join, spelled as
+            // the rewrite spells it.
+            let after = plan
+                .steps
+                .get(index + 1)
+                .map_or("", |next| next.join.spelling());
+            match &step.run {
+                Run::Shell { text } => {
+                    let fold = windows::segment_command(text).expect("cmd.exe reads a fold");
+                    let last = fold.len() - 1;
+                    for (at, (member, connector)) in fold.into_iter().enumerate() {
+                        members.push((
+                            Planned::Shell(member),
+                            if at == last {
+                                after.to_string()
+                            } else {
+                                connector
+                            },
+                        ));
+                    }
+                }
+                Run::Own { args, redirects } => members.push((
+                    Planned::Own(args.clone(), redirects.clone()),
+                    after.to_string(),
+                )),
+            }
+        }
+        members
+    }
+
+    /// The drift guard: the rendered rewrite IS the plan, read back with
+    /// cmd.exe's own model. Every fold's members are byte-identical to the
+    /// rewrite's members, every own-image step's member delivers exactly the argv
+    /// the runner spawns (`[exe] ++ args ++ redirects`), and the connectors
+    /// between the members are the plan's.
+    ///
+    /// One exception, the divergence [`plan`]'s module header names: a member the
+    /// rewrite carried verbatim keeps the spelling the agent typed for the image
+    /// (`mahbot -V`), while the plan spawns the absolute path — so for such a
+    /// member the image's word is compared by the file it names, and everything
+    /// after it byte for byte.
+    #[test]
+    fn the_plan_rejoins_into_the_rewritten_line() {
+        let (_tmp, ws, home) = serve_fixture();
+        // The image as this process spells it: the test binary's own file name is
+        // what a bare-name call of it would be written with.
+        let exe = std::env::current_exe().expect("this process's own path");
+        let name = exe
+            .file_name()
+            .expect("an executable has a file name")
+            .to_string_lossy()
+            .to_string();
+        let bare_call = format!("{name} -V && grep -rn needle .");
+        let prefixed_call = format!("@{name} -V && grep -rn needle .");
+        let mut shapes: Vec<&str> = vec![
+            "grep -rn needle .",
+            "grep -rn needle . | head -3",
+            "cd src && grep -rn needle .",
+            "cd src && grep -rn needle . | head -3",
+            "grep needle f.txt && grep needle src/main.rs",
+            "grep -n needle f.txt > out.txt",
+            "grep -n needle f.txt >> out.txt",
+            "grep -n needle f.txt 2>&1",
+            "grep -n needle f.txt 2>&1 | head -2",
+            "type note.txt && grep -n needle f.txt",
+        ];
+        shapes.push(&bare_call);
+        shapes.push(&prefixed_call);
+        for command in shapes {
+            let (rewritten, plan, files) = served_with_plan(command, &ws, &home);
+            let written = windows::segment_command(&rewritten).expect("cmd.exe reads the rewrite");
+            let planned = planned_members(&plan);
+            assert_eq!(
+                written.len(),
+                planned.len(),
+                "{command}: the plan and the rewrite must have the same members \
+                 (rewrite: {rewritten})"
+            );
+            let plan_exe = plan.exe.to_string_lossy();
+            for (at, ((written_text, written_conn), (member, connector))) in
+                written.iter().zip(&planned).enumerate()
+            {
+                assert_eq!(written_conn, connector, "{command}: connector before {at}");
+                match member {
+                    Planned::Shell(text) => assert_eq!(
+                        written_text, text,
+                        "{command}: the fold's member {at} must be verbatim"
+                    ),
+                    Planned::Own(args, redirects) => {
+                        let delivered: Vec<String> = windows::tokenize(written_text)
+                            .expect("cmd.exe reads the member")
+                            .iter()
+                            .map(|word| windows::unquote_word(&word.raw))
+                            .collect();
+                        let expected: Vec<String> = std::iter::once(plan_exe.to_string())
+                            .chain(args.iter().cloned())
+                            .chain(redirects.iter().map(|token| windows::unquote_word(token)))
+                            .collect();
+                        if delivered != expected {
+                            // The named divergence: a verbatim member keeps the
+                            // agent's spelling of the image while the plan spawns
+                            // the absolute path. The word must name the same file —
+                            // cmd.exe's `@`/`(` punctuation is not part of it — and
+                            // every word after it must be identical.
+                            assert_eq!(delivered.len(), expected.len(), "{command}: member {at}");
+                            assert_eq!(delivered[1..], expected[1..], "{command}: member {at}");
+                            let named = delivered[0]
+                                .trim_start_matches(['@', '('])
+                                .trim_end_matches(')');
+                            assert_eq!(
+                                std::path::Path::new(named).file_name(),
+                                std::path::Path::new(&expected[0]).file_name(),
+                                "{command}: member {at} names another file: {written_text}"
+                            );
+                        }
+                    }
+                }
+            }
+            drop(SpecFiles(files));
+        }
+    }
+
+    /// Every step's cwd is the one the analyzer tracked for its member: a fold
+    /// starts where the member before it left the line — for the fold after a
+    /// served search, the directory that search's own cwd gate named — and a
+    /// served step carries its search's cwd itself. A member's own plan carries
+    /// the directory its member was tracked at, and the two readings agree on every
+    /// shape the analyzer produces.
+    #[test]
+    fn the_plan_carries_the_tracked_cwd_of_every_member() {
+        let (_tmp, ws, home) = serve_fixture();
+        let root = canonical_or_lexical(&ws, ShellPlatform::Windows);
+        let src = root.join("src");
+        let cases: Vec<(&str, Vec<PathBuf>)> = vec![
+            ("grep -rn needle .", vec![root.clone()]),
+            (
+                "cd src && grep -rn needle .",
+                vec![root.clone(), src.clone()],
+            ),
+            (
+                "cd src && grep -rn needle . | head -3",
+                vec![root.clone(), src.clone(), src.clone()],
+            ),
+            // The `cd` is inside the fold that follows the search: the fold runs
+            // the `cd` itself, so it starts in the line's own cwd.
+            (
+                "grep -rn needle . && cd src && echo after",
+                vec![root.clone(), root.clone()],
+            ),
+            (
+                "type note.txt && grep -n needle f.txt",
+                vec![root.clone(), root.clone()],
+            ),
+            (
+                "grep needle f.txt && grep needle src/main.rs",
+                vec![root.clone(), root.clone()],
+            ),
+        ];
+        for (command, expected) in cases {
+            let (_rewritten, plan, files) = served_with_plan(command, &ws, &home);
+            let steps: Vec<&Path> = plan.steps.iter().map(|step| step.cwd.as_path()).collect();
+            assert_eq!(
+                steps,
+                expected.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+                "{command}"
+            );
+            drop(SpecFiles(files));
+        }
+    }
+
+    /// The plan exists only where a rewrite does: a demoted command (an
+    /// unavailable engine here) carries none, and on Windows it is refused rather
+    /// than run through the shell.
+    #[test]
+    fn a_demoted_command_carries_no_plan() {
+        let (_tmp, ws, home) = serve_fixture();
+        for command in ["grep -rn needle .", "grep -P needle f.txt"] {
+            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Windows, || false);
+            assert!(
+                serve.plan.is_none(),
+                "{command}: a demotion carries no plan"
+            );
+            assert!(serve.rewritten.is_none(), "{command}");
+        }
+        // Nothing is planned on unix either: the shell waits for its children
+        // there, so there is nothing to fix.
+        let unix = serve_command(
+            "grep -rn needle .",
+            &ws,
+            Some(&home),
+            ShellPlatform::Unix,
+            || true,
+        );
+        assert!(unix.plan.is_none());
+        assert!(unix.rewritten.is_some());
+    }
+}
+
 // ── The unix word/operator reading (unix-gated: parsing plus a real `sh` run) ─
 // The reading the module header states, observed from both sides: which text
 // the member is served on, and that the operator is handed back to the shell
@@ -6939,9 +7577,16 @@ mod unix_operator_pins {
             let analyzed = analyze_command(command, &ws, &home, ShellPlatform::Unix, false)
                 .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
             let jsons: Vec<String> = analyzed.specs.iter().map(spec_json).collect();
-            let (rewritten, _) =
-                join_rewritten(&analyzed.segments, &jsons, ShellPlatform::Unix, &engine)
-                    .expect("the unix join never refuses");
+            let rewritten = join_rewritten(
+                &analyzed.segments,
+                &analyzed.specs,
+                &jsons,
+                ShellPlatform::Unix,
+                &engine,
+                &analyzed.root_cwd,
+            )
+            .expect("the unix join never refuses")
+            .text;
             assert_eq!(
                 rewritten.contains("TAIL-RAN"),
                 *tail_kept,
@@ -7125,9 +7770,16 @@ mod unix_operator_pins {
             let analyzed = analyze_command(command, &ws, &home, ShellPlatform::Unix, false)
                 .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
             let jsons: Vec<String> = analyzed.specs.iter().map(spec_json).collect();
-            let (rewritten, _) =
-                join_rewritten(&analyzed.segments, &jsons, ShellPlatform::Unix, &engine)
-                    .expect("the unix join never refuses");
+            let rewritten = join_rewritten(
+                &analyzed.segments,
+                &analyzed.specs,
+                &jsons,
+                ShellPlatform::Unix,
+                &engine,
+                &analyzed.root_cwd,
+            )
+            .expect("the unix join never refuses")
+            .text;
             let out = Command::new("/bin/sh")
                 .arg("-c")
                 .arg(&rewritten)
@@ -7159,9 +7811,16 @@ mod unix_operator_pins {
         let analyzed = analyze_command(command, &ws, &home, ShellPlatform::Unix, false)
             .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
         let jsons: Vec<String> = analyzed.specs.iter().map(spec_json).collect();
-        let (rewritten, _) =
-            join_rewritten(&analyzed.segments, &jsons, ShellPlatform::Unix, &engine)
-                .expect("the unix join never refuses");
+        let rewritten = join_rewritten(
+            &analyzed.segments,
+            &analyzed.specs,
+            &jsons,
+            ShellPlatform::Unix,
+            &engine,
+            &analyzed.root_cwd,
+        )
+        .expect("the unix join never refuses")
+        .text;
         assert!(
             rewritten.ends_with(" &"),
             "the `&` rides the rewrite: {rewritten}"

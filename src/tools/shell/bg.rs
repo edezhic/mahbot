@@ -45,8 +45,8 @@
 //! The launch-failure probe is Unix-shell-specific as well: cmd.exe exits 1
 //! (not 126/127) for a missing or non-executable command, so on Windows a
 //! failed launch surfaces as a successful background session whose output
-//! file holds the cmd.exe error and `[exit status: 1]` — the synchronous
-//! launch-error path is Unix-only (accepted deviation from the launch-failure
+//! file holds the cmd.exe error and `[exit status: 1]` — the 126/127 exit the probe
+//! keys on is Unix-shell-specific (accepted deviation from the launch-failure
 //! contract).
 
 use std::collections::HashMap;
@@ -154,6 +154,52 @@ struct SessionEntry {
     finished: Arc<AtomicBool>,
 }
 
+/// The command a background session runs: the shell, or this service's own image
+/// when the command is one call of it ([`super::plan::plan_for_command`]).
+///
+/// The image is spawned directly rather than through a shell, because the shell
+/// does not wait for it ([`super::plan`]) — and a background session is exactly
+/// where that would report a completion the image never reached. `Err` is the
+/// launch error for a command that names the image in a shape the runner cannot
+/// wire as one command: a launcher spelling the planner refuses, and a line the
+/// planner read as a chain, whose members around the call are steps of their own.
+/// A background command must fail at launch, never report a false completion.
+///
+/// The returned streams are the ones the command's own redirect tokens took over
+/// (applied here, exactly as the foreground runner applies them); the caller
+/// leaves those to it and wires the session's own stdio for the rest, which is
+/// also where a `2>&1` whose stdout the session still owns belongs: the session
+/// sends both of its streams to the one output file. A command that does not name
+/// the image is the shell's, and takes no stream over.
+fn own_image_command(
+    command: &str,
+    workspace_root: &Path,
+) -> Result<(tokio::process::Command, Vec<super::Stream>), String> {
+    match super::plan::plan_for_command(command, workspace_root) {
+        super::plan::OwnImage::None => Ok((
+            super::build_shell_command(command, workspace_root),
+            Vec::new(),
+        )),
+        super::plan::OwnImage::Direct(plan) => {
+            let Some((args, redirects, cwd)) = plan.direct_own() else {
+                // A line the runner's own decomposition read as a chain (the
+                // members around the call are steps of their own): a background
+                // session launches one command, so this fails the launch rather
+                // than run a shell whose wait for the image cannot be relied on.
+                return Err(super::plan::refusal_message(
+                    "the command could not be read as a single call of `mahbot`",
+                ));
+            };
+            let mut cmd = super::build_program_command(&plan.exe, args, cwd);
+            let applied = super::plan::apply_redirects(&mut cmd, redirects, cwd).map_err(|e| {
+                format!("Failed to start background command.\ncommand: {command}\nreason: {e}")
+            })?;
+            Ok((cmd, applied.streams))
+        }
+        super::plan::OwnImage::Refused(cause) => Err(super::plan::refusal_message(&cause)),
+    }
+}
+
 impl BackgroundSessions {
     /// Launch `command` in the background. Returns the output-file path.
     ///
@@ -182,7 +228,18 @@ impl BackgroundSessions {
         super::record_spill_owner(output_path.clone());
 
         // ── Command child ──
-        let mut cmd = super::build_shell_command(command, workspace_root);
+        // A command that names this service's own image cannot be left to the
+        // shell: the shell does not wait for it ([`super::plan`]), and a session
+        // whose output file claimed a completion the image never reached would be
+        // a lie. A lone own-image call is spawned directly instead, and any other
+        // shape that names the image fails at launch.
+        let (mut cmd, taken) = match own_image_command(command, workspace_root) {
+            Ok(command) => command,
+            Err(reason) => {
+                let _ = std::fs::remove_file(&output_path);
+                return Err(reason);
+            }
+        };
         let stdout_file = out_file.try_clone().map_err(|e| {
             let _ = std::fs::remove_file(&output_path);
             format!("Failed to set up background output: {e}")
@@ -191,9 +248,17 @@ impl BackgroundSessions {
             let _ = std::fs::remove_file(&output_path);
             format!("Failed to set up background output: {e}")
         })?;
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::from(stdout_file));
-        cmd.stderr(Stdio::from(stderr_file));
+        // The session's own wiring, for the streams the command's redirect tokens
+        // did not take over (they are applied by [`own_image_command`]).
+        if !taken.contains(&super::Stream::Stdin) {
+            cmd.stdin(Stdio::null());
+        }
+        if !taken.contains(&super::Stream::Stdout) {
+            cmd.stdout(Stdio::from(stdout_file));
+        }
+        if !taken.contains(&super::Stream::Stderr) {
+            cmd.stderr(Stdio::from(stderr_file));
+        }
 
         // Windows: the session's whole-tree containment, created before the
         // spawn and dropped on every launch path that never registers the

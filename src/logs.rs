@@ -449,8 +449,9 @@ pub async fn init_tracing(
     let store = match LogStore::open(storage_root).await {
         Ok(store) => store,
         Err(e) => {
-            // Pre-tracing diagnostics were already written to stderr; drop the
-            // buffer — the logs-store replay can never run.
+            // The pre-tracing diagnostics were already handed to stderr (a
+            // best-effort channel, see `boot`); drop the buffer, since the
+            // logs-store replay can never run.
             crate::boot::clear_boot_diagnostics();
             return Err(e);
         }
@@ -652,7 +653,9 @@ async fn absorb_flush(store: &LogStore, batch: &mut Vec<LogEntry>) {
 /// On persistent failure the batch is still cleared (entries are dropped) —
 /// log entries are diagnostics, not durable state. Failures are **not**
 /// swallowed: they are recorded on the [`log_write_error_info`] surface
-/// (rendered on the GUI Logs page) and reported to stderr at a bounded rate.
+/// (rendered on the GUI Logs page, which is the surface that always reaches the
+/// user) and reported to stderr at a bounded rate — a channel a launch with no
+/// console discards (see the `boot` module).
 /// No `tracing!` call is made from here — the writer task consumes the tracing
 /// channel, so tracing from inside it would recurse into itself.
 async fn flush_log_batch(store: &LogStore, batch: &mut Vec<LogEntry>) {
@@ -865,8 +868,10 @@ fn log_writer_panic_backoff(consecutive: u32) -> std::time::Duration {
     std::time::Duration::from_millis(ms.min(30_000))
 }
 
-/// Rate-limited stderr warning (stderr bypasses tracing, so this cannot
-/// recurse into the writer task).
+/// Rate-limited stderr warning. stderr is not routed through tracing, so this
+/// cannot recurse into the writer task — and it is best-effort delivery (see the
+/// `boot` module), which is why [`log_write_error_info`] is the surface a user can
+/// always read.
 fn emit_stderr_warning(count: u64, message: &str, kind: &str) {
     let now_ms = crate::util::unix_millis();
     let last_warn_ms = LOG_WRITE_LAST_STDERR_WARN_MS.load(Ordering::SeqCst);

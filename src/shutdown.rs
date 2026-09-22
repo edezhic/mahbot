@@ -149,9 +149,11 @@ pub(crate) async fn drain_wait() {
 ///
 /// Unix has two, on an async signal stream. Windows has three, from the console
 /// control handler below, and they are not the same request: only Ctrl+C is the
-/// platform's "wind down" gesture. A session end (log-off, shutdown, restart) is a stop
-/// request too, but not one of these and not a drain: it comes from the window listener
-/// ([`install_session_end_listener`]).
+/// platform's "wind down" gesture. A launch with no console — the windowed product's
+/// normal one — receives none of them: the platform delivers no console control event
+/// to a process that has no console (see the `console` module). A session end
+/// (log-off, shutdown, restart) is a stop request too, but not one of these and not a
+/// drain: it comes from the window listener ([`install_session_end_listener`]).
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StopRequest {
@@ -159,8 +161,9 @@ enum StopRequest {
     Interrupt,
     /// Ctrl+Break — terminates the process by default, with no timeout.
     Break,
-    /// The console window is closing; the task manager's "end task" raises the
-    /// same event. The platform kills the process when its grace elapses.
+    /// The console window is closing, so only a launch that has a console can receive
+    /// it; the task manager's "end task" raises the same event. The platform kills the
+    /// process when its grace elapses.
     ConsoleClose,
 }
 
@@ -333,7 +336,8 @@ fn stop_for_session_end(label: &'static str) {
 /// [`install_console_stop_handler`] (each event arrives on a fresh OS thread, so
 /// the handler queues it here and, for a closing console, holds that thread; the
 /// `console` module documents the platform rules and what start-up does before this
-/// loop exists). Ctrl+C is the drain request, a second Ctrl+C force-cancels, and
+/// loop exists — and why a launch with no console has no events to feed it). Ctrl+C
+/// is the drain request, a second Ctrl+C force-cancels, and
 /// Ctrl+Break and a console close are force-cancel class outright. The session end
 /// (log-off, shutdown, restart) is not a console event and does not come through here at
 /// all — it is force-cancel class on its own terms, in [`install_session_end_listener`].
@@ -402,8 +406,11 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
 ///
 /// Called from `main` before boot: the handler needs no runtime (it queues for the
 /// async protocol loop, see the `console` module), so the subscription is never
-/// what a stop request goes missing on. A registration failure is reported, never
-/// fatal: Ctrl+C then still stops the daemon through tokio's own handler.
+/// what a stop request goes missing on. A registration failure is reported where
+/// there is a console (see the `console` module) and never fails a launch — the
+/// fallback it costs is the tokio Ctrl+C handler, which (like this one) can only
+/// ever fire where a console exists to deliver the event, so a console-less launch
+/// loses nothing it had.
 pub fn install_console_stop_handler() {
     #[cfg(windows)]
     console::install();
@@ -421,7 +428,8 @@ pub fn install_session_end_listener() {
     session_end::install();
 }
 
-/// The Windows console control handler — the platform's stop-request source.
+/// The Windows console control handler — the platform's stop-request source
+/// wherever a console exists.
 ///
 /// Ctrl+C, Ctrl+Break and the console window closing arrive as console control
 /// events, each on a **new OS thread the system creates in this process**. That
@@ -492,13 +500,15 @@ pub fn install_session_end_listener() {
 /// # Remaining silent hard deaths
 ///
 /// Those the dead ends above name, plus a stop request that arrives with the handler
-/// unregistered (Ctrl+C alone still reaches tokio's handler then) and a console close
-/// during a start-up that never reached the loop — a console event has no consumer while
-/// that loop does not exist, and none is added for it. The dashboard's own window close
+/// unregistered, and a console close during a start-up that never reached the loop — a
+/// console event has no consumer while that loop does not exist, and none is added for
+/// it. Both of those are console events, so both need a launch that has a console to
+/// arise at all; there, and only there, Ctrl+C still reaches tokio's own handler, whose
+/// `ctrl_c()` is itself a `SetConsoleCtrlHandler` registration. The dashboard's own window close
 /// is not among them: the dashboard consumes it in every state, whether or not boot
 /// finished. A session end is not among them: it reaches the process through its own window
 /// whether or not this handler is registered — the instance a self-update leaves behind owns
-/// a windowless console that no window can close, but it owns a window just the same.
+/// no console at all, so no console close can reach it, but it owns a window just the same.
 #[cfg(windows)]
 mod console {
     use super::{DEFAULT_STOP_GRACE, StopRequest, record_stop_deadline};
@@ -510,7 +520,7 @@ mod console {
     use tokio::sync::Notify;
     use windows_sys::Win32::Foundation::{FALSE, TRUE};
     use windows_sys::Win32::System::Console::{
-        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler,
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, GetConsoleCP, SetConsoleCtrlHandler,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         SPI_GETHUNGAPPTIMEOUT, SystemParametersInfoW,
@@ -524,13 +534,29 @@ mod console {
     static QUEUED: Notify = Notify::const_new();
 
     /// Whether the handler is registered. The protocol loop falls back to tokio's
-    /// Ctrl+C when it is not, so a failed registration cannot cost the daemon a
-    /// stop request it had before.
+    /// Ctrl+C when it is not, so a failed registration cannot cost a launch that has a
+    /// console the stop request it had before; a launch without one receives no
+    /// console event either way, which is why the failure is not diagnosed there (see
+    /// [`attached_to_console`]). The handler is registered on every launch regardless
+    /// — it costs nothing, and a console-subsystem build (the binary's own test
+    /// harness) does have a console to serve.
     static INSTALLED: AtomicBool = AtomicBool::new(false);
 
     /// Whether the protocol loop has started, i.e. whether the queue has a consumer
     /// (see the module docs).
     static LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
+
+    /// Whether this process is attached to a console: without one the platform
+    /// delivers no console control event, so a registration that failed has
+    /// nothing to lose and is not worth a standing diagnostic.
+    fn attached_to_console() -> bool {
+        // SAFETY: `GetConsoleCP` only reads the calling process's console input
+        // code page. The platform documents zero as the failure value, not "no
+        // console"; a launch with no console is one of the ways it fails, and the
+        // consequence here is only whether a refused registration is worth a
+        // standing diagnostic line.
+        unsafe { GetConsoleCP() != 0 }
+    }
 
     /// Register the console control handler for this process.
     pub(super) fn install() {
@@ -540,13 +566,14 @@ mod console {
         // lifetime.
         let installed = unsafe { SetConsoleCtrlHandler(Some(handler), TRUE) != 0 };
         INSTALLED.store(installed, Ordering::SeqCst);
-        if !installed {
+        if !installed && attached_to_console() {
             // Through the boot diagnostic rather than `error!`: this runs before
             // boot opens the stores, so it reaches stderr now and the logs store
             // once tracing exists — where an `error!` would be dropped.
             crate::boot::boot_diagnostic(
-                "console control handler not registered — Ctrl+C still stops the daemon, but a \
-                 console close and Ctrl+Break will kill it without a shutdown"
+                "console control handler not registered — Ctrl+C still stops the daemon \
+                 through tokio's own handler; a console close and Ctrl+Break will kill \
+                 the process without a shutdown."
                     .to_string(),
             );
         }
@@ -587,11 +614,23 @@ mod console {
     ///
     /// With no handler registered, Ctrl+C through tokio's own handler is the only
     /// request source left — today's behaviour, kept so a failed registration cannot
-    /// cost the daemon the stop request it had. Its failure to subscribe is a real
-    /// error, so the caller's signal task reports it rather than inventing a request.
+    /// cost a launch that has a console the stop request it had. (tokio subscribes
+    /// through the same `SetConsoleCtrlHandler`, so this fallback reaches exactly the
+    /// launches the handler above would have.) Its failure to subscribe is a real
+    /// error, so the caller's signal task reports it rather than inventing a request
+    /// — except on a launch with no console, which can receive no console control
+    /// event at all and waits forever instead of subscribing.
     pub(super) async fn next_request() -> anyhow::Result<StopRequest> {
         LOOP_RUNNING.store(true, Ordering::SeqCst);
         if !INSTALLED.load(Ordering::SeqCst) {
+            if !attached_to_console() {
+                // A launch with no console receives no console event at all, so there is
+                // nothing to subscribe to: subscribing (tokio's `ctrl_c`) would only turn
+                // that into a standing `Signal handler failed to set up` error. The stop
+                // sources such a launch really has are the window and the session-end
+                // listener.
+                return std::future::pending().await;
+            }
             tokio::signal::ctrl_c().await?;
             return Ok(StopRequest::Interrupt);
         }

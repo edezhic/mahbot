@@ -1554,15 +1554,24 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
 /// On Unix: null stdin/stdout, stderr → update.log. On Windows: the same, plus
 /// `CREATE_NO_WINDOW`.
 ///
-/// `DETACHED_PROCESS` deliberately is *not* set. It would leave the instance with
-/// no console at all, and the platform then gives every console-subsystem child
-/// such a process starts without creation flags a brand-new **visible** console —
-/// exactly how the service ends up putting windows on the screen. (The
-/// `self-replace` crate's file-swap copy of our own binary is such a child, and it
-/// is not ours to flag.) `CREATE_NO_WINDOW` instead gives the instance a console
-/// with no window, which every process it starts in turn inherits. The instance is
-/// attached to that new console instead of inheriting the launching one, and
-/// stdin/stdout/stderr handling is unchanged.
+/// `CREATE_NO_WINDOW` is inert on this product's replacement instance: the binary
+/// is built windowed (its crate root declares `windows_subsystem = "windows"`), so
+/// the instance owns no console and the platform documents the flag as ignored for
+/// a non-console application. It stays because it remains correct for a
+/// console-subsystem build, and because the shell module's own spawn tripwire
+/// requires the flag at every production spawn site. Every child the service
+/// starts is flagged at that module's spawn sites, not here.
+///
+/// `DETACHED_PROCESS` is deliberately *not* set: the instance is this same windowed
+/// image, so there is no console for it to inherit and none would be created for it —
+/// the flag would change nothing. (A console-subsystem child started without creation
+/// flags from a console-less parent does get a console of its own; the shell module's
+/// spawn sites carry `CREATE_NO_WINDOW` to keep that one windowless, and
+/// `tools::shell::tree` names them.)
+///
+/// The null stdin/stdout and the stderr → update.log redirection still matter: on
+/// either platform update.log is a real file handle, so the replacement's printing
+/// works with no console in sight.
 ///
 /// On spawn failure the error is returned (no admin notification — the caller
 /// [`finalize_update_and_restart`] owns failure reporting); the process keeps

@@ -859,7 +859,7 @@ async fn periodic_checkpoint_inner<'a, Fut>(
     // (synchronously) before the drain, and the round's repair outcome has no say in
     // it. Nothing restarts the process after it and the app shows no reason of its
     // own for it, so this record and the log line below are the operator's only
-    // trace.
+    // trace. Filed once per condition ([`failure_record::record`]).
     let report = build_failure_report(name, &failures, repair.as_ref(), &window, conn).await;
     let pointer = failure_record::recorded_pointer(
         "checkpoint failure",
@@ -908,7 +908,8 @@ fn with_store_file_state(report: FailureReport, db_path: &Path) -> FailureReport
 }
 
 /// File one per-store runtime failure block under the store's own measured file
-/// ([`crate::db::failure_record::record_and_point`]).
+/// ([`crate::db::failure_record::record_and_point`]). Filed once per condition
+/// ([`failure_record::record`]).
 fn record_store_failure(
     kind: FailureKind,
     what: &str,
@@ -927,7 +928,8 @@ static INTEGRITY_FAILURE_ROUNDS: RoundCounter = RoundCounter::new();
 
 /// Record a failed periodic integrity check: the first failing round of a store
 /// files a [`FailureKind::RuntimeIntegrityFailure`] block, every further round
-/// only warns. No drain and no behaviour change otherwise.
+/// only warns. No drain and no behaviour change otherwise. Filed once per
+/// condition ([`failure_record::record`]).
 fn record_integrity_failure(
     name: &'static str,
     conn: &Connection,

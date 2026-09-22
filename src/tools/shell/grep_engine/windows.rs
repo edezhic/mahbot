@@ -48,7 +48,7 @@
 //!
 //! The parent's tracked cwd and the engine's own `current_dir()` both go
 //! through [`super::canonical_or_lexical`], so the cwd gate only then needs
-//! [`same_directory`]'s case/separator/verbatim-insensitive comparison rather
+//! [`same_spelling`]'s case/separator/verbatim-insensitive comparison rather
 //! than byte equality; the same canonicalization keeps displayed and operand
 //! paths in the platform's natural spelling (it strips the verbatim prefix).
 //!
@@ -142,7 +142,7 @@ fn flush(
 /// connector; the caller reads it through [`unquoted_semicolon`]. Blank lines
 /// and a trailing newline stay valid, exactly as in the unix segmenter.
 #[must_use]
-pub(super) fn segment_command(command: &str) -> Option<Vec<(String, String)>> {
+pub(in crate::tools::shell) fn segment_command(command: &str) -> Option<Vec<(String, String)>> {
     let chars: Vec<char> = command.chars().collect();
     let mut out: Vec<(String, String)> = Vec::new();
     let mut current = String::new();
@@ -264,7 +264,7 @@ fn strip_double_quotes(word: &str) -> Option<&str> {
 /// unbalanced `"`): the shell would re-read it, so no list may be matched
 /// against it.
 #[must_use]
-pub(super) fn verb_key(word: &str) -> Option<String> {
+pub(in crate::tools::shell) fn verb_key(word: &str) -> Option<String> {
     let word = strip_double_quotes(word)?;
     // Fold a `.exe` suffix in any case (`Grep.EXE`), one ASCII extension only.
     let bytes = word.as_bytes();
@@ -326,7 +326,7 @@ fn flush_token(raw: &mut String, value: &mut String, out: &mut Vec<GrepWord>) {
 /// expands `%…%` before the program sees its argv, so the caller fails
 /// closed on the whole member (see [`has_percent_expansion`]).
 #[must_use]
-pub(super) fn tokenize(segment: &str) -> Option<Vec<GrepWord>> {
+pub(in crate::tools::shell) fn tokenize(segment: &str) -> Option<Vec<GrepWord>> {
     let mut out = Vec::new();
     let mut raw = String::new();
     let mut value = String::new();
@@ -383,7 +383,7 @@ pub(super) fn has_glued_redirect(raw: &str) -> bool {
 /// other character literal — no expansion, no escape. Idempotent on the value
 /// [`tokenize`] produced, which is what the operand path passes here.
 #[must_use]
-pub(super) fn unquote_word(raw: &str) -> String {
+pub(in crate::tools::shell) fn unquote_word(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut in_double = false;
     let mut chars = raw.chars().peekable();
@@ -553,6 +553,14 @@ fn drive_anchor(pattern: &str) -> Option<&str> {
     Some(&pattern[..colon + 2])
 }
 
+/// True for a drive-relative spelling (`C:foo`): it names the cwd of ANOTHER
+/// drive, which nothing here keeps, so a caller must refuse it rather than resolve
+/// it against the cwd it happens to hold.
+#[must_use]
+pub(in crate::tools::shell) fn is_drive_relative(word: &str) -> bool {
+    drive_colon(word).is_some() && drive_anchor(word).is_none()
+}
+
 /// Split a glob pattern into its walk-root prefix and the components below it,
 /// at `\` and `/` boundaries. The prefix keeps the anchor Windows resolves
 /// first — a drive (`C:\`), a UNC server/share (`\\srv\share\`) or a rooted
@@ -564,7 +572,7 @@ fn drive_anchor(pattern: &str) -> Option<&str> {
 pub(super) fn split_components(pattern: &str) -> Option<(String, Vec<String>)> {
     // A drive-relative spelling (`C:foo`) names the cwd of ANOTHER drive: it has
     // no root to walk, so it is refused rather than resolved against this one.
-    if drive_colon(pattern).is_some() && drive_anchor(pattern).is_none() {
+    if is_drive_relative(pattern) {
         return None;
     }
     let (prefix, rest) = if pattern.starts_with("\\\\") || pattern.starts_with("//") {
@@ -629,23 +637,26 @@ pub(super) fn has_unquoted_glob(tok: &str) -> bool {
 /// default could enable it — accepted, it is the literal reading the agent
 /// wrote).
 #[must_use]
-pub(super) fn has_percent_expansion(word: &str) -> bool {
+pub(in crate::tools::shell) fn has_percent_expansion(word: &str) -> bool {
     word.matches('%').count() >= 2
 }
 
-/// Windows identity of two directories, for the engine's cwd gate: case,
-/// separator spelling and a verbatim prefix are all insignificant there, and
-/// cmd.exe's own cwd never spells a directory the way `fs::canonicalize` does.
-/// Byte equality is deliberately not the test.
+/// Windows identity of two paths — the engine's cwd gate reads *directories* with
+/// it and the runner reads whole file paths with it ([`plan`]'s
+/// `is_own_image_word`), which holds because the key is the entire spelling, not
+/// just its last component: case, separator spelling and a verbatim prefix are all
+/// insignificant — and so is a trailing separator, which is why a file path spelled
+/// with one compares equal to the same path without it. `cmd.exe` never spells a
+/// path the way `fs::canonicalize` does. Byte equality is deliberately not the test.
 #[must_use]
-pub(super) fn same_directory(a: &Path, b: &Path) -> bool {
-    dir_key(a) == dir_key(b)
+pub(in crate::tools::shell) fn same_spelling(a: &Path, b: &Path) -> bool {
+    spelling_key(a) == spelling_key(b)
 }
 
-/// [`same_directory`]'s comparison form: verbatim prefix stripped, `/` folded
+/// [`same_spelling`]'s comparison form: verbatim prefix stripped, `/` folded
 /// to `\`, trailing separators trimmed, lowercased. A root (`C:\`, `\`) keeps
 /// its separator — trimming it would compare equal to the drive-relative `C:`.
-fn dir_key(p: &Path) -> String {
+fn spelling_key(p: &Path) -> String {
     let stripped = crate::util::strip_verbatim_prefix(p);
     let folded = stripped.to_string_lossy().replace('/', "\\");
     let trimmed = folded.trim_end_matches('\\');
@@ -1135,18 +1146,18 @@ mod tests {
     }
 
     #[test]
-    fn same_directory_ignores_case_separators_and_the_verbatim_prefix() {
-        assert!(same_directory(Path::new(r"C:\ws"), Path::new(r"C:\WS\")));
-        assert!(same_directory(Path::new(r"C:\ws"), Path::new(r"\\?\C:\ws")));
-        assert!(same_directory(Path::new("C:/ws/"), Path::new(r"C:\ws")));
-        assert!(same_directory(
+    fn same_spelling_ignores_case_separators_and_the_verbatim_prefix() {
+        assert!(same_spelling(Path::new(r"C:\ws"), Path::new(r"C:\WS\")));
+        assert!(same_spelling(Path::new(r"C:\ws"), Path::new(r"\\?\C:\ws")));
+        assert!(same_spelling(Path::new("C:/ws/"), Path::new(r"C:\ws")));
+        assert!(same_spelling(
             Path::new(r"\\?\UNC\srv\share"),
             Path::new(r"\\SRV\Share")
         ));
-        assert!(!same_directory(Path::new(r"C:\ws\a"), Path::new(r"C:\ws")));
+        assert!(!same_spelling(Path::new(r"C:\ws\a"), Path::new(r"C:\ws")));
         // A drive root is not its drive-relative spelling.
-        assert!(!same_directory(Path::new(r"C:\"), Path::new("C:")));
-        assert!(same_directory(Path::new(r"C:\"), Path::new("C:/")));
+        assert!(!same_spelling(Path::new(r"C:\"), Path::new("C:")));
+        assert!(same_spelling(Path::new(r"C:\"), Path::new("C:/")));
     }
 
     #[test]

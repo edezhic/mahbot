@@ -2,10 +2,16 @@
 //! diagnostics emitted before the tracing layer exists. Diagnostics are written
 //! to stderr immediately (carrying a local-time timestamp for update.log
 //! forensics) and buffered for replay into the logs store once tracing is live,
-//! so they appear in the GUI boot log. A store that is not usable refuses the
-//! start before either store is opened; every store bring-up failure — the
-//! refusal, the locked-store case, and any other error — is also appended to the
-//! storage root's durable failure record (`<root>/error.log`), which is why
+//! so they appear in the GUI boot log.
+//!
+//! That stderr leg is best-effort, not a delivery guarantee: a launch the
+//! platform gave no standard streams prints into nothing, while one started from a
+//! console inherits its handles and prints there. A store that is not usable
+//! refuses the start before either store is opened, and what makes such a failure
+//! recoverable is the storage root's durable failure record
+//! (`<root>/error.log`): every store bring-up failure — the refusal, the
+//! locked-store case, and any other error — is appended there, once per condition
+//! however often the launch repeats (see [`failure_record::record`]), which is why
 //! [`record_startup_failure`] exists for the start-up steps outside this module.
 
 use std::path::Path;
@@ -23,9 +29,15 @@ static TRACING_INITIALIZED: std::sync::atomic::AtomicBool =
 /// Write a diagnostic line to stderr with a local-time timestamp prefix, so
 /// lines captured in update.log (the replacement daemon's stderr) are
 /// time-attributable during incident review.
+///
+/// The daemon's single stderr funnel: boot diagnostics, the failure record's
+/// stderr fallback, the log-store warnings and the panic hook all reach stderr
+/// through here. It prints through [`crate::util::print_stderr`], so a write that
+/// fails is discarded and a panic in a caller — the panic hook, whose own
+/// diagnostics come through here — cannot abort the process on its way out.
 pub(crate) fn timestamped_stderr(message: &str) {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    eprintln!("[mahbot] [{ts}] {message}");
+    crate::util::print_stderr(&format!("[mahbot] [{ts}] {message}"));
 }
 
 /// Record a boot-time diagnostic: stderr now, logs store after tracing init.
@@ -44,8 +56,12 @@ pub(crate) fn mark_tracing_initialized() {
 }
 
 /// Drop the pre-tracing buffer without replaying it. Called when
-/// `init_tracing` fails — the messages were already written to stderr, so
-/// nothing is lost; only the (failed) logs-store replay is skipped.
+/// `init_tracing` fails. The messages went to a best-effort channel that a launch
+/// given no standard streams loses (stderr, see the module header), so dropping
+/// the buffer loses nothing that was not already lost — only the (failed)
+/// logs-store replay is skipped. The failure itself is not left to that channel: the step
+/// that failed it records the durable `error.log` block like any other bring-up
+/// failure.
 pub(crate) fn clear_boot_diagnostics() {
     PRE_TRACING_DIAGNOSTICS.lock().unwrap_poison().clear();
 }
@@ -130,8 +146,8 @@ pub async fn open_stores() -> anyhow::Result<Arc<crate::logs::LogStore>> {
 /// boot-diagnostic channel (stderr now, logs store after tracing init). The
 /// stderr fallback already carries the full block, so a failed write adds
 /// nothing here.
-fn note_recorded(what: &str, path: Option<std::path::PathBuf>) {
-    if let Some(pointer) = failure_record::recorded_pointer(what, path) {
+fn note_recorded(what: &str, filed: Option<failure_record::Filed>) {
+    if let Some(pointer) = failure_record::recorded_pointer(what, filed) {
         boot_diagnostic(pointer);
     }
 }
@@ -140,7 +156,7 @@ fn note_recorded(what: &str, path: Option<std::path::PathBuf>) {
 /// (stderr now, logs store after tracing init) and the structured block in the
 /// storage root's ONE durable failure record (`<root>/error.log`, the shared
 /// writer) — plus a diagnostic line pointing the operator at the file it landed
-/// in when the write succeeded.
+/// in when the write succeeded. Filed once per condition ([`failure_record::record`]).
 fn record_refusal(root: &Path, refusal: &crate::db::StoreRefusal) {
     boot_diagnostic(refusal.to_string());
     note_recorded(
@@ -161,7 +177,8 @@ fn record_refusal(root: &Path, refusal: &crate::db::StoreRefusal) {
 /// store locked by another process is recorded as an environment-caused
 /// refusal; every other bring-up error is a start-up failure naming the store
 /// and its path, with the environment note when the cause is an external
-/// condition rather than store damage.
+/// condition rather than store damage. Filed once per condition
+/// ([`failure_record::record`]).
 fn record_bring_up_failure(root: &Path, store: &'static str, e: anyhow::Error) -> anyhow::Error {
     if let Some(refusal) = e
         .chain()
@@ -198,25 +215,71 @@ fn record_bring_up_failure(root: &Path, store: &'static str, e: anyhow::Error) -
 
 /// Record a start-up failure that is not a store bring-up error (a config load,
 /// a provider or another global init) and return `e` unchanged — the returned
-/// error is what the start-failure screen shows, while the record's reason is
-/// prefixed with `context`, so the two texts are not identical by construction.
+/// error is what the start-failure screen shows, while the record names `context`
+/// as the failing step, so the two texts are not identical by construction.
 /// Callers that need the screen to carry a prefix must put it in the error they
 /// pass (see the panic arm in the binary).
 ///
 /// The storage root is resolved best-effort; when it is not resolved yet (a
 /// failure before config init) or cannot be written, [`failure_record::record`]
-/// puts the full block on stderr instead.
+/// puts the full block on stderr instead — the best-effort channel the module
+/// header names.
 ///
 /// Public (and hidden from the library's docs) for the binary's pre-store boot
 /// steps, the sibling of [`open_stores`].
 #[must_use]
 #[doc(hidden)]
 pub fn record_startup_failure(context: &str, e: anyhow::Error) -> anyhow::Error {
-    record_startup_failure_at(
-        crate::config::CONFIG.try_storage_root().as_deref(),
-        context,
-        e,
+    let block = start_up_block(context, &e);
+    note_recorded(
+        "start-up failure",
+        failure_record::record(crate::config::CONFIG.try_storage_root().as_deref(), &block),
+    );
+    e
+}
+
+/// Record a start-up failure under an explicitly given storage root and return the
+/// error unchanged.
+///
+/// The binary's own pre-boot steps hold that root themselves: they run before
+/// `config::load_or_init()` sets the process-global one
+/// ([`record_startup_failure`] resolves), and the failure is filed in the durable
+/// record under the root they already resolved (`error.log`) rather than on the
+/// channel the module header calls best-effort. The error text is returned
+/// unchanged so the caller's own report is unaffected.
+///
+/// The write is filed once per condition ([`failure_record::record`]): a launch
+/// failure whose condition — the step and the cause class — the record already holds
+/// is not appended again, so a double-launch refused again and again does not grow
+/// the file.
+///
+/// Public (and hidden from the library's docs) for the binary, like
+/// [`record_startup_failure`].
+#[must_use]
+#[doc(hidden)]
+pub fn record_launch_failure(root: &Path, context: &str, e: anyhow::Error) -> anyhow::Error {
+    let block = start_up_block(context, &e);
+    note_recorded(
+        "start-up failure",
+        failure_record::record(Some(root), &block),
+    );
+    e
+}
+
+/// The durable block one start-up failure renders to, ready for
+/// [`failure_record::record`]: the failing step as its own line and the reason as
+/// the error chain alone — so the step is identity (see [`failure_record`]'s
+/// condition rule) rather than a prefix of a reason that two occurrences may word
+/// differently.
+fn start_up_block(context: &str, e: &anyhow::Error) -> String {
+    failure_record::start_up_report(
+        FailureKind::StartUpFailure,
+        None,
+        format!("{e:#}"),
+        crate::db::is_actionable_signal(e),
     )
+    .step(context)
+    .render()
 }
 
 /// The error a panic of the boot sequence is recorded and shown as: the panic
@@ -227,27 +290,6 @@ pub fn record_startup_failure(context: &str, e: anyhow::Error) -> anyhow::Error 
 #[doc(hidden)]
 pub fn startup_panic_error(message: &str) -> anyhow::Error {
     anyhow::anyhow!("Startup panicked: {message}")
-}
-
-/// [`record_startup_failure`] with an explicit storage root (the injectable
-/// seam: the production root is the process-global one).
-#[must_use]
-fn record_startup_failure_at(
-    root: Option<&Path>,
-    context: &str,
-    e: anyhow::Error,
-) -> anyhow::Error {
-    let report = failure_record::start_up_report(
-        FailureKind::StartUpFailure,
-        None,
-        format!("{context}: {e:#}"),
-        crate::db::is_actionable_signal(&e),
-    );
-    note_recorded(
-        "start-up failure",
-        failure_record::record(root, &report.render()),
-    );
-    e
 }
 
 #[cfg(test)]
@@ -366,13 +408,14 @@ mod tests {
     }
 
     /// The start-up-failure writer (config, providers, the process-global
-    /// inits) files a block naming the step and the reason, and passes the error
-    /// through unchanged.
+    /// inits) files a block naming the step on its own line and the reason as the
+    /// error chain, and passes the error through unchanged. Driven through the
+    /// root-explicit launch seam the binary uses for its pre-boot steps.
     #[test]
     fn non_store_startup_failure_is_recorded() {
         let tmp = tempfile::TempDir::new().expect("temp dir for test");
-        let passed = record_startup_failure_at(
-            Some(tmp.path()),
+        let passed = record_launch_failure(
+            tmp.path(),
             "providers::init_global",
             anyhow::anyhow!("no provider credential"),
         );
@@ -381,9 +424,10 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("error.log")).expect("error.log written");
         for needle in [
             "MahBot start-up failure",
-            failure_record::UNKNOWN_STORE,
-            failure_record::UNKNOWN_DB_PATH,
-            "reason: providers::init_global: no provider credential",
+            failure_record::NO_STORE,
+            failure_record::NO_DB_PATH,
+            "step: providers::init_global",
+            "reason: no provider credential",
         ] {
             assert!(
                 body.contains(needle),
@@ -394,12 +438,12 @@ mod tests {
 
     /// The boot-panic path's screen text: the panic summary stays qualified as
     /// such (the start-failure screen renders the returned error verbatim), and
-    /// the record's reason carries that same sentence under the step context.
+    /// the record carries the step on its own line and that same sentence as the
+    /// reason.
     #[test]
     fn startup_panic_keeps_its_qualifier() {
         let tmp = tempfile::TempDir::new().expect("temp dir for test");
-        let returned =
-            record_startup_failure_at(Some(tmp.path()), "bootstrap", startup_panic_error("boom"));
+        let returned = record_launch_failure(tmp.path(), "bootstrap", startup_panic_error("boom"));
         assert_eq!(
             format!("{returned:#}"),
             "Startup panicked: boom",
@@ -408,8 +452,8 @@ mod tests {
         let body =
             std::fs::read_to_string(tmp.path().join("error.log")).expect("error.log written");
         assert!(
-            body.contains("reason: bootstrap: Startup panicked: boom"),
-            "the record keeps the same sentence under the step context: {body}"
+            body.contains("step: bootstrap") && body.contains("reason: Startup panicked: boom"),
+            "the record names the step and keeps the panic sentence as the reason: {body}"
         );
     }
 }

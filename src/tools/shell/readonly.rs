@@ -1390,7 +1390,7 @@ fn validate_file_redirect<'a>(
 /// `NUL` family on Windows — `/dev/null` is an ordinary path under cmd.exe.
 fn is_null_target(target: &str, state: &ValidationState) -> bool {
     if state.ctx.platform == ShellPlatform::Windows {
-        windows::is_null_device(target)
+        scan::is_null_device(target)
     } else {
         target == "/dev/null"
     }

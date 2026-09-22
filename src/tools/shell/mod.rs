@@ -1,6 +1,7 @@
 use crate::{Tool, Workspace};
 use async_trait::async_trait;
 use directories::UserDirs;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use regex::RegexSet;
 use serde_json::json;
 use std::collections::HashSet;
@@ -20,6 +21,7 @@ use crate::util::strip_ansi_escapes;
 mod bg;
 pub(crate) mod grep_engine;
 mod mem;
+mod plan;
 mod profiles;
 mod readonly;
 mod scan;
@@ -124,7 +126,8 @@ const DRAIN_CANCEL_GRACE: Duration = Duration::from_secs(2);
 /// each process in it. A run always takes at least one sample: the interval's
 /// first tick is immediate.
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
-/// Cap bytes collected from each pipe during command execution (including timeouts).
+/// Cap bytes collected from a run's pipes during command execution (including
+/// timeouts): what each stream of a run's capture gets ([`CaptureBudget`]).
 ///
 /// # Truncation safety
 ///
@@ -335,16 +338,146 @@ enum WaitOutcome {
     MemoryExceeded { used: u64, limit: u64 },
 }
 
-/// Read from an async stream up to `cap` bytes, then continue reading and
-/// discarding any remaining data to drain the pipe (preventing back-pressure
-/// on the child process from a full pipe buffer).
+/// One memory sample that crossed the ceiling: what it measured and the ceiling.
+struct MemorySample {
+    used: u64,
+    limit: u64,
+}
+
+/// The bounds every runner watches over the command tree it spawned: one
+/// deadline, one memory cadence, and the warn-once flag for a watchdog that
+/// cannot measure. Shared by [`run_command_with_timeout`] and the plan runner
+/// ([`plan::run`]) so the two cannot drift on the bounds they enforce.
+struct Watchdog {
+    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+    sample: tokio::time::Interval,
+    measure_failed: bool,
+}
+
+impl Watchdog {
+    /// `timeout` is the run's whole-run deadline; the memory cadence is
+    /// [`MEMORY_SAMPLE_INTERVAL`] for every run.
+    pub(in crate::tools::shell) fn new(timeout: Duration) -> Self {
+        let mut sample = tokio::time::interval(MEMORY_SAMPLE_INTERVAL);
+        sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self {
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+            sample,
+            measure_failed: false,
+        }
+    }
+
+    /// Sample the trees of the run's live members (`pids`, empty for a reaped
+    /// one) and report the first total over `limit`.
+    ///
+    /// A run with no live pid has nothing to sample: that is not a failure to
+    /// measure, so it is silent. Fail open, loudly once: a watchdog that killed
+    /// a command it could not measure would be worse than the unbounded command
+    /// it exists to stop. A pid that does not answer is left out of the sum
+    /// rather than failing the whole sample — the run's next cadence reads it
+    /// again if it is still there — so the warning stands for a tree nothing
+    /// could be read from at all. It names the first pid, one process: the
+    /// field's shape for the single-child run as well.
+    pub(in crate::tools::shell) fn measure(
+        &mut self,
+        pids: &[u32],
+        limit: u64,
+    ) -> Option<MemorySample> {
+        if pids.is_empty() {
+            return None;
+        }
+        let mut used = 0_u64;
+        let mut measured = false;
+        for pid in pids {
+            if let Some(rss) = mem::tree_rss(*pid) {
+                measured = true;
+                used = used.saturating_add(rss);
+            }
+        }
+        if !measured {
+            if !self.measure_failed {
+                self.measure_failed = true;
+                tracing::warn!(
+                    pid = pids[0],
+                    "memory watchdog cannot measure the command's tree; the run continues \
+                     without a memory bound"
+                );
+            }
+            return None;
+        }
+        (used > limit).then_some(MemorySample { used, limit })
+    }
+}
+
+/// The three standard streams of a run: what a member's redirect spelling names,
+/// and what [`AppliedRedirects::streams`] reports back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+/// How many bytes one stream of a run's capture may keep.
+///
+/// Every runner gives each stream a budget of its own — the cap each pipe was
+/// always read up to ([`SHELL_PIPE_READ_CAP`]): the single-child runner one per
+/// pipe it reads, a plan one per *stream*, shared by every member that writes it
+/// ([`plan`]), because a plan's stdout is one stream where the shell's was one pipe
+/// and a member's stderr one channel however many members filled it. A member that
+/// floods stdout therefore cannot truncate a later member's stderr, and per-member
+/// budgets would keep more than the shell ever did — the unsafe direction.
+///
+/// The budget is drawn on by the readers of its stream, which run concurrently, so
+/// the split between two of them is decided by which reads first; what is guaranteed
+/// is the total (the cap), which is the truncation-safety property
+/// [`SHELL_PIPE_READ_CAP`] documents.
+#[derive(Clone)]
+struct CaptureBudget(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl CaptureBudget {
+    fn new(cap: usize) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+            cap,
+        )))
+    }
+
+    /// Charge `bytes` kept bytes against the budget, returning how many the
+    /// reader may keep: a reader that finds the budget spent keeps nothing, and
+    /// keeps reading (a full pipe must never stall the member it belongs to —
+    /// the cap is a capture bound, never back-pressure).
+    fn claim(&self, bytes: usize) -> usize {
+        use std::sync::atomic::Ordering;
+
+        let mut remaining = self.0.load(Ordering::Relaxed);
+        loop {
+            let take = bytes.min(remaining);
+            if take == 0 {
+                return 0;
+            }
+            match self.0.compare_exchange_weak(
+                remaining,
+                remaining - take,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return take,
+                Err(actual) => remaining = actual,
+            }
+        }
+    }
+}
+
+/// Read from an async stream up to what `budget` still allows, then continue
+/// reading and discarding any remaining data to drain the pipe (preventing
+/// back-pressure on the child process from a full pipe buffer).
 ///
 /// Stops early when `cancel` is signalled, returning whatever has been read
 /// so far. This allows the timeout path to collect partial output even when
 /// grandchild processes inherited the pipe write end and prevent EOF.
 async fn read_stream_limited(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
-    cap: usize,
+    budget: &CaptureBudget,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Vec<u8> {
     use tokio::io::AsyncReadExt;
@@ -352,24 +485,18 @@ async fn read_stream_limited(
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
-        let to_read = if buf.len() >= cap {
-            chunk.len() // drain mode — read and discard to prevent back-pressure
-        } else {
-            (cap - buf.len()).min(chunk.len())
-        };
-
         tokio::select! {
             biased;
-            result = reader.read(&mut chunk[..to_read]) => {
+            result = reader.read(&mut chunk) => {
                 match result {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if buf.len() < cap {
-                            let take = n.min(cap - buf.len());
-                            buf.extend_from_slice(&chunk[..take]);
-                        }
-                        // In drain mode (buf.len() >= cap): chunk data is discarded
-                        // to prevent the child from blocking on a full pipe buffer.
+                        // Whatever the budget still allows is kept; the rest is
+                        // read and discarded, so a spent budget never stops the
+                        // member from writing (the drain half of the original
+                        // per-pipe cap).
+                        let keep = budget.claim(n);
+                        buf.extend_from_slice(&chunk[..keep]);
                     }
                 }
             }
@@ -384,12 +511,159 @@ async fn read_stream_limited(
 /// whatever data has been buffered so far.
 fn spawn_pipe_reader(
     pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    budget: CaptureBudget,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<Vec<u8>> {
     tokio::spawn(async move {
         let mut pipe = pipe;
-        read_stream_limited(&mut pipe, SHELL_PIPE_READ_CAP, cancel).await
+        read_stream_limited(&mut pipe, &budget, cancel).await
     })
+}
+
+/// One capture reader of a run: what it fills, and the reading task or its
+/// output once it finished. A completed [`tokio::task::JoinHandle`] must never be
+/// awaited again (tokio panics on a re-poll), so its bytes are kept in its place.
+struct Reader {
+    stream: Captured,
+    task: ReaderTask,
+}
+
+/// The two streams a run captures. A reader exists for each of a run's output
+/// streams and for nothing else: a member's stdin is never a capture pipe, so the
+/// plumbing cannot name it, and what each reader fills is decided by this — the
+/// label a stalled reader warns with included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Captured {
+    Stdout,
+    Stderr,
+}
+
+impl Captured {
+    fn label(self) -> &'static str {
+        match self {
+            Captured::Stdout => "stdout",
+            Captured::Stderr => "stderr",
+        }
+    }
+}
+
+enum ReaderTask {
+    Reading(tokio::task::JoinHandle<Vec<u8>>),
+    Done(Vec<u8>),
+}
+
+/// The capture readers of one run, in the order their bytes belong in the run's
+/// output.
+///
+/// One home for the two things every run shape does with them: drain them under
+/// the output bound ([`Readers::drain`]) and collect what they hold
+/// ([`Readers::collect`]). The single-child runner has one reader per stream; the
+/// plan runner one per captured member stream ([`plan`]), all those of one stream
+/// charged to that stream's budget.
+#[derive(Default)]
+struct Readers {
+    readers: Vec<Reader>,
+}
+
+impl Readers {
+    /// Start a reader for one captured output stream of one member.
+    fn push(
+        &mut self,
+        stream: Captured,
+        pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+        budget: CaptureBudget,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        self.readers.push(Reader {
+            stream,
+            task: ReaderTask::Reading(spawn_pipe_reader(pipe, budget, cancel)),
+        });
+    }
+
+    /// Drain every reader within `drain_limit`, taking the bytes of each that
+    /// finishes in time. `true` when they all did — the run's output is complete;
+    /// `false` when the bound expired with a reader still pending, which means a
+    /// leftover process still holds a capture pipe open. The caller then ends the
+    /// run and calls [`Readers::collect`] for what the readers hold.
+    async fn drain(&mut self, drain_limit: Duration) -> bool {
+        let limit = tokio::time::sleep(drain_limit);
+        tokio::pin!(limit);
+        loop {
+            if self
+                .readers
+                .iter()
+                .all(|reader| matches!(reader.task, ReaderTask::Done(_)))
+            {
+                return true;
+            }
+            // One poll of the reading handles per round: `pending` borrows them,
+            // so the round's outcome is stored only after it is dropped.
+            let finished = {
+                let mut pending = FuturesUnordered::new();
+                for (index, reader) in self.readers.iter_mut().enumerate() {
+                    if let ReaderTask::Reading(handle) = &mut reader.task {
+                        pending.push(async move { (index, handle.await) });
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    next = pending.next() => next,
+                    () = &mut limit => None,
+                }
+            };
+            let Some((index, result)) = finished else {
+                return false;
+            };
+            self.readers[index].store(result);
+        }
+    }
+
+    /// The run's output: every reader's bytes, in the order the readers were
+    /// created. A reader that has not finished is given the cancellation grace
+    /// ([`DRAIN_CANCEL_GRACE`]): the run's processes are gone by the time this is
+    /// called, so the bound is for whatever leftover holder still has a pipe.
+    async fn collect(&mut self) -> (Vec<u8>, Vec<u8>) {
+        let collected =
+            futures_util::future::join_all(self.readers.iter_mut().map(Reader::finish)).await;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        for (reader, bytes) in self.readers.iter().zip(collected) {
+            match reader.stream {
+                Captured::Stdout => stdout.extend_from_slice(&bytes),
+                Captured::Stderr => stderr.extend_from_slice(&bytes),
+            }
+        }
+        (stdout, stderr)
+    }
+}
+
+impl Reader {
+    /// Fold a finished task's result in: the reader is done, and its bytes are
+    /// kept where the handle was.
+    fn store(&mut self, result: std::result::Result<Vec<u8>, tokio::task::JoinError>) {
+        let bytes = result.unwrap_or_else(|e| {
+            tracing::warn!(%e, "{} reader task panicked", self.stream.label());
+            Vec::new()
+        });
+        self.task = ReaderTask::Done(bytes);
+    }
+
+    /// Take whatever the reader holds — its bytes when it already finished, else
+    /// the cancellation grace for one whose pipe a leftover process still keeps
+    /// open.
+    async fn finish(&mut self) -> Vec<u8> {
+        match std::mem::replace(&mut self.task, ReaderTask::Done(Vec::new())) {
+            ReaderTask::Done(bytes) => bytes,
+            ReaderTask::Reading(handle) => {
+                await_pipe_reader_with_cancellation_timeout(
+                    handle,
+                    self.stream.label(),
+                    DRAIN_CANCEL_GRACE,
+                )
+                .await
+            }
+        }
+    }
 }
 
 /// Await a pipe reader task with a grace timeout, used after killing a child
@@ -410,23 +684,6 @@ async fn await_pipe_reader_with_cancellation_timeout(
             );
             Vec::new()
         })
-}
-
-/// Finish a pipe reader after a drain timeout: an already-completed reader
-/// (its output is `Some`) keeps its data — never re-awaited, tokio panics on
-/// JoinHandle re-poll — while a still-pending one gets the cancellation grace
-/// bound.
-async fn finish_partial_reader(
-    partial: Option<Vec<u8>>,
-    handle: tokio::task::JoinHandle<Vec<u8>>,
-    label: &str,
-) -> Vec<u8> {
-    match partial {
-        Some(data) => data,
-        None => {
-            await_pipe_reader_with_cancellation_timeout(handle, label, DRAIN_CANCEL_GRACE).await
-        }
-    }
 }
 
 /// Output-drain bound for [`run_command_with_timeout`]: after the main command
@@ -566,19 +823,33 @@ fn engine_failure(
 
 /// The engine's own short account of a failure it reported: the detail it wrote
 /// after the refusal marker, which it emits first — so this is the engine's own
-/// line and never a served member's stderr earlier in the stream — else the
-/// run's first non-blank line (a stale binary's lock message), else a generic
-/// cause for a failure that carried none. Trimmed and length-capped;
+/// line and never a served member's stderr earlier in the stream — else the line
+/// carrying the stale-binary lock message
+/// ([`grep_engine::STALE_BINARY_LOCK_MSG`]), else the run's first non-blank line,
+/// else a generic cause for a failure that carried none. Trimmed and length-capped;
 /// [`grep_engine::unserved_failure`] renders the agent-facing message from it.
+///
+/// The lock message is looked up by its text rather than taken as the first line,
+/// because it is not always the first: a launch that meets the instance lock files
+/// its durable record before it prints the lock error, so the failure-record
+/// pointer ([`crate::boot::record_launch_failure`]'s) comes first. An own-image
+/// member whose command word is outside the hidden subcommands (`mahbot version`)
+/// is a launch like any other and prints both to the same stderr this reads.
 fn engine_cause(text: &str, marked: bool) -> String {
-    let mut lines = text.lines().map(str::trim);
+    // The marked branch is one forward scan; only the two-scan branch below needs
+    // the lines materialised.
     let detail = if marked {
-        lines
-            .by_ref()
+        text.lines()
+            .map(str::trim)
             .skip_while(|line| *line != grep_engine::ENGINE_REFUSAL_MARKER)
             .nth(1)
     } else {
-        lines.find(|line| !line.is_empty())
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        lines
+            .iter()
+            .find(|line| line.contains(grep_engine::STALE_BINARY_LOCK_MSG))
+            .or_else(|| lines.iter().find(|line| !line.is_empty()))
+            .copied()
     };
     detail.map_or_else(
         || "engine could not serve the search".to_string(),
@@ -622,57 +893,6 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Result of draining both pipe readers within a bound.
-enum DrainOutcome {
-    /// Both readers hit EOF within the bound — full output.
-    Both(Vec<u8>, Vec<u8>),
-    /// The bound was exceeded (a leftover process holds a pipe open): each
-    /// field is `Some` only when that reader already completed. The caller
-    /// must not re-await a completed handle (tokio panics on re-poll); only
-    /// the `None` side is still pending.
-    Partial {
-        stdout: Option<Vec<u8>>,
-        stderr: Option<Vec<u8>>,
-    },
-}
-
-/// Drain both pipe readers with a bound — see [`DrainOutcome`].
-async fn drain_pipe_readers(
-    mut stdout_handle: &mut tokio::task::JoinHandle<Vec<u8>>,
-    mut stderr_handle: &mut tokio::task::JoinHandle<Vec<u8>>,
-    drain_limit: Duration,
-) -> DrainOutcome {
-    let drain = tokio::time::sleep(drain_limit);
-    tokio::pin!(drain);
-    let mut stdout_done = None;
-    let mut stderr_done = None;
-    loop {
-        tokio::select! {
-            biased;
-            r = &mut stdout_handle, if stdout_done.is_none() => {
-                stdout_done = Some(r.unwrap_or_else(|e| {
-                    tracing::warn!(%e, "stdout reader task panicked");
-                    Vec::new()
-                }));
-            }
-            r = &mut stderr_handle, if stderr_done.is_none() => {
-                stderr_done = Some(r.unwrap_or_else(|e| {
-                    tracing::warn!(%e, "stderr reader task panicked");
-                    Vec::new()
-                }));
-            }
-            () = &mut drain => break,
-        }
-        if stdout_done.is_some() && stderr_done.is_some() {
-            break;
-        }
-    }
-    match (stdout_done, stderr_done) {
-        (Some(stdout), Some(stderr)) => DrainOutcome::Both(stdout, stderr),
-        (stdout, stderr) => DrainOutcome::Partial { stdout, stderr },
-    }
-}
-
 /// Spawn `cmd`, read stdout/stderr concurrently, and enforce `timeout`.
 /// After the main process exits, remaining output must drain within
 /// `drain_limit` — a leftover backgrounded process holding the pipes open
@@ -685,7 +905,8 @@ async fn drain_pipe_readers(
 ///
 /// `owner` decides the run's whole-tree containment ([`tree`]): unix contains
 /// every run the same way — the process group the child leads — while Windows
-/// gives a job object only to an agent's run.
+/// gives a job object only to an agent's run. A plan run's members get the same
+/// containment through [`plan::run`], which spawns them the same way.
 async fn run_command_with_timeout(
     cmd: &mut tokio::process::Command,
     timeout: Duration,
@@ -721,8 +942,22 @@ async fn run_command_with_timeout(
     let stderr_pipe = child.stderr.take().expect("stderr piped");
 
     let cancel = tokio_util::sync::CancellationToken::new();
-    let mut stdout_handle = spawn_pipe_reader(stdout_pipe, cancel.clone());
-    let mut stderr_handle = spawn_pipe_reader(stderr_pipe, cancel.clone());
+    // One budget per stream here: each pipe is read up to `SHELL_PIPE_READ_CAP`,
+    // the cap it always had — the split a plan run gives its two streams too
+    // ([`CaptureBudget`]).
+    let mut readers = Readers::default();
+    readers.push(
+        Captured::Stdout,
+        stdout_pipe,
+        CaptureBudget::new(SHELL_PIPE_READ_CAP),
+        cancel.clone(),
+    );
+    readers.push(
+        Captured::Stderr,
+        stderr_pipe,
+        CaptureBudget::new(SHELL_PIPE_READ_CAP),
+        cancel.clone(),
+    );
 
     match await_run_end(&mut child, timeout, memory_limit, pid).await {
         WaitOutcome::Exited(Ok(status)) => {
@@ -733,54 +968,42 @@ async fn run_command_with_timeout(
             // Child exited naturally — drain remaining output with a bound.
             // A leftover backgrounded process that inherited the pipes prevents
             // EOF; without the bound the drain would hang the tool forever.
-            match drain_pipe_readers(&mut stdout_handle, &mut stderr_handle, drain_limit).await {
-                DrainOutcome::Both(stdout, stderr) => {
-                    // The run ended on its own — not a stop, so nothing is killed
-                    // here and the job is kept rather than closed (`tree`).
-                    tree.retain_after_completion();
-                    ShellRunResult::Completed {
-                        stdout,
-                        stderr,
-                        status,
-                        elapsed: start.elapsed(),
-                    }
+            if readers.drain(drain_limit).await {
+                // The run ended on its own — not a stop, so nothing is killed
+                // here and the job is kept rather than closed (`tree`).
+                tree.retain_after_completion();
+                let (stdout, stderr) = readers.collect().await;
+                ShellRunResult::Completed {
+                    stdout,
+                    stderr,
+                    status,
+                    elapsed: start.elapsed(),
                 }
-                DrainOutcome::Partial { stdout, stderr } => {
-                    // Drain bound exceeded: a leftover process still holds the
-                    // pipes. End the tree the run is contained in — the process
-                    // group on unix, the job on Windows — mirroring the timeout
-                    // path, then cancel the readers and collect partial output so
-                    // the caller gets a visible, recoverable error instead of
-                    // a hang. Readers that already completed keep their output
-                    // (a completed JoinHandle must not be re-awaited).
-                    let ended = tree.terminate();
-                    cancel.cancel();
-                    let (stdout, stderr) = tokio::join!(
-                        finish_partial_reader(stdout, stdout_handle, "stdout"),
-                        finish_partial_reader(stderr, stderr_handle, "stderr"),
-                    );
-                    ShellRunResult::DrainTimedOut {
-                        stdout,
-                        stderr,
-                        // Named as killed only when the tree really was ended (see
-                        // the variant).
-                        pid: pid.filter(|_| ended),
-                        elapsed: start.elapsed(),
-                    }
+            } else {
+                // Drain bound exceeded: a leftover process still holds the
+                // pipes. End the tree the run is contained in — the process
+                // group on unix, the job on Windows — mirroring the timeout
+                // path, then cancel the readers and collect partial output so
+                // the caller gets a visible, recoverable error instead of
+                // a hang. Readers that already completed keep their output
+                // (a completed JoinHandle must not be re-awaited).
+                let ended = tree.terminate();
+                cancel.cancel();
+                let (stdout, stderr) = readers.collect().await;
+                ShellRunResult::DrainTimedOut {
+                    stdout,
+                    stderr,
+                    // Named as killed only when the tree really was ended (see
+                    // the variant).
+                    pid: pid.filter(|_| ended),
+                    elapsed: start.elapsed(),
                 }
             }
         }
         WaitOutcome::Exited(Err(e)) => ShellRunResult::SpawnFailed(e),
         WaitOutcome::TimedOut => {
-            let (stdout, stderr) = stop_and_collect(
-                &mut child,
-                &tree,
-                &mut kill_guard,
-                &cancel,
-                stdout_handle,
-                stderr_handle,
-            )
-            .await;
+            let (stdout, stderr) =
+                stop_and_collect(&mut child, &tree, &mut kill_guard, &cancel, &mut readers).await;
             ShellRunResult::TimedOut {
                 stdout,
                 stderr,
@@ -789,15 +1012,8 @@ async fn run_command_with_timeout(
             }
         }
         WaitOutcome::MemoryExceeded { used, limit } => {
-            let (stdout, stderr) = stop_and_collect(
-                &mut child,
-                &tree,
-                &mut kill_guard,
-                &cancel,
-                stdout_handle,
-                stderr_handle,
-            )
-            .await;
+            let (stdout, stderr) =
+                stop_and_collect(&mut child, &tree, &mut kill_guard, &cancel, &mut readers).await;
             ShellRunResult::MemoryExceeded {
                 stdout,
                 stderr,
@@ -823,35 +1039,20 @@ async fn await_run_end(
 ) -> WaitOutcome {
     let wait = child.wait();
     tokio::pin!(wait);
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-    let mut sample = tokio::time::interval(MEMORY_SAMPLE_INTERVAL);
-    sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut measure_failed = false;
+    let mut watchdog = Watchdog::new(timeout);
     loop {
         tokio::select! {
             biased;
             status = &mut wait => return WaitOutcome::Exited(status),
-            () = &mut deadline => return WaitOutcome::TimedOut,
-            _ = sample.tick() => {
-                if let (Some(limit), Some(pid)) = (memory_limit, pid) {
-                    match mem::tree_rss(pid) {
-                        Some(used) if used > limit => {
-                            return WaitOutcome::MemoryExceeded { used, limit };
-                        }
-                        // Fail open, loudly once: a watchdog that killed a
-                        // command it could not measure would be worse than the
-                        // unbounded command it exists to stop.
-                        None if !measure_failed => {
-                            measure_failed = true;
-                            tracing::warn!(
-                                ?pid,
-                                "memory watchdog cannot measure the command's tree; \
-                                 the run continues without a memory bound"
-                            );
-                        }
-                        Some(_) | None => {}
-                    }
+            () = &mut watchdog.deadline => return WaitOutcome::TimedOut,
+            _ = watchdog.sample.tick() => {
+                if let Some(limit) = memory_limit
+                    && let Some(sample) = watchdog.measure(pid.as_slice(), limit)
+                {
+                    return WaitOutcome::MemoryExceeded {
+                        used: sample.used,
+                        limit: sample.limit,
+                    };
                 }
             }
         }
@@ -868,14 +1069,14 @@ async fn await_run_end(
 /// be reused before the group it leads could be signalled (`process_group(0)`
 /// in [`build_shell_command`]). On Windows the direct kill is the fallback for
 /// a run whose containment could not be established (see `tree`) and for a job
-/// termination that failed.
+/// termination that failed. The plan runner's stop path does the same for each
+/// of its members ([`plan::run`]'s `end_group`).
 async fn stop_and_collect(
     child: &mut tokio::process::Child,
     tree: &Tree,
     kill_guard: &mut KillOnDrop,
     cancel: &tokio_util::sync::CancellationToken,
-    stdout_handle: tokio::task::JoinHandle<Vec<u8>>,
-    stderr_handle: tokio::task::JoinHandle<Vec<u8>>,
+    readers: &mut Readers,
 ) -> (Vec<u8>, Vec<u8>) {
     let _ = child.start_kill();
     tree.terminate();
@@ -885,16 +1086,10 @@ async fn stop_and_collect(
     cancel.cancel();
 
     // Give readers a grace window to notice cancellation and return their
-    // buffers. If a reader takes longer than 2 s (e.g. because a grandchild
+    // buffers. If a reader takes longer than the grace (e.g. because a grandchild
     // keeps the pipe open), we still get partial data from the buffer it
     // returns after noticing cancellation.
-    let stdout =
-        await_pipe_reader_with_cancellation_timeout(stdout_handle, "stdout", DRAIN_CANCEL_GRACE)
-            .await;
-    let stderr =
-        await_pipe_reader_with_cancellation_timeout(stderr_handle, "stderr", DRAIN_CANCEL_GRACE)
-            .await;
-    (stdout, stderr)
+    readers.collect().await
 }
 
 /// Outcome of a direct program run (argv — never a shell command string), used
@@ -1443,12 +1638,6 @@ impl ShellTool {
             anyhow::bail!("{}", grep_engine::unserved_failure(&cause));
         }
 
-        // Execute with timeout to prevent hanging commands. `exec_str` may be
-        // the grep-engine rewrite; the ORIGINAL `command_str` is what
-        // `process_shell_output` sees below, so the grep output profile keeps
-        // matching (and `cd … &&` chains still navigate the shell).
-        let mut cmd = build_shell_command(&exec_str, ws.as_path());
-
         // Allow agent to override the default timeout via `timeout_secs`.
         // Capped at MAX_SHELL_TIMEOUT_SECS to prevent absurdly long runs.
         let timeout_secs = super::get_opt_u64(&args, "timeout_secs")?
@@ -1458,14 +1647,53 @@ impl ShellTool {
         let timeout = Duration::from_secs(timeout_secs);
         let drain_limit = output_drain_timeout();
 
-        let mut result = run_command_with_timeout(
-            &mut cmd,
-            timeout,
-            drain_limit,
-            mem::default_limit(),
-            RunOwner::Agent,
-        )
-        .await;
+        // ── The runner's own steps ──
+        // A produced rewrite is executed by the plan its analysis was rendered
+        // with, because the shell does not wait for this service's own image
+        // ([`plan`]): the members the runner spawns itself are waited for by the
+        // runner, and the status the tool reports is theirs. A produced rewrite that
+        // was never applied bailed out above as an unserved search, so a plan here is
+        // always the one the line was rewritten into.
+        let mut plan_run = grep_serve.plan.take();
+        if plan_run.is_none() {
+            // A line the serve decision did not plan can still be an own-image
+            // call of its own (`mahbot debug …`, `mahbot -V`): one the runner can
+            // run as a single step is run by the runner, one it cannot is
+            // refused rather than handed to a shell that will not wait for it.
+            match plan::plan_for_command(&exec_str, ws.as_path()) {
+                plan::OwnImage::None => {}
+                plan::OwnImage::Direct(direct) => plan_run = Some(direct),
+                plan::OwnImage::Refused(cause) => {
+                    anyhow::bail!("{}", plan::refusal_message(&cause));
+                }
+            }
+        }
+
+        // Execute with timeout to prevent hanging commands. `exec_str` may be
+        // the grep-engine rewrite — run through its plan when one was built, and
+        // through the shell otherwise. The ORIGINAL `command_str` is what
+        // `process_shell_output` sees below, so the grep output profile keeps
+        // matching (and `cd … &&` chains still navigate the shell).
+        let mut result = if let Some(plan_run) = &plan_run {
+            plan::run(
+                plan_run,
+                timeout,
+                drain_limit,
+                mem::default_limit(),
+                RunOwner::Agent,
+            )
+            .await
+        } else {
+            let mut cmd = build_shell_command(&exec_str, ws.as_path());
+            run_command_with_timeout(
+                &mut cmd,
+                timeout,
+                drain_limit,
+                mem::default_limit(),
+                RunOwner::Agent,
+            )
+            .await
+        };
 
         // Stream-size marker: the engine reports stdin-fed stream bytes
         // consumed via a stderr marker; strip it from the agent-visible stderr.
@@ -6032,6 +6260,7 @@ mod tests {
             rewritten: Some("engine".into()),
             outcomes: Vec::new(),
             spec_files: Vec::new(),
+            plan: None,
             refusal: None,
         };
         // An applied rewrite is never a refusal; on unix neither case refuses.
@@ -6050,6 +6279,7 @@ mod tests {
             rewritten: None,
             outcomes: Vec::new(),
             spec_files: Vec::new(),
+            plan: None,
             refusal: Some("nested grep".into()),
         };
         assert_eq!(
@@ -6143,6 +6373,21 @@ mod tests {
             ),
             Some(EngineFailure::Refused(cause)) if cause.contains(grep_engine::STALE_BINARY_LOCK_MSG)
         ));
+        // The lock message is the cause wherever it sits in the stream, not the
+        // first line: a launch that meets the lock files its durable record first,
+        // so the boot channel's pointer line precedes it.
+        let recorded = format!(
+            "start-up failure recorded in C:\\Users\\owner\\.mahbot\\error.log\n\
+             Error: {} (the instance lock is held)\n",
+            grep_engine::STALE_BINARY_LOCK_MSG
+        );
+        assert!(
+            matches!(
+                engine_failure(Some(1), recorded.as_bytes(), ShellPlatform::Windows),
+                Some(EngineFailure::Refused(cause)) if cause.contains(grep_engine::STALE_BINARY_LOCK_MSG)
+            ),
+            "the lock line is the cause, not the pointer line before it: {recorded:?}"
+        );
         // A served run is not a refusal: exit 0/1 with no engine complaint.
         for code in [0, 1] {
             assert!(engine_failure(Some(code), b"", ShellPlatform::Windows).is_none());

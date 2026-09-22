@@ -23,16 +23,23 @@
 //!
 //! - **unix**: the child leads its own process group from the moment it is
 //!   spawned (`process_group(0)` in [`super::build_shell_command`]), so
-//!   [`Tree::terminate`] is one `kill(-pgid, SIGKILL)` — best-effort, a failure is
-//!   logged — reaching every descendant.
+//!   [`Tree::terminate`] is one `kill(-pgid, SIGKILL)` per member the run
+//!   attached — best-effort, a failure is
+//!   logged — reaching every descendant. The attached members are one shared
+//!   list, not a per-clone snapshot, so a kill guard built before the spawns
+//!   still ends every member attached afterwards ([`Tree::attach`]).
 //! - **windows**: one fresh job object per run, created with
-//!   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and the just-spawned child assigned to
-//!   it ([`Tree::attach`]). Descent is inheritance — the child of a job member
+//!   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and each just-spawned member assigned
+//!   to it ([`Tree::attach`]). Descent is inheritance — the child of a job member
 //!   joins the job — and breakaway is deliberately not permitted, so
 //!   `CREATE_BREAKAWAY_FROM_JOB` cannot hand a descendant to another job.
 //!   [`Tree::terminate`] ends the job with `TerminateJobObject`; nothing here asks
 //!   politely. The handle is the guarantee: closing the last one ends every process
 //!   in the job, which is what an abrupt death of the service does.
+//!
+//! A run is one child for the shell tool's ordinary path and one member per plan
+//! step for a rewritten line ([`super::plan`]); both attach every process they
+//! spawn to one tree, so a stop takes whichever shape the run had.
 //!
 //! # Which runs are contained (windows)
 //!
@@ -56,14 +63,30 @@
 //! descendants too. (That inheritance half is the platform's documented console
 //! rule, reasoned here rather than observed: no Windows host runs in this
 //! project's lane. macOS/Linux need nothing — a process started there cannot
-//! create a window. The two images the flag cannot act on are named below.)
+//! create a window. The images the flag cannot act on are named below.)
 //!
 //! A parent with no console at all hands every console child it starts without
 //! creation flags a brand-new **visible** console. The replacement instance is
 //! therefore never created detached: it gets `CREATE_NO_WINDOW` like every other
-//! spawn, and the console it then owns is itself what covers the children it
-//! starts in turn that the service cannot flag — see
-//! `self_update::spawn_new_instance_from` for the full rationale.
+//! spawn, and its own children get the same flag from it — the flag is inert for
+//! the instance itself (see below), and it is what keeps the console programs it
+//! starts in turn from putting a window on the screen. The rationale for the
+//! instance's own spawn is in `self_update::spawn_new_instance_from`.
+//!
+//! Three of the images those sites launch are not console programs at all — the
+//! browser, the file manager, and this service's own image — and the flag is inert
+//! for them: the platform gives such a program no console in the first place, so
+//! `CREATE_NO_WINDOW` has nothing to suppress. The service is that kind of image
+//! (it is built for the windowed subsystem, `windows_subsystem = "windows"`). Its
+//! own sites — the grep engine's probe, the runner's own-image steps
+//! ([`super::plan`], through the same builders) and the replacement instance —
+//! still set the flag, and what such an image starts in turn is outside the
+//! service's reach, exactly as it is for the browser and the file manager. The one
+//! spawn of this image that is not the service's to flag — the `self-replace` crate
+//! starts its file-swap copy itself — is the residual below. What changes for such
+//! an image is that it asks for no console of its own: a launch with no console has
+//! none to hand on, while one started from a console hands that console over, and
+//! the flag is inert for a windowed image either way.
 //!
 //! Covered, one entry per spawn site: git (`git::commands::git_command`); the
 //! cargo probe and both install modes (`self_update::verify_cargo_on_path`,
@@ -76,14 +99,11 @@
 //! and the browser itself (`tools::chrome_daemon::spawn_chrome_detached`); every
 //! agent command through the shell builders (`tools::shell::build_shell_command`,
 //! `tools::shell::build_program_command` — the shell tool, the diagnostics
-//! runner, the `custom` tool's script, a user's alarm program) plus the grep
+//! runner, the `custom` tool's script, a user's alarm program, and every member
+//! of a rewritten line's plan ([`super::plan`], which spawns its own-image steps
+//! through that same builder rather than a site of its own) plus the grep
 //! engine's own probe (`tools::shell::grep_engine::probe_engine`); and the file
 //! manager the owner asked for (`gui::editor::perform_reveal_in_finder`).
-//!
-//! Two of those launch an image that is not a console program — the browser and
-//! the file manager — for which the flag is documented as inert. They are the
-//! owner's own programs, and the flag is set even there so the rule has no
-//! exceptions; what such a program starts in turn is outside the service's reach.
 //!
 //! Not covered, on purpose: the terminal the owner opens inside the app
 //! (`gui::shell`, spawned through a pseudoconsole) and the owner's own browser
@@ -91,26 +111,33 @@
 //! console program exists to flash) — their windows are the owner's business.
 //! Residual, stated rather than implied: a command that asks the platform for a
 //! window of its own (`CREATE_NEW_CONSOLE`, or `cmd`'s `start` builtin) gets one,
-//! and so does anything it starts; a console program started by one of the two
-//! non-console images (the browser, the file manager) is beyond this flag's reach;
-//! and an un-flagged console child of a console-less parent gets a new visible
-//! console — the concrete case being the `self-replace` crate's file-swap copy of
-//! our own binary, which the service cannot flag and which is reachable only
-//! through the parent's console. That state is closed for the instances this
-//! service starts but not retroactively: an instance launched by an earlier build
-//! is console-less for its lifetime, so its own file-swap copy can still put one
-//! window on the screen during the update that installs this change.
+//! and so does anything it starts; a console program started by one of the three
+//! non-console images (the browser, the file manager, this service's own image)
+//! is beyond this flag's reach; and an un-flagged console child of a console-less
+//! parent gets a new visible console. The `self-replace` crate's file-swap copy of
+//! this service's own binary is an un-flagged child of a console-less parent, and it
+//! is the windowed subsystem, not a creation flag, that keeps it off the screen: the
+//! copy is this service's image, so the platform gives it no console to show. An
+//! instance launched by an earlier build runs the older, console-program image for
+//! its lifetime, so its own file-swap copy can still show one window during an
+//! update started by it.
 //!
-//! Beside the window, two things do change for a console-program child, and are
-//! stated rather than glossed (reasoned, like the inheritance above): it owns a
-//! console of its own — one extra hidden `conhost.exe` per spawn, permanent for
-//! the replacement instance — and it is therefore no longer attached to the
-//! console the service was launched in, so console control events on that console
-//! (a console-window close) no longer reach it. Whether such a child can still
-//! *use* a console handle it inherited from the service is not something this host
-//! can observe: the handle values it receives are unchanged, but it belongs to
-//! another console. Which commands run, when, what they return and how they stop:
-//! unchanged.
+//! A console program this service starts therefore owns a console of its own — one
+//! extra hidden `conhost.exe` per spawn — and it is not attached to the console its
+//! parent would otherwise have handed it, so console control events on that console
+//! (a console-window close) never reach it. Whether such a child can still *use* a
+//! console handle it inherited from this process is not something this host can
+//! observe: the handle values it receives are unchanged, but they belong to another
+//! console.
+//!
+//! No usable standard input either: an agent's command inherits no console for its
+//! input — a console-less process has none to hand on — so a command that would
+//! have read the console (`set /p`, `pause`, `more`, anything interactive) has
+//! none instead of waiting for the owner's keystrokes. The shell tool never hands
+//! a command the owner's prompt, and its background form gives the command no
+//! input at all (null stdin, unless the command's own redirect took it over). What
+//! a command must read it takes from a file (`<`), from a pipe (`… | cmd`), or from
+//! a redirection the runner applies itself ([`super::plan`]).
 //!
 //! The guarantee is a per-spawn flag, so a new spawn site could be added without
 //! one and nothing would say so: `every_production_spawn_is_windowless` below is
@@ -147,6 +174,10 @@
 //!   agent starts by running that tool from a command line is such a descendant,
 //!   and the service's own launch exemption cannot reach it.
 
+// The unix half's shared pid list needs the poison-tolerant lock helper.
+#[cfg(unix)]
+use crate::util::UnwrapPoison;
+
 // The job-object half is the only thing below that needs any of these.
 #[cfg(not(unix))]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -177,10 +208,16 @@ pub(super) enum RunOwner {
 #[cfg(unix)]
 #[derive(Clone)]
 pub(super) struct Tree {
-    /// The child's pid, which `process_group(0)` also made its process group's
-    /// id. `None` until [`Tree::attach`], and after a spawn that produced no pid
-    /// at all.
-    pid: Option<u32>,
+    /// The pids of the run's members, each of which `process_group(0)` also made
+    /// its own process group's id. Empty until [`Tree::attach`], and after a spawn
+    /// that produced no pid at all. A single-child run attaches one (the shell
+    /// tool's child); a plan run attaches one per member it spawns
+    /// ([`super::plan`]), every one of them a group leader of its own.
+    ///
+    /// Shared by every clone a run holds, like the Windows job: the plan runner
+    /// builds its kill guard before it spawns, so a member attached afterwards
+    /// must still be seen by that guard.
+    pids: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
 }
 
 #[cfg(unix)]
@@ -189,22 +226,31 @@ impl Tree {
     /// the spawn itself. `_owner` decides the Windows job only, so both owners
     /// are contained the same way here — deliberately.
     pub(super) fn new(_owner: RunOwner) -> Self {
-        Self { pid: None }
+        Self {
+            pids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
     }
 
-    /// Record the spawned child's process group.
+    /// Record one spawned member's process group.
     pub(super) fn attach(&mut self, pid: u32) {
-        self.pid = Some(pid);
+        self.pids.lock().unwrap_poison().push(pid);
     }
 
-    /// End every process in the run's group — the direct child included, which is
-    /// why a caller that got `true` only has to reap it. `true` means the group was
-    /// signalled, not that every member died: a signal to a group with no live
-    /// member left is not an error here ([`super::kill_process_group`] logs its own
-    /// failure).
+    /// End every process in the run's groups — the direct children included,
+    /// which is why a caller that got `true` only has to reap them. `true` means
+    /// the groups were signalled, not that every member died: a signal to a group
+    /// with no live member left is not an error here
+    /// ([`super::kill_process_group`] logs its own failure).
+    ///
+    /// A member that has already been reaped stays in the list: its process group is
+    /// where anything it left running lives, which is what a stop after the reap is
+    /// for. A group that is fully gone leaves its pgid free for reuse, so a signal
+    /// meant for it can land elsewhere — an accepted window, not the purpose of the
+    /// retention, and the alternative (forgetting the pid) is what loses the leftover
+    /// kill the drain path relies on.
     pub(super) fn terminate(&self) -> bool {
-        if let Some(pid) = self.pid {
-            super::kill_process_group(pid, libc::SIGKILL);
+        for pid in self.pids.lock().unwrap_poison().iter() {
+            super::kill_process_group(*pid, libc::SIGKILL);
         }
         true
     }
@@ -820,6 +866,25 @@ mod tests {
         assert!(
             violations.is_empty(),
             "the service must never put a console window on the screen:\n{violations:#?}"
+        );
+    }
+
+    /// The one line the module docs' premise about this service's own image rests
+    /// on: it is a windowed image because the crate root says so, and with the
+    /// `not(test)` guard the binary's own test harness stays a console program. No
+    /// other lane would notice the attribute's removal (the cross-checks only
+    /// compile), so the source is read back — the same cheap tripwire the spawn
+    /// sweep above is.
+    #[test]
+    fn the_binary_is_built_as_a_windowed_image() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let source = std::fs::read_to_string(&path).expect("read the binary's crate root");
+        let attribute = r#"#![cfg_attr(not(test), windows_subsystem = "windows")]"#;
+        assert!(
+            source.contains(attribute),
+            "{} must carry {attribute} — a Windows launch of the product is \
+             console-less because of it, where the test harness keeps its console",
+            path.display()
         );
     }
 }

@@ -191,7 +191,8 @@ static REFUSAL_ROUNDS: RoundCounter = RoundCounter::new();
 
 /// Record a refused shrink loudly: the first refusal of a store file in this
 /// process files a durable block (the record survives where the ordinary log may
-/// already be gone), every further round only warns with the running count.
+/// already be gone), every further round only warns with the running count. Filed
+/// once per condition ([`failure_record::record`]).
 ///
 /// `store` names the logical store; `db_path` is the main file actually checked
 /// (the caller passes [`Connection::db_path`]) and keys the count, so a probe of

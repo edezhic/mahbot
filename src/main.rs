@@ -1,4 +1,11 @@
 #![warn(clippy::pedantic)]
+// Built for the GUI subsystem so a Windows launch never puts a console window on
+// the screen: the platform gives such a process no console, and it does not block
+// the shell that started it. A launch with no console loses this file's own prints
+// — accepted, never fatal: they go through `mahbot::util::print_stdout` /
+// `print_stderr`, where the policy lives. Conditional so the binary's own test
+// harness stays a console program and `cargo test --bins` output stays visible.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use anyhow::Result;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -32,7 +39,8 @@ const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-
 const JETBRAINS_MONO_ITALIC_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Italic.ttf");
 
 /// Top-level `--help` text. Lists only the public subcommands (hidden
-/// internals like `__grep-engine` are excluded).
+/// internals like `__grep-engine` are excluded). Printed through
+/// `util::print_stdout`, which adds the terminating newline.
 const TOP_LEVEL_USAGE: &str = "\
 mahbot — autonomous agentic engineering system with a GUI dashboard daemon
 
@@ -45,8 +53,7 @@ Usage:
 
 Options:
   -h, --help             Print this help and exit
-  -V, --version          Print the version and exit
-";
+  -V, --version          Print the version and exit";
 
 /// INFO-log retention window (hours): the log-cleanup loop deletes INFO
 /// entries older than this. Independent of the session-purge cutoff.
@@ -628,7 +635,7 @@ fn main() -> Result<()> {
         match rt.block_on(mahbot::db::debug::run_debug()) {
             Ok(()) => std::process::exit(0),
             Err(e) => {
-                eprintln!("Error: {e:#}");
+                mahbot::util::print_stderr(&format!("Error: {e:#}"));
                 std::process::exit(1);
             }
         }
@@ -676,11 +683,11 @@ fn main() -> Result<()> {
     // (`mahbot chrome -h` etc.) keep routing to their own CLI handlers.
     match std::env::args().nth(1).as_deref() {
         Some("-h" | "--help") => {
-            print!("{TOP_LEVEL_USAGE}");
+            mahbot::util::print_stdout(TOP_LEVEL_USAGE);
             return Ok(());
         }
         Some("-V" | "--version") => {
-            println!("mahbot {}", env!("CARGO_PKG_VERSION"));
+            mahbot::util::print_stdout(concat!("mahbot ", env!("CARGO_PKG_VERSION")));
             return Ok(());
         }
         _ => {}
@@ -688,10 +695,23 @@ fn main() -> Result<()> {
 
     // Subscribe to Windows stop requests before boot: the console control handler (Ctrl+C,
     // Ctrl+Break, console close) and the session-end listener (log-off, shutdown, restart).
-    // The handler queues for the protocol loop and the listener forces the stop directly —
-    // neither needs a runtime. No-op on macOS/Linux.
+    // A product launch on Windows gets no console from the windowed image, so no console
+    // control event exists for it — the handler stays registered and remains the platform's
+    // stop source for a launch that does have one (the test harness, or a launch given a
+    // console of its own), while the session-end listener needs none. The handler queues for
+    // the protocol loop and the listener forces the stop directly — neither needs a runtime.
+    // No-op on macOS/Linux.
     mahbot::shutdown::install_console_stop_handler();
     mahbot::shutdown::install_session_end_listener();
+
+    // Resolve the storage root before the temp root: it is a pure environment read
+    // (`mahbot::config::default_config_dir`), resolved before config init so the
+    // instance lock below can be acquired before Iced starts, and the two pre-boot
+    // steps below are recorded against it. The process-global root is not set yet,
+    // and on a launch with no console a stderr-only note is lost — the durable
+    // record in `<root>/error.log` is what keeps them recoverable.
+    let storage_root = mahbot::config::default_config_dir()
+        .map_err(|e| mahbot::boot::record_startup_failure("config::default_config_dir", e))?;
 
     // Consolidate ALL instance temp files under one private root
     // (`/tmp/mahbot`, mode 0700; `<user temp>\mahbot` on Windows) and pin the
@@ -699,16 +719,23 @@ fn main() -> Result<()> {
     // stores, shell children). The debug, __grep-engine, bench-openrouter and
     // chrome subcommands above must NOT create the root (they exit before this
     // point).
-    mahbot::temp::init_temp_root()
-        .map_err(|e| mahbot::boot::record_startup_failure("temp::init_temp_root", e))?;
-
-    // Resolve storage root before config init, so we can acquire the lock.
-    let storage_root = mahbot::config::default_config_dir()
-        .map_err(|e| mahbot::boot::record_startup_failure("config::default_config_dir", e))?;
+    mahbot::temp::init_temp_root().map_err(|e| {
+        mahbot::boot::record_launch_failure(&storage_root, "temp::init_temp_root", e)
+    })?;
 
     // Acquire the instance lock before Iced runtime starts.
-    // Stored in a global so the update flow can release/re-acquire it.
-    mahbot::self_update::acquire_lock(&storage_root)?;
+    // Stored in a global so the update flow can release/re-acquire it. The
+    // refusal is also filed in the durable failure record under the root resolved
+    // above: this is a pre-boot step, so the process-global root is not set
+    // yet. Its text is passed through unchanged — the shell tool's stale-binary
+    // detection matches on it. On a product launch on Windows that the platform gave
+    // no console and no standard streams (the double-click case) the text reaches
+    // nowhere and the launch is silent: no window, no text, exit code 1 — the filed
+    // block is what a second launch leaves behind, and the runner's own-image step
+    // reads that same text off the pipe it wired.
+    mahbot::self_update::acquire_lock(&storage_root).map_err(|e| {
+        mahbot::boot::record_launch_failure(&storage_root, "self_update::acquire_lock", e)
+    })?;
 
     // Read persisted window state (sync, before Iced runtime starts).
     let window_state = mahbot::gui::read_window_state();
