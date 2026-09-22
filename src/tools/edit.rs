@@ -6,17 +6,21 @@ use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 
-/// Edit a file by replacing an exact string match with new content.
+/// Edit a file by replacing a string match with new content.
 ///
 /// Two modes:
 /// - **Write mode**: when `old_string` is omitted or empty, creates a new file with
 ///   `new_string` as the content (including parent directories). Refuses to
 ///   overwrite an existing file — use edit mode for changes.
 /// - **Edit mode**: when `old_string` is provided, performs precise replacement
-///   within an existing file. Matching is semi-insensitive to whitespace for
-///   code files (.rs, .js, .ts, .c, .cpp, .go, etc.): extra/missing spaces
-///   outside string literals are tolerated. By default the `old_string` must
-///   appear exactly once (zero matches = not found, multiple = ambiguous).
+///   within an existing file. Line endings are always tolerated, for every file
+///   type: `\r\n` and `\n` are interchangeable when matching, and the written
+///   text takes the ending of the file around the match rather than the one it
+///   was spelled with, so an edit introduces no ending the file did not have.
+///   Matching is additionally semi-insensitive to whitespace for code files
+///   (.rs, .js, .ts, .c, .cpp, .go, etc.): extra/missing spaces outside string
+///   literals are tolerated there. By default the `old_string` must appear
+///   exactly once (zero matches = not found, multiple = ambiguous).
 ///   `new_string` may be empty to delete the matched text.
 pub struct EditTool;
 
@@ -35,11 +39,11 @@ impl Tool for EditTool {
                 },
                 "old_string": {
                     "type": "string",
-                    "description": "If omitted or empty: creates a new file with `new_string` (refuses if file exists). If provided and non-empty: this exact text is replaced by `new_string` (semi-insensitive to whitespace in code files, must appear exactly once unless multiple is true)."
+                    "description": "If omitted or empty: creates a new file with `new_string` (refuses if file exists). If provided and non-empty: this text is replaced by `new_string`. Its line endings never have to match the file's (LF and CRLF are interchangeable, for every file type), and it is semi-insensitive to whitespace in code files; it must appear exactly once unless multiple is true."
                 },
                 "new_string": {
                     "type": "string",
-                    "description": "When old_string is omitted or empty: the content to write to the new file. When old_string is provided and non-empty: the replacement text (may be empty to delete the matched text). Must differ from old_string — identical old and new strings are rejected as a no-op."
+                    "description": "When old_string is omitted or empty: the content to write to the new file. When old_string is provided and non-empty: the replacement text (may be empty to delete the matched text); its line endings are rewritten to the ending the file uses around it. Must differ from old_string — identical old and new strings are rejected as a no-op."
                 },
                 "multiple": {
                     "type": "boolean",
@@ -109,12 +113,15 @@ impl EditTool {
         multiple: bool,
     ) -> Result<String> {
         // ── No-op guard: reject edits where old and new are identical ──
-        // Raw string comparison (no whitespace normalization) so we fail
-        // fast before touching the file.  Accepts the trade-off that a
-        // whitespace-normalization edit (where old == new but the file
-        // bytes actually differ in spacing) will be incorrectly rejected
+        // Raw string comparison (no line-ending or whitespace normalization) so
+        // we fail fast before touching the file.  Accepts the trade-off that a
+        // whitespace-normalization edit (where old == new but the file bytes
+        // actually differ in spacing) will be incorrectly rejected
         // — this edge case is rare, and the alternative (allowing literal
-        // no-ops to pass through as "replaced 1 occurrence") is worse.
+        // no-ops to pass through as "replaced 1 occurrence") is worse.  An edit
+        // that only turns out to be a no-op once a match is found — because the
+        // text written ends up byte-identical to the text it replaced — is
+        // caught below, after the splice.
         if old_string == new_string {
             anyhow::bail!("old_string equals new_string — no change needed");
         }
@@ -132,7 +139,7 @@ impl EditTool {
             Err(e) => anyhow::bail!("Cannot access file {path}: {e}"),
         }
 
-        // ── 3. Read → match → replace → write ───────────────────
+        // ── 3. Read → match → splice → write ─────────────────────
         let content = match tokio::fs::read_to_string(&resolved_target).await {
             Ok(c) => c,
             Err(e) => {
@@ -142,69 +149,34 @@ impl EditTool {
             }
         };
 
-        let new_content;
-        let replaced_count;
+        let plan = plan_edits(
+            path,
+            &content,
+            old_string,
+            new_string,
+            multiple,
+            use_ws_matching,
+        )?;
+        let edits = &plan.edits;
 
-        let exact_count = content.matches(old_string).count();
+        // Splice the planned replacements in, in file order — every byte
+        // outside a planned span is copied through untouched.
+        let mut new_content = String::with_capacity(content.len());
+        let mut cursor = 0;
+        for edit in edits {
+            new_content.push_str(&content[cursor..edit.span.start]);
+            new_content.push_str(&edit.replacement);
+            cursor = edit.span.end;
+        }
+        new_content.push_str(&content[cursor..]);
 
-        if multiple {
-            // Multiple mode: use exact match (whitespace-insensitive multi-replace is a future concern)
-
-            if exact_count == 0 {
-                // Try a whitespace-insensitive match for a better error message
-                if use_ws_matching
-                    && find_ws_insensitive(&content, old_string).is_ok_and(|r| r.is_some())
-                {
-                    return Err(not_found_error(
-                        path,
-                        " (whitespace differs; try without multiple=true)",
-                    ));
-                }
-                return Err(not_found_error(path, " (multiple=true mode)"));
-            }
-
-            new_content = content.replace(old_string, new_string);
-            replaced_count = exact_count;
-        } else {
-            // Single mode: try exact match first, fall back to whitespace-insensitive
-
-            match exact_count {
-                1 => {
-                    new_content = content.replacen(old_string, new_string, 1);
-                    replaced_count = 1;
-                }
-                0 if use_ws_matching => {
-                    // No exact match — try whitespace-insensitive matching
-                    match find_ws_insensitive(&content, old_string) {
-                        Ok(Some(ws_match)) => {
-                            new_content = format!(
-                                "{}{}{}",
-                                &content[..ws_match.start],
-                                new_string,
-                                &content[ws_match.end..]
-                            );
-                            replaced_count = 1;
-                        }
-                        Ok(None) => {
-                            return Err(not_found_error(
-                                path,
-                                " (whitespace-insensitive matching tried)",
-                            ));
-                        }
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    }
-                }
-                0 => {
-                    return Err(not_found_error(path, " (exact match required)"));
-                }
-                _ => {
-                    anyhow::bail!(
-                        "old_string matches {exact_count} times; must match exactly once (or pass multiple=true to replace all)"
-                    );
-                }
-            }
+        // An edit that only respelled its line endings is a no-op: the written
+        // text took the file's endings and landed byte for byte on the text it
+        // replaced, so the file would not change at all.
+        if new_content == content && !plan.whitespace_fallback {
+            anyhow::bail!(
+                "old_string equals new_string once line endings are accounted for — no change needed"
+            );
         }
 
         tokio::fs::write(&resolved_target, &new_content)
@@ -212,14 +184,301 @@ impl EditTool {
             .map_err(|e| anyhow::anyhow!("io: cannot edit {path}: failed to write file: {e} — hint: check disk space and file permissions"))?;
         update_search_index_after_write(ws, &resolved_target);
         Ok(format!(
-            "Edited {path}: replaced {replaced_count} occurrence{} ({} bytes)",
-            if replaced_count == 1 { "" } else { "s" },
+            "Edited {path}: replaced {} occurrence{} ({} bytes)",
+            edits.len(),
+            if edits.len() == 1 { "" } else { "s" },
             new_content.len()
         ))
     }
 }
 
-// ── Whitespace-insensitive matching ───────────────────────────────
+// ── Match planning ──────────────────────────────────────────────────
+
+/// One planned replacement: the byte span of a match in the file's raw content,
+/// and the text to write there with its line endings already adapted to the
+/// file.
+struct Edit {
+    span: std::ops::Range<usize>,
+    replacement: String,
+}
+
+impl Edit {
+    /// Plan a replacement of `span` by `new_string`. The written text takes the
+    /// ending of the line the span starts on, else the file's prevailing ending,
+    /// else — over a file with no ending at all — the ending it was spelled with.
+    fn new(
+        content: &str,
+        span: std::ops::Range<usize>,
+        new_string: &str,
+        prevailing: Option<LineEnding>,
+    ) -> Self {
+        let replacement = match local_ending(content, span.start).or(prevailing) {
+            Some(ending) => {
+                let adapted = ending.apply(new_string);
+                // A lone `\r` — content, not an ending — can sit right before the
+                // span, the real endings being kept whole by the widening in
+                // `resolve`. It already supplies the carriage return of the break
+                // the written text opens with, so that break must not bring its
+                // own and leave the file with two in a row.
+                if adapted.starts_with("\r\n") && content[..span.start].ends_with('\r') {
+                    adapted[1..].to_string()
+                } else {
+                    adapted
+                }
+            }
+            None => new_string.to_string(),
+        };
+        Self { span, replacement }
+    }
+}
+
+/// The planned replacements for an edit, and how they were matched.
+struct Plan {
+    edits: Vec<Edit>,
+    /// Set when the match came from the whitespace-tolerant fallback. Its span
+    /// can over-extend past the caller's text and already hold the text written
+    /// into it, so an identical splice there is not a line-ending no-op and is
+    /// left to the write exactly as it was before line endings were handled.
+    whitespace_fallback: bool,
+}
+
+/// Plan the replacements for an edit against `content`.
+///
+/// Matching order:
+/// 1. an exact match;
+/// 2. a match that differs in line endings only (`\r\n` and `\n` are
+///    interchangeable) — for every file type;
+/// 3. the whitespace-tolerant fallback, which stays restricted to the code file
+///    types that have it and to single mode.
+///
+/// In `multiple` mode every match found is replaced; otherwise a match count
+/// other than one is an error — not found, or ambiguous when several places
+/// match.
+fn plan_edits(
+    path: &str,
+    content: &str,
+    old_string: &str,
+    new_string: &str,
+    multiple: bool,
+    use_ws_matching: bool,
+) -> Result<Plan> {
+    let exact = exact_spans(content, old_string);
+    if !exact.is_empty() {
+        return Ok(Plan {
+            edits: resolve(exact, content, new_string, multiple)?,
+            whitespace_fallback: false,
+        });
+    }
+
+    let by_ending = line_ending_spans(content, old_string);
+    if !by_ending.is_empty() {
+        return Ok(Plan {
+            edits: resolve(by_ending, content, new_string, multiple)?,
+            whitespace_fallback: false,
+        });
+    }
+
+    if !multiple && use_ws_matching {
+        return match find_ws_insensitive(content, old_string)? {
+            Some(span) => Ok(Plan {
+                edits: resolve(vec![span], content, new_string, multiple)?,
+                whitespace_fallback: true,
+            }),
+            None => Err(not_found_error(
+                path,
+                " (whitespace-insensitive matching tried)",
+            )),
+        };
+    }
+
+    if multiple {
+        // Whitespace — as opposed to line endings — is the one difference
+        // `multiple` cannot tolerate; say so when that is what is in the way.
+        if use_ws_matching && find_ws_insensitive(content, old_string).is_ok_and(|s| s.is_some()) {
+            return Err(not_found_error(
+                path,
+                " (whitespace differs; try without multiple=true)",
+            ));
+        }
+        return Err(not_found_error(path, " (multiple=true mode)"));
+    }
+    Err(not_found_error(
+        path,
+        " (exact match required apart from line endings)",
+    ))
+}
+
+/// Turn the matched spans into a plan: all of them in `multiple` mode, exactly
+/// one otherwise.
+fn resolve(
+    spans: Vec<std::ops::Range<usize>>,
+    content: &str,
+    new_string: &str,
+    multiple: bool,
+) -> Result<Vec<Edit>> {
+    let spans = if multiple {
+        spans
+    } else {
+        match spans.as_slice() {
+            [span] => vec![span.clone()],
+            spans => anyhow::bail!(
+                "old_string matches {} times; must match exactly once (or pass multiple=true to replace all)",
+                spans.len()
+            ),
+        }
+    };
+
+    // A span that starts on the `\n` of a `\r\n` pair covers the line break the
+    // caller's text spells, so the pair's `\r` belongs to it too — widening the
+    // start over that `\r` is what keeps the pair from being split into a stray
+    // carriage return. The previous span's end bounds the widening: a `\r` an
+    // earlier span already replaced is not there to widen over.
+    let mut previous_end = 0;
+    let spans: Vec<_> = spans
+        .into_iter()
+        .map(|span| {
+            let widened = span.start > previous_end
+                && content[..span.start].ends_with('\r')
+                && content[span.start..].starts_with('\n');
+            previous_end = span.end;
+            let start = if widened { span.start - 1 } else { span.start };
+            start..span.end
+        })
+        .collect();
+
+    // Scanned once for the whole plan rather than per match.
+    let prevailing = prevailing_ending(content);
+    Ok(spans
+        .into_iter()
+        .map(|span| Edit::new(content, span, new_string, prevailing))
+        .collect())
+}
+
+/// Byte spans of every non-overlapping occurrence of `old_string`.
+fn exact_spans(content: &str, old_string: &str) -> Vec<std::ops::Range<usize>> {
+    content
+        .match_indices(old_string)
+        .map(|(start, matched)| start..start + matched.len())
+        .collect()
+}
+
+/// Byte spans of `old_string` in `content` when line endings are their only
+/// difference: both sides are reduced to `\n` endings before matching, so an
+/// `old_string` that omits the carriage returns — as an ordinary reading of a
+/// CRLF file shows it — matches the file's `\r\n` bytes, and one that is
+/// spelled with carriage returns matches content that has none. A lone `\r` is
+/// content on both sides and still has to match. Non-overlapping matches only,
+/// exactly like an exact search.
+fn line_ending_spans(content: &str, old_string: &str) -> Vec<std::ops::Range<usize>> {
+    // Without a `\r\n` on either side reducing the endings changes nothing,
+    // and the exact search has already failed on both strings verbatim.
+    if !content.contains("\r\n") && !old_string.contains("\r\n") {
+        return Vec::new();
+    }
+    let view = LfView::new(content);
+    let needle = LfView::new(old_string).text;
+    view.text
+        .match_indices(&needle)
+        .map(|(start, matched)| view.raw_span(start, start + matched.len()))
+        .collect()
+}
+
+// ── Line endings ────────────────────────────────────────────────────
+
+/// The line endings this tool recognises. A lone `\r` is content, not an
+/// ending, so it is never recognised here and never rewritten.
+#[derive(Clone, Copy, Debug)]
+enum LineEnding {
+    Lf,
+    CrLf,
+}
+
+impl LineEnding {
+    /// Rewrite every ending in `text` to this ending, leaving lone `\r` bytes
+    /// (content) untouched.
+    fn apply(self, text: &str) -> String {
+        let lf_only = text.replace("\r\n", "\n");
+        match self {
+            Self::Lf => lf_only,
+            Self::CrLf => lf_only.replace('\n', "\r\n"),
+        }
+    }
+}
+
+/// Whether the `\n` at `newline` closes a `\r\n` pair.
+fn ending_of(content: &str, newline: usize) -> LineEnding {
+    if newline > 0 && content.as_bytes()[newline - 1] == b'\r' {
+        LineEnding::CrLf
+    } else {
+        LineEnding::Lf
+    }
+}
+
+/// The ending of the line that `at` lies on: that of the file's first `\n` at or
+/// after `at`. `None` over a final line the file left unterminated.
+fn local_ending(content: &str, at: usize) -> Option<LineEnding> {
+    content[at..]
+        .find('\n')
+        .map(|offset| ending_of(content, at + offset))
+}
+
+/// The ending most of the file's lines use; a tie goes to the first one seen.
+fn prevailing_ending(content: &str) -> Option<LineEnding> {
+    let bytes = content.as_bytes();
+    let (mut crlf, mut lf) = (0usize, 0usize);
+    let mut first = None;
+    for (i, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        let ending = ending_of(content, i);
+        first.get_or_insert(ending);
+        match ending {
+            LineEnding::CrLf => crlf += 1,
+            LineEnding::Lf => lf += 1,
+        }
+    }
+    match crlf.cmp(&lf) {
+        std::cmp::Ordering::Greater => Some(LineEnding::CrLf),
+        std::cmp::Ordering::Less => Some(LineEnding::Lf),
+        std::cmp::Ordering::Equal => first,
+    }
+}
+
+/// The file's content with `\r\n` endings reduced to `\n` (a lone `\r` is
+/// content and survives), plus the offsets in that reduced view where the
+/// carriage returns sat — enough to map a match back onto the raw content.
+struct LfView {
+    text: String,
+    removed_cr: Vec<usize>,
+}
+
+impl LfView {
+    fn new(content: &str) -> Self {
+        let mut text = String::with_capacity(content.len());
+        let mut removed_cr = Vec::new();
+        let mut chars = content.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\r' && chars.peek() == Some(&'\n') {
+                removed_cr.push(text.len());
+                continue;
+            }
+            text.push(ch);
+        }
+        Self { text, removed_cr }
+    }
+
+    /// The raw span of a match found at `[start, end)` in [`LfView::text`]. A
+    /// match that starts at the `\n` of a `\r\n`, or covers that `\n`, maps
+    /// onto the whole ending, so a replacement made through this view never
+    /// splits a `\r\n` pair.
+    fn raw_span(&self, start: usize, end: usize) -> std::ops::Range<usize> {
+        let removed_before = |at: usize| self.removed_cr.partition_point(|&cr| cr < at);
+        start + removed_before(start)..end + removed_before(end)
+    }
+}
+
+// ── Search index maintenance ────────────────────────────────────────
 
 /// Synchronously update the search engine's file index after a write.
 ///
@@ -256,7 +515,7 @@ fn update_search_index_after_write(ws: &Workspace, file_path: &std::path::Path) 
     }
 }
 
-// ── Whitespace-insensitive matching details ─────────────────────────
+// ── Whitespace-insensitive matching ─────────────────────────────────
 
 /// File extensions for languages where whitespace between tokens has no
 /// semantic meaning, making whitespace-insensitive editing safe.
@@ -356,15 +615,6 @@ fn normalize_ws(s: &str) -> (String, Vec<Segment>) {
     (normalized, segments)
 }
 
-/// Result of a whitespace-insensitive match.
-#[derive(Debug)]
-struct WsMatch {
-    /// Byte offset in the original content where the match starts.
-    start: usize,
-    /// Byte offset in the original content where the match ends (exclusive).
-    end: usize,
-}
-
 /// Find the segment containing a normalized byte position.
 /// Returns an error if `pos` is out of range (which indicates a
 /// normalization bug producing non-contiguous segments).
@@ -403,7 +653,7 @@ fn map_norm_span(
     norm_start: usize,
     norm_end: usize,
     segments: &[Segment],
-) -> Result<(usize, usize)> {
+) -> Result<std::ops::Range<usize>> {
     let seg = segment_at(norm_start, segments)?;
     let orig_start = if seg.orig_range.len() == seg.norm_range.len() {
         seg.orig_range
@@ -423,7 +673,7 @@ fn map_norm_span(
         end_seg.orig_range.end
     };
 
-    Ok((orig_start, orig_end))
+    Ok(orig_start..orig_end)
 }
 
 /// Find `old_string` in `content` using whitespace-insensitive matching.
@@ -432,11 +682,11 @@ fn map_norm_span(
 /// spaces before matching. Normalizes both strings once, then checks for
 /// ambiguity (multiple normalized occurrences of `old_string`). Returns:
 ///
-/// - `Ok(Some(WsMatch))` — a single unambiguous match found.
+/// - `Ok(Some(range))` — a single unambiguous match found.
 /// - `Ok(None)` — pattern not found after normalization.
 /// - `Err(...)` — ambiguous (pattern matches multiple times after
 ///   normalization) or a normalization bug in `map_norm_span`.
-fn find_ws_insensitive(content: &str, old_string: &str) -> Result<Option<WsMatch>> {
+fn find_ws_insensitive(content: &str, old_string: &str) -> Result<Option<std::ops::Range<usize>>> {
     if old_string.is_empty() || content.is_empty() {
         return Ok(None);
     }
@@ -460,9 +710,7 @@ fn find_ws_insensitive(content: &str, old_string: &str) -> Result<Option<WsMatch
         );
     }
 
-    let (start, end) = map_norm_span(norm_pos, norm_end, &segments)?;
-
-    Ok(Some(WsMatch { start, end }))
+    Ok(Some(map_norm_span(norm_pos, norm_end, &segments)?))
 }
 
 #[cfg(test)]
@@ -677,11 +925,7 @@ mod tests {
             let m = find_ws_insensitive(content, old)
                 .unwrap()
                 .unwrap_or_else(|| panic!("Expected match: content={content:?} old={old:?}"));
-            assert_eq!(
-                &content[m.start..m.end],
-                *expected,
-                "content={content:?} old={old:?}"
-            );
+            assert_eq!(&content[m], *expected, "content={content:?} old={old:?}");
         }
     }
 
@@ -1244,11 +1488,541 @@ mod tests {
             assert!(
                 err.contains(
                     "not-found: cannot edit readme.txt: old_string not found in file \
-                     (exact match required)"
+                     (exact match required apart from line endings)"
                 ),
                 ".txt should use exact matching only, got: {err}"
             );
         })
         .await;
+    }
+
+    // ── Line-ending handling ──────────────────────────────────────
+
+    /// The raw bytes of `name` in `dir`. Every reading surface hides a CRLF's
+    /// carriage return, so a line-ending claim can only be checked on bytes.
+    async fn file_bytes(dir: &Path, name: &str) -> Vec<u8> {
+        tokio::fs::read(dir.join(name))
+            .await
+            .expect("read file bytes")
+    }
+
+    /// The text an agent sees for `path`: the `read` tool's content mode with
+    /// its line numbers and summary line stripped — carriage returns hidden.
+    async fn read_view(ws: &Workspace, path: &str) -> String {
+        let out = crate::tools::ReadTool::general()
+            .execute(ws, json!({"path": path}))
+            .await
+            .expect("read should succeed");
+        out.lines()
+            .skip(1) // the "[N lines total]" summary
+            .map(|line| line.split_once(": ").expect("numbered line").1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Writing the initial file and reading it back hides the carriage return of
+    /// every CRLF, so an `old_string` built from a reading is spelled with LF.
+    /// Applying such an edit must land for any file type, and must leave the
+    /// file on the ending it had.
+    #[tokio::test]
+    async fn read_then_edit_round_trip_for_every_file_type_and_ending() {
+        for name in [
+            "notes.md",
+            "notes.txt",
+            "script.py",
+            "config.json",
+            "lib.rs",
+        ] {
+            for ending in ["\n", "\r\n"] {
+                let dir = TempDir::new().unwrap();
+                let initial = format!("alpha{ending}beta{ending}gamma{ending}");
+                tokio::fs::write(dir.path().join(name), &initial)
+                    .await
+                    .unwrap();
+                let ws = test_ws(dir.path());
+
+                assert_eq!(
+                    read_view(&ws, name).await,
+                    "alpha\nbeta\ngamma",
+                    "{name} ({ending:?}) is read with LF"
+                );
+
+                let result = EditTool
+                    .execute(
+                        &ws,
+                        json!({
+                            "path": name,
+                            "old_string": "beta\ngamma", // built from the reading
+                            "new_string": "beta\nGAMMA\nadded",
+                        }),
+                    )
+                    .await;
+                assert!(
+                    result.is_ok(),
+                    "{name} ({ending:?}): edit built from a read must land: {result:?}"
+                );
+                assert_eq!(
+                    file_bytes(dir.path(), name).await,
+                    format!("alpha{ending}beta{ending}GAMMA{ending}added{ending}").as_bytes(),
+                    "{name} ({ending:?}): the change landed, the untouched line kept \
+                     its bytes and the file kept its endings"
+                );
+            }
+        }
+    }
+
+    /// `multiple` has no whitespace-tolerant fallback, but line endings are not
+    /// whitespace: an `old_string` read from a CRLF file matches every
+    /// occurrence, and each written copy takes the file's ending.
+    #[tokio::test]
+    async fn crlf_multiple_mode_replaces_every_match() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(
+            dir.path().join("data.txt"),
+            b"item = 1\r\nkeep = 0\r\nitem = 1\r\nkeep = 0\r\n",
+        )
+        .await
+        .unwrap();
+        let ws = test_ws(dir.path());
+        assert_eq!(
+            read_view(&ws, "data.txt").await,
+            "item = 1\nkeep = 0\nitem = 1\nkeep = 0"
+        );
+
+        let result = EditTool
+            .execute(
+                &ws,
+                json!({
+                    "path": "data.txt",
+                    "old_string": "item = 1\nkeep = 0", // built from the reading
+                    "new_string": "item = 2\nkeep = 1",
+                    "multiple": true,
+                }),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "multiple mode must work on a CRLF file: {result:?}"
+        );
+        assert!(result.unwrap().contains("replaced 2 occurrences"));
+        assert_eq!(
+            file_bytes(dir.path(), "data.txt").await,
+            b"item = 2\r\nkeep = 1\r\nitem = 2\r\nkeep = 1\r\n".as_slice()
+        );
+    }
+
+    /// Surfaces that keep the carriage returns (a zoomed symbol, a redirected
+    /// command) hand the agent a CR-spelled `old_string`. It keeps matching,
+    /// and the text the edit writes still takes the file's ending.
+    #[tokio::test]
+    async fn old_string_spelled_with_carriage_returns_still_matches() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("zoom.txt"), b"one\r\ntwo\r\nthree\r\n")
+            .await
+            .unwrap();
+
+        let result = EditTool
+            .execute(
+                &test_ws(dir.path()),
+                json!({
+                    "path": "zoom.txt",
+                    "old_string": "one\r\ntwo",     // spelled with CRLF
+                    "new_string": "one\ntwo\nhalf", // spelled with LF
+                }),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "CR-spelled old_string must land: {result:?}"
+        );
+        assert_eq!(
+            file_bytes(dir.path(), "zoom.txt").await,
+            b"one\r\ntwo\r\nhalf\r\nthree\r\n".as_slice(),
+            "the written line took the file's CRLF, not the LF it was spelled with"
+        );
+    }
+
+    /// An LF file behaves exactly as it did before line endings were handled at
+    /// all, and a replacement spelled with CRLF puts no carriage return into it.
+    #[tokio::test]
+    async fn unix_endings_are_preserved_and_no_foreign_ending_is_introduced() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("unix.txt"), b"a\nb\nc\n")
+            .await
+            .unwrap();
+        let ws = test_ws(dir.path());
+
+        let result = EditTool
+            .execute(
+                &ws,
+                json!({"path": "unix.txt", "old_string": "b\nc", "new_string": "b\nC"}),
+            )
+            .await;
+        assert!(result.is_ok(), "multi-line edit: {result:?}");
+        assert_eq!(
+            file_bytes(dir.path(), "unix.txt").await,
+            b"a\nb\nC\n".as_slice()
+        );
+
+        let result = EditTool
+            .execute(
+                &ws,
+                json!({"path": "unix.txt", "old_string": "a\nb", "new_string": "a\r\nB"}),
+            )
+            .await;
+        assert!(result.is_ok(), "CRLF-spelled replacement: {result:?}");
+        assert_eq!(
+            file_bytes(dir.path(), "unix.txt").await,
+            b"a\nB\nC\n".as_slice(),
+            "an LF file stays LF"
+        );
+    }
+
+    /// A file whose endings are already mixed keeps that mixture everywhere the
+    /// edit did not reach; the text written into a line takes that line's ending.
+    #[tokio::test]
+    async fn mixed_endings_survive_outside_the_edit() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("mixed.txt"), b"head\nmid\r\ntail\n")
+            .await
+            .unwrap();
+
+        let result = EditTool
+            .execute(
+                &test_ws(dir.path()),
+                json!({"path": "mixed.txt", "old_string": "mid", "new_string": "mid\nmiddle"}),
+            )
+            .await;
+        assert!(result.is_ok(), "edit in a mixed file: {result:?}");
+        assert_eq!(
+            file_bytes(dir.path(), "mixed.txt").await,
+            b"head\nmid\r\nmiddle\r\ntail\n".as_slice(),
+            "the untouched LF line and CRLF pair kept their bytes; the written line \
+             took the CRLF of the line it was written into"
+        );
+    }
+
+    /// A `\r` that is not followed by `\n` is content, not an ending: it is
+    /// never converted, and it is not matched across.
+    #[tokio::test]
+    async fn lone_carriage_return_is_content() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("classic.txt"), b"a\rb\r\nc\r\n")
+            .await
+            .unwrap();
+        let ws = test_ws(dir.path());
+
+        let result = EditTool
+            .execute(
+                &ws,
+                json!({"path": "classic.txt", "old_string": "a\rb", "new_string": "a\rB"}),
+            )
+            .await;
+        assert!(result.is_ok(), "lone CR in old_string: {result:?}");
+        assert_eq!(
+            file_bytes(dir.path(), "classic.txt").await,
+            b"a\rB\r\nc\r\n".as_slice()
+        );
+
+        // A lone `\r` inside the replacement survives; only real endings are
+        // rewritten to the file's ending.
+        let result = EditTool
+            .execute(
+                &ws,
+                json!({"path": "classic.txt", "old_string": "c", "new_string": "c\rd\ne"}),
+            )
+            .await;
+        assert!(result.is_ok(), "lone CR in new_string: {result:?}");
+        assert_eq!(
+            file_bytes(dir.path(), "classic.txt").await,
+            b"a\rB\r\nc\rd\r\ne\r\n".as_slice()
+        );
+
+        // An LF-spelled pattern does not match across the lone CR.
+        let result = EditTool
+            .execute(
+                &ws,
+                json!({"path": "classic.txt", "old_string": "a\nb", "new_string": "x"}),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a lone CR is content, so it cannot be matched as an ending: {result:?}"
+        );
+    }
+
+    /// An edit that is a no-op once the endings are accounted for is rejected
+    /// as a no-op and leaves the file untouched — in either spelling.
+    #[tokio::test]
+    async fn edit_that_only_respells_endings_is_a_no_op() {
+        // The file's own CRLF, asked for with a read-spelled old_string and with
+        // a CR-spelled new_string alike: both edits are already satisfied.
+        for (name, old, new) in [
+            ("lf_spelling.txt", "a\r\nb", "a\nb"),
+            ("crlf_spelling.txt", "a\nb", "a\r\nb"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let before = b"a\r\nb\r\n".as_slice();
+            tokio::fs::write(dir.path().join(name), before)
+                .await
+                .unwrap();
+
+            let result = EditTool
+                .execute(
+                    &test_ws(dir.path()),
+                    json!({"path": name, "old_string": old, "new_string": new}),
+                )
+                .await;
+            let err = format!(
+                "{}",
+                result.expect_err("respelling the file's endings is a no-op")
+            );
+            assert!(err.contains("no change needed"), "{name}: {err}");
+            assert_eq!(file_bytes(dir.path(), name).await, before, "{name}");
+        }
+    }
+
+    /// Several places matching after the endings are ignored is an error, for
+    /// code and non-code files alike — the first match is never picked. The
+    /// pattern is multi-line and read-spelled, so it has no exact match at all.
+    #[tokio::test]
+    async fn line_ending_match_reports_ambiguity() {
+        for name in ["dup.txt", "dup.rs"] {
+            let dir = TempDir::new().unwrap();
+            tokio::fs::write(dir.path().join(name), b"x = 1\r\nkeep\r\nx = 1\r\nkeep\r\n")
+                .await
+                .unwrap();
+
+            let result = EditTool
+                .execute(
+                    &test_ws(dir.path()),
+                    json!({
+                        "path": name,
+                        "old_string": "x = 1\nkeep", // built from the reading
+                        "new_string": "x = 2\nkeep",
+                    }),
+                )
+                .await;
+            let err = format!("{}", result.expect_err("two matches are ambiguous"));
+            assert!(err.contains("matches 2 times"), "{name}: {err}");
+            assert!(err.contains("must match exactly once"), "{name}: {err}");
+            assert_eq!(
+                file_bytes(dir.path(), name).await,
+                b"x = 1\r\nkeep\r\nx = 1\r\nkeep\r\n".as_slice()
+            );
+        }
+    }
+
+    /// The line-ending tolerance is symmetric: a CR-spelled `old_string` also
+    /// matches content that has no carriage returns, and the file keeps its LF.
+    #[tokio::test]
+    async fn cr_spelled_old_string_matches_content_without_carriage_returns() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("unix.txt"), b"a\nb\n")
+            .await
+            .unwrap();
+
+        let result = EditTool
+            .execute(
+                &test_ws(dir.path()),
+                json!({"path": "unix.txt", "old_string": "a\r\nb", "new_string": "a\nB"}),
+            )
+            .await;
+        assert!(result.is_ok(), "CR-spelled old on an LF file: {result:?}");
+        assert_eq!(
+            file_bytes(dir.path(), "unix.txt").await,
+            b"a\nB\n".as_slice()
+        );
+    }
+
+    /// The written text takes the ending of the line it is written into; over a
+    /// final line the file left unterminated it takes the file's prevailing
+    /// ending instead.
+    #[tokio::test]
+    async fn written_text_takes_the_files_ending() {
+        // A whole line of a CRLF file.
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("mid.txt"), b"one two\r\nthree\r\n")
+            .await
+            .unwrap();
+        let ws = test_ws(dir.path());
+
+        let result = EditTool
+            .execute(
+                &ws,
+                json!({"path": "mid.txt", "old_string": "ne", "new_string": "NE\nline"}),
+            )
+            .await;
+        assert!(result.is_ok(), "mid-word edit: {result:?}");
+        assert_eq!(
+            file_bytes(dir.path(), "mid.txt").await,
+            b"oNE\r\nline two\r\nthree\r\n".as_slice()
+        );
+
+        // A last line with no ending of its own.
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("tail.txt"), b"a\r\nb")
+            .await
+            .unwrap();
+
+        let result = EditTool
+            .execute(
+                &test_ws(dir.path()),
+                json!({"path": "tail.txt", "old_string": "b", "new_string": "b\nx"}),
+            )
+            .await;
+        assert!(result.is_ok(), "unterminated last line: {result:?}");
+        assert_eq!(
+            file_bytes(dir.path(), "tail.txt").await,
+            b"a\r\nb\r\nx".as_slice()
+        );
+    }
+
+    /// Over a file with no ending at all the written text is left as it is
+    /// spelled.
+    #[tokio::test]
+    async fn a_file_with_no_ending_gets_the_text_as_written() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("oneline"), b"abc")
+            .await
+            .unwrap();
+
+        let result = EditTool
+            .execute(
+                &test_ws(dir.path()),
+                json!({"path": "oneline", "old_string": "b", "new_string": "x\ny\r\nz"}),
+            )
+            .await;
+        assert!(result.is_ok(), "single-line file: {result:?}");
+        assert_eq!(
+            file_bytes(dir.path(), "oneline").await,
+            b"ax\ny\r\nzc".as_slice()
+        );
+    }
+
+    /// A pattern that starts on the `\n` of a `\r\n` pair leaves that pair's
+    /// `\r` outside the match. The written text must not then bring its own
+    /// carriage return — which would strand the pair's `\r` as content — while
+    /// its other line breaks still take the file's ending.
+    #[tokio::test]
+    async fn pattern_starting_on_the_lf_of_a_crlf_pair_stays_on_crlf() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("pair.txt"), b"alpha\r\nbeta\r\ngamma\r\n")
+            .await
+            .unwrap();
+
+        let result = EditTool
+            .execute(
+                &test_ws(dir.path()),
+                json!({
+                    "path": "pair.txt",
+                    "old_string": "\nbeta",
+                    "new_string": "\nBETA\ninserted",
+                }),
+            )
+            .await;
+        assert!(result.is_ok(), "pattern starting on a bare LF: {result:?}");
+        assert_eq!(
+            file_bytes(dir.path(), "pair.txt").await,
+            b"alpha\r\nBETA\r\ninserted\r\ngamma\r\n".as_slice()
+        );
+    }
+
+    /// A pattern that is nothing but a line break removes the whole ending —
+    /// rather than leaving the carriage return of a `\r\n` pair behind as
+    /// content — so a CRLF file and its LF twin give the same visible text.
+    #[tokio::test]
+    async fn deleting_a_line_break_removes_the_whole_ending() {
+        for (name, ending) in [("unix.txt", "\n"), ("windows.txt", "\r\n")] {
+            let dir = TempDir::new().unwrap();
+            tokio::fs::write(dir.path().join(name), format!("a{ending}b"))
+                .await
+                .unwrap();
+
+            let result = EditTool
+                .execute(
+                    &test_ws(dir.path()),
+                    json!({"path": name, "old_string": "\n", "new_string": " "}),
+                )
+                .await;
+            assert!(result.is_ok(), "{name}: deleting a line break: {result:?}");
+            assert_eq!(
+                file_bytes(dir.path(), name).await,
+                b"a b".as_slice(),
+                "{name}: the ending went with the line break it spelled"
+            );
+        }
+    }
+
+    /// A whitespace-driven no-op is still written as a no-op: the guard for an
+    /// edit that only respelled its line endings must not catch it.
+    #[tokio::test]
+    async fn whitespace_driven_no_op_still_succeeds() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("lib.rs"), b"a  b\n")
+            .await
+            .unwrap();
+
+        let result = EditTool
+            .execute(
+                &test_ws(dir.path()),
+                json!({"path": "lib.rs", "old_string": "a b", "new_string": "a  b"}),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "the whitespace fallback may replace a span with its own text: {result:?}"
+        );
+        assert_eq!(file_bytes(dir.path(), "lib.rs").await, b"a  b\n".as_slice());
+    }
+
+    /// The line-ending tolerance does not hand whitespace tolerance to file
+    /// types that never had it.
+    #[tokio::test]
+    async fn line_ending_tolerance_is_not_whitespace_tolerance() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("readme.txt"), b"a  b\r\nc\r\n")
+            .await
+            .unwrap();
+
+        let result = EditTool
+            .execute(
+                &test_ws(dir.path()),
+                json!({"path": "readme.txt", "old_string": "a b", "new_string": "a+b"}),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a .txt file still gets no whitespace tolerance: {result:?}"
+        );
+    }
+
+    /// In a code file the whitespace fallback still fires for a spacing
+    /// difference, and the text it writes takes the file's ending.
+    #[tokio::test]
+    async fn whitespace_fallback_in_a_crlf_code_file_keeps_the_ending() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(
+            dir.path().join("lib.rs"),
+            b"let  x  =  1;\r\nlet  y  =  2;\r\n",
+        )
+        .await
+        .unwrap();
+
+        let result = EditTool
+            .execute(
+                &test_ws(dir.path()),
+                json!({
+                    "path": "lib.rs",
+                    "old_string": "let x = 1;\nlet y = 2;", // spacing and endings differ
+                    "new_string": "let x = 42;\nlet y = 2;",
+                }),
+            )
+            .await;
+        assert!(result.is_ok(), "whitespace fallback: {result:?}");
+        assert_eq!(
+            file_bytes(dir.path(), "lib.rs").await,
+            b"let x = 42;\r\nlet y = 2;\r\n".as_slice()
+        );
     }
 }
