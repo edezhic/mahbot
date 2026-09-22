@@ -1,6 +1,5 @@
 //! Backed by `fff-search` — an indexed search engine with fuzzy file
-//! name matching, content grep, frecency ranking, constraint filtering,
-//! and pagination.
+//! name matching, content grep, constraint filtering, and pagination.
 //!
 //! All agents searching the same workspace share a single engine instance
 //! managed by [`crate::search_engine`]. Background scanning starts eagerly.
@@ -198,7 +197,7 @@ fn resolve_query(args: &serde_json::Value) -> Option<String> {
 async fn resolve_workspace_engine(
     ws: &crate::Workspace,
 ) -> anyhow::Result<std::sync::Arc<search_engine::SearchEngineEntry>> {
-    search_engine::resolve_engine(&ws.name, &ws.path, "", ws.ephemeral)
+    search_engine::resolve_engine(&ws.name, &ws.path, "")
         .await
         .map_err(|e| anyhow::anyhow!(e))
 }
@@ -249,20 +248,15 @@ impl SearchTool {
         let fff_query = parse_grep_query(query);
         let search_opts = FuzzySearchOptions {
             max_threads: 4,
-            current_file: None,
-            project_path: None,
-            combo_boost_score_multiplier: 10,
-            min_combo_count: 2,
             pagination: fff_search::PaginationArgs {
                 offset,
                 limit: max_results,
             },
+            ..Default::default()
         };
         let guard = entry.picker.read().unwrap();
         let picker = guard.as_ref().unwrap();
-        let qt_guard = entry.query_tracker.read().unwrap();
-        let qt_ref = qt_guard.as_ref();
-        let result = picker.fuzzy_search(&fff_query, qt_ref, search_opts);
+        let result = picker.fuzzy_search(&fff_query, None, search_opts);
         let paths = result
             .items
             .iter()

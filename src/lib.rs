@@ -254,12 +254,6 @@ pub struct Workspace {
     /// `None` if the workspace is not a git repository or has no commits.
     /// Used by the nightly re-analysis check to detect new commits.
     pub last_analyzed_commit: Option<String>,
-    /// Ephemeral per-run workspace (research run roots): never registered in
-    /// the `workspaces` table, created on the fly for a single run's lifetime.
-    /// Ephemeral workspaces get local handling in shared tool paths — e.g.
-    /// the per-run query tracker lives inside the run folder instead of
-    /// `~/.mahbot/search/`.
-    pub ephemeral: bool,
 }
 
 impl Default for Workspace {
@@ -274,7 +268,6 @@ impl Default for Workspace {
             diagnostics: Option::default(),
             notes: String::default(),
             last_analyzed_commit: Option::default(),
-            ephemeral: bool::default(),
         }
     }
 }
@@ -315,16 +308,15 @@ impl Workspace {
         last_path_component(self.as_path())
     }
 
-    /// Create an ephemeral per-run workspace (research run roots). `name`
-    /// becomes the search-engine registry key (e.g. the research `job_id`);
-    /// the workspace is never registered in the `workspaces` table and its lifetime
-    /// is bounded by the run it serves.
+    /// Create a per-run workspace (research run roots, the temp cleaner).
+    /// `name` becomes the search-engine registry key (e.g. the research
+    /// `job_id`); the workspace is never registered in the `workspaces` table
+    /// and its lifetime is bounded by the run it serves.
     #[must_use]
     pub fn ephemeral_run(name: &str, path: &Path) -> Self {
         Self {
             name: name.to_string(),
             path: stored_workspace_path(path).to_string_lossy().to_string(),
-            ephemeral: true,
             ..Default::default()
         }
     }

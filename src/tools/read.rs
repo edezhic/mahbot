@@ -1878,8 +1878,7 @@ mod tests {
     /// the 'annotated but not attached' gap.
     #[tokio::test]
     async fn recovered_image_path_is_attached() {
-        // The fuzzy search needs the global search-engine registry plus a
-        // configured storage root (for the persistent query tracker).
+        // The fuzzy search needs the global search-engine registry.
         crate::util::test::init_test_stores().await;
 
         let dir = TempDir::new().unwrap();

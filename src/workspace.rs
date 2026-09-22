@@ -959,7 +959,6 @@ fn workspace_from_row(row: &db::Row) -> anyhow::Result<Workspace> {
         diagnostics: row.get::<Option<String>>(COL_WS_DIAGNOSTICS)?,
         notes: row.get::<String>(COL_WS_NOTES)?,
         last_analyzed_commit: row.get::<Option<String>>(COL_WS_LAST_ANALYZED_COMMIT)?,
-        ephemeral: false,
     })
 }
 
@@ -1026,7 +1025,7 @@ impl WorkspaceStore {
         clear_pending_pickup_cooldown(name);
         // Eagerly initialize the shared search engine for this workspace.
         if let Err(e) =
-            crate::search_engine::get_or_init_engine(name, std::path::Path::new(&ws.path), false)
+            crate::search_engine::get_or_init_engine(name, std::path::Path::new(&ws.path))
         {
             tracing::warn!(workspace_name = name, error = %e, "Failed to init search engine on workspace add");
         }
@@ -1913,7 +1912,6 @@ mod tests {
             diagnostics: None,
             notes: String::new(),
             last_analyzed_commit: None,
-            ephemeral: false,
         }
     }
 

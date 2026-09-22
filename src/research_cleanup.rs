@@ -7,9 +7,7 @@
 //! `<temp_dir()>/mahbot-research/{job_id}` — inside the readonly-shell's
 //! allowed temp roots, so analysts can write scratch files there. The folder
 //! is created idempotently at dispatch AND boot resume (a resume recreates it
-//! when it is gone; lost prototypes are fail-open). The run's
-//! ephemeral search tracker also lives inside the folder (see
-//! `crate::search_engine`), so everything temporary dies with it.
+//! when it is gone; lost prototypes are fail-open).
 //!
 //! The folder is removed via [`release_run_folder`], the single run-folder
 //! release point, invoked per-job (never as a sweep) from the completion tail
@@ -145,8 +143,7 @@ pub(crate) async fn command_dump_exists(job_id: &str) -> bool {
 
 /// Release a run's per-run folder and its search-engine state — the SOLE
 /// run-folder deleter now that the sweeps are gone. Search-engine registry
-/// entry first (drops the picker + LMDB tracker handles), then the whole
-/// folder (the ephemeral search tracker lives inside it and dies with it).
+/// entry first (drops the picker), then the whole folder.
 ///
 /// Called by the completion tail ([`run_cleanup_agent_and_finish`], folder
 /// before row terminalize) and the cancel sweep
@@ -171,7 +168,7 @@ pub(crate) async fn release_run_folder(job_id: &str) {
     let path = run_root_path(job_id);
     match tokio::fs::remove_dir_all(&path).await {
         Ok(()) => {}
-        // The tracker/folder only exists when the run actually created it.
+        // The folder only exists when the run actually created it.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             tracing::warn!(job = %job_id, error = %e, "Run-folder release: folder removal failed — left for the OS");

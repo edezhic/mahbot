@@ -861,9 +861,7 @@ async fn register_watch_task(name: String, path: String) -> Result<WatchId, Stri
     tokio::task::spawn_blocking(move || {
         let entry = match crate::search_engine::get_engine_by_name(&name) {
             Some(entry) => entry,
-            None => {
-                crate::search_engine::get_or_init_engine(&name, std::path::Path::new(&path), false)?
-            }
+            None => crate::search_engine::get_or_init_engine(&name, std::path::Path::new(&path))?,
         };
         if !entry.picker.wait_for_watcher(WATCH_READY_WAIT) {
             return Err(format!(

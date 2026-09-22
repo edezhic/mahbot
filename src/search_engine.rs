@@ -1,16 +1,14 @@
 //! Shared per-workspace search engine registry.
 //!
-//! Each workspace gets a single [`SharedFilePicker`] + [`SharedQueryTracker`] pair that all
-//! agents share. Background filesystem scanning begins eagerly when a workspace
-//! is registered (on app startup or workspace add). Query tracking persists on
-//! disk via `open_persistent_query_tracker` (with an in-memory fallback), and
-//! `ensure_scanned` gates searches on scan readiness.
+//! Each workspace gets a single [`SharedFilePicker`] that all agents share.
+//! Background filesystem scanning begins eagerly when a workspace is
+//! registered (on app startup or workspace add), and `ensure_scanned` gates
+//! searches on scan readiness.
 
-use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
+use fff_search::FilePicker;
 use fff_search::file_picker::{FFFMode, FilePickerOptions};
-use fff_search::shared::{SharedFilePicker, SharedFrecency, SharedQueryTracker};
-use fff_search::{FilePicker, QueryTracker};
+use fff_search::shared::{SharedFilePicker, SharedFrecency};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -55,9 +53,6 @@ pub(crate) fn registry_initialized() -> bool {
 pub(crate) struct SearchEngineEntry {
     /// Shared file picker used for both `files` and `grep` modes.
     pub picker: SharedFilePicker,
-    /// Persistent query tracker for combo-boost scoring.
-    /// Falls back to in-memory if the LMDB database cannot be opened.
-    pub query_tracker: SharedQueryTracker,
 }
 
 // ── Initialization ────────────────────────────────────────────────────────
@@ -65,18 +60,13 @@ pub(crate) struct SearchEngineEntry {
 /// Get or initialize the shared search engine for a workspace.
 ///
 /// On first access, this creates the [`FilePicker`] and spawns a background
-/// filesystem scan via [`FilePicker::new_with_shared_state`]. The persistent
-/// query tracker database is also opened (or falls back to in-memory).
-///
-/// `ephemeral` marks per-run workspaces (the research coder's run folder): their
-/// query tracker lives inside the run folder instead of `~/.mahbot/search/`.
+/// filesystem scan via [`FilePicker::new_with_shared_state`].
 ///
 /// Returns a cloneable handle. Multiple callers racing on first access are
 /// serialized by the registry write lock — only one engine is created.
 pub(crate) fn get_or_init_engine(
     name: &str,
     path: &Path,
-    ephemeral: bool,
 ) -> Result<Arc<SearchEngineEntry>, String> {
     // Fast path: read-lock check.
     {
@@ -87,7 +77,7 @@ pub(crate) fn get_or_init_engine(
     }
 
     // Slow path: serialise creation under the write lock so that two
-    // concurrent callers never create duplicate scans/query-tracker DBs.
+    // concurrent callers never create duplicate scans.
     let mut reg = registry().write().unwrap_poison();
 
     // Double-check: another writer may have inserted while we waited.
@@ -95,20 +85,15 @@ pub(crate) fn get_or_init_engine(
         return Ok(Arc::clone(existing));
     }
 
-    let entry = Arc::new(init_engine_for_workspace(name, path, ephemeral)?);
+    let entry = Arc::new(init_engine_for_workspace(name, path)?);
     reg.insert(name.to_string(), Arc::clone(&entry));
     Ok(entry)
 }
 
 /// Initialize the search engine for a workspace without touching the registry.
 ///
-/// Handles persistent query tracker setup with fallback, creates the
-/// `FilePicker`, and spawns the background scan.
-fn init_engine_for_workspace(
-    name: &str,
-    path: &Path,
-    ephemeral: bool,
-) -> Result<SearchEngineEntry, String> {
+/// Creates the `FilePicker` and spawns the background scan.
+fn init_engine_for_workspace(name: &str, path: &Path) -> Result<SearchEngineEntry, String> {
     if !path.exists() {
         return Err(format!(
             "Workspace directory does not exist: {}",
@@ -117,21 +102,6 @@ fn init_engine_for_workspace(
     }
 
     let picker = SharedFilePicker::default();
-    let frecency = SharedFrecency::default();
-
-    // Try to open persistent query tracker DB; fall back to in-memory
-    let query_tracker = match open_persistent_query_tracker(name, path, ephemeral) {
-        Ok(qt) => qt,
-        Err(e) => {
-            tracing::warn!(
-                workspace_name = name,
-                error = %e,
-                "Failed to open persistent query tracker — using in-memory fallback"
-            );
-            SharedQueryTracker::default()
-        }
-    };
-
     let options = FilePickerOptions {
         base_path: path.to_string_lossy().to_string(),
         enable_mmap_cache: false,
@@ -144,7 +114,11 @@ fn init_engine_for_workspace(
         cache_budget: None,
     };
 
-    FilePicker::new_with_shared_state(picker.clone(), frecency, options)
+    // The picker requires a frecency handle. Nothing in the product ever
+    // records file visits, so ranking stays fuzzy-match-quality only, and the
+    // disabled handle guarantees no frecency store can be opened per workspace
+    // (`init` is a no-op on it).
+    FilePicker::new_with_shared_state(picker.clone(), SharedFrecency::noop(), options)
         .map_err(|e| format!("Failed to create search engine: {e}"))?;
 
     tracing::info!(
@@ -153,60 +127,7 @@ fn init_engine_for_workspace(
         "Search engine created — background scan started"
     );
 
-    Ok(SearchEngineEntry {
-        picker,
-        query_tracker,
-    })
-}
-
-/// Open a persistent [`QueryTracker`] database.
-///
-/// Real workspaces: `~/.mahbot/search/{workspace_name}/queries/` — durable
-/// combo-boost data that survives restarts. Parent directories are created if
-/// necessary.
-///
-/// Ephemeral per-run workspaces (the research coder's run folder): the tracker
-/// lives at `{workspace_path}/.queries` — dot-prefixed INSIDE the run folder in
-/// the pinned temp root, so everything temporary lives in temp. The leading
-/// dot keeps it out of the run folder's own fff-search index: the run folder
-/// is a non-git root, so the walkers skip hidden entries and the per-dir
-/// (Linux) watcher never subscribes to a hidden dir; on macOS the recursive
-/// FSEvents stream may still deliver write events, but the LMDB files are
-/// binary-classified (excluded from content/grep matches). It dies with the
-/// folder (released by the run's cleanup flow); a resume after the folder was
-/// lost recreates it empty, while a surviving folder re-opens the surviving
-/// LMDB — a fail-open ranking cache.
-fn open_persistent_query_tracker(
-    workspace_name: &str,
-    workspace_path: &Path,
-    ephemeral: bool,
-) -> Result<SharedQueryTracker, String> {
-    let db_path = if ephemeral {
-        workspace_path.join(".queries")
-    } else {
-        CONFIG
-            .global_storage_root()
-            .join("search")
-            .join(workspace_name)
-            .join("queries")
-    };
-
-    std::fs::create_dir_all(&db_path).map_err(|e| {
-        format!(
-            "Failed to create query tracker dir {}: {e}",
-            db_path.display()
-        )
-    })?;
-
-    let tracker = QueryTracker::open(&db_path)
-        .map_err(|e| format!("Failed to open QueryTracker at {}: {e}", db_path.display()))?;
-
-    let shared = SharedQueryTracker::default();
-    shared
-        .init(tracker)
-        .map_err(|e| format!("Failed to init shared query tracker: {e}"))?;
-
-    Ok(shared)
+    Ok(SearchEngineEntry { picker })
 }
 
 // ── Scan readiness ────────────────────────────────────────────────────────
@@ -253,15 +174,13 @@ async fn ensure_scanned(entry: &SearchEngineEntry) -> Result<(), String> {
 ///
 /// `scan_error_prefix` is prepended to scan-readiness errors only; the
 /// editor's run path passes `"Search engine not ready: "` while other callers
-/// pass `""` to keep the raw error. `ephemeral` is passed through to
-/// [`get_or_init_engine`] (per-run trackers live inside the run folder).
+/// pass `""` to keep the raw error.
 pub(crate) async fn resolve_engine(
     name: &str,
     path: &str,
     scan_error_prefix: &str,
-    ephemeral: bool,
 ) -> Result<Arc<SearchEngineEntry>, String> {
-    let entry = get_or_init_engine(name, Path::new(path), ephemeral)?;
+    let entry = get_or_init_engine(name, Path::new(path))?;
     ensure_scanned(&entry)
         .await
         .map_err(|e| format!("{scan_error_prefix}{e}"))?;
@@ -283,13 +202,6 @@ pub(crate) fn get_engine_by_name(name: &str) -> Option<Arc<SearchEngineEntry>> {
 /// Dropping the last [`Arc<SearchEngineEntry>`] will drop the underlying
 /// [`SharedFilePicker`], which triggers the background scan's cancellation
 /// flag and cleans up any associated threads.
-///
-/// The persistent query tracker LMDB directory is **not** deleted here — that
-/// would require closing the LMDB environment while no readers are active,
-/// which is tricky across threads. Real-workspace trackers stay in
-/// `~/.mahbot/search` (durable combo-boost data); ephemeral per-run trackers
-/// live inside the run folder, which the caller removes after dropping the
-/// engine (see `crate::research_cleanup::release_run_folder`).
 pub(crate) fn remove_engine(workspace_name: &str) {
     let mut reg = registry().write().unwrap_poison();
     if let Some(entry) = reg.remove(workspace_name) {
@@ -313,7 +225,7 @@ pub async fn init_all_engines() {
     };
 
     for ws in &workspaces {
-        match get_or_init_engine(&ws.name, Path::new(&ws.path), false) {
+        match get_or_init_engine(&ws.name, Path::new(&ws.path)) {
             Ok(_) => { /* scan started */ }
             Err(e) => {
                 tracing::warn!(

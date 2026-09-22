@@ -1287,23 +1287,19 @@ async fn run_global_search(
     tokio::time::sleep(Duration::from_millis(GLOBAL_SEARCH_DEBOUNCE_MS)).await;
 
     // Step 2: Get or init the search engine.
-    let entry = match crate::search_engine::resolve_engine(
-        &ws_name,
-        &ws_path,
-        "Search engine not ready: ",
-        false,
-    )
-    .await
-    {
-        Ok(e) => e,
-        Err(e) => {
-            return EditorMessage::GlobalSearchResults {
-                r#gen: gs_gen,
-                results: Vec::new(),
-                error: Some(e),
-            };
-        }
-    };
+    let entry =
+        match crate::search_engine::resolve_engine(&ws_name, &ws_path, "Search engine not ready: ")
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                return EditorMessage::GlobalSearchResults {
+                    r#gen: gs_gen,
+                    results: Vec::new(),
+                    error: Some(e),
+                };
+            }
+        };
 
     // Step 3: Run grep on the blocking thread pool.
     let entry_for_blocking = Arc::clone(&entry);
@@ -3070,7 +3066,7 @@ impl EditorState {
         // Start scanning the search engine and show readiness status.
         let engine_task = Task::perform(
             async move {
-                match crate::search_engine::resolve_engine(&ws_name, &ws_path, "", false).await {
+                match crate::search_engine::resolve_engine(&ws_name, &ws_path, "").await {
                     Ok(_) => EditorMessage::GlobalSearchResults {
                         r#gen: gs_gen,
                         results: Vec::new(),
