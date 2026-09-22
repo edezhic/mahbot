@@ -3381,19 +3381,114 @@ fn shared_workspace_options(map: &HashMap<String, Workspace>) -> Vec<widgets::Pi
         .collect()
 }
 
-/// Open a URL in the system browser (fire-and-forget).
+/// Open an address with the platform's own handler (fire-and-forget).
+///
+/// The address is handed over as data — never to something that reads it as a
+/// command line.
 fn open_url(url: &str) {
-    let _ = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).spawn()
-    } else if cfg!(target_os = "linux") {
-        std::process::Command::new("xdg-open").arg(url).spawn()
-    } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/c", "start", url])
-            .spawn()
-    } else {
+    #[cfg(target_os = "windows")]
+    shell_open(url);
+
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+
+    // No other target has a handler to reach; this keeps `url` used there.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let _ = url;
+}
+
+/// Hand an address to the Windows shell as a *data* argument.
+///
+/// `ShellExecuteExW` resolves the address against the registered protocol and
+/// file associations, and takes it whole in `lpFile`, with `lpParameters` NULL
+/// and `lpVerb` NULL (the system's default verb for the item — forcing `open`
+/// would change what some addresses do). The address is therefore one opaque
+/// value: `&`, `^`, `%`, `"`, `?`, `|` or a space in it is data, never a command,
+/// a second command or an argument of one. `SEE_MASK_DOENVSUBST` is left out of
+/// `fMask` too, so the shell does not expand a `%NAME%`-shaped address either.
+///
+/// The launch runs on a throw-away thread because `ShellExecuteExW` is a
+/// synchronous shell call and `open_url` is called on the iced event-loop thread,
+/// which must not wait on the shell. The thread is detached, so a process that
+/// exits right after the click takes the launch with it.
+///
+/// An empty or whitespace-only address is not an address: it never reaches the
+/// shell, because there is nothing to open and nothing may be launched for one.
+#[cfg(target_os = "windows")]
+fn shell_open(address: &str) {
+    if address.trim().is_empty() {
         return;
+    }
+    let address = address.to_owned();
+    // The NUL-terminated UTF-16 spelling the Win32 API takes; an interior NUL in
+    // the address would end the string the shell sees there.
+    let mut wide: Vec<u16> = address.encode_utf16().collect();
+    wide.push(0);
+    let spawned = std::thread::Builder::new()
+        .name("shell-open".to_owned())
+        .spawn(move || {
+            if let Some(code) = shell_execute_address(&wide) {
+                tracing::warn!(%address, code, "ShellExecuteExW did not open the address");
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "Failed to spawn the thread that opens an address");
+    }
+}
+
+/// One `ShellExecuteExW` call for the NUL-terminated UTF-16 `address`, on a
+/// thread whose COM apartment has just been initialised for it. Returns the
+/// `GetLastError` code when the shell did not open the address.
+///
+/// The apartment is the single-threaded one the API documents for itself (some
+/// of the shell extensions it may activate require it). `SEE_MASK_NOASYNC` is
+/// the one `fMask` flag the call needs: the API requires it of a caller without
+/// a message loop that does not outlive the call. No `SEE_MASK_*` suppression
+/// flag is set — whatever the shell shows for an address it cannot open is its
+/// own, and the `GetLastError` code is logged alongside it.
+#[cfg(target_os = "windows")]
+fn shell_execute_address(address: &[u16]) -> Option<u32> {
+    use windows_sys::Win32::Foundation::{FALSE, GetLastError};
+    use windows_sys::Win32::System::Com::{
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
     };
+    use windows_sys::Win32::UI::Shell::{SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    // `CoInitializeEx` takes the flags as an unsigned word, while `windows-sys`
+    // types the constants as the signed `COINIT` alias.
+    let coinit = u32::try_from(COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
+        .expect("COINIT flags are small positives");
+    // SAFETY: `pv_reserved` is required to be null, and the apartment is the one
+    // the API's own documentation names.
+    let apartment = unsafe { CoInitializeEx(std::ptr::null(), coinit) };
+    // SAFETY: all-zero is this struct's "nothing optional set" form. `cbSize`,
+    // `fMask`, `lpVerb`, `lpFile`, `lpParameters` and `nShow` are written below;
+    // every remaining member is an output, or an optional input whose NULL/zero
+    // means "not set".
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>())
+        .expect("shell execute info fits in u32");
+    info.fMask = SEE_MASK_NOASYNC;
+    info.lpVerb = std::ptr::null();
+    info.lpFile = address.as_ptr();
+    info.lpParameters = std::ptr::null();
+    info.nShow = SW_SHOWNORMAL;
+    // SAFETY: `info` is fully initialised and its `lpFile` borrows `address`,
+    // which outlives the call.
+    let failed = unsafe { ShellExecuteExW(&raw mut info) } == FALSE;
+    // SAFETY: `GetLastError` takes no arguments, and it is read before any other
+    // call can overwrite the error the failed launch set.
+    let code = failed.then(|| unsafe { GetLastError() });
+    if apartment >= 0 {
+        // SAFETY: pairs with the successful `CoInitializeEx` above, on the same
+        // thread.
+        unsafe { CoUninitialize() };
+    }
+    code
 }
 
 #[cfg(test)]
