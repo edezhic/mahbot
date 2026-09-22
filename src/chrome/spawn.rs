@@ -145,6 +145,8 @@ fn build_argv(args: &[&str], json: bool, session: Option<&str>) -> Vec<String> {
 /// [`CliRun::SpawnFailure`].
 pub(crate) async fn spawn_cli(spec: CliSpawn<'_>) -> CliRun {
     let mut cmd = Command::new(spec.path);
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     ensure_chrome_env(&mut cmd);
     apply_chrome_deadline(&mut cmd, spec.chrome_deadline);
     cmd.args(build_argv(spec.args, spec.json, spec.session));

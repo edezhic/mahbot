@@ -576,6 +576,8 @@ pub(crate) async fn cli_probe() -> CliStatus {
         return CliStatus::Missing;
     };
     let mut cmd = Command::new(&path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     ensure_chrome_env(&mut cmd);
     cmd.arg("--version")
         .stdout(Stdio::null())
@@ -645,6 +647,8 @@ fn release_asset_name() -> Result<String, String> {
 pub(crate) async fn cli_version() -> Option<semver::Version> {
     let path = cli_path()?;
     let mut cmd = Command::new(&path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     ensure_chrome_env(&mut cmd);
     cmd.arg("--version")
         .stdout(Stdio::piped())
@@ -914,6 +918,7 @@ async fn pgrep_running(pattern: &str) -> Option<bool> {
 #[cfg(target_os = "windows")]
 async fn tasklist_has(name: &str) -> Option<bool> {
     let mut cmd = Command::new("tasklist");
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     cmd.args(["/FI", &format!("IMAGENAME eq {name}"), "/NH", "/FO", "CSV"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1751,6 +1756,8 @@ pub(crate) async fn install_chrome_use() -> Result<(), String> {
     // flow. Supported since chrome-use v1.5.93; the binary is always freshly
     // downloaded so the flag is always available.
     let mut host = Command::new(&dest);
+    #[cfg(target_os = "windows")]
+    host.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     host.args(["extension", "install", "--no-profile"]);
     match run_install_step("`chrome-use extension install --no-profile`", host).await {
         Ok(()) => Ok(()),
@@ -2125,11 +2132,12 @@ fn chrome_binary() -> Option<PathBuf> {
     }
 }
 
-/// Spawn Chrome detached from mahbot: own process group on Unix (terminal
-/// signals to mahbot's group must not kill the browser), detached/no-window
-/// creation flags on Windows (mirrors self_update.rs:1428-1434). The child is
-/// deliberately dropped without wait or kill_on_drop — Chrome must survive
-/// mahbot restarts.
+/// Spawn Chrome independent of mahbot: the child leads its own process group on
+/// Unix, so terminal signals to mahbot's group must not kill the browser, and on
+/// Windows it gets the same windowless-console flag as every other spawn (inert
+/// for this GUI image — see the window guarantee in `tools::shell::tree`). The
+/// child is deliberately dropped without wait or kill_on_drop — Chrome must
+/// survive mahbot restarts.
 fn spawn_chrome_detached(binary: &Path) -> std::io::Result<()> {
     let mut cmd = std::process::Command::new(binary);
     cmd.args(CHROME_LAUNCH_FLAGS)
@@ -2142,12 +2150,10 @@ fn spawn_chrome_detached(binary: &Path) -> std::io::Result<()> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
     cmd.spawn().map(|_| ())
 }
@@ -2346,6 +2352,8 @@ async fn run_cli(args: &[&str]) -> bool {
         return false;
     };
     let mut cmd = Command::new(path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     ensure_chrome_env(&mut cmd);
     cmd.args(args)
         .stdout(std::process::Stdio::null())

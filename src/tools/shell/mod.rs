@@ -192,10 +192,6 @@ pub(crate) fn apply_safe_env(cmd: &mut tokio::process::Command) {
     }
 }
 
-/// Windows: create the child without a console window.
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
 /// Build a [`tokio::process::Command`] for executing a shell command in the
 /// workspace root. The environment is cleared and re-populated from
 /// [`SAFE_ENV_VARS`] only — no parent-process environment is inherited. This
@@ -247,7 +243,7 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
         // switch"): its quote processing strips that pair, so the command
         // arrives verbatim — whatever quotes it carries of its own.
         p.raw_arg(format!("/C \"{command}\""));
-        p.creation_flags(CREATE_NO_WINDOW);
+        p.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
         p
     };
 
@@ -274,7 +270,7 @@ fn build_program_command(
         process.process_group(0);
     }
     #[cfg(target_os = "windows")]
-    process.creation_flags(CREATE_NO_WINDOW);
+    process.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     finalize_command(&mut process, workspace_root);
     process
 }

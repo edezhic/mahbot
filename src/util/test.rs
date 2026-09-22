@@ -26,10 +26,10 @@
 //!
 //! Also provides [`seed_session_row`], a session-seeding helper shared by the
 //! analyze/implement tool tests (it exists because the session store's
-//! `batch_append` is `session`-module private).
-//!
-//! Also provides [`ProbeFile`], a self-removing probe file for the tests that
-//! author a tool into a shared catalogue folder.
+//! `batch_append` is `session`-module private); [`ProbeFile`], a self-removing
+//! probe file for the tests that author a tool into a shared catalogue folder;
+//! and [`rs_files_under`] with [`rel_source_path`], the file list and the
+//! relative-path spelling the source-scanning tripwires walk.
 
 #![cfg(test)]
 
@@ -1174,6 +1174,46 @@ pub(crate) fn init_temp_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     assert!(status.success());
 
     (dir, repo_path)
+}
+
+/// Every `.rs` file under `dir`, recursively, in directory-walk order — the file
+/// list the source-scanning tripwires walk (`db`'s raw-builder guard and
+/// `tools::shell::tree`'s window guarantee).
+///
+/// # Panics
+///
+/// Panics if `dir` cannot be read.
+pub(crate) fn rs_files_under(dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read source directory") {
+            let path = entry.expect("read directory entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    walk(dir, &mut files);
+    files
+}
+
+/// Where a source file sits relative to `manifest_dir`, spelled with `/`
+/// separators — how the tripwires compare a walked file against their literal
+/// lists, so the comparison does not depend on the host's separators.
+///
+/// # Panics
+///
+/// Panics if `file` is not under `manifest_dir`.
+pub(crate) fn rel_source_path(manifest_dir: &Path, file: &Path) -> String {
+    file.strip_prefix(manifest_dir)
+        .expect("source files live under the manifest dir")
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 // ── EnvVarGuard tests ─────────────────────────────────────────────────

@@ -219,6 +219,8 @@ fn inject_safe_directory(cmd: &mut tokio::process::Command, repo_path: &Path) {
 /// and then spawn or execute the command.
 fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("git");
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     apply_safe_env(&mut cmd);
     cmd.env("LC_ALL", "C");
     if let Some(path) = repo_root {

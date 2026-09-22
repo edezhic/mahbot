@@ -872,13 +872,13 @@ fn probe_engine() -> bool {
         .arg("--probe")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    // No console window for the probe child (the daemon also has none).
     // `creation_flags` is a Windows-only API, so this — unlike every platform
-    // *decision* in this module tree — has to be a `cfg`.
+    // *decision* in this module tree — has to be a `cfg`; the flag it carries is
+    // the window guarantee documented in `tools::shell::tree`.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        probe.creation_flags(super::CREATE_NO_WINDOW);
+        probe.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
     probe.status().is_ok_and(|s| s.success())
 }

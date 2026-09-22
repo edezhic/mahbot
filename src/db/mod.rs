@@ -3994,28 +3994,12 @@ mod tests {
         const PATTERNS: [&str; 2] = ["turso::Builder", "Builder::new_local"];
         const ALLOWED: [&str; 2] = ["src/db/mod.rs", "src/db/debug.rs"];
 
-        fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).expect("read src directory") {
-                let path = entry.expect("read directory entry").path();
-                if path.is_dir() {
-                    collect_rs_files(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = Vec::new();
-        collect_rs_files(&manifest_dir.join("src"), &mut files);
+        let files = crate::util::test::rs_files_under(&manifest_dir.join("src"));
 
         let mut violations: Vec<(String, &'static str)> = Vec::new();
         for file in files {
-            let rel = file
-                .strip_prefix(manifest_dir)
-                .expect("source files live under the manifest dir")
-                .to_string_lossy()
-                .to_string();
+            let rel = crate::util::test::rel_source_path(manifest_dir, &file);
             if ALLOWED.contains(&rel.as_str()) {
                 continue;
             }

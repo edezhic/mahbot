@@ -166,6 +166,8 @@ async fn macos_sysctl_has_avx2() -> bool {
 /// non-zero, or its output is not a parseable semver.
 async fn bun_cli_version(path: &Path) -> Option<semver::Version> {
     let mut cmd = Command::new(path);
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     cmd.arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

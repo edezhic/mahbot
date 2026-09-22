@@ -47,6 +47,76 @@
 //! bun runtime's own install/update/probe runs, git — never comes through this
 //! module.
 //!
+//! # No console window (windows)
+//!
+//! A process this service starts must never put a console window on the screen.
+//! Spawning with `CREATE_NO_WINDOW` hands the child a console that has no window
+//! — and any process the child starts in turn inherits that console unless it
+//! asks for its own — so for a console-program child the guarantee covers
+//! descendants too. (That inheritance half is the platform's documented console
+//! rule, reasoned here rather than observed: no Windows host runs in this
+//! project's lane. macOS/Linux need nothing — a process started there cannot
+//! create a window. The two images the flag cannot act on are named below.)
+//!
+//! A parent with no console at all hands every console child it starts without
+//! creation flags a brand-new **visible** console. The replacement instance is
+//! therefore never created detached: it gets `CREATE_NO_WINDOW` like every other
+//! spawn, and the console it then owns is itself what covers the children it
+//! starts in turn that the service cannot flag — see
+//! `self_update::spawn_new_instance_from` for the full rationale.
+//!
+//! Covered, one entry per spawn site: git (`git::commands::git_command`); the
+//! cargo probe and both install modes (`self_update::verify_cargo_on_path`,
+//! `self_update::run_cargo_with_timeout`); the replacement instance
+//! (`self_update::spawn_new_instance_from`); the bun runtime's probe
+//! (`tools::bun::bun_cli_version`); the browser-automation CLI in all its runs —
+//! probe, version, `tasklist`, install and restart
+//! (`tools::chrome_daemon::cli_probe`, `cli_version`, `tasklist_has`,
+//! `install_chrome_use`, `run_cli`) plus the shared `chrome::spawn::spawn_cli` —
+//! and the browser itself (`tools::chrome_daemon::spawn_chrome_detached`); every
+//! agent command through the shell builders (`tools::shell::build_shell_command`,
+//! `tools::shell::build_program_command` — the shell tool, the diagnostics
+//! runner, the `custom` tool's script, a user's alarm program) plus the grep
+//! engine's own probe (`tools::shell::grep_engine::probe_engine`); and the file
+//! manager the owner asked for (`gui::editor::perform_reveal_in_finder`).
+//!
+//! Two of those launch an image that is not a console program — the browser and
+//! the file manager — for which the flag is documented as inert. They are the
+//! owner's own programs, and the flag is set even there so the rule has no
+//! exceptions; what such a program starts in turn is outside the service's reach.
+//!
+//! Not covered, on purpose: the terminal the owner opens inside the app
+//! (`gui::shell`, spawned through a pseudoconsole) and the owner's own browser
+//! (`gui::open_url` hands the address to `ShellExecuteExW` in process, so no
+//! console program exists to flash) — their windows are the owner's business.
+//! Residual, stated rather than implied: a command that asks the platform for a
+//! window of its own (`CREATE_NEW_CONSOLE`, or `cmd`'s `start` builtin) gets one,
+//! and so does anything it starts; a console program started by one of the two
+//! non-console images (the browser, the file manager) is beyond this flag's reach;
+//! and an un-flagged console child of a console-less parent gets a new visible
+//! console — the concrete case being the `self-replace` crate's file-swap copy of
+//! our own binary, which the service cannot flag and which is reachable only
+//! through the parent's console. That state is closed for the instances this
+//! service starts but not retroactively: an instance launched by an earlier build
+//! is console-less for its lifetime, so its own file-swap copy can still put one
+//! window on the screen during the update that installs this change.
+//!
+//! Beside the window, two things do change for a console-program child, and are
+//! stated rather than glossed (reasoned, like the inheritance above): it owns a
+//! console of its own — one extra hidden `conhost.exe` per spawn, permanent for
+//! the replacement instance — and it is therefore no longer attached to the
+//! console the service was launched in, so console control events on that console
+//! (a console-window close) no longer reach it. Whether such a child can still
+//! *use* a console handle it inherited from the service is not something this host
+//! can observe: the handle values it receives are unchanged, but it belongs to
+//! another console. Which commands run, when, what they return and how they stop:
+//! unchanged.
+//!
+//! The guarantee is a per-spawn flag, so a new spawn site could be added without
+//! one and nothing would say so: `every_production_spawn_is_windowless` below is
+//! the tripwire, and the count of sites it insists on, and the names it reads back
+//! out of the inventory above, are the covered list itself.
+//!
 //! # When containment cannot be established (windows)
 //!
 //! The assignment can be refused — a job the platform cannot nest ours under, a
@@ -375,5 +445,381 @@ impl Job {
             )
         };
         queried == 0 || accounting.ActiveProcesses > 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Files that are test-only end to end — `util/test.rs` is `#![cfg(test)]`
+    /// and `db/store_lock_check.rs` is included as `#[cfg(all(unix, test))]`.
+    /// Their spawns are test scaffolding, not commands the service starts.
+    const TEST_ONLY_FILES: [&str; 2] = ["src/util/test.rs", "src/db/store_lock_check.rs"];
+
+    /// The verdict on a `#[cfg(...)]` predicate, on the question "can this code
+    /// be the windows production path?" — `No` is the only verdict that lets the
+    /// sweep ignore the code inside. Anything it cannot decide (a feature, a
+    /// debug assertion) is `Unknown`, and swept: a gate this scanner does not
+    /// understand must never be able to hide a spawn from it.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Gate {
+        Yes,
+        No,
+        Unknown,
+    }
+
+    /// One leaf of a predicate. `unix` is never windows, `test` is never the
+    /// production build, and a `target_os`/`target_family` names windows or not.
+    fn gate_atom(predicate: &str) -> Gate {
+        let p = predicate.trim();
+        if p == "windows" {
+            return Gate::Yes;
+        }
+        if p == "unix" || p == "test" {
+            return Gate::No;
+        }
+        if p.starts_with("target_os") || p.starts_with("target_family") {
+            return if p.contains("\"windows\"") {
+                Gate::Yes
+            } else {
+                Gate::No
+            };
+        }
+        Gate::Unknown
+    }
+
+    /// The contents of `name(...)`, when the predicate is exactly that call.
+    fn gate_bound<'a>(predicate: &'a str, name: &str) -> Option<&'a str> {
+        predicate
+            .strip_prefix(name)?
+            .strip_prefix('(')?
+            .strip_suffix(')')
+    }
+
+    /// Split `all`/`any` arguments at nesting depth zero.
+    fn gate_args(predicate: &str) -> Vec<&str> {
+        let mut args = Vec::new();
+        let mut depth = 0_usize;
+        let mut quoted = false;
+        let mut start = 0_usize;
+        for (i, c) in predicate.char_indices() {
+            match c {
+                '"' => quoted = !quoted,
+                '(' if !quoted => depth += 1,
+                ')' if !quoted => depth = depth.saturating_sub(1),
+                ',' if !quoted && depth == 0 => {
+                    args.push(&predicate[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        args.push(&predicate[start..]);
+        args.into_iter().map(str::trim).collect()
+    }
+
+    /// The verdict on a `#[cfg(...)]` predicate by [Kleene] three-valued logic,
+    /// its leaves being the ones [`gate_atom`] knows.
+    ///
+    /// [Kleene]: https://en.wikipedia.org/wiki/Three-valued_logic
+    fn gate(predicate: &str) -> Gate {
+        let p = predicate.trim();
+        if let Some(inner) = gate_bound(p, "not") {
+            return match gate(inner) {
+                Gate::Yes => Gate::No,
+                Gate::No => Gate::Yes,
+                Gate::Unknown => Gate::Unknown,
+            };
+        }
+        if let Some(inner) = gate_bound(p, "all") {
+            let mut result = Gate::Yes;
+            for arg in gate_args(inner) {
+                match gate(arg) {
+                    Gate::No => return Gate::No,
+                    Gate::Unknown => result = Gate::Unknown,
+                    Gate::Yes => {}
+                }
+            }
+            return result;
+        }
+        if let Some(inner) = gate_bound(p, "any") {
+            let mut result = Gate::No;
+            for arg in gate_args(inner) {
+                match gate(arg) {
+                    Gate::Yes => return Gate::Yes,
+                    Gate::Unknown => result = Gate::Unknown,
+                    Gate::No => {}
+                }
+            }
+            return result;
+        }
+        gate_atom(p)
+    }
+
+    /// The one creation flag every covered spawn sets.
+    const WINDOWLESS_FLAG: &str = "CREATE_NO_WINDOW";
+
+    /// `CREATE_NEW_CONSOLE` is a window by construction; `DETACHED_PROCESS` is
+    /// forbidden for the reason the module docs' guarantee section gives.
+    const FORBIDDEN_FLAGS: [&str; 2] = ["CREATE_NEW_CONSOLE", "DETACHED_PROCESS"];
+
+    /// The number of spawn sites the sweep must see — the module docs' inventory,
+    /// counted. A site that constant and that inventory do not account for fails
+    /// the sweep, and a scan that stopped reading the tree finds far fewer.
+    const SPAWN_SITES: usize = 16;
+
+    fn indent(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+
+    /// The predicate of a `#[cfg(...)]` attribute, when the line carries one.
+    fn cfg_predicate(line: &str) -> Option<&str> {
+        let rest = line.trim_start().strip_prefix("#[cfg(")?;
+        Some(&rest[..rest.rfind(')')?])
+    }
+
+    /// The lines a `#[cfg(...)]`-gated item spans, starting at its attribute.
+    ///
+    /// Indentation alone would end the item at the first blank line or at the
+    /// first line at column 0 — and a gated test module can hold a multi-line
+    /// string literal whose lines are exactly that, which would leave the rest of
+    /// the module scanned as production code. So the item's head is walked to the
+    /// brace that opens its body (a wrapped signature opens it further down), and
+    /// a braced item is then closed where rustfmt puts its closing brace: the first
+    /// line at the item's own indentation that starts with `}`. Both are bounded by
+    /// the item — skipping too little is a loud false positive, skipping too much
+    /// would hide a spawn.
+    ///
+    /// What that close is not: it cannot tell a brace from a string literal that
+    /// holds a line of exactly that shape (the item's indentation, then `}`), which
+    /// still ends the item early and leaves the rest of its body scanned as
+    /// production. No such literal line exists in the tree today, and the direction
+    /// is the loud one — a test-only spawn reported as a violation, never a spawn
+    /// hidden.
+    fn gated_item_end(lines: &[&str], at: usize) -> usize {
+        let gate_indent = indent(lines[at]);
+        // The item's own attributes and doc comments, then the line that opens it.
+        let mut opener = at + 1;
+        while opener < lines.len()
+            && (lines[opener].trim().is_empty()
+                || lines[opener].trim_start().starts_with("//")
+                || lines[opener].trim_start().starts_with("#["))
+        {
+            opener += 1;
+        }
+        let mut braced = false;
+        for start in opener..lines.len() {
+            if indent(lines[start]) < gate_indent {
+                break;
+            }
+            let text = lines[start].trim_end();
+            if text.ends_with('{') {
+                braced = true;
+                opener = start;
+                break;
+            }
+            // The item is a statement, or it is complete on this line (`fn f() {}`).
+            if text.ends_with('}') || text.ends_with(';') {
+                return start + 1;
+            }
+            // Only a wrapped head reads on, and only onto a more indented line.
+            let Some(next) = lines.get(start + 1) else {
+                break;
+            };
+            if next.trim().is_empty()
+                || indent(next) < gate_indent
+                || next.trim_start().starts_with("//")
+            {
+                break;
+            }
+        }
+        if braced {
+            // `}` alone closes an item, `};` closes a `let … = { … }` block: both
+            // are the item's end. Ending early is loud; running past it would hide
+            // a spawn, so the search never leaves the item's indentation.
+            for (end, line) in lines.iter().enumerate().skip(opener + 1) {
+                if indent(line) == gate_indent && line.trim_start().starts_with('}') {
+                    return end + 1;
+                }
+            }
+        }
+        let mut end = opener + 1;
+        while end < lines.len()
+            && (lines[end].trim().is_empty() || indent(lines[end]) > gate_indent)
+        {
+            end += 1;
+        }
+        end
+    }
+
+    /// The lines the sweep must not read: comments (the module docs and ordinary
+    /// comments name the flags), and every `#[cfg(...)]`-gated item that cannot be
+    /// the windows production path.
+    fn skipped_lines(lines: &[&str]) -> Vec<bool> {
+        let mut skipped: Vec<bool> = lines
+            .iter()
+            .map(|l| l.trim_start().starts_with("//"))
+            .collect();
+        for (i, text) in lines.iter().enumerate() {
+            if cfg_predicate(text).is_some_and(|p| gate(p) == Gate::No) {
+                skipped[i..gated_item_end(lines, i)].fill(true);
+            }
+        }
+        skipped
+    }
+
+    /// The name of the function a line declares, if it declares one.
+    fn fn_name(line: &str) -> Option<String> {
+        let name: String = line
+            .split_once("fn ")?
+            .1
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// The function a line sits in: name, first line, first line after the body.
+    fn enclosing_fn(lines: &[&str], at: usize) -> Option<(String, usize, usize)> {
+        let start = (0..at).rev().find(|&i| {
+            !lines[i].trim_start().starts_with("//")
+                && indent(lines[i]) < indent(lines[at])
+                && fn_name(lines[i]).is_some()
+        })?;
+        let mut end = at + 1;
+        while end < lines.len()
+            && (lines[end].trim().is_empty() || indent(lines[end]) > indent(lines[start]))
+        {
+            end += 1;
+        }
+        Some((fn_name(lines[start])?, start, end))
+    }
+
+    /// Whether a function body applies the windowless flag: the flag must sit
+    /// inside a `creation_flags(...)` call — naming it without applying it (a bare
+    /// `use …::CREATE_NO_WINDOW`) does not count. rustfmt wraps that call once a
+    /// site is deep enough, so the argument list is read up to its closing
+    /// parenthesis rather than per line.
+    fn applies_windowless_flag(body: &str) -> bool {
+        let mut rest = body;
+        while let Some(at) = rest.find("creation_flags(") {
+            let call = &rest[at..];
+            let args = &call[..call.find(')').unwrap_or(call.len())];
+            if args.contains(WINDOWLESS_FLAG) {
+                return true;
+            }
+            rest = &call["creation_flags(".len()..];
+        }
+        false
+    }
+
+    /// The names the module docs' "No console window (windows)" section writes in
+    /// backticks: the covered sites as they are recorded for a reader. That section
+    /// *is* the covered list, so the sweep reads it back rather than trusting it —
+    /// a site the sweep finds and the section does not name fails.
+    fn inventoried_sites() -> Vec<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
+        let source = std::fs::read_to_string(&path).expect("read this module");
+        let section = source
+            .lines()
+            .skip_while(|l| !l.contains(" # No console window (windows)"))
+            .skip(1)
+            .take_while(|l| !l.trim_start().starts_with("//! # "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !section.is_empty(),
+            "the module docs' window-guarantee section is gone"
+        );
+        section
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(|token| token.rsplit("::").next().unwrap_or(token))
+            .map(|token| token.trim_end_matches("()"))
+            .filter(|token| {
+                !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Tripwire: every process the service starts must be created without a
+    /// console window. See the module docs' "No console window (windows)"
+    /// section, whose inventory this test reads back.
+    ///
+    /// It is a source scan, not a proof: it reads rustfmt-shaped code and
+    /// best-effort `#[cfg]` gating, it judges per enclosing function (a second
+    /// spawn added to a function that already applies the flag is caught by the
+    /// site count, not site-specifically), and a `#[cfg]` on a `mod` declaration
+    /// elsewhere in the tree is invisible to it — such a site fails loudly, and
+    /// gating the spawn itself is the fix. A `(file, symbol)` allow-list plus the
+    /// count would also catch an added site, but the count alone would not say
+    /// which site it was, and the list would need hand-maintenance on every site
+    /// change; the scan names the offending site itself.
+    #[test]
+    fn every_production_spawn_is_windowless() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let inventory = inventoried_sites();
+
+        let mut sites = 0_usize;
+        let mut violations: Vec<String> = Vec::new();
+        for file in crate::util::test::rs_files_under(&root.join("src")) {
+            let rel = crate::util::test::rel_source_path(root, &file);
+            if TEST_ONLY_FILES.contains(&rel.as_str()) {
+                continue;
+            }
+            let content = std::fs::read_to_string(&file).expect("read source file");
+            let lines: Vec<&str> = content.lines().collect();
+            let skipped = skipped_lines(&lines);
+            for (i, text) in lines.iter().enumerate() {
+                if skipped[i] {
+                    continue;
+                }
+                let starts_process = text.contains("Command::new");
+                let reserved = FORBIDDEN_FLAGS.iter().find(|f| text.contains(**f)).copied();
+                if !starts_process && reserved.is_none() {
+                    continue;
+                }
+                let Some((name, _, end)) = enclosing_fn(&lines, i) else {
+                    violations.push(format!(
+                        "{rel}:{}: a process is created outside any function",
+                        i + 1
+                    ));
+                    continue;
+                };
+                if starts_process {
+                    sites += 1;
+                    if !applies_windowless_flag(&lines[i..end].join("\n")) {
+                        violations.push(format!(
+                            "{rel}:{} `{name}` starts a process without {WINDOWLESS_FLAG}",
+                            i + 1
+                        ));
+                    } else if !inventory.iter().any(|listed| listed == &name) {
+                        violations.push(format!(
+                            "{rel}:{} `{name}` applies {WINDOWLESS_FLAG} but the module docs' \
+                             covered-site inventory does not name it",
+                            i + 1
+                        ));
+                    }
+                }
+                if let Some(flag) = reserved {
+                    violations.push(format!(
+                        "{rel}:{} `{name}` uses {flag} — see the module docs' window guarantee",
+                        i + 1
+                    ));
+                }
+            }
+        }
+
+        assert_eq!(
+            sites, SPAWN_SITES,
+            "the spawn sweep saw {sites} sites, not the {SPAWN_SITES} the module docs \
+             inventory lists — a new site needs the flag and a name in that list, and a \
+             scan that stopped reading the tree would find fewer"
+        );
+        assert!(
+            violations.is_empty(),
+            "the service must never put a console window on the screen:\n{violations:#?}"
+        );
     }
 }

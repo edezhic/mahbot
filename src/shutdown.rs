@@ -497,8 +497,8 @@ pub fn install_session_end_listener() {
 /// that loop does not exist, and none is added for it. The dashboard's own window close
 /// is not among them: the dashboard consumes it in every state, whether or not boot
 /// finished. A session end is not among them: it reaches the process through its own window
-/// whether or not this handler is registered — the detached instance a self-update leaves
-/// behind has no console for console events, but it owns a window just the same.
+/// whether or not this handler is registered — the instance a self-update leaves behind owns
+/// a windowless console that no window can close, but it owns a window just the same.
 #[cfg(windows)]
 mod console {
     use super::{DEFAULT_STOP_GRACE, StopRequest, record_stop_deadline};

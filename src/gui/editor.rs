@@ -5653,11 +5653,11 @@ impl EditorState {
                 }
                 #[cfg(target_os = "windows")]
                 {
-                    if let Err(e) = std::process::Command::new("explorer")
-                        .arg("/select,")
-                        .arg(&path)
-                        .spawn()
-                    {
+                    use std::os::windows::process::CommandExt;
+                    let mut cmd = std::process::Command::new("explorer");
+                    cmd.arg("/select,").arg(&path);
+                    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+                    if let Err(e) = cmd.spawn() {
                         tracing::warn!("Failed to open Explorer for {path}: {e}");
                     }
                 }

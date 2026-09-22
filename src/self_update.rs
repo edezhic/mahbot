@@ -741,14 +741,17 @@ pub fn update_is_finalizing() -> bool {
 /// Verify `cargo` is on PATH, returning an error with a mode-appropriate
 /// message otherwise. Shared by both update modes.
 async fn verify_cargo_on_path(action: &str) -> Result<()> {
-    match tokio::process::Command::new("cargo")
+    let mut cmd = tokio::process::Command::new("cargo");
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    let status = cmd
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .await
-    {
+        .await;
+    match status {
         Ok(status) if status.success() => Ok(()),
         _ => anyhow::bail!("cargo not found on PATH — cannot {action}"),
     }
@@ -1032,7 +1035,7 @@ async fn finalize_install(
 }
 
 /// Shared finalize tail for both update modes: graceful drain, final
-/// single-writer checkpoint, temp-root cleanup, instance-lock release, detached
+/// single-writer checkpoint, temp-root cleanup, instance-lock release, independent
 /// spawn of the replacement, and `exit(0)`.
 ///
 /// The ordering is load-bearing and MUST NOT be rearranged:
@@ -1198,10 +1201,12 @@ async fn run_cargo_with_timeout(
     step: &CargoStep,
 ) -> Result<()> {
     info!("Starting {label} in {}", cwd.display());
+    let mut cmd = tokio::process::Command::new("cargo");
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     let cargo_result = tokio::time::timeout(
         timeout,
-        tokio::process::Command::new("cargo")
-            .args(args)
+        cmd.args(args)
             .current_dir(cwd)
             // Strip any inherited CARGO_TARGET_DIR so registry-mode cargo
             // install (no --target-dir) never redirects its build into an
@@ -1537,7 +1542,8 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Spawn the new mahbot instance as a detached child process from the given path.
+/// Spawn the new mahbot instance as an independent child process from the given
+/// path.
 ///
 /// The `binary_path` must point to an existing, executable binary — always the
 /// captured `current_exe()` after the swap in the unified update flow.
@@ -1545,7 +1551,19 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
 /// The child is marked as the update hand-off ([`HANDOFF_ENV`] — see
 /// [`acquire_lock`]).
 ///
-/// On Unix: null stdin/stdout, stderr → update.log. On Windows: same + `DETACHED_PROCESS | CREATE_NO_WINDOW`.
+/// On Unix: null stdin/stdout, stderr → update.log. On Windows: the same, plus
+/// `CREATE_NO_WINDOW`.
+///
+/// `DETACHED_PROCESS` deliberately is *not* set. It would leave the instance with
+/// no console at all, and the platform then gives every console-subsystem child
+/// such a process starts without creation flags a brand-new **visible** console —
+/// exactly how the service ends up putting windows on the screen. (The
+/// `self-replace` crate's file-swap copy of our own binary is such a child, and it
+/// is not ours to flag.) `CREATE_NO_WINDOW` instead gives the instance a console
+/// with no window, which every process it starts in turn inherits. The instance is
+/// attached to that new console instead of inheriting the launching one, and
+/// stdin/stdout/stderr handling is unchanged.
+///
 /// On spawn failure the error is returned (no admin notification — the caller
 /// [`finalize_update_and_restart`] owns failure reporting); the process keeps
 /// running (does NOT exit).
@@ -1585,9 +1603,7 @@ fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
 
     cmd.stderr(Stdio::from(update_log));
@@ -1595,7 +1611,7 @@ fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
     match cmd.spawn() {
         Ok(child) => {
             info!(pid = child.id(), "Spawned new mahbot instance");
-            // Detach — the child runs independently.
+            // Nothing waits on the child — it runs independently.
             Ok(())
         }
         Err(e) => {
