@@ -142,7 +142,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) 
     {
         warn!(
             ticket = %ticket.id,
-            error = %e,
+            error = ?e,
             "Failed to register diagnostics in-flight marker — diagnostics may re-dispatch",
         );
     }

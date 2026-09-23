@@ -832,10 +832,17 @@ pub(crate) async fn update_phase_job_task(
 // ── Active-agent mapping via the agents roster (replaces tickets.assigned_to) ──
 
 /// Upsert a job-bound roster row for a currently-running stage agent — the
-/// active-agent marker that replaces `tickets.assigned_to`. `status='launched'`
-/// marks the agent as running; a later call with `done`/`failed` clears it. The
-/// agent roster is keyed on (job_id, agent_id) so the NULL-seat engineer anchor
-/// (job_id=NULL) remains a distinct row for session-TTL continuity.
+/// active-agent marker that replaces `tickets.assigned_to`. `status` is the
+/// roster's running signal (`launched` from every caller; a finished agent is
+/// recorded by [`write_agent_outcome`] instead). The agent roster is keyed on
+/// (job_id, agent_id) so the NULL-seat engineer anchor (job_id=NULL) remains a
+/// distinct row for session-TTL continuity.
+///
+/// The update half is the re-registration of an existing `(job_id, agent_id)`:
+/// the agent id is derived from the ticket and role, so the puller re-driving a
+/// job it left in place (`dispatch_working_phases`, after `pause_freezing`
+/// marked its rows `failed`) registers the same pair again and updates the row
+/// instead of inserting it.
 pub(crate) async fn upsert_job_agent(
     conn: &Connection,
     job_id: &str,
@@ -843,10 +850,12 @@ pub(crate) async fn upsert_job_agent(
     kind: AgentKind,
     status: RowStatus,
 ) -> Result<()> {
-    conn.execute(
+    conn.upsert_row(
+        "UPDATE agents SET status = ?1 WHERE job_id = ?2 AND agent_id = ?3",
+        || params![status.as_str(), job_id, agent_id],
         "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
          VALUES (?1, ?2, ?3, NULL, ?4, '') \
-         ON CONFLICT(job_id, agent_id) DO UPDATE SET status = ?4",
+         ON CONFLICT(job_id, agent_id) DO NOTHING",
         params![job_id, agent_id, kind.as_str(), status.as_str()],
     )
     .await
@@ -1746,8 +1755,16 @@ pub(crate) fn session_pin_id(ticket_id: &str, role: Role) -> String {
 
 /// Upsert the session pin for `role` (engineer/sanitation). NEVER sets job_id
 /// (setting it removes the row from the partial-index scope → later NULL
-/// insert no longer conflicts → duplicate anchor). The DDL and this UPSERT use
-/// the IDENTICAL syntactic WHERE form (`job_id IS NULL` on both sides).
+/// insert no longer conflicts → duplicate anchor). The DDL and this write use
+/// the IDENTICAL syntactic WHERE form (`job_id IS NULL` on both sides); the
+/// update branch repeats the guard, so it can never touch the job-bound roster
+/// row that carries the same agent id.
+///
+/// The update half is the normal path, not an edge case: the claim-time write
+/// (`run_claim_pipeline`, Queued→InDevelopment) creates the engineer pin, and
+/// every later `run_stage_agent` for the same ticket and role re-upserts it —
+/// including each bounce/reset round, since the NULL-seat row survives the
+/// round job's deletion.
 pub(crate) async fn upsert_session_pin(
     conn: &Connection,
     ticket_id: &str,
@@ -1756,12 +1773,14 @@ pub(crate) async fn upsert_session_pin(
     role: Role,
 ) -> Result<()> {
     let pin_id = session_pin_id(ticket_id, role);
-    conn.execute(
+    conn.upsert_row(
+        "UPDATE agents SET status = ?1, task = ?2, outcome = NULL \
+         WHERE agent_id = ?3 AND job_id IS NULL",
+        || params![status.as_str(), task, pin_id.as_str()],
         "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
          VALUES (NULL, ?1, ?4, NULL, ?2, NULL, ?3) \
-         ON CONFLICT(agent_id) WHERE job_id IS NULL \
-         DO UPDATE SET status = ?2, task = ?3, outcome = NULL",
-        params![pin_id, status.as_str(), task, role.as_str()],
+         ON CONFLICT(agent_id) WHERE job_id IS NULL DO NOTHING",
+        params![pin_id.as_str(), status.as_str(), task, role.as_str()],
     )
     .await
     .with_context(|| format!("failed to upsert {role} session pin for ticket {ticket_id}"))?;

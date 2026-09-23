@@ -1267,8 +1267,8 @@ async fn handle_set_model_action(
 ) {
     // Handlers are spawned (the dispatch loop must stay non-blocking), so the
     // lock serializes rapid taps of the same picker — without it, concurrent
-    // single-statement upserts would commit last-write-wins in
-    // nondeterministic order instead of tap order. Acquired before validation;
+    // upserts would commit last-write-wins in nondeterministic order instead of
+    // tap order. Acquired before validation;
     // held over the decision+write and the pressed keyboard's in-place ✓
     // refresh so the checkmark lands in tap order too (not the callback ack).
     // Network I/O under the lock is the accepted tradeoff for deterministic

@@ -26,7 +26,7 @@
 //! never touches `cdc` directly: warm-up goes through the `gui::init_*_tx()`
 //! wrappers.
 //!
-//! ## Pinned-engine caveat (turso `=0.7.2`)
+//! ## Pinned-engine caveat
 //!
 //! - CDC is per-connection and mutually exclusive with MVCC (mahbot is WAL, so
 //!   it does not apply).

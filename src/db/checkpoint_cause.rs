@@ -28,7 +28,7 @@
 //! interests no other target, so the added work is that lookup).
 //!
 //! What is verified where: the site ([`ENGINE_TARGET`], [`CAUSE_PREFIX`]) is
-//! checked against the pinned engine's own source (turso_core 0.7.2,
+//! checked against the pinned engine's own source (`turso_core`'s
 //! `vdbe/execute.rs`), the capture and its attachment are exercised through the
 //! production seam — including under the real layer stack
 //! ([`crate::logs::log_layers`]), which is what installs this layer in the

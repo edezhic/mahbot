@@ -303,8 +303,8 @@ async fn insert_messages_in_transaction(
     match context {
         Some((channel, user_name, workspace_name, role)) => {
             // `created_at` stamps the session_metadata row only on creation
-            // (the session's creation timestamp); it must never be touched by
-            // the ON CONFLICT DO UPDATE clause below.
+            // (the session's creation timestamp); the update branch below must
+            // never touch it.
             let created_at = now.clone();
             let count_clause = message_count_clause(replace);
             tx.upsert_row(
@@ -1057,7 +1057,8 @@ impl SessionStore {
     }
 
     /// Upsert one `session_metadata` column for `agent_id`; `last_activity` is
-    /// stamped only when the row is first created (the TTL key), never on conflict.
+    /// stamped only when the row is first created (the TTL key), never on an
+    /// existing row.
     async fn set_metadata_value(
         &self,
         agent_id: &str,
@@ -1066,7 +1067,7 @@ impl SessionStore {
     ) -> Result<()> {
         let col = column.as_str();
         let now = db::now();
-        // `created_at` is stamped only on row creation (never on conflict).
+        // `created_at` is stamped only on row creation (never on an existing row).
         let created_at = now.clone();
         self.conn
             .upsert_row(

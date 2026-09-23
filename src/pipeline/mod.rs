@@ -534,14 +534,23 @@ async fn run_claim_pipeline(ws: &Workspace) {
         && let Ok(Some(ticket)) = board().claim_queued_for_development(&ws.name, now).await
     {
         info!(ticket = %ticket.id, workspace = %ws.name, "Claimed Queued → InDevelopment");
-        let _ = crate::jobs::upsert_session_pin(
+        // Best-effort and non-fatal: the pin only preserves the engineer session
+        // across bounces/resets, and the stage dispatch writes it again.
+        if let Err(e) = crate::jobs::upsert_session_pin(
             &crate::session::store().conn,
             &ticket.id,
             &ticket.title,
             crate::jobs::RowStatus::Launched,
             Role::Engineer,
         )
-        .await;
+        .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                error = ?e,
+                "Failed to upsert engineer session pin — session continuity across bounces/resets degraded",
+            );
+        }
     }
 }
 
@@ -1071,7 +1080,7 @@ async fn register_running_agent(
         warn!(
             agent = agent_id,
             job = job_id,
-            error = %e,
+            error = ?e,
             "{warn_message}",
         );
     }
@@ -1512,7 +1521,7 @@ async fn run_stage_agent(
         warn!(
             ticket = %ticket.id,
             job = %job_id,
-            error = %e,
+            error = ?e,
             "Failed to upsert {} session pin — session continuity across bounces/resets degraded",
             role,
         );

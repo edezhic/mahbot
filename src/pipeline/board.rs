@@ -813,7 +813,7 @@ impl BoardStore {
     ///
     /// Performs the shared validation preamble used by both [`BoardStore::create_ticket`]
     /// and [`BoardStore::supersede_and_create`]: starts a transaction, generates a
-    /// sequential ticket ID via counter upsert, checks that the new ID
+    /// sequential ticket ID from the ticket counter, checks that the new ID
     /// doesn't appear in its own prerequisites, then validates all
     /// prerequisites exist and belong to the same workspace.
     ///
@@ -835,10 +835,20 @@ impl BoardStore {
         prerequisites: &[String],
     ) -> Result<(TxGuard<'_>, String)> {
         let tx = self.conn.begin_tx().await?;
+        // Seed-then-bump, not the engine's unusable `INSERT ... ON CONFLICT ...
+        // DO UPDATE` form (see `db::Connection::upsert_row`); the two-step
+        // helper cannot serve this call because the new id has to be read back.
+        // A fresh workspace seeds `next_id` at 0, then the bump stores 1 and
+        // returns `next_id - 1` — the first ticket is still `<workspace>-0`.
+        tx.execute(
+            "INSERT INTO ticket_counters (workspace_name, next_id) VALUES (?1, 0) \
+             ON CONFLICT(workspace_name) DO NOTHING",
+            db::params![workspace_name],
+        )
+        .await?;
         let seq: i64 = tx
             .query_row(
-                "INSERT INTO ticket_counters (workspace_name, next_id) VALUES (?1, 1) \
-                 ON CONFLICT(workspace_name) DO UPDATE SET next_id = ticket_counters.next_id + 1 \
+                "UPDATE ticket_counters SET next_id = next_id + 1 WHERE workspace_name = ?1 \
                  RETURNING next_id - 1",
                 db::params![workspace_name],
                 |row| row.get(0),

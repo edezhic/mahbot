@@ -915,12 +915,15 @@ impl Connection {
     /// Callers that need the pair to be atomic run it inside a transaction (both
     /// `session_metadata` paths do).
     ///
-    /// The upsert form is unusable on turso 0.8.0: with change capture enabled
-    /// (`PRAGMA capture_data_changes_conn`) it aborts the statement with a
-    /// record-decode error (`Payload too small for indicated header size`,
-    /// `Invalid Text value`, `TEXT value contains invalid UTF-8`) whenever the
-    /// target row sits on a page that carries free space.
-    /// See `INCIDENT-2026-09-21-DATA-LOSS.md`.
+    /// The engine's upsert form is unusable while change capture is enabled on
+    /// the store (`PRAGMA capture_data_changes_conn`); only its `DO UPDATE`
+    /// branch has been observed to abort, with a record-decode error (`Payload
+    /// too small for indicated header size`, `Invalid Text value`, `TEXT value
+    /// contains invalid UTF-8`). The precise engine condition is not isolated.
+    ///
+    /// A caller that wraps this write's error in its own context must render the
+    /// whole `anyhow` chain when it reports the failure (`?e`, or `{:#}` in a
+    /// message): the outer context alone (`%e`) hides the engine's cause.
     pub async fn upsert_row<U, I>(
         &self,
         update_sql: &str,
@@ -1492,12 +1495,15 @@ impl TxGuard<'_> {
     /// Callers that need the pair to be atomic run it inside a transaction (both
     /// `session_metadata` paths do).
     ///
-    /// The upsert form is unusable on turso 0.8.0: with change capture enabled
-    /// (`PRAGMA capture_data_changes_conn`) it aborts the statement with a
-    /// record-decode error (`Payload too small for indicated header size`,
-    /// `Invalid Text value`, `TEXT value contains invalid UTF-8`) whenever the
-    /// target row sits on a page that carries free space.
-    /// See `INCIDENT-2026-09-21-DATA-LOSS.md`.
+    /// The engine's upsert form is unusable while change capture is enabled on
+    /// the store (`PRAGMA capture_data_changes_conn`); only its `DO UPDATE`
+    /// branch has been observed to abort, with a record-decode error (`Payload
+    /// too small for indicated header size`, `Invalid Text value`, `TEXT value
+    /// contains invalid UTF-8`). The precise engine condition is not isolated.
+    ///
+    /// A caller that wraps this write's error in its own context must render the
+    /// whole `anyhow` chain when it reports the failure (`?e`, or `{:#}` in a
+    /// message): the outer context alone (`%e`) hides the engine's cause.
     pub async fn upsert_row<U, I>(
         &self,
         update_sql: &str,
