@@ -405,8 +405,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     );
 
     // Listen for stop requests and drive the two-request drain protocol: signals
-    // on macOS/Linux, the console control handler on Windows (see
-    // `shutdown::install_console_stop_handler`). The first request begins the drain
+    // on macOS/Linux, the console control handler on Windows (the sources are
+    // installed by `shutdown::install_stop_request_sources`). The first request begins the drain
     // (wait_for_shutdown_signal calls drain_begin and keeps listening); the task
     // returns only on a request that abandons the drain — a SECOND signal, or a
     // force-cancel-class console request — which force-cancels it. Clean drain
@@ -417,13 +417,13 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
             .catch_unwind()
             .await;
         match result {
-            Ok(Ok(())) => {
-                // Names the last request the platform recorded (a Windows console
-                // request); the fallback is the literal this line always carried, for
-                // the second Unix signal.
+            Ok(Ok(cause)) => {
+                // Names the request that ended the drain, where the platform gives it a name
+                // (a Windows console request); the fallback is the literal this line always
+                // carried, for the second Unix signal.
                 info!(
                     "{} — force-cancelling drain",
-                    mahbot::shutdown::exit_trigger().unwrap_or("Second signal received")
+                    cause.unwrap_or("Second signal received")
                 );
                 mahbot::shutdown::force_cancel();
             }
@@ -579,19 +579,19 @@ fn init_message_pipeline(
 
 async fn shutdown_after_dashboard() {
     // The stop trace: names the last stop request the platform recorded, and keeps "the
-    // window closed" wording when nothing was recorded. It is a log line, and log delivery is
-    // already gone by this point — the batching writer lives on the iced runtime this runs
-    // after — so it is dropped outright: a stop's reason is in the logs store at all only
-    // where an earlier line named it and that line's batch beat the runtime's teardown.
+    // window closed" wording when nothing was recorded. This line is dropped outright and
+    // reaches no one — `shutdown::EXIT_TRIGGER` documents why, and what that leaves of a
+    // stop's reason.
     info!(
         "{} — shutting down",
         mahbot::shutdown::exit_trigger().unwrap_or("Dashboard window closed")
     );
     // No shutdown() here — the token is already cancelled whenever this function
-    // runs: every in-app exit goes through `save_and_exit`, which fires it before
-    // exiting (the drain paths arrive with it fired already). A future exit path
-    // that drops the runtime without firing the token would break this
-    // invariant.
+    // runs: the ordinary exit path (`save_and_exit`) fires it before leaving the
+    // iced runtime, and a drain path arrives with it fired already.
+    //
+    // The exits that run none of this are named once, in `shutdown`'s module docs; a new exit
+    // path that drops the runtime without firing the token belongs on that list.
     mahbot::agent::registry::AGENT_REGISTRY.shutdown_all();
 
     let release = mahbot::tools::chrome_release::flush_and_close_all_chrome_sessions();
@@ -719,16 +719,9 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    // Subscribe to Windows stop requests before boot: the console control handler (Ctrl+C,
-    // Ctrl+Break, console close) and the session-end listener (log-off, shutdown, restart).
-    // A product launch on Windows gets no console from the windowed image, so no console
-    // control event exists for it — the handler stays registered and remains the platform's
-    // stop source for a launch that does have one (the test harness, or a launch given a
-    // console of its own), while the session-end listener needs none. The handler queues for
-    // the protocol loop and the listener forces the stop directly — neither needs a runtime.
-    // No-op on macOS/Linux.
-    mahbot::shutdown::install_console_stop_handler();
-    mahbot::shutdown::install_session_end_listener();
+    // Subscribe to the platform's stop requests before boot and before the interface
+    // exists; `shutdown` names the three sources.
+    mahbot::shutdown::install_stop_request_sources();
 
     // Resolve the storage root before the temp root: it is a pure environment read
     // (`mahbot::config::default_config_dir`), resolved before config init so the
@@ -813,6 +806,9 @@ fn main() -> Result<()> {
     })
     .exit_on_close_request(false)
     .run()
+    // Returning here with an error leaves without the teardown below — one of the exits
+    // `shutdown`'s module docs name — and without the shutdown token fired: an iced error means
+    // the interface never ran, so there would be nothing to drain.
     .map_err(|e| anyhow::anyhow!("Iced application error: {e}"))?;
 
     // Iced dropped its runtime; use a short-lived one for async teardown.

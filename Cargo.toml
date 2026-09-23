@@ -251,7 +251,11 @@ minimp3 = "0.5"
 # 0.6.x/0.3.x series already resolved transitively via the GUI stack, so the
 # lock gains no additional objc2 base-version forks.
 objc2 = "0.6"
-objc2-foundation = "0.3"
+# The AppleEvent features are not for Computer Use: the quit interception (src/shutdown.rs) reads
+# the reason the system names on a Quit AppleEvent — NSAppleEventManager/NSAppleEventDescriptor,
+# plus kAEQuitReason and its reason codes from CoreServices.
+objc2-foundation = { version = "0.3", features = ["NSAppleEventDescriptor", "NSAppleEventManager", "objc2-core-services"] }
+objc2-core-services = "0.3"
 objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"
 # App enumeration (NSWorkspace/NSRunningApplication) for the `apps` action.

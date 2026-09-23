@@ -131,8 +131,9 @@ impl AgentKind {
 }
 
 /// Graceful-shutdown drain cap: in-flight work completes within this window,
-/// then stragglers are force-cancelled.
-const DRAIN_CAP_SECS: u64 = 10 * 60;
+/// then stragglers are force-cancelled. Read from outside too: the exit bound a
+/// quit arms has to outlast it (`shutdown::macos_quit`).
+pub(crate) const DRAIN_CAP_SECS: u64 = 10 * 60;
 
 /// Stale-purge cutoff (hours): only ticket-phase `jobs` rows older than this
 /// are purged (they are recoverable from `tickets.phase`). Non-phase launched

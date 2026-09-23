@@ -6,6 +6,41 @@
 //!
 //! Extracted from `self_update` where it was a layer violation — shutdown
 //! coordination is not self-update.
+//!
+//! # The exits that run none of the closing path
+//!
+//! The product's closing path is the library's `gui::Dashboard::save_and_exit` (draft flush,
+//! window state, the token fired before the iced runtime drops) and the binary's
+//! `shutdown_after_dashboard` (browser release, background-task join, store checkpoint). The exits
+//! below run none of it, and are listed here once so that the rest of the tree points at this list
+//! instead of restating it:
+//!
+//! - a platform-forced termination (Force Quit, a `SIGKILL`): nothing can intercept it; a plain
+//!   `kill` is SIGTERM, which the product handles once its signal task is installed;
+//! - the self-update tail (its own drain and its own exit, `exit(0)` after its checkpoint), which
+//!   never reaches `save_and_exit` or `shutdown_after_dashboard`;
+//! - the fatal-signal and abort paths (`install_fatal_signal_handlers`, the panic hook): an
+//!   `_exit` from the handler, or an unwind that never reaches the teardown;
+//! - an iced `run()` that returns an error: the process ends with that error before the teardown
+//!   is reached at all;
+//! - the system's own log-out, restart or shut-down on macOS: the quit hook hands the platform's
+//!   ask straight back and AppKit ends the process inside its run loop (see `macos_quit`), with
+//!   the losses that route always had — the last moment of typing, the exit-time tidying that
+//!   leaves the next start slower, and the browser release, which the next start performs anyway;
+//! - an ordinary macOS quit the hook does not take over — the interface is already past its exit,
+//!   or the interception could not be installed: the platform's own handling ends the process
+//!   (both are accepted in `macos_quit`'s "Accepted" section);
+//! - a SIGTERM that arrives before the signal task exists: the platform's own handling ends the
+//!   process the same way;
+//! - the exit bound `macos_quit` arms for a taken-over quit: a hard `_exit` with no closing steps
+//!   after the closing path has failed to finish within it, the same class as a force quit.
+//!
+//! A Windows session end is not on that list: the listener stops the daemon like any other stop
+//! request, so the closing path runs, bounded by the deadline the platform gave it — except for a
+//! notification that arrives before the dashboard subscribes, where the forced stop has no
+//! consumer. The CLI subcommands and a launch the instance lock turns away reach none of the
+//! closing path either, having exited before the runtime exists. A new exit path that drops the
+//! runtime without firing the token belongs on this list.
 
 use crate::util::UnwrapPoison;
 use std::sync::{Mutex, OnceLock};
@@ -22,7 +57,7 @@ fn global_shutdown() -> &'static CancellationToken {
 }
 
 /// Global graceful-drain state: a `watch` channel of `bool` set by the first
-/// shutdown signal (SIGINT / window-close / self-update). Distinct from the
+/// shutdown signal (SIGINT / window-close / quit / self-update). Distinct from the
 /// cancellation token — during the drain the token is NOT fired, so in-flight
 /// LLM calls (which race the token around the HTTP send) survive to complete
 /// their current round. Background loops fold this flag into their
@@ -236,8 +271,8 @@ fn stage_budget(deadline: Instant, now: Instant) -> Duration {
 
 /// The bound on the exit path's stage before the store checkpoint, for a stop that
 /// runs under the platform's own kill deadline (a Windows console close or session
-/// end) — `None` for every other stop, whose stage stays unbounded (macOS/Linux, a
-/// dashboard window close, a first Ctrl+C).
+/// end): `None` for every other stop, which no platform deadline bounds (a dashboard
+/// window close, a first Ctrl+C, a macOS quit).
 ///
 /// Sampled once, when that stage starts, from the deadline the platform's stops recorded
 /// (`record_stop_deadline` keeps the earliest — the kill the process must beat);
@@ -255,20 +290,25 @@ pub fn urgent_release_budget() -> Option<Duration> {
         .map(|deadline| stage_budget(deadline, Instant::now()))
 }
 
-/// The last stop request the platform delivered — recorded by the Windows stop deliveries
-/// (the console protocol loop and the session-end listener, the only ones that name a
-/// request), `None` when nothing was recorded, since nothing else writes one, and the line
-/// then keeps the wording it always had. A `Mutex`, not a `OnceLock`: each request overwrites
-/// the record as it is acted on, so the last write names the last request.
+/// The last stop request the platform delivered, for the exit path to name: the Windows stop
+/// deliveries (the console protocol loop and the session-end listener) and a macOS quit (the
+/// dashboard's exit request) write one — the macOS route only where that request is what drives
+/// the exit, so a repeat gesture leaves the record to the request that caused it. `None` when
+/// nothing was recorded: a dashboard window close and a Unix signal record nothing, and the exit
+/// line then keeps the wording it always had. A `Mutex`, not a `OnceLock`: a later request takes
+/// the record over from the one before it.
+///
+/// The exit line itself is dropped outright — it runs after the iced runtime whose log writer
+/// batches — so this makes a stop's reason nameable by that line, not visible: a stop's reason
+/// reaches the logs store only where an earlier line named it.
 static EXIT_TRIGGER: Mutex<Option<&'static str>> = Mutex::new(None);
 
-/// Record the stop request the exit path is running for, so the exit path names it in its line.
-#[cfg(windows)]
-fn record_exit_trigger(label: &'static str) {
+/// Record the stop request the exit path is running for, so the exit path can name it.
+pub(crate) fn record_exit_trigger(label: &'static str) {
     *EXIT_TRIGGER.lock().unwrap_poison() = Some(label);
 }
 
-/// The last recorded stop request, if the platform recorded one.
+/// The last recorded stop request, if any was recorded — `EXIT_TRIGGER` above says what writes one.
 #[must_use]
 pub fn exit_trigger() -> Option<&'static str> {
     *EXIT_TRIGGER.lock().unwrap_poison()
@@ -333,25 +373,28 @@ fn stop_for_session_end(label: &'static str) {
 /// SIGHUP is explicitly ignored so the daemon survives terminal/SSH disconnects.
 ///
 /// Windows: the same protocol, fed by the console control handler installed by
-/// [`install_console_stop_handler`] (each event arrives on a fresh OS thread, so
+/// `install_console_stop_handler` (each event arrives on a fresh OS thread, so
 /// the handler queues it here and, for a closing console, holds that thread; the
 /// `console` module documents the platform rules and what start-up does before this
 /// loop exists — and why a launch with no console has no events to feed it). Ctrl+C
 /// is the drain request, a second Ctrl+C force-cancels, and
 /// Ctrl+Break and a console close are force-cancel class outright. The session end
 /// (log-off, shutdown, restart) is not a console event and does not come through here at
-/// all — it is force-cancel class on its own terms, in [`install_session_end_listener`].
+/// all — it is force-cancel class on its own terms, in `install_session_end_listener`.
 ///
 /// The "second request" is read off the global drain flag rather than a per-source
 /// count, so a first Ctrl+C that follows a drain begun elsewhere — the dashboard
-/// window close, a self-update's finalizing drain — force-cancels, where on Unix a
-/// first SIGINT after those is a no-op. The window-close path applies the same rule
-/// to itself, so this is deliberate and not a defect.
+/// window close, a platform quit, a self-update's finalizing drain — force-cancels,
+/// where on Unix a first SIGINT after those is a no-op. The dashboard's own exit
+/// requests read the same flag (see `gui::Dashboard::request_exit`), so this is
+/// deliberate and not a defect.
 ///
-/// Returns only when the drain must be abandoned (a force-cancel-class request);
-/// the clean-drain exit path is driven by the drain-watch task in the binary
-/// (fires the token when no in-flight agents or orchestrator calls remain).
-pub async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+/// Returns only when the drain must be abandoned (a force-cancel-class request), naming that
+/// request where the platform names it — a Windows console request does, while a Unix signal is
+/// named in its own line locally and returns none, leaving the caller's line the fallback it always
+/// carried; the clean-drain exit path is driven by the drain-watch task in the binary (fires the
+/// token when no in-flight agents or orchestrator calls remain).
+pub async fn wait_for_shutdown_signal() -> anyhow::Result<Option<&'static str>> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -377,7 +420,7 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
                 first = false;
             } else {
                 info!("Received second {signal} — force-cancelling drain");
-                return Ok(());
+                return Ok(None);
             }
         }
     }
@@ -393,25 +436,40 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
                     info!("Received {label} — draining (a second request force-cancels)");
                     drain_begin();
                 }
-                // The caller's signal task logs this one, naming the trigger.
-                StopAction::ForceCancel => return Ok(()),
+                // The caller's signal task logs this one, naming the request returned here.
+                StopAction::ForceCancel => return Ok(Some(label)),
             }
         }
     }
+}
+
+// ── Stop-request sources ──────────────────────────────────────────────────
+
+/// Subscribe the process to every stop request the platform can deliver, before boot and before
+/// the interface exists: the two Windows sources below and the quit source, the only one of the
+/// three that is not platform-gated (the `install_quit_requests` call below states it).
+///
+/// They have to be up this early because the platform may deliver a stop the moment the window is
+/// up — before boot has finished — and the request has to survive until the dashboard subscribes
+/// to it.
+pub fn install_stop_request_sources() {
+    install_console_stop_handler();
+    install_session_end_listener();
+    install_quit_requests();
 }
 
 // ── Windows console control handler ───────────────────────────────────────
 
 /// Install the console stop-request handler — a no-op on macOS/Linux.
 ///
-/// Called from `main` before boot: the handler needs no runtime (it queues for the
-/// async protocol loop, see the `console` module), so the subscription is never
+/// Called from [`install_stop_request_sources`] before boot: the handler needs no runtime (it
+/// queues for the async protocol loop, see the `console` module), so the subscription is never
 /// what a stop request goes missing on. A registration failure is reported where
 /// there is a console (see the `console` module) and never fails a launch — the
 /// fallback it costs is the tokio Ctrl+C handler, which (like this one) can only
 /// ever fire where a console exists to deliver the event, so a console-less launch
 /// loses nothing it had.
-pub fn install_console_stop_handler() {
+fn install_console_stop_handler() {
     #[cfg(windows)]
     console::install();
 }
@@ -419,11 +477,12 @@ pub fn install_console_stop_handler() {
 /// Install the Windows session-end listener (log-off, shutdown, restart) — a no-op on
 /// macOS/Linux.
 ///
-/// Called from `main` before boot, next to [`install_console_stop_handler`]: the platform
+/// Called from [`install_stop_request_sources`] before boot, next to
+/// [`install_console_stop_handler`]: the platform
 /// may end the session at any time, and the listener needs no runtime (it forces the stop
 /// synchronously, see the `session_end` module). A failure to bring it up is reported, never
 /// fatal: the daemon then keeps exactly the stop requests it had.
-pub fn install_session_end_listener() {
+fn install_session_end_listener() {
     #[cfg(windows)]
     session_end::install();
 }
@@ -482,8 +541,8 @@ pub fn install_session_end_listener() {
 /// - Ctrl+C and Ctrl+Break before the loop exists: nothing can act on them, so they
 ///   keep today's platform default handling, as macOS/Linux does before its signal
 ///   task registers its streams. Swallowing them instead would make Ctrl+C a dead key
-///   wherever boot never reaches the loop — the start-failure screen, which consumes
-///   neither the drain flag nor the token (only its own window's close).
+///   wherever boot never reaches the loop — the start-failure screen, which answers its
+///   own window's close but has no consumer for a console event at all.
 /// - Once the loop exists the handler suppresses the default handling for Ctrl+C and
 ///   Ctrl+Break, so those would be inert if that loop died while the process lived. Unix
 ///   is no better: tokio keeps its handler installed for the whole process even once the
@@ -735,9 +794,9 @@ mod console {
 ///   must never be fatal.
 /// - Fast user switching: it ends no session and sends no notification, so nothing here
 ///   runs for it and the daemon is meant to keep running.
-/// - The stop trace: best-effort, not a durable record — the listener's line can still be
-///   flushed before the iced runtime is torn down, the exit path's own line is dropped
-///   outright (the exit path's note in `main.rs` says why).
+/// - The stop trace: best-effort, not a durable record — this route forces the stop at once and
+///   the exit burst lasts milliseconds, so the listener's own line is dropped with the runtime
+///   exactly as the exit path's line is (see `EXIT_TRIGGER`).
 #[cfg(windows)]
 mod session_end {
     use super::{session_end_label, stop_for_session_end};
@@ -882,6 +941,294 @@ mod session_end {
             "session-end listener: {what}: {detail} — a Windows log-off, shutdown or restart \
              will end the daemon without its stop steps"
         ));
+    }
+}
+
+// ── Application-machinery quit (macOS) ────────────────────────────────────
+
+/// The wording the macOS quit route records for itself in [`EXIT_TRIGGER`]: every ordinary quit
+/// ask — ⌘Q, the application menu's Quit item, the Dock's Quit — arrives as the one AppleEvent
+/// `macos_quit` takes over, so they share one label.
+pub(crate) const MACOS_QUIT_TRIGGER: &str = "macOS quit";
+
+/// Install the source of the platform's quit requests: the quit channel, and on macOS the
+/// interception of the platform's own asks.
+///
+/// Called from [`install_stop_request_sources`] before the interface starts, next to the Windows
+/// installers there. The channel is created on every platform so the dashboard's subscription
+/// always has a source, but only macOS sends on it — and only the interception is macOS-only.
+fn install_quit_requests() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // The receiving half first, so a quit the platform delivers before the dashboard subscribes
+    // waits here instead of being lost.
+    *QUIT_REQUESTS.lock().unwrap_poison() = Some(rx);
+    // The channel exists on every platform so the dashboard's subscription always has a source;
+    // only macOS sends, so everywhere else the sender is dropped here and the source stays empty.
+    #[cfg(target_os = "macos")]
+    macos_quit::install(tx);
+    #[cfg(not(target_os = "macos"))]
+    drop(tx);
+}
+
+/// The receiving half: the dashboard's subscription takes it once, and a quit that arrives
+/// before anything has subscribed waits here instead of being lost — the platform asks whether
+/// or not the interface is ready for it.
+static QUIT_REQUESTS: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<()>>> = Mutex::new(None);
+
+/// Take the quit-request receiver, for the dashboard's subscription. `None` before
+/// [`install_quit_requests`] ran, or once the receiver has been taken: iced spawns a
+/// `Subscription::run` recipe — identified by its function pointer — once per process, so the
+/// subscriber takes it exactly once.
+pub(crate) fn take_quit_requests() -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+    QUIT_REQUESTS.lock().unwrap_poison().take()
+}
+
+/// The macOS quit interception: the platform's own ordinary quit asks, brought into the
+/// product's closing path.
+///
+/// # Why it exists
+///
+/// macOS ends an application through its own machinery: its ordinary quit asks — the ones
+/// [`crate::gui::Message::QuitRequested`] receives — reach AppKit's `terminate:`, which asks the
+/// application delegate (`applicationShouldTerminate:`) whether it may terminate and then
+/// terminates the process itself. winit, which iced draws with, installs that delegate and
+/// implements no `applicationShouldTerminate:`, so AppKit's default answer stands: the asks never
+/// reach the closing path, the window's state is never recorded, the exit-time checkpoint never
+/// runs, the browser release is deferred to the next start, and in-flight work is cut off hard.
+/// The system's own asks during a log-out, restart or shut-down travel the same route and are
+/// deliberately left alone (see below).
+///
+/// # The hook
+///
+/// The method is added to winit's delegate class at run time (`class_addMethod`), which leaves
+/// winit's delegate object untouched — it has to, because winit panics unless the application's
+/// delegate is the one it registered itself (`ApplicationDelegate::get`), so the delegate cannot
+/// be replaced. The class does not exist before the event loop is built (iced builds it inside
+/// `run`, after `main`'s install call), so a thread of its own waits for it and gives up after
+/// `INSTALL_WAIT` — the fallback named under "Accepted" below.
+///
+/// # Which ask it is
+///
+/// `kAEQuitReason` on the Quit AppleEvent names why the quit was sent; an ordinary quit carries no
+/// reason at all. The delegate's `sender` cannot tell them apart — it is the application itself
+/// for every AppleEvent-driven route, the Dock's Quit included. The two are answered differently:
+///
+/// - An ordinary quit is answered `NSTerminateCancel`: the platform's termination is refused and
+///   the closing path takes over, exactly as a window close does (winit answers
+///   `windowShouldClose:` with "no" for the same reason). Nothing stays pending on the platform's
+///   side, so a **second** quit during the graceful drain reaches this hook again and does what a
+///   second window close does — forces that drain, except while a self-update's own drain owns
+///   the exit, which neither gesture forces.
+/// - A session end — a log-out, restart or shut-down — is not the product's to handle: the ask is
+///   answered `NSTerminateNow`, the answer an application that does not implement this method at
+///   all gets, and the platform ends the process at once. That exit and its accepted losses are on
+///   the list above.
+///
+/// # The bound
+///
+/// An ordinary quit is refused at the platform level, so no platform deadline is left to end the
+/// process — the product's own has to, or a wedged closing path would leave it running. It cannot
+/// live inside the machinery the closing path tears down, so `arm_exit_bound` puts it on a thread
+/// that outlives the interface, armed the moment a quit is taken over: `EXIT_BOUND`, the drain cap
+/// plus an allowance for the closing steps after it — the last resort that makes "never left
+/// running" true.
+///
+/// # Accepted, deliberately not fixed
+///
+/// The platform-forced termination and the session end are on the `shutdown` module's list of the
+/// exits that run none of the closing path; nothing here changes either. What this module accepts
+/// on its own terms, the canonical list naming where each of them ends the process:
+///
+/// - A quit that arrives with nothing left to act on it — the dashboard's subscription gone
+///   because the interface is already past its exit: it is handed back (`NSTerminateNow`), which
+///   keeps a quit from being a dead key and the platform from waiting on an answer nothing can
+///   give.
+/// - A failure to install (the delegate class never appears, a future winit renames it, the class
+///   already implements the method, the thread cannot be spawned): an ordinary quit keeps today's
+///   behaviour — the platform ends the process — reported, never fatal.
+/// - The exit bound firing: a hard end with no closing steps, the same class as a force quit. A
+///   quit arriving while a self-update is finalizing is armed like any other, so the bound can cut
+///   that hand-off where the exit path would otherwise wait for it: a tail outrunning the
+///   allowance looks no different from a wedged one.
+#[cfg(target_os = "macos")]
+mod macos_quit {
+    use objc2::ffi::class_addMethod;
+    use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
+    use objc2::sel;
+    use objc2_app_kit::NSApplicationTerminateReply;
+    use objc2_core_services::{
+        kAEQuitAll, kAEQuitReason, kAEReallyLogOut, kAERestart, kAEShutDown,
+    };
+    use objc2_foundation::NSAppleEventManager;
+    use std::ffi::CStr;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    use tracing::{info, warn};
+
+    /// The sending half of the quit channel; this module is its only producer, and what a quit
+    /// carries says nothing — every one of them arrives by the same route.
+    static QUIT_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<()>> = OnceLock::new();
+
+    /// Hand a quit to the dashboard. `false` when nothing will consume it — the subscription is
+    /// gone — so the caller has to fall back on the platform ending the process.
+    fn queue_quit() -> bool {
+        QUIT_TX.get().is_some_and(|tx| tx.send(()).is_ok())
+    }
+
+    /// The delegate class winit registers for its event loop, and the only one AppKit asks about
+    /// termination; a rename in a future winit costs the interception and nothing else.
+    const DELEGATE_CLASS: &CStr = c"WinitApplicationDelegate";
+
+    /// `applicationShouldTerminate:`'s type encoding: the reply (`NSUInteger`), the receiver,
+    /// the selector, the sender.
+    const SHOULD_TERMINATE_TYPES: &CStr = c"Q@:@";
+
+    /// How long the installer waits for winit's delegate class to be registered.
+    const INSTALL_WAIT: Duration = Duration::from_secs(60);
+    /// How often it looks while waiting.
+    const INSTALL_POLL: Duration = Duration::from_millis(5);
+
+    /// The last-resort bound on a quit's exit: the drain cap plus an allowance for the closing
+    /// steps that follow it (see the module's bound note).
+    const EXIT_BOUND: Duration = Duration::from_secs(crate::jobs::DRAIN_CAP_SECS + 300);
+
+    /// Bring the interception up on a thread of its own, never joined: a failure is reported and
+    /// never fatal — an ordinary quit keeps today's behaviour.
+    pub(super) fn install(tx: tokio::sync::mpsc::UnboundedSender<()>) {
+        let _ = QUIT_TX.set(tx);
+        if let Err(e) = std::thread::Builder::new()
+            .name("quit-interception".to_string())
+            .spawn(install_when_registered)
+        {
+            report(&format!("thread not spawned: {e}"));
+        }
+    }
+
+    /// Wait for winit's delegate class, then add the delegate method to it.
+    fn install_when_registered() {
+        let give_up = Instant::now() + INSTALL_WAIT;
+        loop {
+            if let Some(class) = AnyClass::get(DELEGATE_CLASS) {
+                // SAFETY: the IMP's signature is the method's own (`self`, `_cmd`, `sender`,
+                // returning the reply type, an `NSUInteger`), and the encoding string spells it
+                // out; the class outlives the process, so the method stays valid for every
+                // delegate instance.
+                let added = unsafe {
+                    class_addMethod(
+                        std::ptr::from_ref(class).cast_mut(),
+                        sel!(applicationShouldTerminate:),
+                        std::mem::transmute::<
+                            unsafe extern "C-unwind" fn(
+                                *mut AnyObject,
+                                Sel,
+                                *mut AnyObject,
+                            )
+                                -> NSApplicationTerminateReply,
+                            Imp,
+                        >(should_terminate),
+                        SHOULD_TERMINATE_TYPES.as_ptr(),
+                    )
+                };
+                if !added.as_bool() {
+                    report(
+                        "winit's delegate already implements applicationShouldTerminate: — \
+                         the platform's own termination stands",
+                    );
+                }
+                // Success is silent, as the Windows installers are: the class appears inside
+                // `run`, before boot opens the stores, so nothing would carry a line here — and a
+                // takeover is not reported to the owner either (`EXIT_TRIGGER` says what becomes
+                // of the exit path's line). What it produces is the closing path itself.
+                return;
+            }
+            if Instant::now() >= give_up {
+                report(
+                    "winit's delegate class was not registered in time — the platform's own \
+                     termination stands",
+                );
+                return;
+            }
+            std::thread::sleep(INSTALL_POLL);
+        }
+    }
+
+    /// The delegate method AppKit asks about termination: an ordinary quit is handed to the
+    /// product's closing path, a session end is left to the platform (see the module docs).
+    ///
+    /// # Safety
+    ///
+    /// AppKit calls this as `-[WinitApplicationDelegate applicationShouldTerminate:]` on the
+    /// main thread: `_this` is the delegate, `_sender` the application object (unused — the ask
+    /// is told apart by the AppleEvent the system is handling, not by the sender).
+    unsafe extern "C-unwind" fn should_terminate(
+        _this: *mut AnyObject,
+        _cmd: Sel,
+        _sender: *mut AnyObject,
+    ) -> NSApplicationTerminateReply {
+        if is_session_end() {
+            return NSApplicationTerminateReply::TerminateNow;
+        }
+        if !queue_quit() {
+            warn!("the dashboard is past its exit — the platform ends the process");
+            return NSApplicationTerminateReply::TerminateNow;
+        }
+        info!("macOS quit — the platform asked the product to quit");
+        arm_exit_bound();
+        NSApplicationTerminateReply::TerminateCancel
+    }
+
+    /// Whether the platform is ending the session rather than asking the product to quit: its
+    /// Quit AppleEvent names a session end with `kAEQuitReason`, and an ordinary quit carries no
+    /// reason at all.
+    ///
+    /// A reason this build does not know — and a session end whose reason the system leaves out —
+    /// is read as an ordinary quit. The asymmetry is deliberate: a session end read as an ordinary
+    /// one only starts a closing path the platform's own deadline then cuts, while an ordinary
+    /// quit read as a session end would leave a quit the user is watching to the platform — the
+    /// behaviour this module exists to replace. It does mean a misread session end cancels the
+    /// platform's termination, and that the classification rests on Apple's documented reason
+    /// codes alone.
+    fn is_session_end() -> bool {
+        /// The reason codes read as a session end: the documented values of `kAEQuitReason`
+        /// (`AERegistry.h`) — shutdown, restart, log-out, and the system's quit-all, the last of
+        /// which is read as a session end here rather than as an ordinary quit.
+        const SESSION_ENDS: [u32; 4] = [kAEShutDown, kAERestart, kAEReallyLogOut, kAEQuitAll];
+        NSAppleEventManager::sharedAppleEventManager()
+            .currentAppleEvent()
+            .and_then(|event| event.attributeDescriptorForKeyword(kAEQuitReason))
+            .is_some_and(|reason| SESSION_ENDS.contains(&reason.typeCodeValue()))
+    }
+
+    /// Arm [`EXIT_BOUND`] on the first quit the product takes over.
+    fn arm_exit_bound() {
+        static ARMED: AtomicBool = AtomicBool::new(false);
+        if ARMED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Err(e) = std::thread::Builder::new()
+            .name("quit-exit-bound".to_string())
+            .spawn(|| {
+                std::thread::sleep(EXIT_BOUND);
+                report(&format!(
+                    "the closing path did not finish within {EXIT_BOUND:?} of a quit — ending \
+                     the process"
+                ));
+                // SAFETY: `_exit` ends the process at once, from any thread. Nothing is
+                // waited for: this is the last resort, the same class of end as a force quit.
+                unsafe { libc::_exit(1) }
+            })
+        {
+            report(&format!("exit bound not armed: {e}"));
+        }
+    }
+
+    /// Report a failure of the interception, or the exit bound firing, through the boot diagnostic,
+    /// as the session-end listener's `report` does: its stderr leg is the one that carries it (an
+    /// install failure can run before the logs store exists, and the exit-bound report is followed
+    /// at once by the `_exit`).
+    fn report(what: &str) {
+        crate::boot::boot_diagnostic(format!("quit interception: {what}"));
     }
 }
 

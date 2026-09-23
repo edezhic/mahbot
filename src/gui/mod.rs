@@ -74,7 +74,7 @@ use futures_util::StreamExt;
 /// cards and footer responsive.
 const RUNTIME_REFRESH_COALESCE: Duration = Duration::from_millis(250);
 
-/// How long a close requested before boot finished waits for the boot task to
+/// How long an exit requested before boot finished waits for the boot task to
 /// deliver its result before the exit path runs anyway. The boot is the only
 /// writer to the stores until then, and a store left before its first catalog
 /// run is refused on the next start (`db::has_product_schema`) — so waiting is
@@ -306,17 +306,25 @@ pub enum Message {
     /// A users-table or user_channels-table row changed (or the CDC stream
     /// lagged) — triggers a full users re-list on the Settings page.
     UsersCdcChanged,
-    /// Shutdown signaled — close the dashboard window so `run()` returns.
-    /// Triggered by the shutdown token (self-update restart, SIGTERM/SIGINT).
+    /// Shutdown signaled — leave the iced runtime for the product's exit path
+    /// (`save_and_exit`), which `main` continues after `run()` returns.
+    /// Triggered by the shutdown token: a self-update restart, SIGTERM/SIGINT, and the
+    /// end of a drain a window close or a macOS quit began.
     Shutdown,
-    /// The graceful-drain window began (first signal / window-close /
+    /// The graceful-drain window began (first signal / window-close / quit /
     /// self-update). Draining disables input; iced::exit is deferred until
     /// the drain completes (the token fires).
     DrainStarted,
-    /// Window close button pressed — persist position and size before exiting.
-    /// Once boot has finished this begins the graceful drain; before it, the
-    /// close runs the exit path directly (see the arm).
+    /// The dashboard window's close button: an exit request, handled by
+    /// `request_exit` — the graceful drain once boot has finished, the exit path directly
+    /// before it.
     CloseRequested(window::Id),
+    /// One of the platform's own ordinary quit asks — macOS's ⌘Q, the application menu's Quit
+    /// item or the Dock's Quit — delivered by `quit_requests_subscription`, subscribed from the
+    /// first frame. Runs the same exit handling as a window close, the second-quit escape
+    /// included; the system's asks during a log-out, restart or shut-down are not delivered here
+    /// (see `shutdown`).
+    QuitRequested,
     /// Window geometry event (move/resize) — tracks state for persist-on-close.
     WindowEvent(window::Id, window::Event),
     /// Keyboard shortcut: Cmd+F — focus the primary search input on the current page.
@@ -354,7 +362,7 @@ pub enum Message {
         generation: u64,
     },
     /// The wait for a still-running boot expired ([`BOOT_EXIT_WAIT`], a start
-    /// that hangs): run the exit path for the close that was waiting.
+    /// that hangs): run the exit path for the exit request that was waiting.
     BootExitWaitExpired,
     /// Full workspace map reloaded from the store (CDC workspaces event,
     /// stream lag, toggle completion, or a settings add/delete). The handler
@@ -563,9 +571,9 @@ pub static BOOT_LOG_STORE: OnceLock<LogStore> = OnceLock::new();
 pub struct Dashboard {
     ready: bool,
     boot_error: Option<String>,
-    /// A close requested while the boot task was still running: the exit waits
+    /// An exit requested while the boot task was still running: the exit waits
     /// for the boot's result (bounded by [`BOOT_EXIT_WAIT`]) instead of
-    /// interrupting the store bring-up. See the `CloseRequested` arm.
+    /// interrupting the store bring-up. See `request_exit`.
     exit_after_boot: bool,
     page: Page,
     log_store: Option<LogStore>,
@@ -597,11 +605,10 @@ pub struct Dashboard {
     /// admin's "Personal" workspace; `Some("ws")` = a shared workspace;
     /// `None` = nothing selected.
     selected_workspace_name: Option<String>,
-    /// True when a genuine window close was requested while the update was in
-    /// its finalizing window (daemon shut down; checkpoint + spawn + exit
-    /// pending). Only a user close (`CloseRequested`) sets this — the update's
-    /// own step-10 `shutdown()` also fires `Message::Shutdown` via the
-    /// subscription, which must not be mistaken for an exit request. If the
+    /// True when a genuine exit request — the window's close or a platform quit — arrived
+    /// while the update was in its finalizing window (daemon shut down; checkpoint + spawn +
+    /// exit pending). Only a real request sets this: the update's own shutdown step also fires
+    /// `Message::Shutdown` via the subscription, which must not be mistaken for one. If the
     /// update fails, this flag makes the GUI run its own checkpoint + exit.
     exit_requested_during_update: bool,
     /// Graceful-drain window active: the window stays open with input
@@ -768,32 +775,105 @@ impl Dashboard {
         save_window_state(self.last_position, self.last_size);
     }
 
-    /// The one exit path: flush the draft, record the window geometry, fire the
-    /// shutdown token, then leave the iced runtime.
+    /// Act on a request for the product to exit: name the route that asked, then start the wait
+    /// the request calls for.
+    ///
+    /// The two requests that reach it — the window's own close and an ordinary platform quit —
+    /// are handled identically, because full parity is the point of the interception; so are the
+    /// states with no drain to complete (a self-update finalizing, a boot that has not finished,
+    /// a boot that failed). `route` is the platform's wording for the ask
+    /// ([`crate::shutdown::MACOS_QUIT_TRIGGER`], beside the route that produces it), or `None`
+    /// for the window's own close, whose wording the exit line already falls back to.
+    /// It is recorded where this request is what drives the exit (or, in the self-update window,
+    /// may yet drive it once the update is seen to fail); a request that finds the exit already
+    /// pending leaves the record to the one that caused it.
+    fn request_exit(&mut self, route: Option<&'static str>) -> Task<Message> {
+        if crate::self_update::update_in_progress() && crate::self_update::update_is_finalizing() {
+            // The update owns the exit (its own drain + checkpoint + swap + spawn): record the
+            // request and wait — a force-cancel here would abort the update's full drain. The
+            // route is recorded because a failed update re-enters the exit path for this request
+            // (see `exit_requested_during_update`); a request that finds the update window
+            // already claimed changes nothing, and must not take the record over from the
+            // request that claimed it.
+            if !self.exit_requested_during_update {
+                record_exit_route(route);
+            }
+            self.persist_window_state();
+            self.exit_requested_during_update = true;
+            Task::none()
+        } else if !self.ready {
+            // An exit request before boot finished has no drain to complete: the drain-watch,
+            // and the shutdown subscription that turns the token into an exit, both exist only
+            // after a successful boot — so the exit path runs directly. Not while the boot is
+            // still writing the stores, though: a store left before its first catalog run is
+            // refused on the next start (`db::has_product_schema`), so a request that arrives
+            // mid-boot waits for the boot's result instead, and [`BOOT_EXIT_WAIT`] bounds that
+            // wait so a start which never finishes stays closable.
+            if self.boot_error.is_some() {
+                // The start failed, so the boot stopped with it: nothing is writing the stores
+                // any more.
+                record_exit_route(route);
+                self.save_and_exit()
+            } else if self.exit_after_boot {
+                // Nothing changes: this exit is already pending, so the request is not what ends
+                // the process and must not take the exit record over from the one that is.
+                Task::none()
+            } else {
+                record_exit_route(route);
+                self.exit_after_boot = true;
+                Task::perform(async { tokio::time::sleep(BOOT_EXIT_WAIT).await }, |()| {
+                    Message::BootExitWaitExpired
+                })
+            }
+        } else if crate::shutdown::is_draining() {
+            // An exit request during a drain = second request: force-cancel (fires the token →
+            // Message::Shutdown → exit path). The rule is the drain flag's, not the gesture's:
+            // a first ⌘Q after a window close's drain forces that drain too. A drain whose token
+            // has already fired is an exit under way, though — this request changes nothing about
+            // it and must not take the record over.
+            if !crate::shutdown::shutdown_token().is_cancelled() {
+                record_exit_route(route);
+            }
+            crate::shutdown::force_cancel();
+            Task::none()
+        } else {
+            // Begin the GRACEFUL drain: the window stays open with input disabled; the
+            // drain-watch fires the token when no in-flight work remains (or force-cancels at
+            // the cap). save_and_exit is deferred until Message::Shutdown.
+            record_exit_route(route);
+            crate::shutdown::drain_begin();
+            Task::none()
+        }
+    }
+
+    /// Leave the iced runtime for the product's exit path: flush the draft, record the window
+    /// geometry, fire the shutdown token, then exit the runtime.
+    ///
+    /// The ordinary exit for everything the interface handles — a window close, a platform
+    /// quit, SIGINT/SIGTERM, the clean end of a drain — and the entry to the teardown in
+    /// `main` that the token's cancellation is checked against. It is not the only way this
+    /// process ends: [`crate::shutdown`]'s module docs name the exits that never reach it.
     fn save_and_exit(&self) -> Task<Message> {
         crate::channels::chat_draft::flush_global();
         self.persist_window_state();
         if crate::self_update::update_in_progress() && crate::self_update::update_is_finalizing() {
-            // The update path has shut down the daemon and owns the exit:
-            // checkpoint, temp-root cleanup, lock release, spawn, exit(0).
-            // Exiting here would drop the iced runtime and abort that sequence
-            // mid-checkpoint, leaving the daemon down without a replacement —
-            // so wait instead. A close requested meanwhile is recorded in
-            // Message::CloseRequested; if the update fails, UpdateResult
-            // re-enters this path (in-progress cleared, flag cleared)
-            // and honors the close.
+            // The update path has shut down the daemon and owns the exit: checkpoint,
+            // temp-root cleanup, lock release, spawn, exit(0). Exiting here would drop the
+            // iced runtime and abort that sequence mid-checkpoint, leaving the daemon down
+            // without a replacement — so wait instead. A request that arrives meanwhile is
+            // recorded by `request_exit`; if the update fails, UpdateResult re-enters this path
+            // (in-progress cleared, flag cleared) and honors it.
             return Task::none();
         }
-        // Fire the token before the runtime drops — `shutdown_after_dashboard`
-        // relies on it being cancelled by then (see its note in main.rs), and a
-        // close that arrives before boot finished reaches here with no drain to
-        // have fired it. Idempotent: every other arrival has it cancelled
-        // already.
+        // Fire the token before the runtime drops — `shutdown_after_dashboard` relies on it
+        // being cancelled by then (see its note in main.rs), and a request that arrives before
+        // boot finished reaches here with no drain to have fired it. Idempotent: every other
+        // arrival has it cancelled already.
         crate::shutdown::force_cancel();
         // The checkpoint is deliberately NOT run here: it relocated to
-        // shutdown_after_dashboard, which runs after the iced runtime drops —
-        // genuinely single-writer (today's in-iced checkpoint ran while
-        // background writers were still live).
+        // shutdown_after_dashboard, which runs after the iced runtime drops — genuinely
+        // single-writer (today's in-iced checkpoint ran while background writers were still
+        // live).
         iced::exit()
     }
 
@@ -1122,9 +1202,9 @@ impl Dashboard {
         match message {
             // ── Pre-ready handlers (execute regardless of ready state) ──
             Message::Boot(result) => {
-                // A close that arrived while the boot was still writing the
+                // An exit request that arrived while the boot was still writing the
                 // stores takes effect now — the boot has stopped, so it cannot
-                // be left mid-bring-up (see the CloseRequested arm).
+                // be left mid-bring-up (see `request_exit`).
                 if std::mem::take(&mut self.exit_after_boot) {
                     return self.save_and_exit();
                 }
@@ -1132,7 +1212,7 @@ impl Dashboard {
             }
             Message::BootExitWaitExpired => {
                 // The boot did not deliver a result within [`BOOT_EXIT_WAIT`] (a
-                // start that hangs): the close that was waiting ends the
+                // start that hangs): the exit request that was waiting ends the
                 // process anyway.
                 self.save_and_exit()
             }
@@ -1141,60 +1221,13 @@ impl Dashboard {
                 restored_name,
                 generation,
             } => self.apply_boot_workspaces(workspaces, &restored_name, generation),
-            Message::CloseRequested(_) => {
-                if crate::self_update::update_in_progress()
-                    && crate::self_update::update_is_finalizing()
-                {
-                    // The update owns the exit (its own drain + checkpoint +
-                    // swap + spawn): record the close request and wait — a
-                    // force-cancel here would abort the update's full drain.
-                    self.persist_window_state();
-                    self.exit_requested_during_update = true;
-                    Task::none()
-                } else if !self.ready {
-                    // A close before boot finished has no drain to complete: the
-                    // drain-watch, and the shutdown subscription that turns the
-                    // token into an exit, both exist only after a successful
-                    // boot — so the exit path runs directly. Not while the boot
-                    // is still writing the stores, though: a store left before
-                    // its first catalog run is refused on the next start
-                    // (`db::has_product_schema`), so a close that arrives
-                    // mid-boot waits for the boot's result instead, and
-                    // [`BOOT_EXIT_WAIT`] bounds that wait so a start which never
-                    // finishes stays closable. A repeat close changes nothing:
-                    // that exit is already pending.
-                    if self.boot_error.is_some() {
-                        // The start failed, so the boot stopped with it: nothing
-                        // is writing the stores any more.
-                        self.save_and_exit()
-                    } else if self.exit_after_boot {
-                        Task::none()
-                    } else {
-                        self.exit_after_boot = true;
-                        Task::perform(async { tokio::time::sleep(BOOT_EXIT_WAIT).await }, |()| {
-                            Message::BootExitWaitExpired
-                        })
-                    }
-                } else if crate::shutdown::is_draining() {
-                    // Window-close during drain = second signal: force-cancel
-                    // (fires the token → Message::Shutdown → exit path).
-                    crate::shutdown::force_cancel();
-                    Task::none()
-                } else {
-                    // First window-close begins the GRACEFUL drain: the
-                    // window stays open with input disabled; the drain-watch
-                    // fires the token when no in-flight work remains (or
-                    // force-cancels at the cap). save_and_exit is deferred
-                    // until Message::Shutdown.
-                    crate::shutdown::drain_begin();
-                    Task::none()
-                }
-            }
+            Message::CloseRequested(_) => self.request_exit(None),
+            Message::QuitRequested => self.request_exit(Some(crate::shutdown::MACOS_QUIT_TRIGGER)),
             Message::Shutdown => self.save_and_exit(),
             Message::DrainStarted => {
                 // Restart toast: only when the update build/install has
                 // finished and finalize is shutting the service down — a
-                // plain window close or signal during a mid-build update
+                // plain window close, quit or signal during a mid-build update
                 // (in-flight but not yet finalizing) must not show a false
                 // "restarting" toast. `!self.draining` is defensive
                 // single-emission protection.
@@ -1427,9 +1460,9 @@ impl Dashboard {
                 if let Err(err) = result {
                     let toast = self.push_toast_msg(&ToastMessage::Error(err));
                     if self.exit_requested_during_update {
-                        // A genuine window close was requested while the update
-                        // owned the exit; it failed, so run the normal exit
-                        // checkpoint.
+                        // A window close or a platform quit arrived while the
+                        // update owned the exit; it failed, so run the normal
+                        // exit checkpoint.
                         self.exit_requested_during_update = false;
                         return Task::batch([toast, self.save_and_exit()]);
                     }
@@ -2197,24 +2230,28 @@ impl Dashboard {
     pub fn subscription(&self) -> iced::Subscription<Message> {
         // Window events are subscribed from the start, before boot completes —
         // a close request included: it must reach the dashboard in every state
-        // (see the CloseRequested arm). Pre-boot Resized/Moved events update
+        // (see `request_exit`). Pre-boot Resized/Moved events update
         // last_size/last_position, which are persisted to window-state.json on
         // close — without them, closing a never-resized window would overwrite
         // the restored geometry with the hardcoded defaults (iced does not
         // replay missed window events).
-        let window_events = iced::Subscription::batch([
+        //
+        // The platform's quit requests are subscribed from the start for the
+        // same reason: the platform can ask before boot has finished.
+        let always_on = iced::Subscription::batch([
             window::resize_events()
                 .map(|(id, size)| Message::WindowEvent(id, window::Event::Resized(size))),
             window::events().filter_map(|(id, event)| {
                 matches!(&event, window::Event::Moved(_)).then_some(Message::WindowEvent(id, event))
             }),
             window::close_requests().map(Message::CloseRequested),
+            iced::Subscription::run(quit_requests_subscription),
         ]);
         if !self.ready {
-            return window_events;
+            return always_on;
         }
         iced::Subscription::batch([
-            window_events,
+            always_on,
             keyboard::listen().filter_map(|event| {
                 use keyboard::Key;
                 let (key, modifiers, physical_key) = parse_key_press(event)?;
@@ -2314,9 +2351,9 @@ impl Dashboard {
 }
 
 /// Subscription that emits [`Message::Shutdown`] when the global shutdown
-/// token fires (self-update restart, SIGTERM/SIGINT), and
+/// token fires (self-update restart, SIGTERM/SIGINT, the end of a drain), and
 /// [`Message::DrainStarted`] when the graceful-drain window begins (first
-/// signal / window-close / self-update) — the token does NOT fire on the
+/// signal / window-close / quit / self-update) — the token does NOT fire on the
 /// first signal, so the GUI needs a separate drain signal to disable input
 /// while the drain runs.
 fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
@@ -2334,6 +2371,38 @@ fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
         }
         token.cancelled().await;
         let _ = output.try_send(Message::Shutdown);
+    })
+}
+
+/// Record `route` as the exit route, where the ask has wording of its own — a platform quit passes
+/// its label, a window close passes `None`, and this is the one home of the rule that `None` leaves
+/// the record alone. Nothing is shown for it (the exit path's line is dropped with the iced
+/// runtime — see `shutdown::EXIT_TRIGGER`), so it is set for accuracy, not for reporting.
+fn record_exit_route(route: Option<&'static str>) {
+    if let Some(route) = route {
+        crate::shutdown::record_exit_trigger(route);
+    }
+}
+
+/// Subscription that turns an ordinary quit the platform's own application machinery delivered
+/// — one of the asks [`Message::QuitRequested`] names — into that message.
+///
+/// The source is the process-lifetime channel the quit source fills
+/// ([`crate::shutdown::install_stop_request_sources`], called before the iced application runs).
+fn quit_requests_subscription() -> impl futures_util::Stream<Item = Message> {
+    use futures_util::SinkExt;
+    use iced::futures::channel::mpsc;
+    iced::stream::channel(1, |mut output: mpsc::Sender<Message>| async move {
+        let Some(mut requests) = crate::shutdown::take_quit_requests() else {
+            return;
+        };
+        while requests.recv().await.is_some() {
+            // Backpressure, not a dropped request: the next quit gesture during a drain is
+            // what forces the exit, so it must not be lost to a full channel.
+            if output.send(Message::QuitRequested).await.is_err() {
+                return;
+            }
+        }
     })
 }
 

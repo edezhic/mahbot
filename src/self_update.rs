@@ -732,8 +732,8 @@ pub(crate) const UPDATE_RESTART_MSG: &str =
 /// Set while [`execute_update`] runs its finalizing window (drain through
 /// `exit(0)`). During this window the update path owns the process:
 /// the GUI exit path waits ([`update_is_finalizing`]) instead of exiting, so a
-/// window close or SIGINT cannot abort the update's checkpoint on the iced
-/// runtime and leave the instance down without a replacement.
+/// window close, a platform quit or SIGINT cannot abort the update's checkpoint
+/// on the iced runtime and leave the instance down without a replacement.
 static UPDATE_FINALIZING: AtomicBool = AtomicBool::new(false);
 
 /// True while [`execute_update`] is in its finalizing window (the instance is
@@ -803,7 +803,7 @@ pub(crate) async fn execute_update() -> Result<()> {
         anyhow::bail!("{UPDATE_IN_PROGRESS_MSG}");
     };
     // Mark the shared in-progress state so both the GUI and the Telegram
-    // `/update` gate report the update, and the GUI's window-close/finalize
+    // `/update` gate report the update, and the GUI's exit-request/finalize
     // guards key off it (a Telegram-initiated update must also protect the
     // finalize/checkpoint window). Cleared on failure; a successful update
     // exits the process.
@@ -1050,12 +1050,11 @@ async fn finalize_install(
 ///    In-flight agents complete their current round; the drain-watch task fires
 ///    the global token when no in-flight agents or orchestrator calls remain
 ///    (or force-cancels at the 10-min cap). The GUI stays open with input
-///    disabled; the GUI exit path waits
-///    ([`update_is_finalizing`]) instead of exiting, so this sequence cannot
-///    be aborted by a window close or SIGINT racing the checkpoint. No failure
-///    transitions with 'service shutting down' comments fire — agents that
-///    cannot finish stay status='launched' and boot-resume. The drain semantics
-///    are unchanged; then
+///    disabled; the GUI exit path waits ([`update_is_finalizing`]) instead of
+///    exiting, so this sequence cannot be aborted by a window close, a platform
+///    quit or SIGINT racing the checkpoint. No failure transitions with 'service
+///    shutting down' comments fire — agents that cannot finish stay
+///    status='launched' and boot-resume. The drain semantics are unchanged; then
 ///    `crate::tools::chrome_release::flush_and_close_all_chrome_sessions` releases
 ///    the sessions ended runs left queued and closes the rest.
 /// 2. Checkpoint all databases BEFORE releasing the instance lock and spawning
@@ -1121,8 +1120,8 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
     // 5. Spawn the new instance from the determined spawn path, marked as the
     //    update hand-off.
     if let Err(e) = spawn_new_instance_from(spawn_path) {
-        // Spawn failed — the process stays alive (unless a genuine window
-        // close was requested during the finalizing window, in which case the
+        // Spawn failed — the process stays alive (unless a window close or a
+        // platform quit arrived during the finalizing window, in which case the
         // GUI honors it with its own checkpoint + exit via UpdateResult).
         // Clear the finalizing flag and re-acquire the lock.
         UPDATE_FINALIZING.store(false, Ordering::SeqCst);

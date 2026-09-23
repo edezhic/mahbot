@@ -2886,9 +2886,10 @@ pub(crate) fn failure_class_from_error(
 
 /// Stable failure classification for the agent-failure log.
 ///
-/// Order matters: the global shutdown token fires on SIGTERM/SIGINT and
-/// dashboard close, the per-agent token on a deliberate stop — check the global
-/// token first so shutdown isn't mislabeled as an internal cancel. The global
+/// Order matters: the global shutdown token fires on any stop request — SIGTERM/SIGINT, the
+/// dashboard's window close or a macOS quit, a Windows console or session-end request, a
+/// self-update — and when a graceful drain completes; the per-agent token on a deliberate stop —
+/// check the global token first so shutdown isn't mislabeled as an internal cancel. The global
 /// token also cancels every per-agent token via
 /// [`crate::agent::registry::AgentRegistry::shutdown_all`]. `error` is the raw
 /// error source when one is present at the call site (the `run_agent` `Err`
