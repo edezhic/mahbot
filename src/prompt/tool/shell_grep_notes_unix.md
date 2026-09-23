@@ -1,1 +1,1 @@
-The engine serves recursive and multi-path greps (`grep -rn <pat> .`); a single-file lookup (`grep <pat> <file>`) stays on the system `grep`, which is faster there.
+The engine serves recursive and multi-path greps (`grep -rn <pat> .`) that it can also match exactly; one it cannot serve — a single-file lookup, which the system `grep` does faster, or a member whose shape is not proven to agree with the system search under the environment the command runs in — is left to the system `grep`.

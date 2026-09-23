@@ -103,14 +103,23 @@
 //! [`StdoutDest`], which reads the member's real destination — so a redirect into
 //! a file is complete however it is spelled (`exec > file` included).
 //!
-//! Parity target is the host BSD grep under the shell tool's pinned
-//! `LC_ALL=C.UTF-8`. The macOS-gated differential matrix is the authoritative
-//! parity gate; recursive-walk rows compare as sorted line-sets (parallel
-//! ordering), everything else byte-exact. There is no such gate on Windows
-//! (no host, no system `grep`): that lane's reading is argued in `windows` and
-//! its one host-testable piece, [`windows::fnmatch`], is pinned differentially
-//! against this host's own `fnmatch`. Grep decisions are recorded in the
-//! dedicated `grep_telemetry` table (logs DB), not the general log stream.
+//! The engine's matching model was written against the host BSD grep under a
+//! pinned `LC_ALL=C.UTF-8`, and the macOS-gated differential matrix remains its
+//! authoritative equivalence proof under that pin (recursive-walk rows compare as
+//! sorted line-sets — parallel ordering — everything else byte-exact). The
+//! commands this engine intercepts no longer run in that locale, though: they run
+//! in the owner's own environment, whose locale is unknown to the product. A
+//! served member therefore has to clear a second, runtime gate ([`parity`]): the
+//! fast path may stand only for a member shape the product established, under the
+//! locale actually in effect, to agree with the real search, and anything else
+//! keeps the real `grep`. A member the line itself puts in another environment — a
+//! preceding `export`/`unset`/`eval`/`source` — is not served either, since the
+//! verdict is the process environment's and not the one the line built
+//! ([`changes_the_environment`]). There is no such gate on Windows (no host, no system
+//! `grep`): that lane's reading is argued in `windows` and its one host-testable
+//! piece, [`windows::fnmatch`], is pinned differentially against this host's own
+//! `fnmatch`. Grep decisions are recorded in the dedicated `grep_telemetry` table
+//! (logs DB), not the general log stream.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -133,6 +142,16 @@ use super::{SHELL_PLATFORM, ShellPlatform};
 /// ([`super::plan`]), which is why the module and the words it hands out are
 /// visible to its siblings.
 pub(super) mod windows;
+
+/// The runtime locale-parity gate: the fast served path may stand only where the
+/// battery in that module established, under the locale actually in effect, that
+/// the engine agrees with the real search for the member's shape.
+mod parity;
+
+/// The parity hooks the owner-environment reader drives (see [`parity`]): the
+/// reader is what changes the environment — and so the locale — an agent's
+/// commands get.
+pub(crate) use self::parity::{invalidate_verdict_for, refresh_if_environment_changed};
 
 // ── Protocol constants ────────────────────────────────────────────────────
 
@@ -783,6 +802,19 @@ pub fn grep_engine_rewrite_for_test(
     served_rewrite(command, workspace_root, home)
 }
 
+/// Establish the locale-parity verdict for the e2e harness.
+///
+/// The harness's subject is the engine's own equivalence proof — it drives the
+/// served path end to end against the real grep under its own pinned locale —
+/// while the runtime gate has its own tests ([`parity`]); so the harness opens
+/// the gate for its own process instead of measuring. It is a separate export
+/// because the gate's verdict is process-global.
+#[cfg(feature = "grep-engine-e2e")]
+#[doc(hidden)]
+pub fn grep_engine_establish_parity_for_harness() {
+    parity::publish_all_for_harness();
+}
+
 /// Whether a served spec exercises the parallel recursive directory walk
 /// (`-r`/`-R` with at least one directory operand). Cross-file worker ordering
 /// is non-deterministic for such rows, so parity comparisons relax to sorted
@@ -1025,7 +1057,9 @@ fn render_served(
 /// One enum for both platforms: the variants a platform cannot reach are simply
 /// never constructed on it — `CmdSyntax` and `Expansion` come from the cmd.exe
 /// model, `SingleFile` from the unix-only perf gate (Windows serves single-file
-/// lookups, having no host grep to prefer).
+/// lookups, having no host grep to prefer), and `NotEstablished` from the runtime
+/// parity gate (which never fires on Windows, where the fast path is the only
+/// search).
 ///
 /// Visible to this module tree because [`resolve_cd`] returns it and the runner's
 /// own decomposition reads that function ([`plan`]'s `tracked_cd`); it never
@@ -1049,10 +1083,19 @@ pub(super) enum Fallback {
     /// stays on the real `grep`.
     ProcessSubstitution,
     SingleFile,
+    /// The locale in effect could not be proven to agree with the real search
+    /// for this member's shape, so the fast path may not stand: the member is
+    /// kept verbatim and the real `grep` runs it instead. The word is the unmet
+    /// capability's ([`parity::Need`]), for the telemetry reason.
+    NotEstablished(&'static str),
     CdUntrackable,
     StdinOperands,
     StdinRecursive,
     SegmentEmpty,
+    /// A member after a segment that may have exported a new environment: the
+    /// parity verdict was measured for the environment the product hands commands,
+    /// not for the one the line built for itself, so the real `grep` runs it.
+    EnvironmentChanged,
     /// A spelling of the command this module's cmd.exe reading cannot follow: a
     /// `^`, a command group, an unbalanced quote, an empty member — all of them
     /// spellings the interpreter itself reads — or a word whose glued operator
@@ -1101,7 +1144,11 @@ impl std::fmt::Display for Fallback {
             Fallback::UnexpandableGlob => write!(f, "unexpandable glob"),
             Fallback::ProcessSubstitution => write!(f, "process substitution"),
             Fallback::SingleFile => write!(f, "single file"),
+            Fallback::NotEstablished(cap) => {
+                write!(f, "locale parity not established ({cap})")
+            }
             Fallback::CdUntrackable => write!(f, "cd untrackable"),
+            Fallback::EnvironmentChanged => write!(f, "the line changes the environment first"),
             Fallback::StdinOperands => write!(f, "stdin with operands"),
             Fallback::StdinRecursive => write!(f, "stdin with -r"),
             Fallback::SegmentEmpty => write!(f, "empty command or pipeline member"),
@@ -1274,6 +1321,10 @@ fn analyze_command(
     // segment splitter separated them from the group opener (e.g. `( cd d &&
     // grep … )` splits the grep out of the `(` segment).
     let mut group_depth = 0isize;
+    // Set by a segment that may have exported a new environment for the rest of
+    // the line (see [`changes_the_environment`]): a grep after it runs under an
+    // environment the parity verdict was not measured for.
+    let mut env_may_have_changed = false;
 
     for (idx, (seg, conn)) in segments.iter().enumerate() {
         let in_group = group_depth > 0;
@@ -1297,6 +1348,16 @@ fn analyze_command(
         // Every verb list below is read through the platform's own key, so a
         // verb classifies identically however the interpreter spells it.
         let key = list_key(verb, platform);
+        // The environment the earlier segments left behind is what this member runs
+        // under; this segment's own change (if any) applies to what follows it — but
+        // only when the segment is not handed to a pipe, since a pipeline member runs
+        // in a subshell of its own and its change dies with it (`export LC_ALL=C |
+        // grep …` leaves the sibling, and everything after the pipeline, in the
+        // inherited environment). See [`changes_the_environment`].
+        let env_changed = env_may_have_changed;
+        if !matches!(conn.as_str(), "|" | "|&") && changes_the_environment(seg, platform) {
+            env_may_have_changed = true;
+        }
         if is_cd_segment(verb, platform) {
             if pstart[idx] != pend[idx] {
                 return Err(AnalyzeFailure {
@@ -1331,6 +1392,7 @@ fn analyze_command(
                 // engine's stderr (the stream-size marker) into the tool's
                 // captured stdout, where the parent's strip cannot reach it.
                 marker_ok: !exec_redirects_stderr,
+                env_changed,
             };
             // Grep inside an open compound group: never served (the group's
             // opener segment was skipped; this member is inside the construct).
@@ -1849,6 +1911,73 @@ const COMPOUND_KEYWORDS: &[&str] = &[
     "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
     "select",
 ];
+
+/// The shell's own variable builtins: a segment holding one in command position
+/// may have exported a new value, so everything after it in the same line runs
+/// under an environment the parity verdict was not measured for (see
+/// [`changes_the_environment`]).
+const ENV_MUTATING_BUILTINS: &[&str] = &["export", "unset", "eval", "source", "."];
+
+/// True when `seg` may have changed the environment the rest of the line runs
+/// under: an assignment ([`is_env_assignment`](super::is_env_assignment)) or one of
+/// [`ENV_MUTATING_BUILTINS`] in command position — or, in the first position of a
+/// compound body, which the splitter hands over with its keyword
+/// (`then export LC_ALL=C`).
+///
+/// An assignment in command position counts whether or not it stands alone. Alone
+/// (`PATH=…; grep …`) it really does reach the later member, because a name the
+/// environment already exports keeps its export status when it is reassigned; and
+/// prefixed to a special builtin (`LC_ALL=C export FOO=1; grep …`) that builtin
+/// leaves it in force. A plain prefixed form (`FOO=1 echo hi; grep …`) scopes the
+/// assignment to that command and leaves the later member alone, so refusing it too
+/// is a deliberate over-refusal: telling the two apart would mean tracking which
+/// verbs are special builtins. The same goes for a subshell group
+/// (`(export LC_ALL=C); grep …`), whose change dies with the group but whose body
+/// reads as a compound body's first position.
+///
+/// Command position is what is read, so a quoted spelling is read through
+/// [`scan::strip_quoted_word`](super::super::scan), a leading run of backslashes is
+/// dropped (`\export LC_ALL=C` runs the builtin, because the shell removes an
+/// escape before it decides what a word names), and an argument that merely looks
+/// like an assignment (`echo KEY=value`, `grep -rn KEY=value .`) is not one.
+///
+/// The parity gate establishes that a served shape agrees with the real search
+/// under the environment the product hands commands (see [`parity`]). A member
+/// after such a segment runs under the environment the line built for itself,
+/// where the real search would have answered differently, so it is not served and
+/// the real search runs instead.
+///
+/// Unix only: on Windows there is no real search for the line's own environment
+/// to diverge from — the engine is the only search there — so the question does
+/// not arise.
+///
+/// Deliberately not chased, and left as a recorded residual — the spellings in which
+/// a served member can still run under an environment the verdict was not measured
+/// for: a mutating word in any position other than the two that are read — behind a
+/// wrapper keyword (`time export LC_ALL=C; grep …`, `! export …`), inside a
+/// construct body (`case x in a) export LC_ALL=C;; esac; grep …`), behind a wrapper
+/// word (`command export …`) or a redirection (`>log export LC_ALL=C`), or with an
+/// escape inside it (`ex\port LC_ALL=C`) — and `set -a`/`set -o allexport`, which
+/// exports later plain assignments. Each would mean reading redirects, wrapper
+/// words, construct bodies and shell option state for spellings outside the
+/// realistic set.
+fn changes_the_environment(seg: &str, platform: ShellPlatform) -> bool {
+    if platform == ShellPlatform::Windows {
+        return false;
+    }
+    let mut words = seg
+        .split_whitespace()
+        .map(|word| crate::tools::shell::scan::strip_quoted_word(word).trim_start_matches('\\'));
+    let first = words.next().unwrap_or_default();
+    let second = words.next();
+    let command_position =
+        super::is_env_assignment(first) || ENV_MUTATING_BUILTINS.contains(&first);
+    let body_position = is_compound_segment(seg, platform)
+        && second.is_some_and(|word| {
+            super::is_env_assignment(word) || ENV_MUTATING_BUILTINS.contains(&word)
+        });
+    command_position || body_position
+}
 
 /// True when a segment opens a compound construct (keyword prefix or a `(`/`{`
 /// group opener) — such a command must not serve any grep. The keyword list is
@@ -2458,6 +2587,10 @@ struct ParsedGrep {
     /// Ordered --include/--exclude filters (bool = include); last match wins.
     filters: Vec<(bool, String)>,
     exclude_dir: Vec<String>,
+    /// The raw patterns as typed (before [`translate_pattern`]): the locale-parity
+    /// gate reads these, because the engine dialect's metacharacters are not what
+    /// the member's shape is judged on.
+    patterns: Vec<String>,
     /// Translated engine-dialect patterns.
     engine_patterns: Vec<String>,
     /// Raw operand token spellings (quote/glob checks run on these).
@@ -2762,6 +2895,7 @@ fn parse_grep_words(
         flags,
         filters,
         exclude_dir,
+        patterns: raw_patterns,
         engine_patterns,
         operand_tokens,
         redirects,
@@ -3071,6 +3205,10 @@ fn locate_line(bytes: &[u8], term: u8, pos: usize) -> (usize, usize) {
 // ── Operand resolution and the serve gate ─────────────────────────────────
 
 /// Pipeline context for a served grep member.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts about one member, each read on its own"
+)]
 #[derive(Clone, Copy)]
 struct PipelineCtx {
     /// The member feeds a pipeline tail: its stdout must not be capped, so
@@ -3083,6 +3221,10 @@ struct PipelineCtx {
     /// shell-level `exec` stderr merge before it. When false, the stream-size
     /// marker is suppressed (it would leak into the agent-visible stdout).
     marker_ok: bool,
+    /// An earlier command in the same line may have changed the environment the
+    /// member runs under (see [`changes_the_environment`]): it is not the
+    /// environment the parity verdict was measured for, so it is not served.
+    env_changed: bool,
 }
 
 /// Serve one grep segment: parse, translate, resolve operands, apply the
@@ -3170,6 +3312,24 @@ fn serve_one_grep(
         || operands.len() >= 2;
     if !serve {
         return Err(Fallback::SingleFile);
+    }
+
+    // The line may have put this member in an environment of its own (an earlier
+    // `export` or assignment): the parity verdict is the process environment's, so
+    // the member is not served (see [`changes_the_environment`]). After the perf
+    // gate, so telemetry still names the more specific reason first.
+    if ctx.env_changed {
+        return Err(Fallback::EnvironmentChanged);
+    }
+
+    // Locale-parity gate: the fast path may stand only where the runtime battery
+    // established, under the environment actually in effect, that this member's
+    // shape agrees with the real search (see [`parity`]). It sits after the perf
+    // gate so telemetry keeps reporting the more specific reason first, and the
+    // gate itself is what keeps the fast path standing when there is no real
+    // search to run.
+    if let Err(cap) = parity::serve_allowed(&parity::needs(&parsed, platform), platform) {
+        return Err(Fallback::NotEstablished(cap));
     }
 
     let mut fallback = parsed.fallback_prefix.clone();
@@ -3349,8 +3509,11 @@ fn expand_glob(
     };
     let mut results = Vec::new();
     glob_walk(&base, display_prefix, &comps, &mut results, platform);
-    // The shell sorts glob expansions (LC_ALL=C.UTF-8 → byte order); grep
-    // emits operands in command-line order, so operand order must match.
+    // The shell sorts glob expansions by its own collation; grep emits operands
+    // in command-line order, so operand order must match. Whether the shell's
+    // order and this byte order agree is exactly what the `Glob` capability is
+    // measured for (`parity`): it holds in a `C` locale and not in a collating
+    // one, so a locale that collates sends glob operands to the real grep.
     results.sort();
     Ok(results)
 }
@@ -4722,6 +4885,7 @@ mod parity_tests {
     /// Fresh temp root with the fixture `ws` and `home` trees built in. Bind
     /// the returned TempDir for the whole test — dropping it deletes the trees.
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        super::test_support::open_the_gate();
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws = tmp.path().join("ws");
         let home = tmp.path().join("home");
@@ -6315,10 +6479,17 @@ use self::test_support::{render_only_json, serve_fixture, served, spec_cwd};
 mod test_support {
     use super::*;
 
+    /// Open the gate for a lane whose rows are about what the engine serves, not
+    /// about the runtime verdict (see [`parity::publish_for_test`]).
+    pub(super) fn open_the_gate() {
+        parity::publish_for_test((true, true, true));
+    }
+
     /// The temp tree the platform pin modules serve against: a workspace holding
     /// the operand paths their rows name, and a home tree beside it. Bind the
     /// returned `TempDir` for the whole test — dropping it deletes the trees.
     pub(super) fn serve_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        open_the_gate();
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws = tmp.path().join("ws");
         let home = tmp.path().join("home");
@@ -6755,6 +6926,90 @@ mod refusal_pins {
         assert_eq!(unavailable.outcomes.len(), 1, "the member is analysed");
         assert!(!unavailable.outcomes[0].served);
         assert_eq!(unavailable.outcomes[0].reason, "engine unavailable");
+    }
+
+    /// A line that exports a new environment before its search is not served: the
+    /// parity verdict was measured for the environment the product hands commands,
+    /// so the member after such a segment is left to the real `grep`, which answers
+    /// in whatever environment the line built for itself. On Windows there is no
+    /// real search to diverge from, so the same line is served as usual.
+    #[test]
+    fn a_line_that_exports_an_environment_first_is_not_served() {
+        let (_tmp, ws, home) = serve_fixture();
+        for command in [
+            "export LC_ALL=C; grep -rn needle .",
+            "export LC_ALL=C && grep -rn needle .",
+            "unset LANG; grep -rn needle .",
+            "eval \"export LC_ALL=C\"; grep -rn needle .",
+            "source /dev/null; grep -rn needle .",
+            "\"export\" LC_ALL=C; grep -rn needle .",
+            // An escaped builtin: the shell drops the escape before it decides what
+            // the word names, so this runs `export`.
+            "\\export LC_ALL=C; grep -rn needle .",
+            // A subshell group: the change dies with the group, but its body reads
+            // as a compound body's first position — a deliberate over-refusal, like
+            // the assignment prefixed to an ordinary command.
+            "(export LC_ALL=C); grep -rn needle .",
+            // An assignment on its own: a name the environment already exports keeps
+            // its export status, so the search after it runs with another value.
+            "LC_ALL=C; grep -rn needle .",
+            "PATH=/opt/bin:$PATH; grep -rn needle .",
+            // An assignment prefixed to a builtin, which keeps the assignment.
+            "LC_ALL=C export FOO=1; grep -rn needle .",
+            // A builtin inside a compound body, which the splitter hands over with
+            // its keyword.
+            "if true; then export LC_ALL=C; fi; grep -rn needle .",
+        ] {
+            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+            assert!(serve.rewritten.is_none(), "{command}: expected no serve");
+            assert_eq!(serve.outcomes.len(), 1, "{command}: the member is analysed");
+            assert!(
+                !serve.outcomes[0].served,
+                "{command}: the member falls back"
+            );
+            assert_eq!(
+                serve.outcomes[0].reason,
+                Fallback::EnvironmentChanged.to_string(),
+                "{command}: the cause is named"
+            );
+        }
+
+        // A search BEFORE the export runs in the environment the product handed
+        // over; a line that changes nothing about the environment is served as
+        // usual; an argument that merely looks like an assignment is not one; and a
+        // change inside a pipeline member dies with that member's subshell, so the
+        // siblings are served.
+        for command in [
+            "grep -rn needle . ; export LC_ALL=C",
+            "cd . && grep -rn needle .",
+            "echo hi; grep -rn needle .",
+            "echo KEY=value; grep -rn needle .",
+            "grep -rn KEY=value .",
+            "export LC_ALL=C | grep needle",
+            "LC_ALL=C echo hi | grep needle",
+        ] {
+            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+            assert!(
+                serve.rewritten.is_some(),
+                "{command}: expected to be served, got {:?}",
+                serve.refusal
+            );
+        }
+
+        // Windows: the engine is the only search there, so the line's own
+        // environment is not a parity question.
+        let serve = serve_command(
+            "export LC_ALL=C && grep -rn needle .",
+            &ws,
+            Some(&home),
+            ShellPlatform::Windows,
+            || true,
+        );
+        assert!(
+            serve.refusal.is_none(),
+            "windows must still serve: {:?}",
+            serve.refusal
+        );
     }
 
     /// A line that runs this service's own program beside a search is served like

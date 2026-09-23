@@ -102,7 +102,9 @@
 //! runner, the `custom` tool's script, a user's alarm program, and every member
 //! of a rewritten line's plan ([`super::plan`], which spawns its own-image steps
 //! through that same builder rather than a site of its own) plus the grep
-//! engine's own probe (`tools::shell::grep_engine::probe_engine`); and the file
+//! engine's own probe (`tools::shell::grep_engine::probe_engine`) and the grep
+//! engine's locale-parity battery, which runs the real search under the owner's
+//! environment (`tools::shell::grep_engine::parity::agent_command`); and the file
 //! manager the owner asked for (`gui::editor::perform_reveal_in_finder`).
 //!
 //! Not covered, on purpose: the terminal the owner opens inside the app
@@ -611,7 +613,7 @@ mod tests {
     /// The number of spawn sites the sweep must see — the module docs' inventory,
     /// counted. A site that constant and that inventory do not account for fails
     /// the sweep, and a scan that stopped reading the tree finds far fewer.
-    const SPAWN_SITES: usize = 16;
+    const SPAWN_SITES: usize = 17;
 
     fn indent(line: &str) -> usize {
         line.len() - line.trim_start().len()

@@ -5,6 +5,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use regex::RegexSet;
 use serde_json::json;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -143,24 +144,24 @@ const TIMEOUT_OUTPUT_TAIL_CHARS: usize = 2_000;
 /// Windows search (see [`engine_cause`]).
 const ENGINE_FAILURE_DETAIL_CHARS: usize = 200;
 
-/// Environment variables safe to pass to shell commands.
+/// The reduced environment the product uses for its own internal work and as the
+/// fallback for the agent's commands until a read of the owner's environment
+/// succeeds (see [`crate::shell_env`]).
 ///
 /// Only functional variables are included — never API keys or secrets. The
 /// platform's temp variables are NOT listed here: they are bound to the daemon's
-/// private temp root by [`apply_safe_env`] from
-/// [`crate::temp::shell_temp_vars`].
+/// private temp root by [`crate::temp::shell_temp_vars`].
 #[cfg(not(target_os = "windows"))]
-const SAFE_ENV_VARS: &[&str] = &[
+const FALLBACK_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL",
 ];
 
-/// Environment variables safe to pass to shell commands on Windows.
-///
-/// Includes Windows-specific variables needed for cmd.exe and program
-/// resolution. The temp variables are not listed here: [`apply_safe_env`] binds
-/// them to the daemon's private temp root.
+/// The reduced environment, as [`FALLBACK_ENV_VARS`] on every other platform,
+/// carrying in addition the Windows-specific variables program resolution and
+/// cmd.exe need. The temp variables are not listed here either: they are bound to
+/// the daemon's private temp root.
 #[cfg(target_os = "windows")]
-const SAFE_ENV_VARS: &[&str] = &[
+const FALLBACK_ENV_VARS: &[&str] = &[
     "PATH",
     "PATHEXT",
     "HOME",
@@ -176,34 +177,116 @@ const SAFE_ENV_VARS: &[&str] = &[
     "USERNAME",
 ];
 
-/// Clear the child's environment and re-populate it from [`SAFE_ENV_VARS`], plus
-/// the platform's temp variables bound to the daemon's private temp root.
+/// The fallback environment as bindable pairs: every name in
+/// [`FALLBACK_ENV_VARS`] with its baseline value, then the platform's temp
+/// variables bound to the daemon's private temp root.
 ///
 /// The temp names and value come from [`crate::temp::shell_temp_vars`] — the
 /// same pair the read-only guard's temp model reads — so the scratch location a
 /// child actually writes to and the location the guard accepts for a write
 /// cannot drift apart, and a new temp name reaches both at once.
-pub(crate) fn apply_safe_env(cmd: &mut tokio::process::Command) {
-    cmd.env_clear();
-    for &name in SAFE_ENV_VARS {
+#[must_use]
+fn fallback_env_pairs() -> Vec<(OsString, OsString)> {
+    let mut pairs = Vec::new();
+    for &name in FALLBACK_ENV_VARS {
         if let Some(value) = baseline_env_value(name) {
-            cmd.env(name, value);
+            pairs.push((OsString::from(name), OsString::from(value)));
         }
     }
     for (name, value) in crate::temp::shell_temp_vars() {
-        cmd.env(name, value);
+        pairs.push((OsString::from(name), OsString::from(value)));
     }
+    pairs
+}
+
+/// The environment the product's own internal work runs in: today that is git
+/// (see [`crate::git::commands::git_command`]), whose output the product
+/// interprets and whose credential hygiene is deliberate. Internal work that is
+/// not given an environment here — self-update's cargo child, the chrome CLI and
+/// the browser, the GUI Shell page's terminal — inherits this process's
+/// environment, as documented where each is spawned.
+///
+/// Clears the child's environment and re-populates it from
+/// [`fallback_env_pairs`]: this work must not be affected by the owner's
+/// personal environment, and must not leak credentials anywhere. It is
+/// deliberately *not* what an agent's command gets — see [`agent_env_pairs`].
+pub(crate) fn apply_internal_env(cmd: &mut tokio::process::Command) {
+    apply_env_pairs(cmd.as_std_mut(), &fallback_env_pairs());
+}
+
+/// The environment an agent's command runs in: the owner's own environment
+/// ([`crate::shell_env::snapshot`]) once a read has succeeded, with the
+/// data-location home and the pinned temp names applied last, otherwise the
+/// reduced [`fallback_env_pairs`].
+///
+/// Nothing read from the owner's environment is filtered — his secrets and
+/// tokens are handed over as they are, by design: these are his own commands
+/// doing his own work. The two overrides keep winning, which is what the
+/// documented "test instance from another folder" workflow relies on: `HOME`
+/// stays the data-location home and the temp names stay the private temp root,
+/// so a command cannot write into the owner's real home or temp area by
+/// accident. On Windows the home that wins is the profile the OS reports for the
+/// owner — not `$HOME`, so an install relocated through it is not reflected — and
+/// the OS-assembled `USERPROFILE` stays as the owner's profile; the temp names
+/// are pinned there like everywhere else.
+#[must_use]
+pub(crate) fn agent_env_pairs() -> Vec<(OsString, OsString)> {
+    crate::shell_env::snapshot()
+        .map_or_else(fallback_env_pairs, |owner| agent_env_pairs_from(&owner))
+}
+
+/// [`agent_env_pairs`] for a read that is not the published one: the same
+/// application, so a caller can ask what commands *will* get before the read is in
+/// place (the environment reader drops the parity verdict for exactly that
+/// environment, in the step before it publishes).
+#[must_use]
+pub(crate) fn agent_env_pairs_from(
+    owner: &crate::shell_env::OwnerEnv,
+) -> Vec<(OsString, OsString)> {
+    let mut pairs = owner.vars().to_vec();
+    let mut overrides: Vec<(OsString, OsString)> = Vec::new();
+    if let Some(home) = baseline_env_value("HOME") {
+        overrides.push((OsString::from("HOME"), OsString::from(home)));
+    }
+    for (name, value) in crate::temp::shell_temp_vars() {
+        overrides.push((OsString::from(name), OsString::from(value)));
+    }
+    // The product's own values replace the owner's rather than shadowing them, so
+    // the list is exactly the environment a command gets: nothing in it that the
+    // child will not see, and the parity key — which is compared on this list —
+    // moves only when what commands get moves.
+    for (name, value) in overrides {
+        match pairs.iter().position(|(existing, _)| *existing == name) {
+            Some(index) => pairs[index].1 = value,
+            None => pairs.push((name, value)),
+        }
+    }
+    pairs
+}
+
+/// Apply `pairs` to a child's environment, from nothing: the one definition of
+/// a clear-and-fill spawn environment, shared by the async builders
+/// ([`apply_agent_env`], [`apply_internal_env`]) and by the blocking grep-parity
+/// battery, which spawns through `std::process::Command` on a blocking thread.
+pub(crate) fn apply_env_pairs(cmd: &mut std::process::Command, pairs: &[(OsString, OsString)]) {
+    cmd.env_clear();
+    cmd.envs(pairs.iter().map(|(name, value)| (name, value)));
+}
+
+/// Clear the child's environment and re-populate it from [`agent_env_pairs`].
+pub(crate) fn apply_agent_env(cmd: &mut tokio::process::Command) {
+    apply_env_pairs(cmd.as_std_mut(), &agent_env_pairs());
 }
 
 /// Build a [`tokio::process::Command`] for executing a shell command in the
-/// workspace root. The environment is cleared and re-populated from
-/// [`SAFE_ENV_VARS`] only — no parent-process environment is inherited. This
-/// prevents leaking API keys and other secrets into subprocesses (CWE-200).
+/// workspace root.
 ///
-/// **Note:** `$USER`/`$USERNAME` and the Windows system-path variables
-/// (`%SystemRoot%`/`%WINDIR%`, `%SystemDrive%`, `%ComSpec%`) are intentional
-/// exceptions — read from the parent process (usernames and system paths are
-/// not secrets).
+/// The environment is [`agent_env_pairs`]: once the owner's environment has been
+/// read, the command runs in exactly that — secrets and all, by design, since
+/// these are the owner's own commands. Until the first read succeeds, and
+/// whenever one cannot be obtained, the reduced [`fallback_env_pairs`] is used
+/// instead. The data-location home and the private temp root always win (see
+/// [`agent_env_pairs`]).
 ///
 /// On Unix the child is made a process group leader (via
 /// [`process_group(0)`](tokio::process::Command::process_group)), so that the
@@ -212,6 +295,15 @@ pub(crate) fn apply_safe_env(cmd: &mut tokio::process::Command) {
 /// Grandchildren (e.g., `cargo test` or long-running `sleep`) inherit the new
 /// PGID from `sh`, preventing orphaned CPU-consuming process trees when a
 /// shell command times out.
+///
+/// The interpreter itself is named by bare name (`sh`, and `cmd.exe` on Windows),
+/// so `std` resolves it through the environment the child is given: the product's
+/// own baseline until a read succeeds, the owner's own afterwards. That is a real
+/// consequence of running the owner's environment, not a fault to repair — on a
+/// machine whose own search path holds no `sh`, or whose `sh` is a wrapper of its
+/// own, commands start that program or fail to start at all, exactly as they would
+/// for the owner. How commands are spawned is deliberately unchanged, and nothing
+/// here compensates for the owner's search path.
 ///
 /// On Windows the child is what the runner puts under a job object right after
 /// the spawn — the platform's own whole-tree mechanism ([`tree`]).
@@ -258,9 +350,10 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
 /// argv — no shell in between, so no argument can ever be reinterpreted as
 /// shell syntax (unlike [`build_shell_command`], whose string is parsed by
 /// `sh -c`). Containment is otherwise identical: the workspace root as cwd,
-/// a cleared environment re-populated from [`SAFE_ENV_VARS`], and (Unix) the
-/// child leading its own process group; on Windows the runner's job is the
-/// platform's side of that containment ([`tree`]).
+/// [`agent_env_pairs`] as the environment (the owner's own once a read has
+/// succeeded, the reduced fallback until then), and (Unix) the child leading
+/// its own process group; on Windows the runner's job is the platform's side of
+/// that containment ([`tree`]).
 fn build_program_command(
     program: &Path,
     args: &[String],
@@ -278,10 +371,11 @@ fn build_program_command(
     process
 }
 
-/// Shared command setup: working directory + sanitized environment.
+/// Shared command setup: working directory + the agent's environment
+/// ([`apply_agent_env`]).
 fn finalize_command(process: &mut tokio::process::Command, workspace_root: &Path) {
     process.current_dir(workspace_root);
-    apply_safe_env(process);
+    apply_agent_env(process);
 }
 
 /// Outcome of a timed shell subprocess run.
@@ -1126,9 +1220,10 @@ fn program_outcome(success: bool, detail: String, stdout: &[u8], stderr: &[u8]) 
 
 /// Run `program` with `args` (argv — never a shell command string) in `ws` and
 /// return the raw run result. The single place that decides how a direct run is
-/// bounded: the sanitized environment, [`DEFAULT_SHELL_TIMEOUT_SECS`], the
-/// per-pipe output cap and the post-exit drain bound. `owner` travels to
-/// [`run_command_with_timeout`] and decides the run's containment.
+/// bounded: the agent's environment ([`apply_agent_env`]),
+/// [`DEFAULT_SHELL_TIMEOUT_SECS`], the per-pipe output cap and the post-exit
+/// drain bound. `owner` travels to [`run_command_with_timeout`] and decides the
+/// run's containment.
 async fn run_program(
     ws: &Workspace,
     program: &Path,
@@ -2020,9 +2115,10 @@ impl ShellTool {
     }
 }
 
-/// Extra `PATH` entries prepended for shell subprocesses so developer tools
-/// (`cargo`, Homebrew, npm global bins, the managed bun runtime, etc.) resolve
-/// without reading the parent process `PATH`.
+/// Extra `PATH` entries prepended to the fallback `PATH` (see
+/// [`resolved_shell_path`]) so developer tools (`cargo`, Homebrew, npm global
+/// bins, the managed bun runtime, etc.) resolve even in the product's own
+/// internal work, which never reads a parent `PATH`.
 ///
 /// Always includes the cargo bin directory (via `$CARGO_HOME/bin` if set,
 /// else `~/.cargo/bin`) plus commonly expected system tool directories.
@@ -2197,8 +2293,14 @@ fn prepend_path_entries(base: impl AsRef<str>, extras: &[PathBuf]) -> String {
     parts.join(sep)
 }
 
-/// `PATH` for shell tools: built from a portable system baseline plus
-/// [`extra_shell_path_prefixes`] (no parent `PATH` read).
+/// The `PATH` of the reduced fallback environment
+/// ([`fallback_env_pairs`]): a portable system baseline plus
+/// [`extra_shell_path_prefixes`], not the owner's `PATH`.
+///
+/// It is *not* what an agent's commands get once the owner's environment has
+/// been read — those run with the owner's own `PATH` (see [`agent_env_pairs`]).
+/// This list serves the product's internal work and stands in whenever no read
+/// has succeeded.
 fn resolved_shell_path() -> String {
     prepend_path_entries(
         default_search_path_without_parent_env(),
@@ -2206,17 +2308,17 @@ fn resolved_shell_path() -> String {
     )
 }
 
-/// Baseline value of a sanitized session-environment variable. The temp
-/// variables are not handled here: they come from
-/// [`crate::temp::shell_temp_vars`] (see [`apply_safe_env`]).
+/// Baseline value of a [`FALLBACK_ENV_VARS`] entry. The temp variables are not
+/// handled here: they come from [`crate::temp::shell_temp_vars`] (see
+/// [`fallback_env_pairs`]).
 fn baseline_env_value(name: &str) -> Option<String> {
     match name {
         "PATH" => Some(resolved_shell_path()),
         "HOME" | "USERPROFILE" => {
             UserDirs::new().map(|d| d.home_dir().to_string_lossy().into_owned())
         }
-        // $USER is an explicit exception to the no-parent-process-env-reads
-        // constraint — usernames are not secrets and this avoids a full crate dependency
+        // Read from this process rather than derived: usernames are not
+        // secrets, and the fallback has no other source for one.
         "USER" | "USERNAME" => std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
             .ok()
@@ -4412,54 +4514,134 @@ mod tests {
         check_shell_output(cases);
     }
 
-    /// Create a minimal [`Workspace`] from a path for testing.
-
+    /// The reduced fallback list still carries no credential-looking name: it
+    /// is what the product's own internal work runs in, and the stand-in for
+    /// an agent's command until the owner's environment has been read.
     #[test]
-    fn shell_safe_env_vars() {
-        for var in SAFE_ENV_VARS {
+    fn fallback_env_vars_carry_the_essentials_and_no_credentials() {
+        for var in FALLBACK_ENV_VARS {
             let lower = var.to_lowercase();
             assert!(
                 !lower.contains("key") && !lower.contains("secret") && !lower.contains("token")
             );
         }
-        assert!(SAFE_ENV_VARS.contains(&"PATH"));
-        assert!(SAFE_ENV_VARS.contains(&"HOME") || SAFE_ENV_VARS.contains(&"USERPROFILE"));
-        assert!(SAFE_ENV_VARS.contains(&"TERM"));
+        assert!(FALLBACK_ENV_VARS.contains(&"PATH"));
+        assert!(FALLBACK_ENV_VARS.contains(&"HOME") || FALLBACK_ENV_VARS.contains(&"USERPROFILE"));
+        assert!(FALLBACK_ENV_VARS.contains(&"TERM"));
     }
 
-    /// `build_shell_command` clears the parent environment (except `$USER`
-    /// /`$USERNAME`, see [`build_shell_command()`]) and only exposes
-    /// [`SAFE_ENV_VARS`] with baseline values (CWE-200). Verify by running
-    /// `env` through the built command.
-    ///
-    /// Acquires the shared [`env_lock()`] because `build_shell_command` →
-    /// `resolved_shell_path` → `extra_shell_path_prefixes` reads `$CARGO_HOME`
-    /// from the environment.
+    /// Run `env` through [`build_shell_command`] and return its variables keyed
+    /// by name, so an assertion about a name cannot be fooled by the same text
+    /// appearing inside some other value.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn build_shell_command_isolates_environment() {
-        let tmp = TempDir::new().expect("tempdir");
-        // Acquire env_lock while building the command since extra_shell_path_prefixes
-        // reads $CARGO_HOME — concurrent tests in other modules may write it, so
-        // holding the shared lock prevents the theoretical data race.
+    async fn shell_env_vars(workspace: &Path) -> std::collections::HashMap<String, String> {
+        // Building the command reads `$CARGO_HOME` in the fallback branch;
+        // the shared lock keeps that from racing another test's env write.
         let mut cmd = {
             let _guard = env_lock().lock().unwrap_poison();
-            build_shell_command("env", tmp.path())
+            build_shell_command("env", workspace)
         };
-
-        // We can't inspect env vars on a Command directly; spawn it and check.
         let output = cmd.output().await.expect("env should run");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
 
-        // Safe vars with baseline values should be present.
-        assert!(stdout.contains("HOME="), "HOME must be in safe env");
-        assert!(stdout.contains("PATH="), "PATH must be in safe env");
+    /// Once the owner's environment has been read, the child runs in it: a
+    /// variable that exists only there reaches the child — credential-shaped
+    /// names included, nothing is filtered — and nothing the reduced fallback
+    /// would add is merged in (`TERM=dumb` is the tell). The private temp root
+    /// still wins over whatever the snapshot carried.
+    ///
+    /// `#[serial]`: the snapshot is process-global, so a command another lane
+    /// spawns during this window runs in the fixture too — which is why the fixture
+    /// carries the `PATH` a real owner's environment always has.
+    #[cfg(unix)]
+    #[serial_test::serial(shell_env)]
+    #[tokio::test]
+    async fn build_shell_command_uses_the_owner_environment_once_read() {
+        crate::shell_env::set_snapshot(Some(crate::shell_env::OwnerEnv::new(vec![
+            (
+                OsString::from("OWNER_ONLY"),
+                OsString::from("from-the-snapshot"),
+            ),
+            // The owner's own environment is his to expose: a token in it is
+            // handed over as it is, because the command is his own work.
+            (
+                OsString::from("AWS_SECRET_ACCESS_KEY"),
+                OsString::from("owner-secret-value"),
+            ),
+            (
+                OsString::from("PATH"),
+                OsString::from("/usr/local/bin:/usr/bin:/bin"),
+            ),
+        ])));
 
-        // Parent-process env vars not in SAFE_ENV_VARS must NOT leak.
-        // CARGO_HOME is commonly set but NOT in SAFE_ENV_VARS.
+        let tmp = TempDir::new().expect("tempdir");
+        let vars = shell_env_vars(tmp.path()).await;
+        crate::shell_env::set_snapshot(None);
+
+        assert_eq!(
+            vars.get("OWNER_ONLY").map(String::as_str),
+            Some("from-the-snapshot"),
+            "a snapshot variable must reach the child: {vars:?}"
+        );
+        assert_eq!(
+            vars.get("AWS_SECRET_ACCESS_KEY").map(String::as_str),
+            Some("owner-secret-value"),
+            "the owner's own environment is unfiltered: {vars:?}"
+        );
         assert!(
-            !stdout.contains("CARGO_HOME="),
-            "CARGO_HOME must not leak into subprocess env"
+            !vars.contains_key("TERM"),
+            "the fallback must not be merged into the owner's environment: {vars:?}"
+        );
+        // The data-location home is imposed even though the snapshot carried
+        // none: that is the exception the scratch-instance workflow relies on.
+        match std::env::var("HOME") {
+            Ok(home) => assert_eq!(vars.get("HOME"), Some(&home), "{vars:?}"),
+            Err(_) => assert!(vars.contains_key("HOME"), "{vars:?}"),
+        }
+        // `sh` adds `PWD` and friends of its own; the pinned temp names are the
+        // product's and must survive them.
+        for (name, value) in crate::temp::shell_temp_vars() {
+            assert_eq!(
+                vars.get(&name).map(String::as_str),
+                Some(value.as_str()),
+                "{name} must stay the private temp root: {vars:?}"
+            );
+        }
+    }
+
+    /// With no snapshot the child gets exactly the reduced fallback: baseline
+    /// values for its names, and nothing from this process's environment.
+    ///
+    /// `#[serial]`: another lane's snapshot is process-global, and this lane
+    /// asserts the absence of one.
+    #[cfg(unix)]
+    #[serial_test::serial(shell_env)]
+    #[tokio::test]
+    async fn build_shell_command_falls_back_until_the_owner_environment_is_read() {
+        crate::shell_env::set_snapshot(None);
+
+        let tmp = TempDir::new().expect("tempdir");
+        let vars = shell_env_vars(tmp.path()).await;
+
+        assert!(
+            vars.contains_key("HOME"),
+            "HOME must be in the fallback env"
+        );
+        assert!(
+            vars.contains_key("PATH"),
+            "PATH must be in the fallback env"
+        );
+
+        // Parent-process env vars outside the fallback list must NOT leak.
+        // CARGO_HOME is commonly set but is not in the list.
+        assert!(
+            !vars.contains_key("CARGO_HOME"),
+            "CARGO_HOME must not leak into the child env: {vars:?}"
         );
     }
 
@@ -5374,6 +5556,12 @@ mod tests {
         );
     }
 
+    /// The `PATH` of the reduced fallback environment covers the tool
+    /// directories a developer expects (`~/.cargo/bin`, `~/.npm-global/bin`,
+    /// Homebrew on macOS) and honors `$CARGO_HOME`. This is the fallback
+    /// `PATH` — what the product's internal work and an unread owner
+    /// environment get — not the owner's own `PATH`, which replaces it once a
+    /// read has succeeded.
     #[test]
     fn resolved_shell_path_covers_tool_dirs() {
         #[cfg(unix)]

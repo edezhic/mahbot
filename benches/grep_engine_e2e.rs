@@ -24,6 +24,11 @@ fn main() {
     if args.first().map(String::as_str) == Some("--probe") {
         std::process::exit(0);
     }
+    // This lane's subject is the engine's own equivalence proof against its
+    // pinned locale, so it opens the runtime parity gate for its own process; the
+    // gate's fail-closed behaviour has its own tests in the engine's `parity`
+    // module. Nothing about the rows or their assertions is relaxed by this.
+    mahbot::grep_engine_establish_parity_for_harness();
     std::process::exit(run_matrix());
 }
 

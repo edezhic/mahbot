@@ -29,6 +29,21 @@
 //! The Windows (cmd.exe) layer lives in [`windows`] — an additive platform
 //! layer, active only when [`ShellPlatform::Windows`], that leaves every unix
 //! verdict and test unchanged.
+//!
+//! # What the guard does not model: the environment the command runs in
+//!
+//! A verdict is about the command's *words*; what those words reach is decided
+//! when the shell resolves them, and an agent's commands run in the owner's own
+//! environment ([`crate::shell_env`]), handed over as it is — nothing is filtered
+//! and nothing is compensated for. Variables in it can therefore change what an
+//! approved command actually runs: `PATH` decides which program an approved bare
+//! name resolves to (on Windows, `PATHEXT` decides which extensions it may carry
+//! and `ComSpec` which interpreter a nested command gets), and the dynamic
+//! loader's preload variables (`LD_PRELOAD`/`LD_LIBRARY_PATH`, or
+//! `DYLD_INSERT_LIBRARIES`/`DYLD_LIBRARY_PATH` on macOS) decide what code an
+//! approved program starts with. The guard reads none of them and rejects nothing
+//! because of them; the temp-variable binding it does model, and the home the
+//! commands see, are the two values the product pins itself.
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -343,8 +358,10 @@ impl<'a> ValidationState<'a> {
 /// against the tracked state. Returns `Ok(())` if the command is safe, or
 /// `Err(String)` with a descriptive rejection message.
 ///
-/// Validation is scoped to the session being validated (workspace root +
-/// shell environment from `ctx`) — never the daemon process's environment.
+/// Validation is scoped to the session being validated (workspace root plus the
+/// temp variables and platform in `ctx`) — never to whatever the daemon process
+/// happens to have in its own environment (see the module header for what the
+/// command's own environment is *not* modelled).
 pub(super) fn check_command(command_str: &str, ctx: &CheckContext) -> Result<(), String> {
     let trimmed = command_str.trim();
     if trimmed.is_empty() {

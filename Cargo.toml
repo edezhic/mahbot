@@ -218,7 +218,9 @@ libc = "0.2"
 # Win32_UI_Shell carries ShellExecuteExW and Win32_System_Registry the HKEY its
 # SHELLEXECUTEINFOW requires — used only by the link opener (`gui::shell_execute_address`);
 # Win32_System_Com is the CoInitializeEx apartment that call documents.
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Com", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
+# Win32_System_Environment carries CreateEnvironmentBlock/DestroyEnvironmentBlock —
+# used only by the owner-environment read (`shell_env::read_windows`).
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Com", "Win32_System_Console", "Win32_System_Environment", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Acceleration-carrying candle for the embedder and the TTS ONNX runtime.

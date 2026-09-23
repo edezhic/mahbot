@@ -68,11 +68,17 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Environment marker the updating parent sets (to `"1"`) on the replacement
 /// instance it spawns; [`acquire_lock`] owns what it does. Nothing else sets it,
-/// and it is inherited only where the environment is: the agent-facing shell and
-/// git children run with a cleared environment (`tools::shell::apply_safe_env`),
-/// while the GUI Shell tab's PTY does not, so a `mahbot` launched from the
-/// replacement instance's own terminal takes the hand-off wait once before the
-/// ordinary refusal.
+/// and it is inherited only where the environment is:
+///
+/// - git children run with a cleared environment (`tools::shell::apply_internal_env`);
+/// - an agent's shell command is handed the owner's own environment, which
+///   carries this marker on an instance the updater started — on unix, where that
+///   shell's environment is the process's; on Windows the environment is
+///   assembled from the account instead, so the marker does not reach it;
+/// - the GUI Shell tab's PTY does not clear it either.
+///
+/// So a `mahbot` launched from the replacement instance's own terminal takes the
+/// hand-off wait once before the ordinary refusal.
 const HANDOFF_ENV: &str = "MAHBOT_UPDATE_HANDOFF";
 
 /// How long a hand-off-marked instance waits for the previous instance to

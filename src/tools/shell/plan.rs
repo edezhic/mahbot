@@ -172,7 +172,8 @@
 //!   agent types. No *other* spelling of the name is recognised, so a renamed image
 //!   (a version-suffixed copy, a workspace build) is the shell's to run.
 //! - An own step is spawned with the environment this runner hands every command
-//!   (`super::build_program_command`'s isolated set), while cmd.exe would have passed
+//!   ([`super::build_program_command`]'s — the owner's own, or the reduced
+//!   fallback), while cmd.exe would have passed
 //!   a fold's own `set` on to it: `set FOO=1 && mahbot …` runs the call without `FOO`
 //!   — not detectable from the line, so stated rather than refused (the state-carrying
 //!   shape a *later fold* would have observed is refused).
@@ -608,9 +609,10 @@ fn join_before(members: &[(Member, String)], index: usize) -> Result<Join, Refus
 /// module docs). Each fold is its own `cmd.exe`, so state a fold sets dies with
 /// it, and cmd.exe's own reading of the line would have carried that state into
 /// every member after it. Only a later *fold* can observe it here: an own-image
-/// member is spawned by the runner, and the runner hands a command an isolated
-/// environment rather than one a previous fold set (see the module docs'
-/// residuals).
+/// member is spawned by the runner, and the runner hands a command the one
+/// environment the caller built for it — the owner's own, or the reduced
+/// fallback ([`crate::tools::shell::apply_agent_env`]) — never one a previous
+/// fold set (see the module docs' residuals).
 fn state_across_folds(steps: &[Step]) -> Option<String> {
     for (index, step) in steps.iter().enumerate() {
         let Run::Shell { text } = &step.run else {

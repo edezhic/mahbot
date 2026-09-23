@@ -37,8 +37,9 @@ const fn bun_file_name() -> &'static str {
 }
 
 /// Only the managed bun path (`~/.bun/bin`) is probed; a user's Homebrew/npm
-/// bun is never managed or updated by us, and the shell PATH order keeps the
-/// user's install ahead.
+/// bun is never managed or updated by us, and the managed dir is appended last
+/// among the directories the fallback PATH prepends ahead of the system
+/// baseline — the same reason the owner's own rc block lists it last.
 ///
 /// `None` when the managed runtime is absent or not executable — the callers
 /// that launch single-file scripts (the `custom` tool) report that as a

@@ -188,6 +188,18 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     let mut tasks = JoinSet::<()>::new();
     let shutdown_token = mahbot::shutdown::shutdown_token();
 
+    // The owner's own shell environment, read as early as the product can: the
+    // first read starts here, and the loop re-reads it every 10 minutes so an
+    // agent's commands run in the environment the owner's own shell exports
+    // (see `mahbot::shell_env`). Commands use the reduced fallback until this
+    // succeeds, and never wait for it.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "shell-env-read",
+        mahbot::shell_env::run_reader_loop(),
+    );
+
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -649,6 +661,18 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // Hidden environment-dumper subcommand: the shell-env reader spawns this
+    // binary as a child of the owner's own shell, so it inherits exactly the
+    // environment that shell exported and prints it to stdout. Dispatched here,
+    // before the instance lock and before `temp::init_temp_root()`, and it must
+    // touch neither — nor tracing, nor the stores: an instance holds the lock,
+    // and the dumper's only job is to write its environment out.
+    if std::env::args().nth(1).as_deref() == Some("__env-dump") {
+        std::process::exit(mahbot::shell_env::dump_environment(
+            &std::env::args().skip(2).collect::<Vec<_>>(),
+        ));
+    }
+
     // bench-openrouter subcommand: standalone OpenRouter provider benchmark.
     // Dispatched before lock acquisition — it must work while another instance
     // holds the lock. It never opens a live store: the config-store lookup goes
@@ -716,9 +740,9 @@ fn main() -> Result<()> {
     // Consolidate ALL instance temp files under one private root
     // (`/tmp/mahbot`, mode 0700; `<user temp>\mahbot` on Windows) and pin the
     // platform's temp variables to it — BEFORE any temp use (config, logs,
-    // stores, shell children). The debug, __grep-engine, bench-openrouter and
-    // chrome subcommands above must NOT create the root (they exit before this
-    // point).
+    // stores, shell children). The debug, __grep-engine, __env-dump,
+    // bench-openrouter, chrome and help/version dispatches above must NOT create
+    // the root (they exit before this point).
     mahbot::temp::init_temp_root().map_err(|e| {
         mahbot::boot::record_launch_failure(&storage_root, "temp::init_temp_root", e)
     })?;

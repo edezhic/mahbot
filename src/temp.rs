@@ -175,9 +175,10 @@ pub(crate) fn shell_temp_vars() -> Vec<(String, String)> {
 /// it.
 ///
 /// Must run at the very start of startup, BEFORE config and any temp use, and
-/// AFTER the debug/`__grep-engine` subcommand dispatches (those must not
-/// create the root). Cross-platform: `/tmp/mahbot` on unix, `<user temp>\mahbot`
-/// on Windows.
+/// AFTER every dispatch that must not create the root — the read-only `debug`
+/// CLI and the hidden subcommands (`__grep-engine`, `__env-dump`), the
+/// standalone mode CLIs (`bench-openrouter`, `chrome`), and `-h`/`-V`.
+/// Cross-platform: `/tmp/mahbot` on unix, `<user temp>\mahbot` on Windows.
 ///
 /// Failure modes (fail loudly, never paper over):
 /// - the OS temp dir the Windows root is derived from is not an absolute path;

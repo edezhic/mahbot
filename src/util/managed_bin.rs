@@ -349,11 +349,16 @@ fn ensure_unix_rc_path_block() {
         .map(|p| p.display().to_string())
         .collect::<Vec<_>>()
         .join(":");
-    // The managed dirs are APPENDED after `$PATH` — a user's own install
-    // (Homebrew, npm, official installer) keeps precedence, matching the
-    // agent-shell PATH ordering. The dirs are always listed even when a binary
-    // currently resolves elsewhere (e.g. a PATH chrome-use), so a later
-    // managed install is immediately visible.
+    // The managed dirs are APPENDED after `$PATH`, so a user's own install
+    // (Homebrew, npm, official installer) keeps precedence in his terminal. Of the
+    // two dirs, the fallback PATH carries the bun one only, and lists it last among
+    // the dirs it prepends ahead of the system baseline — not a precedence rule,
+    // just where a stand-in `PATH` puts the one managed dir it carries: the
+    // mahbot-owned `<storage root>/bin` is deliberately not in it, because whether
+    // a command resolves the product by bare name is the owner's own search path's
+    // to say (see `tools::shell`'s agent-environment notes). The dirs are always
+    // listed even when a binary currently resolves elsewhere (e.g. a PATH
+    // chrome-use), so a later managed install is immediately visible.
     let block = format!(
         "\n# >>> mahbot managed binaries >>>\nexport PATH=\"$PATH:{path_entry}\"\n# <<< mahbot managed binaries <<<\n"
     );

@@ -3,6 +3,12 @@
 //! Each profile defines how to filter and truncate output for a specific
 //! command or command family. Profiles are compiled once at module init
 //! via [`LazyLock`] and selected by [`crate::tools::shell::select_profile`].
+//!
+//! A profile never decides *whether* a command succeeded: that judgement is the
+//! exit status alone ([`crate::pipeline::diagnostics`] classifies by it). The
+//! patterns below only trim what the agent is *shown*, and — being English-keyed
+//! — they can keep or strip a line a translated answer spells differently, while
+//! the outcome is judged the same either way.
 
 use regex::{Regex, RegexSet};
 use std::sync::LazyLock;

@@ -2,3 +2,4 @@
 - Unprovable command words: a variable can stand for the command name only when it is bound to a plain literal earlier in the same invocation (`BIN=cargo; "$BIN" --list` passes). Substitution-derived bindings (`BIN=$(which cargo)`), transitive chains (`X=rm; Y="$X"`), and unbound variables are rejected — write the command name literally instead.
 - Wrapping the command in another interpreter is not chased (`sh -c "…"`, `bash -c …`).
 - Command names are matched case-sensitively: a destructive verb written in a different case is not recognised as one, though on a case-insensitive filesystem such a spelling still resolves.
+- What an approved program *starts with* is the loader's: `LD_PRELOAD`/`LD_LIBRARY_PATH` (macOS: `DYLD_INSERT_LIBRARIES`/`DYLD_LIBRARY_PATH`); `$TMPDIR`/`$HOME` are the values the product pins.

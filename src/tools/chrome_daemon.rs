@@ -511,9 +511,9 @@ fn invalidate_cli_path() {
 /// goes through [`crate::util::cargo_bin_dir`] and `directories::UserDirs`
 /// (not `$HOME`) so the fallback still works on HOME-less hosts (docker); when
 /// `CARGO_HOME` is set the literal `~/.cargo/bin` is probed too
-/// (belt-and-suspenders, mirroring the shell module's
-/// `extra_shell_path_prefixes`). Candidates must be executable (`execvp` would
-/// skip a non-executable PATH entry, so we do too).
+/// (belt-and-suspenders, mirroring the fallback PATH's own prefixes in
+/// `tools::shell::extra_shell_path_prefixes`). Candidates must be executable
+/// (`execvp` would skip a non-executable PATH entry, so we do too).
 fn find_cli_binary() -> Option<PathBuf> {
     let name = chrome_bin();
     if let Some(dir) = crate::util::managed_bin::storage_bin_dir() {

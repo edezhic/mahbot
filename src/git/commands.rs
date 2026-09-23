@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tracing::warn;
 
-use crate::tools::shell::apply_safe_env;
+use crate::tools::shell::apply_internal_env;
 use crate::util::unquote_c_style;
 
 /// Result of a successful `git commit` — the full hash and line stats.
@@ -201,13 +201,15 @@ fn inject_safe_directory(cmd: &mut tokio::process::Command, repo_path: &Path) {
     cmd.env("GIT_CONFIG_VALUE_0", top_level.as_path());
 }
 
-/// Create a [`tokio::process::Command`] for `git` with a sanitized environment.
+/// Create a [`tokio::process::Command`] for `git` with the product's own
+/// internal environment.
 ///
-/// The subprocess environment is cleared and re-populated with only safe
-/// environment variables (see [`apply_safe_env`]) to prevent credential
-/// leakage (CWE-200). `LC_ALL=C` is set for consistent locale behavior
-/// across all git invocations. This is the only entry point for production git
-/// subprocess creation in this module — all callers must use this helper.
+/// The subprocess environment is cleared and re-populated with the reduced
+/// variable set the product uses for its own work (see [`apply_internal_env`])
+/// to prevent credential leakage (CWE-200). `LC_ALL=C` is set for consistent
+/// locale behavior across all git invocations. This is the only entry point for
+/// production git subprocess creation in this module — all callers must use this
+/// helper.
 ///
 /// `repo_root` is the workspace/`current_dir` path for repo-bound invocations;
 /// when present, the resolved repo top-level is injected as `safe.directory`
@@ -221,7 +223,7 @@ fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("git");
     #[cfg(windows)]
     cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    apply_safe_env(&mut cmd);
+    apply_internal_env(&mut cmd);
     cmd.env("LC_ALL", "C");
     if let Some(path) = repo_root {
         inject_safe_directory(&mut cmd, path);
@@ -236,12 +238,14 @@ fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
 /// [`std::process::Output`] so each caller can interpret the exit
 /// status as appropriate.
 ///
-/// **Environment sanitization**: The subprocess environment is cleared
-/// and re-populated with only a safe set of environment variables
-/// (see [`apply_safe_env`] for details). This prevents leaking API keys
-/// and other secrets into child processes (CWE-200), but it also means
+/// **The product's own internal environment**: The subprocess environment is
+/// cleared and re-populated with the reduced variable set the product uses for
+/// its own work (see [`apply_internal_env`] for details). This prevents leaking
+/// API keys and other secrets into child processes (CWE-200), but it also means
 /// variables like `SSH_AUTH_SOCK` and `GIT_SSH_COMMAND` are **not**
-/// inherited. This is consistent with the shell tool's behavior — use
+/// inherited. That is git's own containment and nothing else's: an agent's
+/// shell command is handed the owner's environment (see
+/// [`crate::shell_env`]), while this internal work keeps the reduced one. Use
 /// SSH config (`~/.ssh/config`) for SSH-based git remotes rather than
 /// environment variables. ([`run_git_fetch`] is the one exception: it
 /// restores `SSH_AUTH_SOCK` so SSH-agent remotes still work.)
@@ -575,13 +579,13 @@ impl Drop for FetchInFlightGuard {
 /// Run `git fetch` so upstream refs are refreshed before behind/ahead is
 /// computed (a fetch-free comparison only sees the last-fetched remote state).
 ///
-/// The subprocess environment is sanitized (see [`git_command`]), then
-/// `GIT_TERMINAL_PROMPT=0` prevents git/credential helpers from popping an
-/// interactive (osxkeychain) prompt for a credential-less remote, and
-/// `SSH_AUTH_SOCK` is restored (if present) so SSH-agent remotes still work —
-/// the sanitized base drops it, and with it dropped behind/ahead would be
-/// limited to the locally-available remote ref. The fetch is time-boxed by
-/// [`FETCH_TIMEOUT`] and single-flight guarded.
+/// The subprocess environment is the product's own internal one (see
+/// [`git_command`]), then `GIT_TERMINAL_PROMPT=0` prevents git/credential
+/// helpers from popping an interactive (osxkeychain) prompt for a
+/// credential-less remote, and `SSH_AUTH_SOCK` is restored (if present) so
+/// SSH-agent remotes still work — the reduced base drops it, and with it
+/// dropped behind/ahead would be limited to the locally-available remote ref.
+/// The fetch is time-boxed by [`FETCH_TIMEOUT`] and single-flight guarded.
 ///
 /// On timeout the direct `git` child is killed and reaped; a remote helper it
 /// spawned (e.g. `git-remote-https`) is not signalled directly but terminates
@@ -601,7 +605,7 @@ pub async fn run_git_fetch(repo_path: &Path) -> anyhow::Result<String> {
     let mut cmd = git_command(Some(repo_path));
     cmd.arg("fetch").arg("--quiet").current_dir(repo_path);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
-    // Restore the SSH agent socket for SSH remotes (dropped by apply_safe_env).
+    // Restore the SSH agent socket for SSH remotes (dropped by apply_internal_env).
     if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
         cmd.env("SSH_AUTH_SOCK", sock);
     }
