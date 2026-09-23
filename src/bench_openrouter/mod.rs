@@ -273,9 +273,18 @@ impl BenchOptions {
         let output_dir = if let Some(d) = output_dir {
             d
         } else {
+            let slug = model_slug(&model);
+            // The slug is a name the product builds for itself, so it must be a
+            // folder name every platform can create before it is used as one.
+            if let Some(problem) = crate::util::folder_name::folder_name_problem(&slug) {
+                return Err(CliError::Usage(format!(
+                    "model '{model}' gives the benchmark folder name '{slug}', which cannot be a \
+                     folder name on every platform this runs on — {problem}"
+                )));
+            }
             let root = crate::config::default_config_dir()
                 .map_err(|e| CliError::Hard(format!("cannot resolve config dir: {e:#}")))?;
-            root.join("benchmarks").join(model_slug(&model))
+            root.join("benchmarks").join(slug)
         };
 
         if !cap_usd.is_finite() || cap_usd <= 0.0 {
@@ -1492,5 +1501,17 @@ mod tests {
             BenchOptions::parse(&["--ladder".to_string(), "0,x".to_string()]),
             Err(CliError::Usage(_))
         ));
+
+        // A model whose slug cannot be a folder name → Usage, so no benchmark
+        // run ever derives a folder the platform cannot create.
+        for model in [".", "..", "NUL", "acme/."] {
+            assert!(
+                matches!(
+                    BenchOptions::parse(&["--model".to_string(), model.to_string()]),
+                    Err(CliError::Usage(_))
+                ),
+                "--model {model} must be rejected: its benchmark folder name is unusable"
+            );
+        }
     }
 }

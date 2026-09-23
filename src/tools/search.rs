@@ -493,7 +493,9 @@ impl Tool for SearchTool {
     fn side_effects(&self) -> bool {
         // The lazily git-init of a personal workspace is a one-time idempotent
         // setup that never mutates content and cannot conflict with parallel
-        // read-only tools, so search stays safely groupable.
+        // read-only tools, so search stays safely groupable. A folder that
+        // cannot be created is reported to its owner over Telegram — equally
+        // unfit to interfere with a sibling tool, and claimed once per process.
         false
     }
 
@@ -509,8 +511,11 @@ impl Tool for SearchTool {
         // engine scans it.
         if crate::users::is_personal_workspace(&ws.name)
             && let Some(user) = crate::users::personal_user_name(&ws.name)
+            && let Err(e) = crate::users::ensure_personal_workspace(user).await
         {
-            crate::users::ensure_personal_workspace(user).await;
+            crate::users::store()
+                .report_personal_workspace_failure(user, &e)
+                .await;
         }
 
         normalize_search_args(&mut args);

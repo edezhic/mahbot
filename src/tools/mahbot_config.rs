@@ -73,7 +73,13 @@ impl Tool for MahbotConfigTool {
                 },
                 "name": {
                     "type": "string",
-                    "description": "(add_workspace / add_user) A short unique name for the workspace (used in ticket ids and the GUI), or the new user's display name."
+                    "description": format!(
+                        "(add_workspace / add_user) A short unique name for the workspace (used \
+                         in ticket ids and the GUI), or the new user's display name. An added \
+                         user's name is also the name of their personal workspace folder, so it \
+                         must be one every platform the service runs on can create: {}.",
+                        crate::util::folder_name::RULE_SUMMARY
+                    )
                 },
                 "user": {
                     "type": "string",
@@ -181,8 +187,11 @@ impl MahbotConfigTool {
         let value = get_binding_value(&args, "telegram")?;
 
         // The name IS the admin marker, so the reserved admin name is refused
-        // before any store access.
-        crate::users::validate_new_user_name(name)?;
+        // before any store access — whether this action creates the account or
+        // only finishes binding one. A name that would become a new account's
+        // folder is checked by `add_user`, which refuses it before its row
+        // exists; a name that already identifies one is never re-judged there.
+        crate::users::refuse_admin_name(name)?;
 
         let store = crate::users::store();
         let exists = store.user_exists(name).await?;

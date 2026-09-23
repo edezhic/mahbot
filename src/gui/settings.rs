@@ -2503,8 +2503,33 @@ impl SettingsState {
         )
     }
 
-    /// Build the add-user modal dialog content.
+    /// Build the add-user modal dialog content. The account name becomes that
+    /// account's personal-workspace folder, so the dialog states the rule and
+    /// refuses a name the product cannot turn into one before the request
+    /// leaves the desktop.
     fn add_user_dialog(&self) -> Element<'_, SettingsMessage> {
+        let name = self.add_user_sender.text();
+        let problem = if name.is_empty() {
+            None
+        } else {
+            crate::util::folder_name::folder_name_problem(&name)
+        };
+        let mut middle = Column::new().push(
+            text(format!(
+                "The name is also the folder of this account's personal workspace, so it must be \
+                 one every platform can create: {}.",
+                crate::util::folder_name::RULE_SUMMARY
+            ))
+            .size(theme::TEXT_11)
+            .color(theme::TEXT_SECONDARY),
+        );
+        if let Some(problem) = problem {
+            middle = middle.push(
+                text(format!("This name cannot be used because {problem}."))
+                    .size(theme::TEXT_11)
+                    .color(theme::STATUS_ERROR),
+            );
+        }
         modal_dialog(
             "Add User".to_string(),
             &[DialogField {
@@ -2514,10 +2539,10 @@ impl SettingsState {
                 id: "add_user_sender",
                 on_input: SettingsMessage::AddUserSender,
             }],
-            None,
+            Some(middle.spacing(theme::SPACE_4).into()),
             "Add",
             self.add_user_adding,
-            !self.add_user_sender.text().is_empty(),
+            !name.is_empty() && problem.is_none(),
             SettingsMessage::ToggleAddUserModal,
             SettingsMessage::SubmitAddUser,
         )

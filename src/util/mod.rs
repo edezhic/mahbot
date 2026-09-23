@@ -3,6 +3,7 @@
 pub(crate) mod catalog_cache;
 pub(crate) mod disk;
 pub(crate) mod error;
+pub(crate) mod folder_name;
 pub(crate) mod html;
 pub(crate) mod http;
 pub(crate) mod json;

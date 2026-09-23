@@ -30,9 +30,12 @@ use crate::Workspace;
 use crate::WorkspaceStatus;
 use crate::db::{self, TxGuard};
 use crate::git::commands::run_git_output;
-use anyhow::Result;
+use crate::util::UnwrapPoison;
+use anyhow::{Context as _, Result};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use tracing::warn;
+use std::sync::{LazyLock, Mutex};
+use tracing::{error, warn};
 
 /// Sentinel that `extract_sender_user_name` (src/channels/telegram.rs)
 /// substitutes for Telegram senders without an @username. It is no nickname
@@ -200,7 +203,7 @@ impl UserStore {
     /// Runs idempotently from both [`crate::db::init_all_stores`] (production,
     /// on the shared consolidated connection) and each isolated user store open.
     /// This is the ONLY path that may create the reserved admin name; every
-    /// user-facing path refuses it ([`validate_new_user_name`]).
+    /// user-facing path refuses it ([`refuse_admin_name`]).
     pub(crate) async fn ensure_admin_user(&self) -> Result<()> {
         if !self.user_exists(ADMIN_USER_NAME).await? {
             self.add_user(ADMIN_USER_NAME).await?;
@@ -212,19 +215,89 @@ impl UserStore {
 
     /// Create an account: the seeding path for the admin, and the path
     /// user-facing callers use for guests — those must refuse the reserved
-    /// admin name first ([`validate_new_user_name`]). Also creates the personal
+    /// admin name first ([`refuse_admin_name`]). Also creates the personal
     /// workspace directory under `~/.mahbot/userspaces/<name>/` with `git init`
-    /// (non-fatal on failure). Idempotent — re-adding an existing account
-    /// preserves its stored preferences.
+    /// (non-fatal on failure, but reported). Idempotent — re-adding an existing
+    /// account preserves its stored preferences.
     pub async fn add_user(&self, name: &str) -> Result<()> {
+        // Only a name that becomes a new account's own folder has to satisfy
+        // the folder rule: an account that is already stored keeps the name it
+        // has — it is never re-judged — and its folder, when it does not exist
+        // yet, is created by [`ensure_personal_workspace`], which applies the
+        // rule the moment it is about to create one.
+        if !self.user_exists(name).await? {
+            validate_folder_name(name)?;
+        }
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO users (name) VALUES (?1)",
                 db::params![name],
             )
             .await?;
-        ensure_personal_workspace(name).await;
+        // A failure to put the folder there (the rule refusing the name, or the
+        // platform refusing the directory) is reported, never silently skipped
+        // — the account still exists either way.
+        if let Err(e) = ensure_personal_workspace(name).await {
+            self.report_personal_workspace_failure(name, &e).await;
+        }
         Ok(())
+    }
+
+    /// Report a personal workspace whose folder could not be created: a
+    /// failure-level record, plus a message on the account's own Telegram chats
+    /// (or, when the account has none, the admin's), so the owner is told
+    /// rather than left with a workspace that silently never exists. The
+    /// account itself survives — this is a complaint, not a refusal to serve.
+    ///
+    /// The search tool retries its account's folder on every call, so each of
+    /// the two reports is claimed once per process; the owner's message is
+    /// claimed only where a send is actually attempted, so a failure that had
+    /// nowhere to go still reaches the owner once there is a transport.
+    pub(crate) async fn report_personal_workspace_failure(
+        &self,
+        name: &str,
+        error: &anyhow::Error,
+    ) {
+        if claim_report(name, error, "log") {
+            error!(
+                user_name = %name,
+                path = %personal_workspace_path(name).display(),
+                error = %error,
+                "Personal workspace folder could not be created"
+            );
+        }
+        // The folder failure is reported through Telegram, and a report that has
+        // nowhere to go must not spend the owner's one message: the account
+        // seeding path runs inside USER_STORE's own bring-up, where
+        // `channel_registry()` panics rather than reporting no channels, and the
+        // channel itself may not be registered even once the registry is.
+        if crate::CHANNEL_REGISTRY
+            .get()
+            .and_then(|registry| registry.get("telegram"))
+            .is_none()
+        {
+            return;
+        }
+        // Read the bindings through `self`, never the global store: this can run
+        // inside USER_STORE's own bring-up, where `store()` would panic.
+        let mut targets =
+            telegram_reply_targets(self.get_user_channels(name).await.unwrap_or_default());
+        if targets.is_empty() && name != ADMIN_USER_NAME {
+            targets = telegram_reply_targets(
+                self.get_user_channels(ADMIN_USER_NAME)
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+        // Nothing to send through, so the message is not claimed — a later
+        // attempt (once the account has a binding) still reaches the owner.
+        if targets.is_empty() || !claim_report(name, error, "owner") {
+            return;
+        }
+        let message = owner_message(name, error);
+        for target in targets {
+            crate::channels::telegram::send_reply(&target, &message).await;
+        }
     }
 
     /// Delete an account and all their child rows (channel bindings). Channel
@@ -681,6 +754,57 @@ impl UserStore {
     }
 }
 
+/// What the owner is told when their account's folder cannot be created: the
+/// cause, and the single remedy that exists for it. An account whose name the
+/// rule refuses keeps its name — there is no rename — so it has to be removed
+/// and added again.
+fn owner_message(name: &str, error: &anyhow::Error) -> String {
+    let cause = if let Some(problem) = crate::util::folder_name::folder_name_problem(name) {
+        format!(
+            "the name cannot be a folder name on every platform the service runs on ({problem}), so \
+             this account cannot keep a workspace under it — remove the account and add it again \
+             under a name the service accepts"
+        )
+    } else {
+        format!(
+            "the storage location {} cannot be written ({error}) — check permissions and free \
+             space, then try again",
+            personal_workspace_path(name).display()
+        )
+    };
+    format!(
+        "⚠️ The personal workspace folder for the account '{name}' could not be created, so nothing \
+         that account stores in its workspace is kept: {cause}."
+    )
+}
+
+/// The reports a folder failure produces, claimed once per process and
+/// separately — so a report with no way to go out does not spend the other's —
+/// under one key per medium, account and cause. `"log"` and `"owner"` are the
+/// two media, both claimed in [`UserStore::report_personal_workspace_failure`].
+static REPORTED_WORKSPACE_FAILURES: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Whether this report has not gone out yet in this process, claiming it for
+/// `medium` if so. Called only where the report is actually made, so a claim is
+/// never spent on an attempt that had nowhere to go.
+fn claim_report(name: &str, error: &anyhow::Error, medium: &str) -> bool {
+    REPORTED_WORKSPACE_FAILURES
+        .lock()
+        .unwrap_poison()
+        .insert(format!("{medium}\u{0}{name}\u{0}{error}"))
+}
+
+/// The Telegram reply targets among a channel-binding read. A failed read
+/// yields no targets — never a partial send list.
+fn telegram_reply_targets(bindings: Vec<ChannelBinding>) -> Vec<String> {
+    bindings
+        .into_iter()
+        .filter(|b| b.channel == "telegram")
+        .filter_map(|b| b.reply_target)
+        .collect()
+}
+
 /// What a grants read-modify-write did.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum GrantChange {
@@ -768,15 +892,38 @@ pub(crate) fn is_admin_name(name: &str) -> bool {
     name == ADMIN_USER_NAME
 }
 
-/// Refuse the reserved admin name on a user-facing account-creation path: only
-/// [`UserStore::ensure_admin_user`] may create the admin account.
-pub(crate) fn validate_new_user_name(name: &str) -> Result<()> {
+/// Refuse the reserved admin name on a user-facing account path: only
+/// [`UserStore::ensure_admin_user`] may create the admin account, and the name
+/// IS the admin marker, so binding a channel to it would address the admin.
+pub(crate) fn refuse_admin_name(name: &str) -> Result<()> {
     if is_admin_name(name) {
         anyhow::bail!(
             "'{ADMIN_USER_NAME}' is the admin account — only guest accounts can be created"
         );
     }
     Ok(())
+}
+
+/// Refuse a name the account's personal-workspace folder cannot be built from.
+/// The name is used verbatim as that folder's name, so it must be creatable on
+/// every platform the product runs on (see [`crate::util::folder_name`]).
+fn validate_folder_name(name: &str) -> Result<()> {
+    let Some(problem) = crate::util::folder_name::folder_name_problem(name) else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "'{name}' cannot be a user name because {problem}. The account name is used verbatim \
+         as the name of its personal workspace folder, so it must be creatable on every \
+         platform MahBot runs on — pick another name."
+    );
+}
+
+/// Both guards, for a name that is about to become a new account: the reserved
+/// admin name ([`refuse_admin_name`]) and the folder rule
+/// ([`validate_folder_name`]).
+pub(crate) fn validate_new_user_name(name: &str) -> Result<()> {
+    refuse_admin_name(name)?;
+    validate_folder_name(name)
 }
 
 /// A single channel binding for an account.
@@ -841,10 +988,13 @@ fn fallback_storage_root() -> PathBuf {
 }
 
 /// Whether `user_name` may be used to resolve a personal-workspace path:
-/// non-empty, no path separators, not a dot entry. Everything that resolves
-/// `userspaces/<user>` for listing or writing guards here — a synthetic or
-/// path-bearing name must never address the userspaces root or another
-/// user's directory.
+/// non-empty, no path separators, not a dot entry. Containment, on both sides
+/// of the filesystem: the read-side callers (the `<personal-files>` listing and
+/// the compaction dump) apply it before touching an existing account's folder,
+/// and [`ensure_personal_workspace`] applies it before creating one, so a
+/// stored name can never address the userspaces root or another account's
+/// directory. A name coming in for a new account is refused outright by
+/// [`validate_folder_name`], which is the stricter cross-platform rule.
 #[must_use]
 pub(crate) fn is_valid_personal_user_name(user_name: &str) -> bool {
     !user_name.trim().is_empty()
@@ -872,20 +1022,36 @@ pub fn personal_workspace_name(user_name: &str) -> String {
 
 /// Ensure the personal workspace directory for a user exists and is
 /// git-initialized. Creates the directory if it's missing and runs `git init`
-/// only when no repo is present yet (idempotent otherwise). Both failures are
-/// non-fatal — they are logged as warnings but the caller continues normally.
-pub(crate) async fn ensure_personal_workspace(name: &str) {
+/// only when no repo is present yet (idempotent otherwise).
+///
+/// `Err` when the name cannot be a folder name on every platform the product
+/// runs on, or when the platform refuses to create the directory. Nothing is
+/// ever created outside `userspaces/`: the caller reports the failure
+/// ([`UserStore::report_personal_workspace_failure`] on the creation path, the
+/// search tool on its lazy retry). A `git init` failure stays a warning — it
+/// leaves a usable directory behind.
+pub(crate) async fn ensure_personal_workspace(name: &str) -> Result<()> {
+    // Containment, whoever stored the name: a name that would resolve outside
+    // its own folder never reaches the filesystem at all.
+    if !is_valid_personal_user_name(name) {
+        anyhow::bail!("'{name}' is not a usable personal-workspace name");
+    }
     let path = personal_workspace_path(name);
-    if let Err(e) = tokio::fs::create_dir_all(&path).await {
-        warn!(
-            path = %path.display(),
-            error = %e,
-            "Failed to create personal workspace directory"
-        );
+    if !path.is_dir() {
+        // The one cross-platform rule, applied where this function is about to
+        // create a folder: a stored name that only THIS platform would accept
+        // keeps the folder it already has. The parts that write *inside* an
+        // account's folder (a generated file, an upload) bring it into being
+        // with their own `create_dir_all`, so a stored name's folder can also
+        // appear there.
+        validate_folder_name(name)?;
+        tokio::fs::create_dir_all(&path)
+            .await
+            .with_context(|| format!("create the folder {}", path.display()))?;
     }
     // Try git init only when there is no repo yet; non-fatal on failure.
     if path.join(".git").exists() {
-        return;
+        return Ok(());
     }
     match run_git_output(&path, &["init", "-q"]).await {
         Ok(o) if o.status.success() => {}
@@ -899,6 +1065,7 @@ pub(crate) async fn ensure_personal_workspace(name: &str) {
             "git init failed for personal workspace"
         ),
     }
+    Ok(())
 }
 
 // ── Free functions ──────────────────────────────────────────────
@@ -1338,6 +1505,58 @@ mod tests {
         assert!(
             !is_admin_in(None, ADMIN_USER_NAME).await,
             "a missing account store is not the admin"
+        );
+    }
+
+    /// A name the platform cannot turn into a folder is refused before its row
+    /// exists, and never relocates the personal workspace: the userspaces root
+    /// gains nothing outside itself.
+    #[tokio::test]
+    async fn add_user_refuses_a_name_that_cannot_be_a_folder() {
+        crate::util::test::init_test_stores().await;
+        let store = store();
+        for name in ["../evil", "a/b", "/tmp/evil", "nul", "trailing."] {
+            let err = store.add_user(name).await.unwrap_err();
+            assert!(
+                err.to_string().contains(name),
+                "the refusal must name the offending name: {err}"
+            );
+            assert!(
+                !store.user_exists(name).await.unwrap(),
+                "a refused name must not leave an account row"
+            );
+        }
+        assert!(
+            !userspaces_root().join("../evil").exists(),
+            "a parent reference must not escape the userspaces root"
+        );
+    }
+
+    /// A name that already identifies an account is never re-judged: an account
+    /// stored by an older installation keeps the name it has, so this completes
+    /// it — and the folder the rule refuses is still not created for it.
+    #[tokio::test]
+    async fn add_user_keeps_a_stored_name_the_folder_rule_would_refuse() {
+        crate::util::test::init_test_stores().await;
+        let store = store();
+        // The name holds a separator-free illegal character, so the rule refuses
+        // it while every platform this test runs on can still create a folder
+        // called that — which is what makes the folder assertion below a real
+        // one.
+        let legacy = "legacy:name";
+        store
+            .conn
+            .execute(
+                "INSERT INTO users (name) VALUES (?1)",
+                crate::db::params![legacy],
+            )
+            .await
+            .unwrap();
+
+        store.add_user(legacy).await.unwrap();
+        assert!(
+            !personal_workspace_path(legacy).exists(),
+            "completing a stored account must not create the folder the rule refuses"
         );
     }
 

@@ -5,7 +5,7 @@ Configure the service through `mahbot_config` — pick the matching `action` (ea
 - `setup_telegram_bot` — persist a Telegram bot token so the service can receive and reply to messages.
 - `bind_telegram` — bind the admin's Telegram account, by `@username` or numeric id, so incoming bot messages route to them.
 - `add_workspace` — register a workspace (a software project directory) and make it active.
-- `add_user` — create a guest account.
+- `add_user` — create a guest account. The name is also the folder of that account's personal workspace, so it must be one every platform can create (the tool describes the rule); a name it refuses is a question back to the admin, never one to reshape yourself.
 - `setup_web_search` — register a web-search backend (Firecrawl or Exa) so agents can search the web.
 
 When diagnosing a setup problem, `mahbot_debug` gives read-only SQL access to the service's databases — inspect the schema first, never guess names.
