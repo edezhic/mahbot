@@ -744,21 +744,14 @@ const ENGINE_PANIC_PREFIX: &str = "the database engine panicked while reading th
 /// closed pipe surfaces consistently as an I/O error, never a panic.
 const STDOUT_WRITE_ERROR_PREFIX: &str = "failed writing to stdout: ";
 
-/// Run a blocking store open/query under `catch_unwind`, converting a panic
-/// into a clean error — turso_core panics on specific corruption shapes
-/// (pager/wal index OOB — the documented prod class), and the debug CLI must
-/// never crash on a damaged store. The default panic hook is suppressed for
-/// the duration so a caught panic does not spray stderr.
-///
-/// Safety: swapping the process-global panic hook is only sound because the
-/// debug CLI is single-threaded (current-thread tokio runtime in `main.rs`);
-/// a panic on any other thread during the window would be silently swallowed.
+/// Run a blocking store open/query under [`crate::shutdown::contain_panics`],
+/// converting a panic into a clean error — turso_core panics on specific
+/// corruption shapes (pager/wal index OOB — the documented prod class), and
+/// the debug CLI must never crash on a damaged store. `contain_panics` also
+/// keeps the caught panic off stderr: the boot hook skips a panic raised
+/// inside it.
 fn guard_panics<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    std::panic::set_hook(prev);
-    match result {
+    match crate::shutdown::contain_panics(f) {
         Ok(r) => r,
         Err(payload) => Err(anyhow!(
             "{ENGINE_PANIC_PREFIX}{}",
@@ -1493,10 +1486,7 @@ mod tests {
 
     /// End-to-end: `run_debug_with_args` opens a real (temporary) store
     /// read-only through the `turso::core` path and runs a query against it.
-    /// Serialized: `guard_panics` swaps the process-global panic hook, so
-    /// guard windows must not overlap other debug tests.
     #[tokio::test]
-    #[serial_test::serial(family)]
     async fn run_debug_queries_a_real_store_read_only() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let db_dir = dir.path().join("db");
@@ -1525,10 +1515,7 @@ mod tests {
     /// The schema dump (`--db <name>` with no SQL) reflects the LIVE stored
     /// schema: one block per user table with its DDL and row count, excluding
     /// internal catalog artifacts (`sqlite_%`, `__turso_internal_%`).
-    /// Serialized: `guard_panics` swaps the process-global panic hook, so
-    /// guard windows must not overlap other debug tests.
     #[tokio::test]
-    #[serial_test::serial(family)]
     async fn schema_dump_prints_user_tables_with_row_counts() {
         let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         // One non-trivial row so the dump's row count reflects live contents.
@@ -1578,10 +1565,7 @@ mod tests {
     /// `mahbot debug --db <name>` without a SQL argument dumps the store schema
     /// and exits 0 — and, like the query path, leaves the store directory
     /// untouched.
-    /// Serialized: `guard_panics` swaps the process-global panic hook, so
-    /// guard windows must not overlap other debug tests.
     #[tokio::test]
-    #[serial_test::serial(family)]
     async fn run_debug_dumps_schema_without_sql() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let db_dir = dir.path().join("db");
@@ -1607,10 +1591,7 @@ mod tests {
     /// `mahbot debug --db all` without a SQL argument dumps every present
     /// store and reports missing stores per-store with a failure summary
     /// (exit 1) — matching the query verb's `--db all` failure semantics.
-    /// Serialized: `guard_panics` swaps the process-global panic hook, so
-    /// guard windows must not overlap other debug tests.
     #[tokio::test]
-    #[serial_test::serial(family)]
     async fn run_debug_dump_all_reports_missing_stores() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let args = vec![
@@ -1755,7 +1736,6 @@ mod tests {
     /// quarantine (no main DB) and a garbage main DB both fail without
     /// crashing, naming the family.
     #[tokio::test]
-    #[serial_test::serial(family)]
     async fn run_debug_family_error_paths_report_clear_errors() {
         let dir = tempfile::TempDir::new().unwrap();
         let db_dir = dir.path().join("db");
@@ -1791,7 +1771,6 @@ mod tests {
     /// `guard_panics` converts a panic into a clean error — the containment
     /// path a damaged family can trigger inside turso_core.
     #[test]
-    #[serial_test::serial(family)]
     fn guard_panics_converts_panic_to_error() {
         let err = guard_panics(|| -> Result<()> { panic!("boom: pager index OOB") })
             .expect_err("a panic must surface as an error");
@@ -1807,7 +1786,6 @@ mod tests {
     /// A forensic family (db + wal) is queried **in place** — the read-only
     /// open must not create or modify any file beside the family.
     #[tokio::test]
-    #[serial_test::serial(family)]
     async fn run_debug_queries_a_family_in_place() {
         let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let db_dir = dir.path().join("db");
@@ -2011,7 +1989,6 @@ mod tests {
     /// dropped without a checkpoint) is visible through the direct
     /// single-process read-only open — no IPC, no running instance.
     #[tokio::test]
-    #[serial_test::serial(family)]
     async fn run_debug_without_an_instance_reads_committed_wal() {
         let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         store
@@ -2072,7 +2049,9 @@ mod tests {
     /// through the channel instead of opening the store: the CLI's own root
     /// holds no openable store here, so a successful read can only have come
     /// from the running instance's endpoint.
-    #[serial_test::serial(family)]
+    // `ipc_bound` is shared with the refusal test: the bounded retry below is
+    // what shrinking `MAHBOT_IPC_BOUND_TIMEOUT_SECS` turns off.
+    #[serial_test::serial(ipc_bound)]
     #[tokio::test]
     async fn run_debug_reaches_a_held_location_through_the_channel() {
         // The instance side: a live store in a root of its own.
@@ -2120,7 +2099,7 @@ mod tests {
     #[tokio::test]
     // `ipc_bound` is shared with the IPC e2e test: shrinking the bound below
     // would make its bounded retry give up.
-    #[serial_test::serial(family, ipc_bound)]
+    #[serial_test::serial(ipc_bound)]
     async fn run_debug_refuses_a_held_location_without_a_channel() {
         // 0 = give up after the first attempt, so the refusal is immediate
         // instead of waiting out the default channel-bound window.
@@ -2148,7 +2127,6 @@ mod tests {
     /// cannot be opened), it must refuse and leave the store alone rather than
     /// treat the failed probe as "no instance is running".
     #[tokio::test]
-    #[serial_test::serial(family)]
     async fn run_debug_refuses_when_the_lock_probe_cannot_tell() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         // A directory where the lock file belongs: the probe cannot open it.

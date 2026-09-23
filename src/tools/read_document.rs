@@ -90,7 +90,8 @@ pub(super) async fn read_document(
             text,
             images,
             notes,
-        } => Some(compose_output(res, &dir, text, images, notes).await),
+            all_page_text_lost,
+        } => Some(compose_output(res, &dir, text, images, notes, all_page_text_lost).await),
     };
     // Empty-only removal (`remove_dir` refuses a non-empty directory): an answer
     // pointing at nothing leaves no directory behind, anything it points at keeps
@@ -162,6 +163,7 @@ async fn compose_output(
     text: String,
     images: Vec<PathBuf>,
     notes: Vec<String>,
+    all_page_text_lost: bool,
 ) -> ToolOutput {
     let display = res.path.display().to_string();
     // The read tool returns `false` from `should_scrub_output`, and the scrub it
@@ -205,10 +207,15 @@ async fn compose_output(
     let note = res.recovery_note.as_deref();
 
     let mut text_block = if text.is_empty() {
-        // Name the pages as provided only when one actually was attached; with
-        // none — no pages produced, all over the cap, or none encodable — the
-        // plain sentence is the honest one.
-        if attached.is_empty() {
+        // The reader failed on every page it was asked for: the notes below name
+        // those pages, and the "no text" sentences would report a reader failure
+        // as a document that has no text.
+        if all_page_text_lost {
+            String::new()
+        } else if attached.is_empty() {
+            // Name the pages as provided only when one actually was attached;
+            // with none — no pages produced, all over the cap, or none
+            // encodable — the plain sentence is the honest one.
             answer_line(&display, crate::document::NO_TEXT_NOTE)
         } else {
             answer_line(&display, crate::document::NO_TEXT_LAYER_NOTE)
@@ -258,7 +265,11 @@ async fn compose_output(
     // its middle), the folder line, then both again with the text spilled.
     let compose = |text_block: &str, listing: &[String]| {
         let mut lines: Vec<&str> = Vec::with_capacity(2 + trailing.len() + listing.len());
-        lines.push(text_block);
+        // Empty only when every page's text failed: the notes are then the whole
+        // answer's opening.
+        if !text_block.is_empty() {
+            lines.push(text_block);
+        }
         lines.extend(trailing.iter().map(String::as_str));
         lines.extend(listing.iter().map(String::as_str));
         crate::tools::with_recovery_note(note, lines.join("\n"))
@@ -310,7 +321,7 @@ async fn spill_text(dir: &Path, display: &str, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::test_fixtures::{DOCX_BODY, assemble_pdf, zip_fixture};
+    use crate::document::test_fixtures::{DOCX_BODY, multi_page_pdf, zip_fixture};
     use tempfile::TempDir;
 
     /// A temp workspace holding `files` (name, bytes) — hold the `TempDir` to
@@ -381,18 +392,17 @@ mod tests {
     /// A one-page PDF with a painted rectangle and no text layer: the page has
     /// to be rasterized, so the read comes back as an image and no text.
     fn raster_only_pdf() -> Vec<u8> {
-        let content = b"0.1 0.5 0.9 rg 0 0 612 792 re f";
-        assemble_pdf(&[
-            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
-            format!(
-                "<< /Length {} >>\nstream\n{}\nendstream",
-                content.len(),
-                String::from_utf8_lossy(content)
-            )
-            .into_bytes(),
-        ])
+        multi_page_pdf(&[(
+            "/MediaBox [0 0 612 792]",
+            b"0.1 0.5 0.9 rg 0 0 612 792 re f",
+        )])
+    }
+
+    /// A one-page PDF whose page has no MediaBox: the reader panics on it, so its
+    /// text is lost while the page itself still parses and renders.
+    fn pdf_with_no_media_box() -> Vec<u8> {
+        // An empty entry list is what leaves the page without a `/MediaBox`.
+        multi_page_pdf(&[("", b"BT /F1 24 Tf 72 700 Td (Page text long enough) Tj ET")])
     }
 
     /// The path a spilled-text line points at.
@@ -473,6 +483,36 @@ mod tests {
         assert!(
             out.text_is_content,
             "the page images supplement, never replace, the answer"
+        );
+    }
+
+    /// A document whose text could not be read is not one that has no text: the
+    /// answer names the pages, and the "no text could be extracted" sentence —
+    /// which would report the reader's failure as an absence — is left out.
+    #[tokio::test]
+    async fn unread_text_is_named_not_reported_as_absent() {
+        let owner = SpillOwner::new();
+        let (_dir, ws) = temp_workspace(&[("broken.pdf", &pdf_with_no_media_box())]);
+
+        let out = convert(&owner, &ws, "broken.pdf", false)
+            .await
+            .expect("a .pdf is a document");
+        assert!(
+            out.text
+                .contains("broken.pdf: the text of page 1 could not be read (1 of 1 pages)"),
+            "{}",
+            out.text
+        );
+        assert!(
+            !out.text.contains(crate::document::NO_TEXT_NOTE),
+            "a reader failure is not a document without text: {}",
+            out.text
+        );
+        assert_eq!(
+            out.image_payloads.len(),
+            1,
+            "the page that could not be read comes back as an image: {}",
+            out.text
         );
     }
 

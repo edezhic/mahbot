@@ -198,8 +198,9 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # read tool): pure-Rust text extraction and page rasterization for .pdf, plus a
 # small XML read for .docx. No native/OS PDF stack is linked (single
 # self-contained binary, identical on macOS/Linux).
-#   pdf-extract — PDF text layer only (MIT); panics on malformed input, so the
-#                 pass it drives is caught and treated as a failed extraction.
+#   pdf-extract — PDF text layer only (MIT); panics on malformed input, so its
+#                 page-level API is driven one page at a time and each page's
+#                 panic is contained to that page.
 #   hayro       — PDF structure walk, filter chain and page rasterizer
 #                 (Apache-2.0 OR MIT); supplies the page list, reports an
 #                 encrypted document and decodes both rasterized pages and the

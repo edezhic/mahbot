@@ -563,10 +563,17 @@ async fn handle_file(
             text,
             images,
             notes,
+            all_page_text_lost,
         } => {
-            batch.annotations.push(
-                extracted_text_annotation(uploads_dir, name, &text, !images.is_empty()).await,
-            );
+            // The reader failed on every page it was asked for, so the document
+            // delivered no text at all: the notes below name those pages, and the
+            // "no text could be extracted" sentence — which would report a reader
+            // failure as a document without a text layer — is left out.
+            if !all_page_text_lost {
+                batch.annotations.push(
+                    extracted_text_annotation(uploads_dir, name, &text, !images.is_empty()).await,
+                );
+            }
             for note in notes {
                 batch.annotations.push(format!("[File {name}: {note}]"));
             }
@@ -1739,6 +1746,53 @@ mod tests {
         assert!(
             !msg_dir.exists(),
             "Inbound per-message directory must be deleted"
+        );
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
+    }
+
+    /// A document the reader failed on for every page it could read, yet which
+    /// still produced text: the attachment path must deliver that text. Dropping
+    /// it because the reader failed is exactly the loss this covers.
+    #[tokio::test]
+    async fn enrich_file_keeps_text_of_pages_that_fail_after_producing_it() {
+        let (tmp_root, ws_path, _msg_dir, attachment) = inbound_ingest_fixture(
+            "test_enrich_file_partial_pdf",
+            7015,
+            "report.pdf",
+            &crate::document::test_fixtures::pdf_with_all_pages_failing_midway(),
+        )
+        .await;
+        let marker = format!("Read [FILE:{}] please", attachment.display());
+
+        let mut msg = inbound_msg(7015, &marker);
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
+
+        assert_eq!(
+            msg.content.matches("Kept page text long enough").count(),
+            2,
+            "every page's text must be inline, got: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(
+                "[File report.pdf: the text of pages 1, 2 could not be read in full (2 of 2 pages)]"
+            ),
+            "the pages must be named in a delimited note, got: {}",
+            msg.content
+        );
+        assert_eq!(
+            msg.content
+                .matches("[IMAGE:data:image/jpeg;base64,")
+                .count(),
+            2,
+            "each page that could not be read in full comes back as an image, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains(crate::document::NO_TEXT_NOTE),
+            "delivered text must never be reported as a document without one, got: {}",
+            msg.content
         );
         // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;

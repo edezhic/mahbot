@@ -284,7 +284,7 @@ fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
             "mode": {
                 "type": "string",
                 "enum": ["content", "symbols", "zoom"],
-                "description": "Read mode. 'content' (default): line-numbered file read — large outputs are truncated to a ~5 KB budget — or, for a raster image (PNG, JPEG, WebP), attaches it to the conversation as a native image instead; a PDF or Word document is converted the way an inbound chat attachment is — extracted text, plus text-free pages and embedded images attached as native images; over 5 of them, all are reported as paths instead (or, if that listing would not fit, as the folder holding them). 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name. 'symbols'/'zoom' work for supported code formats only.",
+                "description": "Read mode. 'content' (default): line-numbered file read — large outputs are truncated to a ~5 KB budget — or, for a raster image (PNG, JPEG, WebP), attaches it to the conversation as a native image instead; a PDF or Word document is converted the way an inbound chat attachment is — extracted text, plus text-free or unreadable pages and embedded images attached as native images; over 5 of them, all are reported as paths instead (or, if that listing would not fit, as the folder holding them). 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name. 'symbols'/'zoom' work for supported code formats only.",
                 "default": "content"
             },
             "symbol": {

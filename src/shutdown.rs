@@ -1299,13 +1299,36 @@ pub fn install_fatal_signal_handlers() {
 
 // ── Panic hook ────────────────────────────────────────────────────────────
 
+thread_local! {
+    /// Set while a contained pass ([`contain_panics`]) runs on this thread.
+    static CONTAINED_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f`, reporting a panic it raises nowhere: the boot hook skips its report
+/// for a panic contained here, and the panic is caught instead ([`Err`] carries
+/// its payload).
+///
+/// For a caller that contains *many* panics by design — the per-page PDF text
+/// pass, where one malformed page panics — the default hook would otherwise
+/// turn one failed document into one report per failed page on stderr.
+pub(crate) fn contain_panics<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+    let previous = CONTAINED_PANIC.with(|flag| flag.replace(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    CONTAINED_PANIC.with(|flag| flag.set(previous));
+    result
+}
+
 /// Install a global panic hook that prints a timestamped marker line before
 /// the default panic report, so panics captured in update.log (the replacement
 /// daemon's stderr) are time-attributable. The default hook (message +
-/// backtrace) still runs.
+/// backtrace) still runs — except for a panic contained by [`contain_panics`],
+/// which is reported through the caller's own result instead.
 pub fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if CONTAINED_PANIC.with(std::cell::Cell::get) {
+            return;
+        }
         crate::boot::timestamped_stderr(&info.to_string());
         default_hook(info);
     }));
@@ -1367,5 +1390,61 @@ mod tests {
         // A grace already spent leaves nothing to spend, so the stage is cut at once
         // and the exit path goes straight to the checkpoint.
         assert_eq!(stage_budget(now, now), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_contained_panic_is_not_reported() {
+        /// Only the marker this test raises is counted: the hook stays
+        /// transparent for every other panic, so a test running in parallel keeps
+        /// its ordinary report.
+        const MARKER: &str = "mahbot: contained-panic test marker";
+        static REPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
+
+        /// Puts the process hook back even when an assertion fails: a counting
+        /// hook left installed would drop every later panic report.
+        struct RestoreHook(Option<std::sync::Arc<PanicHook>>);
+
+        impl Drop for RestoreHook {
+            fn drop(&mut self) {
+                if let Some(hook) = self.0.take() {
+                    std::panic::set_hook(Box::new(move |info| hook.as_ref()(info)));
+                }
+            }
+        }
+
+        let previous = std::sync::Arc::new(std::panic::take_hook());
+        let _restore = RestoreHook(Some(std::sync::Arc::clone(&previous)));
+        std::panic::set_hook(Box::new(move |info| {
+            // A formatted panic carries a `String` payload; a literal one a `&str`.
+            let payload = info.payload();
+            let text = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+            if text == Some(MARKER) {
+                REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                previous.as_ref()(info);
+            }
+        }));
+        install_panic_hook();
+        assert!(
+            contain_panics(|| panic!("{MARKER}")).is_err(),
+            "the panic is still returned to the caller"
+        );
+        assert_eq!(
+            REPORTED.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a contained panic must not reach the hook: one document conversion \
+             cannot report once per failing page"
+        );
+        let _ = std::panic::catch_unwind(|| panic!("{MARKER}"));
+        assert_eq!(
+            REPORTED.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "every other panic is reported as before"
+        );
     }
 }

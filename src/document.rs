@@ -14,15 +14,23 @@
 //!   synchronous on purpose: a slow rasterization never stalls an async task.
 //! - **No panics of its own**, for any input including empty or truncated
 //!   bytes: every fallible step degrades to a skipped artifact, a user-facing
-//!   note, or [`DocOutcome::Unreadable`]. The structure parse and the
-//!   `pdf-extract` text pass each run inside [`std::panic::catch_unwind`], so a
-//!   panic in either one loses that pass alone. The decoders themselves are
-//!   trusted, not hardened: a malicious PDF can overflow the stack or exhaust
-//!   memory inside a decoder and abort the process (the filter chain inflates
-//!   into an unbounded buffer), and a decoder that panics instead is only
-//!   contained at the caller's blocking boundary (as [`DocOutcome::Unreadable`],
-//!   losing the text pass with it). The bounds this module declares are its own
-//!   (see `embedded_image_jpeg`), not the decoders'.
+//!   note, or [`DocOutcome::Unreadable`]. The structure parse runs inside
+//!   [`std::panic::catch_unwind`] and the `pdf-extract` text pass inside
+//!   [`crate::shutdown::contain_panics`], so a panic costs the pass it happens in
+//!   and nothing else: in the text pass it costs one page — the pages around it
+//!   keep theirs — unless it strikes while the reader is being opened, when it
+//!   costs the whole text pass and every page of the document is named as one
+//!   whose text failed. Neither is reported on stderr per page. The decoders
+//!   themselves are trusted, not hardened: a malicious PDF can overflow the stack
+//!   or exhaust memory inside a decoder and abort the process (the filter chain
+//!   inflates into an unbounded buffer), and a decoder that panics instead is
+//!   only contained at the caller's blocking boundary (as
+//!   [`DocOutcome::Unreadable`], losing the text pass with it). The bounds this
+//!   module declares are its own (see `embedded_image_jpeg`), not the decoders'.
+//! - **One page never costs another.** Text comes from every page the reader can
+//!   produce it for; the pages it cannot are rasterized so the document is still
+//!   delivered, and named in a note, because a page whose text could not be read
+//!   is not a page that has none.
 //! - **Content-first detection.** Magic bytes decide the format; the extension
 //!   only disambiguates formats that share a container (a ZIP is a `.docx` only
 //!   when the name says so) or that have no magic (plain text).
@@ -44,6 +52,7 @@ use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings};
 use image::codecs::jpeg::JpegEncoder;
 use image::{RgbImage, RgbaImage};
+use pdf_extract::{Document, PlainTextOutput, output_doc_page};
 use quick_xml::Reader;
 use quick_xml::events::{BytesRef, Event};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -131,11 +140,18 @@ pub(crate) enum DocOutcome {
     /// Text was extracted. `text` may be empty when the document has no text
     /// layer; `images` are files written into `out_dir`, ready for the existing
     /// inbound IMAGE pipeline; `notes` are non-fatal, already user-facing notes
-    /// (e.g. skipped undecodable embedded media).
+    /// (e.g. skipped undecodable embedded media, pages the reader could not
+    /// read).
     Text {
         text: String,
         images: Vec<PathBuf>,
         notes: Vec<String>,
+        /// The reader failed on every page it was asked for, producing no text at
+        /// all: the document's text was lost, not absent, so a caller must not
+        /// report it as one that has no text. A page whose text survived — even
+        /// partially — and a page the reader read without producing text both clear
+        /// this.
+        all_page_text_lost: bool,
     },
     /// A recognized format whose bytes could not be read (corrupt, or
     /// encrypted/password-protected). `reason` is user-facing and short.
@@ -221,6 +237,7 @@ fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome
             text: String::from_utf8_lossy(bytes).into_owned(),
             images: Vec::new(),
             notes: Vec::new(),
+            all_page_text_lost: false,
         },
         DocumentKind::Unsupported => DocOutcome::Unsupported,
     }
@@ -274,17 +291,21 @@ pub(crate) async fn convert_document_file(
     }
 }
 
-/// Extract text, page rasters and embedded images from a PDF: a page with a
-/// usable text layer is inlined together with every image XObject that can be
-/// decoded from it — and every inline image its content stream paints — while a
-/// page without one is rasterized at the scale bounded by
+/// Extract text, page rasters and embedded images from a PDF: a page whose text
+/// layer the reader can produce is inlined together with every image XObject
+/// that can be decoded from it — and every inline image its content stream
+/// paints — while every other page is rasterized at the scale bounded by
 /// [`RASTER_LONG_SIDE_PX`] instead, which already carries its embedded images.
+///
+/// The text pass is per page ([`PdfTextReader`]), so a page the reader cannot
+/// read costs that page and nothing else: the pages around it keep their text,
+/// the pages it costs are rasterized, and [`UnreadablePages`] names them.
 fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     // The structure parse also settles encryption: it decrypts with the empty
     // user password, so an owner-password-only document opens and is readable,
     // while one that needs a password reports `Decryption`. hayro also supplies
-    // the page list both remaining passes walk: its pages are in document order,
-    // the same order `pdf-extract`'s per-page text list uses.
+    // the page list the loop below indexes: its pages are in document order, the
+    // same order the reader's page numbers count in (see [`PdfTextReader::read_page`]).
     //
     // A panic in the parse is caught like one in the text pass below it: the
     // document keeps whatever the other pass can read instead of reaching the
@@ -298,30 +319,19 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         }
         Ok(Err(_)) | Err(_) => None,
     };
-    // `pdf-extract` panics on some malformed structures; a panic is treated
-    // exactly like its `Err` — no page text, so every page takes the visual
-    // path.
-    let page_texts = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pdf_extract::extract_text_from_mem_by_pages(bytes)
-    }));
-    let page_texts = match page_texts {
-        Ok(Ok(texts)) => texts,
-        // Parsed, but the text pass failed: rasterize every page instead.
-        _ if pdf.is_some() => Vec::new(),
-        // Nothing can be read at all — no text and no structure to render — so
-        // the document is reported as such instead of as an empty one.
-        _ => {
-            return DocOutcome::Unreadable {
-                reason: "could not be parsed".to_string(),
-            };
-        }
-    };
-    // Either list running short degrades safely: a page past `page_texts` has no
-    // text to inline, and a page past the page tree has nothing to render or
-    // extract.
-    let page_count = pdf.as_ref().map_or(page_texts.len(), |pdf| {
-        page_texts.len().max(pdf.pages().len())
-    });
+    let reader = PdfTextReader::open(bytes);
+    // Neither pass can read the bytes: nothing to deliver in any form.
+    if matches!(reader, PdfTextReader::Unavailable) && pdf.is_none() {
+        return DocOutcome::Unreadable {
+            reason: "could not be parsed".to_string(),
+        };
+    }
+    // Either list running short degrades safely: a page past the reader's list
+    // has no text to inline, and a page past the page tree has nothing to render
+    // or extract.
+    let page_count = reader
+        .page_count()
+        .max(pdf.as_ref().map_or(0, |pdf| pdf.pages().len()));
 
     ensure_out_dir(out_dir);
 
@@ -331,48 +341,274 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     // never rasterized, so without one aggregated note per cause they would
     // vanish silently.
     let mut skipped = SkippedImages::default();
-    // Text pages left without a page-tree entry, because there is no structure
-    // to render them from.
-    let mut pages_without_structure = 0usize;
+    // Pages the page tree has no entry for, so they could not be delivered as
+    // images (a page that produced text before failing still keeps that text).
+    let mut unrendered = 0usize;
     // The images already written for the document, shared across pages (see
     // [`write_embedded_images`]).
     let mut written = WrittenImages::default();
+    let mut unread = UnreadablePages {
+        total: page_count,
+        ..UnreadablePages::default()
+    };
     for index in 0..page_count {
-        let page_text = page_texts.get(index).map_or("", String::as_str);
+        let page_number = index + 1;
         let page = pdf.as_ref().and_then(|pdf| pdf.pages().get(index));
-        if is_usable_page_text(page_text) {
-            // Trim so the "\n\n" join does not double up with the extractor's
-            // own trailing whitespace.
-            text_pages.push(page_text.trim().to_string());
+        // `None` for a page outside the reader's page list — nothing to read for
+        // it, and nothing lost; a reader that could not be opened is a failure
+        // for every page of the document.
+        let read = reader.read_page(page_number);
+        if read.is_some() {
+            // The reader was asked for this page, so it is one whose text the
+            // reader could have produced: what [`UnreadablePages`] counts to tell
+            // a reader failure from a document with no text.
+            unread.attempted += 1;
+        }
+        // What the reader produced for this page, and whether it could finish it.
+        let (text, failed) = match read {
+            Some(PageText::Read(text)) => (text, false),
+            Some(PageText::Failed(text)) => (text, true),
+            None => (String::new(), false),
+        };
+        // Trim so the "\n\n" join does not double up with the extractor's own
+        // trailing whitespace.
+        let kept = is_usable_page_text(&text).then(|| text.trim().to_string());
+        if failed {
+            // The page is named, and delivered as an image too, because its text
+            // stops where the reader did — but what it produced first is still
+            // the document's to keep.
+            match kept {
+                Some(text) => {
+                    text_pages.push(text);
+                    unread.partial.push(page_number);
+                }
+                None => unread.lost.push(page_number),
+            }
+            rasterize_page(page, page_number, out_dir, &mut images, &mut unrendered);
+        } else if let Some(text) = kept {
+            text_pages.push(text);
             if let Some(page) = page {
                 write_embedded_images(
                     page,
-                    index + 1,
+                    page_number,
                     out_dir,
                     &mut written,
                     &mut images,
                     &mut skipped,
                 );
             }
-        } else if let Some(page) = page {
-            rasterize_page(page, index + 1, out_dir, &mut images);
         } else {
-            pages_without_structure += 1;
+            // No usable text — no text layer at all, or a page the reader does
+            // not know: delivered as a page image, exactly as before.
+            rasterize_page(page, page_number, out_dir, &mut images, &mut unrendered);
         }
     }
-    // Aggregated: a text layer without a readable page tree is one degradation,
-    // not one log line per page of a long scanned document.
-    if pages_without_structure > 0 {
+    // Aggregated: pages the page tree does not hold are one degradation, not one
+    // log line per page of a long scanned document.
+    if unrendered > 0 {
         tracing::warn!(
-            pages = pages_without_structure,
-            "document: text pages missing from the PDF page tree"
+            pages = unrendered,
+            "document: pages with no page-tree entry could not be delivered as images"
         );
     }
+    // The unread pages lead: they qualify the text and the pages below them.
+    let mut notes = unread.notes();
+    notes.extend(skipped.notes());
     DocOutcome::Text {
         text: text_pages.join("\n\n"),
         images,
-        notes: skipped.notes(),
+        notes,
+        all_page_text_lost: unread.lost_all_page_text(),
     }
+}
+
+/// What the reader made of one page.
+enum PageText {
+    /// The page was read. The text is still empty for a page with no text layer,
+    /// which is the ordinary case rather than a failure.
+    Read(String),
+    /// The page could not be read; `text` holds whatever it produced first.
+    Failed(String),
+}
+
+/// The pinned reader's per-page text pass over one document.
+///
+/// The reader's own whole-document entry points read the pages in a loop that
+/// stops at the first page that errors, which silently costs that page's text
+/// and every page after it; its page-level entry point is driven per page here
+/// instead, so one unreadable page costs that page alone. Each page-level call
+/// re-walks the reader's page tree and rebuilds the processor the whole-document
+/// entry point built once — the accepted price of the pages after a failing one.
+#[expect(clippy::large_enum_variant)] // the engine it holds is inherently large
+enum PdfTextReader {
+    /// The document opened: `doc` is the reader's engine and `pages` how many
+    /// pages its tree holds. The reader numbers tree pages `1..=pages` in
+    /// document order, so a page past the count is one it does not know — such a
+    /// page has no text to lose, and is never named as unread.
+    Open { doc: Document, pages: usize },
+    /// The document could not be opened at all, or holds no page: no page of
+    /// it has a text pass, so each of its pages counts as one whose text
+    /// failed.
+    Unavailable,
+}
+
+impl PdfTextReader {
+    /// Open `bytes` for reading: [`Self::Unavailable`] when the reader cannot
+    /// read the file at all, or finds no page in it — the text is then missing
+    /// for every page of a document that has pages, which is a text loss rather
+    /// than a document without text.
+    ///
+    /// Encrypted documents are decrypted with the empty user password, exactly
+    /// as the reader's own entry points do: an owner-password-only document is
+    /// readable, one that needs a password is not. A panic in either step is
+    /// caught like an error — both run before any page can be read, so they cost
+    /// the reader, not one page, and are reported once per conversion rather
+    /// than suppressed.
+    fn open(bytes: &[u8]) -> Self {
+        let Ok(Ok(mut doc)) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Document::load_mem(bytes)))
+        else {
+            return Self::Unavailable;
+        };
+        if doc.is_encrypted() {
+            let decrypted =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doc.decrypt("")));
+            if !matches!(decrypted, Ok(Ok(()))) {
+                return Self::Unavailable;
+            }
+        }
+        let Ok(pages) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doc.get_pages().len()))
+        else {
+            return Self::Unavailable;
+        };
+        if pages == 0 {
+            return Self::Unavailable;
+        }
+        Self::Open { doc, pages }
+    }
+
+    /// The page count the text pass walks to: how many pages the reader holds,
+    /// `0` for one that could not be opened.
+    fn page_count(&self) -> usize {
+        match self {
+            Self::Open { pages, .. } => *pages,
+            Self::Unavailable => 0,
+        }
+    }
+
+    /// The text of 1-based `page_number`, or `None` for a page the reader's page
+    /// tree does not hold — a page it does not know is not an unreadable one.
+    /// The reader numbers its pages by tree order, the order hayro's page list
+    /// indexes them in, which is what pairs one page's text with its raster.
+    ///
+    /// A panic is contained like an error: the reader panics on some malformed
+    /// structures, and one page's panic must cost that page alone. Either way the
+    /// text produced before the failure is kept in [`PageText::Failed`].
+    fn read_page(&self, page_number: usize) -> Option<PageText> {
+        let Self::Open { doc, pages } = self else {
+            // The reader never opened: nothing was produced and the read failed.
+            return Some(PageText::Failed(String::new()));
+        };
+        // The reader holds pages `1..=pages`, in its own `u32` numbering: a page
+        // outside that range is one it does not know, which is not an unreadable
+        // one.
+        if !(1..=*pages).contains(&page_number) {
+            return None;
+        }
+        // Page numbers count in that same numbering and `pages` is its count, so
+        // the number fits a `u32`. `allow`, not `expect`: the cast cannot truncate
+        // on a 32-bit target, where an unfired expectation would itself warn.
+        #[allow(clippy::cast_possible_truncation)]
+        let number = page_number as u32;
+        let mut text = String::new();
+        let outcome = crate::shutdown::contain_panics(|| {
+            let mut output = PlainTextOutput::new(&mut text);
+            output_doc_page(doc, &mut output, number)
+        });
+        Some(match outcome {
+            Ok(Ok(())) => PageText::Read(text),
+            Ok(Err(_)) | Err(_) => PageText::Failed(text),
+        })
+    }
+}
+
+/// Pages whose text the reader could not read: what tells a document whose text
+/// is missing from one that has none. Delivered as a note, never as a log line.
+#[derive(Debug, Default)]
+struct UnreadablePages {
+    /// 1-based numbers of pages that produced no text that could be kept — a page
+    /// this holds is one whose text was lost, not one that has none.
+    lost: Vec<usize>,
+    /// Those that produced text, kept for the delivery, and failed after it.
+    partial: Vec<usize>,
+    /// How many pages the reader was asked for — every page it could read at
+    /// all. Together with `lost` this is what separates a document whose text
+    /// the reader failed on from one that has no text.
+    attempted: usize,
+    /// The document's page count, for the count in the note.
+    total: usize,
+}
+
+impl UnreadablePages {
+    /// Whether the text of every page the reader was asked for was lost — the
+    /// case in which a document that delivered no text is not one that has none.
+    /// A page it read without producing text, and a page its page list does not
+    /// hold, are neither of them losses.
+    fn lost_all_page_text(&self) -> bool {
+        self.attempted > 0 && self.lost.len() == self.attempted
+    }
+
+    /// One compact line per cause, the lost pages before the partial ones: page
+    /// ranges plus a count, so a long document whose reader failed everywhere
+    /// cannot turn one note into a page-by-page listing.
+    fn notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        for (pages, suffix) in [(&self.lost, ""), (&self.partial, " in full")] {
+            if !pages.is_empty() {
+                notes.push(format!(
+                    "the text of {} could not be read{suffix} ({} of {} pages)",
+                    page_list(pages),
+                    pages.len(),
+                    self.total
+                ));
+            }
+        }
+        notes
+    }
+}
+
+/// How many ranges a lost-text note names before it stops: the note shares the
+/// tool output budget with the delivered text.
+const MAX_NOTE_RANGES: usize = 8;
+
+/// `pages 3, 7-9` for the 1-based `pages`, which are ascending.
+fn page_list(pages: &[usize]) -> String {
+    let noun = if pages.len() == 1 { "page" } else { "pages" };
+    format!("{noun} {}", page_ranges(pages))
+}
+
+/// `3, 7-9, 12` for the ascending `pages`: a run of three or more collapses to
+/// `first-last`, and at most [`MAX_NOTE_RANGES`] ranges are named.
+fn page_ranges(pages: &[usize]) -> String {
+    let mut ranges: Vec<String> = Vec::new();
+    let mut remaining = pages.iter().copied().peekable();
+    while let Some(first) = remaining.next() {
+        let mut last = first;
+        while remaining.peek() == Some(&(last + 1)) {
+            last = remaining.next().unwrap_or(last);
+        }
+        if ranges.len() == MAX_NOTE_RANGES {
+            ranges.push("…".to_string());
+            break;
+        }
+        ranges.push(match last - first {
+            0 => first.to_string(),
+            1 => format!("{first}, {last}"),
+            _ => format!("{first}-{last}"),
+        });
+    }
+    ranges.join(", ")
 }
 
 /// Extract body text and embedded images from a `.docx`/`.docm` ZIP package.
@@ -431,6 +667,7 @@ fn convert_docx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         text,
         images,
         notes: skipped.notes(),
+        all_page_text_lost: false,
     }
 }
 
@@ -1152,8 +1389,20 @@ fn encode_jpeg(image: &RgbImage) -> Result<Vec<u8>, ()> {
 }
 
 /// Rasterize `page` (1-based `page_number`) to `<out_dir>/page_<n>.jpg` and push
-/// the path onto `images`. A page that cannot be rendered or encoded is skipped.
-fn rasterize_page(page: &Page<'_>, page_number: usize, out_dir: &Path, images: &mut Vec<PathBuf>) {
+/// the path onto `images`; a page that cannot be rendered or encoded is skipped.
+/// A `None` page — one the page tree has no entry for — has nothing to render
+/// and is counted onto `unrendered` instead.
+fn rasterize_page(
+    page: Option<&Page<'_>>,
+    page_number: usize,
+    out_dir: &Path,
+    images: &mut Vec<PathBuf>,
+    unrendered: &mut usize,
+) {
+    let Some(page) = page else {
+        *unrendered += 1;
+        return;
+    };
     // `render_dimensions` clamps zero-area pages, so `long_side >= 1.0` and the
     // scale stays finite; the cap keeps a tiny page from being blown up.
     let (width, height) = page.render_dimensions();
@@ -1305,7 +1554,8 @@ fn ensure_out_dir(out_dir: &Path) {
 }
 
 /// A page's text layer counts only when trimming leaves at least
-/// [`MIN_PAGE_TEXT_CHARS`] characters.
+/// [`MIN_PAGE_TEXT_CHARS`] characters — the same rule that decides what a page
+/// which failed mid-way still contributes (see [`convert_pdf`]).
 fn is_usable_page_text(text: &str) -> bool {
     text.trim().chars().count() >= MIN_PAGE_TEXT_CHARS
 }
@@ -1316,8 +1566,9 @@ fn is_plain_utf8(bytes: &[u8]) -> bool {
     !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
 }
 
-/// Builders shared by this module's tests and the read tool's document tests
-/// ([`crate::tools::read_document`]), so both sides convert the very same
+/// Builders shared by this module's tests, the read tool's document tests
+/// ([`crate::tools::read_document`]) and the inbound-attachment tests
+/// ([`crate::channels::enrichment`]), so every side converts the very same
 /// fixtures.
 #[cfg(test)]
 pub(crate) mod test_fixtures {
@@ -1364,6 +1615,55 @@ pub(crate) mod test_fixtures {
             .as_bytes(),
         );
         pdf
+    }
+
+    /// A multi-page PDF: one font, and for every entry a page dictionary
+    /// carrying `entries` plus its own content stream, in the order given.
+    pub(crate) fn multi_page_pdf(pages: &[(&str, &[u8])]) -> Vec<u8> {
+        let kids: Vec<String> = (0..pages.len())
+            .map(|slot| format!("{} 0 R", 4 + 2 * slot))
+            .collect();
+        let mut objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            format!(
+                "<< /Type /Pages /Kids [{}] /Count {} >>",
+                kids.join(" "),
+                pages.len()
+            )
+            .into_bytes(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ];
+        for (slot, (entries, content)) in pages.iter().enumerate() {
+            objects.push(
+                format!(
+                    "<< /Type /Page /Parent 2 0 R {entries} /Resources \
+                     << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
+                    5 + 2 * slot
+                )
+                .into_bytes(),
+            );
+            objects.push(
+                format!(
+                    "<< /Length {} >>\nstream\n{}\nendstream",
+                    content.len(),
+                    String::from_utf8_lossy(content)
+                )
+                .into_bytes(),
+            );
+        }
+        assemble_pdf(&objects)
+    }
+
+    /// One page's text that ends where the reader gives up: it panics on an
+    /// operand it cannot show, without losing what it showed before it.
+    pub(crate) const PAGE_THAT_FAILS_MIDWAY: &[u8] =
+        b"BT /F1 24 Tf 72 700 Td (Kept page text long enough) Tj ET BT /F1 24 Tf 72 600 Td 42 Tj ET";
+
+    /// A two-page PDF whose every page yields text and then fails the reader
+    /// part-way: not one page reads to the end, yet the document loses no text.
+    pub(crate) fn pdf_with_all_pages_failing_midway() -> Vec<u8> {
+        let page = ("/MediaBox [0 0 612 792]", PAGE_THAT_FAILS_MIDWAY);
+        multi_page_pdf(&[page, page])
     }
 }
 
@@ -1519,6 +1819,7 @@ mod tests {
             text,
             images,
             notes,
+            ..
         } = outcome
         else {
             panic!("expected Text outcome for a well-formed docx");
@@ -1933,6 +2234,229 @@ mod tests {
         );
     }
 
+    /// A page the reader cannot read costs that page: the pages around it keep
+    /// their text, only it is turned into an image, and the note says why — a
+    /// page whose text could not be read is not a page that has none.
+    #[test]
+    fn pdf_keeps_the_text_of_pages_the_reader_can_read() {
+        // Page 2 has no MediaBox at all, so the reader panics before it reads
+        // anything from that page; page 4 gives text and then fails mid-page.
+        let bytes = multi_page_pdf(&[
+            (
+                "/MediaBox [0 0 612 792]",
+                b"BT /F1 24 Tf 72 700 Td (Page one text long enough) Tj ET",
+            ),
+            (
+                "",
+                b"BT /F1 24 Tf 72 700 Td (Page two text long enough) Tj ET",
+            ),
+            (
+                "/MediaBox [0 0 612 792]",
+                b"BT /F1 24 Tf 72 700 Td (Page three text long enough) Tj ET",
+            ),
+            ("/MediaBox [0 0 612 792]", PAGE_THAT_FAILS_MIDWAY),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = convert_document(&bytes, "report.pdf", dir.path());
+        let DocOutcome::Text {
+            text,
+            images,
+            notes,
+            all_page_text_lost,
+        } = outcome
+        else {
+            panic!("expected Text outcome for a PDF whose pages partly read");
+        };
+        assert!(text.contains("Page one text long enough"), "{text:?}");
+        assert!(text.contains("Page three text long enough"), "{text:?}");
+        assert!(
+            text.contains("Kept page text long enough"),
+            "what a page produced before it failed is kept: {text:?}"
+        );
+        assert!(
+            !text.contains("Page two text long enough"),
+            "the reader panics on page 2 before reading it: {text:?}"
+        );
+        assert_eq!(
+            images,
+            vec![dir.path().join("page_2.jpg"), dir.path().join("page_4.jpg")],
+            "only the pages whose text could not be read are rasterized"
+        );
+        assert_eq!(
+            notes,
+            vec![
+                "the text of page 2 could not be read (1 of 4 pages)",
+                "the text of page 4 could not be read in full (1 of 4 pages)",
+            ]
+        );
+        assert!(!all_page_text_lost);
+    }
+
+    /// Every page yields text and then fails the reader part-way: all of it is
+    /// kept and every page is rasterized, but a page that delivered text is not a
+    /// loss — the flag must clear even though the reader failed on each page.
+    #[test]
+    fn pdf_keeps_the_text_of_pages_that_fail_after_producing_it() {
+        let bytes = pdf_with_all_pages_failing_midway();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = convert_document(&bytes, "report.pdf", dir.path());
+        let DocOutcome::Text {
+            text,
+            images,
+            notes,
+            all_page_text_lost,
+        } = outcome
+        else {
+            panic!("expected Text outcome for a PDF whose every page failed part-way");
+        };
+        assert_eq!(
+            text.matches("Kept page text long enough").count(),
+            2,
+            "both pages delivered the text they produced before failing: {text:?}"
+        );
+        assert_eq!(
+            images,
+            vec![dir.path().join("page_1.jpg"), dir.path().join("page_2.jpg")],
+            "every page whose text could not be read in full is rasterized"
+        );
+        assert_eq!(
+            notes,
+            vec!["the text of pages 1, 2 could not be read in full (2 of 2 pages)"]
+        );
+        assert!(
+            !all_page_text_lost,
+            "no page's text was lost: both delivered what they produced"
+        );
+    }
+
+    /// The reader's page table cannot be followed at all while the pages
+    /// themselves parse: the text of every page is lost, which the note has to
+    /// say — such a document is not one that has no text.
+    #[test]
+    fn pdf_names_every_page_when_the_reader_cannot_read_the_document() {
+        let mut bytes = text_pdf(&[]);
+        // One byte inserted after the header: every xref offset is now one short
+        // of its object, so the reader cannot find a single page (hayro's own
+        // structure scan still finds the one the document has).
+        bytes.insert(b"%PDF-1.4\n".len(), b' ');
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = convert_document(&bytes, "report.pdf", dir.path());
+        let DocOutcome::Text {
+            text,
+            images,
+            notes,
+            all_page_text_lost,
+        } = outcome
+        else {
+            panic!("expected Text outcome for a PDF whose pages parse");
+        };
+        assert!(text.trim().is_empty(), "nothing was read: {text:?}");
+        assert_eq!(images, vec![dir.path().join("page_1.jpg")]);
+        assert_eq!(
+            notes,
+            vec!["the text of page 1 could not be read (1 of 1 pages)"]
+        );
+        assert!(all_page_text_lost);
+    }
+
+    /// A page whose text could not be read is not a page that has no text: the
+    /// one is named and the other is not, and a document is only reported as one
+    /// without text when the reader was not the reason.
+    #[test]
+    fn pdf_distinguishes_a_page_with_no_text_from_one_that_could_not_be_read() {
+        // Page 1 paints a rectangle and has no text at all; page 2 has no
+        // MediaBox, so the reader panics on it before reading anything.
+        let bytes = multi_page_pdf(&[
+            (
+                "/MediaBox [0 0 612 792]",
+                b"0.1 0.5 0.9 rg 0 0 612 792 re f",
+            ),
+            (
+                "",
+                b"BT /F1 24 Tf 72 700 Td (Page two text long enough) Tj ET",
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = convert_document(&bytes, "scan.pdf", dir.path());
+        let DocOutcome::Text {
+            text,
+            images,
+            notes,
+            all_page_text_lost,
+        } = outcome
+        else {
+            panic!("expected Text outcome for a scan with one unreadable page");
+        };
+        assert!(text.trim().is_empty(), "no text layer to extract: {text:?}");
+        assert_eq!(
+            images,
+            vec![dir.path().join("page_1.jpg"), dir.path().join("page_2.jpg")],
+            "the text-free page and the unreadable one are both delivered as images"
+        );
+        assert_eq!(
+            notes,
+            vec!["the text of page 2 could not be read (1 of 2 pages)"],
+            "only the page that could not be read is named"
+        );
+        assert!(
+            !all_page_text_lost,
+            "page 1 was read and has nothing to read: the document is not one \
+             whose text the reader failed on"
+        );
+    }
+
+    /// The note is a bounded contract: ranges, a count, and a stop — never one
+    /// number per lost page of a long document — and the "the reader failed"
+    /// flag only when no page the reader read produced text.
+    #[test]
+    fn unreadable_page_notes_name_ranges_within_a_bound() {
+        let unread = UnreadablePages {
+            lost: vec![1, 2, 3, 7, 9, 11, 13, 15, 17, 19, 21],
+            partial: vec![30, 31],
+            attempted: 44,
+            total: 44,
+        };
+        assert_eq!(
+            unread.notes(),
+            vec![
+                "the text of pages 1-3, 7, 9, 11, 13, 15, 17, 19, … could not be read (11 of 44 pages)",
+                "the text of pages 30, 31 could not be read in full (2 of 44 pages)",
+            ]
+        );
+        assert!(!unread.lost_all_page_text(), "33 pages kept their text");
+        assert_eq!(page_list(&[5]), "page 5");
+        assert!(
+            UnreadablePages {
+                lost: vec![1, 2],
+                attempted: 2,
+                total: 3,
+                ..UnreadablePages::default()
+            }
+            .lost_all_page_text(),
+            "the reader could only read pages 1 and 2, and failed on both"
+        );
+        assert!(
+            !UnreadablePages {
+                lost: vec![2],
+                attempted: 2,
+                total: 2,
+                ..UnreadablePages::default()
+            }
+            .lost_all_page_text(),
+            "page 1 has no text, which is not the reader failing"
+        );
+        assert!(
+            !UnreadablePages {
+                lost: vec![],
+                partial: vec![30, 31],
+                attempted: 2,
+                ..UnreadablePages::default()
+            }
+            .lost_all_page_text(),
+            "both pages delivered the text they produced, so none was lost"
+        );
+    }
+
     /// The only coverage of the rasterization path (render → unpremultiply →
     /// JPEG), including the scale that bounds the rendered page's long side. A
     /// page without a text layer is rendered whole, so its embedded image comes
@@ -1945,6 +2469,7 @@ mod tests {
             text,
             images,
             notes,
+            ..
         } = outcome
         else {
             panic!("expected Text outcome for an image-only PDF");
