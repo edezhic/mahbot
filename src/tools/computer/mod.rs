@@ -1,17 +1,31 @@
 //! Computer (GUI observe/act) tool for the admin's Assistant.
 //!
 //! The platform-agnostic core (types, coordinate math, ref lifecycle, backend
-//! trait) lives in [`core`]; [`macos`]/[`linux`]/[`stub`] implement the backend
-//! per platform. All GUI actions are serialized through a process-wide lock so
+//! trait) lives in [`core`]; [`linux`] and [`stub`] implement the backend per
+//! platform. All GUI actions are serialized through a process-wide lock so
 //! two concurrent agent runs can never race on the live GUI.
+//!
+//! The tool is offered on Linux only. The macOS backend is kept compiled but
+//! dormant and unreachable — see [`macos`] for why and for what must happen
+//! before it is ever enabled again, and the module declaration in
+//! `tools/mod.rs` for how the product is kept away from it.
+
+// Dormant on macOS: nothing in the product references this module there, so its
+// items are dead code. The expectation is scoped to that platform so that
+// bringing the capability back starts here — by deleting it together with the
+// review `macos.rs` asks for.
+#![cfg_attr(
+    target_os = "macos",
+    expect(dead_code, reason = "macOS computer use is dormant (see macos.rs)")
+)]
 
 mod core;
 mod linux;
+// Compiled on macOS too, but unreachable there: see `macos.rs`.
 mod macos;
-// `stub` is the unsupported-platform backend; on macOS/Linux it would be
-// entirely dead (the cfg-gated `backend()` factory never reaches it), so gate
-// the module itself rather than carry per-item allows.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+// Also the backend on macOS, where the capability is withheld rather than
+// unsupported.
+#[cfg(not(target_os = "linux"))]
 mod stub;
 
 use self::core::{
@@ -198,16 +212,16 @@ fn build_action_from_siblings(name: &str, args: &Value) -> Result<(Value, Option
 
 // ── Backend factory ─────────────────────────────────────────────────────
 
+/// The backend for the running platform. macOS is absent on purpose: computer
+/// use is withdrawn there (see `macos.rs`), so a macOS build can only ever
+/// reach the stub — which also keeps the aborting screen-capture path out of
+/// reach if the tool is ever wired back in by mistake.
 fn backend() -> &'static dyn Backend {
-    #[cfg(target_os = "macos")]
-    {
-        &macos::MACOS_BACKEND
-    }
     #[cfg(target_os = "linux")]
     {
         &linux::LINUX_BACKEND
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     {
         &stub::STUB_BACKEND
     }

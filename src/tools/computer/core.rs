@@ -7,7 +7,9 @@
 //! Items carrying a platform-scoped `expect(dead_code)` are the ones only a real
 //! backend — or a test — calls: on a platform whose backend is the stub they
 //! have no caller, and they stay, as they are the real backends' contract. Per
-//! item, not module-wide, so `dead_code` stays armed everywhere else.
+//! item, not module-wide, so `dead_code` stays armed everywhere else; the sole
+//! exception is the module-wide macOS dormancy `expect` on the `computer`
+//! module itself (see `macos.rs`).
 
 use crate::util::UnwrapPoison;
 use anyhow::anyhow;

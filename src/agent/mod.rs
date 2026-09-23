@@ -2650,8 +2650,9 @@ where
 }
 
 /// Everything an agent run releases for its own temporary use when the run ends:
-/// its spill files, its per-agent computer registry entries, and the chrome
-/// sessions it opened. Released from a `Drop` rather than from trailing statements
+/// its spill files, its per-agent computer registry entries (there are none on
+/// macOS, where computer use is withdrawn), and the chrome sessions it opened.
+/// Released from a `Drop` rather than from trailing statements
 /// because a run cut off mid-flight never reaches a trailing statement, and
 /// everything it used would then be stranded with nothing left that records it. The
 /// chrome part is only handed over (the `chrome-run-releases` task does the work,
@@ -2696,7 +2697,9 @@ impl Drop for RunEndCleanup {
         // (safe on macOS — the run is over, nothing will read them again).
         crate::tools::shell::cleanup_agent_spills(&self.agent_id);
         // Drop the per-agent computer registry entries (observation/target/
-        // capture) so they never leak into a later run.
+        // capture) so they never leak into a later run. Not on macOS, where the
+        // computer tool does not exist, so there is no such state.
+        #[cfg(not(target_os = "macos"))]
         crate::tools::computer::cleanup_agent_state(&self.agent_id);
         // Hand the run's chrome sessions to the release queue. The tracker's own
         // `Drop` unregisters the run's namespace once the run's last owner goes.

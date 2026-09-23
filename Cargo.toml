@@ -245,9 +245,11 @@ opus-decoder = "0.1"
 minimp3 = "0.5"
 
 # Computer Use tool (GUI observe/act): accessibility (AXUIElement), input
-# synthesis (CGEvent) and capture (ScreenCaptureKit). Version-aligned objc2
-# family — the same 0.6.x/0.3.x series already resolved transitively via the
-# GUI stack, so the lock gains no additional objc2 base-version forks.
+# synthesis (CGEvent) and capture (ScreenCaptureKit). Computer use is withdrawn
+# on macOS (see src/tools/computer/macos.rs); these deps are kept only so the
+# dormant backend keeps compiling. Version-aligned objc2 family — the same
+# 0.6.x/0.3.x series already resolved transitively via the GUI stack, so the
+# lock gains no additional objc2 base-version forks.
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-core-foundation = "0.3"

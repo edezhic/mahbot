@@ -250,9 +250,11 @@ impl Role {
 use crate::Tool;
 use crate::Workspace;
 use crate::config::CONFIG;
+#[cfg(not(target_os = "macos"))]
+use crate::tools::ComputerTool;
 use crate::tools::{
-    AddAlarmTool, AddCommentTool, AnalyzeTool, ChromeTool, ComputerTool, CreateTicketTool,
-    CustomTool, DispatchMode, EditTool, GetTicketTool, ImageGenTool, ImplementTool, ListAlarmsTool,
+    AddAlarmTool, AddCommentTool, AnalyzeTool, ChromeTool, CreateTicketTool, CustomTool,
+    DispatchMode, EditTool, GetTicketTool, ImageGenTool, ImplementTool, ListAlarmsTool,
     ListTicketsTool, MahbotConfigTool, MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool,
     SearchArchivedTicketsTool, SearchTool, SendMessageToManagerTool, ShellMode, ShellTool,
     SleepTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
@@ -312,7 +314,9 @@ impl Role {
     /// widens the Assistant's toolset: `shell`, `implement`,
     /// `research`, `computer`, `mahbot_config`, `mahbot_debug` and the
     /// Assistant↔Manager chat tools are added. Every other role's toolset is
-    /// byte-identical regardless of its value.
+    /// byte-identical regardless of its value. `computer` exists only where the
+    /// capability does: on macOS it is withdrawn, so the admin's toolset there
+    /// has no such tool (see `tools/computer/macos.rs`).
     ///
     /// `chrome_sessions` is the run-scoped tracker shared with the agent's
     /// `ChromeTool`: every session the run opens is handed to the run-end
@@ -430,7 +434,10 @@ impl Role {
                     // Assistant can also observe/act on the local GUI directly
                     // (gated per-run by the accessibility grant at agent
                     // construction). No structural authorization gate beyond
-                    // `is_admin`, matching the full shell widening.
+                    // `is_admin`, matching the full shell widening. Not on
+                    // macOS, where computer use is withdrawn entirely
+                    // (see `tools/computer/macos.rs`).
+                    #[cfg(not(target_os = "macos"))]
                     t.push(Box::new(ComputerTool));
                     // Assistant→Manager channel (the admin's Assistant only):
                     // address the Manager of a project workspace. The
@@ -667,7 +674,14 @@ mod tests {
         let guest = crate::Role::Assistant.tools(&ws, false, test_sessions());
         let admin = crate::Role::Assistant.tools(&ws, true, test_sessions());
 
-        for name in ["shell", "implement", "research", "computer"] {
+        // `computer` is admin-only where the capability exists at all; on macOS
+        // it is withdrawn entirely (see `tools/computer/macos.rs`).
+        let admin_only: &[&str] = if cfg!(target_os = "macos") {
+            &["shell", "implement", "research"]
+        } else {
+            &["shell", "implement", "research", "computer"]
+        };
+        for &name in admin_only {
             assert!(
                 !guest.iter().any(|t| t.name() == name),
                 "a guest's Assistant toolset must not contain '{name}'"
@@ -675,6 +689,12 @@ mod tests {
             assert!(
                 admin.iter().any(|t| t.name() == name),
                 "the admin's Assistant toolset must contain '{name}'"
+            );
+        }
+        if cfg!(target_os = "macos") {
+            assert!(
+                !admin.iter().any(|t| t.name() == "computer"),
+                "the admin's Assistant must not advertise `computer` on macOS"
             );
         }
         // The read boundary is what the model is told: a guest (restricted)
@@ -789,7 +809,9 @@ mod tests {
         // Acceptance pin: `computer` is granted ONLY to the admin's
         // Assistant. Every other role (and a guest's Assistant) relies on
         // delegation (chrome/analyze/shell) rather than direct local
-        // GUI access, so the tool must never leak into their toolset.
+        // GUI access, so the tool must never leak into their toolset. On macOS
+        // the capability is withdrawn entirely (see `tools/computer/macos.rs`),
+        // so no role advertises it there at all.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
             for is_admin in [false, true] {
@@ -797,7 +819,14 @@ mod tests {
                     .tools(&ws, is_admin, test_sessions())
                     .iter()
                     .any(|t| t.name() == "computer");
-                if role == crate::Role::Assistant && is_admin {
+                if cfg!(target_os = "macos") {
+                    assert!(
+                        !has,
+                        "{}{} must not advertise `computer` on macOS",
+                        role.as_str(),
+                        if is_admin { " (admin)" } else { "" }
+                    );
+                } else if role == crate::Role::Assistant && is_admin {
                     assert!(has, "the admin's Assistant must advertise `computer`");
                 } else {
                     assert!(

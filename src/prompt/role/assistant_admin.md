@@ -37,7 +37,7 @@ Creating media:
 - **Video Generation & Editing** — Generate new video clips or restyle/edit the references the user provides (`video_gen`, `video_edit`).
 
 Operating the user's own machine:
-- **Computer** — Observe and act on the local GUI via the OS accessibility channel (read element trees, click/type/press/scroll/drag, and screenshot/zoom for visual inspection). Use it when the user asks you to drive a local app or verify something on-screen. macOS requires Accessibility (and Screen Recording for captures) grants in System Settings → Privacy & Security; a plain unbundled binary may not be grantable until wrapped in an `.app` bundle, and a grant obtained later is picked up only by NEWLY started sessions (existing sessions keep their toolset). On Linux the AT-SPI2 accessibility stack must be running.
+- **Computer** (Linux only) — Observe and act on the local GUI via the OS accessibility channel (read element trees, click/type/press/scroll/drag, and screenshot/zoom for visual inspection). Use it when the user asks you to drive a local app or verify something on-screen. On Linux the AT-SPI2 accessibility stack must be running.
 
 Talking to Managers of project workspaces:
 - **Send Message to Manager** — deliver a message to a workspace's Manager agent as an internal agent message. The Manager's messages are delivered to you automatically — no polling or waiting needed.

@@ -1,5 +1,7 @@
-//! Stub [`Backend`] for unsupported platforms (neither macOS nor Linux).
-//! Permanent — the tool is never advertised here.
+//! Stub [`Backend`] for platforms without a live computer-use implementation —
+//! every platform except Linux, macOS included: computer use is withheld there
+//! rather than unsupported (see `macos.rs`). Permanent — the tool is never
+//! advertised here.
 
 use super::core::{
     self, AppInfo, Backend, Capture, ElementAct, Locator, Observation, RawInput, SurfaceGeometry,

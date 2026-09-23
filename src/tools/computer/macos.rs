@@ -2,6 +2,17 @@
 //! CGEvent raw input, and ScreenCaptureKit capture. Non-`Send` platform objects
 //! are created and dropped INSIDE `with_block_in_place` closures — never in
 //! struct state or across an await.
+//!
+//! # Dormant — not enabled anywhere
+//!
+//! Computer use is offered on Linux only. This backend is kept compiled but
+//! nothing connects it to the product on macOS (see the module declaration in
+//! `tools/mod.rs`), because it performed poorly in its initial testing: on some
+//! Macs a missing screen-capture method raises a foreign Objective-C exception
+//! that aborts the whole process — daemon, window and every in-flight agent
+//! with it — instead of failing the call. It must be thoroughly reviewed and
+//! fixed before it is ever enabled again; until then nothing may advertise,
+//! invoke or probe it on macOS.
 
 #![cfg(target_os = "macos")]
 // The many casts and raw-pointer borrows are inherent to the C ABI/geometry
