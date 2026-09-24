@@ -86,6 +86,17 @@ const KNOWN_SHELLS: &[&str] = &[
     "sh", "bash", "dash", "ash", "zsh", "fish", "ksh", "ksh93", "mksh", "pdksh",
 ];
 
+/// Whether the product knows `shell` — the one list of the shells whose
+/// environment it reads, and therefore the shells it can read a startup file
+/// out of at all: [`crate::util::owner_path`] writes the product's block into
+/// the startup file of exactly this set, so a shell added here is covered there
+/// too and a shell refused here is never written for.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn knows_shell(shell: &str) -> bool {
+    KNOWN_SHELLS.contains(&shell)
+}
+
 // ── Failure ───────────────────────────────────────────────────────────────
 
 /// Why a read produced no environment.
@@ -252,8 +263,15 @@ pub async fn run_reader_loop() {
                 // follows on the blocking pool.
                 let pairs = crate::tools::shell::agent_env_pairs_from(&env);
                 crate::tools::shell::grep_engine::invalidate_verdict_for(&pairs);
-                publish(Arc::new(env));
+                let env = Arc::new(env);
+                publish(Arc::clone(&env));
                 failures = 0;
+                // The product's own block in the owner's files is decided from the
+                // environment just published — the one his own commands get — so the
+                // decision is remade here, after every successful read, and never
+                // before one. The publish happened first: the block is only ever
+                // written for an environment a command can already be served.
+                crate::util::owner_path::sync(env).await;
                 // How the served search stands under the environment just read: a
                 // measured verdict on unix, where there is a real search to compare
                 // against; on Windows asking is meaningless — its gate never
@@ -442,7 +460,7 @@ pub fn dump_environment(args: &[String]) -> i32 {
 #[cfg(unix)]
 #[must_use]
 fn shell_recipe(shell_basename: &str, macos: bool) -> Option<Vec<&'static str>> {
-    if !KNOWN_SHELLS.contains(&shell_basename) {
+    if !knows_shell(shell_basename) {
         return None;
     }
     Some(if macos { vec!["-l", "-i"] } else { vec!["-i"] })
@@ -763,7 +781,7 @@ async fn run_shell(
 /// several paths.
 #[cfg(unix)]
 #[must_use]
-fn shell_basename(shell: &Path) -> String {
+pub(crate) fn shell_basename(shell: &Path) -> String {
     shell
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
@@ -811,9 +829,13 @@ async fn read_unix() -> Result<OwnerEnv, ReadFailure> {
 /// directory at all — the shell then starts wherever the daemon is, which is all a
 /// shell needs. (A home that does not exist would fail the spawn outright, leaving
 /// the agent on the fallback for good.)
+///
+/// The owner-path sync asks for the same shell and home: it writes into the file
+/// the shell resolved here really reads, which is only knowable if it asks for the
+/// shell the reader read.
 #[cfg(unix)]
 #[must_use]
-fn owner_shell_and_home() -> (Option<PathBuf>, Option<PathBuf>) {
+pub(crate) fn owner_shell_and_home() -> (Option<PathBuf>, Option<PathBuf>) {
     let (recorded_shell, recorded_home) = passwd_record().unwrap_or((None, None));
     let shell = recorded_shell.or_else(|| {
         std::env::var_os("SHELL")

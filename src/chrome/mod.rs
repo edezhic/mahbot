@@ -130,8 +130,9 @@ pub(crate) fn is_blank_page_url(url: &str) -> bool {
 }
 
 /// chrome-use's scratch error-page URL (live-verified on 1.5.101 and
-/// reconfirmed on the installed 1.5.106; the binary auto-updates): DNS/refused/
-/// unsafe-port navigations return
+/// reconfirmed on the installed 1.5.106; the installed copy is replaced with the
+/// newest release on every product start): DNS/refused/unsafe-port navigations
+/// return
 /// rc=0 with success:true and commit to `chrome-error://chromewebdata/`
 /// (prefix match — the trailing slash exists; no false positives on 404/5xx
 /// or real captive-portal pages). The only false positive is a

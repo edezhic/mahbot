@@ -91,11 +91,10 @@
 //! Covered, one entry per spawn site: git (`git::commands::git_command`); the
 //! cargo probe and both install modes (`self_update::verify_cargo_on_path`,
 //! `self_update::run_cargo_with_timeout`); the replacement instance
-//! (`self_update::spawn_new_instance_from`); the bun runtime's probe
-//! (`tools::bun::bun_cli_version`); the browser-automation CLI in all its runs —
-//! probe, version, `tasklist`, install and restart
+//! (`self_update::spawn_new_instance_from`); the browser-automation CLI in all
+//! its runs — probe, version, `tasklist`, install and restart
 //! (`tools::chrome_daemon::cli_probe`, `cli_version`, `tasklist_has`,
-//! `install_chrome_use`, `run_cli`) plus the shared `chrome::spawn::spawn_cli` —
+//! `register_native_host`, `run_cli`) plus the shared `chrome::spawn::spawn_cli` —
 //! and the browser itself (`tools::chrome_daemon::spawn_chrome_detached`); every
 //! agent command through the shell builders (`tools::shell::build_shell_command`,
 //! `tools::shell::build_program_command` — the shell tool, the diagnostics
@@ -613,7 +612,7 @@ mod tests {
     /// The number of spawn sites the sweep must see — the module docs' inventory,
     /// counted. A site that constant and that inventory do not account for fails
     /// the sweep, and a scan that stopped reading the tree finds far fewer.
-    const SPAWN_SITES: usize = 17;
+    const SPAWN_SITES: usize = 16;
 
     fn indent(line: &str) -> usize {
         line.len() - line.trim_start().len()

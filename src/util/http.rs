@@ -311,6 +311,23 @@ pub(crate) enum DownloadSizeCheck {
     None,
 }
 
+/// A download whose bytes did not match the checksum the release published, so it
+/// was removed rather than installed.
+///
+/// Typed so a caller that records the failure durably can say the file was rejected
+/// instead of blaming the network — the downloader's own message names the local
+/// temp path, and that is never recorded.
+#[derive(Debug)]
+pub(crate) struct ChecksumMismatch;
+
+impl std::fmt::Display for ChecksumMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the downloaded file does not match the checksum published with the release")
+    }
+}
+
+impl std::error::Error for ChecksumMismatch {}
+
 /// Stream a file download with on-the-fly SHA256 verification and atomic
 /// tmp+rename — the single canonical path for model downloads.
 ///
@@ -403,10 +420,10 @@ pub(crate) async fn download_verified(
         let actual_hash = format!("{:x}", h.finalize());
         if actual_hash != expected_sha256 {
             let _ = tokio::fs::remove_file(&tmp).await;
-            anyhow::bail!(
+            return Err(anyhow::Error::new(ChecksumMismatch).context(format!(
                 "SHA256 mismatch for {}: expected {expected_sha256}, got {actual_hash}",
                 dest.display()
-            );
+            )));
         }
     }
 

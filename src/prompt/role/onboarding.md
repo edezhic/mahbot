@@ -11,7 +11,7 @@ Configure the service through `mahbot_config` — pick the matching `action` (ea
 When diagnosing a setup problem, `mahbot_debug` gives read-only SQL access to the service's databases — inspect the schema first, never guess names.
 
 ## Chrome use
-The chrome-use binary and its native host install automatically and quietly in the background (like the managed bun runtime); there's no install tool to run. The only manual step is installing the chrome-use extension from the Chrome Web Store, which is inherently a user browser action: the native messaging host must be paired with the extension the user installs from the Store. You can run and verify the automatable CLI side yourself, or hand the user the exact command. Once the extension is installed, the `chrome` tool just works.
+The chrome-use binary and its native host install automatically and quietly in the background (like the bun runtime) and are brought up to date on every start of the product, in the directory the helper's own installer uses; the product also puts its own per-user programs directories on the owner's own search path, so he can run the copies it keeps. There is no install tool to run. The only manual step is installing the chrome-use extension from the Chrome Web Store, which is inherently a user browser action: the native messaging host must be paired with the extension the user installs from the Store. You can run and verify the automatable CLI side yourself, or hand the user the exact command. Once the extension is installed, the `chrome` tool just works.
 
 ## Once done
 Onboarding is one-shot: after setup is complete, normal operation continues. There is no re-onboarding.

@@ -1,44 +1,52 @@
 //! Generic managed-binary release mechanics shared by the rust-installed tool
 //! managers (chrome-use via `chrome_daemon`, the managed bun runtime).
 //!
-//! These binaries are all installed into a location mahbot manages — the
-//! tool-standard user dir where one applies (bun: `~/.bun/bin`), never
-//! resolved through the user's PATH — updated in place via an atomic swap,
-//! and verified against a SHA-256 checksum published with the release.
+//! Each tool is installed at the location its own installer uses — the bun
+//! runtime in its own standard user dir (`~/.bun/bin`), the browser helper
+//! where its own installer puts it: on unix `/usr/local/bin` when it already
+//! holds a copy or can be written, otherwise `~/.local/bin`, and on Windows the
+//! `%LOCALAPPDATA%\Programs\chrome-use` its own installer uses — the vendor's
+//! defaults for both are quoted at [`chrome_use_user_bin_dir`]. Nothing here puts
+//! a location on the owner's own search path: that is `crate::util::owner_path`.
+//!
+//! Each install is updated in place via an atomic swap and verified against a
+//! SHA-256 checksum published with the release.
+//!
 //! The helpers are release-format agnostic: the chrome-use installer reads a
 //! `<asset>.sha256` sidecar and a tar.gz archive, the bun installer reads a
 //! combined `SHASUMS256.txt` file and a zip archive — both share the same
 //! tag/version/swap/extract primitives.
+//!
+//! [`install_on_start`] is the shared start-time policy: every tool is brought
+//! to its newest release on every product start, straight away when no copy is
+//! installed and after the boot has settled otherwise.
 
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[cfg(unix)]
-use tracing::{debug, info, warn};
-
 // ── Release metadata ────────────────────────────────────────────────
 
 /// Follow the GitHub `releases/latest` redirect and return the last path
 /// segment (the release tag) — avoids the api.github.com rate limit. reqwest
 /// follows the redirect by default; the final response URL is the tag page.
+///
+/// Every failure message carries the failing step and a classified reason and no
+/// URL, so it is safe to record verbatim.
 pub(crate) async fn fetch_latest_tag(repo: &str, timeout: Duration) -> Result<String, String> {
     use crate::util::http::build_download_client;
 
     let url = format!("https://github.com/{repo}/releases/latest");
-    let client =
-        build_download_client(timeout).map_err(|e| format!("release check client failed: {e}"))?;
+    let client = build_download_client(timeout)
+        .map_err(|_| "the release check's own client could not be built".to_string())?;
     let response = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("release check request failed: {e}"))?;
+        .map_err(|e| format!("release check request failed: {}", request_reason(&e)))?;
     if !response.status().is_success() {
-        return Err(format!(
-            "release check got HTTP {} from {url}",
-            response.status()
-        ));
+        return Err(format!("release check got HTTP {}", response.status()));
     }
     let tag = response
         .url()
@@ -50,6 +58,50 @@ pub(crate) async fn fetch_latest_tag(repo: &str, timeout: Duration) -> Result<St
     }
     Ok(tag)
 }
+
+// ── Path-free failure reasons ───────────────────────────────────────
+
+/// A short, path-free reason for a failed request: the HTTP status when there
+/// was one, else the kind of transport failure. The error's own display text
+/// names the URL and is deliberately not used.
+pub(crate) fn request_reason(error: &reqwest::Error) -> String {
+    if let Some(status) = error.status() {
+        return format!("HTTP {status}");
+    }
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_body() || error.is_decode() {
+        "body"
+    } else {
+        "transport"
+    };
+    format!("{kind} failure")
+}
+
+/// A short, path-free reason for a failed release download: a rejected file, an
+/// HTTP status or a transport/io kind from the error's own chain, else a sentence
+/// that names no path. The chain's display text carries the URL and the local file
+/// names.
+pub(crate) fn download_reason(error: &anyhow::Error) -> String {
+    for cause in error.chain() {
+        if let Some(rejected) = cause.downcast_ref::<crate::util::http::ChecksumMismatch>() {
+            return rejected.to_string();
+        }
+        if let Some(reqwest) = cause.downcast_ref::<reqwest::Error>() {
+            return request_reason(reqwest);
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return format!("download failed ({})", io.kind());
+        }
+    }
+    "the release download could not be completed".to_string()
+}
+
+// ── Release-format parsers ──────────────────────────────────────────
 
 /// `(hash, filename)` from a `.sha256` sidecar body (`"<hash>  <filename>"`).
 /// The hash must be 64 hex chars (normalized to lowercase to match the
@@ -64,13 +116,11 @@ pub(crate) fn parse_sha256_sidecar(body: &str) -> Option<(String, String)> {
     valid_hash.then(|| (hash.to_ascii_lowercase(), filename))
 }
 
-/// Parse a release tag or CLI `--version` output into a [`semver::Version`],
-/// stripping `prefix` when present. Release tags carry a prefix (`v` for
-/// chrome-use, `bun-v` for bun), while CLI `--version` output is bare — both
-/// flow through here, so the strip is a no-op for bare output.
+/// Parse a version token into a [`semver::Version`], stripping a leading `v` so
+/// that both spellings the helper's `--version` banner can print parse.
 #[must_use]
-pub(crate) fn parse_tag_version(s: &str, prefix: &str) -> Option<semver::Version> {
-    semver::Version::parse(s.strip_prefix(prefix).unwrap_or(s)).ok()
+pub(crate) fn parse_version_token(s: &str) -> Option<semver::Version> {
+    semver::Version::parse(s.strip_prefix('v').unwrap_or(s)).ok()
 }
 
 // ── In-place binary swap ────────────────────────────────────────────
@@ -83,14 +133,16 @@ pub(crate) fn parse_tag_version(s: &str, prefix: &str) -> Option<semver::Version
 /// temp copy in, restore the aside on failure, and best-effort remove the
 /// aside afterwards (its removal fails while the old binary is still running;
 /// the next successful swap clears it).
-pub(crate) fn swap_binary_in_place(fresh: &Path, dest: &Path) -> Result<(), String> {
+///
+/// Every failure message names the step and the io kind and never a path: they
+/// are recorded in the product's own issues view.
+fn swap_binary_in_place(fresh: &Path, dest: &Path) -> Result<(), String> {
     let tmp = dest.with_extension("mahbot_tmp");
     let _ = fs::remove_file(&tmp);
     fs::copy(fresh, &tmp).map_err(|e| {
         format!(
-            "failed to copy {} to {}: {e}",
-            fresh.display(),
-            tmp.display()
+            "the staged copy for the swap could not be prepared ({})",
+            e.kind()
         )
     })?;
     // Unix: keep the old binary's mode (0o755 default on first install) so the
@@ -99,20 +151,19 @@ pub(crate) fn swap_binary_in_place(fresh: &Path, dest: &Path) -> Result<(), Stri
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(dest).map_or(0o755, |m| m.permissions().mode() & 0o777);
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))
-            .map_err(|e| format!("failed to set permissions on {}: {e}", tmp.display()))?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)).map_err(|e| {
+            format!(
+                "the staged copy's permissions could not be set ({})",
+                e.kind()
+            )
+        })?;
     }
 
     if cfg!(target_os = "windows") && dest.exists() {
         rename_aside_swap(&tmp, dest)
     } else {
-        fs::rename(&tmp, dest).map_err(|e| {
-            format!(
-                "failed to rename {} to {}: {e}",
-                tmp.display(),
-                dest.display()
-            )
-        })
+        fs::rename(&tmp, dest)
+            .map_err(|e| format!("the new copy could not be moved into place ({})", e.kind()))
     }
 }
 
@@ -122,31 +173,110 @@ pub(crate) fn swap_binary_in_place(fresh: &Path, dest: &Path) -> Result<(), Stri
 /// fails. Aside removal is best-effort — while the old binary still runs it
 /// cannot be removed; the next successful swap clears it. Platform-neutral
 /// plain `fs::rename`/`remove_file`, so it is unit-testable on every OS.
+///
+/// Failure messages carry no path (the location may be one the owner's own
+/// package manager keeps), only the failing step and its io kind.
 fn rename_aside_swap(tmp: &Path, dest: &Path) -> Result<(), String> {
     let aside = dest.with_extension("old");
     let _ = fs::remove_file(&aside);
     fs::rename(dest, &aside)
-        .map_err(|e| format!("failed to move {} aside: {e}", dest.display()))?;
+        .map_err(|e| format!("the installed copy could not be moved aside ({})", e.kind()))?;
     if let Err(e) = fs::rename(tmp, dest) {
         // Last-resort restore: if this also fails the install is genuinely
         // broken, so surface that instead of discarding the error.
         if let Err(restore) = fs::rename(&aside, dest) {
             return Err(format!(
-                "failed to rename {} to {}: {e}; the restore also failed ({restore}) — \
-                 {} is missing and the managed binary must be reinstalled",
-                tmp.display(),
-                dest.display(),
-                dest.display()
+                "the new copy could not be moved into place ({}); the restore also failed ({}) — \
+                 the managed binary is missing and must be reinstalled",
+                e.kind(),
+                restore.kind()
             ));
         }
         return Err(format!(
-            "failed to rename {} to {}: {e}",
-            tmp.display(),
-            dest.display()
+            "the new copy could not be moved into place ({})",
+            e.kind()
         ));
     }
     let _ = fs::remove_file(&aside);
     Ok(())
+}
+
+/// Put the freshly extracted `fresh` binary at `dest`, creating the directory it
+/// lives in first. The swap is atomic, so whatever sat there is replaced in one
+/// step or not at all, and the executable bit is forced back on afterwards because
+/// the swap carries the old file's mode over — an install that lost its bit would
+/// otherwise survive a reinstall unchanged.
+///
+/// The caller names the destination once and keeps it, so a swap that does not land
+/// still leaves it with the path it must report about.
+///
+/// The one failure of its own carries no path (the location is not the owner's
+/// business and the message is recorded verbatim), only the operation and its io
+/// kind.
+pub(crate) fn place_extracted(fresh: &Path, dest: &Path) -> Result<(), String> {
+    let Some(dir) = dest.parent() else {
+        return Err(
+            "the directory the product's own tool lives in could not be resolved".to_string(),
+        );
+    };
+    fs::create_dir_all(dir).map_err(|e| {
+        format!(
+            "the directory the product's own tool lives in could not be created ({})",
+            e.kind()
+        )
+    })?;
+    swap_binary_in_place(fresh, dest)?;
+    set_executable(dest)
+}
+
+// ── Start-time install policy ───────────────────────────────────────
+
+/// How long an existing copy waits before it is refreshed, so the download never
+/// competes with the boot.
+const REFRESH_DELAY: Duration = Duration::from_mins(5);
+
+/// Bring one of the product's own tools to the newest release: straight away when
+/// no copy is installed, else once the boot has settled. `present` reports whether
+/// the tool's own directory holds a copy — it decides only WHEN this runs, never
+/// what is installed, because whatever sits there is always replaced — and after a
+/// failure it says whether the host was left with a working copy at all.
+///
+/// Every failure is recorded at WARN — the level that survives the 8-hour INFO
+/// retention and shows in the product's own issues view — because a tool that is
+/// not at its newest release is exactly the state the product must not leave
+/// unrecorded. Success stays INFO for a first install and DEBUG for a refresh, and
+/// a failure never removes or invalidates the copy already installed — it is
+/// retried on the next start.
+///
+/// The recorded reason is the failing step's own message: it names no local path
+/// and no value read from the owner or his environment.
+pub(crate) async fn install_on_start(
+    tool: &str,
+    present: impl Fn() -> bool,
+    install: impl std::future::Future<Output = Result<PathBuf, String>>,
+) {
+    let missing = !present();
+    if !missing {
+        tokio::time::sleep(REFRESH_DELAY).await;
+    }
+    match install.await {
+        Ok(path) if missing => tracing::info!("{tool} installed at {}", path.display()),
+        Ok(path) => tracing::debug!("{tool} brought up to date at {}", path.display()),
+        Err(reason) => {
+            let reason = crate::util::truncate(&reason, 1024);
+            // The step that failed says which part did not finish; the state says
+            // what the host is left with, and never more than that: a failed step
+            // can leave the copy placed but not registered, and it can fail before
+            // anything is placed.
+            let state = match (present(), missing) {
+                (true, true) => "was installed but not completely",
+                (true, false) => "could not be brought fully up to date",
+                (false, true) => "could not be installed",
+                (false, false) => "left the host without a working copy",
+            };
+            tracing::warn!("{tool} {state} (retried on the next start): {reason}");
+        }
+    }
 }
 
 // ── Archive extraction ──────────────────────────────────────────────
@@ -155,24 +285,32 @@ fn rename_aside_swap(tmp: &Path, dest: &Path) -> Result<(), String> {
 /// `dir` and return its path. The entry is matched by file name at any depth
 /// but always written to `<dir>/<file_name>`, so a nested vendor layout still
 /// lands correctly; `Err` when the archive has no such regular-file entry.
+///
+/// Failure messages name the operation and the io kind, never a path.
 pub(crate) fn extract_single_file_tar_gz(
     archive: &Path,
     dir: &Path,
     file_name: &str,
 ) -> Result<PathBuf, String> {
     let file = fs::File::open(archive)
-        .map_err(|e| format!("failed to open archive {}: {e}", archive.display()))?;
+        .map_err(|e| format!("the release archive could not be opened ({})", e.kind()))?;
     let mut tar_archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
     let out_path = dir.join(file_name);
     let mut unpacked = false;
     let entries = tar_archive
         .entries()
-        .map_err(|e| format!("failed to read archive {}: {e}", archive.display()))?;
+        .map_err(|e| format!("the release archive could not be read ({})", e.kind()))?;
     for entry in entries {
-        let mut entry = entry.map_err(|e| format!("failed to read archive entry: {e}"))?;
+        let mut entry = entry
+            .map_err(|e| format!("a release archive entry could not be read ({})", e.kind()))?;
         let path = entry
             .path()
-            .map_err(|e| format!("failed to read archive entry path: {e}"))?
+            .map_err(|e| {
+                format!(
+                    "a release archive entry path could not be read ({})",
+                    e.kind()
+                )
+            })?
             .into_owned();
         if !entry.header().entry_type().is_file() {
             continue;
@@ -181,9 +319,12 @@ pub(crate) fn extract_single_file_tar_gz(
             // `unpack` writes exactly to `out_path` (the entry's own internal
             // path is ignored), keeping the returned path correct for any
             // archive layout.
-            entry
-                .unpack(&out_path)
-                .map_err(|e| format!("failed to extract {}: {e}", out_path.display()))?;
+            entry.unpack(&out_path).map_err(|e| {
+                format!(
+                    "{file_name} could not be extracted from the release archive ({})",
+                    e.kind()
+                )
+            })?;
             unpacked = true;
             break;
         }
@@ -203,21 +344,28 @@ pub(crate) fn extract_single_file_tar_gz(
 /// fixed `<dir>/<file_name>` — never the entry's internal path — so a nested
 /// `bun-<target>/` vendor layout still lands correctly; `Err` when the
 /// archive has no such regular-file entry.
+///
+/// Failure messages name the operation and a reason the archive library's own
+/// error yields — the io kind it wraps, or its own short sentence for a malformed
+/// archive or a missing entry — never a path.
 pub(crate) fn extract_single_file_zip(
     archive: &Path,
     dir: &Path,
     file_name: &str,
 ) -> Result<PathBuf, String> {
     let file = fs::File::open(archive)
-        .map_err(|e| format!("failed to open archive {}: {e}", archive.display()))?;
+        .map_err(|e| format!("the release archive could not be opened ({})", e.kind()))?;
     let mut zip = zip::ZipArchive::new(file)
-        .map_err(|e| format!("failed to read archive {}: {e}", archive.display()))?;
+        .map_err(|e| format!("the release archive could not be read ({})", zip_reason(&e)))?;
     let out_path = dir.join(file_name);
     let mut unpacked = false;
     for i in 0..zip.len() {
-        let mut entry = zip
-            .by_index(i)
-            .map_err(|e| format!("failed to read archive entry: {e}"))?;
+        let mut entry = zip.by_index(i).map_err(|e| {
+            format!(
+                "a release archive entry could not be read ({})",
+                zip_reason(&e)
+            )
+        })?;
         if !entry.is_file() {
             continue;
         }
@@ -226,9 +374,13 @@ pub(crate) fn extract_single_file_zip(
             .is_some_and(|n| n == OsStr::new(file_name))
         {
             let mut out_file = fs::File::create(&out_path)
-                .map_err(|e| format!("failed to create {}: {e}", out_path.display()))?;
-            std::io::copy(&mut entry, &mut out_file)
-                .map_err(|e| format!("failed to extract {}: {e}", out_path.display()))?;
+                .map_err(|e| format!("{file_name} could not be written ({})", e.kind()))?;
+            std::io::copy(&mut entry, &mut out_file).map_err(|e| {
+                format!(
+                    "{file_name} could not be extracted from the release archive ({})",
+                    e.kind()
+                )
+            })?;
             unpacked = true;
             break;
         }
@@ -242,19 +394,35 @@ pub(crate) fn extract_single_file_zip(
     Ok(out_path)
 }
 
+/// A path-free reason for a failed zip operation: the io kind when the archive
+/// error wraps one, else the archive library's own short sentence (a malformed or
+/// unsupported archive, a missing entry, a compression method it cannot read). The
+/// archive's own path and the entries' names are never on it.
+#[must_use]
+fn zip_reason(error: &zip::result::ZipError) -> String {
+    match error {
+        zip::result::ZipError::Io(error) => error.kind().to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Make a freshly extracted/installed binary executable by resetting its full
-/// mode to 0o755.
+/// mode to 0o755. The failure message names the io kind only — never the path.
 #[cfg(unix)]
-pub(crate) fn set_executable(path: &Path) -> Result<(), String> {
+fn set_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("failed to set executable bit on {}: {e}", path.display()))
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|e| {
+        format!(
+            "the executable bit could not be set on the installed copy ({})",
+            e.kind()
+        )
+    })
 }
 
 // Callers use `?` uniformly, so the signature mirrors the Unix implementation.
 #[cfg(not(unix))]
 #[expect(clippy::unnecessary_wraps)]
-pub(crate) fn set_executable(_path: &Path) -> Result<(), String> {
+fn set_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -291,7 +459,7 @@ pub(crate) fn linux_host_is_musl() -> bool {
         || Path::new("/lib/ld-musl-aarch64.so.1").exists()
 }
 
-// ── User-shell visibility ───────────────────────────────────────────
+// ── Install directories ─────────────────────────────────────────────
 
 /// bun-standard user install dir (`~/.bun/bin` on unix, `%USERPROFILE%\.bun\bin`
 /// on Windows). Resolved via [`directories::UserDirs`] like the rest of the
@@ -301,161 +469,104 @@ pub(crate) fn bun_bin_dir() -> Option<PathBuf> {
     directories::UserDirs::new().map(|d| d.home_dir().join(".bun").join("bin"))
 }
 
-/// Stable mahbot-owned managed-bin install dir (`<storage root>/bin`). The
-/// chrome-use binary is placed here and probed FIRST by its resolver on every
-/// OS — on Windows it is the only probe that reliably finds mahbot's own
-/// install — so the first-install location and the auto-update swap location
-/// are always the same path. Falls back to the HOME-derived default storage
-/// root when config is not initialized (e.g. the `mahbot chrome` CLI, which
-/// dispatches before config init) so a standard managed install is still found.
+/// The standard per-user programs directory the browser helper's own installer
+/// puts it in when the system-wide directory cannot be written: `~/.local/bin`
+/// on unix, and `%LOCALAPPDATA%\Programs\chrome-use` on Windows, where there is
+/// no system-wide step and no elevation.
+///
+/// Both are the vendor's own defaults, quoted from its installers at the `v1.5.140`
+/// release (both files sit at its repository root on every tag): `install.sh:100`
+/// takes `/usr/local/bin` when `[ -w /usr/local/bin ]` and `$HOME/.local/bin`
+/// otherwise, and `install.ps1:233` is `if (-not $binDir) { $binDir = Join-Path
+/// $env:LOCALAPPDATA 'Programs\chrome-use' }` — the `AGENT_BROWSER_BIN_DIR`
+/// argument it takes overriding that.
 #[must_use]
-pub(crate) fn storage_bin_dir() -> Option<PathBuf> {
-    crate::config::CONFIG
-        .try_storage_root()
-        .or_else(|| crate::config::default_config_dir().ok())
-        .map(|r| r.join("bin"))
-}
-
-/// All managed-bin directories that user shells should resolve by bare name:
-/// the mahbot-owned storage dir first, then the bun-standard user dir.
-#[cfg(unix)]
-fn managed_shell_dirs() -> Vec<PathBuf> {
-    [storage_bin_dir(), bun_bin_dir()]
-        .into_iter()
-        .flatten()
-        .collect()
-}
-
-/// Ensure the user's interactive shells resolve the managed binaries by bare
-/// name. Appends a guarded PATH block (idempotent) to `~/.zshrc`/`~/.bashrc`;
-/// a new rc file is only created when it matches the user's login shell — or
-/// when the login shell cannot be determined (services run without `$SHELL`),
-/// in which case both common rc files are created. Never fails the install.
-pub(crate) fn ensure_rc_path_block() {
+pub(crate) fn chrome_use_user_bin_dir() -> Option<PathBuf> {
     #[cfg(unix)]
-    ensure_unix_rc_path_block();
-}
-
-/// The unix body of [`ensure_rc_path_block`]. No-op on Windows (no rc files).
-#[cfg(unix)]
-fn ensure_unix_rc_path_block() {
-    let dirs = managed_shell_dirs();
-    if dirs.is_empty() {
-        debug!("managed-bin PATH block skipped: no managed bin dirs resolved");
-        return;
+    {
+        directories::UserDirs::new().map(|d| d.home_dir().join(".local").join("bin"))
     }
-    let path_entry = dirs
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(":");
-    // The managed dirs are APPENDED after `$PATH`, so a user's own install
-    // (Homebrew, npm, official installer) keeps precedence in his terminal. Of the
-    // two dirs, the fallback PATH carries the bun one only, and lists it last among
-    // the dirs it prepends ahead of the system baseline — not a precedence rule,
-    // just where a stand-in `PATH` puts the one managed dir it carries: the
-    // mahbot-owned `<storage root>/bin` is deliberately not in it, because whether
-    // a command resolves the product by bare name is the owner's own search path's
-    // to say (see `tools::shell`'s agent-environment notes). The dirs are always
-    // listed even when a binary currently resolves elsewhere (e.g. a PATH
-    // chrome-use), so a later managed install is immediately visible.
-    let block = format!(
-        "\n# >>> mahbot managed binaries >>>\nexport PATH=\"$PATH:{path_entry}\"\n# <<< mahbot managed binaries <<<\n"
-    );
-    let Some(home) = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()) else {
-        debug!("managed-bin PATH block skipped: user home not resolvable");
-        return;
-    };
-    let shell = login_shell_name();
-    // When the login shell cannot be determined (launchd/systemd services run
-    // without `$SHELL`), create both common rc files — a user-local file
-    // holding just the guarded block is harmless, and skipping creation would
-    // leave fresh installs invisible to every interactive shell.
-    for (name, create_allowed) in [
-        (".zshrc", shell.as_deref().is_none_or(|s| s == "zsh")),
-        (".bashrc", shell.as_deref().is_none_or(|s| s == "bash")),
-    ] {
-        let path = home.join(name);
-        match append_rc_block(&path, &block, create_allowed) {
-            Ok(true) => {
-                info!(
-                    "added mahbot managed-binaries PATH block to {}",
-                    path.display()
-                );
-            }
-            Ok(false) => {
-                debug!(
-                    "mahbot managed-binaries PATH block already present in {}",
-                    path.display()
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "failed to ensure managed-binaries PATH block in {}: {e}",
-                    path.display()
-                );
-            }
-        }
+    #[cfg(not(unix))]
+    {
+        directories::BaseDirs::new().map(|d| d.data_local_dir().join("Programs").join("chrome-use"))
     }
 }
 
-/// Append `block` to the rc file at `path` unless it already carries the
-/// managed-binaries START marker. Returns `Ok(true)` when written, `Ok(false)`
-/// when already present. When the file is missing, creates it only if
-/// `create_allowed`. Never writes when the read failed for a non-missing
-/// reason.
-#[cfg(unix)]
-fn append_rc_block(path: &Path, block: &str, create_allowed: bool) -> Result<bool, String> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    match fs::read_to_string(path) {
-        Ok(content) => {
-            if content.contains("# >>> mahbot managed binaries >>>") {
-                Ok(false)
-            } else {
-                let mut f = OpenOptions::new()
-                    .append(true)
-                    .open(path)
-                    .map_err(|e| format!("failed to append to {}: {e}", path.display()))?;
-                f.write_all(block.as_bytes())
-                    .map_err(|e| format!("failed to append to {}: {e}", path.display()))?;
-                Ok(true)
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if create_allowed {
-                let mut f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
-                f.write_all(block.as_bytes())
-                    .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        }
-        Err(e) => Err(format!("failed to read {}: {e}", path.display())),
-    }
-}
-
-/// Basename of `$SHELL` (the user's login shell), or `None` when unset/empty —
-/// decides which rc file may be created; `None` allows both (see
-/// [`ensure_unix_rc_path_block`]).
+/// The full path of the product's own copy of the browser helper (`file_name`): the
+/// directory its own installer uses on this host, and that file inside it.
+///
+/// On unix that directory is the system-wide `/usr/local/bin` when it already holds a
+/// copy — the product's or the owner's — or when it can be written, otherwise the
+/// standard per-user programs directory [`chrome_use_user_bin_dir`]; on Windows it is
+/// that per-user directory, which is where the helper's own installer puts it.
+///
+/// Installs and resolution both ask this one function, and it resolves from the state
+/// of the moment with nothing persisted: a copy in an unwritable system directory is
+/// still the copy the agents run, and a system directory that becomes writable later
+/// becomes the location, leaving an unmaintained per-user copy beside it that the
+/// product neither uses nor removes. Which of the two the owner's own terminal
+/// resolves first is his search path's own order, which the product neither knows nor
+/// changes.
 #[cfg(unix)]
 #[must_use]
-fn login_shell_name() -> Option<String> {
-    std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| {
-            Path::new(&s)
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-        })
+pub(crate) fn chrome_use_bin_path(file_name: &str) -> Option<PathBuf> {
+    let system = Path::new(SYSTEM_BIN_DIR);
+    let dir = chrome_use_dir(
+        crate::util::is_executable(&system.join(file_name)),
+        dir_is_writable(system),
+        chrome_use_user_bin_dir(),
+    )?;
+    Some(dir.join(file_name))
 }
+
+/// The same on Windows, where the helper's own installer puts it in a per-user
+/// directory that does not depend on the file's name — see the unix definition
+/// above for the rule and its reasoning.
+#[cfg(not(unix))]
+#[must_use]
+pub(crate) fn chrome_use_bin_path(file_name: &str) -> Option<PathBuf> {
+    Some(chrome_use_user_bin_dir()?.join(file_name))
+}
+
+/// The helper's directory on unix, from the copy probe, the writability of the
+/// system-wide directory and the per-user one — pure, so the rule is pinned by a
+/// test rather than by a host's permissions ([`chrome_use_bin_path`] holds the
+/// reasoning). The system-wide directory is decided before the per-user one is
+/// ever needed, so a host with no resolvable home — a container, say — still
+/// resolves and installs the helper there.
+#[cfg(unix)]
+#[must_use]
+fn chrome_use_dir(
+    system_copy: bool,
+    system_writable: bool,
+    user: Option<PathBuf>,
+) -> Option<PathBuf> {
+    (system_copy || system_writable)
+        .then(|| PathBuf::from(SYSTEM_BIN_DIR))
+        .or(user)
+}
+
+/// Whether the helper installer's own test (`[ -w dir ]`) passes for `dir`, so a
+/// root-owned `/usr/local/bin` is not written. `libc::access` rather than a look
+/// at the mode bits: it answers through the group/other-write bit and through a
+/// read-only mount, exactly as the installer's own test does.
+#[cfg(unix)]
+#[must_use]
+fn dir_is_writable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a valid NUL-terminated C string that outlives the call
+    // and `access` only reads it.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// The system-wide directory the helper's own installer uses when it can be
+/// written.
+#[cfg(unix)]
+const SYSTEM_BIN_DIR: &str = "/usr/local/bin";
 
 #[cfg(test)]
 mod tests {
@@ -464,24 +575,47 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     #[test]
-    fn release_version_parsing_strips_prefix() {
-        // GitHub release tags are v-prefixed; `--version` output is bare.
+    fn the_helpers_directory_is_the_system_one_whenever_it_holds_a_copy() {
+        // A copy in the system directory keeps resolution on that directory, so the
+        // agents run that copy — writable or not. Which of the two directories the
+        // owner's own terminal resolves first is his search path's own order.
         assert_eq!(
-            parse_tag_version("v1.5.100", "v"),
+            chrome_use_dir(true, false, None),
+            Some(PathBuf::from(SYSTEM_BIN_DIR))
+        );
+        // No copy there yet: writability alone decides. It is decided before the
+        // per-user directory is ever needed, so a container with no resolvable home
+        // still resolves and installs there.
+        assert_eq!(
+            chrome_use_dir(false, true, None),
+            Some(PathBuf::from(SYSTEM_BIN_DIR))
+        );
+        // Neither usable nor a home to fall back to: no directory at all.
+        assert_eq!(chrome_use_dir(false, false, None), None);
+        let user = PathBuf::from("/home/o/.local/bin");
+        assert_eq!(
+            chrome_use_dir(false, false, Some(user.clone())),
+            Some(user),
+            "the per-user directory is the fallback, never the preference"
+        );
+    }
+
+    #[test]
+    fn version_banner_tokens_parse_with_or_without_a_v_prefix() {
+        // The helper's `--version` banner prints the version with or without a
+        // leading `v`.
+        assert_eq!(
+            parse_version_token("v1.5.100"),
             Some(semver::Version::new(1, 5, 100))
         );
         assert_eq!(
-            parse_tag_version("1.5.100", "v"),
+            parse_version_token("1.5.100"),
             Some(semver::Version::new(1, 5, 100))
         );
-        // Bun release tags are `bun-v`-prefixed (NOT just `v`).
-        assert_eq!(
-            parse_tag_version("bun-v1.2.3", "bun-v"),
-            Some(semver::Version::new(1, 2, 3))
-        );
-        assert_eq!(parse_tag_version("latest", "v"), None);
-        assert_eq!(parse_tag_version("", "v"), None);
+        assert_eq!(parse_version_token("latest"), None);
+        assert_eq!(parse_version_token(""), None);
     }
 
     #[test]
@@ -705,55 +839,5 @@ mod tests {
         write_test_zip(dir.path(), &[("readme.txt", b"no bin" as &[u8])]);
 
         assert!(extract_single_file_zip(&dir.path().join("pkg.zip"), dir.path(), "bun").is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn append_rc_block_is_idempotent() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join(".zshrc");
-        let block = "\n# >>> mahbot managed binaries >>>\nexport PATH=\"/x:$PATH\"\n# <<< mahbot managed binaries <<<\n";
-
-        // First append creates/writes.
-        assert!(append_rc_block(&path, block, true).expect("first append"));
-        let content = fs::read_to_string(&path).expect("read back");
-        assert_eq!(
-            content.matches("# >>> mahbot managed binaries >>>").count(),
-            1
-        );
-        assert!(content.contains("export PATH=\"/x:$PATH\""));
-
-        // Second append is a no-op (idempotent) and does not duplicate the block.
-        assert!(!append_rc_block(&path, block, true).expect("second append"));
-        let content = fs::read_to_string(&path).expect("read back");
-        assert_eq!(
-            content.matches("# >>> mahbot managed binaries >>>").count(),
-            1
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn append_rc_block_creates_when_allowed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join(".bashrc");
-        let block = "\n# >>> mahbot managed binaries >>>\nexport PATH=\"/y:$PATH\"\n# <<< mahbot managed binaries <<<\n";
-
-        assert!(append_rc_block(&path, block, true).expect("create"));
-        assert_eq!(
-            fs::read_to_string(&path).expect("read back"),
-            block.to_string()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn append_rc_block_skips_creation_when_not_allowed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join(".bashrc");
-        let block = "\n# >>> mahbot managed binaries >>>\nexport PATH=\"/y:$PATH\"\n# <<< mahbot managed binaries <<<\n";
-
-        assert!(!append_rc_block(&path, block, false).expect("no create"));
-        assert!(!path.exists(), "no file written");
     }
 }

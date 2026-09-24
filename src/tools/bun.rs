@@ -1,22 +1,19 @@
-//! Managed bun runtime (JS/TS runtime, <https://bun.sh>) — silent auto-install
-//! at startup and a once-per-boot auto-update, mirroring the chrome-use binary
-//! management but with a silent first install (no consent flow: the Assistant
-//! role directs agents to run `bun` via the Shell tool, which must resolve it).
-//! Installs to the bun-standard user path (`~/.bun/bin`); updates in place.
+//! Managed bun runtime (JS/TS runtime, <https://bun.sh>) — installed in bun's
+//! OWN standard user directory (`~/.bun/bin`) and brought to the newest release
+//! on every product start — no version comparison, no look at what is already
+//! there. Silent: there is no consent flow (agents invoke `bun` through the
+//! Shell tool, and the product's own tools spawn it by absolute path).
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Stdio;
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
 use tokio::process::Command;
-use tracing::{debug, info, warn};
 
 /// GitHub repo whose releases host the bun runtime (single source of truth).
 const BUN_RELEASE_REPO: &str = "oven-sh/bun";
-
-/// Prefix on bun release tags (`bun-vX.Y.Z` — NOT just `v`).
-const BUN_TAG_PREFIX: &str = "bun-v";
 
 /// Timeout for resolving the latest bun release tag.
 const BUN_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -24,8 +21,9 @@ const BUN_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for a bun release download (zips are ~30–90 MB).
 const BUN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Timeout for a bun CLI `--version` probe and the AVX2 sysctl probe.
-const BUN_CLI_TIMEOUT: Duration = Duration::from_secs(8);
+/// Timeout for the macOS AVX2 `sysctl` probe.
+#[cfg(target_os = "macos")]
+const BUN_SYSCTL_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The platform-appropriate bun binary name.
 const fn bun_file_name() -> &'static str {
@@ -36,12 +34,12 @@ const fn bun_file_name() -> &'static str {
     }
 }
 
-/// Only the managed bun path (`~/.bun/bin`) is probed; a user's Homebrew/npm
-/// bun is never managed or updated by us, and the managed dir is appended last
-/// among the directories the fallback PATH prepends ahead of the system
-/// baseline — the same reason the owner's own rc block lists it last.
+/// The product resolves the runtime itself rather than through the search path:
+/// only bun's own directory (`~/.bun/bin`) is probed. A user's Homebrew/npm bun
+/// is never managed or updated by us, and the owner's own terminal is made to
+/// see the runtime's directory by [`crate::util::owner_path`].
 ///
-/// `None` when the managed runtime is absent or not executable — the callers
+/// `None` when the product's own copy is absent or not executable — the callers
 /// that launch single-file scripts (the `custom` tool) report that as a
 /// mahbot-side fault rather than falling back to an unmanaged interpreter.
 pub(crate) fn bun_binary_path() -> Option<PathBuf> {
@@ -150,7 +148,7 @@ async fn macos_sysctl_has_avx2() -> bool {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let Ok(out) = tokio::time::timeout(BUN_CLI_TIMEOUT, cmd.output()).await else {
+    let Ok(out) = tokio::time::timeout(BUN_SYSCTL_TIMEOUT, cmd.output()).await else {
         return false;
     };
     let Ok(out) = out else {
@@ -160,30 +158,6 @@ async fn macos_sysctl_has_avx2() -> bool {
         return false;
     }
     sysctl_has_avx2(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// Parse the local bun version from `--version` stdout (bare semver), bounded
-/// by [`BUN_CLI_TIMEOUT`]. `None` when the CLI is missing, times out, exits
-/// non-zero, or its output is not a parseable semver.
-async fn bun_cli_version(path: &Path) -> Option<semver::Version> {
-    let mut cmd = Command::new(path);
-    #[cfg(windows)]
-    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    cmd.arg("--version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let out = tokio::time::timeout(BUN_CLI_TIMEOUT, cmd.output())
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    crate::util::managed_bin::parse_tag_version(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        BUN_TAG_PREFIX,
-    )
 }
 
 /// Find the SHA-256 hash for `asset` in a `SHASUMS256.txt` body (one
@@ -202,7 +176,9 @@ fn shasums256_hash_for(body: &str, asset: &str) -> Result<String, String> {
 }
 
 /// Fetch the release's aggregate `SHASUMS256.txt` and extract the hash for
-/// `asset` via [`shasums256_hash_for`].
+/// `asset` via [`shasums256_hash_for`]. Request failures are classified
+/// (path-free and URL-free) through
+/// [`crate::util::managed_bin::request_reason`].
 async fn shasums256_hash(
     client: &reqwest::Client,
     tag: &str,
@@ -210,36 +186,54 @@ async fn shasums256_hash(
 ) -> Result<String, String> {
     let url =
         format!("https://github.com/{BUN_RELEASE_REPO}/releases/download/{tag}/SHASUMS256.txt");
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("failed to fetch SHASUMS256.txt {url}: {e}"))?;
+    let response = client.get(&url).send().await.map_err(|e| {
+        format!(
+            "failed to fetch SHASUMS256.txt: {}",
+            crate::util::managed_bin::request_reason(&e)
+        )
+    })?;
     if !response.status().is_success() {
         return Err(format!(
-            "failed to fetch SHASUMS256.txt {url}: HTTP {}",
+            "failed to fetch SHASUMS256.txt: HTTP {}",
             response.status()
         ));
     }
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("failed to read SHASUMS256.txt {url}: {e}"))?;
+    let body = response.text().await.map_err(|e| {
+        format!(
+            "failed to read SHASUMS256.txt: {}",
+            crate::util::managed_bin::request_reason(&e)
+        )
+    })?;
     shasums256_hash_for(&body, asset)
 }
 
-/// Download the bun release for `tag` for this platform, verify it against the
-/// published `SHASUMS256.txt` hash, extract the single binary, and swap it into
-/// the bun-standard user dir (`~/.bun/bin`). Returns the installed path.
-async fn install_tag(tag: &str) -> Result<PathBuf, String> {
+/// Bring the runtime's own directory (`~/.bun/bin`) up to the newest bun
+/// release: resolve the tag, download this platform's asset, verify it against
+/// the published `SHASUMS256.txt` hash, extract the single binary and place it.
+/// Returns the installed path. Every failure message is path-free and URL-free
+/// (see [`crate::util::managed_bin::download_reason`]), because it is recorded
+/// verbatim.
+async fn install_latest() -> Result<PathBuf, String> {
     use crate::util::http::{DownloadSizeCheck, build_download_client, download_verified};
 
+    // The destination is resolved before anything is fetched: an unresolvable home
+    // is a reason not to download an archive at all.
+    let dest = crate::util::managed_bin::bun_bin_dir()
+        .ok_or_else(|| "bun install dir unavailable (home not resolvable)".to_string())?
+        .join(bun_file_name());
+    let tag =
+        crate::util::managed_bin::fetch_latest_tag(BUN_RELEASE_REPO, BUN_RELEASE_TIMEOUT).await?;
     let asset = format!("bun-{}.zip", bun_asset_name().await?);
     let url = format!("https://github.com/{BUN_RELEASE_REPO}/releases/download/{tag}/{asset}");
     let client = build_download_client(BUN_DOWNLOAD_TIMEOUT)
-        .map_err(|e| format!("failed to build download client: {e}"))?;
-    let hash = shasums256_hash(&client, tag, &asset).await?;
-    let dir = tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+        .map_err(|_| "the download client could not be built".to_string())?;
+    let hash = shasums256_hash(&client, &tag, &asset).await?;
+    let dir = tempfile::tempdir().map_err(|e| {
+        format!(
+            "the download's temporary directory could not be created ({})",
+            e.kind()
+        )
+    })?;
     let archive_path = dir.path().join("bun.zip");
     download_verified(
         &client,
@@ -251,110 +245,34 @@ async fn install_tag(tag: &str) -> Result<PathBuf, String> {
         |_, _| {},
     )
     .await
-    .map_err(|e| format!("failed to download {url}: {e}"))?;
+    .map_err(|e| {
+        format!(
+            "the bun release could not be downloaded: {}",
+            crate::util::managed_bin::download_reason(&e)
+        )
+    })?;
     let fresh = crate::util::managed_bin::extract_single_file_zip(
         &archive_path,
         dir.path(),
         bun_file_name(),
     )?;
-    let dest = crate::util::managed_bin::bun_bin_dir()
-        .ok_or_else(|| "bun install dir unavailable (home not resolvable)".to_string())?
-        .join(bun_file_name());
-    let parent = dest
-        .parent()
-        .ok_or_else(|| format!("invalid bun install path {}", dest.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    crate::util::managed_bin::swap_binary_in_place(&fresh, &dest)?;
-    // The swap preserves the old dest's mode, so a pre-existing install that
-    // lost its executable bit would survive a reinstall unchanged — force the
-    // bit back on after every swap (the fresh copy is 0o755, but the swap may
-    // override it from the dest).
-    crate::util::managed_bin::set_executable(&dest)?;
+    crate::util::managed_bin::place_extracted(&fresh, &dest)?;
     Ok(dest)
 }
 
-/// Resolve the latest bun release tag and install it. Returns the installed
-/// path.
-async fn install_latest() -> Result<PathBuf, String> {
-    let tag =
-        crate::util::managed_bin::fetch_latest_tag(BUN_RELEASE_REPO, BUN_RELEASE_TIMEOUT).await?;
-    install_tag(&tag).await
-}
-
-/// Once-per-boot auto-update of an existing bun install. No retry loop (a
-/// failed update retries next boot); never first-installs.
-async fn run_update_check() {
-    let Some(path) = bun_binary_path() else {
-        debug!("bun not installed — update check skipped (never first-installs)");
-        return;
-    };
-    // Pre-feature installs and transient rc-write failures are healed by
-    // ensuring user-shell visibility on every update check (idempotent,
-    // non-fatal) — not just when a swap actually happens.
-    crate::util::managed_bin::ensure_rc_path_block();
-    let local = bun_cli_version(&path).await;
-    let tag =
-        match crate::util::managed_bin::fetch_latest_tag(BUN_RELEASE_REPO, BUN_RELEASE_TIMEOUT)
-            .await
-        {
-            Ok(tag) => tag,
-            Err(e) => {
-                debug!("bun auto-update skipped: release check failed: {e}");
-                return;
-            }
-        };
-    let Some(latest) = crate::util::managed_bin::parse_tag_version(&tag, BUN_TAG_PREFIX) else {
-        info!("bun auto-update: latest tag '{tag}' is not a semver version; giving up");
-        return;
-    };
-    if let Some(local) = local.as_ref() {
-        if local >= &latest {
-            debug!("bun is up to date ({local})");
-            return;
-        }
-    } else {
-        info!(
-            "bun binary at {} reports no usable version — self-healing reinstall",
-            path.display()
-        );
-    }
-    match install_tag(&tag).await {
-        Ok(dest) => info!("bun auto-updated to {latest} ({})", dest.display()),
-        Err(e) => info!(
-            "bun auto-update failed: {}",
-            crate::util::truncate(&e, 1024)
-        ),
-    }
-}
-
-/// Spawned one-shot task: silent first install at startup (no consent flow),
-/// then a delayed once-per-boot auto-update of an existing install. All
-/// failures are non-fatal (retried next boot).
+/// Spawned one-shot task: install the product's own bun runtime straight away
+/// when it is missing, else bring it to the newest release once the boot has
+/// settled — whatever sits in the runtime's own directory (`~/.bun/bin`) is
+/// always replaced, with no version comparison and no look at what is already
+/// there. The shared shape and its failure levels live in
+/// [`crate::util::managed_bin::install_on_start`].
 pub async fn run_bun_management() {
-    if bun_binary_path().is_none() {
-        match install_latest().await {
-            Ok(path) => {
-                info!("bun installed to {}", path.display());
-                crate::util::managed_bin::ensure_rc_path_block();
-                // The fresh install IS the latest release — no update check.
-                return;
-            }
-            Err(e) => {
-                warn!(
-                    "bun auto-install failed (non-fatal, retried on next boot): {}",
-                    crate::util::truncate(&e, 1024)
-                );
-                // Still no binary — the delayed update check would be a
-                // guaranteed no-op (it never first-installs), so end here.
-                return;
-            }
-        }
-    }
-    // Existing install: once-per-boot update check, delayed like the
-    // chrome-use updater so it never competes with boot.
-    tokio::time::sleep(Duration::from_mins(5)).await;
-    run_update_check().await;
+    crate::util::managed_bin::install_on_start(
+        "bun",
+        || bun_binary_path().is_some(),
+        install_latest(),
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -458,7 +376,7 @@ mod tests {
             Ok("1111111111111111111111111111111111111111111111111111111111111111")
         );
         // A soft failure when the chosen asset has no line (the upstream asset
-        // name set is not frozen) — the caller skips and retries next boot.
+        // name set is not frozen) — the caller skips and retries on the next start.
         assert_eq!(
             shasums256_hash_for(&body, "bun-linux-x64-baseline.zip")
                 .expect_err("missing asset must be an Err"),

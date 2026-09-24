@@ -2,7 +2,8 @@
 //!
 //! Dispatched from `main()` before temp-root/lock init (runs alongside the
 //! daemon), so it must not rely on the `/tmp/mahbot` temp root or initialized
-//! config; chrome-use binary resolution falls back to PATH/home locations.
+//! config; chrome-use resolves to the product's own copy at its standard
+//! install directory, which needs no config to work out.
 //! Sessions are namespaced `mahbot-chrome-*` so they can never collide with
 //! the interactive tool's `agent-tab-*`.
 //!
@@ -1400,6 +1401,14 @@ fn env_failure(action: &str, params: Value, error: &str) -> OutEnvelope {
 }
 
 /// Resolve the chrome-use CLI path, or build the environment-failure envelope.
+///
+/// The standalone `mahbot chrome` CLI deliberately resolves ONLY the product's
+/// own copy ([`crate::tools::chrome_daemon::cli_path`], the location the
+/// helper's own installer uses) — never a `chrome-use` found on the owner's
+/// search path or in a home location, so a foreign or leftover copy is never
+/// run. A host whose product-owned install has not happened yet therefore
+/// reports `chrome-use CLI not found` even when some other `chrome-use` is on
+/// PATH.
 fn require_cli(action: &str, params: Value) -> Result<std::path::PathBuf, OutEnvelope> {
     cli_path().ok_or_else(|| env_failure(action, params, "chrome-use CLI not found"))
 }

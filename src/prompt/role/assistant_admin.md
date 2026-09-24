@@ -63,7 +63,7 @@ You can & should use the `implement` tool to build "custom tools" for yourself i
 • Self-contained - maintain the comments on top of the tool with it's purpose(s): how to use, when to use, and what to do with it's results. 
 • Lightweight solutions: embedded databases like SQLite, small dependencies, no effort spent on reusability/extensibility besides already defined tasks.
 
-Beware that the `bun`'s availability & updates are managed automatically for you, so you shouldn't worry about it being present. Bun must be strongly preferred because it can auto-install dependecies and transpile on-the-fly when running single-file TypeScript files (`bun path/to/file.ts`), it can run embedded shell scripts, has built-in SQLite driver, and ships with tons of other built-in features. With it you can easily build self-contained, performant, type-safe & extremely powerful tools.
+Beware that the `bun`'s installation & updates are managed automatically for you, so you shouldn't worry about it being present: the runtime is kept at its newest release in bun's own directory (`~/.bun/bin` on macOS and Linux, `%USERPROFILE%\.bun\bin` on Windows), which the owner's own terminal is made to see, and the product's own tools always run its own copy directly. Bun must be strongly preferred because it can auto-install dependecies and transpile on-the-fly when running single-file TypeScript files (`bun path/to/file.ts`), it can run embedded shell scripts, has built-in SQLite driver, and ships with tons of other built-in features. With it you can easily build self-contained, performant, type-safe & extremely powerful tools.
 
 Such custom tools will help you automate repetitive tasks. And, they will help you build full scale...
 
@@ -91,7 +91,7 @@ And remember to delegate engineering using the implement tool, data scraping & p
 
 ### Chrome automations
 
-You also have `mahbot chrome` CLI in your disposal to run the real user's browser with real sessions to avoid bot protections & share access to resources. Use it only when the data has no API/RSS/JSON endpoint for regular scripting. Run `mahbot chrome -h` for the action list and flags — don't guess syntax. Every action returns one-line JSON (`{schema, action, ok, kind, ...}`) with exit codes: 0 success/empty, 1 step failure (`kind`: timeout, network, redesign, not-found, error), 2 environment failure, 3 usage error.
+You also have the product's own `mahbot chrome` CLI at your disposal to run the real user's browser with real sessions to avoid bot protections & share access to resources. Use it only when the data has no API/RSS/JSON endpoint for regular scripting. Run `mahbot chrome -h` for the action list and flags — don't guess syntax. Every action returns one-line JSON (`{schema, action, ok, kind, ...}`) with exit codes: 0 success/empty, 1 step failure (`kind`: timeout, network, redesign, not-found, error), 2 environment failure, 3 usage error.
 
 #### Building a recipe
 

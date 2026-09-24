@@ -352,10 +352,11 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::chrome_release::run_session_release_queue(),
     );
 
-    // Managed chrome-use: silent first install at startup (no consent flow —
-    // the user accepted quiet-install risk) plus a delayed once-per-boot
-    // auto-update of an existing install. All failures are non-fatal and
-    // retried next boot.
+    // The product's own tools — the chrome-use browser helper and the bun
+    // runtime. Both follow the shared start-time policy in
+    // `managed_bin::install_on_start`: a missing copy is installed straight away,
+    // an existing one is refreshed once the boot has settled, with no version
+    // comparison, and a non-fatal failure is retried on the next start.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -363,9 +364,6 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::chrome_daemon::run_chrome_use_management(),
     );
 
-    // Managed bun runtime: silent first install at startup (no consent flow —
-    // agents invoke `bun` via the Shell tool) plus a delayed once-per-boot
-    // auto-update of an existing install. All failures are non-fatal.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -692,7 +690,8 @@ fn main() -> Result<()> {
     // `mahbot chrome` subcommand: browser automation CLI over the
     // shared chrome core. Dispatched before lock acquisition + temp-root init
     // so it can run alongside the instance (it uses its own session namespace);
-    // chrome-use binary resolution falls back to PATH/home locations.
+    // chrome-use resolves to the product's own copy at its standard install
+    // directory, which needs no config.
     if std::env::args().nth(1).as_deref() == Some("chrome") {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
