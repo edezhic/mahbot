@@ -20,6 +20,12 @@
 //! [`install_on_start`] is the shared start-time policy: every tool is brought
 //! to its newest release on every product start, straight away when no copy is
 //! installed and after the boot has settled otherwise.
+//!
+//! The product's own install location lives here too — [`mahbot_install_dir`], built
+//! on [`user_programs_dir`] — as the one place inside the product that names it: the
+//! search-path edit, the shell path list and the update all read it. The install
+//! scripts place the ready-made file at the same location, each spelling it with its
+//! own platform's variables.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -187,7 +193,7 @@ fn rename_aside_swap(tmp: &Path, dest: &Path) -> Result<(), String> {
         if let Err(restore) = fs::rename(&aside, dest) {
             return Err(format!(
                 "the new copy could not be moved into place ({}); the restore also failed ({}) — \
-                 the managed binary is missing and must be reinstalled",
+                 the file that was there is gone and must be put back by hand",
                 e.kind(),
                 restore.kind()
             ));
@@ -215,13 +221,11 @@ fn rename_aside_swap(tmp: &Path, dest: &Path) -> Result<(), String> {
 /// kind.
 pub(crate) fn place_extracted(fresh: &Path, dest: &Path) -> Result<(), String> {
     let Some(dir) = dest.parent() else {
-        return Err(
-            "the directory the product's own tool lives in could not be resolved".to_string(),
-        );
+        return Err("the directory it lives in could not be resolved".to_string());
     };
     fs::create_dir_all(dir).map_err(|e| {
         format!(
-            "the directory the product's own tool lives in could not be created ({})",
+            "the directory it lives in could not be created ({})",
             e.kind()
         )
     })?;
@@ -469,6 +473,55 @@ pub(crate) fn bun_bin_dir() -> Option<PathBuf> {
     directories::UserDirs::new().map(|d| d.home_dir().join(".bun").join("bin"))
 }
 
+/// The standard per-user programs directory: `~/.local/bin` on unix,
+/// `%LOCALAPPDATA%\Programs` on Windows — the two places per-user programs
+/// belong, resolved through `directories` like the rest of the codebase.
+///
+/// It is the directory the product's own command goes into on unix, and the base
+/// the product's own folder — and the managed tools' own per-user folders —
+/// sit under on Windows.
+#[must_use]
+fn user_programs_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        directories::UserDirs::new().map(|d| d.home_dir().join(".local").join("bin"))
+    }
+    #[cfg(not(unix))]
+    {
+        directories::BaseDirs::new().map(|d| d.data_local_dir().join("Programs"))
+    }
+}
+
+/// Where the product itself lives when it was installed from a published file:
+/// the standard per-user programs directory itself on unix, and the product's
+/// own folder inside it on Windows, which has no shared per-user programs
+/// directory a single executable can be dropped into. `install.sh`/
+/// `install.ps1` put the ready-made file at exactly this path.
+#[must_use]
+pub(crate) fn mahbot_install_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        user_programs_dir()
+    }
+    #[cfg(not(unix))]
+    {
+        user_programs_dir().map(|dir| dir.join("MahBot"))
+    }
+}
+
+/// The name the product's own file carries: `mahbot.exe` on Windows, `mahbot`
+/// elsewhere — in a release archive, in a cargo install's `bin` directory, and at
+/// the file's path inside [`mahbot_install_dir`], so one definition serves all
+/// three.
+#[must_use]
+pub(crate) fn product_file_name() -> &'static str {
+    if cfg!(windows) {
+        "mahbot.exe"
+    } else {
+        "mahbot"
+    }
+}
+
 /// The standard per-user programs directory the browser helper's own installer
 /// puts it in when the system-wide directory cannot be written: `~/.local/bin`
 /// on unix, and `%LOCALAPPDATA%\Programs\chrome-use` on Windows, where there is
@@ -484,11 +537,11 @@ pub(crate) fn bun_bin_dir() -> Option<PathBuf> {
 pub(crate) fn chrome_use_user_bin_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        directories::UserDirs::new().map(|d| d.home_dir().join(".local").join("bin"))
+        user_programs_dir()
     }
     #[cfg(not(unix))]
     {
-        directories::BaseDirs::new().map(|d| d.data_local_dir().join("Programs").join("chrome-use"))
+        user_programs_dir().map(|dir| dir.join("chrome-use"))
     }
 }
 

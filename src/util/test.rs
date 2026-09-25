@@ -558,9 +558,8 @@ impl Drop for EnvVarGuard {
 /// # Example
 ///
 /// ```ignore
-/// let _guard = set_env_var("CARGO_HOME", Some("/custom/cargo"));
-/// let path = resolve_cargo_bin_path();
-/// // _guard drops here, restoring CARGO_HOME to its original value
+/// let _guard = set_env_var("SOME_TEST_VAR", Some("value"));
+/// // _guard drops here, restoring the variable to its original value
 /// ```
 #[must_use]
 pub fn set_env_var(key: &str, value: Option<&str>) -> EnvVarGuard {
@@ -581,15 +580,13 @@ pub fn set_env_var(key: &str, value: Option<&str>) -> EnvVarGuard {
     }
 }
 
-/// Make a file executable (0o755) on Unix; no-op on other platforms.
+/// Make a file executable (0o755). Unix only, like the tests that need it:
+/// every one of them drives a `sh` stub, and the file's mode is the only way to
+/// make one runnable there.
+#[cfg(unix)]
 pub fn make_executable(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, PermissionsExt::from_mode(0o755)).unwrap();
-    }
-    #[cfg(not(unix))]
-    let _ = path;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, PermissionsExt::from_mode(0o755)).unwrap();
 }
 
 /// 1×1 red PNG as a native data-URI — a payload that survives the media

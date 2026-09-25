@@ -89,10 +89,15 @@
 //! the flag is inert for a windowed image either way.
 //!
 //! Covered, one entry per spawn site: git (`git::commands::git_command`); the
-//! cargo probe and both install modes (`self_update::verify_cargo_on_path`,
-//! `self_update::run_cargo_with_timeout`); the replacement instance
-//! (`self_update::spawn_new_instance_from`); the browser-automation CLI in all
-//! its runs — probe, version, `tasklist`, install and restart
+//! cargo probe and runner of the update that builds from sources
+//! (`self_update::verify_cargo_on_path`, `self_update::run_cargo_with_timeout`) —
+//! the update of a downloaded copy spawns no cargo, only the `self-replace`
+//! crate's own helper, which is the residual stated below; that update's own host
+//! probes (`self_update::host_probe` — `sw_vers` on macOS and `getconf` on Linux,
+//! the two programs that floor check needs; on Windows the same check answers from
+//! the running system's own version and spawns nothing); the replacement
+//! instance (`self_update::spawn_new_instance_from`); the browser-automation CLI
+//! in all its runs — probe, version, `tasklist`, install and restart
 //! (`tools::chrome_daemon::cli_probe`, `cli_version`, `tasklist_has`,
 //! `register_native_host`, `run_cli`) plus the shared `chrome::spawn::spawn_cli` —
 //! and the browser itself (`tools::chrome_daemon::spawn_chrome_detached`); every
@@ -612,7 +617,7 @@ mod tests {
     /// The number of spawn sites the sweep must see — the module docs' inventory,
     /// counted. A site that constant and that inventory do not account for fails
     /// the sweep, and a scan that stopped reading the tree finds far fewer.
-    const SPAWN_SITES: usize = 16;
+    const SPAWN_SITES: usize = 17;
 
     fn indent(line: &str) -> usize {
         line.len() - line.trim_start().len()

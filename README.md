@@ -41,19 +41,33 @@ Circuit breaker pauses the work if a ticket goes through too many bounces, escal
 
 ## Getting Started
 
-Currently mahbot can only be installed from `crates.io`:
+Install and start it with one command. On unix-like systems:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/edezhic/mahbot/main/install.sh | sh
+```
+
+On Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/edezhic/mahbot/main/install.ps1 | iex
+```
+
+That fetches the newest published release, puts it in the standard per-user location, adds that location to your search path only when it is missing, and starts the product. From then on mahbot updates itself from those same published releases, so there is nothing to do by hand. `install.sh <version>` installs one particular release instead of the newest; with the piped form above, set `MAHBOT_INSTALL_VERSION` to that version instead, because a piped script takes no argument of its own — that is how a release is installed by hand, since the newest-release lookup never names a test release.
+
+If you would rather build it yourself, the toolchain way is the alternative:
 
 ```bash
 cargo install mahbot
 ```
 
-Then run `mahbot` to start the service, and you'll be asked to provide one of:
+Either way the product's window opens and asks you to provide one of:
 - OpenRouter API key, or
 - a custom OpenAI-compatible endpoint
 
 The rest of the setup will be explained and done through the agent. It will help you add a workspace, other users, connect the Telegram bot, add the search providers & browser tooling for your agents.
 
-Beware that as of now mahbot is only regularly tested on macos & linux, so it might still have unexpected bugs on other platforms.
+Mahbot supports macOS 12.3 and newer (Intel and Apple silicon), Linux on x86_64 and ARM against glibc 2.35 or newer, Windows 10 1809 and newer on x86_64, and Windows 11 on ARM. A system with no published file for it is refused plainly by the install command — musl Linux, older macOS and older glibc, and Windows 7, 8 and 10 on ARM among them. The Windows files are built and published like the others, but they have not been run by this project, so they ship what compiles rather than what has been exercised.
 
 ### Audio is macOS only
 
@@ -65,6 +79,6 @@ Any local model directory an earlier release downloaded on those platforms (`~/.
 
 ### Building from source on Windows
 
-Windows is not a supported platform yet, so expect rough edges. The product is a windowed program, so starting it opens no console window — its own window is the one it shows — and a failed start is recorded in the durable `error.log` block in the storage root. The product's own subcommands are the exception: the daemon starts those with their streams wired and waits for them, so their output reaches the agent.
+Building mahbot there from source needs a C/C++ toolchain plus the Windows SDK it links against (the Visual Studio Build Tools `Desktop development with C++` workload provides both), because several dependencies (ring, zstd-sys, libz-sys, onig_sys, libgit2-sys) compile C during the build. The product is a windowed program, so starting it opens no console window — its own window is the one it shows — and a failed start is recorded in the durable `error.log` block in the storage root. The product's own subcommands are the exception: the daemon starts those with their streams wired and waits for them, so their output reaches the agent.
 
-Building there from source needs a C/C++ toolchain plus the Windows SDK it links against (the Visual Studio Build Tools `Desktop development with C++` workload provides both), because several dependencies (ring, zstd-sys, libz-sys, onig_sys, libgit2-sys) compile C during the build. Our own source type-checks, lints and compiles for Windows — `scripts/windows-cross-check.sh` in the repository verifies that by hand (dev-only tooling, not part of the published crate). That check only compiles: nothing is linked into a runnable binary and nothing is executed, so it is not a claim that Windows actually works.
+Our own source type-checks, lints and compiles for Windows — `scripts/windows-cross-check.sh` in the repository verifies that by hand (dev-only tooling, not part of the published crate). That check only compiles: nothing is linked into a runnable binary and nothing is executed.

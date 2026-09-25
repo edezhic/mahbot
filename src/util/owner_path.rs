@@ -103,41 +103,27 @@ fn sync_blocking(env: &OwnerEnv) {
 }
 
 /// The directories the owner's own terminal must resolve by bare name, by the
-/// convention of the platform: the browser helper's own per-user programs
-/// directory and the runtime's own directory, and on Windows also the folder the
-/// product's own copy lives in — the product's own command has to be reachable from
-/// his terminal too, and on that platform it is the one that lies outside the two
-/// standard directories. On macOS and Linux only those two are named; the product's
-/// own folder is not.
+/// convention of the platform: the folder the product itself is installed in
+/// ([`crate::util::managed_bin::mahbot_install_dir`]), the browser helper's own
+/// directory — a folder of its own beside the product's on Windows, and the same
+/// per-user programs directory the product's own folder is on unix — and the
+/// runtime's own directory.
 ///
 /// The system-wide directory is deliberately not named: it is on the owner's own
 /// search path by default already. Neither is the private tools folder an earlier
-/// release used — nor is any directory named twice.
+/// release used.
 #[cfg(any(unix, windows))]
 #[must_use]
 fn visible_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
+    // The product's own directory, named as itself rather than through the helper's,
+    // so a move of either one cannot leave the product's own command unnamed.
+    dirs.extend(crate::util::managed_bin::mahbot_install_dir());
+    // On Windows the browser helper's installer puts it in a folder beside the
+    // product's; on unix its per-user fallback is the directory above.
     #[cfg(not(unix))]
-    dirs.extend(crate::util::cargo_bin_dir());
-    dirs.extend(
-        [
-            crate::util::managed_bin::chrome_use_user_bin_dir(),
-            crate::util::managed_bin::bun_bin_dir(),
-        ]
-        .into_iter()
-        .flatten(),
-    );
-    // Two of the resolutions can land on the same directory — a `CARGO_HOME`
-    // pointing inside the per-user programs directory, say — and one directory is
-    // one entry: the first occurrence keeps the place it has in the order.
-    let mut seen: Vec<PathBuf> = Vec::with_capacity(dirs.len());
-    dirs.retain(|dir| {
-        let fresh = !seen.iter().any(|known| same_entry(known, dir));
-        if fresh {
-            seen.push(dir.clone());
-        }
-        fresh
-    });
+    dirs.extend(crate::util::managed_bin::chrome_use_user_bin_dir());
+    dirs.extend(crate::util::managed_bin::bun_bin_dir());
     dirs
 }
 
@@ -2064,6 +2050,72 @@ mod unix {
                 strip_regions(&with_append, &block_regions(&with_append)),
                 owned
             );
+        }
+
+        /// `install.sh` writes this product's own block and the product then keeps it
+        /// in step, so the two must spell it the same way: markers byte for byte, and
+        /// a body line this module reads back naming exactly the folder the product's
+        /// update moves itself into. A drift either way leaves a second block beside
+        /// the first, or one naming a folder the product never uses, and nothing else
+        /// in the tree would say so.
+        #[test]
+        fn the_install_script_writes_the_product_s_own_block() {
+            let script =
+                std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
+                    .expect("install.sh is part of the tree");
+
+            assert!(
+                script.contains(&format!("BLOCK_START='{BLOCK_START}'")),
+                "install.sh's opening marker: {BLOCK_START}"
+            );
+            assert!(
+                script.contains(&format!("BLOCK_END='{BLOCK_END}'")),
+                "install.sh's closing marker: {BLOCK_END}"
+            );
+            // The script recognises a body line with these openings and this closing
+            // (see its `holds_block`), and that recognition must be the product's own:
+            // a body line it does not recognise is a block the product would not take
+            // out, and a second one beside it would sit on the owner's search path for
+            // good.
+            assert!(
+                script.contains(&format!("SH_BODY_PREFIX='{SH_BODY_PREFIX}'")),
+                "install.sh's body-line opening: {SH_BODY_PREFIX}"
+            );
+            assert!(
+                script.contains(&format!("SH_BODY_SUFFIX='{SH_BODY_SUFFIX}'")),
+                "install.sh's body-line closing: {SH_BODY_SUFFIX}"
+            );
+            assert!(
+                script.contains(&format!("FISH_BODY_PREFIX='{FISH_BODY_PREFIX}'")),
+                "install.sh's fish body-line opening: {FISH_BODY_PREFIX}"
+            );
+
+            // The script's own body lines, read back the way this module reads its own
+            // blocks: each must be a line it recognises, and the folder it names — with
+            // its home reference expanded — must be the product's own install
+            // directory, which is also where the product puts itself.
+            let home = directories::UserDirs::new().expect("a home directory");
+            let home = home.home_dir();
+            let install = crate::util::managed_bin::mahbot_install_dir().expect("a home directory");
+            let body = |name: &str| -> String {
+                script
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name)?.strip_suffix('\''))
+                    .unwrap_or_else(|| panic!("install.sh must set {name}…'"))
+                    .to_string()
+            };
+            for name in ["SH_BODY='", "FISH_BODY='"] {
+                let line = body(name);
+                let named: Vec<String> = body_entries(&line)
+                    .into_iter()
+                    .map(|entry| expand_home(entry, home))
+                    .collect();
+                assert_eq!(
+                    named,
+                    vec![install.to_string_lossy().to_string()],
+                    "install.sh's {name} line must name the product's own install directory"
+                );
+            }
         }
     }
 }

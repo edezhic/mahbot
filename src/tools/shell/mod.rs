@@ -2123,6 +2123,11 @@ impl ShellTool {
 /// Always includes the cargo bin directory (via `$CARGO_HOME/bin` if set,
 /// else `~/.cargo/bin`) plus commonly expected system tool directories.
 ///
+/// The standard per-user programs directory
+/// ([`crate::util::managed_bin::mahbot_install_dir`]) is on the list as well: the
+/// product's own installed command lives there, so an agent that runs it by bare
+/// name reaches the installed copy.
+///
 /// # `$CARGO_HOME` belt-and-suspenders
 ///
 /// When `$CARGO_HOME` is explicitly set, both `$CARGO_HOME/bin` (from
@@ -2146,6 +2151,11 @@ fn extra_shell_path_prefixes() -> Vec<PathBuf> {
         && let Some(dirs) = UserDirs::new()
     {
         v.push(dirs.home_dir().join(".cargo").join("bin"));
+    }
+
+    // The product's own installed command.
+    if let Some(dir) = crate::util::managed_bin::mahbot_install_dir() {
+        v.push(dir);
     }
 
     #[cfg(unix)]
@@ -5576,6 +5586,10 @@ mod tests {
             assert!(
                 path.contains(".cargo/bin"),
                 "PATH should include ~/.cargo/bin: {path}"
+            );
+            assert!(
+                path.contains(".local/bin"),
+                "PATH should include the per-user programs directory ~/.local/bin, where the product installs itself: {path}"
             );
             {
                 let _guard = set_env_var("CARGO_HOME", Some("/custom/cargo"));

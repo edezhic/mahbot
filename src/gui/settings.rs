@@ -3217,22 +3217,20 @@ impl SettingsState {
         )
     }
 
-    /// About block — version and install mode on one line.
+    /// About block — version and how this copy of it was obtained, on one line.
     fn about_section() -> Element<'static, SettingsMessage> {
         // Bind the classification once per render — `update_mode()` performs
         // filesystem probes and must not run twice per frame.
         let mode = crate::self_update::update_mode();
-        let mode_label = match mode {
-            crate::self_update::UpdateMode::LocalCheckout => "local checkout",
-            crate::self_update::UpdateMode::Registry => "crates.io install",
+        let origin = match mode {
+            crate::self_update::UpdateMode::Downloaded => "Downloaded copy",
+            crate::self_update::UpdateMode::SourceTree => "Copy built from sources",
         };
         row![
             text(format!("MahBot v{}", crate::self_update::VERSION))
                 .size(theme::TEXT_13)
                 .color(theme::TEXT_FAINT),
-            text(format!("Install mode: {mode_label}"))
-                .size(theme::TEXT_11)
-                .color(theme::TEXT_FAINT)
+            text(origin).size(theme::TEXT_11).color(theme::TEXT_FAINT)
         ]
         .spacing(theme::SPACE_8)
         .align_y(Alignment::Center)

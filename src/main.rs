@@ -332,6 +332,18 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::self_update::run_update_availability_refresh(),
     );
 
+    // A documented test-only hook drives a whole update with no window at all —
+    // see `mahbot::self_update`; it returns at once unless `MAHBOT_UPDATE_TO_VERSION`
+    // named the version to move to.
+    //
+    // Spawned detached rather than through `spawn_cancellable`: an update owns the
+    // drain hand-off itself — it begins the drain and *waits* for the shutdown
+    // token before checkpointing, releasing the lock and starting the replacement —
+    // so a task that gives way to that same token would be dropped at the one
+    // moment it must keep going. The Telegram-triggered update is spawned the same
+    // way, for the same reason.
+    tokio::spawn(mahbot::self_update::run_env_named_update());
+
     // Chrome daemon health watchdog: classifies chrome-use health from the
     // daemon-free status and auto-restarts with bounded backoff when it is
     // down; wedges surface on real chrome calls (fail-fast) and wake this

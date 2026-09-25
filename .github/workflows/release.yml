@@ -1,0 +1,319 @@
+# The release pipeline: one release per version mark, built on GitHub's own six
+# systems, published only once all six of its files are there.
+#
+# Pushing the version mark `v<version>` is the only thing that starts it. The mark
+# must name the version `Cargo.toml` holds — that is the version stamped into the
+# running binary (`src/self_update.rs::VERSION`) — so a mark that disagrees with
+# the manifest names no version at all, and the run stops quietly with nothing
+# released rather than failing.
+#
+# The six legs, each built natively on the platform's own machine with its own
+# toolchain — nothing is built on the owner's machine. The floor is named by the
+# image and then set in the build, so the files run on the widely used systems of
+# recent years and not on the newest ones only:
+#
+#   x86_64-apple-darwin       macos-15-intel    macOS 12.3 floor
+#   aarch64-apple-darwin      macos-14          macOS 12.3 floor
+#   x86_64-unknown-linux-gnu  ubuntu-22.04      glibc 2.35
+#   aarch64-unknown-linux-gnu ubuntu-22.04-arm  glibc 2.35
+#   x86_64-pc-windows-msvc    windows-2022      C runtime inside the file
+#   aarch64-pc-windows-msvc   windows-11-arm    C runtime inside the file
+#
+# What this publishes is the release contract, mirrored by the product's own
+# updater (`src/self_update.rs`) and by `install.sh` / `install.ps1` — this file is
+# the one place it is written down for the release side:
+#
+#   asset:       mahbot-<version>-<os>-<arch>.<ext>, os in macos/linux/windows,
+#                arch in x86_64/aarch64, tar.gz on macOS/Linux and zip on Windows,
+#                holding exactly one file named `mahbot` (`mahbot.exe` on Windows)
+#                at its root
+#   version.txt: the version and a newline, so the product learns the newest
+#                version from {base}/releases/latest/download/version.txt and never
+#                calls a hosting-service API
+#   licences:    LICENSE-MIT and LICENSE-APACHE, beside every release
+#
+# Nothing becomes visible before all six files have arrived, and then all of it
+# does at once: the files go onto a draft first and the draft is flipped visible in
+# one step, so a test release (a version carrying a pre-release part) can never be
+# the newest visible release. A real release — no pre-release part — is handed to
+# the package registry afterwards, and a failure there fails the run: a release the
+# registry never took must not look successful.
+#
+# `scripts/linux-cross-check.sh` and `scripts/windows-cross-check.sh` are local
+# manual gates, unrelated to this pipeline and not wired into it.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Read-only by default: only the job that publishes the release is given write.
+permissions:
+  contents: read
+
+jobs:
+  # ── The mark and the manifest ─────────────────────────────────────────────
+
+  # The mark is the only thing that starts a release and the manifest is the only
+  # place the version is written down, so the two are compared before anything is
+  # built.
+  version:
+    name: The mark must name the manifest's version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare the mark with Cargo.toml
+        id: check
+        run: |
+          set -eu
+          mark="${GITHUB_REF_NAME#v}"
+          version="$(
+            awk -F'"' '
+              $0 == "[package]" { in_package = 1; next }
+              substr($0, 1, 1) == "[" { in_package = 0 }
+              in_package && /^version[[:space:]]*=/ { print $2; exit }
+            ' Cargo.toml
+          )"
+          if [ -z "$version" ]; then
+            echo "::error::Cargo.toml holds no version in its [package] table"
+            exit 1
+          fi
+
+          # A mark naming another version releases nothing, and releasing nothing is
+          # not a failure: an unrelated tag pushed by hand must not turn this red.
+          if [ "$mark" != "$version" ]; then
+            echo "::notice::$GITHUB_REF_NAME names $mark, Cargo.toml holds $version — nothing is released"
+            release=false
+          else
+            release=true
+          fi
+
+          {
+            echo "version=$version"
+            echo "release=$release"
+          } >> "$GITHUB_OUTPUT"
+
+  # ── The six files ─────────────────────────────────────────────────────────
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    if: ${{ needs.version.outputs.release == 'true' }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      # The asset's name, spelled once: this leg, and the version its files belong to.
+      ASSET: mahbot-${{ needs.version.outputs.version }}-${{ matrix.target_os }}-${{ matrix.target_arch }}.${{ matrix.ext }}
+    strategy:
+      # Every leg runs to its own end even when one fails: a release needs all six,
+      # and the failing leg's own log is what the fix starts from.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            target_os: macos
+            target_arch: x86_64
+            ext: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            target_os: macos
+            target_arch: aarch64
+            ext: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            target_os: linux
+            target_arch: x86_64
+            ext: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            target_os: linux
+            target_arch: aarch64
+            ext: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            target_os: windows
+            target_arch: x86_64
+            ext: zip
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            target_os: windows
+            target_arch: aarch64
+            ext: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      # The GUI stack's dependencies probe for these. The base itself is the image,
+      # so the file links against the glibc that image ships.
+      - name: Install the Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config ca-certificates curl \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libfontconfig1-dev
+
+      # `turso_sdk_kit`'s build script compiles a VERSIONINFO resource with `rc.exe`
+      # on MSVC, and looks for it in PATH first and in the SDK's **x64** tools
+      # afterwards — a path the ARM64 runner's own SDK does not use. Its own
+      # architecture's `rc.exe` is put on PATH here, from the Windows SDK the image
+      # already ships, so the leg does not depend on which architecture's tools a
+      # dependency's build script happens to look for. Nothing is downloaded.
+      - name: Put the Windows SDK's resource compiler on PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          if (Test-Path $sdk) {
+            $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+            $newest = Get-ChildItem $sdk -Directory | Sort-Object Name | Select-Object -Last 1
+            $rc = Join-Path (Join-Path $newest.FullName $arch) 'rc.exe'
+            if (Test-Path $rc) {
+              Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $rc)
+            }
+          }
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          # Windows: the C runtime travels inside the file, so no redistributable has
+          # to be present on the owner's machine.
+          RUSTFLAGS: ${{ matrix.target_os == 'windows' && '-C target-feature=+crt-static' || '' }}
+          # macOS: the floor is set in this build, not merely written down.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target_os == 'macos' && '12.3' || '' }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Staged before archiving: the archive's single entry is `mahbot` at its root,
+      # not a path with the build directory in it. `COPYFILE_DISABLE` keeps it the
+      # only entry there — macOS `tar` otherwise stores the copy's extended
+      # attributes as an AppleDouble `._mahbot` beside it. The contract is one file.
+      - name: Package (macOS/Linux)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p stage
+          cp "target/${{ matrix.target }}/release/mahbot" stage/mahbot
+          COPYFILE_DISABLE=1 tar -czf "$ASSET" -C stage mahbot
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path stage -Force | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\mahbot.exe" "stage\mahbot.exe"
+          Compress-Archive -Path "stage\mahbot.exe" -DestinationPath $env:ASSET
+
+      # No leg publishes anything itself: every file is handed to the release job.
+      - name: Upload the file under its own name
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  # ── The release ───────────────────────────────────────────────────────────
+
+  # Runs only after all six legs have succeeded, so a release is never left visible
+  # with part of its files. Everything is staged in the runner's own temp directory,
+  # outside the working tree: nothing this job holds may be mistaken for part of the
+  # package the registry is handed.
+  publish:
+    name: Publish the release
+    needs: [version, build]
+    if: ${{ needs.version.outputs.release == 'true' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: v${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the six files
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/release
+          merge-multiple: true
+
+      # All or nothing: one missing file stops the job before anything is visible.
+      - name: Check that all six files arrived
+        run: |
+          missing=0
+          for name in \
+            "mahbot-${VERSION}-macos-x86_64.tar.gz" \
+            "mahbot-${VERSION}-macos-aarch64.tar.gz" \
+            "mahbot-${VERSION}-linux-x86_64.tar.gz" \
+            "mahbot-${VERSION}-linux-aarch64.tar.gz" \
+            "mahbot-${VERSION}-windows-x86_64.zip" \
+            "mahbot-${VERSION}-windows-aarch64.zip"; do
+            if [ ! -f "$RUNNER_TEMP/release/$name" ]; then
+              echo "::error::$name did not arrive"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+      - name: Prepare the draft
+        run: |
+          printf '%s\n' "$VERSION" > "$RUNNER_TEMP/release/version.txt"
+
+          # A failed earlier attempt leaves an invisible draft of this mark behind,
+          # and the next attempt of the same mark replaces it. A visible release is
+          # never touched, and neither is the mark itself.
+          if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || true)" = "true" ]; then
+            gh release delete "$TAG" --yes --cleanup-tag=false
+          fi
+
+          gh release create "$TAG" --draft --title "$TAG" \
+            "$RUNNER_TEMP/release"/mahbot-*.tar.gz "$RUNNER_TEMP/release"/mahbot-*.zip \
+            "$RUNNER_TEMP/release/version.txt" LICENSE-MIT LICENSE-APACHE
+
+      - name: Make it visible
+        run: |
+          # One step for a draft that already holds every file. A test release (a
+          # version carrying a pre-release part) is never the newest release.
+          case "$VERSION" in
+            *-*) gh release edit "$TAG" --draft=false --prerelease ;;
+            *)   gh release edit "$TAG" --draft=false ;;
+          esac
+
+  # ── The package registry ──────────────────────────────────────────────────
+
+  # Only a real release goes to the registry, and only once it is visible: the
+  # registry verifies a publication by building the package it was handed.
+  registry:
+    name: Publish the version to the package registry
+    needs: [version, publish]
+    if: ${{ needs.version.outputs.release == 'true' && !contains(needs.version.outputs.version, '-') }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Verification links the same Linux libraries the build legs install.
+      - name: Install the Linux build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config ca-certificates curl \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libfontconfig1-dev
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # No `--locked`: the registry verifies a publication by building the package
+        # it was handed, and re-resolving there always succeeds where a stale
+        # packaged lock would not.
+        run: cargo publish

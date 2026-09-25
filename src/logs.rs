@@ -125,9 +125,10 @@ impl LogStore {
     /// in WAL mode the per-commit fsync dominates the insert cost. Batching
     /// the diagnostics logs into one transaction reduces N commits to one.
     /// On failure the whole batch is dropped (the caller's [`spawn_log_writer`]
-    /// clears it regardless) — matching the existing drop-on-failure semantics;
-    /// log entries are diagnostics, not durable state.
-    async fn insert_batch(&self, entries: &[LogEntry]) -> anyhow::Result<()> {
+    /// clears it regardless) — log entries are diagnostics, not durable state. A
+    /// caller that cannot lose a row — the partly-finished-update record
+    /// `self_update::record_update_unfinished` writes — inserts here directly instead.
+    pub(crate) async fn insert_batch(&self, entries: &[LogEntry]) -> anyhow::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -192,6 +193,37 @@ impl LogStore {
             .execute(&format!("DELETE FROM logs {where_sql}"), values)
             .await
             .context("Failed to clear log entries")
+    }
+
+    /// Whether any row carrying `message` holds `reason` in its `reason` field.
+    ///
+    /// The reader a caller dedupes against: the rows carrying one message are one
+    /// per distinct reason, so they are all read and parsed here rather than
+    /// matched in SQL against the JSON they store.
+    pub(crate) async fn has_reason(&self, message: &str, reason: &str) -> anyhow::Result<bool> {
+        /// The `reason` field of a row's stored `fields`, or `None` when it holds none.
+        fn reason_of(fields: &str) -> Option<String> {
+            serde_json::from_str::<serde_json::Value>(fields)
+                .ok()?
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }
+        let rows = self
+            .conn
+            .query(
+                "SELECT fields FROM logs WHERE message = ?1",
+                params![message],
+            )
+            .await
+            .context("Failed to read the log rows carrying a message")?;
+        for row in &rows {
+            // The one selected column, so its position is its own.
+            if reason_of(&row.get::<String>(0)?).as_deref() == Some(reason) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Query log entries with optional filters.
@@ -1126,6 +1158,56 @@ mod tests {
         // All Logs scope: every stored record.
         assert_eq!(store.clear_logs(None).await.unwrap(), 1);
         assert_eq!(store.query(&LogQuery::default()).await.unwrap().1, 0);
+    }
+
+    /// [`LogStore::has_reason`] finds a reason any row carrying a message holds, so
+    /// a reason already recorded is never recorded again — and a reason the store
+    /// has not been told is not found.
+    #[tokio::test]
+    async fn a_reason_already_recorded_is_found_and_a_new_one_is_not() {
+        let (store, _dir) = test_store().await;
+
+        store
+            .insert_batch(&[
+                LogEntry {
+                    message: "the update stopped".into(),
+                    fields: serde_json::json!({ "reason": "first" }),
+                    ..Default::default()
+                },
+                LogEntry {
+                    message: "the update stopped".into(),
+                    fields: serde_json::json!({ "reason": "second" }),
+                    ..Default::default()
+                },
+                // A row with no reason at all is not evidence for one.
+                LogEntry {
+                    message: "the update stopped".into(),
+                    ..Default::default()
+                },
+                // A different message is its own fact, whatever its reason.
+                LogEntry {
+                    message: "another fact".into(),
+                    fields: serde_json::json!({ "reason": "first" }),
+                    ..Default::default()
+                },
+            ])
+            .await
+            .unwrap();
+
+        for (message, reason, found) in [
+            ("the update stopped", "first", true),
+            ("the update stopped", "second", true),
+            ("the update stopped", "third", false),
+            ("another fact", "first", true),
+            ("another fact", "second", false),
+            ("never recorded", "first", false),
+        ] {
+            assert_eq!(
+                store.has_reason(message, reason).await.unwrap(),
+                found,
+                "{message:?} + {reason:?}"
+            );
+        }
     }
 
     /// Open a healthy store in a fresh temp dir, seed one entry, and checkpoint

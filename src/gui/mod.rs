@@ -333,7 +333,7 @@ pub enum Message {
     EscapePressed,
     /// Update button pressed — open the self-update confirmation modal.
     UpdateBot,
-    /// Self-update confirmed — start the background build/install.
+    /// Self-update confirmed — start the background update.
     ConfirmUpdate,
     /// Self-update confirmation dismissed — nothing happens.
     CancelUpdate,
@@ -615,7 +615,7 @@ pub struct Dashboard {
     /// disabled until the drain completes.
     draining: bool,
     /// Whether the self-update confirmation modal is open. Set by
-    /// [`Message::UpdateBot`]; the build/install itself only starts on
+    /// [`Message::UpdateBot`]; the update itself only starts on
     /// [`Message::ConfirmUpdate`], so dismissing leaves the system untouched.
     show_update_confirm: bool,
     /// Research run awaiting manual-cancel confirmation — the run's durable
@@ -1225,12 +1225,11 @@ impl Dashboard {
             Message::QuitRequested => self.request_exit(Some(crate::shutdown::MACOS_QUIT_TRIGGER)),
             Message::Shutdown => self.save_and_exit(),
             Message::DrainStarted => {
-                // Restart toast: only when the update build/install has
-                // finished and finalize is shutting the service down — a
-                // plain window close, quit or signal during a mid-build update
-                // (in-flight but not yet finalizing) must not show a false
-                // "restarting" toast. `!self.draining` is defensive
-                // single-emission protection.
+                // Restart toast: only when the update has finished and finalize
+                // is shutting the service down — a plain window close, quit or
+                // signal during an update still in flight (not yet finalizing)
+                // must not show a false "restarting" toast. `!self.draining` is
+                // defensive single-emission protection.
                 if !self.draining
                     && crate::self_update::update_in_progress()
                     && crate::self_update::update_is_finalizing()
@@ -1393,7 +1392,7 @@ impl Dashboard {
             },
             Message::EscapePressed => self.process_escape(),
             Message::UpdateBot => {
-                // Only opens the confirmation modal — the build/install
+                // Only opens the confirmation modal — the update
                 // starts on `ConfirmUpdate`. Availability is read from the
                 // shared cache, so a Telegram-initiated update disables the
                 // button here too.
@@ -1411,13 +1410,9 @@ impl Dashboard {
                 }
                 // Save window state before update (synchronous).
                 self.persist_window_state();
-                // Transient confirmation that the build/install has kicked off —
-                // condensed from the mode-specific Telegram update notifications
-                // ("building from source…" / "installing from crates.io…").
-                let toast = self.push_toast(
-                    "Update started — building/installing…".to_string(),
-                    ToastKind::Success,
-                );
+                // Transient confirmation that the update has kicked off; the
+                // update itself tells the admin the same thing in its own words.
+                let toast = self.push_toast("Update started…".to_string(), ToastKind::Success);
                 Task::batch([
                     toast,
                     Task::perform(
@@ -2824,32 +2819,35 @@ impl Dashboard {
     /// [`Message::UpdateBot`], confirmed by [`Message::ConfirmUpdate`]).
     /// Returns a type-stable placeholder when closed.
     ///
-    /// The text truthfully reflects the real sequence: the build/install
-    /// runs in the background while the system keeps working — nothing is
-    /// paused during the build — then in-flight work drains, databases are
-    /// checkpointed, and the app restarts and resumes work automatically.
-    /// The window closing is the success signal.
+    /// The text truthfully reflects the real sequence for this copy: the update
+    /// runs in the background while the system keeps working — nothing is paused
+    /// during it — then in-flight work drains, databases are checkpointed, and the
+    /// app restarts and resumes work automatically. The window closing is the
+    /// success signal.
     fn render_update_confirm(&self) -> Element<'_, Message> {
         if !self.show_update_confirm {
             // Keep the Stack widget type stable across open/close transitions
             // (see `empty_stack_placeholder`): the open state is a Stack.
             return iced::widget::stack([widgets::empty_stack_placeholder()]).into();
         }
-        let build_desc = match crate::self_update::update_mode() {
-            crate::self_update::UpdateMode::LocalCheckout => {
-                "The new version is built from the local source checkout in \
-                 the background while the system keeps working — the build can \
-                 take 10–60 minutes and nothing is paused during it.\n\n\
-                 When the build finishes, current in-flight work is drained \
-                 (up to ~10 min), databases are checkpointed, and the app \
-                 restarts, automatically resuming work afterwards. The window \
-                 closing signals the restart."
+        let mode_desc = match crate::self_update::update_mode() {
+            crate::self_update::UpdateMode::Downloaded => {
+                "The ready-made file for this system is downloaded in the background \
+                 while the system keeps working, and put at the standard location: it \
+                 replaces the file this copy runs from when that is already where it \
+                 sits, and for a copy running from anywhere else it is placed there \
+                 while the file it came from is taken away. Nothing is paused during \
+                 it.\n\n\
+                 When it is in place, current in-flight work is drained (up to \
+                 ~10 min), databases are checkpointed, and the app restarts from \
+                 the standard location, automatically resuming work afterwards. \
+                 The window closing signals the restart."
             }
-            crate::self_update::UpdateMode::Registry => {
-                "The new version is downloaded from crates.io and installed in \
-                 the background while the system keeps working — the install \
-                 can take 10–60 minutes and nothing is paused during it.\n\n\
-                 When the install finishes, current in-flight work is drained \
+            crate::self_update::UpdateMode::SourceTree => {
+                "The new version is built from this working tree in the \
+                 background while the system keeps working — the build can take \
+                 10–60 minutes and nothing is paused during it.\n\n\
+                 When the build finishes, current in-flight work is drained \
                  (up to ~10 min), databases are checkpointed, and the app \
                  restarts, automatically resuming work afterwards. The window \
                  closing signals the restart."
@@ -2858,7 +2856,7 @@ impl Dashboard {
         widgets::modal_backdrop(
             dialog::confirm_dialog(
                 dialog::dialog_title("Update MahBot?"),
-                dialog::dialog_body([build_desc]),
+                dialog::dialog_body([mode_desc]),
                 [
                     dialog::DialogAction::secondary("Cancel", Message::CancelUpdate),
                     dialog::DialogAction::secondary("Update", Message::ConfirmUpdate),
@@ -2873,9 +2871,10 @@ impl Dashboard {
     /// Returns `None` when self-update is not available on this installation.
     ///
     /// Visibility is driven entirely by the shared availability cache — no
-    /// Windows gate is needed here: registry mode now discovers and installs on
-    /// all platforms (both Windows guards removed; the install goes through
-    /// install-to-temp + `self_replace`, which works with a running .exe).
+    /// platform gate is needed: a downloaded copy finds and puts this system's
+    /// ready-made file at the standard location on every platform, and replacing a
+    /// file that is in use there is the platform's own rename-aside, so a running
+    /// copy is never in the way.
     fn render_update_button() -> Option<Element<'static, Message>> {
         let availability = crate::self_update::update_availability();
         // Show the button while an update is in flight even if `available` was

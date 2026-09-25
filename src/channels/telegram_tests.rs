@@ -2820,9 +2820,9 @@ async fn user_command_entries_reflect_admin_state() {
 
         // The admin: single Assistant role →
         // no role-switch entry, just unconditional model commands and
-        // state-aware admin commands. In the (LocalCheckout) test environment
-        // the shared availability cache seeds `available = true`, so `/update`
-        // is present for the admin.
+        // state-aware admin commands. In the (SourceTree) test environment the
+        // shared availability cache seeds `available = true`, so `/update` is
+        // present for the admin.
         let admin_entries = user_command_entries(admin).await;
         let cmds: Vec<&str> = admin_entries.iter().map(|(c, _)| c.as_str()).collect();
         assert!(cmds.contains(&"board"));
@@ -2868,9 +2868,9 @@ async fn user_command_entries_reflect_admin_state() {
         assert!(flipped_cmds.contains(&"maintenance_off"));
         assert!(!flipped_cmds.contains(&"maintenance_on"));
 
-        // Registry-hidden branch: no available update → `/update` is absent even
-        // for the admin (the cache is a process-local single source of truth). The
-        // RAII guard restores the LocalCheckout default on drop.
+        // Hidden branch: no available update → `/update` is absent even for the
+        // admin (the cache is a process-local single source of truth). The RAII
+        // guard restores the SourceTree default on drop.
         {
             let _guard = crate::self_update::set_update_cache_for_test(false, false);
             let hidden = user_command_entries(admin).await;
@@ -2905,7 +2905,7 @@ async fn user_command_entries_reflect_admin_state() {
 fn test_update_notification_texts_render_as_plain_single_messages() {
     for text in [
         crate::self_update::UPDATE_BUILD_COMPLETE_MSG,
-        crate::self_update::UPDATE_INSTALL_COMPLETE_MSG,
+        crate::self_update::UPDATE_DOWNLOAD_COMPLETE_MSG,
         crate::self_update::UPDATE_RESTART_MSG,
     ] {
         assert_eq!(to_telegram_html(text), text, "not plain text: {text}");
@@ -2917,7 +2917,7 @@ fn test_update_notification_texts_render_as_plain_single_messages() {
     }
 
     // A failure's lead line is plain text like the notifications above; only the
-    // detail under it (the captured build/install output) becomes a code block.
+    // detail under it (the captured build output) becomes a code block.
     let failure = crate::self_update::update_failure_notification(&anyhow::anyhow!(
         "Failed to build from source:\n```\nboom\n```"
     ));

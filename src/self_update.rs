@@ -1,51 +1,76 @@
-//! Self-update logic — single-instance guarding, install-to-temp, binary swap,
-//! cargo-bin refresh, and restart.
+//! Self-update logic — single-instance guarding, obtaining the new version,
+//! putting it in place, and restart.
 //!
-//! Two update modes are supported, selected at runtime by [`update_mode`]. Both
-//! converge on a single install-to-temp then `self_replace` flow:
+//! Two update modes are supported, selected at runtime by [`update_mode`]:
 //!
-//! * **Local checkout**: the binary was built from a local source checkout
-//!   (`.git` present at `CARGO_MANIFEST_DIR`, or a plain source tree with
-//!   `Cargo.toml`). Update = `cargo install --path <repo> --root <temp_install>
-//!   --locked --target-dir <temp_build>` → swap → copy to cargo bin →
-//!   shutdown → checkpoint → restart.
-//! * **Registry**: `CARGO_MANIFEST_DIR` points into the cargo registry/git
-//!   source cache (e.g. `~/.cargo/registry/src/`), so a local rebuild would be a
-//!   same-version no-op. Update = periodic crates.io sparse-index check for a
-//!   strictly newer stable version → `cargo install <crate> --root <temp_install>
-//!   --force` → swap → copy to cargo bin → shutdown → checkpoint → restart.
+//! * **A downloaded copy** ([`UpdateMode::Downloaded`]): this binary is one of the
+//!   product's own published files — the package registry's source cache, a moved
+//!   copy, or a copy whose build source is gone. Update = download this system's
+//!   ready-made release file → extract → put it at the standard per-user location
+//!   (in place of the working file when that location is already where this copy
+//!   runs from; when it is not, the working file is taken away afterwards) →
+//!   restart.
+//! * **A copy built from sources** ([`UpdateMode::SourceTree`]): this binary has
+//!   its own working tree at `CARGO_MANIFEST_DIR`. Update = `cargo install --path
+//!   <tree> --root <temp_install> --locked --target-dir <temp_build>` → swap →
+//!   restart.
 //!
-//! The running executable cannot be replaced in place on Windows, so each mode
-//! installs the freshly built binary into a temp root first, then swaps it in via
-//! `self_replace` (which rename-asides the running exe, copies the new one in,
-//! and schedules deferred deletion). This removes the previous Windows guards
-//! and the bespoke local build-swap machinery.
+//! Both modes converge on the same tail: the new file becomes the one the
+//! replacement instance runs from (the running file itself when it is already the
+//! standard location, a placement at the standard location otherwise), the admin is
+//! notified, in-flight work is drained, the databases are checkpointed, and a
+//! replacement instance is started from that file before `exit(0)`. The running
+//! executable cannot be replaced in place on Windows, so the source-tree build lands
+//! in a temp root first and is swapped in via `self_replace` (which rename-asides the
+//! running exe, copies the new one in, and schedules deferred deletion) — the product
+//! no longer copies itself into any toolchain's directory, in either mode.
 //!
-//! After the swap the fresh binary is also copied to the cargo install bin path
-//! (`$CARGO_HOME/bin` / `~/.cargo/bin`) so PATH invocations of `mahbot` stay
-//! fresh even when the instance runs from a different path (e.g. the repo's
-//! `target/release`). Single-instance enforcement is an exclusive whole-file
-//! lock on `mahbot.lock`, released explicitly before the hand-off spawn — see
-//! [`acquire_lock`] and [`crate::util::lock`]. The WAL checkpoint before
-//! `exit(0)` is a clean store handoff: `std::process::exit(0)`
-//! bypasses all Rust destructors, so Turso connections are never properly
-//! closed. The TRUNCATE leaves an empty WAL; committed data is already
-//! fsync-durable at COMMIT.
+//! ## Where the new file comes from
+//!
+//! The product is its own release host: [`RELEASE_REPO`] (`CARGO_PKG_REPOSITORY`)
+//! holds one release per version, and the release workflow, the install scripts
+//! and this file mirror one contract:
+//!
+//! * the newest release's tiny version file is
+//!   `{base}/releases/latest/download/version.txt` and holds `<version>\n`;
+//! * an exact version's archive is `{base}/releases/download/v{version}/{name}`;
+//! * `{name}` is `mahbot-<version>-<os>-<arch>.<ext>`, with the `(os, arch)` pair
+//!   [`crate::util::managed_bin::host_os_arch`] returns and `tar.gz` on
+//!   macOS/Linux, `zip` on Windows;
+//! * the archive holds exactly one file, `mahbot` (`mahbot.exe` on Windows), at
+//!   its root.
+//!
+//! No hosting-service API call is made anywhere — only those download URLs.
+//!
+//! ## Test-only hooks
+//!
+//! [`RELEASE_BASE_URL_ENV`] and [`UPDATE_TO_VERSION_ENV`] drive a whole update of
+//! this machinery with no window at all, from a release host other than the
+//! product's own (see [`run_env_named_update`]): the first moves the
+//! release base, the second names the version to move to — a test release is
+//! deliberately undiscoverable, so the one being driven must be named outright.
+//! Both are unset in every ordinary run, where the release base is [`RELEASE_REPO`]
+//! and the version to move to is the newest published one.
+//!
+//! Single-instance enforcement is an exclusive whole-file lock on `mahbot.lock`,
+//! released explicitly before the hand-off spawn — see [`acquire_lock`] and
+//! [`crate::util::lock`]. The WAL checkpoint before `exit(0)` is a clean store
+//! handoff: `std::process::exit(0)` bypasses all Rust destructors, so Turso
+//! connections are never properly closed. The TRUNCATE leaves an empty WAL;
+//! committed data is already fsync-durable at COMMIT.
 //!
 //! ## macOS Gatekeeper safety
 //!
 //! `posix_spawn` triggers async Gatekeeper code-signing validation; deleting the
 //! spawn target during validation produces empty stderr (SIGKILL by
-//! `syspolicyd`). In the temp-root flow the spawn target is always the captured
-//! `current_exe()` (never a temp root), and the temp roots are removed before
-//! the lock release and spawn, so the spawn target is never deleted in its
-//! startup window.
+//! `syspolicyd`). The spawn target is always the working file the update left in
+//! place — never a temp root — and the temp roots are removed before the lock
+//! release and spawn (see [`finalize_update_and_restart`]), so the spawn target is
+//! never deleted in its startup window.
 
 use crate::ChannelMessage;
 use crate::util::UnwrapPoison;
 use anyhow::{Context, Result, anyhow};
-#[cfg(test)]
-use directories::UserDirs;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -54,15 +79,15 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// The embedded package version, stamped at build time from `CARGO_PKG_VERSION`.
 ///
-/// Cargo sets this from the `version` field in `Cargo.toml` for every build —
-/// including `cargo install` builds from crates.io — so it is the authoritative
-/// version of the running binary. The GUI surfaces it on the Settings page and
-/// registry-mode self-update compares against it.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Cargo sets this from the `version` field in `Cargo.toml` for every build, so it
+/// is the authoritative version of the running binary. The GUI surfaces it on the
+/// Settings page, and a downloaded copy's self-update compares the release host's
+/// version against it.
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── File-lock based single-instance guard ─────────────────────────────────
 
@@ -322,70 +347,393 @@ async fn reacquire_instance_lock() -> Result<()> {
     }
 }
 
+// ── The product's own release files ───────────────────────────────────────
+
+/// Where the product's own releases live: this crate's repository, one release
+/// per version. The release workflow publishes to it and the install scripts
+/// download from it, so this is the single source of truth for all three.
+const RELEASE_REPO: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// Test-only: the release base a driven update downloads from, in place of
+/// [`RELEASE_REPO`].
+const RELEASE_BASE_URL_ENV: &str = "MAHBOT_RELEASE_BASE_URL";
+
+/// Test-only: the version a driven update moves to, named outright so no
+/// newest-release lookup (and no published newest release) is needed.
+const UPDATE_TO_VERSION_ENV: &str = "MAHBOT_UPDATE_TO_VERSION";
+
+/// How long downloading this system's archive may take. Generous on purpose: the
+/// file is tens of megabytes and the connection may be slow, but it is still a
+/// hard deadline so a stalled transfer cannot leave the update hanging forever.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(30);
+/// How long the host's own `sw_vers`/`getconf` answer may take, when the floor
+/// check asks it one ([`host_probe`]). Both answer at once, and the wait is bounded
+/// like every other one on this path: a probe still running after this much is read
+/// as one that answered nothing, which refuses nothing.
+const HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The release base every download is built from — [`RELEASE_REPO`] unless
+/// [`RELEASE_BASE_URL_ENV`] moved it.
+fn release_base_url() -> String {
+    std::env::var(RELEASE_BASE_URL_ENV).unwrap_or_else(|_| RELEASE_REPO.to_string())
+}
+
+/// The URL of the newest release's version file.
+fn latest_version_url(base: &str) -> String {
+    format!("{base}/releases/latest/download/version.txt")
+}
+
+/// The name of this system's archive for `version`:
+/// `mahbot-<version>-<os>-<arch>.<ext>`, `zip` on Windows and `tar.gz` elsewhere.
+/// The release workflow names the assets exactly like this and the install scripts
+/// read the same names back, so the three must stay in step.
+fn asset_name(version: &semver::Version, os: &str, arch: &str) -> String {
+    let extension = if os == "windows" { "zip" } else { "tar.gz" };
+    format!("mahbot-{version}-{os}-{arch}.{extension}")
+}
+
+/// The URL of `version`'s archive for this system.
+fn asset_url(base: &str, version: &semver::Version, os: &str, arch: &str) -> String {
+    format!(
+        "{base}/releases/download/v{version}/{}",
+        asset_name(version, os, arch)
+    )
+}
+
+// ── The floors a published file is built against ──────────────────────────
+
+/// The floors the published files are built against: the deployment target both
+/// macOS legs pass to the compiler, the glibc of the Linux base they are built on,
+/// and the Windows build each Windows file is for (Windows 10 version 1809 on
+/// x86_64, and Windows 11 on ARM — every Windows 10 on ARM is below the ARM64
+/// file). A system below its floor has no file that can load, so it has no file for
+/// it at all — the same refusal as an os/arch with no file published.
+const MACOS_FLOOR: (u32, u32) = (12, 3);
+const GLIBC_FLOOR: (u32, u32) = (2, 35);
+const WINDOWS_X86_64_FLOOR: u32 = 17_763;
+const WINDOWS_ARM64_FLOOR: u32 = 22_000;
+
+/// The opening of every refusal for a system with no published file for it — the
+/// same words both install scripts begin theirs with.
+const NO_RELEASE_FILE: &str = "MahBot has no file for this system";
+
+/// The refusal for a Linux host with no glibc at all: a file built for glibc has
+/// nothing to load against there. `install.sh` prints these words too; the Windows
+/// script has no glibc refusal to print.
+const NO_GLIBC_FOUND: &str =
+    "the released Linux files are built for glibc, and no glibc was found on this system";
+
+/// The plain reason this system has no published release file for it, or `None`
+/// when it has one.
+///
+/// The floors above and, on Linux, the musl loader
+/// ([`crate::util::managed_bin::linux_host_is_musl`]) are the whole of it, and only
+/// what can actually be read is consulted: a host that does not answer is not
+/// refused for that, while a host that answers with a glibc below its floor is. The
+/// install scripts refuse the same systems, so no file is ever put in place that
+/// cannot load — which would leave the machine with no working copy at all.
+async fn absent_release_file() -> Option<String> {
+    if cfg!(target_os = "linux") {
+        let report = host_probe("getconf", &["GNU_LIBC_VERSION"]).await;
+        let musl_loader = crate::util::managed_bin::linux_host_is_musl();
+        if let Some(refusal) = linux_refusal(report.as_deref(), musl_loader) {
+            return Some(match refusal {
+                LinuxRefusal::GlibcBelowFloor => format!(
+                    "{NO_RELEASE_FILE}: Linux with glibc {}.{} or newer is required",
+                    GLIBC_FLOOR.0, GLIBC_FLOOR.1
+                ),
+                LinuxRefusal::NoGlibc => format!("{NO_RELEASE_FILE}: {NO_GLIBC_FOUND}"),
+            });
+        }
+    }
+    if cfg!(target_os = "macos") {
+        let version = host_probe("sw_vers", &["-productVersion"]).await?;
+        if version_below_floor(&version, MACOS_FLOOR) {
+            return Some(format!(
+                "{NO_RELEASE_FILE}: macOS {}.{} or newer is required",
+                MACOS_FLOOR.0, MACOS_FLOOR.1
+            ));
+        }
+    }
+    if cfg!(target_os = "windows") {
+        let (floor, requirement) = if cfg!(target_arch = "aarch64") {
+            // Every Windows 10 on ARM — below Windows 11's own first build — is below
+            // the ARM64 file.
+            (WINDOWS_ARM64_FLOOR, "Windows 11 on ARM")
+        } else {
+            (WINDOWS_X86_64_FLOOR, "Windows 10 version 1809")
+        };
+        if windows_build()? < floor {
+            return Some(format!(
+                "{NO_RELEASE_FILE}: {requirement} (build {floor}) or newer is required"
+            ));
+        }
+    }
+    None
+}
+
+/// The Windows build this host runs, when it can be read.
+///
+/// `RtlGetVersion` rather than `GetVersionExW`: the latter reports Windows 8's
+/// version for an image that carries no compatibility manifest, which this one does
+/// not, and every published Windows file is newer than that. `None` when it cannot
+/// be read at all — nothing is refused on a guess.
+#[cfg(windows)]
+fn windows_build() -> Option<u32> {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    // SAFETY: every field is an integer or a fixed array of them, so all-zero is a
+    // valid value; the size field below is what the call reads.
+    let mut info = unsafe { std::mem::zeroed::<OSVERSIONINFOW>() };
+    info.dwOSVersionInfoSize =
+        u32::try_from(std::mem::size_of_val(&info)).expect("a struct of a few words");
+    // SAFETY: `info` is a live, zeroed, correctly sized `OSVERSIONINFOW`, and the
+    // call fills exactly the words its size field describes.
+    let status = unsafe { RtlGetVersion(&raw mut info) };
+    (status == 0 && info.dwBuildNumber != 0).then_some(info.dwBuildNumber)
+}
+
+/// Not Windows: there is no Windows build here to read.
+#[cfg(not(windows))]
+fn windows_build() -> Option<u32> {
+    None
+}
+
+/// Ask the host what it is, the way the install scripts ask it (`sw_vers`,
+/// `getconf`): a program's trimmed stdout when it exits successfully, and nothing
+/// at all otherwise — including when it does not answer in time, so a host that
+/// never answers cannot hold the update open.
+async fn host_probe(program: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    let output = tokio::time::timeout(HOST_PROBE_TIMEOUT, cmd.args(args).output())
+        .await
+        .ok()?
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !text.is_empty()).then_some(text)
+}
+
+/// Whether `version` (`major[.minor[…]]`) is below `floor`. Each part is compared
+/// as a whole number — a minor of 4 is not four tenths of 2.35 — a version with no
+/// minor part counts as zero, and a part that is not a whole number is a version
+/// this cannot compare: below the floor rather than accepted, exactly as the
+/// install script's own check refuses it.
+fn version_below_floor(version: &str, floor: (u32, u32)) -> bool {
+    let mut parts = version.trim().split('.');
+    let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let minor = match parts.next() {
+        Some(part) => part.parse::<u32>().ok(),
+        None => Some(0),
+    };
+    match (major, minor) {
+        (Some(major), Some(minor)) => (major, minor) < floor,
+        _ => true,
+    }
+}
+
+/// Whether a `getconf GNU_LIBC_VERSION` report names glibc at all: another libc's
+/// own report names none, and neither does no report.
+fn names_glibc(report: &str) -> bool {
+    report.starts_with("glibc ")
+}
+
+/// Which of the two ways a Linux host has no published file for it its own answers
+/// amount to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxRefusal {
+    /// A glibc below the floor the Linux files are built against.
+    GlibcBelowFloor,
+    /// No glibc was found, with musl's loader present: nothing to load a file built
+    /// for glibc with.
+    NoGlibc,
+}
+
+/// The refusal a Linux host's own answers amount to, or `None` when the published
+/// file is one it can load.
+///
+/// What the host answers with decides when it answers with a glibc: at or above the
+/// floor ([`GLIBC_FLOOR`]) the file loads and below it there is none for this system.
+/// A host that names no glibc — another libc's own report, or no answer at all — is
+/// then judged by musl's loader being there, the check the vendor installers make:
+/// musl installed beside glibc is not a musl system, while a host that names no glibc
+/// has none of its own to load the file with. A host with neither answers nothing
+/// this can refuse on, and is not refused.
+fn linux_refusal(report: Option<&str>, musl_loader: bool) -> Option<LinuxRefusal> {
+    if report.is_some_and(glibc_below_floor) {
+        return Some(LinuxRefusal::GlibcBelowFloor);
+    }
+    (!report.is_some_and(names_glibc) && musl_loader).then_some(LinuxRefusal::NoGlibc)
+}
+
+/// Whether a `getconf GNU_LIBC_VERSION` report names a glibc below the floor.
+/// A report this does not recognise — a `getconf` that answers something else,
+/// or does not answer at all — is not a refusal.
+fn glibc_below_floor(report: &str) -> bool {
+    report
+        .strip_prefix("glibc ")
+        .is_some_and(|version| version_below_floor(version, GLIBC_FLOOR))
+}
+
+/// The running binary's version, parsed from [`VERSION`].
+fn current_version() -> Result<semver::Version> {
+    semver::Version::parse(VERSION)
+        .with_context(|| format!("embedded version {VERSION} is not valid semver"))
+}
+
+/// The version a driven update was told to move to, when it named one other than
+/// the running version — `None` in every ordinary run.
+///
+/// Read by both the availability check and the update itself, so a driven update
+/// cannot be shown one version and given another. The version is named by hand, so
+/// it is taken in either spelling: the release's own mark carries the `v`
+/// (`v0.7.0`), while the version itself — and every URL built from it — does not.
+#[must_use]
+fn update_target_override() -> Option<semver::Version> {
+    let named = std::env::var(UPDATE_TO_VERSION_ENV).ok()?;
+    let named = named.trim();
+    let named = semver::Version::parse(named.strip_prefix('v').unwrap_or(named)).ok()?;
+    let current = semver::Version::parse(VERSION).ok()?;
+    (named != current).then_some(named)
+}
+
+/// HTTP client for the release check, with a descriptive User-Agent and a short
+/// timeout so a hung network never stalls the refresh loop for long.
+///
+/// Build failure surfaces as `Err` (the builder has no reason to fail in
+/// practice — fixed config, no env interaction). Both the background
+/// availability-refresh task and the update's own newest-release lookup tolerate
+/// the failure and report it; the periodic one retries on its next tick.
+fn release_http_client() -> Result<&'static reqwest::Client> {
+    /// Short: this is a check, and the tick retries anyway.
+    const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            crate::util::http::install_ring_provider();
+            reqwest::Client::builder()
+                .user_agent(format!("mahbot/{VERSION} (self-update check)"))
+                .timeout(CHECK_TIMEOUT)
+                .build()
+                .map_err(|e| format!("failed to build the release-check HTTP client: {e}"))
+        })
+        .as_ref()
+        .map_err(|e| anyhow!("{e}"))
+}
+
+/// The newest published version held by the release host's version file.
+///
+/// A version carrying a pre-release part is ignored (reported as `Ok(None)`): a
+/// test release is published that way and must never be discovered by an ordinary
+/// copy — only named outright through [`UPDATE_TO_VERSION_ENV`]. A malformed body
+/// and a network failure both surface as `Err`; callers tolerate them silently and
+/// retry on the next tick.
+async fn fetch_latest_release_version() -> Result<Option<semver::Version>> {
+    let url = latest_version_url(&release_base_url());
+    let response = release_http_client()?
+        .get(&url)
+        .send()
+        .await
+        .context("failed to read the newest release version")?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "the newest release version request returned HTTP {}",
+            response.status()
+        );
+    }
+    let body = response
+        .text()
+        .await
+        .context("failed to read the newest release version")?;
+    discoverable_version(&body)
+}
+
+/// The version a version file's body names, or `None` when it names a test
+/// release: a version carrying a pre-release part is never offered to an ordinary
+/// copy, which is what keeps test releases from reaching anybody who did not ask
+/// for one (a driven update names the version outright through
+/// [`UPDATE_TO_VERSION_ENV`] instead).
+fn discoverable_version(body: &str) -> Result<Option<semver::Version>> {
+    let version = semver::Version::parse(body.trim())
+        .context("the newest release version file does not hold a version")?;
+    Ok(version.pre.is_empty().then_some(version))
+}
+
+/// Check the product's own release host for a newer version of itself.
+///
+/// Returns `Ok(Some(latest))` when a newer version is published, `Ok(None)` when
+/// up to date, and `Err` on a failed check (the caller retries later — never a
+/// user-visible error for a failed check). A version named through
+/// [`UPDATE_TO_VERSION_ENV`] is reported as-is, with no lookup at all.
+async fn check_download_update() -> Result<Option<semver::Version>> {
+    if let Some(named) = update_target_override() {
+        return Ok(Some(named));
+    }
+    let Some(latest) = fetch_latest_release_version().await? else {
+        return Ok(None);
+    };
+    Ok((latest > current_version()?).then_some(latest))
+}
+
 // ── Update availability ───────────────────────────────────────────────────
 
-/// How the running binary was installed — selects the self-update strategy.
-///
-/// [`LocalCheckout`](UpdateMode::LocalCheckout): built from a local source
-/// checkout; update rebuilds from that source.
-///
-/// [`Registry`](UpdateMode::Registry): installed via `cargo install` (or a
-/// binary whose build source is unreachable); update checks crates.io and runs
-/// `cargo install <crate> --force`.
+/// How the running binary was obtained — selects the self-update strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpdateMode {
-    /// Built from a local source checkout (`.git` present, or a plain source
-    /// tree with `Cargo.toml` at the compile-time manifest dir).
-    LocalCheckout,
-    /// Installed via cargo — the manifest dir points into the cargo source
-    /// cache (`~/.cargo/registry/src/…` or `~/.cargo/git/checkouts/…`), or no
-    /// source is reachable at all. A local rebuild would be a same-version
-    /// no-op, so updates come from crates.io.
-    Registry,
+    /// Built from a working tree (a checkout): the update rebuilds from that tree.
+    SourceTree,
+    /// A copy obtained as a ready-made published file: the update downloads the
+    /// ready-made file for this system and puts it at the standard per-user
+    /// location — the working file itself when that is already where this copy runs
+    /// from, and a placement at that location (the working file taken away
+    /// afterwards) when it is not.
+    Downloaded,
 }
 
 /// Classify the update mode from a manifest-directory probe.
 ///
-/// The manifest dir is the compile-time `CARGO_MANIFEST_DIR`. The historical
-/// probe (Cargo.toml present) is NOT a reliable local-checkout discriminator:
-/// `cargo install` keeps the extracted crate in `$CARGO_HOME/registry/src` and
-/// `cargo install --git` in `$CARGO_HOME/git/checkouts`, both of which contain
-/// a `Cargo.toml` — rebuilding there would be a same-version no-op. The
-/// intent-aligned discriminator:
+/// The manifest dir is the compile-time `CARGO_MANIFEST_DIR`. A copy that arrived
+/// as a ready-made file keeps no working tree to rebuild from, but the probe
+/// cannot simply look for `Cargo.toml`: the package registry extracts its crates
+/// into `$CARGO_HOME/registry/src` and `$CARGO_HOME/git/checkouts`, both of which
+/// contain one. So the discriminator:
 ///
-/// 1. The path contains the cargo source-cache layout (`registry/src` or
-///    `git/checkouts` as path segments — CARGO_HOME may be custom, so the
-///    `.cargo` prefix is not required) → registry-installed. This is checked
-///    FIRST, before the `.git` heuristic, because cargo `git/checkouts`
-///    entries are full non-bare clones and contain a real `.git` directory.
-/// 2. `.git` at the manifest dir → a real local checkout.
-/// 3. Otherwise a reachable `Cargo.toml` → treat as a local build (a source
+/// 1. The path contains the package registry's source-cache layout (`registry/src`
+///    or `git/checkouts` as path segments — CARGO_HOME may be custom, so the
+///    `.cargo` prefix is not required) → a downloaded copy. This is checked
+///    FIRST, before the `.git` heuristic, because cargo `git/checkouts` entries
+///    are full non-bare clones and contain a real `.git` directory.
+/// 2. `.git` at the manifest dir → a real working tree.
+/// 3. Otherwise a reachable `Cargo.toml` → treat as a working tree (a source
 ///    tarball extract or a moved checkout still rebuilds fine).
-/// 4. No source at all → registry mode (the only viable update path).
+/// 4. No source at all → a downloaded copy: its build source is gone, so the
+///    ready-made file is the only way forward.
 fn classify_update_mode(manifest_dir: &Path) -> UpdateMode {
-    // 1. Cargo source cache (registry src or git checkouts), as adjacent path
-    //    segments — separator-agnostic (Windows uses backslashes).
+    // 1. The package registry's source cache (registry src or git checkouts), as
+    //    adjacent path segments — separator-agnostic (Windows uses backslashes).
     let mut prev: Option<&std::ffi::OsStr> = None;
     for component in manifest_dir.components() {
         if let (Some(a), std::path::Component::Normal(b)) = (prev, component)
             && ((a == "registry" && b == "src") || (a == "git" && b == "checkouts"))
         {
-            return UpdateMode::Registry;
+            return UpdateMode::Downloaded;
         }
         prev = match component {
             std::path::Component::Normal(os) => Some(os),
             _ => None,
         };
     }
-    // 2. Real local checkout: git metadata present.
+    // 2. Real working tree: git metadata present.
     if manifest_dir.join(".git").exists() {
-        return UpdateMode::LocalCheckout;
+        return UpdateMode::SourceTree;
     }
-    // 3/4. Reachable Cargo.toml → local build; otherwise registry.
+    // 3/4. Reachable Cargo.toml → working tree; otherwise a downloaded copy.
     if manifest_dir.join("Cargo.toml").is_file() {
-        UpdateMode::LocalCheckout
+        UpdateMode::SourceTree
     } else {
-        UpdateMode::Registry
+        UpdateMode::Downloaded
     }
 }
 
@@ -403,10 +751,10 @@ pub(crate) fn update_mode() -> UpdateMode {
 /// a consistent two-field view instead of observing intermediate cache writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UpdateAvailability {
-    /// Whether an update is available (mode-aware: local checkout always;
-    /// registry only when a strictly newer stable version is published).
+    /// Whether an update is available (mode-aware: a copy built from sources
+    /// always; a downloaded copy only when the release host has a newer version).
     pub(crate) available: bool,
-    /// Whether an update is currently in flight (build/install running, and
+    /// Whether an update is currently in flight (download/build running, and
     /// the finalizing window inclusive).
     pub(crate) in_progress: bool,
 }
@@ -422,13 +770,13 @@ pub(crate) struct UpdateAvailability {
 /// fresh process has no stale `available` state from a previous run, so an
 /// already-installed update is never advertised across a restart.
 struct UpdateCache {
-    /// Whether an update is available. Local checkout: statically true (the
-    /// build checkout is reachable). Registry: derived from the periodic
-    /// crates.io check, boot-seeded false until the first refresh tick.
+    /// Whether an update is available. A copy built from sources: statically
+    /// true (its working tree is reachable). A downloaded copy: derived from the
+    /// periodic release check, boot-seeded false until the first refresh tick.
     available: AtomicBool,
-    /// The discovered latest published stable version (registry mode) — drives
-    /// the GUI "Update MahBot to vX" tooltip. `None` in local-checkout mode,
-    /// and in registry mode when up to date / not yet checked.
+    /// The newest published version a downloaded copy found — drives the GUI
+    /// "Update MahBot to vX" tooltip. `None` for a copy built from sources, and
+    /// for a downloaded copy that is up to date or not yet checked.
     latest: std::sync::Mutex<Option<semver::Version>>,
     /// Whether an update is currently in flight. Set at [`execute_update`]
     /// entry, cleared on failure; a successful update exits the process.
@@ -439,9 +787,10 @@ static UPDATE_CACHE: OnceLock<UpdateCache> = OnceLock::new();
 
 fn update_cache() -> &'static UpdateCache {
     UPDATE_CACHE.get_or_init(|| UpdateCache {
-        // Boot-seed mode-aware: local checkout is always available without a
-        // network call; registry starts unknown until the first refresh tick.
-        available: AtomicBool::new(update_mode() == UpdateMode::LocalCheckout),
+        // Boot-seed mode-aware: a copy built from sources is always available
+        // without a network call; a downloaded copy starts unknown until the
+        // first refresh tick.
+        available: AtomicBool::new(update_mode() == UpdateMode::SourceTree),
         latest: std::sync::Mutex::new(None),
         in_progress: AtomicBool::new(false),
     })
@@ -457,15 +806,15 @@ pub(crate) fn update_availability() -> UpdateAvailability {
     }
 }
 
-/// The latest published stable version discovered by the periodic registry
-/// check (registry mode). `None` in local-checkout mode, and in registry mode
-/// when up to date or no newer version exists yet.
+/// The newest published version a downloaded copy found (see
+/// [`refresh_update_cache`]). `None` for a copy built from sources, and for a
+/// downloaded copy that is up to date or has not been checked yet.
 #[must_use]
 pub(crate) fn update_latest() -> Option<semver::Version> {
     update_cache().latest.lock().unwrap_poison().clone()
 }
 
-/// Whether an update is currently in flight (build/install running, and the
+/// Whether an update is currently in flight (download/build running, and the
 /// finalizing window inclusive).
 #[must_use]
 pub(crate) fn update_in_progress() -> bool {
@@ -517,156 +866,29 @@ pub(crate) fn set_update_cache_for_test(
     UpdateCacheTestGuard { previous }
 }
 
-// ── crates.io registry check (registry mode) ─────────────────────────────
-
-/// HTTP client for the crates.io sparse index, with a descriptive User-Agent
-/// (crates.io requires one; an empty UA is rejected) and a short timeout so a
-/// hung network never stalls the refresh loop for long.
-///
-/// Build failure surfaces as `Err` (the builder has no reason to fail in
-/// practice — fixed config, no env interaction). The only caller is the
-/// background availability-refresh task, which tolerates the failure and
-/// retries on its next tick.
-fn registry_http_client() -> Result<&'static reqwest::Client> {
-    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            crate::util::http::install_ring_provider();
-            reqwest::Client::builder()
-                .user_agent(format!("mahbot/{VERSION} (self-update check)"))
-                .timeout(Duration::from_secs(15))
-                .build()
-                .map_err(|e| format!("failed to build crates.io registry HTTP client: {e}"))
-        })
-        .as_ref()
-        .map_err(|e| anyhow!("{e}"))
-}
-
-/// Sparse-index path for a crate name (cargo's own layout):
-/// `1/{name}`, `2/{name}`, `3/{first}/{name}`, else `{first2}/{next2}/{name}`.
-///
-/// Byte-slicing is safe: the only caller passes the compile-time
-/// `CARGO_PKG_NAME`, which cargo enforces as ASCII `[a-zA-Z0-9_-]`.
-fn sparse_index_path(name: &str) -> String {
-    let len = name.len();
-    match len {
-        1 => format!("1/{name}"),
-        2 => format!("2/{name}"),
-        3 => format!("3/{}/{name}", &name[..1]),
-        _ => format!("{}/{}/{}", &name[..2], &name[2..4], name),
-    }
-}
-
-/// Parse the crates.io sparse-index NDJSON body and return the newest
-/// non-yanked stable version.
-///
-/// Each line is a JSON object `{"name", "vers", "yanked", …}`. The index
-/// appends a line per publish/yank/unyank event, so a version's LAST line is
-/// its current state ("last line wins") — a version that went through
-/// yank → unyank → re-yank must count as yanked even though an earlier line
-/// said unyanked. Pre-release versions are excluded (matching
-/// `max_stable_version` — what plain `cargo install <crate>` installs) and
-/// yanked versions never count.
-fn latest_stable_version(index_body: &str) -> Option<semver::Version> {
-    // Resolve each version's final yanked flag first (last line wins).
-    let mut yanked: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    for line in index_body.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        // Malformed lines are skipped (tolerance for index format drift).
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let Some(vers) = record.get("vers").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let is_yanked = record
-            .get("yanked")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        yanked.insert(vers.to_string(), is_yanked);
-    }
-    yanked
-        .into_iter()
-        .filter(|(_, is_yanked)| !is_yanked)
-        .filter_map(|(vers, _)| {
-            let version = semver::Version::parse(&vers).ok()?;
-            if !version.pre.is_empty() {
-                return None;
-            }
-            Some(version)
-        })
-        .max()
-}
-
-/// Query the crates.io sparse index for the newest stable published version of
-/// this crate. Network failures surface as `Err` — callers tolerate them
-/// silently and retry on the next tick.
-async fn fetch_latest_stable_version() -> Result<Option<semver::Version>> {
-    let name = env!("CARGO_PKG_NAME");
-    let url = format!("https://index.crates.io/{}", sparse_index_path(name));
-    let response = registry_http_client()?
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("failed to query crates.io index for {name}"))?;
-    if !response.status().is_success() {
-        anyhow::bail!(
-            "crates.io index returned HTTP {} for {name}",
-            response.status()
-        );
-    }
-    let body = response
-        .text()
-        .await
-        .with_context(|| format!("failed to read crates.io index response for {name}"))?;
-    Ok(latest_stable_version(&body))
-}
-
-/// Check whether a strictly newer stable version of this crate is published on
-/// crates.io.
-///
-/// Returns `Ok(Some(latest))` when `latest > embedded VERSION`, `Ok(None)`
-/// when up to date, and `Err` on network failure (the caller retries later —
-/// never a user-visible error for a failed check).
-///
-/// Discovery runs on all platforms: an update found here is installed via the
-/// unified install-to-temp + `self_replace` flow, which works on Windows too.
-async fn check_registry_update() -> Result<Option<semver::Version>> {
-    let Some(latest) = fetch_latest_stable_version().await? else {
-        return Ok(None);
-    };
-    let current = semver::Version::parse(VERSION)
-        .with_context(|| format!("embedded version {VERSION} is not valid semver"))?;
-    Ok((latest > current).then_some(latest))
-}
-
 // ── Update availability refresh ──────────────────────────────────────────
 
 /// Refresh the shared update-availability cache once.
 ///
-/// Local-checkout mode seeds `available = true` (idempotent, no network).
-/// Registry mode performs the crates.io check, preserving the last-known
+/// A copy built from sources seeds `available = true` (idempotent, no network).
+/// A downloaded copy performs the release check, preserving the last-known
 /// availability on a transient check failure so a network blip never hides a
 /// previously discovered update. While an update is in flight the check is
-/// skipped entirely (not just the write) — a long cargo install would
-/// otherwise waste a request per tick, and the InProgress status must never be
-/// clobbered. The `in_progress` flag is re-checked after the network await so
-/// an update that starts while the check is in flight cannot be clobbered by
-/// its result.
+/// skipped entirely (not just the write) — a long download would otherwise waste
+/// a request per tick, and the InProgress status must never be clobbered. The
+/// `in_progress` flag is re-checked after the network await so an update that
+/// starts while the check is in flight cannot be clobbered by its result.
 async fn refresh_update_cache() {
     let cache = update_cache();
     match update_mode() {
-        UpdateMode::LocalCheckout => {
+        UpdateMode::SourceTree => {
             cache.available.store(true, Ordering::SeqCst);
         }
-        UpdateMode::Registry => {
+        UpdateMode::Downloaded => {
             if cache.in_progress.load(Ordering::SeqCst) {
                 return;
             }
-            let result = check_registry_update().await;
+            let result = check_download_update().await;
             // Re-check after the await: an update may have started while this
             // network request was in flight, and the write must not clobber
             // the in-progress state (which would hide the "Updating…" UI and
@@ -694,10 +916,10 @@ async fn refresh_update_cache() {
 /// Periodic refresh of the shared update-availability cache.
 ///
 /// Spawned from the binary's background task set (cancellable via the global
-/// shutdown token). Ticks immediately so a fresh registry install isn't hidden
+/// shutdown token). Ticks immediately so a fresh downloaded copy isn't hidden
 /// until the first 10-minute interval elapses, then every 10 minutes. Runs on
-/// all platforms/modes to keep the contract uniform — local-checkout mode is a
-/// no-op network-wise but keeps `available` seeded.
+/// all platforms/modes to keep the contract uniform — a copy built from sources
+/// is a no-op network-wise but keeps `available` seeded.
 pub async fn run_update_availability_refresh() {
     loop {
         refresh_update_cache().await;
@@ -716,16 +938,114 @@ static UPDATE_MUTEX: Mutex<()> = Mutex::const_new(());
 
 // ── Telegram update notifications ─────────────────────────────────────────
 
-/// Local-checkout build done; the restart is reported by [`UPDATE_RESTART_MSG`].
+/// The build from this working tree is done; the restart is reported by
+/// [`UPDATE_RESTART_MSG`].
 pub(crate) const UPDATE_BUILD_COMPLETE_MSG: &str = "✅ Build complete.";
 
-/// Registry install done; the restart is reported by [`UPDATE_RESTART_MSG`].
-pub(crate) const UPDATE_INSTALL_COMPLETE_MSG: &str = "✅ Update installed from crates.io.";
+/// The downloaded file is in place; the restart is reported by
+/// [`UPDATE_RESTART_MSG`].
+pub(crate) const UPDATE_DOWNLOAD_COMPLETE_MSG: &str = "✅ Update downloaded and put in place.";
 
 /// Sent as the restart phase begins — nothing has restarted yet when this goes
 /// out.
 pub(crate) const UPDATE_RESTART_MSG: &str =
     "🔄 Waiting for work in progress to finish before the restart…";
+
+// ── The durable record of a partly-finished update ────────────────────────
+
+/// The target every partly-finished update is recorded under, and the message it
+/// is recorded with. Durable rather than a tracing line because the process
+/// restarts moments later, and one row per distinct reason because it must not
+/// repeat — see [`record_update_unfinished`].
+const UPDATE_UNFINISHED_TARGET: &str = "mahbot::self_update";
+const UPDATE_UNFINISHED_MESSAGE: &str = "the update could not be completed in full";
+
+/// A step of an update that could not be done, as it is recorded durably and told
+/// to the admin.
+struct UnfinishedStep {
+    /// The step that failed — the whole of what is recorded, and never a path or
+    /// anything else taken from the owner's environment.
+    reason: &'static str,
+    /// Whether the update stops here. A step that stops the update is already
+    /// reported to the admin by the ordinary failure line, so its record raises no
+    /// second sentence on the phone about the same fact; a step the update goes on
+    /// past would otherwise be told to him nowhere.
+    stops_update: bool,
+}
+
+/// The standard per-user programs directory could not be written to, so the new
+/// version could not be put where the install scripts put it. The update stops here
+/// and the copy that is already there keeps working.
+const STANDARD_DIR_UNUSABLE: UnfinishedStep = UnfinishedStep {
+    reason: "the standard per-user programs directory could not be written to",
+    stops_update: true,
+};
+
+/// A second copy of the product — the one this instance came from when it moved
+/// itself, or the one the old way of installing left in the toolchain's own
+/// directory — could not be removed, so it stays on the disk beside the running
+/// one. One reason for both, because they are the same failing step on the same kind
+/// of file: a second sentence for it would be one fact told twice. The update goes
+/// through, so this is the only word the admin gets about it.
+const SECOND_COPY_REMAINS: UnfinishedStep = UnfinishedStep {
+    reason: "a second copy of the product could not be taken away",
+    stops_update: false,
+};
+
+/// Record a partly-finished update durably, and tell the admin about it once — when
+/// it is not already being told about the same failing step by the ordinary failure
+/// line (see [`UnfinishedStep::stops_update`]).
+///
+/// The record is written straight into the logs store — which is what the
+/// product's own issues view reads — because the tracing writer is asynchronous
+/// and the update path calls `exit(0)`, so a `tracing::warn!` here would be lost
+/// with the process. It names only the step that failed, never a path and never a
+/// value read from the owner or his environment, and a reason the store already
+/// holds is not written again — across restarts, which is where the repeat would
+/// otherwise come from. A read of what the store already holds that fails is no
+/// answer at all: the step is recorded regardless, because a possible second row for
+/// one reason is better than silence about it.
+async fn record_update_unfinished(admin_target: Option<&str>, step: UnfinishedStep) {
+    let Some(store) = crate::logs::LOG_STORE.get() else {
+        warn!(
+            reason = step.reason,
+            "Logs store is not up — an unfinished update cannot be recorded"
+        );
+        return;
+    };
+    match store
+        .has_reason(UPDATE_UNFINISHED_MESSAGE, step.reason)
+        .await
+    {
+        // This reason has been recorded before: one fact, told once.
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => warn!(
+            error = %e,
+            "Could not read whether this unfinished update was already recorded — recording it again"
+        ),
+    }
+    let entry = crate::logs::LogEntry {
+        timestamp: crate::db::now(),
+        level: "WARN".to_string(),
+        target: UPDATE_UNFINISHED_TARGET.to_string(),
+        message: UPDATE_UNFINISHED_MESSAGE.to_string(),
+        fields: serde_json::json!({ "reason": step.reason }),
+        ..Default::default()
+    };
+    // The row is the durable record of what happened here.
+    if let Err(e) = store.insert_batch(&[entry]).await {
+        warn!(error = %e, "Could not record an unfinished update");
+        return;
+    }
+    // The row above is the whole of what a fatal step adds: the ordinary failure
+    // line already tells him which step failed.
+    if step.stops_update {
+        return;
+    }
+    let message = format!("⚠️ {UPDATE_UNFINISHED_MESSAGE}: {}.", step.reason);
+    notify_admin(&message, admin_target).await;
+}
 
 // ── Execute update ────────────────────────────────────────────────────────
 
@@ -745,7 +1065,8 @@ pub fn update_is_finalizing() -> bool {
 }
 
 /// Verify `cargo` is on PATH, returning an error with a mode-appropriate
-/// message otherwise. Shared by both update modes.
+/// message otherwise. The build-from-sources path only: updating a downloaded
+/// copy never runs cargo.
 async fn verify_cargo_on_path(action: &str) -> Result<()> {
     let mut cmd = tokio::process::Command::new("cargo");
     #[cfg(windows)]
@@ -766,7 +1087,7 @@ async fn verify_cargo_on_path(action: &str) -> Result<()> {
 /// Resolve the admin Telegram reply target for update notifications, logging
 /// the rationale (info/warn) when notifications cannot be sent. Resolution is
 /// per-call — a DB round trip to find the admin and its channel bindings.
-/// Shared by both update modes.
+/// Shared by both update paths.
 async fn resolve_update_admin_target() -> Option<String> {
     let admin_target = resolve_admin_telegram_target().await;
     // Log info-level rationale when notifications cannot be sent.
@@ -784,12 +1105,12 @@ async fn resolve_update_admin_target() -> Option<String> {
     admin_target
 }
 
-/// Execute a self-update, dispatching on the install mode:
+/// Execute a self-update, dispatching on the update mode:
 ///
-/// - [`UpdateMode::LocalCheckout`]: build from the local checkout into a temp
-///   root, swap the binary, refresh the cargo bin copy, restart.
-/// - [`UpdateMode::Registry`]: `cargo install <crate> --force` into a temp root
-///   from crates.io, swap the binary, refresh the cargo bin copy, restart.
+/// - [`UpdateMode::SourceTree`]: build from this working tree into a temp root,
+///   swap the binary, restart.
+/// - [`UpdateMode::Downloaded`]: download this system's ready-made release file,
+///   put it at the standard per-user location, restart.
 ///
 /// Called from the GUI update button and the Telegram `/update` command.
 /// Only one update runs at a time — concurrent calls return an error immediately.
@@ -809,8 +1130,8 @@ pub(crate) async fn execute_update() -> Result<()> {
     // exits the process.
     update_cache().in_progress.store(true, Ordering::SeqCst);
     let result = match update_mode() {
-        UpdateMode::LocalCheckout => execute_local_update().await,
-        UpdateMode::Registry => execute_registry_update().await,
+        UpdateMode::SourceTree => execute_source_tree_update().await,
+        UpdateMode::Downloaded => execute_downloaded_update().await,
     };
     if result.is_err() {
         update_cache().in_progress.store(false, Ordering::SeqCst);
@@ -818,11 +1139,37 @@ pub(crate) async fn execute_update() -> Result<()> {
     result
 }
 
-/// Local-checkout self-update: build from the source checkout into a temp
-/// root via `cargo install --path`, swap the running binary, refresh the
-/// cargo bin copy, and restart. See [`execute_update`] for the
-/// concurrent-guard and exit contracts.
-async fn execute_local_update() -> Result<()> {
+/// Drive a whole update with no window at all, when a version was named through
+/// [`UPDATE_TO_VERSION_ENV`]: wait for the stores and channels, then run
+/// [`execute_update`].
+///
+/// Returns immediately unless the version named through [`UPDATE_TO_VERSION_ENV`]
+/// differs from the running one *and* this copy updates by downloading — an
+/// ordinary copy (no named version) never reaches the update here. It then waits
+/// for the stores and the channels to come up before running [`execute_update`],
+/// and reports a failure instead of restarting anything. The hook terminates by
+/// itself: after the restart, the replacement instance sees the named version as
+/// its own and does nothing. See the module doc — this and
+/// [`RELEASE_BASE_URL_ENV`] are the only test-only paths in this file.
+pub async fn run_env_named_update() {
+    /// Long enough for the stores and the channels to be up when the update runs.
+    const SETTLE_DELAY: Duration = Duration::from_secs(15);
+
+    if update_target_override().is_none() || update_mode() != UpdateMode::Downloaded {
+        return;
+    }
+    if !crate::shutdown::sleep_or_shutdown_or_drain(SETTLE_DELAY).await {
+        return;
+    }
+    if let Err(e) = execute_update().await {
+        error!(error = %e, "The update to the version named in the environment did not complete");
+    }
+}
+
+/// The build-from-sources self-update: build from this working tree into a temp
+/// root via `cargo install --path`, swap the running binary, and restart. See
+/// [`execute_update`] for the concurrent-guard and exit contracts.
+async fn execute_source_tree_update() -> Result<()> {
     // 1. Validate prerequisites.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let cargo_toml = manifest_dir.join("Cargo.toml");
@@ -850,7 +1197,7 @@ async fn execute_local_update() -> Result<()> {
 
     // 4. Create temp roots for the install and the cargo build. Held in scope
     //    for the whole update so an install/spawn failure RAII-cleans them; on
-    //    success `std::process::exit(0)` bypasses RAII, so `finalize_install`
+    //    success `std::process::exit(0)` bypasses RAII, so the finalize tail
     //    removes them explicitly before the lock release and spawn. The cold
     //    release rebuild of the heavy dep tree can be several-GB; the temp
     //    roots land under the (pinned) system temp dir, which on macOS is the
@@ -888,76 +1235,195 @@ async fn execute_local_update() -> Result<()> {
     )
     .await?;
 
-    // 6. Shared tail: swap, PATH freshness, drain, checkpoint, restart.
+    // 6. Tail: validate, swap the running binary, notify, drain, restart.
     let fresh_binary = temp_bin_path(&install_root);
-    finalize_install(
+    finalize_source_tree_update(
         &fresh_binary,
         admin_target.as_deref(),
-        UPDATE_BUILD_COMPLETE_MSG,
         vec![install_root, build_dir],
     )
     .await
 }
 
-/// Registry self-update: `cargo install <crate> --force` from crates.io into a
-/// temp root, swap the running binary, refresh the cargo bin copy, and restart.
-/// See [`execute_update`] for the concurrent-guard and exit contracts.
-async fn execute_registry_update() -> Result<()> {
-    // Verify cargo is on PATH.
-    verify_cargo_on_path("install from crates.io").await?;
+/// The downloaded-copy self-update: fetch this system's ready-made release file,
+/// extract it, put it at the standard per-user location, and restart. See
+/// [`execute_update`] for the concurrent-guard and exit contracts.
+async fn execute_downloaded_update() -> Result<()> {
+    // 1. A system with no published file for it is refused before anything happens
+    //    at all: downloading one and putting it in place would leave this copy
+    //    replaced by a file that cannot load — no working copy, the one state an
+    //    update must never produce. The install scripts refuse the same systems.
+    if let Some(reason) = absent_release_file().await {
+        anyhow::bail!("{reason} — no update was made.");
+    }
 
-    // 1. Look up admin Telegram reply_target.
+    // 2. The version to move to. A version named through [`UPDATE_TO_VERSION_ENV`]
+    //    is taken outright — any version other than the running one is a step it
+    //    deliberately asked for; the ordinary path reads the newest published
+    //    release and only ever moves forward, so a published release is never a
+    //    step back. Nothing at all is installed when the version cannot be
+    //    determined.
+    let target = if let Some(named) = update_target_override() {
+        named
+    } else {
+        let latest = fetch_latest_release_version().await?.ok_or_else(|| {
+            anyhow!("The newest published MahBot version could not be determined.")
+        })?;
+        let current = current_version()?;
+        anyhow::ensure!(
+            latest > current,
+            "The newest published MahBot version {latest} is not newer than the running \
+             {current} — no update was made."
+        );
+        latest
+    };
+
+    // 3. The admin every notification goes to, and the file the new version goes
+    //    in place of — or is placed at, for a copy whose own file sits elsewhere:
+    //    the standard per-user programs location the install scripts use. A location
+    //    that cannot be resolved cannot be written to either, so it is the same
+    //    failing step as a placement that fails — recorded and reported the same way
+    //    — and nothing is downloaded.
     let admin_target = resolve_update_admin_target().await;
+    let Some(dest) = crate::util::managed_bin::mahbot_install_dir()
+        .map(|dir| dir.join(crate::util::managed_bin::product_file_name()))
+    else {
+        record_update_unfinished(admin_target.as_deref(), STANDARD_DIR_UNUSABLE).await;
+        anyhow::bail!("The standard install location could not be resolved — no update was made.");
+    };
 
-    // 2. Notify: install started.
+    // 4. Notify: download started (the Telegram channel must still be live for
+    //    every notification in this function).
     notify_admin(
-        "🔄 Update started — installing from crates.io…",
+        "🔄 Update started — downloading the new version…",
         admin_target.as_deref(),
     )
     .await;
 
-    // 3. Create the temp install root, held for the whole update (RAII on error;
-    //    explicit cleanup in the finalize tail — see `finalize_install`).
-    let temp_install_root =
-        tempfile::tempdir().context("Failed to create temp install root for self-update")?;
-    let install_root = temp_install_root.path().to_path_buf();
-
-    // 4. Run `cargo install <crate> --root <temp_install> --force`. No
-    //    `--locked`: the published .crate ships a Cargo.lock, but a stale
-    //    lockfile would hard-fail the install; plain `cargo install`
-    //    re-resolves when the lock is stale. No `--target-dir`: cargo builds in
-    //    its own temp target dir (`CARGO_TARGET_DIR` is stripped, so a hostile
-    //    env cannot redirect it; a user `build.target-dir` config is a residual
-    //    disk edge). cwd is the storage root (it is guaranteed writable and
-    //    exists, unlike the launch dir).
-    let crate_name = env!("CARGO_PKG_NAME");
-    run_cargo_with_timeout(
-        &[
-            OsStr::new("install"),
-            OsStr::new(crate_name),
-            OsStr::new("--root"),
-            install_root.as_os_str(),
-            OsStr::new("--force"),
-        ],
-        &crate::config::CONFIG.global_storage_root(),
-        Duration::from_hours(1),
-        &format!("cargo install {crate_name} --force"),
-        &CargoStep {
-            toast_head: "Update failed",
-            admin_head: "Failed to install from crates.io",
-        },
-    )
-    .await?;
-
-    // 5. Shared tail: swap, PATH freshness, drain, checkpoint, restart.
-    let fresh_binary = temp_bin_path(&install_root);
-    finalize_install(
-        &fresh_binary,
-        admin_target.as_deref(),
-        UPDATE_INSTALL_COMPLETE_MSG,
-        vec![install_root],
+    // 5. Download this system's archive and extract the single file from it. The
+    //    temp dir is held in scope for the whole update (RAII on error; explicit
+    //    removal in the finalize tail, before the lock release and spawn).
+    let temp_dir = tempfile::tempdir().context("Failed to create temp dir for self-update")?;
+    let (os, arch) = crate::util::managed_bin::host_os_arch().map_err(|e| anyhow!("{e}"))?;
+    let name = asset_name(&target, os, arch);
+    let url = asset_url(&release_base_url(), &target, os, arch);
+    let client = crate::util::http::build_download_client(DOWNLOAD_TIMEOUT)
+        .context("Failed to build the download client for self-update")?;
+    let archive = temp_dir.path().join(&name);
+    crate::util::http::download_verified(
+        &client,
+        &url,
+        &archive,
+        // The product's own file: it is published beside the version that names
+        // it, so there is deliberately no checksum to verify it against.
+        "",
+        Some(DOWNLOAD_TIMEOUT),
+        crate::util::http::DownloadSizeCheck::Exact,
+        |_, _| {},
     )
     .await
+    .with_context(|| format!("Failed to download {name}"))?;
+    // The archive runs a zip for Windows and a tar.gz everywhere else — the
+    // platform split [`asset_name`] owns.
+    let extract = if os == "windows" {
+        crate::util::managed_bin::extract_single_file_zip
+    } else {
+        crate::util::managed_bin::extract_single_file_tar_gz
+    };
+    let fresh = extract(
+        &archive,
+        temp_dir.path(),
+        crate::util::managed_bin::product_file_name(),
+    )
+    .map_err(|e| anyhow!("Failed to extract {name}: {e}"))?;
+
+    // 6. Put it in place. When the running file IS the standard location, the
+    //    swap rewrites that file in place and the restart target is that same
+    //    path. Otherwise this is a ready-made copy whose file sits outside the
+    //    standard location (it "moves itself" there): the new file is placed at
+    //    the standard location and the restart target is that new copy.
+    let current_exe = std::env::current_exe().context("Failed to resolve current_exe()")?;
+    let (spawn_path, relocated) = if canonicalize_safe(&current_exe) == canonicalize_safe(&dest) {
+        // The running file IS the standard location, so the swap rewrites it in
+        // place. A swap that fails leaves the copy that is there working, and the
+        // step that failed is recorded durably like every other.
+        if let Err(e) = self_replace::self_replace(&fresh) {
+            record_update_unfinished(admin_target.as_deref(), STANDARD_DIR_UNUSABLE).await;
+            return Err(e).with_context(|| format!("Failed to swap binary at {}", fresh.display()));
+        }
+        (current_exe, false)
+    } else {
+        if let Err(reason) = crate::util::managed_bin::place_extracted(&fresh, &dest) {
+            record_update_unfinished(admin_target.as_deref(), STANDARD_DIR_UNUSABLE).await;
+            anyhow::bail!("Could not put the new version at the standard location: {reason}");
+        }
+        (dest.clone(), true)
+    };
+
+    // 7. Take away the copies a working installation must not leave behind: the one
+    //    this instance came from, when this copy moved itself, and the one the old
+    //    way of installing (`cargo install mahbot`) left in the toolchain's own
+    //    directory — a removal an earlier update may have failed to make, tried
+    //    again here because this runs at every update. The running image itself needs
+    //    the platform's own way of getting rid of it — `self_delete` unlinks the
+    //    file on unix and, on Windows, where a running image cannot be unlinked,
+    //    renames it aside and schedules the deletion. The update goes through either
+    //    way: a leftover is recorded durably, never fatal.
+    //
+    //    The failure itself is a developer's line (it carries the platform's own
+    //    error, path and all) and so is logged below the owner's view: what he sees
+    //    of this step is the durable record, one row per distinct reason.
+    if relocated && let Err(e) = self_replace::self_delete() {
+        debug!(error = %e, "Could not remove the copy this instance came from");
+        record_update_unfinished(admin_target.as_deref(), SECOND_COPY_REMAINS).await;
+    }
+    if let Some(legacy) = legacy_copy(&dest)
+        && let Err(e) = fs::remove_file(&legacy)
+    {
+        debug!(error = %e, "Could not remove the copy the old way of installing left behind");
+        record_update_unfinished(admin_target.as_deref(), SECOND_COPY_REMAINS).await;
+    }
+
+    // 8. Notify: in place, then wrapping up before the restart (MUST be before
+    //    the shutdown in finalize_update_and_restart — the Telegram channel must
+    //    still be live).
+    notify_admin(UPDATE_DOWNLOAD_COMPLETE_MSG, admin_target.as_deref()).await;
+    notify_admin(UPDATE_RESTART_MSG, admin_target.as_deref()).await;
+
+    // 9. Shared finalize tail. The temp dir is never the spawn target (that is
+    //    always the file the update left in place).
+    finalize_update_and_restart(&spawn_path, vec![temp_dir.path().to_path_buf()]).await
+}
+
+/// The copy the old way of installing leaves behind — the product's own file in the
+/// toolchain's binary directory (`$CARGO_HOME/bin`, else `~/.cargo/bin`) — when one
+/// is there that is neither the file this instance is running from nor the file this
+/// update has just put in place. `None` otherwise.
+///
+/// A downloaded copy is updated at the standard per-user programs directory from the
+/// second update on, so without this the leftover of a failed move would never be
+/// looked at again. It is computed fresh — from the toolchain's own convention, which
+/// is where `cargo install` puts a command and where the install scripts look for it
+/// too — rather than remembered, and the path is never part of what gets recorded.
+///
+/// `dest` is excluded because a `CARGO_HOME` can name the install directory itself
+/// (`~/.local` on unix), where the toolchain's binary directory *is* the standard
+/// per-user programs directory: removing that would take away the file the update
+/// just put there, leaving nothing to start.
+fn legacy_copy(dest: &Path) -> Option<PathBuf> {
+    let path = crate::util::cargo_bin_dir()?.join(crate::util::managed_bin::product_file_name());
+    if !path.is_file() {
+        return None;
+    }
+    let path = canonicalize_safe(&path);
+    // The file this instance is running from is the move's business, not this one's,
+    // and the destination is what this update placed: only a copy that is neither is
+    // removed here.
+    if path == canonicalize_safe(&std::env::current_exe().ok()?) || path == canonicalize_safe(dest)
+    {
+        return None;
+    }
+    Some(path)
 }
 
 /// Path to the freshly built `mahbot` binary inside a cargo install temp root.
@@ -967,39 +1433,32 @@ async fn execute_registry_update() -> Result<()> {
 fn temp_bin_path(install_root: &Path) -> PathBuf {
     install_root
         .join("bin")
-        .join(format!("mahbot{}", std::env::consts::EXE_SUFFIX))
+        .join(crate::util::managed_bin::product_file_name())
 }
 
-/// Shared finalize tail for both update modes, after `cargo install` produced
-/// the fresh binary at `<temp_install>/bin/mahbot`.
+/// The build-from-sources tail, after `cargo install --path` produced the fresh
+/// binary at `<temp_install>/bin/mahbot`.
 ///
 /// 1. Validate that the fresh binary exists and is non-empty (bail otherwise —
 ///    a silent empty swap would strand the instance).
-/// 2. Capture `current_exe()` BEFORE the swap — it is always the restart
-///    target (self_replace rewrites it in place, wherever it lives).
+/// 2. Capture `current_exe()` BEFORE the swap — it is the restart target
+///    (self_replace rewrites it in place, wherever it lives).
 /// 3. Swap the running binary with the fresh one via `self_replace`. The source
 ///    differs from the running exe (it lives in the temp root), which
 ///    self-replace requires on Windows.
-/// 4. Notify `completion_msg` (mode-specific: [`UPDATE_BUILD_COMPLETE_MSG`] /
-///    [`UPDATE_INSTALL_COMPLETE_MSG`]).
-/// 5. Refresh the PATH-visible cargo bin copy (sourced from the freshly-swapped
-///    `current_exe`, so the manual-remediation source survives temp-root
-///    cleanup), skipping the copy when already running from the cargo bin path
-///    (`copy_to_cargo_bin`'s rename would otherwise fail on a Windows binary
-///    locked in place).
-/// 6. Notify [`UPDATE_RESTART_MSG`] (Telegram channel must still be live).
-/// 7. Hand off to [`finalize_update_and_restart`] for the drain → checkpoint →
-///    temp-root cleanup → unlock → spawn-from-`current_exe` → exit.
+/// 4. Notify [`UPDATE_BUILD_COMPLETE_MSG`], then [`UPDATE_RESTART_MSG`] (the
+///    Telegram channel must still be live for both).
+/// 5. Hand off to [`finalize_update_and_restart`] for the drain → checkpoint →
+///    temp-root removal → unlock → spawn-from-`current_exe` → exit.
 ///
 /// `cleanup_paths` are the temp roots to remove before the instance-lock release
 /// and spawn. On any error return the caller keeps the `TempDir` values in
 /// scope, so their RAII drops clean them up; `std::process::exit(0)` bypasses
 /// RAII, so the success path removes them in [`finalize_update_and_restart`]
 /// instead.
-async fn finalize_install(
+async fn finalize_source_tree_update(
     fresh_binary: &Path,
     admin_target: Option<&str>,
-    completion_msg: &str,
     cleanup_paths: Vec<PathBuf>,
 ) -> Result<()> {
     // 1. Validate the freshly built binary.
@@ -1020,19 +1479,13 @@ async fn finalize_install(
     self_replace::self_replace(fresh_binary)
         .with_context(|| format!("Failed to swap binary at {}", fresh_binary.display()))?;
 
-    // 4. Notify: install/build complete (swap succeeded).
-    notify_admin(completion_msg, admin_target).await;
-
-    // 5. Refresh the PATH-visible cargo bin copy (non-fatal). The source is the
-    //    freshly-swapped `current_exe` (not the temp root), so the manual
-    //    remediation in `stale_binary_notification` points at a surviving path.
-    refresh_cargo_bin(&current_exe, admin_target).await;
-
-    // 6. Notify: wrapping up before the restart (MUST be before the shutdown in
-    //    finalize_update_and_restart — the Telegram channel must still be live).
+    // 4. Notify: build complete (swap succeeded), then wrapping up before the
+    //    restart (MUST be before the shutdown in finalize_update_and_restart —
+    //    the Telegram channel must still be live).
+    notify_admin(UPDATE_BUILD_COMPLETE_MSG, admin_target).await;
     notify_admin(UPDATE_RESTART_MSG, admin_target).await;
 
-    // 7. Shared finalize tail. The temp roots are removed in the tail (before
+    // 5. Shared finalize tail. The temp roots are removed in the tail (before
     //    the instance-lock release and spawn) rather than by RAII: `exit(0)`
     //    bypasses destructors, and they are never the spawn target (which is
     //    always `current_exe`), so removal cannot race macOS Gatekeeper
@@ -1040,11 +1493,13 @@ async fn finalize_install(
     finalize_update_and_restart(&current_exe, cleanup_paths).await
 }
 
-/// Shared finalize tail for both update modes: graceful drain, final
-/// single-writer checkpoint, temp-root cleanup, instance-lock release, independent
+/// Shared finalize tail for both update paths: graceful drain, final
+/// single-writer checkpoint, temp-dir removal, instance-lock release, independent
 /// spawn of the replacement, and `exit(0)`.
 ///
-/// The ordering is load-bearing and MUST NOT be rearranged:
+/// `spawn_path` is the file the update left in place — the working file the
+/// replacement instance runs from. The ordering is load-bearing and MUST NOT be
+/// rearranged:
 ///
 /// 1. Graceful drain (the FULL drain, same as window close — NOT fast-cancel).
 ///    In-flight agents complete their current round; the drain-watch task fires
@@ -1064,18 +1519,20 @@ async fn finalize_install(
 ///    replacement is live (the GUI exit path waits while the update is
 ///    finalizing — see `save_and_exit` / `update_is_finalizing`).
 /// 3. Remove the temp update roots BEFORE releasing the instance lock or
-///    spawning: `exit(0)` below bypasses Rust destructors, so the multi-GB
-///    deletion must complete here while the old process still holds Turso's
-///    exclusive open-time fcntl locks on the store files (connections are
+///    spawning: `exit(0)` below bypasses Rust destructors, so the (potentially
+///    multi-GB) deletion must complete here while the old process still holds
+///    Turso's exclusive open-time fcntl locks on the store files (connections are
 ///    never formally closed). If the child booted while they were held, its
 ///    store open would fail on the lock — boot has only a bounded retry, not
 ///    immunity. Keeping the instance flock held during cleanup also prevents a
 ///    manually started second instance from sneaking in. Safe to delete before
-///    spawn because the spawn target is ALWAYS the `current_exe()` path
-///    captured before the in-place `self_replace` swap in `finalize_install` —
-///    never a temp root — so cleanup can never delete the binary the child is
-///    validating; macOS syspolicyd SIGKILLs children whose binary is deleted
-///    during async code-signature validation, and that invariant must hold.
+///    spawn because the spawn target is ALWAYS the working file the update put in
+///    place — never a temp root — so cleanup can never delete the binary the
+///    child is validating; macOS syspolicyd SIGKILLs children whose binary is
+///    deleted during async code-signature validation, and that invariant must
+///    hold. In the build-from-sources path the working file is `current_exe()`
+///    (in-place `self_replace`); in the downloaded-copy path it is the standard
+///    location the new file was placed at.
 /// 4. Release the instance lock so the child can acquire it.
 /// 5. Spawn the new instance, marked as the update hand-off ([`HANDOFF_ENV`] —
 ///    see [`acquire_lock`]). On macOS, posix_spawn triggers asynchronous
@@ -1085,7 +1542,7 @@ async fn finalize_install(
 ///
 /// On spawn failure (step 5) the process stays alive and the update returns
 /// `Err`, having already removed its temp roots — acceptable, since they are
-/// transient build artifacts (the caller keeps the `TempDir` values in scope
+/// transient update artifacts (the caller keeps the `TempDir` values in scope
 /// and RAII cleans any leftover).
 async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathBuf>) -> Result<()> {
     // 1. Begin the graceful drain.
@@ -1179,9 +1636,8 @@ impl std::fmt::Display for CargoStepFailure {
 
 impl std::error::Error for CargoStepFailure {}
 
-/// Run a long-running cargo subcommand with a timeout. Shared by the
-/// local-build and registry-install update paths (the only differences are the
-/// arguments, working directory, timeout, and user-facing labels).
+/// Run a long-running cargo subcommand with a timeout — the build-from-sources
+/// update path's only cargo runner.
 ///
 /// `args` are the cargo arguments (excluding the `cargo` binary itself, each
 /// as `&OsStr` so paths and flags pass through without Unicode assumption),
@@ -1190,11 +1646,11 @@ impl std::error::Error for CargoStepFailure {}
 /// "cargo install --path --locked"), and `step` the two heads a failure of this
 /// step is reported under.
 ///
-/// `CARGO_TARGET_DIR` is stripped so `cargo install` (registry mode, which
-/// passes no `--target-dir`) never redirects its build into an uncleaned tree;
-/// local mode passes `--target-dir` explicitly, which takes precedence, so this
-/// is purely defensive. `CARGO_HOME` is NOT stripped — the child needs it for
-/// the toolchain/registry cache.
+/// The caller passes `--target-dir` explicitly, which takes precedence over any
+/// inherited `CARGO_TARGET_DIR` — that variable is stripped anyway, so no stray
+/// value can redirect the build out of the tree the update cleans up after
+/// itself. `CARGO_HOME` is NOT stripped — the child needs it for the
+/// toolchain/registry cache.
 ///
 /// On failure the error is returned (no admin notification — the caller owns
 /// failure reporting via the single [`handle_update_command`]/GUI path).
@@ -1209,13 +1665,13 @@ async fn run_cargo_with_timeout(
     let mut cmd = tokio::process::Command::new("cargo");
     #[cfg(windows)]
     cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+
     let cargo_result = tokio::time::timeout(
         timeout,
         cmd.args(args)
             .current_dir(cwd)
-            // Strip any inherited CARGO_TARGET_DIR so registry-mode cargo
-            // install (no --target-dir) never redirects its build into an
-            // uncleaned tree.
+            // Strip any inherited CARGO_TARGET_DIR so a stray value can never
+            // redirect the build out of the tree this update cleans up.
             .env_remove("CARGO_TARGET_DIR")
             // kill_on_drop: if the timeout fires, the cargo child must die
             // too rather than keep compiling in the background. For
@@ -1316,7 +1772,9 @@ const UPDATE_IN_PROGRESS_MSG: &str =
 ///
 /// Gated on the shared availability cache (admin + update available), with a
 /// synchronous reply for the early-failure cases (not an admin / already in
-/// progress / no update / cargo not on PATH). The actual update runs as a
+/// progress / no update / cargo not on PATH — the last only when this copy's
+/// update has to build, so a downloaded copy is never held up by a toolchain it
+/// does not use). The actual update runs as a
 /// spawned async task so it does not block the Telegram message dispatch loop.
 /// Progress notifications route via the normal update notification path (the
 /// admin's Telegram binding); a failure is also reported directly to the
@@ -1348,8 +1806,11 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
     // Synchronous pre-check so the early-failure reply is guaranteed before the
     // update is spawned. `cargo --version` is cheap, but this briefly awaits a
     // subprocess inline in the dispatch loop — accepted so the invoker gets an
-    // immediate answer instead of a silent no-op.
-    if let Err(e) = verify_cargo_on_path("perform the update").await {
+    // immediate answer instead of a silent no-op. Only a copy built from sources
+    // needs cargo at all; a downloaded copy is never built here.
+    if update_mode() == UpdateMode::SourceTree
+        && let Err(e) = verify_cargo_on_path("perform the update").await
+    {
         crate::channels::telegram::send_reply(
             &msg.reply_target,
             &format!("Cannot start the update: {e}"),
@@ -1374,13 +1835,13 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
 
     crate::channels::telegram::send_reply(
         &msg.reply_target,
-        "✅ Update triggered — it will build/install in the background and restart the daemon when complete.",
+        "✅ Update triggered — it will run in the background and restart the daemon when complete.",
     )
     .await;
 
-    // Fire-and-forget: the build/install (10–60 min) must not block the
-    // dispatch loop. Progress notifications route via the normal update
-    // notification path (the admin's bound Telegram target); on failure the invoking admin is
+    // Fire-and-forget: the update must not block the dispatch loop. Progress
+    // notifications route via the normal update notification path (the admin's
+    // bound Telegram target); on failure the invoking admin is
     // also told directly so a non-primary invoker isn't left guessing.
     let invoker_target = msg.reply_target.clone();
     tokio::spawn(async move {
@@ -1397,151 +1858,10 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
     });
 }
 
-// ── Cargo bin path resolution and installation ───────────────────────────
-
-/// Resolve the path to the `mahbot` binary in the cargo bin directory.
-///
-/// Delegates to [`crate::util::cargo_bin_dir`] for directory resolution,
-/// then appends the platform-specific executable name.
-fn resolve_cargo_bin_path() -> Option<PathBuf> {
-    let exe_name = format!("mahbot{}", std::env::consts::EXE_SUFFIX);
-    Some(crate::util::cargo_bin_dir()?.join(exe_name))
-}
-
-/// Copy the freshly built binary to the PATH-visible cargo bin path, so a
-/// `mahbot` invoked from PATH runs the new version even when the instance
-/// started from a different path (e.g. the repo's `target/release`).
-///
-/// The source is the freshly-swapped `current_exe` (the running binary after
-/// `self_replace`), which persists across the temp-root cleanup — so the manual
-/// remediation in [`copy_to_cargo_bin`] points at a surviving path.
-///
-/// Skipped when already running from the cargo bin path (self_replace already
-/// updated it in place) — copying onto it would fail the rename on a Windows
-/// binary locked in place. Non-fatal: the running binary is already updated via
-/// self_replace; failures are logged and reported to the admin inside
-/// [`copy_to_cargo_bin`].
-async fn refresh_cargo_bin(current_exe: &Path, admin_target: Option<&str>) {
-    let Some(cargo_bin) = resolve_cargo_bin_path() else {
-        warn!("No cargo bin path resolved — PATH-visible binary not refreshed");
-        return;
-    };
-    if canonicalize_safe(current_exe) == canonicalize_safe(&cargo_bin) {
-        info!(
-            "Already running from cargo bin path `{}` — skipping install copy",
-            cargo_bin.display()
-        );
-        return;
-    }
-    copy_to_cargo_bin(current_exe, &cargo_bin, admin_target).await;
-}
-
-/// Format an admin-facing notification for a copy-to-cargo-bin failure.
-///
-/// The message tells the admin that the PATH-visible binary is stale and
-/// provides manual remediation steps.
-fn stale_binary_notification(reason: &str, source: &Path, dest: &Path) -> String {
-    format!(
-        "⚠️ {reason}. \
-         The running binary is updated, but the PATH-visible binary \
-         remains stale. Manually copy `{}` to `{}`.",
-        source.display(),
-        dest.display(),
-    )
-}
-
-/// Copy the newly built binary to the cargo install bin path.
-///
-/// Uses a temp-file + rename pattern for crash safety: writes to a
-/// `.mahbot_update_tmp` sibling first, then atomically renames. If the process
-/// crashes mid-copy, the install path retains its old (stale but valid) binary.
-///
-/// This function is intentionally non-fatal — the running process is already
-/// updated via `self_replace`, so the caller doesn't need a result. On failure
-/// it logs a warning and attempts admin notification.
-async fn copy_to_cargo_bin(source: &Path, dest: &Path, admin_target: Option<&str>) {
-    // Create parent directory if it doesn't exist.
-    if let Some(parent) = dest.parent()
-        && let Err(e) = fs::create_dir_all(parent)
-    {
-        warn!(
-            error = %e,
-            path = %parent.display(),
-            "Failed to create cargo bin directory"
-        );
-        notify_admin(
-            &stale_binary_notification(
-                &format!(
-                    "Could not create cargo bin directory `{}`",
-                    parent.display()
-                ),
-                source,
-                dest,
-            ),
-            admin_target,
-        )
-        .await;
-        return;
-    }
-
-    // Write to a temp file first, then atomically rename to the target.
-    // This prevents a partial/corrupt binary at the install path if the
-    // process crashes during the copy.
-    let tmp_path = dest.with_extension("mahbot_update_tmp");
-    let _ = fs::remove_file(&tmp_path); // Clean up any leftover from a previous crash.
-
-    if let Err(e) = fs::copy(source, &tmp_path) {
-        warn!(
-            error = %e,
-            path = %dest.display(),
-            "Failed to copy binary to cargo bin temp path"
-        );
-        let _ = fs::remove_file(&tmp_path);
-        notify_admin(
-            &stale_binary_notification(
-                &format!("Could not install updated binary to `{}`", dest.display()),
-                source,
-                dest,
-            ),
-            admin_target,
-        )
-        .await;
-        return;
-    }
-
-    // Atomically replace the target with the temp file. Deliberately not
-    // routed through `stale_binary_notification` like the copy failure above:
-    // this message is more actionable — it names the exact rename error and
-    // the temp path instead of the generic remediation.
-    if let Err(e) = fs::rename(&tmp_path, dest) {
-        warn!(
-            error = %e,
-            path = %dest.display(),
-            source = %tmp_path.display(),
-            "Failed to rename temp binary to final path"
-        );
-        let _ = fs::remove_file(&tmp_path);
-        notify_admin(
-            &format!(
-                "⚠️ Could not install updated binary to `{}`: rename failed: {e}. \
-                 The temp file is at `{}`. Manually rename it to complete installation.",
-                dest.display(),
-                tmp_path.display(),
-            ),
-            admin_target,
-        )
-        .await;
-        return;
-    }
-
-    info!(path = %dest.display(), "Installed new binary to cargo bin path");
-}
-
 /// Canonicalize a path, falling back to the lexical path on failure.
 ///
-/// Used for canonicalized-path comparisons where the file may not exist yet
-/// (e.g., the cargo bin install path before installation) or where
-/// canonicalization may fail for other reasons (e.g., broken symlinks,
+/// Used for canonicalized-path comparisons where the file may not exist yet or
+/// where canonicalization may fail for other reasons (e.g., broken symlinks,
 /// permission denied).
 fn canonicalize_safe(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
@@ -1551,7 +1871,8 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
 /// path.
 ///
 /// The `binary_path` must point to an existing, executable binary — always the
-/// captured `current_exe()` after the swap in the unified update flow.
+/// working file the update left in place, and never a temp root (see
+/// [`finalize_update_and_restart`]).
 ///
 /// The child is marked as the update hand-off ([`HANDOFF_ENV`] — see
 /// [`acquire_lock`]).
@@ -1658,7 +1979,6 @@ fn truncate_to_last_64k(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::util::lock::{lock_file_path, try_flock};
-    use crate::util::test::make_executable;
 
     #[test]
     fn test_truncate_to_last_64k_no_truncation() {
@@ -1791,13 +2111,13 @@ mod tests {
     fn test_update_mode_detection() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Local checkout: `.git` present → LocalCheckout even with Cargo.toml.
+        // A working tree: `.git` present → SourceTree even with Cargo.toml.
         let checkout = dir.path().join("checkout");
         std::fs::create_dir_all(checkout.join(".git")).unwrap();
         std::fs::write(checkout.join("Cargo.toml"), "").unwrap();
-        assert_eq!(classify_update_mode(&checkout), UpdateMode::LocalCheckout);
+        assert_eq!(classify_update_mode(&checkout), UpdateMode::SourceTree);
 
-        // Registry src cache: `registry/src` segment → Registry even with
+        // Registry src cache: `registry/src` segment → Downloaded even with
         // Cargo.toml (the cargo-installed trap the probe used to misclassify).
         let registry = dir
             .path()
@@ -1808,10 +2128,10 @@ mod tests {
             .join("mahbot-0.3.0");
         std::fs::create_dir_all(&registry).unwrap();
         std::fs::write(registry.join("Cargo.toml"), "").unwrap();
-        assert_eq!(classify_update_mode(&registry), UpdateMode::Registry);
+        assert_eq!(classify_update_mode(&registry), UpdateMode::Downloaded);
 
-        // Git checkouts cache: `git/checkouts` segment → Registry. Cargo
-        // git checkouts are full non-bare clones and contain a real `.git`
+        // Git checkouts cache: `git/checkouts` segment → Downloaded. Cargo git
+        // checkouts are full non-bare clones and contain a real `.git`
         // directory — the source-cache scan must win over the `.git`
         // heuristic (regression guard for that ordering).
         let git_checkout = dir
@@ -1823,7 +2143,7 @@ mod tests {
             .join("main");
         std::fs::create_dir_all(git_checkout.join(".git")).unwrap();
         std::fs::write(git_checkout.join("Cargo.toml"), "").unwrap();
-        assert_eq!(classify_update_mode(&git_checkout), UpdateMode::Registry);
+        assert_eq!(classify_update_mode(&git_checkout), UpdateMode::Downloaded);
 
         // Custom CARGO_HOME layout (no `.cargo` prefix): `registry/src` segment
         // still detected.
@@ -1836,155 +2156,284 @@ mod tests {
             .join("mahbot-0.3.0");
         std::fs::create_dir_all(&custom).unwrap();
         std::fs::write(custom.join("Cargo.toml"), "").unwrap();
-        assert_eq!(classify_update_mode(&custom), UpdateMode::Registry);
+        assert_eq!(classify_update_mode(&custom), UpdateMode::Downloaded);
 
-        // Plain source tree (no .git, no cargo cache): Cargo.toml → LocalCheckout.
+        // Plain source tree (no .git, no cargo cache): Cargo.toml → SourceTree.
         let plain = dir.path().join("plain-src");
         std::fs::create_dir_all(&plain).unwrap();
         std::fs::write(plain.join("Cargo.toml"), "").unwrap();
-        assert_eq!(classify_update_mode(&plain), UpdateMode::LocalCheckout);
+        assert_eq!(classify_update_mode(&plain), UpdateMode::SourceTree);
 
-        // No source at all → Registry (the only viable update path).
+        // No source at all → Downloaded (a ready-made copy is the only way
+        // forward).
         let bare = dir.path().join("bare");
         std::fs::create_dir_all(&bare).unwrap();
-        assert_eq!(classify_update_mode(&bare), UpdateMode::Registry);
+        assert_eq!(classify_update_mode(&bare), UpdateMode::Downloaded);
     }
 
+    /// The asset-name and URL derivation is the contract the release workflow and
+    /// the install scripts mirror, so it is pinned here: the platform tag, the
+    /// extension, and both URL shapes.
     #[test]
-    fn test_sparse_index_path() {
-        assert_eq!(sparse_index_path("a"), "1/a");
-        assert_eq!(sparse_index_path("ab"), "2/ab");
-        assert_eq!(sparse_index_path("abc"), "3/a/abc");
-        assert_eq!(sparse_index_path("mahbot"), "ma/hb/mahbot");
-        assert_eq!(sparse_index_path("serde"), "se/rd/serde");
-    }
+    fn test_release_asset_naming_and_urls() {
+        let base = "https://example.test/owner/repo";
+        let version = semver::Version::new(1, 2, 3);
 
-    #[test]
-    fn test_latest_stable_version_filters_yanked_and_prerelease() {
-        // NDJSON sparse-index fixture lines (subset of real fields).
-        let body = "\
-{\"name\":\"mahbot\",\"vers\":\"0.2.0\",\"yanked\":false}
-{\"name\":\"mahbot\",\"vers\":\"0.3.0\",\"yanked\":false}
-{\"name\":\"mahbot\",\"vers\":\"0.4.0\",\"yanked\":true}
-{\"name\":\"mahbot\",\"vers\":\"0.3.1-beta.1\",\"yanked\":false}
-{\"name\":\"mahbot\",\"vers\":\"0.4.0-rc.1\",\"yanked\":false}
-";
-        let latest = latest_stable_version(body).expect("a stable non-yanked version exists");
-        // 0.3.0 wins: 0.4.0 is yanked, 0.3.1-beta.1 / 0.4.0-rc.1 are prereleases.
-        assert_eq!(latest.to_string(), "0.3.0");
-    }
+        // The platform tag is the `(os, arch)` pair itself; only the extension
+        // splits by platform.
+        for (os, arch, name) in [
+            ("macos", "x86_64", "mahbot-1.2.3-macos-x86_64.tar.gz"),
+            ("macos", "aarch64", "mahbot-1.2.3-macos-aarch64.tar.gz"),
+            ("linux", "x86_64", "mahbot-1.2.3-linux-x86_64.tar.gz"),
+            ("linux", "aarch64", "mahbot-1.2.3-linux-aarch64.tar.gz"),
+            ("windows", "x86_64", "mahbot-1.2.3-windows-x86_64.zip"),
+            ("windows", "aarch64", "mahbot-1.2.3-windows-aarch64.zip"),
+        ] {
+            assert_eq!(asset_name(&version, os, arch), name, "{os}-{arch}");
+        }
 
-    #[test]
-    fn test_latest_stable_version_empty_and_malformed() {
-        assert_eq!(latest_stable_version(""), None);
-        assert_eq!(latest_stable_version("not json\n"), None);
+        // The newest release is found through its own tiny file, an exact version
+        // through its tag.
         assert_eq!(
-            latest_stable_version("{\"vers\":\"1.0.0\"}\n"),
-            Some(semver::Version::new(1, 0, 0))
+            latest_version_url(base),
+            "https://example.test/owner/repo/releases/latest/download/version.txt"
         );
-        // All yanked → None.
         assert_eq!(
-            latest_stable_version("{\"vers\":\"1.0.0\",\"yanked\":true}\n"),
-            None
+            asset_url(base, &version, "windows", "x86_64"),
+            "https://example.test/owner/repo/releases/download/v1.2.3/mahbot-1.2.3-windows-x86_64.zip"
+        );
+
+        // A pre-release version — what a test release carries — uses the same two
+        // shapes, so it needs no separate path.
+        let test_release = semver::Version::parse("1.2.3-rc.1").unwrap();
+        assert_eq!(
+            asset_url(base, &test_release, "linux", "aarch64"),
+            "https://example.test/owner/repo/releases/download/v1.2.3-rc.1/\
+             mahbot-1.2.3-rc.1-linux-aarch64.tar.gz"
         );
     }
 
+    /// The version file's own rule: an ordinary copy is never offered a test
+    /// release, and a file that holds no version is an error rather than an
+    /// absence.
     #[test]
-    fn test_latest_stable_version_semver_ordering() {
-        // Proper semantic ordering, not lexicographic: 0.10.0 > 0.9.0.
-        let body = "\
-{\"name\":\"mahbot\",\"vers\":\"0.9.0\",\"yanked\":false}
-{\"name\":\"mahbot\",\"vers\":\"0.10.0\",\"yanked\":false}
-";
-        assert_eq!(
-            latest_stable_version(body).map(|v| v.to_string()),
-            Some("0.10.0".to_string())
-        );
+    fn test_a_test_release_is_never_discovered() {
+        let stable = semver::Version::new(1, 2, 3);
+        assert_eq!(discoverable_version("1.2.3\n").unwrap(), Some(stable));
+        assert_eq!(discoverable_version("1.2.3-rc.1\n").unwrap(), None);
+        assert_eq!(discoverable_version("  1.2.3-rc.1  ").unwrap(), None);
+        assert!(discoverable_version("").is_err());
+        assert!(discoverable_version("version 1.2.3").is_err());
     }
 
+    /// The install scripts download what this file publishes and the release workflow
+    /// builds it, so one contract is spelled in four files and only comments tie them
+    /// together. Drift in any of them would otherwise be invisible: nothing else in
+    /// the tree reads them, and the cross-checks only compile. Pinned here are the
+    /// repository the releases live in, the two URL shapes, the asset name
+    /// [`asset_name`] builds — against the workflow's own list of the six files, and
+    /// the scripts' own spellings — the install location all three share, and the
+    /// version file's location.
     #[test]
-    fn test_latest_stable_version_last_line_wins_for_yank_state() {
-        // The sparse index appends a line per publish/yank/unyank event and a
-        // version's LAST line is its current state. A yank → unyank → re-yank
-        // cycle must count as yanked even though an earlier line said
-        // unyanked (cargo install would refuse the re-yanked version).
-        let re_yanked = "\
-{\"name\":\"mahbot\",\"vers\":\"0.4.0\",\"yanked\":false}
-{\"name\":\"mahbot\",\"vers\":\"0.4.0\",\"yanked\":true}
-{\"name\":\"mahbot\",\"vers\":\"0.4.0\",\"yanked\":false}
-{\"name\":\"mahbot\",\"vers\":\"0.4.0\",\"yanked\":true}
-{\"name\":\"mahbot\",\"vers\":\"0.3.0\",\"yanked\":false}
-";
-        assert_eq!(
-            latest_stable_version(re_yanked).map(|v| v.to_string()),
-            Some("0.3.0".to_string())
-        );
+    fn test_the_release_contract_is_spelled_the_same_everywhere() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |name: &str| std::fs::read_to_string(root.join(name)).expect("part of the tree");
+        let (sh, ps1) = (read("install.sh"), read("install.ps1"));
 
-        // Unyank wins when the last line says unyanked.
-        let unyanked = "\
-{\"name\":\"mahbot\",\"vers\":\"0.4.0\",\"yanked\":true}
-{\"name\":\"mahbot\",\"vers\":\"0.4.0\",\"yanked\":false}
-";
-        assert_eq!(
-            latest_stable_version(unyanked).map(|v| v.to_string()),
-            Some("0.4.0".to_string())
-        );
-    }
-
-    // ── New function tests ─────────────────────────────────────────────────
-
-    use crate::util::test::set_env_var;
-
-    #[test]
-    fn test_resolve_cargo_bin_path_cargo_home() {
-        // Scenario 1: CARGO_HOME is set to a custom path.
-        let path_with = {
-            let _guard = set_env_var("CARGO_HOME", Some("/custom/cargo"));
-            resolve_cargo_bin_path()
-        };
-
-        // Scenario 2: CARGO_HOME is set to empty string (falls through to
-        // UserDirs — see cargo_bin_dir() in src/util/mod.rs).
-        let path_empty = {
-            let _guard = set_env_var("CARGO_HOME", Some(""));
-            resolve_cargo_bin_path()
-        };
-        // Both guards have dropped, restoring CARGO_HOME to its original
-        // state (typically absent).
-
-        // With custom CARGO_HOME, should use that path.
-        assert!(
-            path_with.is_some(),
-            "resolve_cargo_bin_path should return Some with CARGO_HOME set"
-        );
-        let path = path_with.unwrap();
-        assert!(
-            path.starts_with("/custom/cargo/bin/mahbot"),
-            "Expected path to start with /custom/cargo/bin/mahbot, got {}",
-            path.display(),
-        );
-        let file_name = path.file_name().unwrap().to_string_lossy();
-        assert!(
-            file_name.starts_with("mahbot"),
-            "Expected file name to start with 'mahbot', got '{file_name}'"
-        );
-
-        // With empty CARGO_HOME, should fall through to UserDirs.
-        let dirs = UserDirs::new();
-        if let Some(dirs) = dirs {
+        // The two URLs, each as this file builds it, with the base and the version
+        // left as the variables the script sets them from: a path that changes on one
+        // side fails here instead of leaving the scripts downloading nothing. The base
+        // is the constant, not the test hook that can override it.
+        for (name, script, base_var, version_var) in [
+            ("install.sh", &sh, "$RELEASE_BASE", "$VERSION"),
+            ("install.ps1", &ps1, "$ReleaseBase", "$Version"),
+        ] {
+            assert!(script.contains(RELEASE_REPO), "{name} names {RELEASE_REPO}");
+            let pointer = latest_version_url(RELEASE_REPO).replace(RELEASE_REPO, base_var);
             assert!(
-                path_empty.is_some(),
-                "Expected a path when CARGO_HOME is empty"
+                script.contains(&pointer),
+                "{name} must look the newest release up at {pointer}"
             );
-            let path = path_empty.unwrap();
-            let expected_prefix = dirs.home_dir().join(".cargo").join("bin");
+            let download = asset_url(
+                RELEASE_REPO,
+                &semver::Version::new(1, 0, 0),
+                "linux",
+                "x86_64",
+            )
+            .replace(RELEASE_REPO, base_var)
+            .replace("1.0.0", version_var);
+            let version_dir = download.rsplit_once('/').expect("an asset name").0;
             assert!(
-                path.starts_with(&expected_prefix),
-                "Expected path to start with {}, got {}",
-                expected_prefix.display(),
-                path.display(),
+                script.contains(version_dir),
+                "{name} must download a version from {version_dir}"
             );
         }
+        // The scripts build an asset's name from their own variables, so what is
+        // pinned there is the shape: `mahbot-<version>-<os>-<arch>.<ext>`.
+        assert!(sh.contains(r#"ASSET="mahbot-$VERSION-$OS-$ARCH.tar.gz""#));
+        assert!(ps1.contains(r#"$Asset = "mahbot-$Version-windows-$Arch.zip""#));
+
+        // One install location for all three: the scripts put the ready-made file
+        // there, the product moves itself there when its working file is elsewhere
+        // (a downloaded copy that is not in the standard location moves itself in at
+        // its next update), and the product's own search-path edit points at it. A
+        // drift would leave exactly the second copy the whole arrangement prevents.
+        // Each script's own literal is checked wherever this runs; the comparison
+        // against the location this product computes only where it can be asked.
+        assert!(sh.contains(r#"INSTALL_DIR="$HOME/.local/bin""#));
+        assert!(ps1.contains(r"'Programs\MahBot'"));
+        let install = crate::util::managed_bin::mahbot_install_dir().expect("a home directory");
+        #[cfg(unix)]
+        assert!(
+            install.ends_with(".local/bin"),
+            "the product's own install directory is {}",
+            install.display()
+        );
+        #[cfg(windows)]
+        assert!(
+            install.ends_with(r"Programs\MahBot"),
+            "the product's own install directory is {}",
+            install.display()
+        );
+
+        // The workflow builds one file per system and publishes the release only once
+        // all six are attached, so its own list of them is the release's definition.
+        let workflow = read(".github/workflows/release.yml");
+        floors_are_spelled_the_same(&sh, &ps1, &workflow);
+
+        // The words the owner is refused with are one fact too: the scripts begin
+        // their refusals with this file's own opening, and name the same requirement
+        // for a Linux host with no glibc at all.
+        assert!(sh.contains(&format!("NO_FILE_PREFIX='{NO_RELEASE_FILE}'")));
+        assert!(ps1.contains(&format!("$NoFilePrefix = '{NO_RELEASE_FILE}'")));
+        assert!(sh.contains(NO_GLIBC_FOUND));
+
+        for (os, arch) in [
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+            ("windows", "aarch64"),
+        ] {
+            let spelled =
+                asset_name(&semver::Version::new(1, 0, 0), os, arch).replace("1.0.0", "${VERSION}");
+            assert!(
+                workflow.contains(&format!("\"{spelled}\"")),
+                "release.yml must publish {spelled}"
+            );
+        }
+    }
+
+    /// The floors a published file is built against are one fact told by the machinery
+    /// that has to agree on them: the install command refuses below them, the update
+    /// path refuses below them, and the workflow builds the files against them. A
+    /// drift offers a file to a system it cannot load on, which is the one outcome the
+    /// whole arrangement exists to prevent. What the README claims in prose is not
+    /// pinned here: a rewording of it is not a drift in any of these.
+    fn floors_are_spelled_the_same(sh: &str, ps1: &str, workflow: &str) {
+        assert!(sh.contains(&format!("MACOS_FLOOR_MAJOR={}", MACOS_FLOOR.0)));
+        assert!(sh.contains(&format!("MACOS_FLOOR_MINOR={}", MACOS_FLOOR.1)));
+        assert!(sh.contains(&format!("GLIBC_FLOOR_MAJOR={}", GLIBC_FLOOR.0)));
+        assert!(sh.contains(&format!("GLIBC_FLOOR_MINOR={}", GLIBC_FLOOR.1)));
+        assert!(
+            workflow.contains(&format!(
+                "MACOSX_DEPLOYMENT_TARGET: ${{{{ matrix.target_os == 'macos' && '{}.{}' || '' }}}}",
+                MACOS_FLOOR.0, MACOS_FLOOR.1
+            )),
+            "the macOS files must be built against {}.{}",
+            MACOS_FLOOR.0,
+            MACOS_FLOOR.1
+        );
+        assert!(
+            workflow.contains(&format!("glibc {}.{}", GLIBC_FLOOR.0, GLIBC_FLOOR.1)),
+            "the Linux files must be built on a base whose glibc is the floor"
+        );
+        // The Windows floors are the systems the files exist for, by their own build
+        // numbers: Windows 10 1809 on x86_64, and Windows 11 on ARM because every
+        // Windows 10 on ARM (below the ARM64 floor) is below the file that exists.
+        // Both what is compared and the sentence it is refused with are the constants'.
+        assert!(ps1.contains(&format!("$Build -lt {WINDOWS_X86_64_FLOOR}")));
+        assert!(ps1.contains(&format!("$Build -lt {WINDOWS_ARM64_FLOOR}")));
+        assert!(ps1.contains(&format!("Windows 11 (build {WINDOWS_ARM64_FLOOR})")));
+        assert!(ps1.contains(&format!(
+            "Windows 10 version 1809 (build {WINDOWS_X86_64_FLOOR})"
+        )));
+    }
+
+    #[test]
+    fn floor_checks_compare_whole_version_numbers() {
+        // A minor part is not a decimal: 2.4 is below 2.35, while 2.39 is not.
+        assert!(version_below_floor("2.4", GLIBC_FLOOR));
+        assert!(!version_below_floor("2.39", GLIBC_FLOOR));
+        // A version with no minor part counts as zero, and a trailing part is not
+        // part of the comparison.
+        assert!(version_below_floor("12", MACOS_FLOOR));
+        assert!(!version_below_floor("12.3", MACOS_FLOOR));
+        assert!(!version_below_floor("12.3.1", MACOS_FLOOR));
+        assert!(!version_below_floor("13", MACOS_FLOOR));
+        // A part that is not there or not a whole number is not a version to accept,
+        // in either position: the install script's check refuses both.
+        assert!(version_below_floor("", MACOS_FLOOR));
+        assert!(version_below_floor("12.", MACOS_FLOOR));
+        assert!(version_below_floor("12.x", MACOS_FLOOR));
+        assert!(version_below_floor("13.x", MACOS_FLOOR));
+        // The glibc report is read the same way, and a report this does not
+        // recognise is not a refusal.
+        assert!(glibc_below_floor("glibc 2.31"));
+        assert!(!glibc_below_floor("glibc 2.35"));
+        assert!(!glibc_below_floor("musl libc (x86_64)"));
+    }
+
+    #[test]
+    fn a_linux_host_is_refused_by_its_own_evidence() {
+        use LinuxRefusal::{GlibcBelowFloor, NoGlibc};
+        // A glibc below the floor is refused whether or not musl's loader is there.
+        assert_eq!(
+            linux_refusal(Some("glibc 2.31"), false),
+            Some(GlibcBelowFloor)
+        );
+        assert_eq!(
+            linux_refusal(Some("glibc 2.31"), true),
+            Some(GlibcBelowFloor)
+        );
+        // At or above it there is a file to load: musl's loader being there as well —
+        // it is under a symlinked `/lib` on Debian, where musl can be installed
+        // beside glibc — is not a refusal.
+        assert_eq!(linux_refusal(Some("glibc 2.35"), true), None);
+        assert_eq!(linux_refusal(Some("glibc 2.39"), true), None);
+        // A host that names no glibc is judged by the loader it has.
+        assert_eq!(linux_refusal(None, true), Some(NoGlibc));
+        assert_eq!(
+            linux_refusal(Some("musl libc (x86_64)"), true),
+            Some(NoGlibc)
+        );
+        // A host with neither is not refused on evidence it does not have.
+        assert_eq!(linux_refusal(None, false), None);
+        assert_eq!(linux_refusal(Some("musl libc (x86_64)"), false), None);
+    }
+
+    #[test]
+    fn the_leftover_is_never_the_file_just_put_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let copy = bin.join(crate::util::managed_bin::product_file_name());
+        std::fs::write(&copy, b"a copy").unwrap();
+        // A `CARGO_HOME` whose binary directory is the install directory itself, so
+        // the toolchain's own convention names the file the update has just placed.
+        let _cargo_home = crate::util::test::set_env_var(
+            "CARGO_HOME",
+            Some(dir.path().to_str().expect("a UTF-8 temp path")),
+        );
+        let placed = legacy_copy(&copy);
+        let elsewhere = legacy_copy(&bin.join("somewhere_else"));
+        assert_eq!(placed, None, "the file just placed is not a leftover");
+        assert_eq!(
+            elsewhere,
+            Some(canonicalize_safe(&copy)),
+            "a copy that is neither is a leftover"
+        );
     }
 
     #[test]
@@ -2008,52 +2457,5 @@ mod tests {
             "Canonicalized path should end with test_file.txt, got {}",
             result.display(),
         );
-    }
-
-    #[tokio::test]
-    async fn test_copy_to_cargo_bin_success() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source_bin");
-        let dest = dir.path().join("subdir").join("installed_bin");
-
-        // Create a source binary.
-        std::fs::write(&source, "binary content").unwrap();
-        make_executable(&source);
-
-        // Copy should succeed (non-fatal, returns nothing).
-        copy_to_cargo_bin(&source, &dest, None).await;
-
-        // Verify destination exists and has correct content.
-        assert!(dest.is_file(), "Destination should exist");
-        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "binary content");
-
-        // Verify temp file was cleaned up.
-        let tmp_path = dest.with_extension("mahbot_update_tmp");
-        assert!(!tmp_path.exists(), "Temp file should be cleaned up");
-    }
-
-    #[tokio::test]
-    async fn test_copy_to_cargo_bin_source_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("nonexistent_source");
-        let dest = dir.path().join("dest_bin");
-
-        // Copy should fail gracefully (non-fatal, returns nothing).
-        copy_to_cargo_bin(&source, &dest, None).await;
-        assert!(!dest.exists(), "Destination should not be created");
-    }
-
-    #[test]
-    fn test_stale_binary_notification_format() {
-        let msg = stale_binary_notification(
-            "Test error",
-            Path::new("/src/mahbot"),
-            Path::new("/dest/mahbot"),
-        );
-        assert!(msg.contains("⚠️ Test error"));
-        assert!(msg.contains("Manually copy"));
-        assert!(msg.contains("/src/mahbot"));
-        assert!(msg.contains("/dest/mahbot"));
-        assert!(msg.contains("PATH-visible binary remains stale"));
     }
 }

@@ -3181,11 +3181,11 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
         entries.push(("board".to_string(), BOARD_COMMAND_DESC.to_string()));
         entries.push(("archive".to_string(), ARCHIVE_COMMAND_DESC.to_string()));
 
-        // `/update` is global (the single admin) and shown only when
-        // the shared availability cache confirms an update — always in
-        // local-checkout mode, registry mode only when a strictly newer stable
-        // version exists. The menu reflects the cached state, never a network
-        // call per refresh.
+        // `/update` is global (the single admin) and shown only when the shared
+        // availability cache confirms an update — always for a copy built from
+        // sources, and for a downloaded copy only when the release host holds a
+        // newer version. The menu reflects the cached state, never a network call
+        // per refresh.
         if crate::self_update::should_show_update(crate::self_update::update_availability()) {
             entries.push(("update".to_string(), UPDATE_COMMAND_DESC.to_string()));
         }
