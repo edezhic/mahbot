@@ -177,16 +177,25 @@ const FALLBACK_ENV_VARS: &[&str] = &[
     "USERNAME",
 ];
 
-/// The fallback environment as bindable pairs: every name in
-/// [`FALLBACK_ENV_VARS`] with its baseline value, then the platform's temp
-/// variables bound to the daemon's private temp root.
+/// The environment the product's own work runs in — today that is git (see
+/// [`crate::git::commands::git_command`]) — and the one an agent's command falls
+/// back to until the owner's environment has been read ([`agent_env_pairs`]):
+/// every name in [`FALLBACK_ENV_VARS`] with its baseline value, then the
+/// platform's temp variables bound to the daemon's private temp root.
 ///
-/// The temp names and value come from [`crate::temp::shell_temp_vars`] — the
-/// same pair the read-only guard's temp model reads — so the scratch location a
-/// child actually writes to and the location the guard accepts for a write
-/// cannot drift apart, and a new temp name reaches both at once.
+/// The temp names and value come from [`crate::temp::shell_temp_vars`] — the same
+/// pair the read-only guard's temp model reads — so the scratch location a child
+/// actually writes to and the location the guard accepts for a write cannot drift
+/// apart, and a new temp name reaches both at once.
+///
+/// A child's environment is cleared and re-populated from this list (see
+/// [`program_command`]): the product's own work must not be affected by the
+/// owner's personal environment, and must not leak credentials anywhere. Internal
+/// work that is not given an environment at all — self-update's cargo child, the
+/// chrome CLI and the browser, the GUI Shell page's terminal — inherits this
+/// process's environment, as documented where each is spawned.
 #[must_use]
-fn fallback_env_pairs() -> Vec<(OsString, OsString)> {
+pub(crate) fn internal_env_pairs() -> Vec<(OsString, OsString)> {
     let mut pairs = Vec::new();
     for &name in FALLBACK_ENV_VARS {
         if let Some(value) = baseline_env_value(name) {
@@ -199,25 +208,10 @@ fn fallback_env_pairs() -> Vec<(OsString, OsString)> {
     pairs
 }
 
-/// The environment the product's own internal work runs in: today that is git
-/// (see [`crate::git::commands::git_command`]), whose output the product
-/// interprets and whose credential hygiene is deliberate. Internal work that is
-/// not given an environment here — self-update's cargo child, the chrome CLI and
-/// the browser, the GUI Shell page's terminal — inherits this process's
-/// environment, as documented where each is spawned.
-///
-/// Clears the child's environment and re-populates it from
-/// [`fallback_env_pairs`]: this work must not be affected by the owner's
-/// personal environment, and must not leak credentials anywhere. It is
-/// deliberately *not* what an agent's command gets — see [`agent_env_pairs`].
-pub(crate) fn apply_internal_env(cmd: &mut tokio::process::Command) {
-    apply_env_pairs(cmd.as_std_mut(), &fallback_env_pairs());
-}
-
 /// The environment an agent's command runs in: the owner's own environment
 /// ([`crate::shell_env::snapshot`]) once a read has succeeded, with the
 /// data-location home and the pinned temp names applied last, otherwise the
-/// reduced [`fallback_env_pairs`].
+/// reduced [`internal_env_pairs`].
 ///
 /// Nothing read from the owner's environment is filtered — his secrets and
 /// tokens are handed over as they are, by design: these are his own commands
@@ -232,7 +226,7 @@ pub(crate) fn apply_internal_env(cmd: &mut tokio::process::Command) {
 #[must_use]
 pub(crate) fn agent_env_pairs() -> Vec<(OsString, OsString)> {
     crate::shell_env::snapshot()
-        .map_or_else(fallback_env_pairs, |owner| agent_env_pairs_from(&owner))
+        .map_or_else(internal_env_pairs, |owner| agent_env_pairs_from(&owner))
 }
 
 /// [`agent_env_pairs`] for a read that is not the published one: the same
@@ -265,10 +259,9 @@ pub(crate) fn agent_env_pairs_from(
 }
 
 /// Apply `pairs` to a child's environment, from nothing: the one definition of
-/// a clear-and-fill spawn environment, shared by the async builders
-/// ([`apply_agent_env`], [`apply_internal_env`]) and by the blocking grep-parity
-/// battery, which spawns through `std::process::Command` on a blocking thread.
-pub(crate) fn apply_env_pairs(cmd: &mut std::process::Command, pairs: &[(OsString, OsString)]) {
+/// a clear-and-fill spawn environment, used by [`program_command`] and by the
+/// async builder [`apply_agent_env`].
+fn apply_env_pairs(cmd: &mut std::process::Command, pairs: &[(OsString, OsString)]) {
     cmd.env_clear();
     cmd.envs(pairs.iter().map(|(name, value)| (name, value)));
 }
@@ -278,13 +271,195 @@ pub(crate) fn apply_agent_env(cmd: &mut tokio::process::Command) {
     apply_env_pairs(cmd.as_std_mut(), &agent_env_pairs());
 }
 
+/// The command that starts `program` with `env` as the child's whole environment
+/// and `dir` as its working directory. On macOS `program` is named by the absolute
+/// path that environment's own search list resolves it to ([`resolve_program_path`]),
+/// so that [`std`](std::process::Command) takes its non-forking start: it forks for a
+/// bare program name whenever the command sets `PATH` (it must — the search belongs to
+/// the child), and a forked child of this process makes macOS print a line about memory
+/// tooling to the terminal the daemon was started from, once per command started.
+/// `argv[0]` keeps the bare name, so the program sees exactly what
+/// `Command::new(program)` would have handed it; environment, directory, streams,
+/// process group and exit status stay the caller's. Only `Command::new` can name a
+/// program, so the name is chosen here rather than on a command already built.
+///
+/// `env` is applied here ([`apply_env_pairs`]): the list that names the program and
+/// the environment the child gets must be one, so a site that sets the child's
+/// directory afterwards passes an absolute list (the product's own internal one is) or
+/// nothing. A name carrying a separator is the caller's own program, passed through as
+/// it is, and the classes where a resolved path would change what runs keep the bare
+/// name ([`resolve_program_path`], [`is_mach_o`]) — those fork exactly as they do
+/// today.
+///
+/// Only macOS resolves anything: elsewhere `program` is named exactly as given, the
+/// Windows `cmd.exe` site included, where the platform's own start call does the
+/// search with its own extension rules. The command carries `CREATE_NO_WINDOW` on
+/// Windows, like every spawn in this tree ([`tree`]).
+///
+/// The two starts that need a session of their own are deliberately not served here
+/// ([`crate::shell_env`], [`crate::gui::shell`]): `std` has no session control, so no
+/// naming can spare them the fork — a hand-written start call could, and is not
+/// attempted.
+#[must_use]
+pub(crate) fn program_command(
+    program: &str,
+    env: &[(OsString, OsString)],
+    dir: Option<&Path>,
+) -> std::process::Command {
+    // macOS only: otherwise every name is left as it was given. `None` is also the
+    // answer for the classes the doc lists as left alone.
+    #[cfg(target_os = "macos")]
+    let resolved = if program.contains('/') {
+        None
+    } else {
+        resolve_program_path(program, env, dir).filter(|path| is_mach_o(path))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let resolved: Option<PathBuf> = None;
+    let mut cmd =
+        std::process::Command::new(resolved.as_deref().unwrap_or_else(|| Path::new(program)));
+    if resolved.is_some() {
+        // The resolved path is only the spelling: `argv[0]` stays as it would be.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.arg0(program);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
+    apply_env_pairs(&mut cmd, env);
+    cmd
+}
+
+/// `/usr/bin:/bin` — Darwin's `_PATH_DEFPATH`, the list `execvp` falls back to when
+/// the child's environment carries no `PATH`.
+#[cfg(target_os = "macos")]
+const DEFAULT_SEARCH_PATH: &str = "/usr/bin:/bin";
+
+/// The path [`program_command`] names `program` by: the first entry of `env`'s
+/// search list ([`DEFAULT_SEARCH_PATH`] when the environment carries none) that
+/// holds an executable regular file by that name.
+///
+/// The rules are `execvp`'s, because the point is to name the program that same
+/// call would have started: entries in order, an empty or relative entry resolved
+/// against the child's own directory (`None`: the daemon's working directory, which
+/// is where a child with no directory of its own looks), an absolute one joined
+/// directly, and a directory, or a file the effective user may not execute, skipped
+/// with the search going on. The result is absolute, so a leftover relative path
+/// ([`std::path::absolute`]) carries no dependence on the daemon's own working
+/// directory.
+///
+/// Two residues, both of them on the way to the start rather than in it. The
+/// permission test happens once, here, where `execvp` repeats it in the child and
+/// goes on to the next entry when it fails there: a permission that changes between
+/// this look and the start makes the start fail where today the search would have
+/// continued. And the look is a few `stat`s and one `access` on the caller's own
+/// thread, where `execvp` did that work in the forked child.
+#[cfg(target_os = "macos")]
+fn resolve_program_path(
+    program: &str,
+    env: &[(OsString, OsString)],
+    base_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    let search = env.iter().find(|(name, _)| name == "PATH").map_or_else(
+        || OsString::from(DEFAULT_SEARCH_PATH),
+        |(_, value)| value.clone(),
+    );
+    // Resolved only if a relative or empty entry needs it: an absolute entry — every
+    // entry of the product's own list — never asks. A directory that cannot be read
+    // leaves the candidate relative, and the absolute step below then gives up and
+    // leaves the bare name, as before.
+    let mut search_dir: Option<PathBuf> = base_dir.map(Path::to_path_buf);
+    std::env::split_paths(&search)
+        .map(|entry| {
+            if entry.is_absolute() {
+                entry.join(program)
+            } else {
+                search_dir
+                    .get_or_insert_with(|| std::env::current_dir().unwrap_or_default())
+                    .join(&entry)
+                    .join(program)
+            }
+        })
+        .find(|candidate| is_executable_file(candidate))
+        .and_then(|candidate| std::path::absolute(candidate).ok())
+}
+
+/// Whether `path` is a regular file the effective user may execute — `execvp`'s own
+/// test, `access(X_OK)` included: mode bits alone would name a file that is
+/// executable for someone else and then fail the start, where the search should
+/// have continued.
+#[cfg(target_os = "macos")]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated path and `access` only reads it.
+    unsafe { libc::access(c_path.as_ptr(), libc::X_OK) == 0 }
+}
+
+/// Whether `path` begins with a Mach-O header: thin (`MH_MAGIC`/`MH_MAGIC_64`) or
+/// universal (`FAT_MAGIC`/`FAT_MAGIC_64`), each in both byte orders — the images the
+/// kernel starts directly, which is the whole of what the naming rule acts on.
+/// (`CAFEBABE` also heads a Java class file, which would then be handed to the
+/// platform's own validation rather than re-run under `/bin/sh`; accepted, like every
+/// other head here.)
+///
+/// Anything else with an execute bit keeps the bare name and forks, the conservative
+/// direction twice over. A text file with no interpreter line is what `execvp` re-runs
+/// under `/bin/sh`; and a script *with* one is reached by the kernel through its
+/// interpreter under rules this deliberately does not model — an interpreter that does
+/// not exist, a relative one, a line longer than the kernel reads — so naming the
+/// script here would turn a search that today moves on to the next entry into a start
+/// that fails. Any read error (a file shorter than the four bytes read here included)
+/// answers `false` for the same reason.
+///
+/// That is also where the line this exists to stop still comes back: a program that is
+/// a script — a version manager's shim standing in for `git`, say — is started the
+/// forking way and prints it. Behaviour is unchanged there; the programs the product
+/// names itself (`sh`, `git`, the search tools its battery asks about) are Mach-O
+/// images on this platform, so what the product starts is covered.
+#[cfg(target_os = "macos")]
+fn is_mach_o(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 4];
+    if file.read_exact(&mut head).is_err() {
+        return false;
+    }
+    matches!(
+        &head,
+        b"\xCF\xFA\xED\xFE"
+            | b"\xFE\xED\xFA\xCF"
+            | b"\xCE\xFA\xED\xFE"
+            | b"\xFE\xED\xFA\xCE"
+            | b"\xCA\xFE\xBA\xBE"
+            | b"\xBE\xBA\xFE\xCA"
+            | b"\xCA\xFE\xBA\xBF"
+            | b"\xBF\xBA\xFE\xCA"
+    )
+}
+
 /// Build a [`tokio::process::Command`] for executing a shell command in the
 /// workspace root.
 ///
 /// The environment is [`agent_env_pairs`]: once the owner's environment has been
 /// read, the command runs in exactly that — secrets and all, by design, since
 /// these are the owner's own commands. Until the first read succeeds, and
-/// whenever one cannot be obtained, the reduced [`fallback_env_pairs`] is used
+/// whenever one cannot be obtained, the reduced [`internal_env_pairs`] is used
 /// instead. The data-location home and the private temp root always win (see
 /// [`agent_env_pairs`]).
 ///
@@ -296,22 +471,29 @@ pub(crate) fn apply_agent_env(cmd: &mut tokio::process::Command) {
 /// PGID from `sh`, preventing orphaned CPU-consuming process trees when a
 /// shell command times out.
 ///
-/// The interpreter itself is named by bare name (`sh`, and `cmd.exe` on Windows),
-/// so `std` resolves it through the environment the child is given: the product's
-/// own baseline until a read succeeds, the owner's own afterwards. That is a real
-/// consequence of running the owner's environment, not a fault to repair — on a
+/// The interpreter is still the one the child's own search list resolves to —
+/// the product's own baseline until a read succeeds, the owner's own afterwards —
+/// but [`program_command`] names it by the path that search finds rather than by
+/// the bare `sh`, so macOS takes its non-forking start. That resolution is a real
+/// consequence of running the owner's environment, not a fault to repair: on a
 /// machine whose own search path holds no `sh`, or whose `sh` is a wrapper of its
 /// own, commands start that program or fail to start at all, exactly as they would
-/// for the owner. How commands are spawned is deliberately unchanged, and nothing
-/// here compensates for the owner's search path.
+/// for the owner. Nothing here compensates for the owner's search path, and
+/// nothing about which program is started changes. Windows keeps its bare
+/// `cmd.exe` name (see [`program_command`]).
 ///
 /// On Windows the child is what the runner puts under a job object right after
 /// the spawn — the platform's own whole-tree mechanism ([`tree`]).
 fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::Command {
+    // The interpreter is named under the very environment the child is handed, so
+    // the pairs are the ones [`program_command`] applies.
+    let env = agent_env_pairs();
+
     // The spawn side of [`SHELL_PLATFORM`]; the two must not drift.
     #[cfg(not(target_os = "windows"))]
-    let mut process = {
-        let mut p = tokio::process::Command::new("sh");
+    let process = {
+        let mut p: tokio::process::Command =
+            program_command("sh", &env, Some(workspace_root)).into();
         p.arg("-c").arg(command);
         // Make this child a process group leader so grandchildren inherit the
         // PGID and can be killed together on timeout (see run_command_with_timeout).
@@ -323,8 +505,9 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
     };
 
     #[cfg(target_os = "windows")]
-    let mut process = {
-        let mut p = tokio::process::Command::new(WINDOWS_COMMAND_INTERPRETER);
+    let process = {
+        let mut p: tokio::process::Command =
+            program_command(WINDOWS_COMMAND_INTERPRETER, &env, Some(workspace_root)).into();
         // `raw_arg`, not `arg`: std's argument escaping belongs to the
         // `CommandLineToArgvW` convention `cmd.exe` does not follow (see
         // `Command::raw_arg`'s own doc). It would re-escape the command's quotes
@@ -338,11 +521,9 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
         // switch"): its quote processing strips that pair, so the command
         // arrives verbatim — whatever quotes it carries of its own.
         p.raw_arg(format!("/C \"{command}\""));
-        p.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
         p
     };
 
-    finalize_command(&mut process, workspace_root);
     process
 }
 
@@ -354,6 +535,9 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
 /// succeeded, the reduced fallback until then), and (Unix) the child leading
 /// its own process group; on Windows the runner's job is the platform's side of
 /// that containment ([`tree`]).
+///
+/// `program` is already an absolute path by the time it arrives — the managed bun
+/// runtime, this service's own image — so nothing here resolves a name.
 fn build_program_command(
     program: &Path,
     args: &[String],
@@ -367,15 +551,9 @@ fn build_program_command(
     }
     #[cfg(target_os = "windows")]
     process.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    finalize_command(&mut process, workspace_root);
-    process
-}
-
-/// Shared command setup: working directory + the agent's environment
-/// ([`apply_agent_env`]).
-fn finalize_command(process: &mut tokio::process::Command, workspace_root: &Path) {
     process.current_dir(workspace_root);
-    apply_agent_env(process);
+    apply_agent_env(&mut process);
+    process
 }
 
 /// Outcome of a timed shell subprocess run.
@@ -2304,7 +2482,7 @@ fn prepend_path_entries(base: impl AsRef<str>, extras: &[PathBuf]) -> String {
 }
 
 /// The `PATH` of the reduced fallback environment
-/// ([`fallback_env_pairs`]): a portable system baseline plus
+/// ([`internal_env_pairs`]): a portable system baseline plus
 /// [`extra_shell_path_prefixes`], not the owner's `PATH`.
 ///
 /// It is *not* what an agent's commands get once the owner's environment has
@@ -2320,7 +2498,7 @@ fn resolved_shell_path() -> String {
 
 /// Baseline value of a [`FALLBACK_ENV_VARS`] entry. The temp variables are not
 /// handled here: they come from [`crate::temp::shell_temp_vars`] (see
-/// [`fallback_env_pairs`]).
+/// [`internal_env_pairs`]).
 fn baseline_env_value(name: &str) -> Option<String> {
     match name {
         "PATH" => Some(resolved_shell_path()),
@@ -6593,6 +6771,187 @@ mod tests {
         // A served run is not a refusal: exit 0/1 with no engine complaint.
         for code in [0, 1] {
             assert!(engine_failure(Some(code), b"", ShellPlatform::Windows).is_none());
+        }
+    }
+
+    /// macOS only, the platform [`program_command`] acts on: the resolution it
+    /// performs and the non-forking start it buys.
+    #[cfg(target_os = "macos")]
+    mod program_command_tests {
+        use super::*;
+        use std::ffi::OsStr;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use tempfile::TempDir;
+
+        /// An executable program named `name` under `dir`: a copy of a real Mach-O
+        /// binary, the only kind of file [`program_command`] names by its path — so
+        /// the fixture is one the kernel starts directly, and its permissions can be
+        /// changed by the tests that need that.
+        fn program(dir: &Path, name: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::copy("/bin/echo", &path).expect("copy a real program");
+            path
+        }
+
+        /// An executable script named `name` under `dir`, with a valid interpreter
+        /// line: exactly the kind of file the naming rule leaves to the forking
+        /// start.
+        fn script(dir: &Path, name: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, "#!/bin/sh\nprintf '%s' \"$0\"\n").expect("write fixture");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make the fixture executable");
+            path
+        }
+
+        /// `prog`'s search list as the pairs a spawn would be handed.
+        fn search_path(value: &str) -> Vec<(OsString, OsString)> {
+            vec![(OsString::from("PATH"), OsString::from(value))]
+        }
+
+        #[test]
+        fn a_bare_name_becomes_the_path_its_own_search_list_finds() {
+            let dir = TempDir::new().expect("tempdir");
+            let found = program(dir.path(), "prog");
+            let env = search_path(&dir.path().to_string_lossy());
+
+            let cmd = program_command("prog", &env, Some(dir.path()));
+
+            assert_eq!(cmd.get_program(), found.as_os_str());
+        }
+
+        /// Every file the kernel does not start by itself keeps the bare name: an
+        /// empty executable (which `execvp` re-runs under `/bin/sh`), a script (which
+        /// it reaches through its interpreter under rules the naming rule does not
+        /// model), and a name that already carries a separator (the caller's own
+        /// program, not one to look up).
+        #[test]
+        fn a_name_is_left_alone_where_a_resolved_path_would_change_what_runs() {
+            let dir = TempDir::new().expect("tempdir");
+            let env = search_path(&dir.path().to_string_lossy());
+            let unresolvable = dir.path().join("prog");
+            std::fs::write(&unresolvable, "").expect("write an empty fixture");
+            std::fs::set_permissions(&unresolvable, std::fs::Permissions::from_mode(0o755))
+                .expect("make the fixture executable");
+
+            assert_eq!(
+                program_command("prog", &env, Some(dir.path())).get_program(),
+                OsStr::new("prog"),
+                "an executable the kernel cannot start must keep the bare name"
+            );
+
+            std::fs::remove_file(&unresolvable).expect("clear the fixture");
+            script(dir.path(), "prog");
+            assert_eq!(
+                program_command("prog", &env, Some(dir.path())).get_program(),
+                OsStr::new("prog"),
+                "a script must keep the bare name"
+            );
+
+            // The same directory holds a program a bare `prog` *would* have found,
+            // so the untouched name is what a separator buys, not a missing fixture.
+            std::fs::remove_file(dir.path().join("prog")).expect("clear the fixture");
+            let found = program(dir.path(), "prog");
+            assert_eq!(
+                program_command(&found.to_string_lossy(), &env, Some(dir.path())).get_program(),
+                found.as_os_str()
+            );
+        }
+
+        #[test]
+        fn an_empty_search_entry_resolves_against_the_commands_directory() {
+            let dir = TempDir::new().expect("tempdir");
+            let found = program(dir.path(), "prog");
+
+            let cmd = program_command("prog", &search_path(""), Some(dir.path()));
+
+            assert_eq!(cmd.get_program(), found.as_os_str());
+        }
+
+        #[test]
+        fn an_environment_without_a_path_falls_back_to_the_default_search_path() {
+            let cmd = program_command("true", &[], None);
+
+            assert_eq!(cmd.get_program(), OsStr::new("/usr/bin/true"));
+        }
+
+        #[test]
+        fn a_directory_and_a_non_executable_file_are_skipped_for_the_next_entry() {
+            let root = TempDir::new().expect("tempdir");
+            let as_dir = root.path().join("as-dir");
+            std::fs::create_dir_all(as_dir.join("prog")).expect("directory named like the program");
+            let no_exec = root.path().join("no-exec");
+            std::fs::create_dir(&no_exec).expect("tempdir");
+            std::fs::write(no_exec.join("prog"), "#!/bin/sh\n").expect("non-executable fixture");
+            let good = root.path().join("good");
+            std::fs::create_dir(&good).expect("tempdir");
+            let found = program(&good, "prog");
+            let search = std::env::join_paths([&as_dir, &no_exec, &good])
+                .expect("join the search list")
+                .to_string_lossy()
+                .into_owned();
+
+            let cmd = program_command("prog", &search_path(&search), Some(root.path()));
+
+            assert_eq!(cmd.get_program(), found.as_os_str());
+        }
+
+        /// `execvp` tests whether *this* user may execute the file, not whether the
+        /// mode's execute bits are set, so a file that is executable for someone
+        /// else is passed over and the search goes on. (Root may execute anything,
+        /// so the check has nothing to say there.)
+        #[test]
+        fn a_file_its_owner_may_not_execute_is_not_the_program() {
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            let root = TempDir::new().expect("tempdir");
+            let not_ours = root.path().join("not-ours");
+            std::fs::create_dir(&not_ours).expect("tempdir");
+            let foreign = program(&not_ours, "prog");
+            std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o001))
+                .expect("executable for someone else only");
+            let good = root.path().join("good");
+            std::fs::create_dir(&good).expect("tempdir");
+            let found = program(&good, "prog");
+            let search = std::env::join_paths([&not_ours, &good])
+                .expect("join the search list")
+                .to_string_lossy()
+                .into_owned();
+
+            let cmd = program_command("prog", &search_path(&search), Some(root.path()));
+
+            assert_eq!(cmd.get_program(), found.as_os_str());
+        }
+
+        #[test]
+        fn nothing_resolving_leaves_the_bare_name() {
+            let dir = TempDir::new().expect("tempdir");
+            let env = search_path(&dir.path().to_string_lossy());
+
+            let cmd = program_command("prog", &env, Some(dir.path()));
+
+            assert_eq!(cmd.get_program(), OsStr::new("prog"));
+        }
+
+        /// The actual regression guard, and the one thing `Command`'s own getters
+        /// cannot show: `argv[0]`. A shell script cannot say — the kernel hands its
+        /// interpreter the script's own path as that — so the product's own shell
+        /// start is asked to print what it was called: the interpreter is named by an
+        /// absolute path, and still sees itself as bare `sh`.
+        #[tokio::test]
+        async fn build_shell_command_names_sh_by_path_without_changing_its_argv0() {
+            let dir = TempDir::new().expect("tempdir");
+            let mut cmd = build_shell_command("printf '%s' \"$0\"", dir.path());
+
+            let program = cmd.as_std().get_program().to_owned();
+            assert!(
+                Path::new(&program).is_absolute(),
+                "the interpreter is still named bare: {program:?}"
+            );
+            let ran = cmd.output().await.expect("the interpreter runs");
+            assert_eq!(ran.stdout, b"sh");
         }
     }
 }

@@ -127,6 +127,13 @@ pub struct ShellState {
 /// terminal crate assembles the ConPTY command line without quoting, so an
 /// interpreter installed under a path with spaces would name a program Windows
 /// cannot find.
+///
+/// The terminal crate starts this program in a session of its own — its own
+/// `pre_exec` does the `setsid` and takes the controlling terminal — so this is one
+/// of the two starts that keep the forking path and hand the name over as it is
+/// (the other is the periodic read of the owner's shell environment; the reason
+/// both do is [`crate::tools::shell::program_command`]'s). macOS prints its line
+/// about memory tooling to this process's terminal once per tab, as it did before.
 fn terminal_program() -> Result<String, String> {
     if cfg!(windows) {
         return Ok(crate::tools::shell::WINDOWS_COMMAND_INTERPRETER.into());

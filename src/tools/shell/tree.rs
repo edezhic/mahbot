@@ -88,28 +88,26 @@
 //! none to hand on, while one started from a console hands that console over, and
 //! the flag is inert for a windowed image either way.
 //!
-//! Covered, one entry per spawn site: git (`git::commands::git_command`); the
-//! cargo probe and runner of the update that builds from sources
-//! (`self_update::verify_cargo_on_path`, `self_update::run_cargo_with_timeout`) —
-//! the update of a downloaded copy spawns no cargo, only the `self-replace`
-//! crate's own helper, which is the residual stated below; that update's own host
-//! probes (`self_update::host_probe` — `sw_vers` on macOS and `getconf` on Linux,
-//! the two programs that floor check needs; on Windows the same check answers from
-//! the running system's own version and spawns nothing); the replacement
-//! instance (`self_update::spawn_new_instance_from`); the browser-automation CLI
-//! in all its runs — probe, version, `tasklist`, install and restart
-//! (`tools::chrome_daemon::cli_probe`, `cli_version`, `tasklist_has`,
-//! `register_native_host`, `run_cli`) plus the shared `chrome::spawn::spawn_cli` —
-//! and the browser itself (`tools::chrome_daemon::spawn_chrome_detached`); every
-//! agent command through the shell builders (`tools::shell::build_shell_command`,
-//! `tools::shell::build_program_command` — the shell tool, the diagnostics
-//! runner, the `custom` tool's script, a user's alarm program, and every member
-//! of a rewritten line's plan ([`super::plan`], which spawns its own-image steps
-//! through that same builder rather than a site of its own) plus the grep
-//! engine's own probe (`tools::shell::grep_engine::probe_engine`) and the grep
-//! engine's locale-parity battery, which runs the real search under the owner's
-//! environment (`tools::shell::grep_engine::parity::agent_command`); and the file
-//! manager the owner asked for (`gui::editor::perform_reveal_in_finder`).
+//! Covered, one entry per spawn site: the one shared start a program named by a
+//! bare name is given (`tools::shell::program_command`, which names it by the path
+//! its own search list resolves and carries the flag) — the agent's shell, git, and
+//! the grep engine's locale-parity battery
+//! (`tools::shell::grep_engine::parity::agent_command`); the cargo probe and runner
+//! of the update that builds from sources (`self_update::verify_cargo_on_path`,
+//! `self_update::run_cargo_with_timeout` — an update of a downloaded copy runs no
+//! cargo at all); that update's host probes (`self_update::host_probe`: `sw_vers` or
+//! `getconf`, Windows answering from the running system and spawning nothing); the
+//! replacement instance (`self_update::spawn_new_instance_from`); the
+//! browser-automation CLI (`tools::chrome_daemon::cli_probe`, `cli_version`,
+//! `tasklist_has`, `register_native_host`, `run_cli`) with the shared
+//! `chrome::spawn::spawn_cli` and the browser itself
+//! (`tools::chrome_daemon::spawn_chrome_detached`); every agent command through the
+//! shell builders (`tools::shell::build_program_command` itself, and
+//! `tools::shell::build_shell_command` through the shared start above — the shell
+//! tool, the diagnostics runner, the `custom` tool's script, a user's alarm program,
+//! and every step of a rewritten line's plan, [`super::plan`] included) with the grep
+//! engine's own probe (`tools::shell::grep_engine::probe_engine`); and the file
+//! manager (`gui::editor::perform_reveal_in_finder`).
 //!
 //! Not covered, on purpose: the terminal the owner opens inside the app
 //! (`gui::shell`, spawned through a pseudoconsole) and the owner's own browser
@@ -617,7 +615,7 @@ mod tests {
     /// The number of spawn sites the sweep must see — the module docs' inventory,
     /// counted. A site that constant and that inventory do not account for fails
     /// the sweep, and a scan that stopped reading the tree finds far fewer.
-    const SPAWN_SITES: usize = 17;
+    const SPAWN_SITES: usize = 15;
 
     fn indent(line: &str) -> usize {
         line.len() - line.trim_start().len()

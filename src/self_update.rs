@@ -95,7 +95,7 @@ pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// instance it spawns; [`acquire_lock`] owns what it does. Nothing else sets it,
 /// and it is inherited only where the environment is:
 ///
-/// - git children run with a cleared environment (`tools::shell::apply_internal_env`);
+/// - git children run with a cleared environment (`tools::shell::internal_env_pairs`);
 /// - an agent's shell command is handed the owner's own environment, which
 ///   carries this marker on an instance the updater started — on unix, where that
 ///   shell's environment is the process's; on Windows the environment is

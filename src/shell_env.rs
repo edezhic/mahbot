@@ -712,6 +712,13 @@ async fn run_shell(
         // the controlling terminal (SIGTTOU); the shell would sit stopped before
         // it ever ran the command. `setsid` also makes the child its own group
         // leader, which is what lets a timed-out read kill the whole group.
+        //
+        // One of the two starts that keep the forking path on purpose — the reason is
+        // `tools::shell::program_command`'s, and the other is
+        // `gui::shell::terminal_program` — so macOS prints its line about memory
+        // tooling to the daemon's terminal on each of these reads, some six times an
+        // hour. Not a stream to filter: real errors arrive there too.
+        //
         // SAFETY: `setsid` is async-signal-safe, and the child is freshly forked,
         // so it is not a group leader and the call succeeds.
         unsafe {

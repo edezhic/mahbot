@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tracing::warn;
 
-use crate::tools::shell::apply_internal_env;
+use crate::tools::shell::{internal_env_pairs, program_command};
 use crate::util::unquote_c_style;
 
 /// Result of a successful `git commit` — the full hash and line stats.
@@ -205,7 +205,7 @@ fn inject_safe_directory(cmd: &mut tokio::process::Command, repo_path: &Path) {
 /// internal environment.
 ///
 /// The subprocess environment is cleared and re-populated with the reduced
-/// variable set the product uses for its own work (see [`apply_internal_env`])
+/// variable set the product uses for its own work (see [`internal_env_pairs`])
 /// to prevent credential leakage (CWE-200). `LC_ALL=C` is set for consistent
 /// locale behavior across all git invocations. This is the only entry point for
 /// production git subprocess creation in this module — all callers must use this
@@ -220,10 +220,11 @@ fn inject_safe_directory(cmd: &mut tokio::process::Command, repo_path: &Path) {
 /// Callers should add further configuration (args, current_dir, stdio, etc.)
 /// and then spawn or execute the command.
 fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("git");
-    #[cfg(windows)]
-    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    apply_internal_env(&mut cmd);
+    // `program_command` applies the pairs it names `git` under. No directory is
+    // passed: the internal list is absolute, so the `current_dir` callers set
+    // afterwards cannot change which program it resolves to.
+    let mut cmd: tokio::process::Command =
+        program_command("git", &internal_env_pairs(), None).into();
     cmd.env("LC_ALL", "C");
     if let Some(path) = repo_root {
         inject_safe_directory(&mut cmd, path);
@@ -240,7 +241,7 @@ fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
 ///
 /// **The product's own internal environment**: The subprocess environment is
 /// cleared and re-populated with the reduced variable set the product uses for
-/// its own work (see [`apply_internal_env`] for details). This prevents leaking
+/// its own work (see [`internal_env_pairs`] for details). This prevents leaking
 /// API keys and other secrets into child processes (CWE-200), but it also means
 /// variables like `SSH_AUTH_SOCK` and `GIT_SSH_COMMAND` are **not**
 /// inherited. That is git's own containment and nothing else's: an agent's
@@ -605,7 +606,7 @@ pub async fn run_git_fetch(repo_path: &Path) -> anyhow::Result<String> {
     let mut cmd = git_command(Some(repo_path));
     cmd.arg("fetch").arg("--quiet").current_dir(repo_path);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
-    // Restore the SSH agent socket for SSH remotes (dropped by apply_internal_env).
+    // Restore the SSH agent socket for SSH remotes (dropped by the internal environment).
     if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
         cmd.env("SSH_AUTH_SOCK", sock);
     }

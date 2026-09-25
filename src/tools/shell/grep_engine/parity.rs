@@ -827,8 +827,8 @@ fn shell_glob(
     env: &[(OsString, OsString)],
 ) -> Option<Vec<String>> {
     let script = format!("printf \"%s\\n\" {pattern}");
-    let mut cmd = agent_command("sh", env);
-    cmd.arg("-c").arg(&script).current_dir(&fixture.names);
+    let mut cmd = agent_command("sh", env, &fixture.names);
+    cmd.arg("-c").arg(&script);
     let Child::Ran(stdout, _code) = bounded_output(&mut cmd) else {
         return None;
     };
@@ -847,31 +847,29 @@ fn real_search(argv: &[String], env: &[(OsString, OsString)], cwd: &Path) -> Chi
         // No program name at all: nothing ran, so nothing was measured.
         return Child::Unusable;
     };
-    let mut cmd = agent_command(verb, env);
-    cmd.args(operands).current_dir(cwd);
+    let mut cmd = agent_command(verb, env, cwd);
+    cmd.args(operands);
     bounded_output(&mut cmd)
 }
 
-/// A command with the agent's environment applied whole (nothing inherited), and
-/// its stdin and stderr taken away: the battery runs the owner's own programs
-/// unattended in the background, so nothing here may read the daemon's stdin or
-/// spill its diagnostics into the daemon's stderr. Its stdout is the row's
-/// capture ([`bounded_output`]).
+/// A command with the agent's environment applied whole (nothing inherited), run
+/// in `cwd`, and its stdin and stderr taken away: the battery runs the owner's own
+/// programs unattended in the background, so nothing here may read the daemon's
+/// stdin or spill its diagnostics into the daemon's stderr. Its stdout is the
+/// row's capture ([`bounded_output`]).
 ///
-/// The window guarantee `tools::shell::tree` documents holds for this site too
-/// (the battery never runs on Windows, but the flag is what every spawn in the
-/// tree carries); `creation_flags` is a Windows-only API, so — like the engine's
-/// own probe — it rides its own `cfg`.
-fn agent_command(program: &str, env: &[(OsString, OsString)]) -> Command {
-    let mut cmd = Command::new(program);
-    crate::tools::shell::apply_env_pairs(&mut cmd, env);
+/// The program is named by the path that environment's own search list resolves it
+/// to ([`crate::tools::shell::program_command`]), which is why `cwd` sits here
+/// rather than with the callers: an empty or relative search entry is resolved
+/// against it, and a name nothing in the list resolves stays bare — so today's
+/// [`Child::Missing`] classification is unchanged. The window guarantee
+/// `tools::shell::tree` documents holds here too: that shared start is the one
+/// place the windowless creation flag is applied (the battery never runs on
+/// Windows, but the flag is what every spawn in the tree carries).
+fn agent_command(program: &str, env: &[(OsString, OsString)], cwd: &Path) -> Command {
+    let mut cmd = crate::tools::shell::program_command(program, env, Some(cwd));
     cmd.stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    }
     cmd
 }
 
