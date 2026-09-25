@@ -140,7 +140,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 regex = "1.13"
 
 # Fast file/content search for the tools
-fff-search = "0.10"
+fff-search = "0.11"
 
 # Transparent grep interception engine (shell tool, read-only mode): the
 # ripgrep substrate (grep-regex/grep-searcher/grep-matcher) plus the ignore

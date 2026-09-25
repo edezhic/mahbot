@@ -401,13 +401,27 @@ fn log_entry_from_row(row: &Row) -> anyhow::Result<LogEntry> {
 /// reports through the standard `log` interface, so its directive only ever
 /// matches records that arrive over the bridge [`install_log_bridge`] installs.
 ///
+/// `fff` mutes the file-search library the tools and the editor search with —
+/// `fff_search`, `fff_grep`, `fff_query_parser` and `fff_notify_debouncer_full`,
+/// every module of each: EnvFilter matches a target directive as a raw prefix, so
+/// this one directive covers the whole family. It must stay `off`, with no
+/// narrower directive added for one of its modules — the most specific directive
+/// wins, so `fff_search::grep=error` would re-open that module. A level cut is not
+/// enough: it is the pre-existing `fff_search=error` that let the library's
+/// in-memory file table, once full after a burst of newly created files, write
+/// 24 473 identical ERROR rows in under two seconds — rows nothing reaps, which
+/// buried every real problem in the owner's view of the logs. The product's own
+/// record for that condition is the edit tool's notice that a written file could
+/// not be added to the search index (target `mahbot::tools::edit`), and it is
+/// unaffected.
+///
 /// `pdf_extract` is the PDF text layer that [`crate::document`] converts with: on a
 /// font table whose glyphs and Unicode disagree it warns once per page, so a single
 /// document produces hundreds of near-identical records. The crate is held to ERROR
 /// for that reason — a genuine parse failure is still recorded, everything quieter is
 /// not.
 pub(crate) const DEFAULT_LOG_FILTER: &str =
-    "info,turso_core=warn,tantivy=warn,fff_search=error,fff_search::grep=error,pdf_extract=error";
+    "info,turso_core=warn,tantivy=warn,fff=off,pdf_extract=error";
 
 /// The production layer stack: the JSON log layer, with the log filter applied
 /// PER LAYER, plus the engine-cause capture layer (see
@@ -1722,6 +1736,88 @@ mod tests {
         assert!(
             written.contains(KEPT),
             "the dependency's errors must still reach the log layer: {written}"
+        );
+    }
+
+    /// The whole `fff_*` family — the file-search library the tools, the editor
+    /// and the read tool's path recovery search with — is muted outright: not one
+    /// of its targets reaches the log layer at any level, while records from
+    /// everywhere else do, including the product's own notice that a written file
+    /// could not be added to the search index.
+    ///
+    /// The records are written with explicit targets on the tracing API rather
+    /// than through the `log` interface: the bridge is a process-global `log`
+    /// logger that only one test in this process can install, and it preserves the
+    /// record's real target — which
+    /// [`dependency_log_records_reach_the_log_store`] pins. What is asserted here
+    /// is the layer's own verdict, per target and per level.
+    #[test]
+    fn the_default_filter_silences_the_search_library() {
+        // The burst that motivated the mute: the library's file table refusing to
+        // grow, one ERROR per file that does not fit. The other targets are the
+        // family's other crates and modules — the pre-existing filter held
+        // `fff_search` and `fff_search::grep` at ERROR, so a broader mute that
+        // leaves a narrower directive behind re-opens them.
+        const BURST_TARGET: &str = "fff_search::stable_vec";
+        const BURST: &str = "StableVec: capacity exhausted — dropping item to prevent reallocation";
+        const GREP_TARGET: &str = "fff_search::grep";
+        const GREP: &str = "a grep diagnostic from the file-search library";
+        const SHARED_TARGET: &str = "fff_search::shared";
+        const SHARED: &str = "a watcher diagnostic from the file-search library";
+        const FFF_GREP_TARGET: &str = "fff_grep::matcher";
+        const FFF_GREP: &str = "a record from the family's grep crate";
+        const PARSER_TARGET: &str = "fff_query_parser::parse";
+        const PARSER: &str = "a record from the family's query parser";
+        const DEBOUNCER_TARGET: &str = "fff_notify_debouncer_full";
+        const DEBOUNCER: &str = "a record the family logs over the `log` interface";
+        // The product's own record for the same condition, and the workspace
+        // engine's own INFO — both emit under `mahbot::*` and must be unaffected.
+        const NOTICE_TARGET: &str = "mahbot::tools::edit";
+        const NOTICE: &str =
+            "Search index capacity exhausted after file write — background rescan needed";
+        const ENGINE_TARGET: &str = "mahbot::search_engine";
+        const ENGINE: &str = "Search engine created — background scan started";
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _guard = tracing::subscriber::set_default(log_layers(
+            make_log_writer(tx),
+            EnvFilter::new(DEFAULT_LOG_FILTER),
+        ));
+
+        tracing::error!(target: BURST_TARGET, len = 1025, capacity = 1025, "{BURST}");
+        tracing::error!(target: GREP_TARGET, "{GREP}");
+        tracing::warn!(target: SHARED_TARGET, "{SHARED}");
+        tracing::info!(target: FFF_GREP_TARGET, "{FFF_GREP}");
+        tracing::error!(target: PARSER_TARGET, "{PARSER}");
+        tracing::info!(target: DEBOUNCER_TARGET, "{DEBOUNCER}");
+        tracing::warn!(target: NOTICE_TARGET, "{NOTICE}");
+        tracing::info!(target: ENGINE_TARGET, "{ENGINE}");
+
+        let mut written = String::new();
+        while let Ok(line) = rx.try_recv() {
+            written.push_str(&line);
+        }
+        for (target, message) in [
+            (BURST_TARGET, BURST),
+            (GREP_TARGET, GREP),
+            (SHARED_TARGET, SHARED),
+            (FFF_GREP_TARGET, FFF_GREP),
+            (PARSER_TARGET, PARSER),
+            (DEBOUNCER_TARGET, DEBOUNCER),
+        ] {
+            assert!(
+                !written.contains(message),
+                "a record from {target} reached the log layer: {written}"
+            );
+        }
+        assert!(
+            written.contains(NOTICE),
+            "the product's own notice about the search index must still reach the log layer: \
+             {written}"
+        );
+        assert!(
+            written.contains(ENGINE),
+            "the product's own search-engine record must still reach the log layer: {written}"
         );
     }
 }

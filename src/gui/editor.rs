@@ -1319,11 +1319,15 @@ async fn run_global_search(
         let grep_opts = GrepSearchOptions {
             mode: GrepMode::PlainText,
             smart_case: true,
+            // Overrides `smart_case` when set; `None` keeps the smart-case default.
+            casing: None,
             max_file_size: MAX_FILE_SIZE,
             max_matches_per_file: GLOBAL_SEARCH_MATCHES_PER_FILE,
             file_offset: 0,
             page_limit: MAX_GLOBAL_SEARCH_RESULTS,
             time_budget_ms: 3_000,
+            // As in the search tool: the budget only counts once something matched.
+            enforce_time_budget: false,
             before_context: 0,
             after_context: 0,
             classify_definitions: false,

@@ -344,11 +344,17 @@ impl SearchTool {
         let grep_opts = GrepSearchOptions {
             mode: grep_mode,
             smart_case: !case_sensitive,
+            // The explicit case mode overrides `smart_case` when set, so this stays
+            // `None`: the tool's `case_sensitive` argument keeps deciding.
+            casing: None,
             max_file_size: super::MAX_FILE_SIZE_BYTES,
             max_matches_per_file: 100,
             file_offset: offset,
             page_limit: max_results,
             time_budget_ms: 10_000, // 10 seconds
+            // The budget stays dormant until the search has matched something, as
+            // it has always been here: a zero-match query scans the whole index.
+            enforce_time_budget: false,
             before_context: context_lines,
             after_context: context_lines,
             classify_definitions: false,

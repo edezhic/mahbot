@@ -7,6 +7,7 @@
 
 use crate::util::UnwrapPoison;
 use fff_search::FilePicker;
+use fff_search::GitRecencyConfig;
 use fff_search::file_picker::{FFFMode, FilePickerOptions};
 use fff_search::shared::{SharedFilePicker, SharedFrecency};
 use std::collections::HashMap;
@@ -112,6 +113,14 @@ fn init_engine_for_workspace(name: &str, path: &Path) -> Result<SearchEngineEntr
         enable_fs_root_scanning: false,
         enable_home_dir_scanning: false,
         cache_budget: None,
+        // Ranking by git recency is on by default, and it reorders matches by how
+        // recently each file was touched by a commit. The product's result order
+        // is fuzzy-match quality only (see the frecency note below), so it stays
+        // off and search results are ordered exactly as they were before.
+        git_recency: GitRecencyConfig {
+            enabled: false,
+            ..GitRecencyConfig::default()
+        },
     };
 
     // The picker requires a frecency handle. Nothing in the product ever
