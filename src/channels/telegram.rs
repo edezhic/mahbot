@@ -7,7 +7,7 @@ use crate::util::{
     FILE_MAX_BYTES, MediaMarkerKind, TELEGRAM_MEDIA_MARKER_RE, UnwrapPoison, file_name_or_path,
     is_http_url, parse_media_marker,
 };
-use crate::{Channel, ChannelMessage, SendMessage};
+use crate::{Channel, ChannelMessage, SendMessage, Workspace};
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
@@ -56,6 +56,9 @@ const MAINTENANCE_ON_COMMAND_DESC: &str = "Enable workspace maintenance";
 const MAINTENANCE_OFF_COMMAND_DESC: &str = "Disable workspace maintenance";
 /// Description for the `/update` command (admin, menu form).
 const UPDATE_COMMAND_DESC: &str = "Update MahBot to the latest version";
+/// Description for the `/workspace` command (admin) — the active-workspace
+/// switcher, shown only while there is something to switch between.
+const WORKSPACE_COMMAND_DESC: &str = "Select the active workspace";
 
 // ── Action prefixes (__act__) ───────────────────────────────────────
 
@@ -3163,6 +3166,50 @@ pub fn format_board_line(phase: &TicketPhase, id: &str, title: &str) -> String {
     format!("{} `{}` {}", phase_emoji(*phase), id, title)
 }
 
+/// The label of one workspace-picker button: the same name the desktop shows
+/// for that workspace, its readiness state (the product's own status word,
+/// problem states included) and `paused` when the pipeline is frozen — nothing
+/// else. The active workspace carries the ✓ marker, matching the model pickers.
+#[must_use]
+fn workspace_picker_label(ws: &Workspace, active: bool) -> String {
+    let name = if active {
+        format!("\u{2713} {}", ws.display_name())
+    } else {
+        ws.display_name()
+    };
+    // The status word through its `Display`, the same spelling the desktop status
+    // pill renders.
+    let mut label = format!("{name} — {}", ws.status);
+    if ws.paused {
+        label.push_str(", paused");
+    }
+    label
+}
+
+/// The active-workspace picker keyboard: one button per workspace, in the order
+/// the desktop picker lists them, with the ✓ on the active one and nothing
+/// marked when no workspace is active.
+///
+/// The button payload is the registered workspace name — stable, and bounded by
+/// `workspace::MAX_NAME_LEN` at the store, which keeps
+/// `__act__set_workspace|<name>` inside Telegram's 64-byte `callback_data` cap.
+#[must_use]
+pub fn workspace_picker_keyboard(
+    workspaces: &[Workspace],
+    active: Option<&str>,
+) -> serde_json::Value {
+    let rows = workspaces
+        .iter()
+        .map(|ws| {
+            serde_json::json!([{
+                "text": workspace_picker_label(ws, active == Some(ws.name.as_str())),
+                "callback_data": format!("{ACTION_PREFIX}set_workspace|{}", ws.name),
+            }])
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "inline_keyboard": rows })
+}
+
 /// (command, description) entries for a user's Telegram command menu,
 /// derived from their admin status and the state of their selected shared
 /// workspace. Shared by the per-chat `setMyCommands` refresh and the
@@ -3178,6 +3225,13 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
     let mut entries: Vec<(String, String)> = Vec::new();
 
     if crate::users::is_admin(user_name).await {
+        // The workspace switcher heads the admin menu: the active workspace is
+        // chosen first, and only then do the other admin commands act on it. It
+        // is shown only while there is something to switch between, so a
+        // single-workspace install never carries a one-item picker.
+        if crate::users::workspace_switcher_available().await {
+            entries.push(("workspace".to_string(), WORKSPACE_COMMAND_DESC.to_string()));
+        }
         entries.push(("board".to_string(), BOARD_COMMAND_DESC.to_string()));
         entries.push(("archive".to_string(), ARCHIVE_COMMAND_DESC.to_string()));
 

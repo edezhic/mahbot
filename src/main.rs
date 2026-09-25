@@ -914,22 +914,49 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
         // which requires a selected shared workspace). The handler applies its
         // own admin gate + availability pre-check.
         BotCommand::Update => mahbot::self_update::handle_update_command(msg).await,
-        // Admin-gated commands: denial for guests.
+        // Admin-gated commands: denial for guests. `/workspace` shares the gate
+        // but not the body: `handle_admin_command` requires an already-active
+        // shared workspace — the very choice `/workspace` exists to make.
         BotCommand::Board
         | BotCommand::Archive
         | BotCommand::Pause
         | BotCommand::Unpause
         | BotCommand::Maintenance
         | BotCommand::MaintenanceOn
-        | BotCommand::MaintenanceOff => {
+        | BotCommand::MaintenanceOff
+        | BotCommand::Workspace => {
             if mahbot::users::is_admin(&msg.user_name).await {
-                handle_admin_command(msg, cmd).await;
+                if cmd == BotCommand::Workspace {
+                    handle_workspace_command(msg).await;
+                } else {
+                    handle_admin_command(msg, cmd).await;
+                }
             } else {
                 send_telegram_reply(msg, mahbot::self_update::ADMIN_ONLY_CMD_MSG.to_string()).await;
             }
         }
     }
     true
+}
+
+/// `base` with `tail` appended as a second sentence, or `base` alone when there is
+/// no tail — the one place a reply's tail is joined, so the spacing lives here.
+fn with_tail(base: String, tail: Option<&str>) -> String {
+    match tail {
+        Some(tail) => format!("{base} {tail}"),
+        None => base,
+    }
+}
+
+/// Point an admin at the switcher — for text a command cannot honour, or a
+/// command with no active workspace to act on. `None` when there is no choice to
+/// make: callers name `/workspace` only where it can act, and with fewer than two
+/// shared workspaces it refuses itself. One sentence for both replies, so it
+/// stands on its own wherever it is appended.
+async fn switcher_pointer() -> Option<&'static str> {
+    mahbot::users::workspace_switcher_available()
+        .await
+        .then_some("Use /workspace to choose the active workspace.")
 }
 
 /// Send a plain-text reply directly on the Telegram channel (no router
@@ -946,6 +973,64 @@ async fn handle_agents_command(msg: &ChannelMessage) {
         "You have only the Assistant role — there is nothing to switch.".to_string(),
     )
     .await;
+}
+
+/// Handle `/workspace` — show the shared workspaces as a tappable list; the
+/// tapped button makes that workspace the admin's active one (the same choice
+/// the desktop footer picker writes). With fewer than two shared workspaces
+/// there is nothing to switch, so the command refuses instead of falling
+/// through to the Assistant as ordinary chat.
+async fn handle_workspace_command(msg: &ChannelMessage) {
+    let workspaces = match mahbot::users::switchable_workspaces().await {
+        Ok(workspaces) => workspaces,
+        Err(e) => {
+            send_telegram_reply(msg, format!("Failed to load workspaces: {e}")).await;
+            return;
+        }
+    };
+    // What the command answers when it cannot act, or `None` while it can.
+    // Written once: it is both the bare command's reply and the tail of a
+    // stray-text refusal, which has to explain the same thing.
+    let unavailable = if mahbot::users::switcher_exists(workspaces.len()) {
+        None
+    } else if workspaces.is_empty() {
+        Some("No shared workspace is registered — there is nothing to switch.")
+    } else {
+        Some("Only one shared workspace is registered — there is nothing to switch.")
+    };
+    if let Some(refusal) = stray_text_refusal(&msg.content) {
+        // The tail answers the command either way: why it cannot act, or the list
+        // a bare `/workspace` posts when it can.
+        let tail = unavailable.unwrap_or("Send it on its own to get the list.");
+        send_telegram_reply(msg, with_tail(refusal, Some(tail))).await;
+        return;
+    }
+    if let Some(unavailable) = unavailable {
+        send_telegram_reply(msg, unavailable.to_string()).await;
+        return;
+    }
+    // The active workspace: unset leaves every entry unmarked.
+    let active = match mahbot::users::get_raw_selected_workspace(&msg.user_name).await {
+        Ok(name) => name,
+        Err(e) => {
+            send_telegram_reply(msg, format!("Failed to read the active workspace: {e}")).await;
+            return;
+        }
+    };
+    let keyboard =
+        mahbot::channels::telegram::workspace_picker_keyboard(&workspaces, active.as_deref());
+    // Send directly through the channel so the inline_keyboard structure (rows
+    // of buttons) is preserved exactly — the router delivery path has no
+    // inline-keyboard support, same as the model pickers.
+    if let Err(e) = mahbot::channels::telegram::send_direct(
+        &msg.reply_target,
+        "Select the active workspace:".to_string(),
+        Some(keyboard),
+    )
+    .await
+    {
+        warn!(error = %e, "Failed to send the workspace picker");
+    }
 }
 
 /// Handle `/start` command for Telegram — sends a per-user welcome message
@@ -1021,8 +1106,12 @@ async fn handle_models_command(msg: &ChannelMessage, is_image: bool) {
     // (rows of buttons) is preserved exactly — the router delivery path
     // has no inline-keyboard support, so this bypasses it for multi-row
     // replies like the model menus.
-    let _ = mahbot::channels::telegram::send_direct(&msg.reply_target, content, Some(reply_markup))
-        .await;
+    if let Err(e) =
+        mahbot::channels::telegram::send_direct(&msg.reply_target, content, Some(reply_markup))
+            .await
+    {
+        warn!(error = %e, "Failed to send the model picker");
+    }
 }
 
 /// Build inline keyboard for image or video model selection for `user_name`.
@@ -1086,8 +1175,9 @@ fn build_model_button_rows(
 
 /// Resolve the user's shared active workspace for admin commands. Returns
 /// `None` when the user has no shared workspace selected (personal or
-/// undefined) — mirroring the GUI's "no active workspace" guard.
-async fn resolve_admin_workspace(msg: &ChannelMessage) -> Result<Option<String>, String> {
+/// undefined) — mirroring the GUI's "no active workspace" guard — and the
+/// workspace row otherwise, so replies can name it the way the desktop does.
+async fn resolve_admin_workspace(msg: &ChannelMessage) -> Result<Option<Workspace>, String> {
     let selected = mahbot::users::get_raw_selected_workspace(&msg.user_name)
         .await
         .map_err(|e| format!("Failed to read workspace selection: {e}"))?;
@@ -1097,7 +1187,7 @@ async fn resolve_admin_workspace(msg: &ChannelMessage) -> Result<Option<String>,
                 .await
                 .map_err(|e| format!("Failed to look up workspace: {e}"))?;
             match ws {
-                Some(_) => Ok(Some(name)),
+                Some(ws) => Ok(Some(ws)),
                 None => Err(format!("Active workspace '{name}' no longer exists.")),
             }
         }
@@ -1105,10 +1195,22 @@ async fn resolve_admin_workspace(msg: &ChannelMessage) -> Result<Option<String>,
     }
 }
 
-/// Handle admin-gated commands (`/board`, `/archive`, `/pause`, `/unpause`,
-/// `/maintenance`). All reuse the same store methods the GUI calls so the
-/// two surfaces can never diverge.
+/// Handle the admin-gated commands that act on the active workspace (`/board`,
+/// `/archive`, `/pause`, `/unpause`, `/maintenance`). All reuse the same store
+/// methods the GUI calls, so the two surfaces can never diverge.
 async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
+    // The pause/resume pair reports trailing text rather than dropping it:
+    // `/pause <name>` used to act on the active workspace while reading as if it
+    // targeted the named one. The other admin commands are unaffected.
+    if matches!(cmd, BotCommand::Pause | BotCommand::Unpause)
+        && let Some(refusal) = stray_text_refusal(&msg.content)
+    {
+        // Only a refusal needs the pointer, and it costs a workspace read.
+        let tail = switcher_pointer().await;
+        send_telegram_reply(msg, with_tail(refusal, tail)).await;
+        return;
+    }
+
     // `/maintenance` validates its on|off argument before anything else —
     // a missing/invalid arg gets a usage response regardless of workspace
     // state. Lowercased first: command recognition is case-insensitive.
@@ -1126,14 +1228,14 @@ async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
         None
     };
 
-    let ws_name = match resolve_admin_workspace(msg).await {
-        Ok(Some(name)) => name,
+    let ws = match resolve_admin_workspace(msg).await {
+        Ok(Some(ws)) => ws,
         Ok(None) => {
-            send_telegram_reply(
-                msg,
-                "No active workspace — select a shared workspace in Settings → Users.".to_string(),
-            )
-            .await;
+            let text = with_tail(
+                "No active workspace is selected.".to_string(),
+                switcher_pointer().await,
+            );
+            send_telegram_reply(msg, text).await;
             return;
         }
         Err(e) => {
@@ -1143,45 +1245,75 @@ async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
     };
 
     match (cmd, maintenance_arg) {
-        (BotCommand::Board, _) => handle_board_listing(msg, &ws_name).await,
+        (BotCommand::Board, _) => handle_board_listing(msg, &ws).await,
         (BotCommand::Archive, _) => {
             let count = mahbot::pipeline::board::store()
-                .archive_all_done_and_cancelled(Some(&ws_name))
+                .archive_all_done_and_cancelled(Some(&ws.name))
                 .await;
             match count {
-                Ok(n) => send_telegram_reply(msg, format!("Archived {n} tickets.")).await,
-                Err(e) => send_telegram_reply(msg, format!("Failed to archive tickets: {e}")).await,
+                Ok(n) => {
+                    send_telegram_reply(
+                        msg,
+                        format!("Archived {n} tickets in {}.", ws.display_name()),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    send_telegram_reply(
+                        msg,
+                        format!("Failed to archive tickets in {}: {e}", ws.display_name()),
+                    )
+                    .await;
+                }
             }
         }
-        (BotCommand::Pause, _) => toggle_workspace_state(msg, &ws_name, true, false).await,
-        (BotCommand::Unpause, _) => toggle_workspace_state(msg, &ws_name, false, false).await,
+        (BotCommand::Pause, _) => toggle_workspace_state(msg, &ws, true, false).await,
+        (BotCommand::Unpause, _) => toggle_workspace_state(msg, &ws, false, false).await,
         (BotCommand::Maintenance, Some(enable)) => {
-            toggle_workspace_state(msg, &ws_name, enable, true).await;
+            toggle_workspace_state(msg, &ws, enable, true).await;
         }
-        (BotCommand::MaintenanceOn, _) => toggle_workspace_state(msg, &ws_name, true, true).await,
-        (BotCommand::MaintenanceOff, _) => toggle_workspace_state(msg, &ws_name, false, true).await,
-        // Impossible: invalid /maintenance args returned early above, and the
-        // admin-gated commands never reach this handler.
+        (BotCommand::MaintenanceOn, _) => toggle_workspace_state(msg, &ws, true, true).await,
+        (BotCommand::MaintenanceOff, _) => toggle_workspace_state(msg, &ws, false, true).await,
+        // Impossible: an invalid `/maintenance` argument returned early above,
+        // and `/workspace` — the only other admin-gated command — never reaches
+        // this handler (see the dispatch arm).
         _ => unreachable!(),
     }
+}
+
+/// The refusal for text typed after `/pause`, `/unpause` or `/workspace` — the
+/// three commands that report trailing text rather than dropping it (`/pause
+/// <name>` once acted on the active workspace while reading as if it targeted
+/// the named one) — or `None` when there is none. So the caller can use it as
+/// the guard, and join its own tail with [`with_tail`]. The command word is
+/// echoed as typed so the admin can locate it in the chat.
+fn stray_text_refusal(content: &str) -> Option<String> {
+    let mut words = content.split_whitespace();
+    let cmd_word = words.next().unwrap_or_default();
+    words.next()?;
+    Some(format!("`{cmd_word}` takes no other text."))
 }
 
 /// Apply a pause or maintenance toggle via the workspace store (the same
 /// method the GUI toggle uses) and confirm the requested state.
 async fn toggle_workspace_state(
     msg: &ChannelMessage,
-    ws_name: &str,
+    ws: &Workspace,
     enable: bool,
     is_maintenance: bool,
 ) {
     let store = mahbot::workspace::store();
     let result = if is_maintenance {
-        store.set_maintenance_enabled(ws_name, enable).await
+        store.set_maintenance_enabled(&ws.name, enable).await
     } else {
-        store.set_paused(ws_name, enable).await
+        store.set_paused(&ws.name, enable).await
     };
     if let Err(e) = result {
-        send_telegram_reply(msg, format!("Failed to update workspace '{ws_name}': {e}")).await;
+        send_telegram_reply(
+            msg,
+            format!("Failed to update workspace '{}': {e}", ws.display_name()),
+        )
+        .await;
         return;
     }
     let verb = match (is_maintenance, enable) {
@@ -1190,25 +1322,33 @@ async fn toggle_workspace_state(
         (false, true) => "Workspace pipeline paused",
         (false, false) => "Workspace pipeline resumed",
     };
-    send_telegram_reply(msg, format!("{verb} for '{ws_name}'.")).await;
+    send_telegram_reply(msg, format!("{verb} for '{}'.", ws.display_name())).await;
 }
 
 /// Handle `/board` — list the active workspace's non-archived tickets in the
 /// exact order the GUI board column shows them (shared ordering helper).
-async fn handle_board_listing(msg: &ChannelMessage, ws_name: &str) {
+///
+/// Every project-reporting reply names the workspace it refers to: the admin
+/// can switch workspaces from the same chat, so a bare ticket list would leave
+/// the subject ambiguous.
+async fn handle_board_listing(msg: &ChannelMessage, ws: &Workspace) {
     let tickets = match mahbot::pipeline::board::store()
-        .list_all_tickets(Some(ws_name), None)
+        .list_all_tickets(Some(&ws.name), None)
         .await
     {
         Ok(t) => t,
         Err(e) => {
-            send_telegram_reply(msg, format!("Failed to load board: {e}")).await;
+            send_telegram_reply(
+                msg,
+                format!("Failed to load the board for {}: {e}", ws.display_name()),
+            )
+            .await;
             return;
         }
     };
     let ordered = mahbot::pipeline::board::BoardStore::board_display_order(&tickets);
     if ordered.is_empty() {
-        send_telegram_reply(msg, "No tickets.".to_string()).await;
+        send_telegram_reply(msg, format!("{} — no tickets", ws.display_name())).await;
         return;
     }
     // The line opens with a per-phase emoji rather than a `•`/`*` bullet: a
@@ -1221,7 +1361,8 @@ async fn handle_board_listing(msg: &ChannelMessage, ws_name: &str) {
         .map(|t| mahbot::channels::telegram::format_board_line(&t.phase, &t.id, &t.title))
         .collect::<Vec<_>>()
         .join("\n");
-    send_telegram_reply(msg, listing).await;
+    let header = format!("{} — {} tickets", ws.display_name(), ordered.len());
+    send_telegram_reply(msg, format!("{header}\n{listing}")).await;
 }
 
 /// Handle an action callback (`__act__` prefix).
@@ -1242,6 +1383,7 @@ async fn handle_action_callback(msg: ChannelMessage, decoded: (String, String)) 
             answer_telegram_callback(&msg, None).await;
             handle_clear_session(&msg).await;
         }
+        "set_workspace" => handle_set_workspace_action(&msg, &payload).await,
         _ => {
             // Acknowledge callback queries to dismiss the Telegram loading
             // spinner and surface a toast for unknown actions. This catches
@@ -1257,8 +1399,16 @@ async fn handle_action_callback(msg: ChannelMessage, decoded: (String, String)) 
     }
 }
 
-/// Serializes per-user model writes (see [`handle_set_model_action`]).
-static MODEL_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+/// Serializes picker callbacks — the per-user model pickers and the
+/// active-workspace picker — so rapid taps of one picker apply in tap order and
+/// each picker's in-place ✓ refresh lands on the row that actually won. One
+/// shared lock: both are the same pattern, and a single lock cannot drift. It is
+/// held across the HTTP that follows a tap (the model write's request, the
+/// workspace confirmation reply and the markup refresh), the accepted tradeoff
+/// for deterministic ordering — human-paced taps and the HTTP client timeout
+/// caps any stall. The tap's acknowledgement and posting a picker are not under
+/// it: neither is part of the order the taps must apply in.
+static PICKER_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 /// Common handler for setting a per-user model via callback action.
 ///
@@ -1272,16 +1422,9 @@ async fn handle_set_model_action(
     display_name: &str,
     validate_image: bool,
 ) {
-    // Handlers are spawned (the dispatch loop must stay non-blocking), so the
-    // lock serializes rapid taps of the same picker — without it, concurrent
-    // upserts would commit last-write-wins in nondeterministic order instead of
-    // tap order. Acquired before validation;
-    // held over the decision+write and the pressed keyboard's in-place ✓
-    // refresh so the checkmark lands in tap order too (not the callback ack).
-    // Network I/O under the lock is the accepted tradeoff for deterministic
-    // ordering — human-paced taps and the HTTP client timeout cap any stall.
+    // Serialized with every other picker tap (see `PICKER_WRITE_LOCK`).
     let toast = {
-        let _guard = MODEL_WRITE_LOCK
+        let _guard = PICKER_WRITE_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
             .await;
@@ -1296,23 +1439,88 @@ async fn handle_set_model_action(
     answer_telegram_callback(msg, toast).await;
 }
 
-/// Best-effort in-place refresh of the pressed model-picker keyboard: moves
-/// the ✓ to the just-saved model. Any failure (deleted/48h-expired message,
-/// identical keyboard, transport error) is cosmetic — log and skip. No-op
-/// when the callback didn't carry its source message identity.
-async fn refresh_pressed_models_keyboard(msg: &ChannelMessage, is_image: bool) {
+/// Switch the presser's active workspace from a picker tap.
+///
+/// The payload is the registered workspace name; the write goes through the
+/// canonical `set_active_workspace` guard (admin-only, non-personal, must
+/// exist), so a stale keyboard cannot point the active choice at nothing. The
+/// tap path pre-judges nothing: whether the switch is allowed — admin-only is
+/// absolute, and the payload is public knowledge, so a guest holding a forwarded
+/// copy or hand-crafting the callback data in a group must change nothing — is
+/// decided once, by the write itself, and its refusal is reported in the write's
+/// own words rather than as the command gate's generic notice.
+async fn handle_set_workspace_action(msg: &ChannelMessage, payload: &str) {
+    // Serialized with every other picker tap (see `PICKER_WRITE_LOCK`): the
+    // write, the ✓ refresh and the reply all land in tap order, the reply's HTTP
+    // call included. The acknowledgement below is outside it — it has no order to
+    // keep and must not wait behind other taps.
+    {
+        let _guard = PICKER_WRITE_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let reply = match mahbot::users::set_active_workspace(&msg.user_name, payload).await {
+            Ok(ws) => {
+                refresh_pressed_workspaces_keyboard(msg).await;
+                // A reply, not just a toast: the rest of the chat (which of
+                // /pause and /unpause the menu offers, what /board reports)
+                // follows the switch, and the menu refresh rides the outbound
+                // send.
+                format!("Active workspace: {}", ws.display_name())
+            }
+            // Plainly, in the chat: the toast is transient and only the presser
+            // sees it in a group.
+            Err(e) => e.to_string(),
+        };
+        send_telegram_reply(msg, reply).await;
+    }
+    // The reply above is the confirmation; the tap only dismisses its spinner
+    // rather than repeating the same sentence as a toast.
+    answer_telegram_callback(msg, None).await;
+}
+
+/// Best-effort in-place refresh of the pressed picker keyboard — `keyboard`
+/// replacing the one the callback's own message carries. Any failure (a callback
+/// without source-message identity, a deleted/48h-expired message, an identical
+/// keyboard, a transport error) is cosmetic: the pick itself is already reported,
+/// so the failure is logged at debug and skipped.
+async fn refresh_pressed_picker_keyboard(
+    msg: &ChannelMessage,
+    keyboard: &serde_json::Value,
+    what: &str,
+) {
     let (Some(chat_id), Some(message_id)) = (&msg.chat_id, msg.message_id) else {
         return;
     };
-    let keyboard = build_models_keyboard(is_image, &msg.user_name).await;
     if let Some(channel) = mahbot::channel_registry().get("telegram")
         && let Some(tc) = channel
             .as_any()
             .downcast_ref::<mahbot::channels::telegram::TelegramChannel>()
-        && let Err(e) = tc.edit_reply_markup(chat_id, message_id, &keyboard).await
+        && let Err(e) = tc.edit_reply_markup(chat_id, message_id, keyboard).await
     {
-        tracing::debug!(?e, "model picker keyboard refresh skipped");
+        tracing::debug!(?e, what, "picker keyboard refresh skipped");
     }
+}
+
+/// Move the pressed model picker's ✓ to the just-saved model.
+async fn refresh_pressed_models_keyboard(msg: &ChannelMessage, is_image: bool) {
+    let keyboard = build_models_keyboard(is_image, &msg.user_name).await;
+    refresh_pressed_picker_keyboard(msg, &keyboard, "model").await;
+}
+
+/// Move the pressed workspace picker's ✓ to the just-selected workspace.
+async fn refresh_pressed_workspaces_keyboard(msg: &ChannelMessage) {
+    // The switch itself is already reported to the admin, so a failed read is a
+    // plain skip.
+    let (Ok(workspaces), Ok(active)) = (
+        mahbot::users::switchable_workspaces().await,
+        mahbot::users::get_raw_selected_workspace(&msg.user_name).await,
+    ) else {
+        return;
+    };
+    let keyboard =
+        mahbot::channels::telegram::workspace_picker_keyboard(&workspaces, active.as_deref());
+    refresh_pressed_picker_keyboard(msg, &keyboard, "workspace").await;
 }
 
 /// Validate and write one per-user model pick, returning the callback toast.

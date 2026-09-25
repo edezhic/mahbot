@@ -304,8 +304,19 @@ pub enum Message {
     /// fired) — triggers one full map reload via `load_workspace_map`.
     WorkspacesCdcChanged,
     /// A users-table or user_channels-table row changed (or the CDC stream
-    /// lagged) — triggers a full users re-list on the Settings page.
+    /// lagged) — triggers a full users re-list on the Settings page and a
+    /// read-back of the admin's active workspace (the phone-side switcher
+    /// writes that same column).
     UsersCdcChanged,
+    /// The admin's DB-stored active workspace read back after a users-table
+    /// change — the desktop and the chat are one and the same choice, so a
+    /// switch made on the phone applies here without a restart. `generation` is
+    /// the `active_workspace_gen` guard value captured at dispatch, so a read a
+    /// newer pick or read superseded cannot apply.
+    ActiveWorkspaceSynced {
+        generation: u64,
+        name: Option<String>,
+    },
     /// Shutdown signaled — leave the iced runtime for the product's exit path
     /// (`save_and_exit`), which `main` continues after `run()` returns.
     /// Triggered by the shutdown token: a self-update restart, SIGTERM/SIGINT, and the
@@ -365,11 +376,11 @@ pub enum Message {
     /// that hangs): run the exit path for the exit request that was waiting.
     BootExitWaitExpired,
     /// Full workspace map reloaded from the store (CDC workspaces event,
-    /// stream lag, toggle completion, or a settings add/delete). The handler
-    /// re-resolves the live selection against this fresh map — falling back to
-    /// the "Personal" default when the selected workspace vanished or none was
-    /// set. The generation is the reload it answers, so a slow read cannot
-    /// overwrite a newer one.
+    /// stream lag/baseline, toggle completion, or a settings add/delete). The
+    /// handler replaces the map and re-resolves the live selection against it,
+    /// but never substitutes one the fresh map does not carry: that is the DB
+    /// read-back's call (see `Message::ActiveWorkspaceSynced`). The generation
+    /// is the reload it answers, so a slow read cannot overwrite a newer one.
     WorkspacesReloaded {
         workspaces: HashMap<String, Workspace>,
         generation: u64,
@@ -596,6 +607,14 @@ pub struct Dashboard {
     /// Generation of the latest workspace-map reload, so a slow read cannot
     /// apply its (now stale) outcome over a newer one.
     workspaces_reload_gen: u64,
+    /// The read-back guard: bumped on every active-workspace pick this app
+    /// applies and on every read-back it dispatches. Each read carries the
+    /// generation it was dispatched with and applies only while it still matches,
+    /// so a read dispatched before a local pick — or before a newer read — can
+    /// never apply. A read dispatched *after* a pick can still observe that pick's
+    /// pre-commit row (the commit lands after the write is issued) and revert the
+    /// display until the pick's own CDC event re-reads it.
+    active_workspace_gen: u64,
     /// The `(name, path)` pair last pushed to the workspace-scoped surfaces;
     /// `None` while none has been pushed. A workspace-map reload compares
     /// against it, so a change of *resolvability* alone — the selected name
@@ -666,6 +685,7 @@ impl Dashboard {
             workspaces: HashMap::new(),
             workspaces_error: None,
             workspaces_reload_gen: 0,
+            active_workspace_gen: 0,
             pushed_workspace: None,
             selected_workspace_name: None,
             exit_requested_during_update: false,
@@ -1470,8 +1490,8 @@ impl Dashboard {
                 self.finish_toggle(kind, result, &ws_name, intended_state)
             }
             // A workspaces-table row changed (or the stream lagged/baseline
-            // fired) — one full map reload; the handler below resolves the
-            // selection fallback against the fresh map.
+            // fired) — one full map reload; the handler below re-resolves the
+            // live selection against the fresh map.
             Message::WorkspacesCdcChanged => self.reload_workspace_map(),
             Message::WorkspacesReloaded {
                 workspaces,
@@ -1484,14 +1504,29 @@ impl Dashboard {
                 }
                 self.apply_workspace_reload(Ok(workspaces));
 
-                // Re-resolve the LIVE selection against the fresh map instead of
-                // a value captured when the reload was triggered: that snapshot
-                // can be stale (e.g. the boot CDC baseline reload runs before
-                // the persisted selection is applied). A selected workspace that
-                // no longer exists falls back to the "Personal" default.
-                // Propagate only on an actual fallback — propagate is heavy
-                // (board refresh + home reload) and must not run on every CDC
-                // event.
+                // A selection this map does not contain is NOT re-resolved to
+                // "Personal": the map can lag the stored choice (a workspace
+                // registered and selected in one go is missing from a read that
+                // started before its insert), and resolving here would leave the
+                // desktop on the personal space while the chat and the DB keep
+                // the project active. The DB owns the choice and its read-back
+                // applies it (see `active_workspace_gen`), so only the
+                // now-unresolved surfaces are re-pushed.
+                let unknown = self.selected_workspace_name.as_deref().is_some_and(|name| {
+                    !self.workspaces.contains_key(name)
+                        && !crate::users::is_personal_workspace(name)
+                });
+                if unknown {
+                    return self.sync_workspace_surfaces();
+                }
+
+                // Otherwise re-resolve the LIVE selection against the fresh map
+                // instead of a value captured when the reload was triggered, so a
+                // reload that lands before the boot selection is applied cannot
+                // clobber it. Only a resolution that differs from the live
+                // selection — the "Personal" default of nothing selected yet —
+                // propagates (propagate is heavy); otherwise only the
+                // workspace-scoped surfaces are re-pushed.
                 let personal_name =
                     crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
                 let resolved = resolve_workspace_selection(
@@ -1512,9 +1547,39 @@ impl Dashboard {
                 self.sync_workspace_surfaces()
             }
             // A users-table / user_channels-table row changed (or the stream
-            // lagged) — re-list the Settings users page. Full re-list is its
-            // own recovery.
-            Message::UsersCdcChanged => self.refresh_settings_users(),
+            // lagged) — the event does not say which column changed, so the
+            // read-back is the authority on the shared selection. Full re-list
+            // is its own recovery.
+            Message::UsersCdcChanged => {
+                self.active_workspace_gen += 1;
+                let generation = self.active_workspace_gen;
+                Task::batch([
+                    self.refresh_settings_users(),
+                    Task::perform(read_active_workspace(), move |name| {
+                        Message::ActiveWorkspaceSynced { generation, name }
+                    }),
+                ])
+            }
+            Message::ActiveWorkspaceSynced {
+                generation,
+                name: Some(name),
+            } => {
+                // Stale reads are dropped (see `active_workspace_gen`); an
+                // unchanged value must not re-run the heavy propagate.
+                if generation != self.active_workspace_gen
+                    || self.selected_workspace_name.as_deref() == Some(name.as_str())
+                {
+                    Task::none()
+                } else {
+                    // Applied as stored, not resolved against the loaded map the
+                    // way a reload is: the map can be a reload behind while the DB
+                    // is authoritative about the choice. In memory only — writing
+                    // the value back would answer our own CDC event.
+                    self.apply_workspace_selection(&name)
+                }
+            }
+            // A failed read-back changes nothing: the live selection stands.
+            Message::ActiveWorkspaceSynced { name: None, .. } => Task::none(),
             Message::WorkspacesReloadFailed { error, generation } => {
                 // Stale-result guard, mirroring the success arm: without it a
                 // reload that fails after a newer one succeeded would re-set the
@@ -1602,7 +1667,8 @@ impl Dashboard {
 
     /// Apply a workspace selection in memory and broadcast it to all pages,
     /// without writing the DB. Used where the DB write happened (or happens)
-    /// elsewhere — e.g. the footer workspace picker's [`Self::select_workspace`].
+    /// elsewhere — the footer picker's [`Self::select_workspace`] and the
+    /// read-back in the `Message::ActiveWorkspaceSynced` arm.
     fn apply_workspace_selection(&mut self, name: &str) -> Task<Message> {
         // Git state is cleared and eagerly refreshed below via
         // propagate_workspace_selection → set_workspace_path.
@@ -1619,11 +1685,12 @@ impl Dashboard {
     /// A name missing from the workspace map is never persisted: the picker
     /// renders from the map, so a reload that dropped the picked name between
     /// render and click must not write a dangling value into the DB. The
-    /// in-memory selection still applies; a subsequent
-    /// [`Message::WorkspacesReloaded`] re-resolves it to "Personal".
+    /// in-memory selection still applies; the DB read-back decides if it stands.
     fn select_workspace(&mut self, name: &str) -> Task<Message> {
         let propagate = self.apply_workspace_selection(name);
         let known = crate::users::is_personal_workspace(name) || self.workspaces.contains_key(name);
+        // Supersedes any in-flight read-back (see `active_workspace_gen`).
+        self.active_workspace_gen += 1;
         let db_write = known.then(|| {
             let ws = name.to_string();
             Task::perform(
@@ -1668,19 +1735,17 @@ impl Dashboard {
         self.board_state.delta_removed_ids.clear();
         let board_refresh = self.board_state.refresh().map(Message::Board);
 
-        // Notify the Home page so it can reload chat history. Home is name-keyed
-        // and also serves personal workspaces, so a selection missing from the
-        // loaded map keeps its personal fallback here — the deliberate asymmetry
-        // with the workspace-scoped surfaces (see `sync_workspace_surfaces`),
-        // which follow the resolution instead.
-        let home_name =
-            if self.workspaces.contains_key(name) || crate::users::is_personal_workspace(name) {
-                name.to_string()
-            } else {
-                crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME)
-            };
+        // Notify the Home page so it can reload chat history: the selection as
+        // stored, with no substitution. A selection the loaded map has not
+        // caught up with yet — a project activated from the chat while a reload
+        // read was in flight — is still the account's active choice, and Home
+        // (its transcript read key and its per-workspace draft) must key on the
+        // same choice the picker and the DB carry. Same rule as
+        // `sync_workspace_surfaces`: an unresolved selection is never shown the
+        // personal workspace.
         let home_task: Task<Message> =
-            Task::done(home::HomeMessage::WorkspaceChanged(Some(home_name))).map(Message::Home);
+            Task::done(home::HomeMessage::WorkspaceChanged(Some(name.to_string())))
+                .map(Message::Home);
 
         let surfaces = self.sync_workspace_surfaces();
         Task::batch([board_refresh, home_task, surfaces])
@@ -1743,11 +1808,8 @@ impl Dashboard {
     }
 
     /// Reload the full workspace map from storage (e.g. after add/delete on
-    /// the Workspaces page or a post-toggle refresh). Preserves the live
-    /// selection if it still exists in the fresh map; otherwise the
-    /// [`Message::WorkspacesReloaded`] handler falls back to "Personal".
-    /// Resolution is done at apply time from the live selection, so a reload
-    /// triggered before the boot selection is applied cannot clobber it.
+    /// the Workspaces page or a post-toggle refresh). Resolution happens in
+    /// [`Message::WorkspacesReloaded`], from the live selection.
     ///
     /// The reload carries the generation it was issued under: this read retries
     /// for a second on a transient failure, so without it a delayed failure
@@ -2545,21 +2607,32 @@ fn workspaces_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
 }
 
 /// Subscription that emits [`Message::UsersCdcChanged`] when a users-table row
-/// changes or the stream lags. Both cases map to the same message — a full
-/// users re-list is its own Lagged recovery. Source is the shared
+/// changes or the stream lags. Both map to the same message: the full users
+/// re-list and the DB read-back of the active workspace (the same single choice
+/// the chat's switcher writes) that follow are each their own recovery.
+///
+/// The stream opens with one synthetic BASELINE event, like
+/// [`workspaces_cdc_subscription`]: a switch written between the boot selection
+/// read and this subscription's first poll would otherwise be missed for the
+/// rest of the run, leaving the dashboard showing a project the account no
+/// longer has active. The subscription only exists in the post-boot (`ready`)
+/// branch of [`Dashboard::subscription`], so the baseline can never be
+/// swallowed by the pre-boot no-op catch-all. Source is the shared
 /// [`crate::db::cdc`] users sender, warmed in `main` before the iced app runs.
 fn users_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
     use iced::futures::channel::mpsc;
-    common::broadcast_stream_producer(
-        128,
-        crate::db::cdc::users_sender_lock(),
-        |output: &mut mpsc::Sender<Message>, _event: Option<crate::db::cdc::ChangeEvent>| {
-            Box::pin(async move {
-                // Awaited send: a dropped trigger would leave the list stale
-                // until the next event (same rationale as the board stream).
-                let _ = futures_util::SinkExt::send(output, Message::UsersCdcChanged).await;
-            })
-        },
+    futures_util::stream::once(async { Message::UsersCdcChanged }).chain(
+        common::broadcast_stream_producer(
+            128,
+            crate::db::cdc::users_sender_lock(),
+            |output: &mut mpsc::Sender<Message>, _event: Option<crate::db::cdc::ChangeEvent>| {
+                Box::pin(async move {
+                    // Awaited send: a dropped trigger would leave the list stale
+                    // until the next event (same rationale as the board stream).
+                    let _ = futures_util::SinkExt::send(output, Message::UsersCdcChanged).await;
+                })
+            },
+        ),
     )
 }
 
@@ -3433,12 +3506,23 @@ async fn load_workspace_options(generation: u64) -> Message {
     }
 }
 
+/// Read the admin's stored active workspace back from the DB (the admin-aware
+/// resolution: a NULL/personal value yields the canonical `personal:{user}`
+/// name). `None` — the read failed; the live selection is kept.
+async fn read_active_workspace() -> Option<String> {
+    crate::users::resolve_selected_workspace_name(crate::users::ADMIN_USER_NAME).await
+}
+
 /// Build the footer workspace picker options from the shared workspace map:
-/// values sorted by name, labeled by each workspace's display name. Personal
-/// workspaces never live in the map, so the list is shared-only by construction.
+/// values sorted by name, labeled by each workspace's display name. A personal
+/// workspace is never an option — a lingering `personal:{user}` row is filtered
+/// out, so this picker and the chat's switcher offer the same set.
 #[must_use]
 fn shared_workspace_options(map: &HashMap<String, Workspace>) -> Vec<widgets::PickOption> {
-    let mut values: Vec<&Workspace> = map.values().collect();
+    let mut values: Vec<&Workspace> = map
+        .values()
+        .filter(|ws| !crate::users::is_personal_workspace(&ws.name))
+        .collect();
     values.sort_by(|a, b| a.name.cmp(&b.name));
     values
         .into_iter()
@@ -3598,24 +3682,28 @@ mod tests {
     }
 
     #[test]
-    fn workspaces_reloaded_replaces_map_and_falls_back_on_delete() {
+    fn workspaces_reloaded_replaces_map_and_defers_an_unknown_selection() {
         let mut dash = ready_dashboard();
         dash.workspaces = HashMap::from([
             ("ws1".to_string(), ws("ws1")),
             ("ws2".to_string(), ws("ws2")),
         ]);
         dash.selected_workspace_name = Some("ws2".to_string());
+        let _ = dash.apply_workspace_selection("ws2");
+        assert_eq!(dash.resolved_workspace(), Some(("ws2", "/p/ws2")));
 
-        // A reload whose map lacks ws2 → selection falls back to Personal.
+        // A reload whose map lacks ws2 replaces the map, but leaves the live
+        // selection standing — never substituted with the admin's Personal
+        // workspace — and the now-unresolved surfaces are dropped with it: the
+        // DB read-back, not this map, decides whether the selection survives.
         let new_map = HashMap::from([
             ("ws1".to_string(), ws("ws1")),
             ("ws3".to_string(), ws("ws3")),
         ]);
         let _ = dash.update(reloaded(new_map));
-        assert_eq!(
-            dash.selected_workspace_name.as_deref(),
-            Some("personal:admin")
-        );
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws2"));
+        assert_eq!(dash.resolved_workspace(), None);
+        assert_eq!(dash.pushed_workspace, None);
         assert!(dash.workspaces.contains_key("ws1"));
         assert!(dash.workspaces.contains_key("ws3"));
         assert!(!dash.workspaces.contains_key("ws2"));
@@ -3628,6 +3716,86 @@ mod tests {
         let new_map2 = HashMap::from([("ws3".to_string(), ws("ws3"))]);
         let _ = dash.update(reloaded(new_map2));
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws3"));
+    }
+
+    /// A phone-side switch reaches a running dashboard: the read-back applies
+    /// the stored choice in memory, an unchanged value is a no-op, and a read
+    /// superseded by a local pick or by a newer read is dropped — the two
+    /// surfaces are one choice, and the running app follows it.
+    #[test]
+    fn active_workspace_sync_follows_an_external_switch_and_drops_a_superseded_read() {
+        let mut dash = ready_dashboard();
+        dash.workspaces = HashMap::from([
+            ("ws1".to_string(), ws("ws1")),
+            ("ws2".to_string(), ws("ws2")),
+        ]);
+        dash.selected_workspace_name = Some("ws1".to_string());
+
+        // A switch made elsewhere — the chat — is adopted as soon as it is read
+        // back.
+        let _ = dash.update(Message::ActiveWorkspaceSynced {
+            generation: 0,
+            name: Some("ws2".to_string()),
+        });
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws2"));
+
+        // A pick made here issues a write of its own, so a read dispatched
+        // before it is stale by construction and must not revert the pick.
+        let _ = dash.select_workspace("ws1");
+        assert_eq!(dash.active_workspace_gen, 1);
+        let _ = dash.update(Message::ActiveWorkspaceSynced {
+            generation: 0,
+            name: Some("ws2".to_string()),
+        });
+        assert_eq!(
+            dash.selected_workspace_name.as_deref(),
+            Some("ws1"),
+            "a superseded read must not revert the live selection"
+        );
+
+        // A failed read changes nothing, and an unchanged value must not re-run
+        // the heavy propagate (the board generation it bumps stays put).
+        let _ = dash.update(Message::ActiveWorkspaceSynced {
+            generation: 1,
+            name: None,
+        });
+        let board_gen = dash.board_state.board_generation;
+        let _ = dash.update(Message::ActiveWorkspaceSynced {
+            generation: 1,
+            name: Some("ws1".to_string()),
+        });
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
+        assert_eq!(
+            dash.board_state.board_generation, board_gen,
+            "an unchanged value must not re-propagate the selection"
+        );
+
+        // Two reads in flight: the one dispatched first cannot land last and
+        // revert the newer answer, because the newer dispatch bumped the guard.
+        let stale = dash.active_workspace_gen;
+        dash.active_workspace_gen += 1; // a newer read is dispatched
+        let _ = dash.update(Message::ActiveWorkspaceSynced {
+            generation: stale,
+            name: Some("ws2".to_string()),
+        });
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
+
+        // A stored shared name the loaded map does not hold is still adopted:
+        // the map can simply be a reload behind (a workspace registered and
+        // selected at once) and the DB is authoritative about the choice, so the
+        // read-back must not pin Personal here.
+        assert!(!dash.workspaces.contains_key("late"));
+        let _ = dash.update(Message::ActiveWorkspaceSynced {
+            generation: dash.active_workspace_gen,
+            name: Some("late".to_string()),
+        });
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("late"));
+
+        // And a reload whose map read predates that workspace must not settle the
+        // desktop on Personal either — the two surfaces stay one choice until the
+        // DB says otherwise.
+        let _ = dash.update(reloaded(HashMap::from([("ws1".to_string(), ws("ws1"))])));
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("late"));
     }
 
     #[test]
@@ -3817,6 +3985,26 @@ mod tests {
             personal
         );
         assert_eq!(resolve_workspace_selection(&map, None, personal), personal);
+    }
+
+    /// A personal workspace is never a picker option — a lingering
+    /// `personal:{user}` row in the map is filtered out — so the footer picker
+    /// and the chat's switcher offer the same set.
+    #[test]
+    fn shared_workspace_options_never_offer_a_personal_workspace() {
+        let map = HashMap::from([
+            ("personal:admin".to_string(), ws("personal:admin")),
+            ("ws2".to_string(), ws("ws2")),
+            ("ws1".to_string(), ws("ws1")),
+        ]);
+
+        let options = shared_workspace_options(&map);
+
+        assert_eq!(
+            options.iter().map(|o| o.value.as_str()).collect::<Vec<_>>(),
+            vec!["ws1", "ws2"],
+            "shared workspaces only, ordered by name"
+        );
     }
 
     #[test]

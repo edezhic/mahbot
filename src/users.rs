@@ -1012,12 +1012,17 @@ pub fn personal_workspace_path(user_name: &str) -> PathBuf {
     userspaces_root().join(user_name)
 }
 
+/// The prefix of a personal workspace's synthetic name (`personal:{user}`).
+/// Personal workspaces are not `workspaces` rows, so a row carrying this prefix
+/// is a legacy leftover rather than a shared workspace.
+const PERSONAL_WORKSPACE_PREFIX: &str = "personal:";
+
 /// The canonical GUI-wide workspace name for a user's personal workspace:
 /// `personal:{user_name}`. This is the single search-engine key shared by the
 /// agent side and the dashboard.
 #[must_use]
 pub fn personal_workspace_name(user_name: &str) -> String {
-    format!("personal:{user_name}")
+    format!("{PERSONAL_WORKSPACE_PREFIX}{user_name}")
 }
 
 /// Ensure the personal workspace directory for a user exists and is
@@ -1150,6 +1155,68 @@ pub(crate) async fn resolve_selected_workspace_name(user_name: &str) -> Option<S
         );
     }
     Some(personal_workspace_name(user_name))
+}
+
+/// The shared workspaces the active one can be switched between, in the order
+/// the desktop footer picker lists them (`workspaces.name`, already ordered by
+/// the store). A personal workspace is never a choice: those are not `workspaces`
+/// rows, and a legacy row carrying a `personal:{user}` name is filtered out.
+pub async fn switchable_workspaces() -> Result<Vec<Workspace>> {
+    Ok(crate::workspace::store()
+        .list()
+        .await?
+        .into_iter()
+        .filter(|ws| !is_personal_workspace(&ws.name))
+        .collect())
+}
+
+/// Whether a store holding `shared_count` shared workspaces has the switcher at
+/// all: with fewer than two there is nothing to switch between.
+#[must_use]
+pub const fn switcher_exists(shared_count: usize) -> bool {
+    shared_count >= 2
+}
+
+/// [`switcher_exists`] against the shared workspaces — the same set the picker
+/// lists, so the menu gate cannot disagree with it. A failed read hides it
+/// rather than offering a broken choice.
+#[must_use]
+pub async fn workspace_switcher_available() -> bool {
+    switchable_workspaces()
+        .await
+        .is_ok_and(|workspaces| switcher_exists(workspaces.len()))
+}
+
+/// Make `workspace_name` the account's active workspace — the same single
+/// choice as the desktop footer picker (`users.selected_workspace`), so
+/// whichever surface wrote last wins.
+///
+/// Refusals, all before anything is written: a non-admin (resolved through
+/// [`is_admin`], which requires the account's own row — a bare name is not
+/// authority, and an unset store is fail-closed), a nameless request, a personal
+/// workspace, and a name with no workspace row — so the active choice can never
+/// point at something that does not exist. Returns the now-active row for the
+/// caller to confirm the switch by its desktop label.
+pub async fn set_active_workspace(user_name: &str, workspace_name: &str) -> Result<Workspace> {
+    if !is_admin(user_name).await {
+        anyhow::bail!("Only the admin can change the active workspace.");
+    }
+    // A hand-typed `__act__set_workspace|` reaches this path exactly like a tap
+    // does, with no name in it: say so rather than reporting a nameless
+    // workspace as one that no longer exists.
+    if workspace_name.trim().is_empty() {
+        anyhow::bail!("No workspace was named.");
+    }
+    if is_personal_workspace(workspace_name) {
+        anyhow::bail!("A personal workspace can never be the active workspace.");
+    }
+    let ws = crate::workspace::get_by_name(workspace_name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Workspace '{workspace_name}' no longer exists."))?;
+    store()
+        .set_selected_workspace(user_name, Some(workspace_name))
+        .await?;
+    Ok(ws)
 }
 
 /// Get the current active workspace for an account, admin-aware.
@@ -1403,7 +1470,7 @@ pub async fn update_channel_contact(
 /// `None` when the name is not a personal workspace.
 #[must_use]
 pub fn personal_user_name(workspace_name: &str) -> Option<&str> {
-    workspace_name.strip_prefix("personal:")
+    workspace_name.strip_prefix(PERSONAL_WORKSPACE_PREFIX)
 }
 
 /// Check whether a workspace name refers to a personal workspace
@@ -1470,6 +1537,40 @@ pub(crate) mod test_util {
             .set_selected_workspace(ADMIN_USER_NAME, previous.as_deref())
             .await
             .expect("restore admin selected_workspace");
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Run `body` with the given `(path, name)` fixtures seeded into the shared
+    /// workspace store, deleting each row afterwards — including when `body`
+    /// panics, so a failed assertion cannot leak a test-only workspace into the
+    /// sibling tests that share this process-global store. The seeding is inside
+    /// the guard too, so a fixture that is already there cannot leave the rows
+    /// seeded before it behind.
+    ///
+    /// Unwinding by hand, like [`with_admin_workspace_restored`]: the cleanup
+    /// awaits the store, which no destructor can do.
+    pub(crate) async fn with_test_workspaces<F>(workspaces: &[(&str, &str)], body: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use futures_util::FutureExt as _;
+
+        let outcome = std::panic::AssertUnwindSafe(async {
+            for (path, name) in workspaces {
+                crate::util::test::create_test_workspace(path, name).await;
+            }
+            body.await;
+        })
+        .catch_unwind()
+        .await;
+        for (_, name) in workspaces {
+            crate::workspace::store()
+                .delete(name)
+                .await
+                .expect("delete test workspace");
+        }
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
@@ -2031,6 +2132,60 @@ mod tests {
             let ws = resolve_workspace_for_user_name(ADMIN_USER_NAME).await;
             assert_eq!(ws.name, "ws_admin_aware");
         })
+        .await;
+    }
+
+    /// A switch is the same stored choice the desktop picker writes, and every
+    /// refusal happens before that write: a guest has no authority, a nameless
+    /// request names nothing, a personal workspace is never selectable, and a
+    /// name with no row is refused rather than stored.
+    #[tokio::test]
+    #[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
+    async fn set_active_workspace_refuses_every_invalid_switch_and_writes_the_admin_row() {
+        test_util::init_test_store().await;
+
+        test_util::with_test_workspaces(
+            &[("/tmp/mahbot_test_ws_switch", "switch_ws")],
+            test_util::with_admin_workspace_restored(async {
+                let before = get_raw_selected_workspace(ADMIN_USER_NAME).await.unwrap();
+
+                for (user, name, refusal) in [
+                    ("bob", "switch_ws", "Only the admin"),
+                    (ADMIN_USER_NAME, "", "No workspace was named"),
+                    (ADMIN_USER_NAME, "   ", "No workspace was named"),
+                    (ADMIN_USER_NAME, "personal:bob", "personal workspace"),
+                    (ADMIN_USER_NAME, "no_such_workspace", "no_such_workspace"),
+                ] {
+                    let err = set_active_workspace(user, name)
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.contains(refusal),
+                        "{user} / {name:?} must be refused: {err}"
+                    );
+                }
+                assert_eq!(
+                    get_raw_selected_workspace("bob").await.unwrap(),
+                    None,
+                    "a refused switch must not write the guest's row"
+                );
+                assert_eq!(
+                    get_raw_selected_workspace(ADMIN_USER_NAME).await.unwrap(),
+                    before,
+                    "a refused switch must not write the admin's row"
+                );
+
+                let ws = set_active_workspace(ADMIN_USER_NAME, "switch_ws")
+                    .await
+                    .unwrap();
+                assert_eq!(ws.name, "switch_ws");
+                assert_eq!(
+                    get_raw_selected_workspace(ADMIN_USER_NAME).await.unwrap(),
+                    Some("switch_ws".to_string())
+                );
+            }),
+        )
         .await;
     }
 }

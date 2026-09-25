@@ -193,16 +193,7 @@ impl DiagnosticsCommands {
 /// Mirrors the `status` TEXT column in the workspaces database table.
 /// Conversion to/from strings happens at the DB boundary only.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Serialize,
-    Default,
-    strum::Display,
-    strum::AsRefStr,
-    strum::EnumString,
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Default, strum::Display, strum::EnumString,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -399,6 +390,8 @@ pub enum BotCommand {
     ImageModels,
     /// `/video_models` — show video model selection keyboard.
     VideoModels,
+    /// `/workspace` — switch the admin's active shared workspace (admin).
+    Workspace,
     /// `/board` — list the active workspace's tickets (admin).
     Board,
     /// `/archive` — archive done & cancelled tickets (admin).
@@ -435,6 +428,7 @@ pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
         "/clear" => Some(BotCommand::Clear),
         "/image_models" => Some(BotCommand::ImageModels),
         "/video_models" => Some(BotCommand::VideoModels),
+        "/workspace" => Some(BotCommand::Workspace),
         "/board" => Some(BotCommand::Board),
         "/archive" => Some(BotCommand::Archive),
         "/pause" => Some(BotCommand::Pause),
@@ -1661,6 +1655,10 @@ mod tests {
             ("/video_models", Some(VideoModels)),
             ("/Video_Models", Some(VideoModels)),
             ("/video_models foo", Some(VideoModels)),
+            // /workspace
+            ("/workspace", Some(Workspace)),
+            ("/WORKSPACE", Some(Workspace)),
+            ("/workspace foo", Some(Workspace)),
             // admin commands
             ("/board", Some(Board)),
             ("/BOARD", Some(Board)),

@@ -881,18 +881,21 @@ fn spawn_diagnostics_discovery(ws: &Workspace, diagnostics_generation: i64) {
     });
 }
 
+/// The longest workspace name [`validate_name`] admits.
+pub(crate) const MAX_NAME_LEN: usize = 40;
+
 /// Validate a workspace name against the naming rules.
 ///
 /// Rules:
 /// - ASCII letters (a-z, A-Z) and underscores only
 /// - Must start with a letter — no leading underscore
-/// - Maximum 40 characters
+/// - Maximum [`MAX_NAME_LEN`] characters
 fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
         anyhow::bail!("Workspace name must not be empty");
     }
-    if name.len() > 40 {
-        anyhow::bail!("Workspace name must not exceed 40 characters");
+    if name.len() > MAX_NAME_LEN {
+        anyhow::bail!("Workspace name must not exceed {MAX_NAME_LEN} characters");
     }
     if !name.chars().all(|c| c.is_ascii_alphabetic() || c == '_') {
         anyhow::bail!("Workspace name must contain only ASCII letters (a-z, A-Z) and underscores");
