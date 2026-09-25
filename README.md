@@ -68,17 +68,3 @@ Either way the product's window opens and asks you to provide one of:
 The rest of the setup will be explained and done through the agent. It will help you add a workspace, other users, connect the Telegram bot, add the search providers & browser tooling for your agents.
 
 Mahbot supports macOS 12.3 and newer (Intel and Apple silicon), Linux on x86_64 and ARM against glibc 2.35 or newer, Windows 10 1809 and newer on x86_64, and Windows 11 on ARM. A system with no published file for it is refused plainly by the install command — musl Linux, older macOS and older glibc, and Windows 7, 8 and 10 on ARM among them. The Windows files are built and published like the others, but they have not been run by this project, so they ship what compiles rather than what has been exercised.
-
-### Audio is macOS only
-
-Everything local about audio — the microphone button, wake-word detection and enrolment, voice commands, local transcription of incoming voice messages, read-aloud replies and audio cues — exists **only on macOS**. The speech engine behind it has no other platform support and nothing here has a fallback, so on Linux and Windows mahbot builds with no audio capability whatsoever: no audio dependency is compiled in, and nothing audio-shaped is offered — no microphone button, no recording popup, no audio section on the settings page, no voice status anywhere.
-
-On those platforms an incoming **voice message** is refused before anything is downloaded: the sender gets a notice saying voice messages are not supported there, and the agent gets an honest note instead of the contentless marker. A plain **sound file** is not refused — it is saved and handed to the agent like any other attachment. Nothing is transcribed from audio and there is no cloud transcription fallback.
-
-Any local model directory an earlier release downloaded on those platforms (`~/.mahbot/models/qwen3-asr-0.6b/` and `~/.mahbot/models/supertonic3/` on unix, the same paths under `%USERPROFILE%\.mahbot\` on Windows) is simply unreachable now. Nothing deletes it and no stored setting is purged; if you want the disk space back, remove those directories by hand.
-
-### Building from source on Windows
-
-Building mahbot there from source needs a C/C++ toolchain plus the Windows SDK it links against (the Visual Studio Build Tools `Desktop development with C++` workload provides both), because several dependencies (ring, zstd-sys, libz-sys, onig_sys, libgit2-sys) compile C during the build. The product is a windowed program, so starting it opens no console window — its own window is the one it shows — and a failed start is recorded in the durable `error.log` block in the storage root. The product's own subcommands are the exception: the daemon starts those with their streams wired and waits for them, so their output reaches the agent.
-
-Our own source type-checks, lints and compiles for Windows — `scripts/windows-cross-check.sh` in the repository verifies that by hand (dev-only tooling, not part of the published crate). That check only compiles: nothing is linked into a runnable binary and nothing is executed.
