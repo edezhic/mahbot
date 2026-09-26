@@ -791,6 +791,9 @@ fn main() -> Result<()> {
     // must have a source before the iced app runs, same convention.
     mahbot::gui::init_runtime_event_tx();
 
+    // The icon on the surfaces the window itself does not carry.
+    mahbot::app_icon::install_desktop_integration();
+
     iced::application(
         move || {
             (
@@ -809,12 +812,7 @@ fn main() -> Result<()> {
     .default_font(JETBRAINS_MONO)
     .subscription(Dashboard::subscription)
     .theme(Dashboard::theme)
-    .window(iced::window::Settings {
-        size: iced::Size::new(window_state.width, window_state.height),
-        position: window_state.position(),
-        min_size: Some(iced::Size::new(800.0, 500.0)),
-        ..iced::window::Settings::default()
-    })
+    .window(dashboard_window_settings(&window_state))
     .exit_on_close_request(false)
     .run()
     // Returning here with an error leaves without the teardown below — one of the exits
@@ -830,6 +828,29 @@ fn main() -> Result<()> {
     rt.block_on(shutdown_after_dashboard());
 
     Ok(())
+}
+
+/// The dashboard window's own settings: the geometry this account was last closed
+/// with, and the icon and announced name the platform's identity surfaces need.
+fn dashboard_window_settings(state: &mahbot::gui::WindowState) -> iced::window::Settings {
+    iced::window::Settings {
+        size: iced::Size::new(state.width, state.height),
+        position: state.position(),
+        min_size: Some(iced::Size::new(800.0, 500.0)),
+        // The window's own icon where the platform has one (the title bar on
+        // Windows and X11); macOS and Wayland carry no window icon and ignore it.
+        icon: mahbot::app_icon::window_icon(),
+        // Linux: the name the window announces. A desktop environment matches it
+        // against the launcher entry's file name to know which entry — and so which
+        // icon — belongs to this window; with nothing announced no entry is ever
+        // associated with it.
+        #[cfg(target_os = "linux")]
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: mahbot::app_icon::LINUX_APP_ID.to_owned(),
+            ..Default::default()
+        },
+        ..iced::window::Settings::default()
+    }
 }
 
 /// Background cleanup loop adapter — runs every 10 minutes until cancelled

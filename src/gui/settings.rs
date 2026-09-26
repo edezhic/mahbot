@@ -26,7 +26,7 @@ use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
-    Column, Id, Row, Space, button, column, container, pick_list, row, stack, text, toggler,
+    Column, Id, Row, Space, button, column, container, image, pick_list, row, stack, text, toggler,
     tooltip,
 };
 #[cfg(target_os = "macos")]
@@ -3227,6 +3227,7 @@ impl SettingsState {
             crate::self_update::UpdateMode::SourceTree => "Copy built from sources",
         };
         row![
+            image(crate::app_icon::widget_image()).width(20).height(20),
             text(format!("MahBot v{}", crate::self_update::VERSION))
                 .size(theme::TEXT_13)
                 .color(theme::TEXT_FAINT),

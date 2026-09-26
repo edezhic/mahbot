@@ -210,6 +210,13 @@ pdf-extract = { version = "0.12", default-features = false }
 hayro = "0.7"
 quick-xml = { version = "0.39", default-features = false }
 
+[build-dependencies]
+# The product's icon inside the Windows executable (build.rs). Requested without
+# its default `toml` feature: the crate reads `[package.metadata.winresource]`
+# only when that feature is on, and this project sets the few properties it wants
+# from the build script itself. Every other target builds no resource at all.
+winresource = { version = "0.1", default-features = false }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -262,8 +269,10 @@ objc2-foundation = { version = "0.3", features = ["NSAppleEventDescriptor", "NSA
 objc2-core-services = "0.3"
 objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"
-# App enumeration (NSWorkspace/NSRunningApplication) for the `apps` action.
-objc2-app-kit = { version = "0.3", features = ["NSRunningApplication", "NSWorkspace", "NSApplication"] }
+# App enumeration (NSWorkspace/NSRunningApplication) for the `apps` action, and
+# the running application's own icon ([`crate::app_icon`]): NSImage built from the
+# embedded artwork's pixels, with NSBitmapImageRep as its representation.
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSBitmapImageRep", "NSGraphics", "NSImage", "NSImageRep", "NSRunningApplication", "NSWorkspace"] }
 objc2-application-services = "0.3"
 objc2-screen-capture-kit = "0.3"
 block2 = "0.6"

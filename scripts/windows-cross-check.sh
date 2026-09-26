@@ -74,9 +74,12 @@ chmod +x "$ZIGCC"
 sed 's/zig cc/zig c++/' "$ZIGCC" > "$BIN/zigcc.cxx"
 chmod +x "$BIN/zigcc.cxx"
 
-# turso_sdk_kit's build script compiles a VERSIONINFO resource for its cdylib by
-# shelling out to `windres` (`<in> -O coff -o <out>`). zig ships an `rc.exe`
-# drop-in, so translate the windres spelling and let zig do the work.
+# Both resource steps this lane runs are reached through `windres`: turso_sdk_kit
+# compiles a VERSIONINFO resource for its cdylib (`<in> -O coff -o <out>`), and
+# mahbot's own build script compiles the icon resource through the winresource
+# crate (`<in> <out>` with `-I`/`--target` options). This host has no mingw-w64
+# toolchain, and zig ships an `rc.exe` drop-in, so translate the spelling and let
+# zig do the work.
 cat > "$BIN/windres" <<'EOF'
 #!/bin/sh
 in=""; out=""
@@ -84,9 +87,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
     -i) in="$2"; shift 2 ;;
-    -O) shift 2 ;;
+    -O|--target) shift 2 ;;
     -*) shift ;;
-    *) in="$1"; shift ;;
+    *) if [ -z "$in" ]; then in="$1"; else out="$1"; fi; shift ;;
   esac
 done
 [ -n "$in" ] && [ -n "$out" ] || { echo "windres shim: missing input or output" >&2; exit 1; }
@@ -94,7 +97,18 @@ exec zig rc /nologo /fo "$out" "$in"
 EOF
 chmod +x "$BIN/windres"
 
+# The archiver that same resource step wraps its object into a static library with.
+cat > "$BIN/ar" <<'EOF'
+#!/bin/sh
+exec zig ar "$@"
+EOF
+chmod +x "$BIN/ar"
+
 export PATH="$BIN:$PATH"
+# winresource asks for its resource compiler and archiver by the unprefixed names
+# above; both variables are that crate's own documented overrides.
+export WINDRES="$BIN/windres"
+export AR="$BIN/ar"
 # A scratch build dir, so the host's target/ is not invalidated by the cross
 # build and a rerun recompiles only what changed.
 export CARGO_TARGET_DIR="$WORK/target"

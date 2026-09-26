@@ -45,7 +45,7 @@ use crate::pipeline::board::Ticket;
 
 use iced::keyboard;
 use iced::widget::{
-    Column, Row, Space, button, column, container, pick_list, row, rule, text, tooltip,
+    Column, Row, Space, button, column, container, image, pick_list, row, rule, text, tooltip,
 };
 use iced::window;
 use iced::{Alignment, Element, Length, Task};
@@ -338,6 +338,15 @@ pub enum Message {
     QuitRequested,
     /// Window geometry event (move/resize) — tracks state for persist-on-close.
     WindowEvent(window::Id, window::Event),
+    /// The dashboard window was created, carrying the id of the new window.
+    /// Windows only: the icons the taskbar and Alt-Tab show have to be attached to
+    /// the window's own handle (see [`crate::app_icon`]).
+    #[cfg(target_os = "windows")]
+    WindowOpened(window::Id),
+    /// The window's own platform handle, the answer to [`Message::WindowOpened`].
+    /// Windows only — the value is the window's `HWND`.
+    #[cfg(target_os = "windows")]
+    WindowHandle(u64),
     /// Keyboard shortcut: Cmd+F — focus the primary search input on the current page.
     FocusSearch,
     /// Keyboard shortcut: Escape — dismiss modal/panel/confirmation on the current page.
@@ -1275,6 +1284,13 @@ impl Dashboard {
                 }
                 _ => Task::none(),
             },
+            #[cfg(target_os = "windows")]
+            Message::WindowOpened(id) => window::raw_id::<Message>(id).map(Message::WindowHandle),
+            #[cfg(target_os = "windows")]
+            Message::WindowHandle(raw) => {
+                crate::app_icon::apply_window_icons(raw);
+                Task::none()
+            }
             Message::CloseDiffModal => {
                 self.show_diff_modal = false;
                 Task::done(Message::DiffModal(diff::DiffMessage::ClearCommitState))
@@ -1903,6 +1919,7 @@ impl Dashboard {
         if !self.ready {
             return container(
                 column![
+                    image(crate::app_icon::widget_image()).width(96).height(96),
                     text("MahBot")
                         .size(theme::TEXT_24)
                         .color(theme::TEXT_PRIMARY),
@@ -2298,8 +2315,15 @@ impl Dashboard {
         let always_on = iced::Subscription::batch([
             window::resize_events()
                 .map(|(id, size)| Message::WindowEvent(id, window::Event::Resized(size))),
-            window::events().filter_map(|(id, event)| {
-                matches!(&event, window::Event::Moved(_)).then_some(Message::WindowEvent(id, event))
+            window::events().filter_map(|(id, event)| match &event {
+                window::Event::Moved(_) => Some(Message::WindowEvent(id, event)),
+                // The window is created after this subscription is registered, so
+                // its first `Opened` event arrives here. Windows needs the id it
+                // carries: it is the window's handle, and the taskbar/Alt-Tab icon
+                // has to be attached to it (see `crate::app_icon`).
+                #[cfg(target_os = "windows")]
+                window::Event::Opened { .. } => Some(Message::WindowOpened(id)),
+                _ => None,
             }),
             window::close_requests().map(Message::CloseRequested),
             iced::Subscription::run(quit_requests_subscription),

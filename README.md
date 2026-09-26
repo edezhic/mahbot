@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/mb-icon-256.png" width="64" alt="MahBot">
+</p>
+
 # MahBot
 
 Mahbot(i.e. __my bot__) is an agentic system that automates coding while also providing built-in tools for everyday automations, research, as well as media editing and generation.

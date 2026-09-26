@@ -468,19 +468,18 @@ async fn walk_node(
     let focused = accessible
         .get_state()
         .await
-        .map(|s| s.contains(AtspiState::Focused))
-        .unwrap_or(false);
+        .is_ok_and(|s| s.contains(AtspiState::Focused));
 
     let mut children = Vec::new();
-    if depth < MAX_DEPTH {
-        if let Ok(child_refs) = accessible.get_children().await {
-            for child in child_refs {
-                if *nodes >= core::MAX_RENDER_NODES {
-                    break;
-                }
-                if let Some(child_node) = walk_node(&child, conn, depth + 1, handles, nodes).await {
-                    children.push(child_node);
-                }
+    if depth < MAX_DEPTH
+        && let Ok(child_refs) = accessible.get_children().await
+    {
+        for child in child_refs {
+            if *nodes >= core::MAX_RENDER_NODES {
+                break;
+            }
+            if let Some(child_node) = walk_node(&child, conn, depth + 1, handles, nodes).await {
+                children.push(child_node);
             }
         }
     }
@@ -624,14 +623,14 @@ async fn set_element_value(
             Err(anyhow!("set-text-contents returned false"))
         };
     }
-    if let Ok(value) = proxies.value().await {
-        if let Ok(num) = text.trim().parse::<f64>() {
-            value
-                .set_current_value(num)
-                .await
-                .map_err(|e| dbus_err(e, "set current value"))?;
-            return Ok(());
-        }
+    if let Ok(value) = proxies.value().await
+        && let Ok(num) = text.trim().parse::<f64>()
+    {
+        value
+            .set_current_value(num)
+            .await
+            .map_err(|e| dbus_err(e, "set current value"))?;
+        return Ok(());
     }
     Err(core::taxonomy_error(
         core::ERR_UNSUPPORTED,
@@ -764,6 +763,9 @@ fn pixel_point(
     Ok((x.round() as i32, y.round() as i32))
 }
 
+// The error is only ever a `map_err` callback's argument, so it arrives owned and
+// is formatted as it is: borrowing it would push a closure into every call site.
+#[expect(clippy::needless_pass_by_value)]
 fn input_err(e: enigo::InputError) -> anyhow::Error {
     anyhow!("input synthesis failed: {e}")
 }
@@ -911,8 +913,7 @@ fn x11_capture_screen() -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
     let lsb_first = conn.setup().image_byte_order == xproto::ImageOrder::LSB_FIRST;
     let cap_bytes = conn
         .maximum_request_bytes()
-        .min(4 * 1024 * 1024)
-        .max(64 * 1024);
+        .clamp(64 * 1024, 4 * 1024 * 1024);
     let rects = x11_monitor_rects(&conn, root);
     let geo = surface_from_rects(&rects);
     let (w, h) = (geo.width.round() as u32, geo.height.round() as u32);
@@ -1085,7 +1086,7 @@ async fn portal_screenshot() -> Result<Capture, anyhow::Error> {
             ),
         )
     })?;
-    let want = req_path.as_str().to_owned();
+    let expected_path = req_path.as_str().to_owned();
     let wait = async {
         while let Some(msg) = stream.next().await {
             let msg = msg.map_err(|e| {
@@ -1094,10 +1095,10 @@ async fn portal_screenshot() -> Result<Capture, anyhow::Error> {
                     format!("portal response stream failed: {e}"),
                 )
             })?;
-            if !msg
+            if msg
                 .header()
                 .path()
-                .is_some_and(|p| p.as_str() == want.as_str())
+                .is_none_or(|p| p.as_str() != expected_path.as_str())
             {
                 continue;
             }

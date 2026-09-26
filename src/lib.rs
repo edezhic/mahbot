@@ -12,6 +12,10 @@
 
 pub mod agent;
 pub mod alarms;
+/// The product's own icon: the artwork, and the surfaces outside the window it
+/// appears on (the file's own resource on Windows, the running application's Dock
+/// tile on macOS, the launcher entry on Linux, the dashboard's own renderings).
+pub mod app_icon;
 /// Local audio subsystem (wake word, voice commands, local transcription,
 /// read-aloud TTS, cues). macOS-only: the speech engine it is built on has no
 /// other platform support, and nothing here has a fallback. Linux and Windows

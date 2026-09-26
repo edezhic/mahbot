@@ -1,16 +1,17 @@
 #!/bin/sh
 # Local Linux cross-check: compiles mahbot for x86_64-unknown-linux-gnu — the
-# lib, all test targets (which pull in src/tools/computer/linux.rs and its
-# Linux-gated tests) and the benches under the `voice-tests` marker. Manual
-# release-gate tool — not wired into any CI.
+# lib, the bin, all test targets (which pull in src/tools/computer/linux.rs and
+# its Linux-gated tests), the workspace lint gate with warnings denied, and the
+# benches under the `voice-tests` marker. Manual release-gate tool — not wired
+# into any CI.
 #
 # Requires: zig, cargo-zigbuild (`brew install cargo-zigbuild`) and the target's
 # rust std (`rustup target add x86_64-unknown-linux-gnu`).
 #
 # Why not a plain `cargo zigbuild` run: cargo-zigbuild only supports build-like
 # subcommands (no `check`), and the check lane is what type-checks the test
-# targets. So: `cargo check` with zig as the cross C compiler covers lib + test
-# targets (type/borrow-check, no final link), and `cargo zigbuild --lib` adds
+# targets. So: `cargo check` with zig as the cross C compiler covers lib + bin +
+# test targets (type/borrow-check, no final link), and `cargo zigbuild --lib` adds
 # full codegen for the lib target (an rlib needs no final link).
 set -eu
 
@@ -53,10 +54,17 @@ export CC_x86_64_unknown_linux_gnu="$ZIGCC"
 export CXX_x86_64_unknown_linux_gnu="$BIN/zigcc.cxx"
 export AR_x86_64_unknown_linux_gnu="zig ar"
 
-cargo check --target "$TARGET" --lib --tests
+echo "==> type-check (lib + bins + tests) for $TARGET"
+cargo check --target "$TARGET" --lib --bins --tests
+# This target's lint gate, matching the Windows lane: the host lint never sees
+# Linux-gated code.
+echo "==> lint (lib + bins + tests), warnings denied, for $TARGET"
+cargo clippy --target "$TARGET" --lib --bins --tests -- -D warnings
 # Audio benches and the `voice-tests` dev marker: the feature cannot be
 # platform-gated, so this lane proves the marker enables nothing here and the
 # wake-word bench compiles to its inert stub instead of reaching for the
 # macOS-only audio subsystem.
+echo "==> type-check (audio benches) for $TARGET"
 cargo check --target "$TARGET" --benches --features voice-tests
+echo "==> codegen (lib) for $TARGET"
 cargo zigbuild --target "$TARGET" --lib

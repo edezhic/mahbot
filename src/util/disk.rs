@@ -25,9 +25,17 @@ pub(crate) fn free_and_capacity(path: &Path) -> Option<(u64, u64)> {
         return None;
     }
     Some((
-        u64::from(stats.f_bavail).saturating_mul(frsize),
-        u64::from(stats.f_blocks).saturating_mul(frsize),
+        block_bytes(stats.f_bavail, frsize),
+        block_bytes(stats.f_blocks, frsize),
     ))
+}
+
+/// `blocks` blocks of `frsize` bytes as a byte count. The block counts are the
+/// platform's own width — `u64` on Linux, narrower on macOS — so they are widened
+/// through `Into` instead of being spelled per target.
+#[cfg(unix)]
+fn block_bytes(blocks: impl Into<u64>, frsize: u64) -> u64 {
+    blocks.into().saturating_mul(frsize)
 }
 
 /// Whether a wide path needs a trailing separator before it reaches the
