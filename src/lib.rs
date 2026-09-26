@@ -220,28 +220,32 @@ pub struct Workspace {
     /// `true`  — the maintainer loop processes this workspace on each cycle.
     /// `false` — the maintainer skips this workspace entirely (default).
     ///
-    /// Unlike [`Self::paused`] (which is a strict freeze — all in-flight work
-    /// stops and no stage advances until manual resume),
-    /// `maintenance_enabled` specifically controls only the maintainer loop.
-    /// A paused workspace can still be maintained if
-    /// `maintenance_enabled` is `true`, and vice versa.
+    /// Unlike [`Self::paused`] (which freezes the whole pipeline — no stage
+    /// advances and its ticket agents stop at their next round boundary, until
+    /// manual resume), `maintenance_enabled` specifically controls only the
+    /// maintainer loop. A paused workspace can still be maintained if
+    /// `maintenance_enabled` is `true`, and vice versa. Disabling maintenance
+    /// does cancel a running maintainer outright, where pausing is cooperative.
     ///
     /// Persisted in the `workspaces` table with a `DEFAULT 0` schema default.
     /// Toggled from the dashboard footer chrome.
     pub maintenance_enabled: bool,
     /// Whether automatic claim dispatch is paused for this workspace (a strict
-    /// freeze): ALL in-flight pipeline work stops (in-flight agents are
-    /// cancelled) and NO pipeline stage advances — including the
-    /// dispatcher finalizers — until the workspace is manually resumed.
+    /// freeze): NO pipeline stage advances — including the dispatcher
+    /// finalizers — and the agents working on its tickets freeze at their next
+    /// LLM round boundary, until the workspace is manually resumed. (The freeze
+    /// is cooperative: no cancel token is fired, so a round already in flight
+    /// finishes its current turn first.)
     ///
     /// Automatically set to `true` on technical/agent failures (dispatch panic,
     /// agent run failure, all verifiers failing, user cancelling an in-flight
     /// run) so queued development tickets aren't claimed and don't cascade.
-    /// Lifted via the normal unpause path (GUI toggle or rediscovery; the
-    /// nightly loop skips paused workspaces). A discovery already in flight when
-    /// the pause lands clears it on completion without checking who set it: the
-    /// round stopped by that failure replays once and freezes the workspace
-    /// again — see `finalize_discovery`.
+    /// Lifted via the normal unpause path (GUI toggle, the admin's
+    /// `workspace_control` chat tool, or rediscovery; the nightly loop skips
+    /// paused workspaces). A discovery already in flight when the pause lands
+    /// clears it on completion without checking who set it: the round stopped by
+    /// that failure replays once and freezes the workspace again — see
+    /// `finalize_discovery`.
     pub paused: bool,
     /// RFC 3339 timestamp of the last completed maintainer run.
     /// `None` means the workspace has never been maintained.

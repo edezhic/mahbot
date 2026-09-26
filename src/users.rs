@@ -1157,11 +1157,16 @@ pub(crate) async fn resolve_selected_workspace_name(user_name: &str) -> Option<S
     Some(personal_workspace_name(user_name))
 }
 
-/// The shared workspaces the active one can be switched between, in the order
-/// the desktop footer picker lists them (`workspaces.name`, already ordered by
-/// the store). A personal workspace is never a choice: those are not `workspaces`
-/// rows, and a legacy row carrying a `personal:{user}` name is filtered out.
-pub async fn switchable_workspaces() -> Result<Vec<Workspace>> {
+/// The registered workspaces — every `workspaces` row except a personal space,
+/// in the order the desktop footer picker lists them (`workspaces.name`, already
+/// ordered by the store). A personal workspace is never included: those are not
+/// `workspaces` rows, and a legacy row carrying a `personal:{user}` name is
+/// filtered out.
+///
+/// Two consumers: the active-workspace switcher (the choices) and the Assistant's
+/// `workspace_control list` (the same set, reported with each row's status and
+/// pause state).
+pub async fn registered_workspaces() -> Result<Vec<Workspace>> {
     Ok(crate::workspace::store()
         .list()
         .await?
@@ -1170,19 +1175,19 @@ pub async fn switchable_workspaces() -> Result<Vec<Workspace>> {
         .collect())
 }
 
-/// Whether a store holding `shared_count` shared workspaces has the switcher at
-/// all: with fewer than two there is nothing to switch between.
+/// Whether a store holding `shared_count` registered workspaces has the switcher
+/// at all: with fewer than two there is nothing to switch between.
 #[must_use]
 pub const fn switcher_exists(shared_count: usize) -> bool {
     shared_count >= 2
 }
 
-/// [`switcher_exists`] against the shared workspaces — the same set the picker
-/// lists, so the menu gate cannot disagree with it. A failed read hides it
-/// rather than offering a broken choice.
+/// [`switcher_exists`] against the registered workspaces — the same set the
+/// picker lists, so the menu gate cannot disagree with it. A failed read hides
+/// it rather than offering a broken choice.
 #[must_use]
 pub async fn workspace_switcher_available() -> bool {
-    switchable_workspaces()
+    registered_workspaces()
         .await
         .is_ok_and(|workspaces| switcher_exists(workspaces.len()))
 }

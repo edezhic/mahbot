@@ -981,7 +981,7 @@ async fn handle_agents_command(msg: &ChannelMessage) {
 /// there is nothing to switch, so the command refuses instead of falling
 /// through to the Assistant as ordinary chat.
 async fn handle_workspace_command(msg: &ChannelMessage) {
-    let workspaces = match mahbot::users::switchable_workspaces().await {
+    let workspaces = match mahbot::users::registered_workspaces().await {
         Ok(workspaces) => workspaces,
         Err(e) => {
             send_telegram_reply(msg, format!("Failed to load workspaces: {e}")).await;
@@ -1513,7 +1513,7 @@ async fn refresh_pressed_workspaces_keyboard(msg: &ChannelMessage) {
     // The switch itself is already reported to the admin, so a failed read is a
     // plain skip.
     let (Ok(workspaces), Ok(active)) = (
-        mahbot::users::switchable_workspaces().await,
+        mahbot::users::registered_workspaces().await,
         mahbot::users::get_raw_selected_workspace(&msg.user_name).await,
     ) else {
         return;

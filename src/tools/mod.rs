@@ -37,6 +37,7 @@ pub(crate) mod ticket;
 pub(crate) mod video_edit;
 pub(crate) mod video_gen;
 pub(crate) mod web_search;
+pub(crate) mod workspace_control;
 
 /// Maximum file size for edit and search tool operations and the dashboard editor
 /// (10 MB), and the read tool's cap for any read that is not a document container;
@@ -193,6 +194,7 @@ pub(crate) use ticket::{
 pub(crate) use video_edit::VideoEditTool;
 pub(crate) use video_gen::VideoGenTool;
 pub(crate) use web_search::{WebSearchBackend, WebSearchTool};
+pub(crate) use workspace_control::WorkspaceControlTool;
 
 use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::{Tool, Workspace};

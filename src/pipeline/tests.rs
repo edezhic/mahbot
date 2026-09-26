@@ -743,6 +743,12 @@ async fn bounce_breaker_trips_to_failed() {
 /// `reset_phase_attempt` destroys the current attempt: it comments, cancels
 /// orphaned agents, pauses the workspace for an implementation phase, and
 /// deletes the phase job so the puller creates a fresh one.
+///
+/// Serialized on `drain`: the auto-pause goes through
+/// `pause_workspace_on_failure`, which short-circuits while the process-global
+/// drain flag is set — a test that drives a drain (see `session::dead_session`)
+/// must not overlap with this assertion.
+#[serial_test::serial(drain)]
 #[tokio::test]
 async fn reset_phase_attempt_destroys_attempt_and_pauses() {
     let _guard = TEST_LOCK.lock().await;

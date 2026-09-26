@@ -257,6 +257,7 @@ use crate::tools::{
     ListTicketsTool, MahbotConfigTool, MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool,
     SearchArchivedTicketsTool, SearchTool, SendMessageToManagerTool, ShellMode, ShellTool,
     SleepTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
+    WorkspaceControlTool,
 };
 
 impl Role {
@@ -310,8 +311,8 @@ impl Role {
     /// operations are confined to that workspace.
     ///
     /// `is_admin` says whether the triggering account is the admin. It only
-    /// widens the Assistant's toolset: `shell`, `implement`,
-    /// `research`, `computer`, `mahbot_config`, `mahbot_debug` and the
+    /// widens the Assistant's toolset: `shell`, `implement`, `research`,
+    /// `computer`, `mahbot_config`, `mahbot_debug`, `workspace_control` and the
     /// Assistant↔Manager chat tools are added. Every other role's toolset is
     /// byte-identical regardless of its value. `computer` exists only where the
     /// capability does: on macOS it is withdrawn, so the admin's toolset there
@@ -448,6 +449,12 @@ impl Role {
                     // migrated over from the removed Support role.
                     t.push(Box::new(MahbotConfigTool));
                     t.push(Box::new(MahbotDebugTool));
+                    // The admin's project-pipeline control: freeze/unfreeze a
+                    // named workspace's pipeline and list the registered
+                    // workspaces with their pause state. The one project action
+                    // the Assistant performs itself instead of forwarding to
+                    // the Manager (see `role/assistant_admin.md`).
+                    t.push(Box::new(WorkspaceControlTool));
                 }
                 t
             }
@@ -575,14 +582,26 @@ mod tests {
     fn all_roles_have_tools() {
         // Guards against an empty Vec in Role::tools() — the compiler catches
         // missing arms in the match, but cannot catch an arm that returns
-        // vec![]. Every role needs at least one tool to function.
+        // vec![]. Every role needs at least one tool to function, and every
+        // advertised tool must build its spec: `spec()` loads
+        // `src/prompt/tool/{name}.md`, so a misnamed description asset panics
+        // here instead of at the first agent run.
         for role in Role::iter() {
-            let tools = role.tools(&crate::workspace::test_ws("test"), false, test_sessions());
-            assert!(
-                !tools.is_empty(),
-                "{}: Role::tools() must not be empty — every role needs at least one tool",
-                role.as_str()
-            );
+            for is_admin in [false, true] {
+                let tools = role.tools(
+                    &crate::workspace::test_ws("test"),
+                    is_admin,
+                    test_sessions(),
+                );
+                assert!(
+                    !tools.is_empty(),
+                    "{}: Role::tools() must not be empty — every role needs at least one tool",
+                    role.as_str()
+                );
+                for tool in &tools {
+                    let _ = tool.spec();
+                }
+            }
         }
     }
 
@@ -718,11 +737,13 @@ mod tests {
     }
 
     #[test]
-    fn config_and_debug_tools_only_in_admin_assistant() {
-        // Acceptance pin: the merged `mahbot_config` setup tool and the
-        // read-only `mahbot_debug` query tool are granted ONLY to the admin's
-        // Assistant. A guest's Assistant and every other role must never
-        // advertise either.
+    fn admin_only_tools_only_in_admin_assistant() {
+        // Acceptance pin: the admin's administrative tools — the merged
+        // `mahbot_config` setup tool, the read-only `mahbot_debug` query tool
+        // and `workspace_control` (the registered workspaces' pipeline
+        // pause/resume/list) — are granted ONLY to the admin's Assistant. A
+        // guest's Assistant and every other role must never advertise any of
+        // them.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
             for is_admin in [false, true] {
@@ -731,7 +752,7 @@ mod tests {
                     .iter()
                     .map(|t| t.name())
                     .collect();
-                for name in ["mahbot_config", "mahbot_debug"] {
+                for name in ["mahbot_config", "mahbot_debug", "workspace_control"] {
                     let has = names.contains(&name);
                     if role == crate::Role::Assistant && is_admin {
                         assert!(has, "the admin's Assistant must advertise `{name}`");

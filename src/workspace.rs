@@ -980,18 +980,22 @@ impl WorkspaceStore {
     /// Run an UPDATE on `workspaces` that sets `set_clause` plus
     /// `updated_at = now` for a single named row — mirrors the ticket-update
     /// helper in `board.rs` to keep placeholder numbering uniform.
+    ///
+    /// Returns the affected-row count, so a caller that reports the write as
+    /// applied can refuse `0` (no such workspace) instead of reporting a write
+    /// that never happened — see [`Self::set_paused`]. Callers that only need
+    /// the write map it away.
     async fn exec_update_with_updated_at(
         &self,
         set_clause: &str,
         set_params: Vec<db::Value>,
         name: &str,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let sql = format!("UPDATE workspaces SET {set_clause}, updated_at = ? WHERE name = ?");
         let mut params = set_params;
         params.push(Value::from(db::now()));
         params.push(Value::from(name));
-        self.conn.execute(&sql, params).await?;
-        Ok(())
+        Ok(self.conn.execute(&sql, params).await?)
     }
 
     /// Insert a new workspace and register it for analysis.
@@ -1106,6 +1110,7 @@ impl WorkspaceStore {
     pub async fn set_status(&self, name: &str, status: &WorkspaceStatus) -> Result<()> {
         self.exec_update_with_updated_at("status = ?", vec![Value::from(status.to_string())], name)
             .await
+            .map(|_| ())
     }
 
     /// Atomically claim a pending workspace for its first discovery:
@@ -1191,10 +1196,19 @@ impl WorkspaceStore {
     }
 
     /// Set or clear the pipeline pause toggle for a workspace.
+    ///
+    /// A name with no row is an error rather than a silent no-op: every caller
+    /// reports the toggle as applied (a toast, a chat reply, a model-facing
+    /// tool result), so a pause that wrote nothing would be reported as one.
     pub async fn set_paused(&self, name: &str, paused: bool) -> Result<()> {
         let val: i64 = i64::from(paused);
-        self.exec_update_with_updated_at("paused = ?", vec![Value::from(val)], name)
+        let affected = self
+            .exec_update_with_updated_at("paused = ?", vec![Value::from(val)], name)
             .await?;
+        anyhow::ensure!(
+            affected > 0,
+            "No workspace is registered under the name '{name}'."
+        );
         if paused {
             // Keyed to the user/operator/failure pause — the one place that
             // sets `paused` via this method. The discovery "analysis-pause"
@@ -1231,6 +1245,7 @@ impl WorkspaceStore {
             name,
         )
         .await
+        .map(|_| ())
     }
 
     /// Store the per-workspace maintainer recommendations blob (replace-only) —
@@ -1247,6 +1262,7 @@ impl WorkspaceStore {
             name,
         )
         .await
+        .map(|_| ())
     }
 
     /// Read the raw maintainer recommendations JSON blob (None = absent/NULL).
@@ -1282,6 +1298,7 @@ impl WorkspaceStore {
             name,
         )
         .await
+        .map(|_| ())
     }
 
     /// Retrieve discovered diagnostics commands for a workspace.
@@ -1311,6 +1328,7 @@ impl WorkspaceStore {
         let notes = truncate_workspace_notes(notes);
         self.exec_update_with_updated_at("notes = ?", vec![Value::from(notes)], name)
             .await
+            .map(|_| ())
     }
 
     /// Clear all workspace context rows (role-keyed and the general NULL-role
@@ -1971,6 +1989,17 @@ mod tests {
             .expect("fetch")
             .expect("exists");
         assert!(fetched.paused, "Should be paused after set_paused(true)");
+
+        // A name with no row is refused: the toggle is reported as applied by
+        // every caller, so it must not silently do nothing.
+        let err = store
+            .set_paused("toggle_test_absent", true)
+            .await
+            .expect_err("an unknown workspace must be refused");
+        assert!(
+            err.to_string().contains("No workspace is registered"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
