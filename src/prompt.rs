@@ -20,6 +20,19 @@ struct PromptAssets;
 pub(crate) static TEMPLATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?-u)\{\{(\w+)\}\}").expect("TEMPLATE_RE must compile"));
 
+/// The text an embedded asset delivers: its bytes with the checkout's line
+/// endings normalised to LF.
+///
+/// `rust_embed` embeds an asset exactly as the working copy holds it, and a
+/// checkout that rewrites line endings (Windows, `core.autocrlf`) hands the
+/// build CRLF — which would change the text a model is sent and, by hiding the
+/// `\n---\n` separator, collapse a variant asset into a single section. The
+/// repository pins LF for these files (`.gitattributes`), so this is a no-op on
+/// a correct checkout and a repair everywhere else.
+fn asset_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).replace("\r\n", "\n")
+}
+
 /// Load a prompt template from embedded assets.
 ///
 /// Panics if the asset is missing — prompt files are always present in the
@@ -32,15 +45,20 @@ pub(crate) fn load_prompt(asset_key: &str) -> String {
              Create the file at src/prompt/{asset_key} and rebuild."
         )
     });
-    String::from_utf8_lossy(file.data.as_ref()).into_owned()
+    asset_text(file.data.as_ref())
 }
 
 /// Load a prompt asset and split it into `---`-delimited sections (trimmed,
 /// empty sections dropped).
 #[must_use]
 pub(crate) fn load_prompt_sections(asset_key: &str) -> Vec<String> {
-    load_prompt(asset_key)
-        .split("\n---\n")
+    split_sections(&load_prompt(asset_key))
+}
+
+/// Split a prompt asset's text into `---`-delimited sections (trimmed, empty
+/// sections dropped).
+fn split_sections(text: &str) -> Vec<String> {
+    text.split("\n---\n")
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -441,6 +459,66 @@ mod tests {
                 !content.trim().is_empty(),
                 "Prompt asset '{asset_key}' is empty or whitespace-only.\n\
                  Each embedded prompt file must contain meaningful content.",
+            );
+        }
+    }
+
+    /// The assets the pipeline rotates through parallel agents, with the number
+    /// of variants each must yield. A collapse to one section silently hands
+    /// every analyst/reviewer the same variant instead of a decorrelated set.
+    const VARIANT_ASSETS: &[(&str, usize)] = &[
+        ("analyze/angles.md", 3),
+        ("analyze/ticket_angles.md", 3),
+        ("review_angles.md", 4),
+        ("qa_angles.md", 3),
+        // Five framings plus the trailing order-contract comment section.
+        ("synthesis/repair_framing.md", 6),
+    ];
+
+    #[test]
+    fn embedded_assets_are_checked_out_with_lf() {
+        // `rust_embed` embeds the checkout's bytes, so CR bytes here mean the
+        // build would carry something other than the repository's text — the
+        // Windows build did exactly that before `.gitattributes` pinned LF.
+        let mut scanned = 0;
+        // The instruction texts are the `.md` assets (a stray `.DS_Store` that
+        // finds its way into the folder is not one of them).
+        for asset_key in PromptAssets::iter().filter(|key| key.ends_with(".md")) {
+            let asset =
+                PromptAssets::get(&asset_key).expect("asset disappeared between iter and get");
+            assert!(
+                !asset.data.contains(&b'\r'),
+                "Embedded prompt '{asset_key}' holds CR bytes.\n\
+                 src/prompt must be checked out with LF — see .gitattributes, \
+                 and re-checkout rather than keeping an existing working copy.",
+            );
+            scanned += 1;
+        }
+        assert!(scanned > 0, "no embedded prompt asset was inspected");
+    }
+
+    #[test]
+    fn variant_assets_split_alike_under_either_checkout() {
+        for &(asset_key, variants) in VARIANT_ASSETS {
+            let file =
+                PromptAssets::get(asset_key).expect("asset disappeared between iter and get");
+            let text = asset_text(file.data.as_ref());
+            assert_eq!(
+                split_sections(&text).len(),
+                variants,
+                "'{asset_key}' must split into its {variants} variants — \
+                 the `---` separators are a contract, not formatting",
+            );
+
+            // A working copy checked out under the Windows convention hands the
+            // build the same file with CRLF endings.
+            let crlf = text.replace('\n', "\r\n");
+            assert_ne!(crlf, text, "'{asset_key}' has no line endings to convert");
+            assert_eq!(
+                asset_text(crlf.as_bytes()),
+                text,
+                "'{asset_key}' must deliver the same text under either \
+                 checkout convention",
             );
         }
     }

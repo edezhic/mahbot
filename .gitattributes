@@ -1,0 +1,8 @@
+# The instruction texts under src/prompt are embedded into the binary exactly as
+# the checkout wrote them (`rust_embed`), and the pipeline splits several of them
+# on a `---` line so each parallel agent gets its own variant. A checkout that
+# rewrites line endings — Windows, where `core.autocrlf` is on by default — would
+# ship bytes the repository does not hold and collapse those variants into one.
+# LF is therefore pinned for this folder alone, in the store and on checkout; no
+# other file in the repository is affected, raw-byte files included.
+/src/prompt/** text eol=lf
