@@ -33,18 +33,19 @@
 //! recursive-walk exclusions). Substitution is per-segment: an unservable grep
 //! (single-file perf gate, unsupported flag, compound/nested shape, …) is kept
 //! verbatim while a servable sibling grep elsewhere in the command is still
-//! served. Anything not provably safe executes the original command unchanged
-//! (fallback).
+//! served. Anything not provably safe is left unrewritten (fallback): what runs is
+//! the command as this platform reads it, which on Windows is not always the agent's
+//! own spelling of the line ([`super::windows_line`]).
 //!
 //! That per-segment tolerance is unix-only. On Windows an unserved member would
 //! be left to run a `grep` the platform does not have, and the interpreter's
 //! "not recognized" failure is the very status a "no match" produces elsewhere,
 //! so a command carrying a grep-family invocation is either fully served by the
 //! engine or refused as an explicit failure ([`unserved_failure`],
-//! [`GrepServe::refusal`]), except for the shapes listed below, which are left
-//! to the platform as written. A member the runner cannot take over refuses the
-//! same way — a redirect it cannot apply to a member it spawns itself, or a fold
-//! that names this service's own image ([`plan`]).
+//! [`GrepServe::refusal`]), except for the shapes listed below, which the engine
+//! leaves unrewritten and the platform runs. A member the runner cannot take over
+//! refuses the same way — a redirect it cannot apply to a member it spawns itself, or
+//! a fold that names this service's own image ([`plan`]).
 //! That decision is fail-closed on *words*, not on meanings: a segment that
 //! merely carries a grep-family word in a followed program's argument list
 //! refuses too ([`GREP_INTRODUCERS`]) — unless that program owns the search
@@ -377,8 +378,8 @@ pub(super) struct GrepOutcome {
 #[derive(Debug)]
 pub(super) struct GrepServe {
     /// The rewritten command; `None` when no grep was served, which leaves the
-    /// original to run — through the shell, except where a demotion on Windows
-    /// carries a cause and the caller refuses it ([`GrepServe::refusal`]).
+    /// command it was handed to run — through the shell, except where a demotion on
+    /// Windows carries a cause and the caller refuses it ([`GrepServe::refusal`]).
     pub rewritten: Option<String>,
     /// Per-grep-member decisions; empty when the command is not greppable.
     pub outcomes: Vec<GrepOutcome>,
@@ -390,8 +391,8 @@ pub(super) struct GrepServe {
     /// only on Windows and only when a rewrite was actually produced: a demotion
     /// (an unserved member, an unavailable engine, a payload too large, a plan
     /// shape the runner refuses) carries no rewrite and so no plan, and on Windows
-    /// the caller refuses it when it carries a cause — the original runs through
-    /// the shell only on unix or for a demotion with no cause
+    /// the caller refuses it when it carries a cause — the command it was handed runs
+    /// through the shell only on unix or for a demotion with no cause
     /// ([`GrepServe::refusal`]). A plan exists because the shell does not wait for
     /// this service's own image — see [`plan`] for the guarantee and for what is
     /// deliberately refused.
@@ -406,16 +407,17 @@ pub(super) struct GrepServe {
 
 /// The frame every refusal of a run opens with — the cause follows, then the
 /// consequence that belongs to the entry point that refused. Spelled once here so
-/// [`unserved_failure`] and the plan runner's `plan::refusal_message` cannot word
-/// one cause two ways.
+/// the three renderers of it ([`unserved_failure`], the plan runner's
+/// `plan::refusal_message`, and [`crate::tools::shell::windows_line::refusal`])
+/// cannot word one cause two ways.
 pub(super) const REFUSAL_FRAME: &str = "Command not run: ";
 
 /// The agent-facing failure for a command the engine or the runner refuses on
 /// Windows (the value of [`GrepServe::refusal`] and the engine's own reported
 /// failure). It becomes the tool error, so it must be unmistakable for a result:
 /// it names the cause and says nothing ran rather than that the search matched
-/// nothing. Every refusal path renders its message through here, so those two
-/// guarantees cannot drift between them.
+/// nothing. Every refusal this engine and its runner render comes through here, so
+/// those two guarantees cannot drift between them.
 ///
 /// The frame is shared with the runner's own refusal
 /// ([`plan::refusal_message`]): [`REFUSAL_FRAME`] is the same sentence
@@ -425,15 +427,18 @@ pub(super) const REFUSAL_FRAME: &str = "Command not run: ";
 /// guard rejected, a member the runner cannot run at all), as the shell
 /// description does.
 ///
-/// No remedy is offered: which commands can be served, and this platform's quoting
-/// and `%` rules, are the shell description's business, and one repeated here would
-/// be wrong for the causes no rewrite can avoid (an unavailable engine, an
-/// unquotable hand-off path).
-pub(super) fn unserved_failure(reason: &str) -> String {
-    format!(
+/// `remedy` is the caller's because only the shell's serve decision knows which
+/// causes no respelling can avoid; it also picks the reading's mode-selected sentence
+/// ([`crate::tools::shell::windows_line::remedy`]).
+pub(super) fn unserved_failure(reason: &str, remedy: Option<&str>) -> String {
+    let message = format!(
         "{REFUSAL_FRAME}{reason}. The search did NOT run — this is not an empty \
          match set."
-    )
+    );
+    match remedy {
+        Some(remedy) => format!("{message} {remedy}"),
+        None => message,
+    }
 }
 
 /// Aggregate telemetry fields derived purely from the per-member outcomes
@@ -451,9 +456,11 @@ pub(super) struct GrepTelemetryShape {
 }
 
 impl GrepServe {
-    /// A serve decision that keeps the original command running (no rewrite):
-    /// every analyzed member stays as-is, and `refusal` carries the Windows
-    /// failure when the platform refuses the command instead of running it.
+    /// A serve decision that runs the command it was handed, unrewritten: every
+    /// analyzed member stays as-is, and `refusal` carries the Windows failure when
+    /// the platform refuses the command instead of running it. The text handed to
+    /// the engine is the shell's own reading of the agent's line
+    /// ([`crate::tools::shell::windows_line`]), not the agent's spelling.
     fn not_rewritten(outcomes: Vec<GrepOutcome>, refusal: Option<String>) -> Self {
         Self {
             rewritten: None,
@@ -514,8 +521,8 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> GrepSer
     )
 }
 
-/// The Windows refusal for a serve decision that keeps the original command
-/// running: the short cause of the search the command is known to carry, and
+/// The Windows refusal for a serve decision that runs the command it was handed:
+/// the short cause of the search the command is known to carry, and
 /// always `None` on unix, where an unserved member keeps falling back to the
 /// real `grep`.
 fn refusal(platform: ShellPlatform, cause: Option<String>) -> Option<String> {
@@ -526,7 +533,7 @@ fn refusal(platform: ShellPlatform, cause: Option<String>) -> Option<String> {
     }
 }
 
-/// A serve decision demoted to the original command: no rewrite, every member
+/// A serve decision demoted to the command it was handed: no rewrite, every member
 /// marked not-served with `reason` (the row's served field must match the
 /// ACTUAL execution), and the platform's refusal — the command is known to
 /// carry a search at every call site.
@@ -536,8 +543,8 @@ fn demoted(platform: ShellPlatform, mut outcomes: Vec<GrepOutcome>, reason: &str
     GrepServe::not_rewritten(outcomes, refusal)
 }
 
-/// The single routing decision for one command: a served rewrite, or the
-/// original command unchanged. The platform and the engine probe are explicit
+/// The single routing decision for one command: a served rewrite, or the command
+/// it was handed, unchanged. The platform and the engine probe are explicit
 /// parameters so both platforms' routing — and every demotion path — is
 /// drivable from any host's unit-test lane.
 ///
@@ -985,7 +992,8 @@ struct ServedMember {
 ///
 /// The spec reaches the engine by argv on unix (`sh -c` puts no meaningful
 /// payload limit on it) and by scratch file on Windows ([`windows::write_spec_file`]):
-/// cmd.exe caps its command line at 8191 characters and re-parses it before the
+/// cmd.exe caps its command line at 8191 UTF-16 code units — the unit
+/// [`crate::tools::shell::windows_line`] measures it in — and re-parses it before the
 /// program sees the argv, so the JSON — which carries the agent's pattern and
 /// operands — cannot ride on it. That scratch file is pushed onto `files`, the
 /// caller's list of files to remove when the call finishes, and is the same file
@@ -1520,8 +1528,8 @@ fn analyze_command(
 
     // Served iff at least one grep was served. If none was, the command falls
     // back wholesale with the first per-segment skip reason naming the cause — a
-    // pure-skip command must not run the engine, and whether the original then
-    // runs at all is the platform's and the cause's ([`GrepServe::refusal`]).
+    // pure-skip command must not run the engine, and whether the command then runs
+    // at all is the platform's and the cause's ([`GrepServe::refusal`]).
     // The collected per-member outcomes are preserved (the caller records the
     // shape; a would-be serve demoted by the whole-command abort is handled at
     // the call site).
@@ -1547,8 +1555,8 @@ fn analyze_command(
 /// this service's own image — the plan its runner executes instead
 /// ([`super::plan`]).
 struct Joined {
-    /// The rewrite as one command, verbatim except that the Windows splitter's
-    /// newline connector is re-emitted as `&` (see the loop).
+    /// The rewrite as one command: the members joined with their own connectors —
+    /// the joining, and the one connector it can add, are [`join_rewritten`]'s.
     text: String,
     /// Scratch spec files the rewrite names, for the caller to remove when the
     /// call finishes.
@@ -1556,19 +1564,21 @@ struct Joined {
     /// The runner's own decomposition of the same members: `Some` only when a
     /// rewrite was produced on the platform that needs one. A demotion produces no
     /// rewrite and so no plan, and on Windows one carrying a cause is refused
-    /// rather than run, so the original reaches the shell only on unix or with no
-    /// cause ([`GrepServe::refusal`]).
+    /// rather than run, so the command it was handed reaches the shell only on unix
+    /// or with no cause ([`GrepServe::refusal`]).
     plan: Option<Plan>,
 }
 
-/// Join the rewritten members with their connectors into one command — verbatim
-/// except that the Windows splitter's newline connector is re-emitted as `&` (see
-/// the loop) — rendering every served member through [`render_served`]. The
-/// rendered spec files are returned to the caller: on Windows they are the
-/// hand-off's scratch files, created here — the first point at which the whole
-/// command is known to be servable — and removed when the call finishes. A member
-/// whose hand-off fails takes the files already written by its predecessors with
-/// it: the command is demoted, so nobody else ever owns them.
+/// Join the rewritten members with their own connectors into one command —
+/// verbatim on both platforms: a newline connector can only come from the unix
+/// core (the Windows splitter refuses a break) and is emitted verbatim because
+/// `sh -c` is what runs that rewrite — rendering every served member through
+/// [`render_served`]. The rendered spec files are returned to the caller: on
+/// Windows they are the hand-off's scratch files, created here — the first
+/// point at which the whole command is known to be servable — and removed when
+/// the call finishes. A member whose hand-off fails takes the files already
+/// written by its predecessors with it: the command is demoted, so nobody else
+/// ever owns them.
 ///
 /// The same traversal collects the [`Plan`]'s members, so the text and the plan
 /// are two renderings of ONE per-member decision and cannot drift apart; a plan
@@ -1624,26 +1634,14 @@ fn join_rewritten(
         }
         if i + 1 < segments.len() {
             out.push(' ');
-            // The Windows splitter's newline connector: cmd.exe reads a bare
-            // newline as the same unconditional separator `&` spells, but the
-            // rewrite rides one `/C "…"` argument and whether cmd splits there
-            // is the one spelling this workspace cannot measure — getting it
-            // wrong costs every command after the first line. `&` is
-            // unambiguous, and the Windows splitter never emits an empty member
-            // (blank lines are skipped), so the substitution cannot create a
-            // syntax error.
-            if platform == ShellPlatform::Windows && conn == "\n" {
-                out.push('&');
-            } else {
-                out.push_str(conn);
-            }
+            out.push_str(conn);
         } else if conn == "&" {
-            // The last member's connector is normally a no-op (`;`, a newline)
-            // and is dropped with its trailing position. A trailing `&`
-            // backgrounds the member instead: dropping it would run the served
-            // search in the foreground, under the member's own exit status
-            // rather than the shell's. Windows never produces one — its
-            // splitter fails closed on a trailing connector.
+            // The last member's connector is normally a no-op (`;`, or — on the
+            // unix core alone — a trailing newline) and is dropped with its
+            // trailing position. A trailing `&` backgrounds the member instead:
+            // dropping it would run the served search in the foreground, under
+            // the member's own exit status rather than the shell's. Windows never
+            // produces one — its splitter fails closed on a trailing connector.
             out.push(' ');
             out.push_str(conn);
         }
@@ -1688,15 +1686,17 @@ pub(super) fn discard_spec_files(files: &[PathBuf]) {
 
 /// Split a command into (segment, following-connector) pairs, in the spelling
 /// of `platform`'s own shell: `sh` connectors are `&&`, `||`, `;`, `|`, `|&`,
-/// `&`, `\n` or `` (last); cmd.exe's are `&&`, `||`, `&`, `|`, `\n` or `` (last)
-/// — `;` and `&` are not interchangeable between them, which is why the platform
-/// is a parameter rather than a `cfg` branch. Quote- and substitution-aware
-/// (per platform), heredoc bodies already stripped. Empty segments before a
-/// connector (or a trailing `|`/`|&`/`||`/`&&`, and on Windows a bare `&`) are
-/// shell syntax errors; the rewriting would silently drop them into a VALID
-/// executed pipeline — fail-closed on the whole class. Blank lines (`\n`
-/// between commands) are valid on both and stay allowed, as is a trailing `&`
-/// (a backgrounded member).
+/// `&`, `\n` or `` (last); cmd.exe's are `&&`, `||`, `&`, `|` or `` (last) — the
+/// text this receives on Windows has already had its breaks respelled by
+/// [`crate::tools::shell::windows_line`], so a `\n` connector never arrives
+/// there. `;` and `&` are not interchangeable between the platforms, which is
+/// why the platform is a parameter rather than a `cfg` branch. Quote- and
+/// substitution-aware (per platform), heredoc bodies already stripped. Empty
+/// segments before a connector (or a trailing `|`/`|&`/`||`/`&&`, and on Windows
+/// a bare `&`) are shell syntax errors; the rewriting would silently drop them
+/// into a VALID executed pipeline — fail-closed on the whole class. Blank lines
+/// (`\n` between commands) are valid on unix and stay allowed there, as is a
+/// trailing `&` (a backgrounded member).
 fn split_segments(
     command: &str,
     platform: ShellPlatform,
@@ -1706,9 +1706,10 @@ fn split_segments(
             super::segment_command(command, super::SegmentMode::Grep).ok_or(Fallback::SegmentEmpty)
         }
         // A line the cmd.exe model does not cover — a caret, a command group,
-        // an unbalanced quote, an empty member before a connector — leaves the
-        // whole line unread (the first three are spellings cmd.exe itself reads;
-        // the empty member mirrors the unix segmenter's own fail-closed policy).
+        // an unbalanced quote, a line break, an empty member before a connector —
+        // leaves the whole line unread (all but the empty member are spellings
+        // cmd.exe itself reads; the empty member mirrors the unix segmenter's own
+        // fail-closed policy).
         ShellPlatform::Windows => windows::segment_command(command)
             .ok_or_else(|| Fallback::CmdSyntax("the whole line".into())),
     }
@@ -2059,14 +2060,16 @@ const SEARCH_OWNING_VERBS: &[&str] = &["git", "docker", "kubectl", "podman", "ss
 
 /// True when `command` carries a grep-family invocation in command position,
 /// by a deliberately tolerant scan: split on every separator cmd.exe acts on
-/// unconditionally (`&`, `|`, newlines) plus, over-wide on purpose, `;` — which
-/// cmd reads as ordinary text and the cmd model therefore refuses — with no
-/// quote handling at all, then strip the leading whitespace and any group opener
-/// (`(`/`{`) off each fragment and test its first word through the same verb
-/// predicate the analyzer uses. The opener is stripped rather than split on, so
-/// a `(grep …)` fragment is still read as the grep it is, while
-/// `echo (grep is a tool)` — a grep word in argument position — stays the plain
-/// echo it is.
+/// unconditionally (`&`, `|`) plus, over-wide on purpose, a line break and `;`
+/// (a break is read here because one that reaches this line at all is a shape the
+/// cmd model refused — the shell respells or deletes every break a reader ends at,
+/// see [`crate::tools::shell::windows_line`] — and `;` is ordinary text for cmd
+/// that the cmd model therefore refuses), with no quote handling at all, then strip
+/// the leading whitespace and any group opener (`(`/`{`) off each fragment and test
+/// its first word through the same verb predicate the analyzer uses. The opener is
+/// stripped rather than split on, so a `(grep …)` fragment is still read as the grep
+/// it is, while `echo (grep is a tool)` — a grep word in argument position — stays
+/// the plain echo it is.
 ///
 /// It exists only to decide whether a line the cmd.exe model could not read AT
 /// ALL (a caret, a group, an unbalanced quote, a `;`, a trailing connector)
@@ -6797,14 +6800,16 @@ mod read_only_serve_pins {
         drop(SpecFiles(files));
     }
 
-    /// The segmenter's newline connector is re-emitted as `&`: the rewrite rides
-    /// a single `/C "…"` argument, where a literal newline is the one spelling
-    /// this workspace cannot measure (see the `windows` module header).
+    /// The engine receives the shell's own reading of the line, never the agent's
+    /// raw text: `windows_line` has already respelled a plain break as `&`, so
+    /// there is no break left for the segmenter to join. The rewrite tracks the
+    /// `cd` and carries no newline, because the shell — not the engine — is what
+    /// joined the members.
     #[test]
-    fn a_newline_connector_joins_the_members_with_an_ampersand() {
+    fn the_shell_hands_over_a_line_whose_break_is_already_an_ampersand() {
         let (_tmp, ws, home) = serve_fixture();
         let (rewritten, files) = served_and_guard_accepted(
-            "cd src\ngrep -rn needle .",
+            "cd src&grep -rn needle .",
             &ws,
             &home,
             ShellPlatform::Windows,
@@ -6876,7 +6881,7 @@ mod refusal_pins {
             .refusal
             .take()
             .unwrap_or_else(|| panic!("{command}: expected a refusal"));
-        let message = unserved_failure(&cause);
+        let message = unserved_failure(&cause, None);
         assert!(!cause.is_empty(), "{command}: a cause is named");
         assert!(
             message.contains("did NOT run"),

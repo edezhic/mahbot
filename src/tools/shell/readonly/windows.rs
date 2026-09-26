@@ -71,13 +71,27 @@
 //! an extra operand of the first (`del %TEMP%\a;C:\ws\x.exe`). cmd.exe has no
 //! comment syntax either, so a `#` is an ordinary character to it: `echo hi # &
 //! del C:\ws\x.txt` is a comment for the bash parse and two commands for cmd.
-//! A heredoc is refused outright: cmd.exe has no `<<`, so the body's later lines
-//! are command lines of its own that this reader never inspects — a body line
-//! written `del C:\ws\x.txt` would run without ever being judged.
+//! A heredoc is refused outright: this platform has no text block at all, so a
+//! `<<` is two input redirections to it, and the body's later lines would be
+//! commands of their own here — lines this guard never read as commands.
 //! All three are checked once, over the whole tree ([`check_line`]) — each is a
 //! property of the LINE rather than of a nesting position, so all three also hold
 //! inside a substituted command, a parenthesised group, a function body, a case
 //! branch and a pipeline member.
+//!
+//! The line breaks of a command text are read by the shell itself
+//! ([`crate::tools::shell::windows_line`]) before this guard is consulted: in
+//! read-only mode — the mode this guard is the reader of — a break this platform's
+//! reader and the execution would read differently (an odd run of `\` before one, a
+//! break inside a quoted word, a caret over a character this guard reads as an
+//! operator) is refused whole there, because this guard reads the ORIGINAL text
+//! through the bash grammar while the execution reads what actually runs, and a shape
+//! the two read differently must never run. A break with nothing after it is the one
+//! such shape this reading does not refuse: nothing but the platform's own separators
+//! follows it, so the text is run as the line before the break — the reading a command
+//! with no break at all has always had here. Two breaks are left differing on purpose:
+//! this one, which neither reader can find a command in, and a caret-continued one,
+//! whose reading is this platform's own.
 //!
 //! # Accepted limits (settled, not chased)
 //!
@@ -120,13 +134,6 @@
 //!   `erase`, `rd`, `md`, `move`, `copy`, `xcopy`, `ren`, `replace`, `mklink` and
 //!   even the denied `format`). The same spelling with backslashes is the shared
 //!   classifier's unprovable word and is refused.
-//! - whole-line divergences beyond the ones the layer models: the bash parse
-//!   folds a `\` before a line break and a line break inside a quoted word into
-//!   one command, where cmd.exe reads the text after the break as a command of
-//!   its own (`dir C:\ws \` then `del C:\ws\x.txt`, or the same second command
-//!   inside an unterminated quoted word). The divergences the layer does model —
-//!   a `#` comment, an unquoted `;`, a heredoc — are refused whole-line (see
-//!   `# Matching`).
 //! - an OPERAND carrying a `%…%` whose name is not `[A-Za-z0-9_]` (`del
 //!   "%TEMP%\%中%\x.txt"`) is read as literal text: the model follows no such
 //!   variable, yet cmd resolves one of that shape, so a defined name would put
@@ -194,11 +201,11 @@
 //! limits under `# Accepted limits` alike. Chiefly argued: that Win32 strips a
 //! trailing dot or space off a name component, that cmd.exe resolves a bare
 //! `;`-bearing word the way it resolves the fragments the guard splits it into,
-//! that a `%…%` outside the name grammar stays literal, that a heredoc's body
-//! lines are commands cmd.exe would run, that an omitted `move`/`replace`
-//! destination defaults to cmd's own directory ([`CWD_DESTINATION_VERBS`]), and
-//! that `ren`/`mklink` refuse an omitted second operand rather than defaulting
-//! it.
+//! that a `%…%` outside the name grammar stays literal, that this platform has
+//! no text block at all, so a `<<` has none to reach, that an omitted
+//! `move`/`replace` destination defaults to cmd's own directory
+//! ([`CWD_DESTINATION_VERBS`]), and that `ren`/`mklink` refuse an omitted second
+//! operand rather than defaulting it.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -749,8 +756,8 @@ pub(super) fn check_line(root: Node, src: &str, ctx: &CheckContext) -> Result<()
             "heredoc_redirect" => {
                 return Err(rejection_message(
                     src,
-                    "cmd.exe has no `<<` — the body's later lines are command lines of its own, \
-                     which this guard never reads as commands.",
+                    "cmd.exe has no `<<` — it reads two input redirections, not a text block, so \
+                     the body's later lines would run as commands this guard never read.",
                     "write the command in the plain spelling cmd.exe accepts.",
                 ));
             }
@@ -1679,9 +1686,8 @@ mod tests {
         ok(r"C:/Windows/System32/format C:");
         assert_rejected(r"C:/Windows/System32/rm C:\ws\x.txt");
         assert_rejected(r"C:\Windows\System32\del C:\ws\x.txt");
-        // Whole-line divergences beyond the modelled ones: the bash parse folds
-        // a `\` before a line break and a line break inside a quoted word into
-        // one command, while cmd.exe reads a second command after the break.
+        // Shapes the shell refuses on Windows before this guard is consulted:
+        // this reader folds both into one command and accepts them.
         ok("dir C:\\ws \\\n del C:\\ws\\x.exe");
         ok("echo \"a\n del C:\\ws\\x.exe\"");
         // An operand `%…%` whose name is not `[A-Za-z0-9_]`: read as literal

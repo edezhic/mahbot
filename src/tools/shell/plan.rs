@@ -231,6 +231,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use super::grep_engine;
 use super::grep_engine::windows;
 use super::scan;
+use super::windows_line::{Executed, Written};
 use super::{
     CaptureBudget, Captured, KillOnDrop, Readers, RunOwner, SHELL_PIPE_READ_CAP, ShellPlatform,
     ShellRunResult, Stream, Tree, Watchdog, build_program_command, build_shell_command,
@@ -289,7 +290,11 @@ pub(super) enum Join {
     And,
     /// `||`: the step runs only when the group before it failed.
     Or,
-    /// `&` — and the newline connector cmd.exe reads the same way: always.
+    /// `&`: the step runs whether or not the group before it succeeded, and its
+    /// failure does not stop the line. The platform's reading of a bare line
+    /// break ENDS the command there rather than sequencing it, which is why the
+    /// shell respells a plain break as this `&` before the decomposition ever
+    /// sees the line.
     Always,
     /// `|`: the step is one member of the pipeline the step before it feeds, so
     /// the two are members of one group rather than steps that follow each other.
@@ -585,7 +590,11 @@ fn flush_fold(steps: &mut Vec<Step>, fold: &mut Option<Fold>) {
 
 /// The join the member at `index` connects to the member before it with: the
 /// previous member's own following connector, in cmd.exe's vocabulary. `First`
-/// for the line's first member.
+/// for the line's first member. The vocabulary is only the connectors the fold can
+/// spell on ONE line — no break reaches this table, since the shell respells a
+/// plain break as `&` (see [`Join::Always`]) and refuses the shapes it cannot read
+/// before this decomposition is reached — so a `"\n"` connector falls to the
+/// refusal below.
 fn join_before(members: &[(Member, String)], index: usize) -> Result<Join, Refusal> {
     if index == 0 {
         return Ok(Join::First);
@@ -593,9 +602,7 @@ fn join_before(members: &[(Member, String)], index: usize) -> Result<Join, Refus
     match members[index - 1].1.as_str() {
         "&&" => Ok(Join::And),
         "||" => Ok(Join::Or),
-        // A newline is the unconditional separator `&` spells — the rewrite
-        // re-emits it as `&` for exactly that reason.
-        "&" | "\n" => Ok(Join::Always),
+        "&" => Ok(Join::Always),
         "|" => Ok(Join::Pipe),
         other => Err(Refusal::Shape(format!(
             "the rewritten line carries the connector `{other}`, which this \
@@ -1035,7 +1042,8 @@ fn stdin_stdio(target: &str, cwd: &Path) -> io::Result<Stdio> {
 
 /// Whether a whole line the segmenter refused names this service's own image where
 /// cmd.exe would have run a command from. This is [`own_image_plan`]'s fallback for
-/// the line [`windows::segment_command`] refused: the text is the raw line, so a
+/// the line [`windows::segment_command`] refused: the text is the line the
+/// interpreter is handed — the reading, not the agent's own spelling — so a
 /// spelling the model cannot read whole is still read at its first word and for the
 /// image's path spelling anywhere in it ([`spelling_in_text`]) — the little an
 /// unreadable line can still say.
@@ -1390,9 +1398,18 @@ pub(super) enum OwnImage {
 ///
 /// Windows-only by construction, like every reading in this module: the platform
 /// gate — and the `current_exe()` lookup with it — is [`plan_for_command`]'s.
+///
+/// The refusal quotes `written`, the line the agent wrote: `executed` is the
+/// platform's reading of it ([`crate::tools::shell::windows_line`] may have respelled
+/// it), and an agent is shown its own line rather than a spelling of it.
 #[must_use]
-fn own_image_plan(command: &str, exe: &Path, cwd: &Path) -> OwnImage {
-    let Some(members) = windows::segment_command(command) else {
+fn own_image_plan(
+    executed: Executed<'_>,
+    written: Written<'_>,
+    exe: &Path,
+    cwd: &Path,
+) -> OwnImage {
+    let Some(members) = windows::segment_command(executed.0) else {
         // A line the segmenter refused is read twice: for a call where a command can
         // start ([`own_image_in_text`] — the line's first word, one after a
         // connector, one a launcher hands the image to, so both `mahbot -V (x)` and
@@ -1400,11 +1417,12 @@ fn own_image_plan(command: &str, exe: &Path, cwd: &Path) -> OwnImage {
         // image's own path spelling anywhere in the text ([`spelling_in_text`] — the
         // member no command-position reading can see). Only a line that merely
         // *mentions* the name is ordinary text (see the residuals).
-        return if own_image_in_text(command, exe) || spelling_in_text(command, exe) {
+        return if own_image_in_text(executed.0, exe) || spelling_in_text(executed.0, exe) {
             OwnImage::Refused(format!(
                 "the line names `mahbot` but cannot be read as cmd.exe's own chain of \
-                 commands (`{command}`), and a line the shell has to run cannot be \
-                 waited for — run it as a line of its own"
+                 commands (`{}`), and a line the shell has to run cannot be \
+                 waited for — run it as a line of its own",
+                written.0
             ))
         } else {
             OwnImage::None
@@ -1444,7 +1462,11 @@ fn own_image_plan(command: &str, exe: &Path, cwd: &Path) -> OwnImage {
 /// analyzer's rewrite: nothing can be recognised as the image, so the line runs as
 /// the shell runs it today.
 #[must_use]
-pub(super) fn plan_for_command(command: &str, cwd: &Path) -> OwnImage {
+pub(super) fn plan_for_command(
+    executed: Executed<'_>,
+    written: Written<'_>,
+    cwd: &Path,
+) -> OwnImage {
     if super::SHELL_PLATFORM != super::ShellPlatform::Windows {
         return OwnImage::None;
     }
@@ -1458,7 +1480,7 @@ pub(super) fn plan_for_command(command: &str, cwd: &Path) -> OwnImage {
             return OwnImage::None;
         }
     };
-    own_image_plan(command, &exe, cwd)
+    own_image_plan(executed, written, &exe, cwd)
 }
 
 /// The argv and redirect tokens of one member's plain call of this service's own
@@ -2276,7 +2298,12 @@ mod tests {
     /// The plan [`own_image_plan`] built for a line, or a panic naming what it
     /// read instead.
     fn direct_plan(command: &str) -> Plan {
-        match own_image_plan(command, Path::new(EXE), Path::new(ROOT)) {
+        match own_image_plan(
+            Executed(command),
+            Written(command),
+            Path::new(EXE),
+            Path::new(ROOT),
+        ) {
             OwnImage::Direct(plan) => plan,
             OwnImage::Refused(cause) => panic!("{command}: refused: {cause}"),
             OwnImage::None => panic!("{command}: not read as an own-image line"),
@@ -2285,7 +2312,12 @@ mod tests {
 
     /// The agent-facing cause of the refusal for a line.
     fn refusal_cause(command: &str) -> String {
-        match own_image_plan(command, Path::new(EXE), Path::new(ROOT)) {
+        match own_image_plan(
+            Executed(command),
+            Written(command),
+            Path::new(EXE),
+            Path::new(ROOT),
+        ) {
             OwnImage::Refused(cause) => cause,
             OwnImage::Direct(_) | OwnImage::None => {
                 panic!("{command}: expected a refusal")
@@ -2462,12 +2494,12 @@ mod tests {
         assert_eq!(redirects, &[">".to_string(), "out.txt".to_string()]);
     }
 
-    /// The fold rejoins its members with the connectors the rewrite spells,
-    /// including the newline cmd.exe reads as `&`.
+    /// The fold rejoins its members with the connectors the rewrite spells: here
+    /// the `&` the shell respelled a plain line break into, and cmd's own `&&`.
     #[test]
     fn a_fold_joins_its_members_with_their_own_connectors() {
         let plan = plan(&[
-            shell("echo one", "\n"),
+            shell("echo one", "&"),
             shell("echo two", "&&"),
             shell("echo three", ""),
         ]);
@@ -2960,7 +2992,8 @@ mod tests {
         let exe = Path::new(EXE);
         let cwd = Path::new(ROOT);
         let OwnImage::Direct(direct) = own_image_plan(
-            r#""C:\Program Files\MahBot\mahbot.exe" debug --db board "select 1""#,
+            Executed(r#""C:\Program Files\MahBot\mahbot.exe" debug --db board "select 1""#),
+            Written(r#""C:\Program Files\MahBot\mahbot.exe" debug --db board "select 1""#),
             exe,
             cwd,
         ) else {
@@ -2974,7 +3007,8 @@ mod tests {
         assert_eq!(step_cwd, tracked_root_of(ROOT));
 
         let OwnImage::Direct(redirected) = own_image_plan(
-            r#""C:\Program Files\MahBot\mahbot.exe" -V > out.txt"#,
+            Executed(r#""C:\Program Files\MahBot\mahbot.exe" -V > out.txt"#),
+            Written(r#""C:\Program Files\MahBot\mahbot.exe" -V > out.txt"#),
             exe,
             cwd,
         ) else {
@@ -2989,7 +3023,8 @@ mod tests {
         // The glued spelling of the same redirect is the same call, and it is the
         // one an agent types.
         let OwnImage::Direct(glued) = own_image_plan(
-            r#""C:\Program Files\MahBot\mahbot.exe" -V >out.txt"#,
+            Executed(r#""C:\Program Files\MahBot\mahbot.exe" -V >out.txt"#),
+            Written(r#""C:\Program Files\MahBot\mahbot.exe" -V >out.txt"#),
             exe,
             cwd,
         ) else {
@@ -3130,7 +3165,10 @@ mod tests {
             "for /f %i in ('mahbot -V') do echo x",
         ] {
             assert!(
-                matches!(own_image_plan(command, exe, cwd), OwnImage::None),
+                matches!(
+                    own_image_plan(Executed(command), Written(command), exe, cwd),
+                    OwnImage::None
+                ),
                 "{command}"
             );
         }
@@ -3139,7 +3177,11 @@ mod tests {
         // dispatch the callers use.
         if crate::tools::shell::SHELL_PLATFORM == ShellPlatform::Unix {
             assert!(matches!(
-                plan_for_command("mahbot -V && echo done", cwd),
+                plan_for_command(
+                    Executed("mahbot -V && echo done"),
+                    Written("mahbot -V && echo done"),
+                    cwd
+                ),
                 OwnImage::None
             ));
         }

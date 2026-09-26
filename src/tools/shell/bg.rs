@@ -59,8 +59,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use super::ShellMode;
 #[cfg(not(unix))]
 use super::tree::{RunOwner, Tree};
+use super::windows_line::{Executed, Written};
 use crate::util::UnwrapPoison;
 
 /// Watcher script: ignore SIGTERM (the daemon owns the graceful two-stage
@@ -165,6 +167,14 @@ struct SessionEntry {
 /// planner read as a chain, whose members around the call are steps of their own.
 /// A background command must fail at launch, never report a false completion.
 ///
+/// Only the shell's own arm measures anything: the text handed to the interpreter
+/// is this platform's one line, so a reading past the platform's command line is
+/// refused here rather than left to the interpreter's line-length error
+/// ([`super::windows_line::check_command_line`]) — the same measurement the
+/// foreground hands each of its own texts over under. A call of this service's own
+/// image is spawned from its own argv and hands no line to any interpreter, so
+/// nothing is measured for it.
+///
 /// The returned streams are the ones the command's own redirect tokens took over
 /// (applied here, exactly as the foreground runner applies them); the caller
 /// leaves those to it and wires the session's own stdio for the rest, which is
@@ -172,14 +182,19 @@ struct SessionEntry {
 /// sends both of its streams to the one output file. A command that does not name
 /// the image is the shell's, and takes no stream over.
 fn own_image_command(
-    command: &str,
+    executed: Executed<'_>,
+    written: Written<'_>,
     workspace_root: &Path,
+    mode: ShellMode,
 ) -> Result<(tokio::process::Command, Vec<super::Stream>), String> {
-    match super::plan::plan_for_command(command, workspace_root) {
-        super::plan::OwnImage::None => Ok((
-            super::build_shell_command(command, workspace_root),
-            Vec::new(),
-        )),
+    match super::plan::plan_for_command(executed, written, workspace_root) {
+        super::plan::OwnImage::None => {
+            super::windows_line::check_command_line(executed.0, super::SHELL_PLATFORM, mode)?;
+            Ok((
+                super::build_shell_command(executed.0, workspace_root),
+                Vec::new(),
+            ))
+        }
         super::plan::OwnImage::Direct(plan) => {
             let Some((args, redirects, cwd)) = plan.direct_own() else {
                 // A line the runner's own decomposition read as a chain (the
@@ -192,7 +207,10 @@ fn own_image_command(
             };
             let mut cmd = super::build_program_command(&plan.exe, args, cwd);
             let applied = super::plan::apply_redirects(&mut cmd, redirects, cwd).map_err(|e| {
-                format!("Failed to start background command.\ncommand: {command}\nreason: {e}")
+                format!(
+                    "Failed to start background command.\ncommand: {}\nreason: {e}",
+                    written.0
+                )
             })?;
             Ok((cmd, applied.streams))
         }
@@ -201,7 +219,15 @@ fn own_image_command(
 }
 
 impl BackgroundSessions {
-    /// Launch `command` in the background. Returns the output-file path.
+    /// Launch `executed` in the background. Returns the output-file path.
+    ///
+    /// `executed` is the text the platform will run and `written` the line the agent
+    /// wrote, which is what a launch failure and a refusal quote: the two are the same
+    /// string on every platform but Windows, where the reading may have respelled it
+    /// (see [`super::windows_line`]), and an agent is shown its own line rather than a
+    /// spelling of it. `mode` is the shell mode the session was started in — a
+    /// background session exists in full mode alone, and the mode decides the words of
+    /// the remedy a refusal ends with.
     ///
     /// The command is spawned detached from the tool call: stdout and stderr
     /// are redirected (RAW) into the output file, stdin is null (strictly
@@ -213,10 +239,12 @@ impl BackgroundSessions {
     /// Launch failures (command not found / not executable, detected via the
     /// bounded early-exit probe) are returned as `Err` synchronously — never
     /// a silent empty file.
-    pub(crate) async fn launch(
+    pub(super) async fn launch(
         self: &Arc<Self>,
-        command: &str,
+        executed: Executed<'_>,
+        written: Written<'_>,
         workspace_root: &Path,
+        mode: ShellMode,
     ) -> Result<PathBuf, String> {
         // ── Output file (create_new — never overwrite) ──
         let (output_path, out_file) = create_bg_output_file()
@@ -233,7 +261,7 @@ impl BackgroundSessions {
         // whose output file claimed a completion the image never reached would be
         // a lie. A lone own-image call is spawned directly instead, and any other
         // shape that names the image fails at launch.
-        let (mut cmd, taken) = match own_image_command(command, workspace_root) {
+        let (mut cmd, taken) = match own_image_command(executed, written, workspace_root, mode) {
             Ok(command) => command,
             Err(reason) => {
                 let _ = std::fs::remove_file(&output_path);
@@ -308,8 +336,9 @@ impl BackgroundSessions {
                     .unwrap_or_default();
                 return Err(format!(
                     "Failed to start background command.\n\
-                     command: {command}\n\
+                     command: {}\n\
                      reason: command not found or not executable (exit status {}).{prefix_msg}",
+                    written.0,
                     status.code().unwrap_or(-1)
                 ));
             }
@@ -812,14 +841,26 @@ mod tests {
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
+    /// Launch `command` in the mode every background session runs in, its own text
+    /// standing as the reading the platform runs — the two differ on Windows alone,
+    /// and no text here is a Windows multi-line shape.
+    async fn launch_command(
+        sessions: &Arc<BackgroundSessions>,
+        ws: &Path,
+        command: &str,
+    ) -> Result<PathBuf, String> {
+        sessions
+            .launch(Executed(command), Written(command), ws, ShellMode::Full)
+            .await
+    }
+
     #[tokio::test]
     async fn launch_quick_exit_appends_annotation() {
         let dir = TempDir::new().expect("tempdir");
         let ws = test_ws(dir.path());
         let sessions = Arc::new(BackgroundSessions::default());
 
-        let path = sessions
-            .launch("echo hello-bg", ws.as_path())
+        let path = launch_command(&sessions, ws.as_path(), "echo hello-bg")
             .await
             .expect("launch succeeds");
         assert!(
@@ -851,8 +892,7 @@ mod tests {
         let ws = test_ws(dir.path());
         let sessions = Arc::new(BackgroundSessions::default());
 
-        let path = sessions
-            .launch("sleep 0.7", ws.as_path())
+        let path = launch_command(&sessions, ws.as_path(), "sleep 0.7")
             .await
             .expect("launch succeeds");
 
@@ -891,8 +931,7 @@ mod tests {
         let ws = test_ws(dir.path());
         let sessions = Arc::new(BackgroundSessions::default());
 
-        let err = sessions
-            .launch("definitely_not_a_command_xyz_123", ws.as_path())
+        let err = launch_command(&sessions, ws.as_path(), "definitely_not_a_command_xyz_123")
             .await
             .expect_err("unknown command must be a synchronous launch error");
         assert!(
@@ -919,8 +958,7 @@ mod tests {
         let script = dir.path().join("not-exec.sh");
         std::fs::write(&script, "#!/bin/sh\necho hi\n").expect("write script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-        let err = sessions
-            .launch("./not-exec.sh", ws.as_path())
+        let err = launch_command(&sessions, ws.as_path(), "./not-exec.sh")
             .await
             .expect_err("non-executable script must be a synchronous launch error");
         assert!(
@@ -939,8 +977,7 @@ mod tests {
 
         // A legitimate non-zero early exit (grep no-match semantics) is a
         // successful launch surfaced via the annotation.
-        let path = sessions
-            .launch("exit 3", ws.as_path())
+        let path = launch_command(&sessions, ws.as_path(), "exit 3")
             .await
             .expect("exit 3 is a successful launch");
         assert!(
@@ -960,8 +997,7 @@ mod tests {
         let ws = test_ws(dir.path());
         let sessions = Arc::new(BackgroundSessions::default());
 
-        let path = sessions
-            .launch(LONG_RUNNING, ws.as_path())
+        let path = launch_command(&sessions, ws.as_path(), LONG_RUNNING)
             .await
             .expect("launch succeeds");
         assert!(
@@ -1002,8 +1038,7 @@ mod tests {
         let sessions = Arc::new(BackgroundSessions::default());
 
         // Traps SIGTERM (ignores it), exits 0 on its own after ~0.5s.
-        let path = sessions
-            .launch("trap '' TERM; sleep 0.5; exit 0", ws.as_path())
+        let path = launch_command(&sessions, ws.as_path(), "trap '' TERM; sleep 0.5; exit 0")
             .await
             .expect("launch succeeds");
 
@@ -1030,8 +1065,7 @@ mod tests {
         let ws = test_ws(dir.path());
         let sessions = Arc::new(BackgroundSessions::default());
 
-        let path = sessions
-            .launch("echo quick", ws.as_path())
+        let path = launch_command(&sessions, ws.as_path(), "echo quick")
             .await
             .expect("launch succeeds");
         assert!(
@@ -1063,12 +1097,10 @@ mod tests {
         let ws = test_ws(dir.path());
         let sessions = Arc::new(BackgroundSessions::default());
 
-        let p1 = sessions
-            .launch(LONG_RUNNING, ws.as_path())
+        let p1 = launch_command(&sessions, ws.as_path(), LONG_RUNNING)
             .await
             .expect("launch 1");
-        let p2 = sessions
-            .launch(LONG_RUNNING, ws.as_path())
+        let p2 = launch_command(&sessions, ws.as_path(), LONG_RUNNING)
             .await
             .expect("launch 2");
         assert_eq!(sessions.inner.lock().unwrap_poison().len(), 2);
@@ -1097,8 +1129,7 @@ mod tests {
         let ws = test_ws(dir.path());
         let sessions = Arc::new(BackgroundSessions::default());
 
-        let path = sessions
-            .launch("sleep 30", ws.as_path())
+        let path = launch_command(&sessions, ws.as_path(), "sleep 30")
             .await
             .expect("launch succeeds");
 
@@ -1139,8 +1170,7 @@ mod tests {
         let pid_file = dir.path().join("stray.pid");
         let cmd = format!("sleep 5 & echo $! > {}", pid_file.display());
 
-        let path = sessions
-            .launch(&cmd, ws.as_path())
+        let path = launch_command(&sessions, ws.as_path(), &cmd)
             .await
             .expect("launch succeeds — sh exits 0 even with a stray");
 

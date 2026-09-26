@@ -1,0 +1,1 @@
+the interpreter reads it literally while this mode's own checks read it as an operator or a group, so a command escaping one of `&`, `|`, `<`, `>` is refused here rather than run, and one escaping a `(` or `)` is refused in both modes.

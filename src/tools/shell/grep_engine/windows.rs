@@ -19,7 +19,8 @@
 //!
 //! # Spec hand-off
 //!
-//! cmd.exe's command line is capped at 8191 characters and the shell re-parses
+//! cmd.exe's command line is capped at 8191 UTF-16 code units (the unit
+//! `crate::tools::shell::windows_line` measures it in), and the shell re-parses
 //! the whole line (`%name%` expansion, separators, carets) before the program
 //! sees its argv, so no quoting carries a 64 KiB JSON payload intact. A served
 //! member therefore passes its spec through a scratch file under the daemon's
@@ -58,7 +59,10 @@
 //! # Unverifiable from this host
 //!
 //! No Windows host or CI is available to this crate, so cmd.exe's own reading
-//! is argued rather than measured: that it splits a line on `&`/`|`/newlines,
+//! is argued rather than measured: that its reading of a line ENDS at a bare
+//! line break — which is why the shell respells every plain break as `&` before
+//! any reader here sees the text ([`crate::tools::shell::windows_line`]) — and
+//! that it splits the rest of a line on `&`/`|`,
 //! keeps a `>`-family redirect's own `&` inside the redirect (`2>&1`), treats
 //! `;`/`'`/`\` as ordinary characters, reads `""` inside a quoted span as a
 //! literal quote, dispatches verbs case-insensitively and extension-insensitively
@@ -69,12 +73,7 @@
 //! shell spawns a rewrite with. The one decision with a host oracle,
 //! [`fnmatch`], is pinned differentially against the host's own `fnmatch` by
 //! the parent module's `windows_fnmatch_parity` tests — a unix host's pin: a
-//! Windows test host has no second implementation to compare against. One
-//! spelling stays unmeasurable even so: a newline inside a quoted verbatim
-//! member is not a connector, so it stays in the rewrite and is the
-//! newline-in-`/C` spelling nothing here can measure (the segmenter's newline
-//! connector is re-emitted as `&` for exactly this reason — see
-//! [`super::join_rewritten`]).
+//! Windows test host has no second implementation to compare against.
 
 use std::fs;
 use std::io::Write;
@@ -126,21 +125,29 @@ fn flush(
     true
 }
 
-/// Split a command line the way `cmd.exe /C` does: on `&`, `&&`, `|`, `||` and
-/// newlines, returning `(segment, following-connector)` pairs with `""` as the
-/// last connector. `None` for a line whose reading is not modelled:
+/// Split a command line the way `cmd.exe /C` does: on `&`, `&&`, `|`, `||`,
+/// returning `(segment, following-connector)` pairs with `""` as the last
+/// connector. `None` for a line whose reading is not modelled:
 ///
-/// - a `^` or a `(`/`)` outside double quotes: the caret escapes the next
-///   character and the parentheses group commands, so a member split at the
-///   wrong place could run a command the agent did not write;
+/// - a `^`, a `(`/`)` or a line break outside double quotes: the caret escapes
+///   the next character and the parentheses group commands, so a member split at
+///   the wrong place could run a command the agent did not write, and a break is
+///   the same kind of unknown. A break *inside* a quoted span is no part of that
+///   test and would be carried into a member's own text — a step `cmd /C` then
+///   reads to its first line alone — so this model rests on the reading refusing
+///   that shape before any text reaches it: [`crate::tools::shell::windows_line`]
+///   refuses a break in the platform's `"` span (its `BREAK_IN_DOUBLE_QUOTES`
+///   cause) and respells or joins every other break, so a break that arrives here
+///   is one of the shapes the platform itself continues across — a caret, or a
+///   group — text this model cannot split into the members a rewrite needs, which
+///   is what the fail-closed answer below is for;
 /// - an unbalanced `"`;
 /// - an empty member before a connector (`&& a`) or a trailing connector with
 ///   no member after it (`a &&`, `a |`) — the unix segmenter's fail-closed
 ///   policy, mirrored.
 ///
 /// `;` is ordinary text here (cmd.exe keeps one line) and is never a
-/// connector; the caller reads it through [`unquoted_semicolon`]. Blank lines
-/// and a trailing newline stay valid, exactly as in the unix segmenter.
+/// connector; the caller reads it through [`unquoted_semicolon`].
 #[must_use]
 pub(in crate::tools::shell) fn segment_command(command: &str) -> Option<Vec<(String, String)>> {
     let chars: Vec<char> = command.chars().collect();
@@ -168,12 +175,11 @@ pub(in crate::tools::shell) fn segment_command(command: &str) -> Option<Vec<(Str
             continue;
         }
         match c {
-            // Unmodellable outside quotes (see the doc comment).
-            '^' | '(' | ')' => return None,
-            '\n' => {
-                flush(&mut current, &mut out, "\n", false);
-                i += 1;
-            }
+            // Unmodellable outside quotes (see the doc comment). A break is one
+            // of them: `windows_line` already respelled or deleted every break
+            // this platform can hand over, so one reaching here is a text the
+            // model cannot read.
+            '^' | '(' | ')' | '\n' => return None,
             '&' | '|' => {
                 if c == '&' && redirect_keeps_amp(&current) {
                     current.push('&');
@@ -906,15 +912,19 @@ mod tests {
         assert!(segment_command("\"a & b").is_none());
     }
 
+    /// `windows_line` removed every break this model could read before it ever sees
+    /// the text: a plain break is respelled as `&` and an operator continuation is
+    /// joined. A break that reaches the segmenter is therefore one of the shapes the
+    /// platform itself continues across — a caret, or a group — which is a text this
+    /// model cannot read.
     #[test]
-    fn newlines_separate_and_crlf_is_trimmed() {
-        assert_segments("a\nb", &[("a", "\n"), ("b", "")]);
-        assert_segments("a\r\nb\r\n", &[("a", "\n"), ("b", "\n")]);
-        // Blank lines stay valid, like the unix segmenter's exception.
-        assert_segments("a\n\nb", &[("a", "\n"), ("b", "")]);
-        assert_segments("a\n", &[("a", "\n")]);
-        // A member before a hard connector must not be empty.
-        assert!(segment_command("\n& a").is_none());
+    fn a_line_break_the_shell_still_hands_over_is_refused() {
+        for text in ["a\nb", "a\r\nb", "a\n\nb", "a\n", "\n& a"] {
+            assert!(
+                segment_command(text).is_none(),
+                "a break must be refused: {text:?}"
+            );
+        }
     }
 
     #[test]

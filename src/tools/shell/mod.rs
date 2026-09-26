@@ -27,6 +27,7 @@ mod profiles;
 mod readonly;
 mod scan;
 mod tree;
+mod windows_line;
 
 pub(crate) use self::bg::BackgroundSessions;
 use self::profiles::{CARGO_COMPILE_PREFIXES, GEN_FALLBACK, PROFILES, Profile};
@@ -36,8 +37,10 @@ use self::tree::{RunOwner, Tree};
 
 /// The shell that runs a validated command string (`sh -c` on unix,
 /// `cmd.exe /C` on Windows). Every platform rule in this module tree reads
-/// this one value — the spawn side ([`build_shell_command`]), the read-only
-/// guard's tables and the grep engine's command model — as a runtime value
+/// this one value — the spawn side ([`build_shell_command`]), the reading of a
+/// command's line breaks ([`windows_line`], which decides the text the spawn
+/// hands over), the read-only guard's tables and the grep engine's command
+/// model — as a runtime value
 /// rather than a `cfg` branch, so both platforms' behaviour is drivable from
 /// any host's unit-test lane. Only the value's own definition branches on the
 /// target ([`SHELL_PLATFORM`] is one `if cfg!(windows)` constant); every
@@ -520,6 +523,15 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
         // this hand-off (`cmd /?`, "the remainder of the command line after the
         // switch"): its quote processing strips that pair, so the command
         // arrives verbatim — whatever quotes it carries of its own.
+        //
+        // What arrives is the platform's reading of the agent's command
+        // ([`windows_line`]): every plain break is already respelled as `&`, and a
+        // line this reader would swallow at such a break — a comment or a label, a
+        // statement whose own text runs to the line's end — is refused whole, so the
+        // lines after the first are never lost silently. Only the shapes cmd.exe
+        // itself continues across — a caret's break, a break inside a group it opened
+        // — still carry a line break here, and they are the platform's own reading,
+        // not a raw text.
         p.raw_arg(format!("/C \"{command}\""));
         p
     };
@@ -1026,11 +1038,12 @@ impl Drop for SpecFiles {
 /// [`grep_engine::unserved_failure`] at the bail site, the way the engine's own
 /// cause is.
 ///
-/// `applied` is whether the rewrite reached the shell (`exec_str !=
-/// command_str`). The platform is tested first: on unix neither case refuses —
-/// the original command runs and its `grep` is the real one — while on Windows
-/// an unserved search must not come back looking like an empty result (see
-/// [`grep_engine::unserved_failure`]).
+/// `applied` is whether the rewrite reached the shell (`exec_str !=` the
+/// platform's own reading of the line, [`windows_line::executable`] — the text
+/// the shell would run had the engine not rewritten it). The platform is tested
+/// first: on unix neither case refuses — the original command runs and its `grep`
+/// is the real one — while on Windows an unserved search must not come back
+/// looking like an empty result (see [`grep_engine::unserved_failure`]).
 fn unserved_refusal(
     platform: ShellPlatform,
     grep_serve: &grep_engine::GrepServe,
@@ -1753,28 +1766,40 @@ impl ShellTool {
     /// file in the temp area's `.agent` directory, and the returned message
     /// carries that file's path. The agent reads progress with the read tool
     /// and stops the session via [`Self::stop_background`].
+    ///
+    /// Two texts, and neither substitutes for the other: `executed` is the
+    /// platform's reading of `written` ([`windows_line::executable`]), which is
+    /// what actually runs, while `written` is the line the agent wrote: the one the
+    /// started-session message shows it, and the one a launch failure or a refusal
+    /// names it by. They arrive as [`windows_line::Executed`] and
+    /// [`windows_line::Written`], so a call cannot pass them the other way round. A
+    /// background command must never be the one path that loses its lines after the
+    /// first: the whole reading is what the shell is handed here, and [`self::bg`] is
+    /// where it is measured and handed over.
     async fn launch_background(
         &self,
         ws: &Workspace,
-        command: &str,
+        executed: windows_line::Executed<'_>,
+        written: windows_line::Written<'_>,
     ) -> anyhow::Result<(String, Option<i32>)> {
         let sessions = Self::background_sessions_handle()?;
         let path = sessions
-            .launch(command, ws.as_path())
+            .launch(executed, written, ws.as_path(), self.mode)
             .await
             .map_err(anyhow::Error::msg)?;
         Ok((
             format!(
                 "Background session started.\n\
                  output file: {}\n\
-                 command: {command}\n\
+                 command: {}\n\
                  The command is running detached from this tool call — its raw output \
                  is written to the output file. Read the file with the read tool to follow \
                  progress. When the command exits, the line `[exit status: N]` is appended \
                  to the end of the file (including for exit 0) — its presence means the \
                  command finished. Stop the session with the shell tool's `stop` argument \
                  set to this output-file path.",
-                path.display()
+                path.display(),
+                written.0
             ),
             Some(0),
         ))
@@ -1855,7 +1880,17 @@ impl ShellTool {
             }
             if background {
                 let command_str = super::get_str(&args, "command")?;
-                return self.launch_background(ws, command_str).await;
+                // The foreground's own reading (see [`Self::launch_background`]), so a
+                // background command loses no line either.
+                let exec_str = windows_line::executable(command_str, SHELL_PLATFORM, self.mode)
+                    .map_err(anyhow::Error::msg)?;
+                return self
+                    .launch_background(
+                        ws,
+                        windows_line::Executed(&exec_str),
+                        windows_line::Written(command_str),
+                    )
+                    .await;
             }
         }
 
@@ -1864,12 +1899,21 @@ impl ShellTool {
         // Read-only mode: validate command before execution.
         // The grep engine interception runs in BOTH modes (read-only for the
         // validation path, full for the inherent read-only engine) — see below.
-        let mut exec_str = command_str.to_string();
+        //
+        // `base` is the platform's reading of the command — the text that will
+        // be executed, and the text the serve decision below is taken on (a
+        // rewrite's members are that reading's, not the agent's spelling of it).
+        // `command_str` stays the original: it is what the read-only check
+        // validates, what the grep telemetry records, what profiles the output
+        // and what every error message quotes.
+        let base = windows_line::executable(command_str, SHELL_PLATFORM, self.mode)
+            .map_err(anyhow::Error::msg)?;
+        let mut exec_str = base.as_ref().to_owned();
 
         // Capture the grep-engine serve decision once, before the mode branch;
         // reused by both branches for the rewrite and by the telemetry write
         // after execution.
-        let mut grep_serve = grep_engine::try_serve_command(command_str, ws.as_path());
+        let mut grep_serve = grep_engine::try_serve_command(&exec_str, ws.as_path());
         // The rewrite may name scratch spec files (the Windows hand-off); the
         // guard removes them on every exit path below, `bail!`s included.
         let _spec_files = SpecFiles(std::mem::take(&mut grep_serve.spec_files));
@@ -1880,9 +1924,9 @@ impl ShellTool {
                 anyhow::bail!("{rejection}");
             }
             if let Some(rewritten) = grep_serve.rewritten.as_deref() {
-                // The engine verb is an unlisted literal and passes validation;
-                // on the off chance it does not, keep the original command (on
-                // Windows the refusal below reports it instead).
+                // The engine verb is an unlisted literal and passes validation; on the
+                // off chance it does not, `exec_str` keeps the reading of the line it
+                // was seeded with (on Windows the refusal below reports it instead).
                 if check_command(rewritten, &ctx).is_ok() {
                     exec_str = rewritten.to_string();
                 }
@@ -1891,7 +1935,8 @@ impl ShellTool {
             // Full mode: no read-only validation; the engine is inherently
             // read-only and preserves non-grep (incl. mutating) segments
             // verbatim. Background-mode Full greps are deliberately NOT served
-            // (the early return above keeps them on the original command).
+            // (the early return above runs them on the platform's reading of the
+            // line, and a background command is never handed to the engine).
             if let Some(rewritten) = grep_serve.rewritten.as_deref() {
                 exec_str = rewritten.to_string();
             }
@@ -1904,11 +1949,24 @@ impl ShellTool {
         // otherwise reach the agent as interpreter noise under a status it
         // cannot tell from "no match". On unix `unserved_refusal` is `None` and
         // the original command runs.
-        if let Some(cause) = unserved_refusal(SHELL_PLATFORM, &grep_serve, exec_str != command_str)
+        if let Some(cause) =
+            unserved_refusal(SHELL_PLATFORM, &grep_serve, exec_str != base.as_ref())
         {
             self.write_grep_telemetry(ws, command_str, &grep_serve, false, &cause, None)
                 .await;
-            anyhow::bail!("{}", grep_engine::unserved_failure(&cause));
+            // The remedy follows the text that would run, not the cause: a text that
+            // still carries a line break is the one shape only a file can run, whatever
+            // cause the engine's refusal carries ([`windows_line::remedy`]). Only this
+            // refusal can offer one — the text it refuses is a reading this module kept
+            // a break in, while the failure the engine reports after a run is about a
+            // text it served, which carries none.
+            let remedy = exec_str
+                .contains('\n')
+                .then(|| windows_line::remedy(self.mode));
+            anyhow::bail!(
+                "{}",
+                grep_engine::unserved_failure(&cause, remedy.as_deref())
+            );
         }
 
         // Allow agent to override the default timeout via `timeout_secs`.
@@ -1933,13 +1991,34 @@ impl ShellTool {
             // call of its own (`mahbot debug …`, `mahbot -V`): one the runner can
             // run as a single step is run by the runner, one it cannot is
             // refused rather than handed to a shell that will not wait for it.
-            match plan::plan_for_command(&exec_str, ws.as_path()) {
+            match plan::plan_for_command(
+                windows_line::Executed(&exec_str),
+                windows_line::Written(command_str),
+                ws.as_path(),
+            ) {
                 plan::OwnImage::None => {}
                 plan::OwnImage::Direct(direct) => plan_run = Some(direct),
                 plan::OwnImage::Refused(cause) => {
                     anyhow::bail!("{}", plan::refusal_message(&cause));
                 }
             }
+        }
+
+        // Measured at each hand-off — a planned fold, or the text the shell is spawned
+        // with when no plan serves it — as [`windows_line::check_command_line`] states.
+        match &plan_run {
+            Some(plan_run) => plan_run
+                .steps
+                .iter()
+                .try_for_each(|step| match &step.run {
+                    plan::Run::Shell { text } => {
+                        windows_line::check_command_line(text, SHELL_PLATFORM, self.mode)
+                    }
+                    plan::Run::Own { .. } => Ok(()),
+                })
+                .map_err(anyhow::Error::msg)?,
+            None => windows_line::check_command_line(&exec_str, SHELL_PLATFORM, self.mode)
+                .map_err(anyhow::Error::msg)?,
         }
 
         // Execute with timeout to prevent hanging commands. `exec_str` may be
@@ -1981,7 +2060,7 @@ impl ShellTool {
             | ShellRunResult::TimedOut { stderr, .. }
             | ShellRunResult::DrainTimedOut { stderr, .. }
             | ShellRunResult::MemoryExceeded { stderr, .. } => {
-                if exec_str != command_str {
+                if exec_str != base.as_ref() {
                     grep_engine::strip_stream_size_marker(stderr);
                 }
             }
@@ -2021,7 +2100,7 @@ impl ShellTool {
         // run's one composed status, never a per-member one, so a member-3 is
         // not told apart from an engine-3 here.
         let engine_failure = match &result {
-            ShellRunResult::Completed { status, stderr, .. } if exec_str != command_str => {
+            ShellRunResult::Completed { status, stderr, .. } if exec_str != base.as_ref() => {
                 engine_failure(status.code(), stderr, SHELL_PLATFORM)
             }
             _ => None,
@@ -2038,11 +2117,16 @@ impl ShellTool {
                     Some(&result),
                 )
                 .await;
-                anyhow::bail!("{}", grep_engine::unserved_failure(&cause));
+                // No remedy: a served text carries no break, so the serve decision
+                // above offers none.
+                anyhow::bail!("{}", grep_engine::unserved_failure(&cause, None));
             }
             Some(EngineFailure::ReRun) => {
                 sentinel_rerun = true;
-                let mut original = build_shell_command(command_str, ws.as_path());
+                // The platform that re-runs here is the one whose interpreter reads the
+                // whole text itself, so the re-executed line has no single-line limit
+                // to check — the refusal arm above is the other platform's.
+                let mut original = build_shell_command(base.as_ref(), ws.as_path());
                 run_command_with_timeout(
                     &mut original,
                     timeout,
@@ -2058,7 +2142,7 @@ impl ShellTool {
         // Record the served invocation's exit code at DEBUG (filtered from the
         // general log stream). The dedicated `grep_telemetry` table is the
         // source of truth for grep decisions; this line is observability only.
-        if exec_str != command_str {
+        if exec_str != base.as_ref() {
             let exit_code = match &result {
                 ShellRunResult::Completed { status, .. } => status.code(),
                 _ => None,
@@ -2082,7 +2166,7 @@ impl ShellTool {
         // mismatch, matcher-build failure, version mismatch) re-execs real grep
         // in place, which is NOT observable from the parent; that residual is
         // documented rather than fixed.
-        let applied = exec_str != command_str;
+        let applied = exec_str != base.as_ref();
         let served = applied && !sentinel_rerun;
         let reason = if sentinel_rerun {
             "engine sentinel re-run (real grep)"
@@ -2626,6 +2710,59 @@ fn render_grep_notes() -> String {
     )
 }
 
+/// The command-line reading: this platform's own rules for a command text's line
+/// breaks, the reading the shell applies before the guard looks at anything. One
+/// skeleton for both modes — the reading is the same in both, one line or two — with
+/// the sentences the mode decides substituted in from its own fragment: which
+/// characters a caret's escape may reach, whether that same text is read by the
+/// guard's reader as well, and the answer to every shape the reading refuses (a file,
+/// which the read-only mode does not run). The read-only mode's aside is the one
+/// sentence the skeleton carries no place for: the mode that has none must not be left
+/// a paragraph for it, so it is added to the rendered text (see below). `platform` and
+/// `mode` are arguments rather than the process-global pair, so a host of either kind
+/// renders — and tests — both. `None` on the platform whose own interpreter already
+/// separates commands at a break: it has nothing to be told about line breaks.
+fn render_command_line_notes(platform: ShellPlatform, mode: ShellMode) -> Option<String> {
+    if platform != ShellPlatform::Windows {
+        return None;
+    }
+    // Each of the mode's fragments — the caret's clause and the remedy — is written
+    // exactly once in the skeleton, and [`crate::prompt::substitute`] replaces every
+    // occurrence it finds: a fragment written twice is a sentence the agent reads twice.
+    let escaped_target = crate::prompt::load_prompt(match mode {
+        ShellMode::Full => "tool/shell_command_lines_escaped_full.md",
+        ShellMode::ReadOnly => "tool/shell_command_lines_escaped_read_only.md",
+    })
+    .trim()
+    .to_owned();
+    let remedy = windows_line::remedy(mode);
+    // The limit's sentence is built from the same constants the refusal names, so the
+    // three numbers cannot drift apart.
+    let cap = windows_line::COMMAND_LINE_CAP.to_string();
+    let limit = windows_line::TEXT_UNIT_LIMIT.to_string();
+    let overhead = (windows_line::COMMAND_LINE_CAP - windows_line::TEXT_UNIT_LIMIT).to_string();
+    let mut notes = crate::prompt::substitute(
+        &crate::prompt::load_prompt("tool/shell_command_lines.md"),
+        &[
+            ("{{escaped_target}}", &escaped_target),
+            ("{{remedy}}", &remedy),
+            ("{{cap}}", &cap),
+            ("{{limit}}", &limit),
+            ("{{overhead}}", &overhead),
+        ],
+    );
+    // The aside is added to the mode that has one, one blank line after the last
+    // paragraph: the skeleton's own trailing line break goes with the join.
+    if mode == ShellMode::ReadOnly {
+        notes = format!(
+            "{}\n\n{}",
+            notes.trim_end(),
+            crate::prompt::load_prompt("tool/shell_command_lines_read_only_aside.md").trim()
+        );
+    }
+    Some(notes)
+}
+
 /// The full-mode notes: the shared skeleton with this platform's stop semantics
 /// substituted in. What stopping a session does is the one thing the two
 /// platforms do differently, and a session must never be promised a mechanism
@@ -2660,14 +2797,24 @@ impl Tool for ShellTool {
         // The base description and the grep-engine disclosure are shared
         // verbatim between the modes (a single copy each, so the two
         // descriptions cannot drift); only the read-only banner, the full-mode
-        // sections (stop semantics included) and the platform's grep notes are
+        // sections (stop semantics included) and the platform-selected notes
+        // (the grep engine's and the command-line reading's) are
         // mode-/platform-specific.
         let base = crate::prompt::load_prompt("tool/shell.md");
-        let sections: [String; 3] = match self.mode {
-            ShellMode::ReadOnly => [render_readonly_banner(), base, render_grep_notes()],
-            ShellMode::Full => [base, render_full_mode_notes(), render_grep_notes()],
+        let mut sections: Vec<String> = match self.mode {
+            ShellMode::ReadOnly => vec![render_readonly_banner(), base, render_grep_notes()],
+            ShellMode::Full => vec![base, render_full_mode_notes(), render_grep_notes()],
         };
-        sections.map(|s| s.trim_end().to_owned()).join("\n\n")
+        // A platform with nothing to add is handed the sections it had before this one
+        // existed, with no blank line where it would have been.
+        if let Some(command_lines) = render_command_line_notes(SHELL_PLATFORM, self.mode) {
+            sections.push(command_lines);
+        }
+        sections
+            .iter()
+            .map(|s| s.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -6536,13 +6683,13 @@ mod tests {
         ]);
     }
 
-    /// Both platform fragments of the read-only banner and the grep notes must
-    /// be embedded, and must carry no placeholder of their own: `substitute`
-    /// does not rescan a replacement value. Each shared skeleton must keep
-    /// exactly the keys its renderer supplies — a stray one would render
-    /// literally into every agent's description. The renderers pick the
-    /// fragment through `SHELL_PLATFORM`, so a typo in a key would otherwise
-    /// panic on that platform's host only.
+    /// The fragments of every shared prompt skeleton must be embedded, and must
+    /// carry no placeholder of their own: `substitute` does not rescan a
+    /// replacement value. Each skeleton must keep exactly the keys its renderer
+    /// supplies — a stray one would render literally into every agent's
+    /// description. The renderers pick the fragment through `SHELL_PLATFORM`, or
+    /// (the command-line notes) through the mode, so a typo in a key would
+    /// otherwise panic on that platform's host only.
     #[test]
     fn platform_prompt_assets_are_embedded() {
         for (skeleton, keys, fragments) in [
@@ -6573,6 +6720,25 @@ mod tests {
                 ]
                 .as_slice(),
             ),
+            (
+                "tool/shell_command_lines.md",
+                [
+                    "{{escaped_target}}",
+                    "{{remedy}}",
+                    "{{cap}}",
+                    "{{overhead}}",
+                    "{{limit}}",
+                ]
+                .as_slice(),
+                [
+                    "tool/shell_command_lines_escaped_full.md",
+                    "tool/shell_command_lines_escaped_read_only.md",
+                    "tool/shell_command_lines_read_only_aside.md",
+                    "tool/shell_command_lines_remedy_full.md",
+                    "tool/shell_command_lines_remedy_read_only.md",
+                ]
+                .as_slice(),
+            ),
         ] {
             let shared = crate::prompt::load_prompt(skeleton);
             let mut rest = shared.clone();
@@ -6586,6 +6752,99 @@ mod tests {
                 assert!(!text.contains("{{"), "{asset} carries a placeholder");
             }
         }
+    }
+
+    /// The Windows section of the shell description's own notes, in `mode`: the
+    /// renderer whose assets `platform_prompt_assets_are_embedded` above checks.
+    fn command_line_notes(mode: ShellMode) -> String {
+        render_command_line_notes(ShellPlatform::Windows, mode)
+            .expect("the platform whose interpreter ends a command at a break has notes")
+    }
+
+    /// Whether the rendering leaves a paragraph no sentence fills: a placeholder a
+    /// mode's fragment does not fill leaves its line breaks behind, and the rendering
+    /// has to be right in itself rather than after a later trim.
+    fn has_blank_paragraph(text: &str) -> bool {
+        text.split("\n\n").any(|para| para.trim().is_empty())
+    }
+
+    /// The guidance the agent is handed — in both modes, on the platform whose
+    /// interpreter reads one line — states the limit this reading refuses under, in
+    /// numbers the constants decide.
+    #[test]
+    fn the_guidance_states_the_same_command_line_limit() {
+        for mode in [ShellMode::Full, ShellMode::ReadOnly] {
+            let guidance = command_line_notes(mode);
+            // The three numbers of the limit's sentence are the constants': the
+            // platform's own line, what its path and `/C` switch take, and what that
+            // leaves for the text.
+            for number in [
+                windows_line::COMMAND_LINE_CAP,
+                windows_line::TEXT_UNIT_LIMIT,
+                windows_line::COMMAND_LINE_CAP - windows_line::TEXT_UNIT_LIMIT,
+            ] {
+                assert!(
+                    guidance.contains(&number.to_string()),
+                    "{number}: {guidance}"
+                );
+            }
+            // No `{{…}}` placeholder is left: every one the skeleton writes is
+            // substituted, so a missing fragment would reach the agent as its own name.
+            assert!(!guidance.contains("{{"), "{guidance}");
+        }
+    }
+
+    /// The section is rendered from the mode's own fragments and no other's, each of
+    /// them once: the caret's escape is described by the reader that mode consults,
+    /// only the read-only mode's own checks need the aside, and a fragment the skeleton
+    /// wrote twice would be substituted twice (see [`super::render_command_line_notes`]),
+    /// so the agent would read the same sentence twice. The fragments themselves are
+    /// asserted, rather than a word like "read-only" that an unrelated sentence could
+    /// later carry.
+    #[test]
+    fn the_guidance_names_each_modes_own_fragments() {
+        let full = command_line_notes(ShellMode::Full);
+        let read_only = command_line_notes(ShellMode::ReadOnly);
+        let (full_escaped, read_only_escaped, aside) = (
+            crate::prompt::load_prompt("tool/shell_command_lines_escaped_full.md")
+                .trim()
+                .to_owned(),
+            crate::prompt::load_prompt("tool/shell_command_lines_escaped_read_only.md")
+                .trim()
+                .to_owned(),
+            crate::prompt::load_prompt("tool/shell_command_lines_read_only_aside.md")
+                .trim()
+                .to_owned(),
+        );
+        assert!(!full.contains(&read_only_escaped));
+        assert!(!full.contains(&aside));
+        assert!(!read_only.contains(&full_escaped));
+        // Once each, and the aside as a paragraph of its own: the read-only mode adds it
+        // after a blank line, so it is never run on from the sentence before.
+        for (guidance, fragment) in [
+            (&full, full_escaped.as_str()),
+            (&full, windows_line::remedy(ShellMode::Full).as_str()),
+            (&read_only, read_only_escaped.as_str()),
+            (
+                &read_only,
+                windows_line::remedy(ShellMode::ReadOnly).as_str(),
+            ),
+            (&read_only, aside.as_str()),
+        ] {
+            assert_eq!(guidance.matches(fragment).count(), 1, "{fragment}");
+        }
+        assert!(
+            read_only.lines().any(|line| line == aside),
+            "the aside is a paragraph of its own: {read_only}"
+        );
+        // The mode that has no aside leaves no paragraph behind for it, and neither
+        // rendering leaves a blank paragraph anywhere else: both are right as they stand,
+        // with nothing for the description to trim away when it joins the sections.
+        assert!(!has_blank_paragraph(&full), "{full:?}");
+        assert!(!has_blank_paragraph(&read_only), "{read_only:?}");
+        // The platform whose interpreter already separates at a break is handed no
+        // such section at all.
+        assert!(render_command_line_notes(ShellPlatform::Unix, ShellMode::Full).is_none());
     }
 
     /// The stop text is one text: the tool description's stop bullet and the `stop`
