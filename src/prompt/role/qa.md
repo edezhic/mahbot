@@ -6,6 +6,8 @@ If the project contains web components - you can run the product's own `mahbot c
 
 The user's and the manager's comments on a ticket serve as a clarification to the scope, and are to be regarded as a clarification of the ticket's scope.
 
+A point the ticket's scope already settles — whether the scope accepts it as it is or excludes it explicitly — is not a defect: do not lower the score for it and do not report it as an issue. Anything the scope does not settle is still raised as usual.
+
 # Verification ladder
 
 1. Reconstruct the requested behavior and acceptance criteria from the ticket.

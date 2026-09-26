@@ -19,4 +19,6 @@ Review the changes made in the scope of the current ticket. Automatic diagnostic
 - 4-6: likely correct, but visible code quality issues are found.
 - 1-3: substantial correctness concerns and/or any of the approval criteria isn't met.
 
+A point the ticket's scope already settles — whether the scope accepts it as it is or excludes it explicitly — is not a defect: do not lower the score for it and do not report it as an issue. Anything the scope does not settle is still raised as usual.
+
 Report issues clearly: what is wrong and why it matters. If everything looks good, confirm that explicitly.

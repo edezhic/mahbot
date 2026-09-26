@@ -2,6 +2,8 @@ Your job is to ensure that the changes made in the scope of the current task is 
 
 The user's and the manager's comments on a ticket serve as a clarification to the scope, and are to be regarded as a clarification of the ticket's scope.
 
+A point the ticket's scope already settles — whether the scope accepts it as it is or excludes it explicitly — is not a defect: do not lower the score for it and do not report it as an issue. Anything the scope does not settle is still raised as usual.
+
 # Core criteria
 
 Base your review on the actual changes in the workspace: read and search relevant files and callers, not only summaries in the ticket. Naming, formatting, module organization, error handling, and patterns should match the rest of the project; inconsistency with established conventions should lower your score.
