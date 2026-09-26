@@ -11,13 +11,18 @@ use super::{
     TicketPhase, TransitionCtx, Write, agent_slot_from_roster_row, build_agent_slots,
     build_round_grouping, deserialize_verdict_outcome, guard_job_phase, info, insert_round_slots,
     issue_grade, pause_freezing, render_joint_comment, reset_phase_attempt, run_parallel_agents,
-    stage_name, warn, with_comment_and_transition,
+    warn, with_comment_and_transition,
 };
 
 /// Default number of parallel analyst agents per round. Reviewers use a
 /// calibrated dynamic count (see [`crate::pipeline::verdict::review_agent_count`]);
-/// QA runs a single tester (see [`qa::QA_PARALLEL_AGENT_COUNT`]).
+/// the verification stage runs its single functional tester alongside them.
 const DEFAULT_PARALLEL_AGENT_COUNT: usize = 3;
+
+/// The stage's own name: the role the joint comment is authored under and the
+/// stage name the grouping pass reports (mirrors the verification stage's
+/// `STAGE`).
+pub(crate) const STAGE: &str = "Analysis";
 
 /// Load the three base ticket-analysis angle sections for Backlog analysts.
 fn load_ticket_analysis_angles() -> Vec<String> {
@@ -32,12 +37,14 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
 }
 
 /// Build the base analysis slot roster and write it onto the phase job.
+/// Returns `None` when the roster could not be written: the round never starts
+/// on a half-written plan, and the poller re-drives the job.
 async fn ensure_analysis_slots(
     ticket: &Ticket,
     job_id: &str,
     prompt: &str,
     count: usize,
-) -> Vec<AgentSlot> {
+) -> Option<Vec<AgentSlot>> {
     let slots = build_agent_slots(
         &ticket.id,
         Role::Analyst,
@@ -46,8 +53,18 @@ async fn ensure_analysis_slots(
         0,
         count,
     );
-    insert_round_slots(job_id, &slots, crate::jobs::AgentKind::Analyst).await;
-    slots
+    match insert_round_slots(job_id, &[(crate::jobs::AgentKind::Analyst, &slots)]).await {
+        Ok(()) => Some(slots),
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                job = %job_id,
+                error = %e,
+                "Failed to write the analysis roster — round not started",
+            );
+            None
+        }
+    }
 }
 
 /// Append escalation slots (3, 4) to an existing phase job. Escalation slots
@@ -67,7 +84,7 @@ async fn append_analysis_slots(
         .max()
         .map_or(0, |m| m + 1);
     let slots = build_agent_slots(&ticket.id, Role::Analyst, prompt, &[], next_idx, count);
-    insert_round_slots(job_id, &slots, crate::jobs::AgentKind::Analyst).await;
+    insert_round_slots(job_id, &[(crate::jobs::AgentKind::Analyst, &slots)]).await?;
     Ok(slots)
 }
 
@@ -511,8 +528,11 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace, job_id: &
         return;
     };
     if roster.is_empty() {
-        let slots =
-            ensure_analysis_slots(&ticket, job_id, &message, DEFAULT_PARALLEL_AGENT_COUNT).await;
+        let Some(slots) =
+            ensure_analysis_slots(&ticket, job_id, &message, DEFAULT_PARALLEL_AGENT_COUNT).await
+        else {
+            return;
+        };
         run_analysis_round(&ticket, &ws, job_id, &slots, false).await;
         return;
     }
@@ -567,9 +587,11 @@ async fn finalize_analysis_round_with_grouping(
     job_id: &str,
 ) {
     let (round, outcome) = build_round_grouping(
-        "Analysis",
+        STAGE,
         base_results,
         Role::Analyst,
+        // Analysis always runs the grouping pass.
+        false,
         ws,
         &ticket.id,
         &ticket.title,
@@ -687,9 +709,11 @@ async fn run_analysis_round(
     }
     let base_count = base_results.len();
     let (round, outcome) = build_round_grouping(
-        "Analysis",
+        STAGE,
         &base_results,
         Role::Analyst,
+        // Analysis always runs the grouping pass.
+        false,
         ws,
         &ticket.id,
         &ticket.title,
@@ -830,13 +854,7 @@ async fn process_analyst_verdicts(
                 Role::Analyst.as_str(),
             ),
             async |tx| {
-                BoardStore::add_comment_tx(
-                    tx,
-                    &ticket.id,
-                    stage_name(Role::Analyst),
-                    &joint_comment,
-                )
-                .await?;
+                BoardStore::add_comment_tx(tx, &ticket.id, STAGE, &joint_comment).await?;
                 Ok(())
             },
         )

@@ -844,7 +844,7 @@ pub struct Agent {
 
 // ── Verdict type ─────────────────────────────────────────────────
 
-/// Result of a single review or QA verification pass.
+/// Result of a single verification pass (code reviewer or functional tester).
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Verdict {
     /// Quality score from 0 (worst) to 10 (best).
@@ -884,8 +884,8 @@ pub(crate) struct AnalysisIssue {
 }
 
 /// Score-less analysis verdict: a list of individually-graded issues. Unlike
-/// the shared `Verdict` (review/QA, score-based), analysis drops the score and
-/// grades each issue minor/major/blocker.
+/// the shared `Verdict` (the verification stage's score-based shape), analysis
+/// drops the score and grades each issue minor/major/blocker.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct AnalysisVerdict {
     #[serde(rename = "issues")]

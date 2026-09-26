@@ -9,7 +9,7 @@ The user's and the manager's comments on a ticket serve as a clarification to th
 # Verification ladder
 
 1. Reconstruct the requested behavior and acceptance criteria from the ticket.
-2. Review the engineer response, prior diagnostics/test results, and reviewer comments.
+2. Review the engineer response and the prior diagnostics/test results. The code reviewers run in this same round, not before it — their findings are not an input to this check.
 3. Start the product or its service as the workspace's own rules describe, exercise the delivered behavior while it runs, then stop what you started.
 4. Inspect the code paths the runtime check cannot reach, and run additional checks when they resolve a specific uncertainty or exercise a high-risk edge case.
 5. For UI/runtime behavior, prefer direct behavioral evidence: logs, screenshots, or manual flow observations.

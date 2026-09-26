@@ -87,8 +87,8 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
     (comment.trim_start_matches('\n').to_string(), all_passed)
 }
 
-/// Conclude a successful diagnostics run — transition to InReview and delete
-/// the phase job (the puller creates the InReview job).
+/// Conclude a successful diagnostics run — transition to Verification and delete
+/// the phase job (the puller creates the Verification job).
 async fn conclude_diagnostics_success(
     ticket: &Ticket,
     job_id: &str,
@@ -99,7 +99,7 @@ async fn conclude_diagnostics_success(
         TransitionCtx::buffered(
             ticket,
             TicketPhase::InDiagnostics,
-            TicketPhase::InReview,
+            TicketPhase::Verification,
             "Diagnostics",
             DIAGNOSTICS_ROLE,
         ),

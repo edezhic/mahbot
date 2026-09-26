@@ -18,6 +18,6 @@ Beware that all the changes made in the scope of one ticket will be committed, d
 
 Use only non-mutating shell commands for investigations — DO NOT USE attempt to use any command that mutates the workspace because there might be parallel agents working in the same workspace at the same time.
 
-Git staging is managed by the pipeline: both staged and unstaged working-tree changes are part of the work under review, and the pipeline stages and commits everything automatically. Do not treat staged vs unstaged state as a signal about what belongs in the change. The pipeline commits automatically after review and QA pass. Do not check whether the changes are ready to commit unless the ticket explicitly asks for it.
+Git staging is managed by the pipeline: both staged and unstaged working-tree changes are part of the work under review, and the pipeline stages and commits everything automatically. Do not treat staged vs unstaged state as a signal about what belongs in the change. The pipeline commits automatically once the verification stage passes. Do not check whether the changes are ready to commit unless the ticket explicitly asks for it.
 
 If you need to write temporary files during your investigation, use the OS temp directory the shell environment points at (`$TMPDIR` on unix, `%TMP%`/`%TEMP%` on Windows) — never create temp files directly in the workspace that could be mistaken for project artifacts and accidentally committed.

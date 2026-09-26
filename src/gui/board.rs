@@ -704,7 +704,7 @@ impl BoardState {
     /// Map an action label to its lucide icon (16px) and tooltip text.
     ///
     /// Keyed off the action label. The keyword chain
-    /// (Cancel → QA → Pause → Queued → Backlog) drives both the icon and the
+    /// (Cancel → Pause → Queued → Backlog) drives both the icon and the
     /// tooltip, so the two can never drift apart. Rework is automatic via
     /// validation failures — there is no manual rework action anymore.
     /// The trailing `circle_check`/"move phase" pair is a defensive
@@ -717,8 +717,6 @@ impl BoardState {
     ) {
         if label.contains("Cancel") {
             (lucide::circle_x(), "cancel ticket")
-        } else if label.contains("QA") {
-            (lucide::shield_check(), "send to QA")
         } else if label.contains("Pause") {
             (lucide::pause(), "move to planning")
         } else if label.contains("Queued") {
@@ -2422,13 +2420,13 @@ mod tests {
         // and a new engineer comment — the exact staleness the feature fixes.
         let _task = state.update(BoardMessage::TicketDetailsRefreshed(
             gen_before,
-            Box::new(refreshed_ticket(TicketPhase::InReview)),
+            Box::new(refreshed_ticket(TicketPhase::Verification)),
         ));
 
         let ticket = state.selected_ticket.as_ref().expect("modal still open");
         assert_eq!(
             ticket.phase,
-            TicketPhase::InReview,
+            TicketPhase::Verification,
             "phase should update to the latest state"
         );
         assert_eq!(
@@ -2457,7 +2455,7 @@ mod tests {
         // switched tickets while the fetch was in flight — must be dropped.
         let _task = state.update(BoardMessage::TicketDetailsRefreshed(
             0,
-            Box::new(refreshed_ticket(TicketPhase::InReview)),
+            Box::new(refreshed_ticket(TicketPhase::Verification)),
         ));
 
         let ticket = state.selected_ticket.as_ref().expect("modal still open");
@@ -2480,7 +2478,7 @@ mod tests {
         let generation = state.comment_generation;
         let _task = state.update(BoardMessage::TicketDetailsRefreshed(
             generation,
-            Box::new(refreshed_ticket(TicketPhase::InReview)),
+            Box::new(refreshed_ticket(TicketPhase::Verification)),
         ));
 
         let ticket = state.selected_ticket.as_ref().expect("modal still open");
@@ -2895,7 +2893,7 @@ mod tests {
         // list refresh is paused), so they are consulted before the list.
         let mut state = make_board_state();
         state.selected_ticket = None;
-        state.search_results = vec![make_ticket("T-1", TicketPhase::InQa)];
+        state.search_results = vec![make_ticket("T-1", TicketPhase::Verification)];
         state.tickets = vec![make_ticket("T-1", TicketPhase::Backlog)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         assert_eq!(

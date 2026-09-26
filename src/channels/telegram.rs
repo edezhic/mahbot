@@ -3138,7 +3138,7 @@ async fn post_set_my_commands(
 /// arm, so a newly added phase is a compile error rather than a silently
 /// missing (or transposed) row.
 ///
-/// All twelve glyphs already default to emoji presentation, so none carries a
+/// All eleven glyphs already default to emoji presentation, so none carries a
 /// variation selector. This is deliberately not `TicketPhase::display_name()`:
 /// the desktop board badge keeps the phase words.
 fn phase_emoji(phase: TicketPhase) -> &'static str {
@@ -3150,8 +3150,7 @@ fn phase_emoji(phase: TicketPhase) -> &'static str {
         TicketPhase::InDevelopment => "🔨",
         TicketPhase::InDiagnostics => "🧪",
         TicketPhase::InSanitation => "🧹",
-        TicketPhase::InReview => "👀",
-        TicketPhase::InQa => "🎯",
+        TicketPhase::Verification => "🎯",
         TicketPhase::Done => "✅",
         TicketPhase::Cancelled => "🚫",
         TicketPhase::Failed => "❌",

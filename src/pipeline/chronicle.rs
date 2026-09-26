@@ -129,7 +129,8 @@ pub fn start_subscriber() {
 /// Materialize one ticket change into a `ticket_chronicle` row when the phase
 /// changed. This is the only write path to the table. Returns whether a row was
 /// actually inserted (`false` for non-tickets events, non-update events, no
-/// phase change, or a duplicate that `INSERT OR IGNORE` skipped).
+/// phase change, an unreadable phase pair, or a duplicate that `INSERT OR
+/// IGNORE` skipped).
 async fn apply_change(
     conn: &Connection,
     event: &crate::db::cdc::ChangeEvent,
@@ -153,8 +154,23 @@ async fn apply_change(
     if before == after {
         return Ok(false);
     }
-    let source: TicketPhase = before.parse()?;
-    let target: TicketPhase = after.parse()?;
+    // A phase string this binary cannot read is NOT a materialization failure:
+    // it comes from an older arrangement — a stage name retired since, left in a
+    // pending CDC image by the build that wrote it (nothing drains `turso_cdc`
+    // on the way out, so any exit can leave one; this build's own migrations
+    // produce none, running before capture is enabled). The row is dropped rather
+    // than retried forever, because the parse can never succeed on a later drain
+    // and the drainer leaves a failed row un-pruned (stalling the whole ticket
+    // transport).
+    let (Ok(source), Ok(target)) = (before.parse::<TicketPhase>(), after.parse::<TicketPhase>())
+    else {
+        tracing::warn!(
+            before = %before,
+            after = %after,
+            "ticket chronicle: unreadable phase pair — skipping the hop",
+        );
+        return Ok(false);
+    };
     let ticket_id = event.ticket_id().unwrap_or_default();
     let workspace = event
         .after
@@ -369,7 +385,7 @@ mod tests {
             Hop {
                 id: "mahbot-1736".into(),
                 source: "in_diagnostics".into(),
-                target: "in_review".into(),
+                target: "verification".into(),
                 at: "2026-08-17T08:21:19.225709+00:00".into(),
                 actor: "system".into(),
             },
@@ -382,7 +398,7 @@ mod tests {
             "    in_development → in_diagnostics (2026-08-17T08:11:34.225709+00:00) [engineer]"
         ));
         assert!(result.contains(
-            "    in_diagnostics → in_review (2026-08-17T08:21:19.225709+00:00) [system]"
+            "    in_diagnostics → verification (2026-08-17T08:21:19.225709+00:00) [system]"
         ));
     }
 
@@ -513,6 +529,42 @@ mod tests {
         assert_eq!(
             count, 2,
             "both transitions materialize one chronicle row each"
+        );
+
+        // A pending CDC image carrying a phase string this binary cannot read (a
+        // stage name retired since, as the older build that wrote it leaves in
+        // `turso_cdc`) must neither materialize a hop nor wedge the drainer: the
+        // unreadable rows are skipped AND pruned, so the next readable hop still
+        // lands.
+        for phase in ["in_review", TicketPhase::Cancelled.as_ref()] {
+            board
+                .conn
+                .execute(
+                    "UPDATE tickets SET phase = ?1 WHERE id = ?2",
+                    crate::db::params![phase, ticket_id.as_str()],
+                )
+                .await
+                .unwrap();
+        }
+        board
+            .conn
+            .execute(
+                "UPDATE tickets SET phase = ?1 WHERE id = ?2",
+                crate::db::params![TicketPhase::Done.as_ref(), ticket_id.as_str()],
+            )
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            crate::db::cdc::drain_once(&board.conn).await.unwrap();
+            count = chronicle_rows_for(board, &ticket_id).await;
+            if count >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            count, 3,
+            "unreadable phase pairs are skipped and pruned without wedging the drainer"
         );
 
         let block = drain(ws.name.as_str()).await;

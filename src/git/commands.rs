@@ -5,6 +5,7 @@
 
 use anyhow::Context;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -234,10 +235,9 @@ fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
 
 /// Run a git command without any interpretation of the exit code.
 ///
-/// Shared by [`run_git_command`] and other raw-output callers to avoid
-/// duplicating the spawn + collect + wait pattern. Returns the raw
-/// [`std::process::Output`] so each caller can interpret the exit
-/// status as appropriate.
+/// Returns the raw [`std::process::Output`] so each caller can interpret the
+/// exit status as appropriate; [`run_git_command_env`] is the checked-output
+/// sibling.
 ///
 /// **The product's own internal environment**: The subprocess environment is
 /// cleared and re-populated with the reduced variable set the product uses for
@@ -254,7 +254,20 @@ pub(crate) async fn run_git_output(
     repo_path: &Path,
     args: &[&str],
 ) -> anyhow::Result<std::process::Output> {
+    run_git_output_env(repo_path, &[], args).await
+}
+
+/// [`run_git_output`] with extra environment variables — used to point git at a
+/// throwaway index file instead of the repository's own.
+async fn run_git_output_env(
+    repo_path: &Path,
+    env: &[(&str, &OsStr)],
+    args: &[&str],
+) -> anyhow::Result<std::process::Output> {
     let mut cmd = git_command(Some(repo_path));
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
     cmd.args(args).current_dir(repo_path);
     cmd.output()
         .await
@@ -265,7 +278,17 @@ pub(crate) async fn run_git_output(
 ///
 /// Returns an error if git exits with a non-zero status.
 pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = run_git_output(repo_path, args).await?;
+    run_git_command_env(repo_path, &[], args).await
+}
+
+/// [`run_git_command`] with extra environment variables set — used to point git
+/// at a throwaway index file instead of the repository's own.
+async fn run_git_command_env(
+    repo_path: &Path,
+    env: &[(&str, &OsStr)],
+    args: &[&str],
+) -> anyhow::Result<String> {
+    let output = run_git_output_env(repo_path, env, args).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -280,6 +303,18 @@ pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> anyhow::Result<
 /// Shared by the helpers that return a single scalar (hash, branch, message).
 async fn run_git_trimmed(repo_path: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(run_git_command(repo_path, args).await?.trim().to_string())
+}
+
+/// [`run_git_trimmed`] with extra environment variables set.
+async fn run_git_trimmed_env(
+    repo_path: &Path,
+    env: &[(&str, &OsStr)],
+    args: &[&str],
+) -> anyhow::Result<String> {
+    Ok(run_git_command_env(repo_path, env, args)
+        .await?
+        .trim()
+        .to_string())
 }
 
 /// Check if `git status --porcelain` output contains any unstaged changes.
@@ -334,6 +369,53 @@ pub async fn run_git_head(repo_path: &Path) -> anyhow::Result<String> {
 /// unknown-as-`None` semantics should use `.ok()`.
 pub async fn run_git_write_tree(repo_path: &Path) -> anyhow::Result<String> {
     run_git_trimmed(repo_path, &["write-tree"]).await
+}
+
+/// The current content identity of the working tree: `(HEAD, tree)`, where the
+/// tree is the one a `git add -A` would stage (tracked modifications, untracked
+/// files, deletions, `.gitignore` honoured).
+///
+/// Read-only: the entries go into a throwaway index seeded from the
+/// repository's own, so the repository's index and working tree are left exactly
+/// as they were found — a caller may take this reading without changing what an
+/// agent's `git status`/`git diff` reports or the state a later step inherits.
+/// The blobs a tree needs land in the object store, as they do for any
+/// `git add`, and stay unreferenced until something stages that content.
+/// The value it returns is what [`run_git_write_tree`] reports after a real
+/// `git add -A` of the same content.
+pub async fn run_git_worktree_identity(repo_path: &Path) -> anyhow::Result<(String, String)> {
+    let dir = tempfile::tempdir().context("Failed to create a throwaway git index")?;
+    let index = dir.path().join("index");
+    // Seed from the repository's own index: without the seed, a path that is
+    // tracked but matched by `.gitignore` is dropped (ignore rules govern making
+    // new index entries), so the tree would differ from the real `git add -A`
+    // this reading has to agree with. A split index needs nothing extra: its
+    // shared file is named after its own content and looked up through the
+    // repository, not relative to the index that links to it.
+    //
+    // A repository with no index yet is normal — git creates the throwaway one
+    // from nothing. A failed copy is warned, because the tree would then be
+    // built unseeded and could disagree with the real `git add -A`. A repository
+    // git cannot resolve at all is not reported here: the `add -A` below fails
+    // on the same condition and the caller reports the round's missing identity.
+    if let Ok(path) = run_git_trimmed(repo_path, &["rev-parse", "--git-path", "index"]).await {
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            repo_path.join(path)
+        };
+        match tokio::fs::copy(&path, &index).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                warn!(error = %e, path = %path.display(), "Could not seed the throwaway git index");
+            }
+            _ => {}
+        }
+    }
+    let env = [("GIT_INDEX_FILE", index.as_os_str())];
+    run_git_trimmed_env(repo_path, &env, &["add", "-A"]).await?;
+    let tree = run_git_trimmed_env(repo_path, &env, &["write-tree"]).await?;
+    Ok((run_git_head(repo_path).await?, tree))
 }
 
 /// Stage all changes and commit with the given message.
@@ -1110,6 +1192,64 @@ pub(crate) fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFil
 mod tests {
     use super::*;
     use crate::util::test::init_temp_repo;
+
+    /// The worktree identity is a pure reading (the repository's own index and
+    /// status are left as found) that agrees with a real `git add -A` — the value
+    /// the reviewed-base skip check compares an index tree against.
+    #[tokio::test]
+    async fn worktree_identity_is_read_only_and_matches_a_real_add() {
+        let (_dir, repo_path) = init_temp_repo();
+        std::fs::write(repo_path.join("tracked.txt"), b"changed\n").unwrap();
+        std::fs::write(repo_path.join("untracked.txt"), b"new\n").unwrap();
+
+        let status_before = run_git_status(&repo_path).await.unwrap();
+        let index_before = run_git_write_tree(&repo_path).await.unwrap();
+        let (head, tree) = run_git_worktree_identity(&repo_path).await.unwrap();
+
+        assert_eq!(
+            status_before,
+            run_git_status(&repo_path).await.unwrap(),
+            "the reading must not change the working-tree status",
+        );
+        assert_eq!(
+            index_before,
+            run_git_write_tree(&repo_path).await.unwrap(),
+            "the reading must not touch the repository's own index",
+        );
+
+        run_git_add_all(&repo_path).await.unwrap();
+        assert_eq!(
+            tree,
+            run_git_write_tree(&repo_path).await.unwrap(),
+            "the identity must be what a real add -A stages",
+        );
+        assert_eq!(head, run_git_head(&repo_path).await.unwrap());
+    }
+
+    /// Both cases the seed exists for: a split index (whose shared file git
+    /// resolves through the repository, not next to the copy) and a tracked file
+    /// matched by `.gitignore`, which an unseeded throwaway index drops.
+    #[tokio::test]
+    async fn worktree_identity_seeds_a_split_index_and_ignored_tracked_paths() {
+        let (_dir, repo_path) = init_temp_repo();
+        let status = std::process::Command::new("git")
+            .args(["update-index", "--split-index"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git update-index");
+        assert!(status.success());
+        std::fs::write(repo_path.join(".gitignore"), b"test.txt\n").unwrap();
+        std::fs::write(repo_path.join("test.txt"), b"v2\n").unwrap();
+        std::fs::write(repo_path.join("untracked.txt"), b"new\n").unwrap();
+
+        let (_, tree) = run_git_worktree_identity(&repo_path).await.unwrap();
+        run_git_add_all(&repo_path).await.unwrap();
+        assert_eq!(
+            tree,
+            run_git_write_tree(&repo_path).await.unwrap(),
+            "the identity must be what a real add -A stages",
+        );
+    }
 
     // ── Unit tests for CommitInfo::short_hash ────────────────────
 

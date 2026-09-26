@@ -1,4 +1,4 @@
-//! Joint verdict comments for pipeline stages (analysis, review, QA).
+//! Joint verdict comments for pipeline stages (analysis, verification).
 //!
 //! Replaces the per-agent verdict comments with ONE comment per round —
 //! written even on fully clean rounds so the audit trail is uniform. The
@@ -13,8 +13,9 @@
 //! scores + issues are persisted with each agent's stored verdict outcome
 //! (`agents.outcome` on the phase-job roster) instead. The Analysis
 //! stage shares this renderer, so analyst critiques are dropped too (analysis
-//! uses the score-less `AnalysisVerdict` with per-issue grades; review and QA
-//! use the score-based `Verdict` — critiques were never persisted anywhere).
+//! uses the score-less `AnalysisVerdict` with per-issue grades; the
+//! verification stage's reviewers and tester use the score-based `Verdict` —
+//! critiques were never persisted anywhere).
 //!
 //! Items are referenced by stable numeric ids (global flat numbering across
 //! all agents); validation is strictly structural (id range, duplicate
@@ -24,14 +25,13 @@
 //! ever freezes.
 //!
 //! Beyond comment rendering, this module also holds the parallel-verdict
-//! data model ([`ParallelVerdict`], [`AgentSlot`], [`ExtractionMode`]) and
-//! the verifier-round orchestration for review/QA.
+//! data model ([`ParallelVerdict`], [`AgentSlot`], [`ExtractionMode`]) and the
+//! reviewer-count calibration.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
 
 use crate::jobs::RowStatus;
-use crate::pipeline::board::Ticket;
 use crate::retry::RetryExhausted;
 use crate::util::{panic_message, scrub_credentials};
 use crate::{
@@ -39,10 +39,7 @@ use crate::{
     Verdict, Workspace,
 };
 
-use super::{
-    FinalizeOutcome, TicketPhase, TransitionCtx, bounce_to_development, comment_and_transition,
-    info, raw_response_dump_section, reset_phase_attempt,
-};
+use super::raw_response_dump_section;
 
 // ── Hardcoded review-count calibration defaults (no config surface) ──────
 
@@ -52,8 +49,8 @@ pub(crate) const DEFAULT_REVIEW_COUNT_HIGH_CHURN: i64 = 3000;
 
 // ── Round data ─────────────────────────────────────────────────────────
 
-/// One valid verdict from a parallel round, unified across review/QA
-/// (score-based Score) and analysis (score-less Graded). The verdict data is
+/// One valid verdict from a parallel round, unified across the verification
+/// round (score-based Score) and analysis (score-less Graded). The verdict data is
 /// OWNED so the round can be split away from the base_results vec — the
 /// analysis consolidation must run before escalation and be reused afterward.
 pub(crate) enum JointVerdict {
@@ -78,7 +75,7 @@ pub(crate) struct JointFailure {
 
 /// Everything the joint-comment renderer needs about a round.
 pub(crate) struct JointRound {
-    /// Stage name: "Analysis", "Review" or "QA" (comment role = stage name).
+    /// Stage name: "Analysis" or "Verification" (comment role = stage name).
     pub stage: &'static str,
     /// Valid verdicts, one per responding agent.
     pub verdicts: Vec<JointVerdict>,
@@ -87,7 +84,7 @@ pub(crate) struct JointRound {
     /// Per-agent issue texts, indexed by dispatch index (empty for failures /
     /// no-verdict slots). This is the text-only input to the grouping core.
     pub issues: Vec<Vec<String>>,
-    /// Per-agent per-issue grade (analysis only; `None` for review/QA and for
+    /// Per-agent per-issue grade (analysis only; `None` for verification and for
     /// issues that carry no grade).
     pub grades: Vec<Vec<Option<crate::IssueGrade>>>,
 }
@@ -254,15 +251,12 @@ pub(crate) fn render_joint_comment(
             }
         }
         crate::consensus::RepairOutcome::Fallback => {
-            if has_issues {
-                // the grouping pass either failed or was
-                // deliberately skipped (single-verdict verifier round) — both
-                // reduce to the deterministic per-agent dump.
-            } else {
-                // No issues existed to merge — the synthesis pass was
-                // deliberately skipped, so the summary must not imply it
-                // failed. (Whether the round actually passes is decided
-                // separately by `verdict_passes` in `process_verifier_verdicts`.)
+            // Without issues there is nothing to merge: the synthesis pass was
+            // deliberately skipped, so the summary must not imply it failed.
+            // (Whether the round actually passes is decided separately by the
+            // stage finalizer.) With issues, the deterministic per-agent dump
+            // above is the whole artifact and no summary is added.
+            if !has_issues {
                 let summary = if round.n_valid() > 0 || round.failures.is_empty() {
                     "\n\n### Summary\nNo issues found.".to_string()
                 } else {
@@ -275,7 +269,7 @@ pub(crate) fn render_joint_comment(
 
     // Raw-dump appendix for failed agents.
     if !round.failures.is_empty() {
-        out.push_str("\n\n### Plain verifier responses");
+        out.push_str("\n\n### Plain participant responses");
         for f in &round.failures {
             let _ = write!(out, "\n- {}\n", f.dump);
         }
@@ -299,7 +293,7 @@ fn member_text(
 }
 
 /// Resolve a flat item id's per-issue grade (analysis only): `None` for
-/// review/QA, for unknown ids, and for issues that carry no grade.
+/// verification rounds, for unknown ids, and for issues that carry no grade.
 #[must_use]
 pub(crate) fn issue_grade(
     round: &JointRound,
@@ -357,28 +351,19 @@ pub(crate) fn review_agent_count(base: usize, priority: i64) -> usize {
     if priority == 0 { base.max(2) } else { base }
 }
 
-/// Human-readable stage name for a parallel-verdict role (used in the joint
-/// comment title and the comment role).
-#[must_use]
-pub(crate) fn stage_name(role: Role) -> &'static str {
-    match role {
-        Role::Analyst => "Analysis",
-        Role::Reviewer => "Review",
-        Role::Qa => "QA",
-        // Only the three parallel-verdict roles reach this function (all call
-        // sites pass Analyst/Reviewer/Qa).
-        _ => unreachable!("stage_name called with a non-verdict role"),
-    }
-}
-
-/// Inverse of [`stage_name`]: resolve a stage-name comment role back to the
-/// verdict role (used by the GUI to color joint-comment badges).
+/// Resolve a stage-name comment role back to the role whose badge and icon the
+/// GUI renders for it. The stages' own names come from the stage modules
+/// ([`crate::pipeline::analysis::STAGE`],
+/// [`crate::pipeline::verification::STAGE`]) so a rename cannot silently leave a
+/// comment unmapped; the merged stage renders with the functional tester's
+/// identity — the stage's final gate — while "Review"/"QA" are the retired
+/// stages' own labels, kept so historical comments keep their visuals.
 #[must_use]
 pub(crate) fn stage_role(name: &str) -> Option<Role> {
     match name {
-        "Analysis" => Some(Role::Analyst),
+        crate::pipeline::analysis::STAGE => Some(Role::Analyst),
+        crate::pipeline::verification::STAGE | "QA" => Some(Role::Qa),
         "Review" => Some(Role::Reviewer),
-        "QA" => Some(Role::Qa),
         _ => None,
     }
 }
@@ -388,7 +373,7 @@ pub(crate) fn stage_role(name: &str) -> Option<Role> {
 // These are the verdict-round types the renderer above consumes, so they
 // live with it rather than in the orchestrator.
 
-/// Result from a single parallel verifier agent.
+/// Result from a single participant of a parallel round.
 #[derive(Clone)]
 pub(crate) enum ParallelVerdict {
     /// Agent failed to produce any response (crashed, timed out, empty output).
@@ -416,7 +401,7 @@ impl ParallelVerdict {
 /// Structured-extraction behavior for a parallel round member.
 #[derive(Clone)]
 pub(crate) enum ExtractionMode {
-    /// Standard score+issues verdict (review, QA).
+    /// Standard score+issues verdict (the verification stage's participants).
     ScoreVerdict,
     /// Score-less analysis base round (no score; each issue graded).
     ScorelessVerdict,
@@ -513,7 +498,7 @@ pub(crate) fn deserialize_verdict_outcome(outcome: &str) -> ParallelVerdict {
         return ParallelVerdict::NoResponse("unreadable stored outcome".to_string());
     };
     if let Some(verdict) = v.get("verdict") {
-        // A numeric `score` is the review/QA shape; score-less graded objects
+        // A numeric `score` is the verification-round shape; score-less graded objects
         // are analysis verdicts. The two are NOT distinguishable at the type
         // level for empty-issue rows (`AnalysisVerdict` ignores the unknown
         // `score` field and accepts `{"issues":[]}`), so the presence of
@@ -542,42 +527,27 @@ pub(crate) fn deserialize_verdict_outcome(outcome: &str) -> ParallelVerdict {
     }
 }
 
-/// Build the joint comment for a round: deterministic merge + a single LLM
-/// synthesis pass.
-async fn build_round_joint_comment(
-    stage: &'static str,
-    results: &[ParallelVerdict],
-    role: Role,
-    ws: &Workspace,
-    ticket_id: &str,
-    ticket_title: &str,
-) -> String {
-    let (round, outcome) =
-        build_round_grouping(stage, results, role, ws, ticket_id, ticket_title).await;
-    render_joint_comment(
-        &round,
-        &outcome,
-        &crate::consensus::ItemTable::new(&round.issues),
-    )
-}
-
 /// Run the grouping pass ONCE for a round, returning the round plus its
 /// synthesis outcome so the caller can reuse both (escalation selection and
-/// final rendering). Skips the LLM grouping pass when every verdict is clean
-/// or when a single verifier's verdict is authoritative; otherwise runs
-/// [`run_synthesis`].
+/// final rendering). Skips the LLM pass when every verdict is clean, or for a
+/// round the caller declares single-participant — there is nothing to merge, so
+/// the deterministic dump is the honest artifact. Only the merged verification
+/// stage can declare one: its skipped code review leaves the functional tester
+/// as the round's only participant, whereas the analysis stage always runs the
+/// pass (it tolerates partially-failed rounds, where one surviving verdict is
+/// not a complete picture).
 pub(crate) async fn build_round_grouping(
     stage: &'static str,
     results: &[ParallelVerdict],
     role: Role,
+    single_participant_round: bool,
     ws: &Workspace,
     ticket_id: &str,
     ticket_title: &str,
 ) -> (JointRound, crate::consensus::RepairOutcome) {
     let round = build_joint_round(stage, results);
     let has_no_issues = round.has_no_issues();
-    let single_verifier_verdict = matches!(role, Role::Reviewer | Role::Qa) && round.n_valid() == 1;
-    if has_no_issues || single_verifier_verdict {
+    if has_no_issues || single_participant_round {
         (round, crate::consensus::RepairOutcome::Fallback)
     } else {
         let outcome = run_synthesis(&round, role, ws, ticket_id, ticket_title).await;
@@ -624,161 +594,4 @@ fn build_joint_round(stage: &'static str, results: &[ParallelVerdict]) -> JointR
         issues,
         grades,
     }
-}
-
-// ── Verifier round processing (review / QA) ─────────────────────────────
-
-/// Minimum acceptable verification score (0-10) for review and QA phases.
-const REVIEW_QA_THRESHOLD: u8 = 9;
-
-/// Check whether a review or QA verdict passes (score at or above threshold).
-#[must_use]
-fn verdict_passes(verdict: &crate::Verdict) -> bool {
-    verdict.score >= REVIEW_QA_THRESHOLD
-}
-
-/// Static metadata driving a verifier round (reviewer or QA).
-#[derive(Copy, Clone)]
-pub(crate) struct VerifierInfo {
-    pub(crate) role: Role,
-    /// Human-readable label used in logs and bounce-breaker messages.
-    pub(crate) log_label: &'static str,
-    /// The phase the ticket advances to when every verifier agent passes.
-    pub(crate) success_phase: TicketPhase,
-    /// The phase the verifier is actively working in.
-    pub(crate) active_phase: TicketPhase,
-    pub(crate) prompt_template: &'static str,
-    pub(crate) extraction_prompt_path: &'static str,
-}
-
-pub(crate) const REVIEWER_VI: VerifierInfo = VerifierInfo {
-    role: Role::Reviewer,
-    log_label: "Reviewers",
-    success_phase: TicketPhase::InQa,
-    active_phase: TicketPhase::InReview,
-    prompt_template: "review.md",
-    extraction_prompt_path: "extraction/reviewer.md",
-};
-
-pub(crate) const QA_VI: VerifierInfo = VerifierInfo {
-    role: Role::Qa,
-    log_label: "QA",
-    success_phase: TicketPhase::InSanitation,
-    active_phase: TicketPhase::InQa,
-    prompt_template: "qa.md",
-    extraction_prompt_path: "extraction/qa.md",
-};
-
-/// Process parallel verifier results: add the joint comment, determine
-/// pass/fail, and update ticket phase accordingly.
-pub(crate) async fn process_verifier_verdicts(
-    ws: &Workspace,
-    ticket: &Ticket,
-    results: &[ParallelVerdict],
-    verifier: VerifierInfo,
-    job_id: &str,
-) -> bool {
-    // Distinguish the two failure classes: a verifier that did NOT complete
-    // (NoResponse/ParseFailed) is a HARD TECHNICAL failure — reset the attempt
-    // (comment + delete job + pause; no bounce budget). A verifier that DID
-    // complete but found issues (a Verdict below threshold) is a rework verdict
-    // — bounce to development, consuming bounce budget.
-    let technical_failure = results.iter().any(ParallelVerdict::is_technical_failure);
-    let rework_failure = !technical_failure
-        && results.iter().any(|r| match r {
-            ParallelVerdict::Verdict(v) => !verdict_passes(v),
-            _ => false,
-        });
-
-    if crate::shutdown::aborting() {
-        info!(
-            ticket = %ticket.id,
-            stage = %verifier.log_label,
-            "Verifier round cut short by drain — job stays launched for boot resume",
-        );
-        return false;
-    }
-
-    if technical_failure {
-        // Hard technical failure: a verifier did not complete. Reset the
-        // attempt (the round is destroyed; the puller creates a fresh one).
-        let comment = format!(
-            "{} could not complete the round (a verifier did not respond).",
-            verifier.log_label,
-        );
-        reset_phase_attempt(
-            ticket,
-            verifier.active_phase,
-            job_id,
-            verifier.log_label,
-            &comment,
-        )
-        .await;
-        return false;
-    }
-
-    // Build the joint comment only for the success / rework paths — the reset
-    // path above uses its own short failure comment.
-    let joint_comment = build_round_joint_comment(
-        stage_name(verifier.role),
-        results,
-        verifier.role,
-        ws,
-        &ticket.id,
-        &ticket.title,
-    )
-    .await;
-
-    if !rework_failure {
-        return apply_clean_verifier_round(ticket, verifier, &joint_comment, job_id).await;
-    }
-
-    let outcome = bounce_to_development(
-        ticket,
-        verifier.active_phase,
-        verifier.log_label,
-        stage_name(verifier.role),
-        verifier.role.as_str(),
-        &joint_comment,
-        job_id,
-    )
-    .await;
-    matches!(outcome, FinalizeOutcome::Applied)
-}
-
-/// Apply the clean-pass outcome of a verifier round: write the joint comment,
-/// transition the ticket to its next phase, and delete the phase job. Returns
-/// `false` if the transition was not applied (phase moved concurrently).
-async fn apply_clean_verifier_round(
-    ticket: &Ticket,
-    verifier: VerifierInfo,
-    joint_comment: &str,
-    job_id: &str,
-) -> bool {
-    if !matches!(
-        comment_and_transition(
-            TransitionCtx::buffered(
-                ticket,
-                verifier.active_phase,
-                verifier.success_phase,
-                verifier.log_label,
-                verifier.role.as_str(),
-            ),
-            stage_name(verifier.role),
-            joint_comment,
-        )
-        .await,
-        FinalizeOutcome::Applied
-    ) {
-        return false;
-    }
-    info!(
-        ticket = %ticket.id,
-        "{log_label}: all passed (≥ {threshold}/10)",
-        log_label = verifier.log_label,
-        threshold = REVIEW_QA_THRESHOLD,
-    );
-    // Delete the phase job; the puller creates the next phase job.
-    let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
-    true
 }

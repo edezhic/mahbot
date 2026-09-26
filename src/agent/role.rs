@@ -27,11 +27,10 @@ pub(crate) const DIAGNOSTICS_ROLE: &str = "diagnostics";
 /// Role string for system comments — `"system"`.
 ///
 /// Used only to post non-agent ticket comments: the engineer hard-failure
-/// notice (`development.rs`), the skip-review notice (`review.rs`), and the
-/// phase-reset / bounce-breaker trip notices (`pipeline/mod.rs`). It is
-/// posting-only — no site reads or compares a comment's role against this
-/// value, and the GUI badge for `"system"` is an unrelated generic fallback
-/// in `gui/theme.rs`.
+/// notice (`development.rs`) and the phase-reset / bounce-breaker trip notices
+/// (`pipeline/mod.rs`). It is posting-only — no site reads or compares a
+/// comment's role against this value, and the GUI badge for `"system"` is an
+/// unrelated generic fallback in `gui/theme.rs`.
 pub(crate) const SYSTEM_ROLE: &str = "system";
 
 // ── RoleInfo ──────────────────────────────────────────────────────────────

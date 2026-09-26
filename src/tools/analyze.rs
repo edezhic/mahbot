@@ -187,9 +187,6 @@ pub(crate) async fn run_analyze_with_job(
     // AND the new ids would not match the stored roster rows).
     let (slots, pre_done) = if resume {
         let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
-        // Split Done (reconstruct from stored outcome) from not-Done (re-run
-        // with the stored task).
-        let split = crate::jobs::split_slot_resume(&rows);
         let slots: Vec<AnalyzeSlot> = rows
             .iter()
             .map(|r| AnalyzeSlot {
@@ -197,9 +194,11 @@ pub(crate) async fn run_analyze_with_job(
                 task: r.task.clone(),
             })
             .collect();
-        let pre_done: Vec<(String, String)> = split
-            .done
+        // Done slots are reconstructed from their stored outcomes; the rest
+        // re-run with their stored tasks.
+        let pre_done: Vec<(String, String)> = rows
             .iter()
+            .filter(|r| r.status == crate::jobs::RowStatus::Done.as_str())
             .filter_map(|r| r.outcome.clone().map(|o| (r.agent_id.clone(), o)))
             .collect();
         (slots, pre_done)

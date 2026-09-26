@@ -266,7 +266,7 @@ impl Tool for UpdateTicketTool {
                 },
                 "phase": {
                     "type": "string",
-                    "description": "New phase for the ticket. Valid manual transitions: backlog (return to queue), planning (paused state awaiting further decision whether to proceed with the ticket or cancel it), queued (send to engineer), cancelled (abandon), failed (mark unsuccessful), done (mark complete). Do NOT manually set other pipeline-managed phases (analysis, in_development, in_diagnostics, in_review, in_qa, in_sanitation) — the board poller handles these automatically and manual transitions will interfere with running agents."
+                    "description": "New phase for the ticket. Valid manual transitions: backlog (return to queue), planning (paused state awaiting further decision whether to proceed with the ticket or cancel it), queued (send to engineer), cancelled (abandon), failed (mark unsuccessful), done (mark complete). Do NOT manually set other pipeline-managed phases (analysis, in_development, in_diagnostics, verification, in_sanitation) — the board poller handles these automatically and manual transitions will interfere with running agents."
                 }
             }),
             &["ticket_id", "phase"],
@@ -569,7 +569,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(reset_inflight)] // shared global board — a concurrent boot reset would clobber the InQa fixture
+    #[serial_test::serial(reset_inflight)] // shared global board — a concurrent boot reset would clobber the Verification fixture
     async fn test_update_ticket_tool() {
         crate::util::test::init_test_stores().await;
 
@@ -586,7 +586,7 @@ mod tests {
         let tool = UpdateTicketTool::new(&ws);
         let args = json!({
             "ticket_id": id,
-            "phase": "in_qa"
+            "phase": "verification"
         });
         tool.execute(&ws, args).await.expect("execute");
         let ticket = store
@@ -594,7 +594,7 @@ mod tests {
             .await
             .expect("get_ticket")
             .expect("ticket exists");
-        assert_eq!(ticket.phase, TicketPhase::InQa);
+        assert_eq!(ticket.phase, TicketPhase::Verification);
     }
 
     #[tokio::test]

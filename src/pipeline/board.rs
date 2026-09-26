@@ -104,7 +104,7 @@ crate::columns! {
     }
 }
 
-/// Phases where a ticket occupies the dev/review/QA pipeline.
+/// Phases where a ticket occupies the dev/verification pipeline.
 ///
 /// Only one ticket at a time per workspace may be in this pipeline. Any ticket in one of these
 /// phases blocks new Engineer dispatches for that workspace. The Maintainer uses a separate
@@ -127,22 +127,21 @@ crate::columns! {
 const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
     TicketPhase::InDiagnostics,
-    TicketPhase::InReview,
-    TicketPhase::InQa,
+    TicketPhase::Verification,
     TicketPhase::InSanitation,
 ];
 
-/// The six phases the poll loop drives with phase jobs, in dispatch order.
+/// The five phases the poll loop drives with phase jobs, in dispatch order.
 ///
 /// Note: this is deliberately NOT the [`TicketPhase`] declaration order —
-/// `InSanitation` is dispatched last, after review and QA. Both the dispatch
-/// snapshot query and its phase-major grouping derive from this constant.
-const WORKING_PHASES: &[TicketPhase] = &[
+/// `InSanitation` is dispatched last, after verification. Both the dispatch
+/// snapshot query and its phase-major grouping derive from this constant, as
+/// does the `jobs.kind` vocabulary of ticket phase jobs.
+pub(crate) const WORKING_PHASES: &[TicketPhase] = &[
     TicketPhase::Analysis,
     TicketPhase::InDevelopment,
     TicketPhase::InDiagnostics,
-    TicketPhase::InReview,
-    TicketPhase::InQa,
+    TicketPhase::Verification,
     TicketPhase::InSanitation,
 ];
 
@@ -306,21 +305,22 @@ pub struct Ticket {
     /// Whether this ticket has been archived (hidden from normal listings).
     pub is_archived: bool,
     pub priority: i64,
-    /// HEAD commit hash at the last completed reviewer round on this ticket.
-    /// `None` until the first reviewer pass finishes — used by the reviewer
-    /// skip-gate to detect brand-new content that must never skip review.
+    /// HEAD commit hash of the content the code reviewers were handed, as
+    /// written by `verification::record_reviewed_base` — a round whose code
+    /// review ran and which then moved the ticket on. `None` until the first
+    /// such recording; used by the reviewer skip-gate to detect brand-new
+    /// content that must never skip review.
     pub reviewed_head: Option<String>,
-    /// `git write-tree` index tree hash at the last completed reviewer round
-    /// (captured after the post-review auto-stage). Together with
-    /// [`reviewed_head`](Self::reviewed_head) and a clean porcelain this
-    /// identifies the exact content reviewers saw.
+    /// The working tree identity of the same content: what a `git add -A` would
+    /// have staged. Together with [`reviewed_head`](Self::reviewed_head) and a
+    /// clean porcelain this identifies the exact content reviewers saw.
     pub reviewed_tree: Option<String>,
     /// Exact completion timestamp: set on transition to Done, cleared when the
     /// ticket leaves Done. `None` for never-done or not-currently-done tickets.
     pub done_at: Option<String>,
     /// Number of times this ticket bounced back into development from a
-    /// validation-phase non-success (diagnostics/review/QA/sanitation). Drives
-    /// the bounce-based circuit breaker (max 10). Engineer hard failures are
+    /// validation-phase non-success (diagnostics/verification/sanitation).
+    /// Drives the bounce-based circuit breaker (max 10). Engineer hard failures are
     /// pause-only (workspace pause, implementation frozen) and do not consume this
     /// budget.
     pub bounce_count: i64,
@@ -501,10 +501,20 @@ impl Ticket {
     }
 }
 /// Lowercase snake_case strings matching the DB column values — no schema
-/// migration needed. Display, AsRefStr, and EnumIter are derived via `strum`;
-/// FromStr is implemented manually for user-friendly error messages.
+/// migration needed. Display, AsRefStr (the borrow-side token), IntoStaticStr
+/// (the same strings with a `'static` lifetime — the `jobs.kind` vocabulary) and
+/// EnumIter are derived via `strum`; FromStr is implemented manually for
+/// user-friendly error messages.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Serialize, strum::Display, strum::AsRefStr, strum::EnumIter,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Serialize,
+    strum::Display,
+    strum::AsRefStr,
+    strum::IntoStaticStr,
+    strum::EnumIter,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -518,8 +528,10 @@ pub enum TicketPhase {
     InDevelopment,
     InDiagnostics,
     InSanitation,
-    InReview,
-    InQa,
+    /// The merged code-review + functional-check stage: the code reviewers and
+    /// the single functional tester run concurrently on one phase job and
+    /// produce one consolidated result.
+    Verification,
     Done,
     Cancelled,
     Failed,
@@ -553,10 +565,10 @@ impl TicketPhase {
 
     /// Returns `true` if the ticket is in a pipeline-occupied phase.
     ///
-    /// Tickets in these phases occupy the dev/review/QA pipeline — only one
+    /// Tickets in these phases occupy the dev/verification pipeline — only one
     /// ticket per workspace may be in the pipeline at a time. Each phase is
     /// owned by its own short-lived phase job (development, diagnostics,
-    /// review, QA, sanitation). The automated
+    /// verification, sanitation). The automated
     /// create-ticket tool (when superseding an existing ticket) and the
     /// update-ticket tool refuse to modify tickets in any of these phases to
     /// prevent race conditions during phase transitions. `add_comment` is the
@@ -575,9 +587,18 @@ impl TicketPhase {
     /// `"in_development"`). Use `display_name()` for user-facing UI labels;
     /// keep `as_ref()` for tool output, SQL fragments, and agent-facing text
     /// where agents expect the snake_case phase string.
+    ///
+    /// [`TicketPhase::Verification`] is the one phase whose token carries no
+    /// `in_`: it is still a phase a ticket is *in*, so the display label is
+    /// prefixed and it reads like its neighbours `in development` and
+    /// `in sanitation`.
     #[must_use]
     pub fn display_name(&self) -> String {
-        self.as_ref().replace('_', " ")
+        let token = self.as_ref();
+        match self {
+            Self::Verification => format!("in {token}"),
+            _ => token.replace('_', " "),
+        }
     }
 }
 
@@ -1046,7 +1067,7 @@ impl BoardStore {
     ///
     /// - while any pipeline-occupied ticket ([`PIPELINE_OCCUPIED_PHASES`]) exists
     ///   in the same workspace, enforcing a single ticket at a time in the
-    ///   dev/review/QA pipeline;
+    ///   dev/verification pipeline;
     /// - while any non-archived [`TicketPhase::Failed`] ticket exists in the same
     ///   workspace — a failure awaiting Manager triage parks the workspace so no
     ///   new work starts next to the unresolved failure (and its uncommitted
@@ -1464,11 +1485,11 @@ impl BoardStore {
         prepared.execute_tx(tx).await
     }
 
-    /// Record the reviewed content base (HEAD + index tree) on a ticket.
-    ///
-    /// Set after a completed reviewer round so later rounds can skip the
-    /// reviewer pass only when their content is identical to this base.
-    /// `None` values clear the base (ticket becomes never-reviewed).
+    /// Record the reviewed content base on a ticket — the content the code
+    /// reviewers were handed, read before the round's participants ran. Written
+    /// only by a round whose code review ran and which then moved the ticket on;
+    /// see `verification::record_reviewed_base`. `None` values clear the base
+    /// (ticket becomes never-reviewed).
     pub(crate) async fn set_reviewed_base(
         &self,
         ticket_id: &str,
@@ -1485,7 +1506,7 @@ impl BoardStore {
 
     /// Increment the ticket's bounce counter inside an existing transaction.
     ///
-    /// Called atomically with the bounce-back transition (review/QA bounce or
+    /// Called atomically with the bounce-back transition (verification bounce or
     /// engineer hard failure) so the counter can never drift from the
     /// transitions that produce it.
     pub(crate) async fn increment_bounce_count_tx(

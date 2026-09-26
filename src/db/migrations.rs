@@ -39,8 +39,14 @@
 //! drops are `39`/`40`, which remove `users.permissions` and
 //! `users.selected_role` — account kind is the admin's name and no account
 //! stores an agent role — and `43`, which retires the `alarms.command` column.
+//! The tail's stage-merge entries are `44`, which rewrites the retired
+//! `in_review`/`in_qa` stages to the merged `verification` stage (deleting the
+//! retired job rows, since a rename would collide on the per-ticket unique
+//! index, and the retired→retired chronicle hops, which never happened), and
+//! `45`, which invalidates the stored per-workspace lifecycle descriptions
+//! that still name a retired stage.
 //!
-//! Future schema changes resume the chain at id `44` with monotonically
+//! Future schema changes resume the chain at id `46` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -467,6 +473,65 @@ CREATE INDEX IF NOT EXISTS idx_llm_failures_failure_class ON llm_failures(failur
 /// rewritten; every other stored order survives verbatim.
 const REWRITE_LEGACY_DEEPSEEK_ROUTING_SLUG: &str = "UPDATE config_model_routing SET provider_order = 'deepseek' WHERE provider_order = 'DeepSeek';";
 
+/// Catalog `44`: rewrite the retired `in_review`/`in_qa` stages to the merged
+/// `verification` stage — a data migration; no schema change.
+///
+/// `tickets.phase`, `ticket_chronicle.source_phase` and
+/// `ticket_chronicle.target_phase` are untyped `TEXT` with no CHECK constraint,
+/// so only the stored strings move — a ticket's stage state is entirely its
+/// phase string, so nothing else about it has to change. Ticket comments are NOT
+/// touched: the retired stage labels a past round's comment carries are
+/// history, they are displayed as written, and no read path parses them.
+///
+/// `last_transition_actor` is deliberately left alone, unlike every service-side
+/// phase write (see `board::PIPELINE_ACTOR`'s invariant): that column records
+/// the actor of a transition, and this rewrite is not one — the ticket's last
+/// real transition still is. The invariant's misattribution hazard cannot arise
+/// here either: the catalog runs before CDC capture is enabled on the connection
+/// (see `db::open_consolidated_store`), so this UPDATE is never captured and
+/// materializes no chronicle hop to attribute.
+///
+/// The retired `jobs` rows are DELETED, **never renamed**. `jobs.kind` for a
+/// ticket phase job equals the ticket's phase, and the partial unique index
+/// `idx_jobs_phase_ticket` on `jobs(kind, ticket_id)` WHERE
+/// `ticket_id IS NOT NULL` admits one row per (kind, ticket_id) pair. A single
+/// ticket can hold both an `in_review` and an `in_qa` row — the window between
+/// a stage's transition commit and its job deletion, and stale rows are
+/// purge-immune while their workspace is paused — so renaming both to
+/// `verification` would collide and abort this entry's transaction, and a
+/// failed SQL migration is a HARD BOOT REFUSAL, which this change must never
+/// cause.
+///
+/// Deleting the retired rows also discards their roster (`agents.job_id`
+/// references `jobs(id)` `ON DELETE CASCADE`), which is exactly what the merge
+/// requires: a round interrupted by the upgrade is re-driven as a whole — the
+/// puller creates a fresh `verification` job for a ticket now in the
+/// verification phase — so partial work from the old two-stage arrangement is
+/// never mistaken for a completed check.
+///
+/// The chronicle's retired→retired hops (`in_review → in_qa` and the like) are
+/// DELETED *before* the rewrite, not rewritten into `verification →
+/// verification` self-transitions: the two ends are one stage now, so the hop
+/// between them never happened. The remaining rewrites cannot collide on the
+/// unique `idx_ticket_chronicle_dedup` (`ticket_id, workspace_name,
+/// source_phase, target_phase, at`): `at` is the transition's own `updated_at`
+/// (microsecond resolution), so no two hops of one ticket share it — and without
+/// that, one ticket's `in_review → X` and `in_qa → X` rows would be exactly the
+/// pair sharing every other key column, which the rewrite merges. Idempotent:
+/// re-running matches no rows.
+///
+/// One-way, like every phase rename: a binary that predates this entry parses
+/// phase strings strictly and cannot read `verification`, so a manual downgrade
+/// (not a supported path) leaves tickets in this phase unreadable — the same
+/// hazard the `ready_for_development` → `queued` rename carried.
+const REWRITE_RETIRED_STAGES_TO_VERIFICATION: &str = "\
+DELETE FROM jobs WHERE kind IN ('in_review', 'in_qa');\
+DELETE FROM ticket_chronicle WHERE source_phase IN ('in_review', 'in_qa') \
+  AND target_phase IN ('in_review', 'in_qa');\
+UPDATE tickets SET phase = 'verification' WHERE phase IN ('in_review', 'in_qa');\
+UPDATE ticket_chronicle SET source_phase = 'verification' WHERE source_phase IN ('in_review', 'in_qa');\
+UPDATE ticket_chronicle SET target_phase = 'verification' WHERE target_phase IN ('in_review', 'in_qa');";
+
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
 /// Entries `24`–`26` are the consolidated current-shape baseline; entries
@@ -509,6 +574,14 @@ const REWRITE_LEGACY_DEEPSEEK_ROUTING_SLUG: &str = "UPDATE config_model_routing 
 ///   trigger that replaced the retired shell command (a no-op on fresh
 ///   installs, whose baseline already declares it).
 /// - `43` drops the retired `alarms.command` column.
+/// - `44` rewrites the retired `in_review`/`in_qa` stages to the merged
+///   `verification` stage: the retired job rows are deleted (a rename would
+///   collide on `idx_jobs_phase_ticket`), the retired→retired chronicle hops
+///   are deleted, and the remaining ticket/chronicle phase strings are
+///   rewritten (see [`REWRITE_RETIRED_STAGES_TO_VERIFICATION`]).
+/// - `45` invalidates the stored per-workspace lifecycle descriptions in
+///   `workspace_contexts` that still name a retired stage, so no agent is
+///   handed the retired two-stage arrangement.
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -610,6 +683,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Rust(drop_alarms_command),
     },
+    Migration {
+        id: "44",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(REWRITE_RETIRED_STAGES_TO_VERIFICATION),
+    },
+    Migration {
+        id: "45",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(drop_retired_lifecycle_descriptions),
+    },
 ];
 
 /// Apply the migration catalog to `conn` for one physical database.
@@ -684,11 +767,10 @@ async fn run_catalog(conn: &Connection, db: TargetDb, catalog: &[Migration]) -> 
             MigrationBody::Rust(run) => {
                 // Unlike an SQL entry, a Rust body and its tracking row are not
                 // recorded atomically (the body runs without a transaction). This
-                // is safe because every Rust body — the `chat_history` reply-column
-                // upfill and the `users` column drops, which probe before
-                // altering — is idempotent and re-runnable, so a crash between
-                // body success and id recording re-runs the body without
-                // corruption on the next boot.
+                // is safe because every Rust body probes (or is written to be
+                // indifferent to) the state it applies, so it is idempotent and
+                // re-runnable: a crash between body success and id recording
+                // re-runs the body without corruption on the next boot.
                 run(conn)
                     .await
                     .with_context(|| format!("Migration '{}' failed", migration.id))?;
@@ -1040,6 +1122,99 @@ fn drop_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 /// indexed and not part of a PK/UNIQUE/CHECK/FK constraint.
 async fn run_drop_alarms_command(conn: &Connection) -> anyhow::Result<()> {
     drop_column_if_missing(conn, "alarms", "command").await
+}
+
+/// Case-folded markers of a stored description of the retired two-stage
+/// review-then-QA arrangement, matched as substrings of the content after
+/// [`describes_retired_lifecycle`]'s normalization.
+///
+/// They cover the spellings the retired phases were actually written in
+/// (`in_review`, `in review`, `InReview`), the lifecycle-list spellings that
+/// drop the `in` (`→ Review`, `Review →`, `Review/QA`, `review and QA`), and the
+/// retired stages named as the two ends of one pipeline step.
+const RETIRED_LIFECYCLE_MARKERS: &[&str] = &[
+    "in_review",
+    "in review",
+    "inreview",
+    "in_qa",
+    "in qa",
+    "inqa",
+    "→ review",
+    "review →",
+    "→ qa",
+    "qa →",
+    "review/qa",
+    "qa/review",
+];
+
+/// Whether a stored workspace context describes the retired arrangement.
+///
+/// Deliberately greedy pipeline vocabulary, not a parser: the content is
+/// case-folded, its stage-list separators (` and `, `, `, ` then `) are
+/// normalized to `/`, and the `reviewer`/`reviewers` role names are folded out —
+/// so `Review/QA`, `review and QA` and `review then QA` all hit, while a role
+/// list like `analyst/coder/qa/reviewer/sanitation` does not (the reviewer role
+/// survives the merge; only the retired *stage* names are probed, and the fold's
+/// placeholder carries no stage word).
+fn describes_retired_lifecycle(content: &str) -> bool {
+    let mut folded = content.to_ascii_lowercase();
+    for separator in [" and ", ", ", " then "] {
+        folded = folded.replace(separator, "/");
+    }
+    folded = folded
+        .replace("reviewers", "role_name")
+        .replace("reviewer", "role_name");
+    RETIRED_LIFECYCLE_MARKERS
+        .iter()
+        .any(|marker| folded.contains(marker))
+}
+
+fn drop_retired_lifecycle_descriptions(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_drop_retired_lifecycle_descriptions(conn))
+}
+
+/// Data migration (`45`): no stored workspace context may hand an agent the
+/// retired two-stage arrangement.
+///
+/// `workspace_contexts` holds discovery-generated prose per
+/// (`workspace_name`, `role`), and a row that names the retired stages
+/// describes the pipeline's lifecycle — including the module split and the
+/// review-then-QA order that the merge removed. No partial rewrite can make such
+/// a description true, so the row is DELETED: the value is a derived cache that
+/// the workspace's next re-analysis (the manual Re-analyze, or the nightly
+/// new-commit pass) regenerates from the current source, a missing context
+/// degrades to the file-derived fallback rather than to an error, and a stored
+/// description of the retired arrangement is worse than a missing one.
+///
+/// The probe behind it is a heuristic in both directions: prose that describes
+/// the retired order without naming a retired stage or joining the two as one
+/// lifecycle step (e.g. "the code is reviewed, then tested") survives and waits
+/// for the next re-analysis, while a context that uses `review` as its own
+/// subject (e.g. "review → merge") is dropped unnecessarily. Idempotent and
+/// non-transactional like every Rust body: a second run matches nothing.
+async fn run_drop_retired_lifecycle_descriptions(conn: &Connection) -> anyhow::Result<()> {
+    let rows = conn
+        .query("SELECT rowid, content FROM workspace_contexts", ())
+        .await
+        .context("Failed to read stored workspace contexts")?;
+    for row in rows {
+        let content = row
+            .get::<String>(1)
+            .context("Failed to read workspace_contexts.content")?;
+        if !describes_retired_lifecycle(&content) {
+            continue;
+        }
+        let rowid = row
+            .get::<i64>(0)
+            .context("Failed to read workspace_contexts.rowid")?;
+        conn.execute(
+            "DELETE FROM workspace_contexts WHERE rowid = ?1",
+            params![rowid],
+        )
+        .await
+        .context("Failed to drop a stale stored workspace context")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2346,7 +2521,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`43` tail, and converges to the exact current core
+    /// upfills and the `36`–`45` tail, and converges to the exact current core
     /// shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -2373,10 +2548,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             applied,
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-                "40", "41", "42", "43"
+                "40", "41", "42", "43", "44", "45"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–43 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–45 tail exactly"
         );
     }
 
@@ -2642,7 +2817,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`43`) as a
+    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`45`) as a
     /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
     /// column upfill, the delta-28 `jobs.caller_agent_id` /
     /// `session_metadata.created_at` column upfills (plus the delta-28
@@ -2660,6 +2835,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// only counts, chat content and tickets). All asserted explicitly. This
     /// also proves Turso honors `IF NOT EXISTS` on the FTS index when the
     /// baseline re-runs it.
+    ///
+    /// The stage-merge tail (`44`/`45`) is a no-op here too: the seeded rows
+    /// name none of the retired stages, so no job is deleted, no phase is
+    /// rewritten and the empty `workspace_contexts` stays empty.
     #[tokio::test]
     #[expect(clippy::too_many_lines)]
     async fn old_catalog_current_db_reopens_as_noop() {
@@ -2686,7 +2865,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40", "41", "42", "43",
+            "40", "41", "42", "43", "44", "45",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -2695,7 +2874,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..43"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..45"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -2891,9 +3070,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
     /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
     /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
-    /// entries `36`–`43`: three data migrations (detaching guests from
-    /// shared workspaces, rewriting the legacy `DeepSeek` routing slug, and
-    /// deleting the command-armed alarm rows), the `users.granted_tools`
+    /// entries `36`–`45`: the data migrations (detaching guests from
+    /// shared workspaces, rewriting the legacy `DeepSeek` routing slug,
+    /// deleting the command-armed alarm rows, rewriting the retired
+    /// `in_review`/`in_qa` stages to `verification`, and invalidating the
+    /// stored workspace lifecycle descriptions that still name them), the `users.granted_tools`
     /// column, the drops of the account-kind `users.permissions` /
     /// `users.selected_role` columns, and the `alarms.trigger` upfill plus the
     /// `alarms.command` drop that retire the command-armed alarm feature.
@@ -2998,7 +3179,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40", "41", "42", "43",
+            "40", "41", "42", "43", "44", "45",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3007,7 +3188,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..43"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..45"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -3375,5 +3556,290 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             .await
             .expect("re-run entry 37 body");
         assert_eq!(model_routing_orders(&conn).await, rewritten);
+    }
+
+    /// The stage-merge description probe catches the spellings the retired
+    /// phases were written in (underscored, spaced, fused, any casing) and the
+    /// lifecycle-list spellings that drop the `in`, in the separator styles the
+    /// stored prose uses (` and `, `, `, ` then `), and leaves a description
+    /// that names no retired stage alone.
+    #[test]
+    fn retired_lifecycle_description_probe_handles_the_stored_shapes() {
+        for retired in [
+            "a fixed lifecycle — `Backlog → Analysis → InReview → InQa → InSanitation → Done`",
+            "Each phase (`in_development`, `in_diagnostics`, `in_review`, `in_qa`) owns a job",
+            "the lifecycle is in development → in diagnostics → in review → in QA → in sanitation",
+            "(Analysis → Planning → Queued → Development → Diagnostics → Review → QA → Sanitation)",
+            "the dev/review/QA pipeline",
+            "the board keeps IN_REVIEW and IN_QA columns",
+            "comments come from the analysis, engineer, diagnostics, review and QA",
+            "two separate checks: review, qa",
+            "review then QA",
+            // Greedy by design: `review` given its own arrow is invalidated even
+            // when the prose is not about this pipeline — the accepted cost.
+            "the docs are updated on each review → merge cycle",
+        ] {
+            assert!(
+                describes_retired_lifecycle(retired),
+                "must be invalidated: {retired:?}"
+            );
+        }
+        for kept in [
+            "the code reviewers check the change and one functional tester runs the product",
+            "every phase owns a short-lived `jobs` row",
+            "reviewing the diff is what the reviewer does",
+            "the reviewer and the analyst read the same tree",
+            "the model slots split inspector roles (analyst/coder/qa/reviewer/sanitation) from the rest",
+            "`review.rs` and `qa.rs` were merged",
+        ] {
+            assert!(
+                !describes_retired_lifecycle(kept),
+                "must survive verbatim: {kept:?}"
+            );
+        }
+    }
+
+    /// Role (empty for the NULL role) → content for every stored workspace
+    /// context.
+    async fn workspace_context_rows(
+        conn: &Connection,
+    ) -> std::collections::BTreeMap<String, String> {
+        conn.query("SELECT role, content FROM workspace_contexts", ())
+            .await
+            .expect("read workspace_contexts")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<Option<String>>(0)
+                        .expect("role")
+                        .unwrap_or_default(),
+                    row.get::<String>(1).expect("content"),
+                )
+            })
+            .collect()
+    }
+
+    /// Behavioral pin for the stage-merge tail: entry `44` rewrites the retired
+    /// `in_review`/`in_qa` stages to `verification` on the ticket and on both
+    /// chronicle sides, DELETES the retired job rows — a ticket can hold
+    /// both an `in_review` and an `in_qa` row, so a rename would collide on the
+    /// unique `jobs(kind, ticket_id)` index and abort the migration — taking
+    /// their cascaded `agents` roster with them, and DELETES the retired→retired
+    /// chronicle hop, which never happened. Entry `45` deletes every stored
+    /// workspace lifecycle description that names a retired stage and leaves a
+    /// description naming none verbatim. Idempotent: re-running both bodies
+    /// matches no rows.
+    #[tokio::test]
+    #[expect(clippy::too_many_lines)] // large table-driven migration fixture
+    async fn retired_stages_are_merged_into_verification() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        // Catalog front entry 24 (baseline core schema) creates workspaces,
+        // tickets, jobs, agents, ticket_chronicle and workspace_contexts.
+        run_catalog(&conn, TargetDb::Core, &MIGRATIONS[..1])
+            .await
+            .expect("baseline catalog");
+        let now = crate::db::now();
+        conn.execute(
+            "INSERT INTO workspaces (name, path, created_at, updated_at) VALUES ('ws', '/ws', ?1, ?1)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        for (id, phase) in [("T1", "in_review"), ("T2", "in_qa"), ("T3", "backlog")] {
+            conn.execute(
+                "INSERT INTO tickets \
+                 (id, title, description, phase, workspace_name, created_at, updated_at) \
+                 VALUES (?1, ?1, '', ?2, 'ws', ?3, ?3)",
+                params![id, phase, now.clone()],
+            )
+            .await
+            .unwrap();
+        }
+        // T1 holds BOTH retired job rows — the collision a rename would hit.
+        for (job, kind, ticket) in [
+            ("J1", "in_review", Some("T1")),
+            ("J2", "in_qa", Some("T1")),
+            ("J3", "in_qa", Some("T2")),
+            ("J4", "analysis", Some("T3")),
+        ] {
+            conn.execute(
+                "INSERT INTO jobs \
+                 (id, kind, role, workspace_name, task, user_name, channel, retry_count, status, \
+                  created_at, updated_at, ticket_id) \
+                 VALUES (?1, ?2, 'qa', 'ws', '', 'bob', '', 0, 'launched', ?3, ?3, ?4)",
+                params![job, kind, now.clone(), ticket],
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
+             VALUES ('J1', 'A1', 'verifier', 0, 'done', 'task')",
+            (),
+        )
+        .await
+        .unwrap();
+        for (ticket, source, target) in [
+            ("T1", "in_diagnostics", "in_review"),
+            ("T2", "in_qa", "in_sanitation"),
+            ("T3", "backlog", "queued"),
+            // The retired→retired hop the merge turned into one stage: it must
+            // be dropped rather than rewritten into a `verification →
+            // verification` self-transition.
+            ("T1", "in_review", "in_qa"),
+        ] {
+            conn.execute(
+                "INSERT INTO ticket_chronicle \
+                 (ticket_id, workspace_name, source_phase, target_phase, at) VALUES (?1, 'ws', ?2, ?3, ?4)",
+                params![ticket, source, target, now.clone()],
+            )
+            .await
+            .unwrap();
+        }
+        let arrow_lifecycle =
+            "lifecycle — `Backlog → Analysis → InReview → InQa → InSanitation → Done`";
+        let phase_list =
+            "Each phase (`in_development`, `in_diagnostics`, `in_review`, `in_qa`) owns a job";
+        let spaced_lifecycle =
+            "the pipeline runs development → diagnostics → review → QA → sanitation";
+        for (role, content) in [
+            (None, arrow_lifecycle),
+            (Some("engineer"), phase_list),
+            (Some("qa"), "the board keeps IN_REVIEW and IN_QA columns"),
+            (Some("manager"), spaced_lifecycle),
+            (Some("coder"), "no retired stage is named here"),
+        ] {
+            conn.execute(
+                "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
+                 VALUES ('ws', ?1, ?2, ?3)",
+                params![role, content, now.clone()],
+            )
+            .await
+            .unwrap();
+        }
+
+        let merge_entries: Vec<Migration> = MIGRATIONS
+            .iter()
+            .filter(|m| m.id == "44" || m.id == "45")
+            .copied()
+            .collect();
+        run_catalog(&conn, TargetDb::Core, &merge_entries)
+            .await
+            .expect("stage-merge tail");
+
+        let phases: Vec<(String, String)> = conn
+            .query("SELECT id, phase FROM tickets ORDER BY id", ())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()))
+            .collect();
+        assert_eq!(
+            phases,
+            vec![
+                ("T1".to_string(), "verification".to_string()),
+                ("T2".to_string(), "verification".to_string()),
+                ("T3".to_string(), "backlog".to_string()),
+            ],
+            "the retired phases become verification; every other phase survives"
+        );
+
+        let remaining_jobs: Vec<String> = conn
+            .query("SELECT id FROM jobs ORDER BY id", ())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(
+            remaining_jobs,
+            vec!["J4".to_string()],
+            "the retired job rows must be deleted, never renamed"
+        );
+        let orphan_rosters: i64 = conn.query("SELECT COUNT(*) FROM agents", ()).await.unwrap()[0]
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(
+            orphan_rosters, 0,
+            "the deleted jobs must cascade their roster away"
+        );
+
+        let chronicle: Vec<(String, String, String)> = conn
+            .query(
+                "SELECT ticket_id, source_phase, target_phase FROM ticket_chronicle ORDER BY ticket_id",
+                (),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String>(0).unwrap(),
+                    row.get::<String>(1).unwrap(),
+                    row.get::<String>(2).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            chronicle,
+            vec![
+                (
+                    "T1".to_string(),
+                    "in_diagnostics".to_string(),
+                    "verification".to_string()
+                ),
+                (
+                    "T2".to_string(),
+                    "verification".to_string(),
+                    "in_sanitation".to_string()
+                ),
+                (
+                    "T3".to_string(),
+                    "backlog".to_string(),
+                    "queued".to_string()
+                ),
+            ],
+            "both chronicle sides must be rewritten, the retired→retired hop \
+             dropped, and unretired edges kept"
+        );
+
+        let contexts = workspace_context_rows(&conn).await;
+        assert!(
+            !contexts.contains_key(""),
+            "the arrow lifecycle list names a retired stage — the row must go, not be patched"
+        );
+        assert!(
+            !contexts.contains_key("engineer"),
+            "the code-span slug list names a retired stage"
+        );
+        assert!(
+            !contexts.contains_key("qa"),
+            "an upper-cased retired stage name still instructs the old arrangement"
+        );
+        assert!(
+            !contexts.contains_key("manager"),
+            "the spaced lifecycle prose names a retired stage"
+        );
+        assert_eq!(
+            contexts.get("coder"),
+            Some(&"no retired stage is named here".to_string()),
+            "a description naming no retired stage survives verbatim"
+        );
+
+        // The ledger records `44`/`45` after the first application, so re-run
+        // both bodies directly to pin that they match no rows a second time.
+        conn.execute_batch(REWRITE_RETIRED_STAGES_TO_VERIFICATION)
+            .await
+            .expect("re-run entry 44 body");
+        run_drop_retired_lifecycle_descriptions(&conn)
+            .await
+            .expect("re-run entry 45 body");
+        assert_eq!(workspace_context_rows(&conn).await, contexts);
     }
 }

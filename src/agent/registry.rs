@@ -39,8 +39,8 @@ static NEXT_ENTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// INVOCATION a running work item belongs to.
 ///
 /// - [`Ticket`](ParentKey::Ticket) — all agents working on the same ticket
-///   plus LLM calls belonging to the ticket's own work (e.g. joint-verdict
-///   synthesis of a review round).
+///   plus LLM calls belonging to the ticket's own work (e.g. the joint-verdict
+///   synthesis of a verification round).
 /// - [`AnalyzeRound`](ParentKey::AnalyzeRound) — the parallel analysts of one analyze
 ///   round plus its consolidation LLM call (members share the round key).
 /// - [`Research`](ParentKey::Research) — all sub-agents and orchestrator LLM
@@ -344,10 +344,11 @@ impl AgentRegistry {
     /// FREEZE (leave the ticket in place for unpause), not a failure and not a
     /// cancellation.
     ///
-    /// Scoped to TICKET-parented pipeline agents (engineer, verifiers, QA,
-    /// analysts, sanitation) — the managers, maintainers, and on-demand
-    /// analyze/research sub-agents (all `ticket_id = None`) are intentionally
-    /// left running so a pause only halts the ticket pipeline.
+    /// Scoped to TICKET-parented pipeline agents (engineer, the verification
+    /// round's reviewers and tester, analysts, sanitation) — the managers,
+    /// maintainers, and on-demand analyze/research sub-agents (all
+    /// `ticket_id = None`) are intentionally left running so a pause only halts
+    /// the ticket pipeline.
     pub fn cancel_by_workspace_pause(&self, workspace_name: &str) {
         {
             let map = self.inner.lock().unwrap_poison();

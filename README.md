@@ -6,13 +6,13 @@ Mahbot treats software development as a managed pipeline, not a chat session: yo
 
 **Reliability** comes from orchestration and process, not based on the expectation that the current frontier model will one-shot any task. 
 
-**Autonomy** is achieved using the pipeline - you can request a large amount of work and agents in the pipeline will ensure that every piece is analyzed, implemented, reviewed, tested and commited.
+**Autonomy** is achieved using the pipeline - you can request a large amount of work and agents in the pipeline will ensure that every piece is analyzed, implemented, verified and commited.
 
 Batteries included:
 - __Smooth native GUI__ for the core pipeline management as well as code editor, diff viewer and shell
 - __Telegram bot__ integration that allows you to easily manage the work from your smartphone
 - __Voice control__ (macOS only) using a CPU-optimized local speech-to-text model that turns babble into features (passive wake-word detection wip)
-- __Modern agentic__ adversarial analysis before dev, review and QA after dev
+- __Modern agentic__ adversarial analysis before dev, verification after dev
 - __Good old deterministic__ CI-style diagnostics after every dev round
 - __Background maintenance__ agentic process to clean up the usual videcoding bloat and other code quality issues
 - __Full history__ of the previous work in the tickets with efficient hybrid search over it
@@ -31,9 +31,8 @@ Every ticket has a lifecycle with **redundant checks**:
 | **→ Planning** | Manager sees the analysis and refines/cancels/approved or escalates |
 | **→ Queued** | Awaits in the engineer's queue according to it's priority |
 | **→ Development** | Engineer implements the ticket (or the required fixes) |
-| **→ Diagnostics** | Deterministic verification (format, lint, build, test) |
-| **→ Review** | Agentic verification focused on the code quality |
-| **→ QA** | Agentic verification focused on the product behaviour |
+| **→ Diagnostics** | Deterministic checks (format, lint, build, test) |
+| **→ Verification** | Code reviewers and one functional tester, run in parallel |
 | **→ Sanitation** | Audit untracked/new files in the working tree |
 | **→ Done** | Auto git commit with the ticket's title if the tree is dirty |
 

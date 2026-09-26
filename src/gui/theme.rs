@@ -118,7 +118,8 @@ pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
 ///
 /// Accepts canonical names (e.g. `"analyst"`), derivative names with a
 /// numeric suffix (e.g. `"analyst_1"`, `"analyst_2"`), and the joint-comment
-/// stage roles ("Analysis"/"Review"/"QA" — the comment role is the stage
+/// stage roles ("Analysis"/"Verification", plus the retired stages' "Review"/
+/// "QA" labels historical comments still carry — the comment role is the stage
 /// name, per the joint-verdict pipeline). Unknown strings (including LLM API
 /// roles like `"user"`, `"assistant"`, `"system"`, `"tool"`) fall back to a
 /// muted grey.
@@ -132,9 +133,8 @@ pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
 /// reads colors from [`crate::agent::role::role_info()`] as the single source of truth.
 #[must_use]
 pub fn role_badge_color(role: &str) -> (Color, Color) {
-    // Stage-name comment roles from the joint-verdict pipeline ("Analysis"/
-    // "Review"/"QA" — the comment role is the stage name). Resolved via the
-    // shared inverse mapping so it can't drift from verdict::stage_name.
+    // Stage-name comment roles, resolved through the shared inverse mapping so
+    // the badge cannot drift from verdict::stage_role.
     if let Some(r) = crate::pipeline::verdict::stage_role(role) {
         return role_badge_color_for(&r);
     }
@@ -204,12 +204,13 @@ pub fn diagnostics_icon() -> iced::widget::Text<'static, iced::Theme, iced::Rend
 /// plain muted text.
 ///
 /// Only the exact author values the pipeline writes today resolve to an
-/// icon: the joint-verdict stage names ("Analysis"/"Review"/"QA", resolved
-/// via the shared [`crate::pipeline::verdict::stage_role`] inverse mapping),
-/// the canonical agent names "engineer"/"manager"/"sanitation", and
-/// "diagnostics" (stethoscope, [`TEXT_PRIMARY`] tint). Legacy or unexpected
-/// values (e.g. old suffixed labels like "analyst_1", "system",
-/// "user:{name}") intentionally return `None`.
+/// icon: the joint-verdict stage names (resolved via the shared
+/// [`crate::pipeline::verdict::stage_role`] inverse mapping, which also carries
+/// the retired stages' labels that historical comments keep), the canonical
+/// agent names "engineer"/"manager"/"sanitation", and "diagnostics"
+/// (stethoscope, [`TEXT_PRIMARY`] tint). Legacy or unexpected values (e.g. old
+/// suffixed labels like "analyst_1", "system", "user:{name}") intentionally
+/// return `None`.
 ///
 /// Delegates to [`role_badge_color_for`] for the foreground color, and to
 /// [`role_icon`] for the glyph.
@@ -359,8 +360,8 @@ fn markdown_settings_with(font: iced::Font, text_size: f32) -> iced::widget::mar
 #[must_use]
 pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
     use TicketPhase::{
-        Analysis, Backlog, Cancelled, Done, Failed, InDevelopment, InDiagnostics, InQa, InReview,
-        InSanitation, Planning, Queued,
+        Analysis, Backlog, Cancelled, Done, Failed, InDevelopment, InDiagnostics, InSanitation,
+        Planning, Queued, Verification,
     };
     match phase {
         // Early phases — cool/muted, neutral
@@ -396,14 +397,10 @@ pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
             Color::from_rgb(0.788, 0.788, 0.788),
             Color::from_rgb(0.310, 0.310, 0.310),
         ),
-        // Review & QA
-        InReview => (
+        // Verification — the merged agentic code review + functional check
+        Verification => (
             Color::from_rgb(0.816, 0.816, 0.933),
             Color::from_rgb(0.184, 0.216, 0.380),
-        ),
-        InQa => (
-            Color::from_rgb(0.816, 0.816, 0.933),
-            Color::from_rgb(0.216, 0.184, 0.380),
         ),
         // Unblocking phases — distinct
         Done => (
@@ -1065,11 +1062,15 @@ mod tests {
     #[test]
     fn joint_comment_stage_roles_get_their_role_colors() {
         // The joint-verdict pipeline writes comments with the STAGE NAME as the
-        // comment role ("Analysis"/"Review"/"QA") — they must render with the
-        // corresponding role color, not the muted-grey fallback.
+        // comment role ("Analysis"/"Verification"/"Review"/"QA") — they must
+        // render with the corresponding role color, not the muted-grey fallback.
         assert_eq!(
             role_badge_color("Analysis"),
             role_badge_color_for(&crate::Role::Analyst)
+        );
+        assert_eq!(
+            role_badge_color("Verification"),
+            role_badge_color_for(&crate::Role::Qa)
         );
         assert_eq!(
             role_badge_color("Review"),
@@ -1134,6 +1135,7 @@ mod tests {
             "system",
             "tool",
             "Analysis",
+            "Verification",
             "Review",
             "QA",
             "analyst_3",
@@ -1385,6 +1387,7 @@ mod tests {
 
         for author in [
             "Analysis",
+            "Verification",
             "Review",
             "QA",
             "engineer",

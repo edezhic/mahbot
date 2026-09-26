@@ -16,6 +16,7 @@
 use crate::Role;
 use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::db::{self, Connection, Row, TxGuard, Value, params};
+use crate::pipeline::board::{TicketPhase, WORKING_PHASES};
 use anyhow::{Context, Result};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -103,10 +104,16 @@ impl std::str::FromStr for JobMode {
 }
 
 /// Values of `agents.kind` — dispatch-slot kinds.
+///
+/// The verification round's two cohorts carry their own labels (`Reviewer` for
+/// the code reviewers, `Tester` for the single functional tester) because the
+/// resume path reads the cohorts back from the stored roster: the label is the
+/// cohort identity, never the slot's position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentKind {
     Analyst,
-    Verifier,
+    Reviewer,
+    Tester,
     Engineer,
     /// Single coder sub-agent for the durable async ImplementTool dispatch.
     Coder,
@@ -121,7 +128,8 @@ impl AgentKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Analyst => "analyst",
-            Self::Verifier => "verifier",
+            Self::Reviewer => "reviewer",
+            Self::Tester => "tester",
             Self::Engineer => "engineer",
             Self::Coder => "coder",
             Self::Sanitation => "sanitation",
@@ -171,6 +179,8 @@ pub(crate) struct JobRow {
 pub(crate) struct AgentRow {
     pub idx: Option<i64>,
     pub agent_id: String,
+    /// The row's `agents.kind` label — the roster's cohort identity.
+    pub kind: String,
     pub status: String,
     pub outcome: Option<String>,
     pub task: String,
@@ -218,13 +228,25 @@ fn job_row_from(row: &Row) -> anyhow::Result<JobRow> {
     })
 }
 
+crate::columns! {
+    AGENT_COLUMNS [AGENT] {
+        IDX      => "idx",
+        AGENT_ID => "agent_id",
+        KIND     => "kind",
+        STATUS   => "status",
+        OUTCOME  => "outcome",
+        TASK     => "task",
+    }
+}
+
 fn agent_row_from(row: &Row) -> anyhow::Result<AgentRow> {
     Ok(AgentRow {
-        idx: row.get(0)?,
-        agent_id: row.get(1)?,
-        status: row.get(2)?,
-        outcome: row.get(3)?,
-        task: row.get(4)?,
+        idx: row.get(COL_AGENT_IDX)?,
+        agent_id: row.get(COL_AGENT_AGENT_ID)?,
+        kind: row.get(COL_AGENT_KIND)?,
+        status: row.get(COL_AGENT_STATUS)?,
+        outcome: row.get(COL_AGENT_OUTCOME)?,
+        task: row.get(COL_AGENT_TASK)?,
     })
 }
 
@@ -320,7 +342,7 @@ pub(crate) enum SpawnChild {
     /// truth. Roster grows during the phase (analysts/reviewers), and the job
     /// is deleted when the phase completes or is reset.
     Phase {
-        phase: crate::pipeline::board::TicketPhase,
+        phase: TicketPhase,
         ticket_id: String,
     },
 }
@@ -337,15 +359,17 @@ impl SpawnChild {
             Self::Research => "research",
             Self::ResearchCleanup => "research_cleanup",
             Self::TempCleanup => "temp_cleanup",
-            Self::Phase { phase, .. } => match phase {
-                crate::pipeline::board::TicketPhase::Analysis => "analysis",
-                crate::pipeline::board::TicketPhase::InDevelopment => "in_development",
-                crate::pipeline::board::TicketPhase::InDiagnostics => "in_diagnostics",
-                crate::pipeline::board::TicketPhase::InReview => "in_review",
-                crate::pipeline::board::TicketPhase::InQa => "in_qa",
-                crate::pipeline::board::TicketPhase::InSanitation => "in_sanitation",
-                _ => unreachable!("non-working phase as a job kind"),
-            },
+            // A phase job is named after its phase (`jobs.kind` mirrors
+            // `tickets.phase`, the sole running truth); only the working phases
+            // are spawnable, so anything else is a caller bug worth a refusal.
+            Self::Phase { phase, .. } => {
+                assert!(
+                    crate::pipeline::board::WORKING_PHASES.contains(phase),
+                    "non-working phase as a job kind: {}",
+                    phase.as_ref(),
+                );
+                <&'static str>::from(*phase)
+            }
         }
     }
 }
@@ -763,7 +787,7 @@ pub(crate) async fn find_owned_launched_jobs(
 //
 // A ticket phase job is a short-lived `jobs` row whose `kind` equals the
 // ticket's current phase (`analysis`, `in_development`, `in_diagnostics`,
-// `in_review`, `in_qa`, `in_sanitation`) and whose `ticket_id` — stored
+// `verification`, `in_sanitation`) and whose `ticket_id` — stored
 // directly on the job — links it to the ticket. `tickets.phase` is the sole
 // durable running truth; the job is created by the single puller when a
 // ticket in a working phase has no job, and deleted when the phase completes
@@ -784,7 +808,7 @@ fn ticket_job_row_from(row: &Row) -> anyhow::Result<TicketJobRow> {
 pub(crate) async fn find_phase_job(
     conn: &Connection,
     ticket_id: &str,
-    phase: crate::pipeline::board::TicketPhase,
+    phase: TicketPhase,
 ) -> Result<Option<TicketJobRow>> {
     conn.query_optional_cached(
         "SELECT id FROM jobs \
@@ -900,42 +924,11 @@ pub(crate) async fn job_has_launched_agents(conn: &Connection, job_id: &str) -> 
         .is_some())
 }
 
-// ── Slot-resume skeleton (shared by the pipeline parallel phases + AnalyzeTool) ──
+// ── Slot-resume skeleton (the pipeline's parallel phase rounds) ──
 //
-// An interrupted phase/analyze round is resumable from its roster: already-Done
-// slots are reconstructed from their stored `outcome` (per-consumer hook),
-// not-Done slots are re-run with their stored per-slot `task`. This module owns
-// the shared partition/discriminator helpers so the two consumers never
-// re-implement the split.
-
-/// The slot-resume partition of a job's roster: Done slots (reconstructable
-/// from their stored outcome) vs not-Done slots (re-run with their stored
-/// task). Refers into the input [`AgentRow`]s — the caller owns the lifetime.
-#[derive(Debug)]
-pub(crate) struct SlotResume<'a> {
-    pub done: Vec<&'a AgentRow>,
-    pub not_done: Vec<&'a AgentRow>,
-}
-
-/// Partition a roster into Done and not-Done slots for a slot-resume.
-/// A slot is Done iff its stored status is `done`; every other status
-/// (`launched`/`failed`) is not-Done and must be re-run, with its stored
-/// task, on resume. The per-consumer restorer turns a Done slot's stored
-/// `outcome` back into the consumer's artifact (pipeline: deserialize the
-/// verdict; AnalyzeTool: re-extract from the raw response).
-#[must_use]
-pub(crate) fn split_slot_resume(roster: &[AgentRow]) -> SlotResume<'_> {
-    let mut done = Vec::new();
-    let mut not_done = Vec::new();
-    for row in roster {
-        if row.status == RowStatus::Done.as_str() {
-            done.push(row);
-        } else {
-            not_done.push(row);
-        }
-    }
-    SlotResume { done, not_done }
-}
+// An interrupted parallel round is resumable from its roster: not-Done slots
+// are re-run with their stored per-slot `task`, while the phase body
+// reconstructs the Done half from each slot's stored `outcome`.
 
 /// Mark a phase job's stale `launched` roster rows as `failed` so the
 /// re-dispatch guard sees no running agents while the rows — and their stored
@@ -1173,12 +1166,11 @@ async fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
     rows.iter().map(job_row_from).collect()
 }
 
-/// Load the agent roster for a job.
+/// Load the agent roster for a job (with each row's cohort label).
 pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Result<Vec<AgentRow>> {
     let rows = conn
         .query(
-            "SELECT idx, agent_id, status, outcome, task \
-             FROM agents WHERE job_id = ?1 ORDER BY idx",
+            &format!("SELECT {AGENT_COLUMNS} FROM agents WHERE job_id = ?1 ORDER BY idx"),
             params![job_id],
         )
         .await
@@ -1500,10 +1492,11 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     let conn = &crate::session::store().conn;
 
     // A paused (frozen) phase job is purge-immune: it holds the workspace's
-    // running slot while frozen. The kind filter mirrors `is_ticket_phase_kind`.
-    let phase_kinds = TICKET_PHASE_KINDS
+    // running slot while frozen. The kind filter mirrors `is_ticket_phase_kind`:
+    // the working phases' own tokens.
+    let phase_kinds = WORKING_PHASES
         .iter()
-        .map(|kind| format!("'{kind}'"))
+        .map(|phase| format!("'{}'", phase.as_ref()))
         .collect::<Vec<_>>()
         .join(", ");
     let rows = conn
@@ -1565,21 +1558,12 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     Ok(deleted as u64)
 }
 
-/// `jobs.kind` values of the ticket working-phase kinds — the single source
-/// shared by [`is_ticket_phase_kind`] and the purge's SQL filter.
-const TICKET_PHASE_KINDS: &[&str] = &[
-    "analysis",
-    "in_development",
-    "in_diagnostics",
-    "in_review",
-    "in_qa",
-    "in_sanitation",
-];
-
-/// Is this `jobs.kind` one of the ticket working-phase kinds?
+/// Is this `jobs.kind` one of the ticket working-phase kinds? A phase job is
+/// named after its phase ([`SpawnChild::kind_str`]), so this is a check against
+/// the working phase set itself rather than a second vocabulary list.
 #[must_use]
 fn is_ticket_phase_kind(kind: &str) -> bool {
-    TICKET_PHASE_KINDS.contains(&kind)
+    WORKING_PHASES.iter().any(|phase| phase.as_ref() == kind)
 }
 
 /// Sync jobs (mode='sync') are settled by the owner's live resume-completion

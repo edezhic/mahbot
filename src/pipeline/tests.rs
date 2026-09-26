@@ -4,7 +4,7 @@
 //! The deterministic store + orchestrator tests exercise claim/bounce/reset and
 //! phase classification without agent rounds. The end-to-end behavioral-oracle
 //! tests drive the real phase bodies (analysis / development / diagnostics /
-//! review / QA / sanitation) and the puller through a scripted
+//! verification / sanitation) and the puller through a scripted
 //! [`FakeProvider`](crate::util::test::FakeProvider), so they are isolated from
 //! the live model. Global-DB tests are serialized behind [`TEST_LOCK`] because
 //! every global store shares one test root; isolated-store tests run freely.
@@ -566,23 +566,23 @@ async fn halfway_bounce_notifies_manager_once() {
     crate::agent::message_router::unregister_agent(&crate::session::manager_agent_id(&ws.name));
 }
 
-/// Bounce a fresh InReview ticket whose bounce counter starts at `bounce_count`,
-/// returning the ticket as the bounce left it.
+/// Bounce a fresh Verification ticket whose bounce counter starts at
+/// `bounce_count`, returning the ticket as the bounce left it.
 async fn halfway_bounce(ws: &Workspace, bounce_count: i64) -> Ticket {
     let store = crate::pipeline::board::store();
-    let id = make_ticket(store, ws, "Halfway", TicketPhase::InReview).await;
+    let id = make_ticket(store, ws, "Halfway", TicketPhase::Verification).await;
     let job_id = crate::generate_id();
     crate::jobs::spawn_job(
         &crate::session::store().conn,
         &job_id,
-        "review",
+        "verification",
         &ws.name,
         "",
         "",
         crate::Role::Reviewer,
         &[],
         &crate::jobs::SpawnChild::Phase {
-            phase: TicketPhase::InReview,
+            phase: TicketPhase::Verification,
             ticket_id: id.clone(),
         },
         None,
@@ -599,10 +599,10 @@ async fn halfway_bounce(ws: &Workspace, bounce_count: i64) -> Ticket {
         .unwrap();
     super::bounce_to_development(
         &expect_ticket(store, &id).await,
-        TicketPhase::InReview,
-        "Reviewers",
-        "Reviewer",
-        "reviewer",
+        TicketPhase::Verification,
+        "Verification",
+        "Verification",
+        "verification",
         "failed",
         &job_id,
     )
@@ -622,19 +622,19 @@ async fn bounce_to_development_returns_ticket_without_tripping() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    let id = make_ticket(store, &ws, "Bounce", TicketPhase::InReview).await;
+    let id = make_ticket(store, &ws, "Bounce", TicketPhase::Verification).await;
     let job_id = crate::generate_id();
     crate::jobs::spawn_job(
         &crate::session::store().conn,
         &job_id,
-        "review",
+        "verification",
         &ws.name,
         "",
         "",
         crate::Role::Reviewer,
         &[],
         &crate::jobs::SpawnChild::Phase {
-            phase: TicketPhase::InReview,
+            phase: TicketPhase::Verification,
             ticket_id: id.clone(),
         },
         None,
@@ -644,10 +644,10 @@ async fn bounce_to_development_returns_ticket_without_tripping() {
 
     super::bounce_to_development(
         &expect_ticket(store, &id).await,
-        TicketPhase::InReview,
-        "Reviewers",
-        "Reviewer",
-        "reviewer",
+        TicketPhase::Verification,
+        "Verification",
+        "Verification",
+        "verification",
         "failed",
         &job_id,
     )
@@ -657,10 +657,14 @@ async fn bounce_to_development_returns_ticket_without_tripping() {
     assert_eq!(ticket.phase, TicketPhase::InDevelopment);
     assert_eq!(ticket.bounce_count, 1);
     assert!(
-        crate::jobs::find_phase_job(&crate::session::store().conn, &id, TicketPhase::InReview)
-            .await
-            .unwrap()
-            .is_none(),
+        crate::jobs::find_phase_job(
+            &crate::session::store().conn,
+            &id,
+            TicketPhase::Verification
+        )
+        .await
+        .unwrap()
+        .is_none(),
         "a non-trip bounce deletes the phase job so the puller re-dispatches",
     );
 }
@@ -677,19 +681,19 @@ async fn bounce_breaker_trips_to_failed() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    let id = make_ticket(store, &ws, "Trip", TicketPhase::InReview).await;
+    let id = make_ticket(store, &ws, "Trip", TicketPhase::Verification).await;
     let job_id = crate::generate_id();
     crate::jobs::spawn_job(
         &crate::session::store().conn,
         &job_id,
-        "review",
+        "verification",
         &ws.name,
         "",
         "",
         crate::Role::Reviewer,
         &[],
         &crate::jobs::SpawnChild::Phase {
-            phase: TicketPhase::InReview,
+            phase: TicketPhase::Verification,
             ticket_id: id.clone(),
         },
         None,
@@ -709,10 +713,10 @@ async fn bounce_breaker_trips_to_failed() {
 
     super::bounce_to_development(
         &expect_ticket(store, &id).await,
-        TicketPhase::InReview,
-        "Reviewers",
-        "Reviewer",
-        "reviewer",
+        TicketPhase::Verification,
+        "Verification",
+        "Verification",
+        "verification",
         "failed",
         &job_id,
     )
@@ -730,7 +734,10 @@ async fn bounce_breaker_trips_to_failed() {
         )
         .await
         .unwrap();
-    assert_eq!(actor, "reviewer", "the bounce records the stage role actor");
+    assert_eq!(
+        actor, "verification",
+        "the bounce records the merged stage's actor"
+    );
 }
 
 /// `reset_phase_attempt` destroys the current attempt: it comments, cancels
@@ -903,17 +910,42 @@ async fn expect_phase_job(
         .unwrap()
 }
 
-/// A scripted FakeProvider that yields `count` clean verifier pairs: each
-/// agent produces a turn response then a clean `{"score":10,"issues":[]}`
-/// verdict.
-fn fake_clean_verifiers(count: usize) -> crate::util::test::FakeProvider {
+/// A provider script for a round with `count` participants: every response is
+/// the same clean verdict, so it does not matter which of the round's concurrent
+/// participants pops which one — a turn reads it as the assistant's message and
+/// the extraction that follows reads it as the verdict.
+fn fake_clean_participants(count: usize) -> crate::util::test::FakeProvider {
     let mut fake = crate::util::test::FakeProvider::new();
     for _ in 0..count {
         fake = fake
-            .ok("verifier check ok")
+            .ok(r#"{"score":10,"issues":[]}"#)
             .ok(r#"{"score":10,"issues":[]}"#);
     }
     fake
+}
+
+/// [`fake_clean_participants`] that also leaves a file in the repository on every
+/// call — a participant touching the workspace mid-round, made deterministic.
+/// Every call happens after the round read the reviewers' content identity, so
+/// the file is exactly the content the code review was never handed.
+struct ArtefactLeavingProvider {
+    repo: std::path::PathBuf,
+    fake: crate::util::test::FakeProvider,
+}
+
+#[async_trait::async_trait]
+impl crate::Provider for ArtefactLeavingProvider {
+    async fn chat_scoped(
+        &self,
+        request: crate::ChatRequest,
+    ) -> Result<crate::ChatResponse, crate::providers::ScopedCallError> {
+        std::fs::write(self.repo.join("tester-artefact.txt"), b"left behind\n").unwrap();
+        self.fake.chat_scoped(request).await
+    }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Poll (tightly) until an agent for `ticket_id` is registered in the global
@@ -1015,8 +1047,8 @@ async fn probe_then_claim_queued(store: &BoardStore, ws: &Workspace) -> (bool, O
 
 /// Drive a Backlog→Done lifecycle through the real phase bodies and the
 /// per-phase puller claims: analysis → planning → queued → development →
-/// diagnostics (skipped) → review (skip-reviewed) → QA → sanitation (dirty
-/// commit).
+/// diagnostics (skipped) → verification (code review skipped, tester runs) →
+/// sanitation (dirty commit).
 
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -1137,9 +1169,13 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         job_id.clone(),
     )
     .await;
-    assert_eq!(expect_ticket_phase(store, &id).await, TicketPhase::InReview);
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Verification,
+    );
 
-    // Record the reviewed base so the reviewer pass is skipped (content-identical).
+    // Record the reviewed base so the reviewer cohort is skipped
+    // (content-identical) while the functional tester still runs.
     let head = crate::git::commands::run_git_head(repo_path.as_path())
         .await
         .ok();
@@ -1151,32 +1187,24 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         .await
         .unwrap();
 
-    // Review: content identical → skip reviewer dispatch (no provider calls).
+    // Verification: ONE round. The content is identical to the reviewed base, so
+    // only the functional tester is dispatched — the reviewers are skipped, the
+    // round still advances the ticket, and the consolidated comment records the
+    // skipped code review.
     let job_id = crate::generate_id();
     spawn_phase_job(
         &job_id,
         &ws,
         &id,
-        TicketPhase::InReview,
+        TicketPhase::Verification,
         crate::Role::Reviewer,
-        "review",
+        "verification",
     )
     .await;
-    super::review::run(
-        std::sync::Arc::new(expect_ticket(store, &id).await),
-        ws.clone(),
-        job_id.clone(),
-    )
-    .await;
-    assert_eq!(expect_ticket_phase(store, &id).await, TicketPhase::InQa);
-
-    // QA: 1 tester, clean verdict → InSanitation.
-    let job_id = crate::generate_id();
-    spawn_phase_job(&job_id, &ws, &id, TicketPhase::InQa, crate::Role::Qa, "qa").await;
+    let fake = std::sync::Arc::new(fake_clean_participants(1));
     {
-        let fake = fake_clean_verifiers(1);
-        let _seam = crate::util::test::install_retry_seam(fake);
-        super::qa::run(
+        let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
+        super::verification::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),
             job_id.clone(),
@@ -1185,7 +1213,30 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
     }
     assert_eq!(
         expect_ticket_phase(store, &id).await,
-        TicketPhase::InSanitation
+        TicketPhase::InSanitation,
+    );
+    assert_eq!(
+        fake.request_fingerprints.lock().unwrap().len(),
+        2,
+        "a skipped code review still runs the one functional tester \
+         (one turn + one verdict extraction)",
+    );
+    let comments = store.get_comments(&id).await.unwrap();
+    let round_comment = comments.last().expect("the round must leave its comment");
+    assert_eq!(
+        round_comment.role, "Verification",
+        "the consolidated round comment is authored under the stage name",
+    );
+    assert!(
+        round_comment.content.starts_with("**Code review skipped**"),
+        "the note heads the consolidated comment (no leading blank lines):\n{}",
+        round_comment.content,
+    );
+    assert!(
+        round_comment.content.contains("still ran.\n\n"),
+        "the note must end with the blank line separating it from the round's \
+         own sections:\n{}",
+        round_comment.content,
     );
 
     // Dirty the working tree, sanitation inspects and commits → Done.
@@ -1226,6 +1277,249 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
     );
 
     drop(repo_dir);
+}
+
+/// A verification roster that is not a verification round — no functional
+/// tester row — is never resumed as one: the job is dropped so the poller
+/// re-creates it and the round re-runs whole, and a clean reviewer verdict in
+/// it can never pass the ticket on in place of the functional check.
+#[serial_test::serial(provider, drain)]
+#[tokio::test]
+async fn a_roster_without_a_tester_row_is_not_resumed_as_a_round() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
+    let ws = create_test_workspace(repo_path.to_str().unwrap(), "roster_shape_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "RosterShape", TicketPhase::Verification).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Verification,
+        crate::Role::Engineer,
+        "verification",
+    )
+    .await;
+    // One Done reviewer slot carrying a CLEAN verdict: a round that read this
+    // roster back would pass the ticket without running the functional check.
+    let reviewer_outcome =
+        super::serialize_verdict_outcome(&super::ParallelVerdict::Verdict(crate::Verdict {
+            score: 10,
+            issues_detected: Vec::new(),
+        }));
+    let reviewer_id = format!("{job_id}_reviewer_0");
+    store
+        .conn
+        .execute(
+            "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
+             VALUES (?1, ?2, 'reviewer', 0, 'done', ?3, 'task')",
+            crate::db::params![job_id.clone(), reviewer_id, reviewer_outcome],
+        )
+        .await
+        .unwrap();
+
+    super::verification::run(
+        std::sync::Arc::new(expect_ticket(store, &id).await),
+        ws.clone(),
+        job_id.clone(),
+    )
+    .await;
+
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Verification,
+        "a roster without a tester row must never pass the ticket on",
+    );
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::Verification)
+            .await
+            .is_none(),
+        "the unreadable round's job must be dropped so the poller re-creates it",
+    );
+    assert_workspace_paused(&ws, false).await;
+    drop(repo_dir);
+}
+
+/// A verification round whose code review actually ran records the ticket's
+/// reviewed base — the recording the identical-content skip then fires on — from
+/// the content the reviewers were handed, not from the tree the round ended
+/// with. The round's size is pinned too: the churn-calibrated reviewers plus the
+/// single functional tester.
+#[serial_test::serial(provider, drain)]
+#[tokio::test]
+async fn passed_verification_round_records_the_reviewed_content() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
+    let ws = create_test_workspace(repo_path.to_str().unwrap(), "reviewed_base_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    // No reviewed base is recorded for the ticket and the tree carries
+    // uncommitted work, so the code review runs (never skipped).
+    let id = make_ticket(store, &ws, "ReviewedBase", TicketPhase::Verification).await;
+    std::fs::write(repo_path.join("a.rs"), b"fn foo() {\n    bar();\n}\n").unwrap();
+    // The identity the round must record: the tree as the reviewers are handed
+    // it, before any participant runs.
+    let (root_head, root_tree) = crate::git::commands::run_git_worktree_identity(&repo_path)
+        .await
+        .unwrap();
+
+    // Round 1: tiny churn in a fresh temp repo → 1 reviewer + the single tester.
+    // The provider leaves a file in the repository on every call, i.e. after the
+    // round captured the reviewers' content: exactly the "the tester touched the
+    // workspace" case the recorded base must not absorb.
+    let artefact_fake = std::sync::Arc::new(ArtefactLeavingProvider {
+        repo: repo_path.clone(),
+        fake: fake_clean_participants(2),
+    });
+    run_verification_round(store, &ws, &id, artefact_fake.clone()).await;
+
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::InSanitation,
+    );
+    assert_eq!(
+        artefact_fake
+            .fake
+            .request_fingerprints
+            .lock()
+            .unwrap()
+            .len(),
+        4,
+        "one calibrated reviewer plus the one functional tester, each consuming \
+         one turn and one verdict extraction",
+    );
+    let ticket = expect_ticket(store, &id).await;
+    assert_eq!(
+        (
+            ticket.reviewed_head.as_deref(),
+            ticket.reviewed_tree.as_deref()
+        ),
+        (Some(root_head.as_str()), Some(root_tree.as_str())),
+        "a passing round whose code review ran must record the content the \
+         reviewers were handed, not the tree the round ended with",
+    );
+    let (_, artefact_tree) = crate::git::commands::run_git_worktree_identity(&repo_path)
+        .await
+        .unwrap();
+    assert_ne!(
+        artefact_tree, root_tree,
+        "the round must really have changed the tree, or the assertion above \
+         could pass vacuously",
+    );
+    // Both cohorts' verdicts become ONE comment: the stage's consolidated
+    // result, not one comment per participant group.
+    let round_comments = ticket
+        .comments
+        .iter()
+        .filter(|c| c.role == "Verification")
+        .count();
+    assert_eq!(
+        round_comments, 1,
+        "the merged round must leave exactly one consolidated comment",
+    );
+
+    // Round 2 on the same ticket and that artefact-carrying tree: the content is
+    // NOT what the reviewers were handed last time, so the code review runs
+    // again instead of being skipped for content it never saw. The unstaged file
+    // written here is what makes the round's own post-round staging load-bearing:
+    // the base recorded below only matches the index at round 3 because
+    // `git add -A` put this file into it.
+    retry_verification(store, &id).await;
+    std::fs::write(repo_path.join("docs.rs"), b"// unstaged\n").unwrap();
+    let second_fake = std::sync::Arc::new(fake_clean_participants(2));
+    run_verification_round(store, &ws, &id, second_fake.clone()).await;
+    let ticket = expect_ticket(store, &id).await;
+    assert_eq!(
+        second_fake.request_fingerprints.lock().unwrap().len(),
+        4,
+        "content the reviewers never saw must be reviewed, not skipped",
+    );
+    assert!(
+        !ticket
+            .comments
+            .last()
+            .expect("round 2 leaves its comment")
+            .content
+            .contains("Code review skipped"),
+        "a tree that moved under the reviewers must not be reported as skipped",
+    );
+
+    // Round 3: nothing changed since round 2 recorded its base, so the reviewers
+    // are skipped and only the functional tester runs — the whole point of
+    // recording it, and the part that silently stops working if the recording or
+    // the post-round staging goes away.
+    retry_verification(store, &id).await;
+    let third_fake = std::sync::Arc::new(fake_clean_participants(1));
+    run_verification_round(store, &ws, &id, third_fake.clone()).await;
+    assert_eq!(
+        third_fake.request_fingerprints.lock().unwrap().len(),
+        2,
+        "identical content is dispatched to the functional tester only \
+         (one turn + one verdict extraction)",
+    );
+    assert!(
+        expect_ticket(store, &id)
+            .await
+            .comments
+            .last()
+            .expect("round 3 leaves its comment")
+            .content
+            .contains("Code review skipped"),
+        "the skipped code review must still be recorded in the round's comment",
+    );
+
+    drop(repo_dir);
+}
+
+/// Move the ticket back into the verification phase so the stage can run another
+/// round on it.
+async fn retry_verification(store: &crate::pipeline::board::BoardStore, ticket_id: &str) {
+    store
+        .transition_to(
+            ticket_id,
+            Some(TicketPhase::InSanitation),
+            TicketPhase::Verification,
+            "test",
+        )
+        .await
+        .unwrap();
+}
+
+/// Spawn the ticket's verification phase job and run one round of the stage with
+/// `provider` as the global fake.
+async fn run_verification_round(
+    store: &crate::pipeline::board::BoardStore,
+    ws: &Workspace,
+    ticket_id: &str,
+    provider: std::sync::Arc<dyn crate::Provider>,
+) {
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        ws,
+        ticket_id,
+        TicketPhase::Verification,
+        crate::Role::Reviewer,
+        "verification",
+    )
+    .await;
+    let _seam = crate::util::test::install_retry_seam_dyn(provider);
+    super::verification::run(
+        std::sync::Arc::new(expect_ticket(store, ticket_id).await),
+        ws.clone(),
+        job_id,
+    )
+    .await;
 }
 
 // ── 2. Analysis escalation + blocker verification ───────────────────────
@@ -1616,15 +1910,16 @@ fn blocker_verification_merge_reduces_two_verifiers_to_one_outcome() {
     assert_eq!(r.reasoning, "present but not blocking — core requirement");
 }
 
-// ── 3. Reviewer/QA dynamic count calibration ────────────────────────────
+// ── 3. Verification-stage dynamic count calibration ─────────────────────
 
-/// The reviewer-count churn bands and P0 floor are product behavior; the QA
-/// verifier count is a single tester. These are asserted deterministically
-/// without an agent round (real churn is measured for at least one band).
+/// The reviewer-count churn bands and P0 floor are product behavior; the merged
+/// stage's functional tester count is a single tester. These are asserted
+/// deterministically without an agent round (real churn is measured for at
+/// least one band).
 
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
-async fn review_qa_dynamic_count_calibration() {
+async fn verification_dynamic_count_calibration() {
     use crate::pipeline::verdict::{
         DEFAULT_REVIEW_COUNT_HIGH_CHURN, DEFAULT_REVIEW_COUNT_LOW_CHURN,
         DEFAULT_REVIEW_COUNT_TINY_CHURN, review_agent_count, review_base_from_signals,
@@ -1638,7 +1933,7 @@ async fn review_qa_dynamic_count_calibration() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    let id = make_ticket(store, &ws, "Calib", TicketPhase::InReview).await;
+    let id = make_ticket(store, &ws, "Calib", TicketPhase::Verification).await;
 
     let (tiny, low, high) = (
         DEFAULT_REVIEW_COUNT_TINY_CHURN,
@@ -1668,34 +1963,36 @@ async fn review_qa_dynamic_count_calibration() {
     // untracked file yields the highest band (4 reviewers).
     std::fs::write(repo_path.join("big.txt"), "x\n".repeat(3000)).unwrap();
     let ticket = expect_ticket(store, &id).await;
-    let count = crate::pipeline::review::compute_reviewer_count(&ticket, repo_path.as_path()).await;
+    let count =
+        crate::pipeline::verification::compute_reviewer_count(&ticket, repo_path.as_path()).await;
     assert_eq!(count, 4, "churn >= 3000 must calibrate to 4 reviewers");
 
-    // QA runs exactly one tester per round.
-    assert_eq!(crate::pipeline::qa::QA_PARALLEL_AGENT_COUNT, 1);
-
-    // A clean QA round uses exactly 1 verifier (2 responses) → InSanitation.
+    // A clean verification round advances the ticket → InSanitation. The
+    // workspace below is not a git repo, so the churn cannot be measured and
+    // the reviewer base falls back to 3: the round is 3 reviewers + the single
+    // tester (8 responses). The skip never fires here (no recorded base), so
+    // this also pins that the tester is always dispatched.
     drop(repo_dir);
     let ws2 = create_test_workspace("/tmp/qa_calib_ws", "qa_calib_ws").await;
     crate::workspace::store()
         .set_status(&ws2.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    let qa_id = make_ticket(store, &ws2, "QaCalib", TicketPhase::InQa).await;
+    let qa_id = make_ticket(store, &ws2, "QaCalib", TicketPhase::Verification).await;
     let job_id = crate::generate_id();
     spawn_phase_job(
         &job_id,
         &ws2,
         &qa_id,
-        TicketPhase::InQa,
+        TicketPhase::Verification,
         crate::Role::Qa,
-        "qa",
+        "verification",
     )
     .await;
     {
-        let fake = fake_clean_verifiers(1);
+        let fake = fake_clean_participants(4);
         let _seam = crate::util::test::install_retry_seam(fake);
-        super::qa::run(
+        super::verification::run(
             std::sync::Arc::new(expect_ticket(store, &qa_id).await),
             ws2.clone(),
             job_id.clone(),
@@ -1710,9 +2007,10 @@ async fn review_qa_dynamic_count_calibration() {
 
 // ── 4. Bounce breaker trips terminal and drains Queued siblings ────────────
 
-/// When the reviewer bounce budget is exhausted the ticket trips to Failed
-/// (terminal), the phase job is deleted, Queued siblings are drained to Planning,
-/// and the workspace is NOT paused (a bounce is not a technical failure).
+/// When a ticket's bounce budget is exhausted the verification round trips it
+/// to Failed (terminal), the phase job is deleted, Queued siblings are drained
+/// to Planning, and the workspace is NOT paused (a bounce is not a technical
+/// failure).
 
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -1726,7 +2024,7 @@ async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    let id = make_ticket(store, &ws, "Trip", TicketPhase::InReview).await;
+    let id = make_ticket(store, &ws, "Trip", TicketPhase::Verification).await;
     let sibling = make_ticket(store, &ws, "Sibling", TicketPhase::Queued).await;
 
     // Seed the bounce budget at the exhaustion threshold (MAX_BOUNCES = 10).
@@ -1744,20 +2042,27 @@ async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
         &job_id,
         &ws,
         &id,
-        TicketPhase::InReview,
+        TicketPhase::Verification,
         crate::Role::Reviewer,
-        "review",
+        "verification",
     )
     .await;
 
     {
-        // Zero-change repo → reviewer count 1 → a single sub-threshold verdict
-        // trips the breaker (only the agent-turn + extraction are consumed).
+        // Zero-change repo → reviewer count 1 → the full merged round (one
+        // reviewer + the single functional tester) returns sub-threshold verdicts
+        // and trips the breaker (each participant consumes an agent-turn + an
+        // extraction). Every scripted response is that same sub-threshold verdict,
+        // so whichever of the two concurrently dispatched participants pops which
+        // one, the round bounces: a turn reads it as the assistant's message and
+        // the extraction that follows reads it as the verdict.
         let fake = crate::util::test::FakeProvider::new()
-            .ok("reviewer checked")
-            .ok(r#"{"score":5,"issues":["bug"]}"#);
+            .ok(r#"{"score":5,"issues":["bug: x"]}"#)
+            .ok(r#"{"score":5,"issues":["bug: x"]}"#)
+            .ok(r#"{"score":5,"issues":["bug: x"]}"#)
+            .ok(r#"{"score":5,"issues":["bug: x"]}"#);
         let _seam = crate::util::test::install_retry_seam(fake);
-        super::review::run(
+        super::verification::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),
             job_id.clone(),
@@ -1772,7 +2077,7 @@ async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
         "terminal trip must not consume further bounce budget"
     );
     assert!(
-        expect_phase_job(store, &id, TicketPhase::InReview)
+        expect_phase_job(store, &id, TicketPhase::Verification)
             .await
             .is_none(),
     );
@@ -1866,7 +2171,7 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
     // The puller re-creates a fresh Analysis job and re-drives it to completion
     // (so no lingering phase-body task consumes the next provider script).
     {
-        let fake = fake_clean_verifiers(3);
+        let fake = fake_clean_participants(3);
         let _seam = crate::util::test::install_retry_seam(fake);
         super::dispatch_working_phases(&ws).await;
         assert!(
@@ -2142,8 +2447,8 @@ async fn cancel_requested_engineer_goes_to_cancelled() {
 
 // ── 8. Cooperative pause keeps the job and unpause does not re-pause ─────
 
-/// A cooperative workspace pause freezes an in-flight verifier at its LLM
-/// boundary: the phase job is retained, the workspace is paused, and the
+/// A cooperative workspace pause freezes an in-flight verification round at its
+/// LLM boundary: the phase job is retained, the workspace is paused, and the
 /// unpause re-drives the round to completion without re-pausing.
 
 #[serial_test::serial(provider, drain)]
@@ -2157,21 +2462,31 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    let id = make_ticket(store, &ws, "PauseQa", TicketPhase::InQa).await;
+    // Not a git repo: the churn cannot be measured, so the round is the 3
+    // reviewer-base fallback plus the single functional tester.
+    let id = make_ticket(store, &ws, "PauseVerification", TicketPhase::Verification).await;
     let job_id = crate::generate_id();
-    spawn_phase_job(&job_id, &ws, &id, TicketPhase::InQa, crate::Role::Qa, "qa").await;
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Verification,
+        crate::Role::Qa,
+        "verification",
+    )
+    .await;
 
     {
-        // The QA verifier's first outcome is a tool call (errors), holding it
-        // in-flight until the workspace pause lands.
+        // The round's first outcome is a tool call (errors), holding every
+        // participant in-flight until the workspace pause lands.
         let mut fake = crate::util::test::FakeProvider::new().ok_tool_call("read");
-        for _ in 0..9 {
+        for _ in 0..39 {
             fake = fake.ok_tool_call("read");
         }
         let _seam = crate::util::test::install_retry_seam(fake);
 
         let ticket = expect_ticket(store, &id).await;
-        let handle = tokio::spawn(super::qa::run(
+        let handle = tokio::spawn(super::verification::run(
             std::sync::Arc::new(ticket),
             ws.clone(),
             job_id.clone(),
@@ -2184,28 +2499,30 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
         handle.await.unwrap();
 
         assert!(
-            expect_phase_job(store, &id, TicketPhase::InQa)
+            expect_phase_job(store, &id, TicketPhase::Verification)
                 .await
                 .is_some(),
             "a cooperative pause must retain the phase job for the unpause re-drive",
         );
         assert_workspace_paused(&ws, true).await;
 
-        // The interrupted verifier slot is preserved in place (status 'failed'),
-        // carrying the stored task the resume re-runs it with — a fresh dispatch
-        // would have re-derived a new suffix instead.
+        // The interrupted round's whole roster is preserved in place (the
+        // reviewers plus the tester), carrying the stored tasks the resume
+        // re-runs them with — a fresh dispatch would have re-derived a new
+        // suffix instead.
         let roster = crate::jobs::list_agents_for_job(&crate::session::store().conn, &job_id)
             .await
             .unwrap();
         assert_eq!(
             roster.len(),
-            1,
-            "the pause-freeze must preserve the interrupted verifier slot (not clear it)",
+            4,
+            "the pause-freeze must preserve the interrupted round's roster (not clear it)",
         );
-        assert_ne!(
-            roster[0].status,
-            crate::jobs::RowStatus::Launched.as_str(),
-            "the paused verifier must not remain marked launched",
+        assert!(
+            roster
+                .iter()
+                .all(|r| r.status != crate::jobs::RowStatus::Launched.as_str()),
+            "no paused participant may remain marked launched",
         );
     }
 
@@ -2216,9 +2533,9 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
         .await
         .unwrap();
     {
-        let fake = fake_clean_verifiers(1);
+        let fake = fake_clean_participants(4);
         let _seam = crate::util::test::install_retry_seam(fake);
-        super::qa::run(
+        super::verification::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),
             job_id.clone(),
@@ -2228,7 +2545,7 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
     assert_eq!(
         expect_ticket_phase(store, &id).await,
         TicketPhase::InSanitation,
-        "the unpause re-drive must complete the QA round",
+        "the unpause re-drive must complete the verification round",
     );
     assert_workspace_paused(&ws, false).await;
 }
@@ -2255,21 +2572,29 @@ async fn failure_freeze_while_paused_stops_in_flight_ticket_agent() {
         .set_paused(&ws.name, true)
         .await
         .unwrap();
-    let id = make_ticket(store, &ws, "FreezeWhilePaused", TicketPhase::InQa).await;
+    let id = make_ticket(store, &ws, "FreezeWhilePaused", TicketPhase::Verification).await;
     let job_id = crate::generate_id();
-    spawn_phase_job(&job_id, &ws, &id, TicketPhase::InQa, crate::Role::Qa, "qa").await;
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Verification,
+        crate::Role::Qa,
+        "verification",
+    )
+    .await;
 
     {
-        // Holding script: tool calls keep the verifier in flight until the
-        // freeze lands.
+        // Holding script: tool calls keep the round's participants in flight
+        // until the freeze lands.
         let mut fake = crate::util::test::FakeProvider::new().ok_tool_call("read");
-        for _ in 0..9 {
+        for _ in 0..39 {
             fake = fake.ok_tool_call("read");
         }
         let _seam = crate::util::test::install_retry_seam(fake);
 
         let ticket = expect_ticket(store, &id).await;
-        let handle = tokio::spawn(super::qa::run(
+        let handle = tokio::spawn(super::verification::run(
             std::sync::Arc::new(ticket.clone()),
             ws.clone(),
             job_id.clone(),
@@ -2283,7 +2608,7 @@ async fn failure_freeze_while_paused_stops_in_flight_ticket_agent() {
         handle.await.unwrap();
 
         assert!(
-            expect_phase_job(store, &id, TicketPhase::InQa)
+            expect_phase_job(store, &id, TicketPhase::Verification)
                 .await
                 .is_some(),
             "the frozen round must keep its phase job for the unpause re-drive",

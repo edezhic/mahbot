@@ -3,7 +3,7 @@
 //! The poll loop ([`run_management`]) is the ONLY way a stage's work starts.
 //! Each pipeline phase owns a short-lived `jobs` row whose `kind` equals the
 //! ticket's current phase (`analysis`, `in_development`, `in_diagnostics`,
-//! `in_review`, `in_qa`, `in_sanitation`); the ticket's `phase` is the sole
+//! `verification`, `in_sanitation`); the ticket's `phase` is the sole
 //! durable running truth. The puller:
 //!
 //! 1. claims `Backlog -> Analysis` and `Queued -> InDevelopment`,
@@ -31,12 +31,11 @@ pub mod board;
 pub mod chronicle;
 pub mod development;
 pub mod diagnostics;
-pub mod qa;
-pub mod review;
 pub mod sanitation;
 #[cfg(test)]
 mod tests;
 pub(crate) mod verdict;
+pub mod verification;
 
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -52,19 +51,16 @@ use crate::agent::{RETRY_EXHAUSTION_MARKER, run_agent};
 use crate::db::TxGuard;
 use crate::git::commands::{list_new_or_untracked_files, run_git_status};
 use crate::pipeline::board::{BoardStore, PIPELINE_ACTOR, Ticket, TicketPhase};
-use crate::prompt::{load_prompt, load_prompt_sections, substitute};
+use crate::prompt::{load_prompt, substitute};
 use crate::session::manager_agent_id;
 use crate::util::UnwrapPoison;
 use crate::{Role, Workspace, WorkspaceStatus};
 
-pub(crate) use verdict::stage_name;
 pub(crate) use verdict::{
     AgentSlot, ExtractionMode, JointRound, ParallelVerdict, build_round_grouping,
-    deserialize_verdict_outcome, issue_grade, process_verifier_verdicts, render_joint_comment,
-    round_member_failed, serialize_verdict_outcome, validate_blocker_verification,
-    validate_verdict_score,
+    deserialize_verdict_outcome, issue_grade, render_joint_comment, round_member_failed,
+    serialize_verdict_outcome, validate_blocker_verification, validate_verdict_score,
 };
-pub(crate) use verdict::{QA_VI, REVIEWER_VI, VerifierInfo};
 
 use development::finalize_engineer_stage;
 use sanitation::finalize_sanitation_stage;
@@ -472,8 +468,7 @@ fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_
             TicketPhase::Analysis => Box::pin(analysis::run(ticket, ws, job_id)),
             TicketPhase::InDevelopment => Box::pin(development::run(ticket, ws, job_id)),
             TicketPhase::InDiagnostics => Box::pin(diagnostics::run(ticket, ws, job_id)),
-            TicketPhase::InReview => Box::pin(review::run(ticket, ws, job_id)),
-            TicketPhase::InQa => Box::pin(qa::run(ticket, ws, job_id)),
+            TicketPhase::Verification => Box::pin(verification::run(ticket, ws, job_id)),
             TicketPhase::InSanitation => Box::pin(sanitation::run(ticket, ws, job_id)),
             _ => {
                 error!(phase = %phase, "spawn_phase_body called for a non-working phase");
@@ -1088,7 +1083,7 @@ async fn register_running_agent(
     incoming_rx
 }
 
-// ── Parallel-agent machinery (analysis / review / QA) ───────────────────
+// ── Parallel-agent machinery (analysis / verification) ──────────────────
 
 /// Canonical agent-id format for ticket phase roster slots
 /// (`ticket_{ticket_id}_{idx}_{suffix}_{role}`).
@@ -1106,6 +1101,23 @@ fn agent_slot_task(prompt: &str, angles: &[String], count: usize, global_idx: us
         format!("{prompt}\n\n{}", angles.join("\n\n"))
     } else {
         format!("{prompt}\n\n{}", angles[global_idx % angles.len()])
+    }
+}
+
+/// Read a phase roster for slot-resume detection, bailing on read failure.
+///
+/// A read failure must NOT degrade to a fresh dispatch: doing so would
+/// re-derive a new-suffix roster and orphan the interrupted round's rows.
+/// Returns `None` after warning — the caller returns and lets the poller
+/// re-drive (the job stays occupied, with no running agents, so
+/// re-dispatch is safe).
+async fn read_roster_or_bail(ticket_id: &str, job_id: &str) -> Option<Vec<crate::jobs::AgentRow>> {
+    match crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await {
+        Ok(roster) => Some(roster),
+        Err(e) => {
+            warn!(ticket = %ticket_id, job = %job_id, error = %e, "Failed to read phase roster — bailing to preserve interrupted round");
+            None
+        }
     }
 }
 
@@ -1156,26 +1168,38 @@ fn agent_slot_from_roster_row(r: &crate::jobs::AgentRow) -> AgentSlot {
     }
 }
 
-/// Write a batch of round slots as launched roster rows (with their idx) so
-/// the re-dispatch guard blocks and mid-run comments route to the agents.
-async fn insert_round_slots(job_id: &str, slots: &[AgentSlot], kind: crate::jobs::AgentKind) {
+/// Write a round's roster — one `(kind, slots)` cohort per dispatch group — as
+/// launched rows (with their idx) so the re-dispatch guard blocks and mid-run
+/// comments route to the agents. The kind is the row's own cohort label, which
+/// is what the resume path reads a round's cohorts back from.
+///
+/// The whole batch is ONE transaction: the roster is the round's durable plan,
+/// so a half-written plan (a mid-batch failure or crash) must never exist — a
+/// caller that cannot write the whole roster bails instead of running a round
+/// whose composition the resume path could misread.
+async fn insert_round_slots(
+    job_id: &str,
+    cohorts: &[(crate::jobs::AgentKind, &[AgentSlot])],
+) -> anyhow::Result<()> {
     let conn = &crate::session::store().conn;
-    for slot in slots {
-        if let Err(e) = conn
-            .execute(
+    let tx = conn.begin_tx().await?;
+    for (kind, slots) in cohorts {
+        for slot in *slots {
+            tx.execute(
                 crate::jobs::AGENT_INSERT_SQL,
-                crate::jobs::agent_params(job_id, &slot.agent_id, kind, Some(slot.idx), &slot.task),
+                crate::jobs::agent_params(
+                    job_id,
+                    &slot.agent_id,
+                    *kind,
+                    Some(slot.idx),
+                    &slot.task,
+                ),
             )
-            .await
-        {
-            warn!(
-                agent = %slot.agent_id,
-                job = %job_id,
-                error = %e,
-                "Failed to write round roster row",
-            );
+            .await?;
         }
     }
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn checkpoint_parallel_outcomes(
@@ -1403,15 +1427,6 @@ fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
             failure.final_class.label(),
             failure.detail,
         ),
-    }
-}
-
-/// Load per-agent angle supplements for a verifier role.
-fn load_verifier_angles(role: Role) -> Vec<String> {
-    match role {
-        Role::Reviewer => load_prompt_sections("review_angles.md"),
-        Role::Qa => load_prompt_sections("qa_angles.md"),
-        _ => Vec::new(),
     }
 }
 
@@ -1663,8 +1678,10 @@ async fn drain_queued_siblings(ticket: &Ticket) {
 /// On a non-exhausting bounce the ticket goes back to InDevelopment and the
 /// phase job is deleted so the puller creates a fresh engineer attempt.
 ///
-/// `failure_role` authors the failure comment; `actor` is kept separate as the
-/// transition's recorded identity (the stage role, e.g. `verifier.role.as_str()`).
+/// `log_label` is the stage phrase used in tracing (e.g. `"verification
+/// failure"`); `failure_role` authors the failure comment; `actor` is kept
+/// separate as the transition's recorded identity (the stage's own token, e.g.
+/// `"verification"`).
 async fn bounce_to_development(
     ticket: &Ticket,
     source: TicketPhase,
@@ -1729,221 +1746,6 @@ async fn bounce_to_development(
         }
     }
     outcome
-}
-
-// ── Verifier rounds (review / QA) ───────────────────────────────────────
-//
-// Review and QA genuinely share one parallel-verifier engine (same prompt/sub,
-// slot, extraction, and verdict-finalize tail — only the role/phase/count and
-// the reviewer-only git-state decisions differ). The verdict-processing core
-// (`process_verifier_verdicts` / `apply_clean_verifier_round`, the `VerifierInfo`
-// metadata, and the review/QA thresholds) lives in [`crate::pipeline::verdict`];
-// the phase-entry dispatch lives in `dispatch_verifiers` here. The
-// per-phase entry points (`review::run`/`qa::run`) and the reviewer-only git
-// logic (`review::compute_review_skip`/`compute_reviewer_count`/
-// `record_reviewed_base_after_review`) and the QA count
-// (`qa::QA_PARALLEL_AGENT_COUNT`) live in their phase modules. The shared tail
-// is DRY, and each phase module owns its own decisions.
-
-/// Finalize a verifier round (review/QA).
-async fn finalize_verifier_round(
-    ws: &Workspace,
-    ticket: &Ticket,
-    vi: VerifierInfo,
-    results: &[ParallelVerdict],
-    job_id: &str,
-    is_reviewer: bool,
-) {
-    let transitioned = process_verifier_verdicts(ws, ticket, results, vi, job_id).await;
-    if !transitioned && crate::shutdown::aborting() {
-        // Return early to skip recording the reviewed base during drain; the
-        // drain-abort log lives in `process_verifier_verdicts`.
-        return;
-    }
-
-    // Only a passing review records the reviewed base (QA never has git
-    // available, and the skip-review base is a reviewer-only concept).
-    if is_reviewer {
-        review::record_reviewed_base_after_review(
-            ws.as_path(),
-            &ticket.id,
-            review::git_available_for_review(ws, vi).await,
-            transitioned,
-            results,
-        )
-        .await;
-    }
-}
-
-/// Read a phase roster for slot-resume detection, bailing on read failure.
-///
-/// A read failure must NOT degrade to a fresh dispatch: doing so would
-/// re-derive a new-suffix roster and orphan the interrupted round's rows.
-/// Returns `None` after warning — the caller returns and lets the poller
-/// re-drive (the job stays occupied, with no running agents, so
-/// re-dispatch is safe).
-async fn read_roster_or_bail(ticket_id: &str, job_id: &str) -> Option<Vec<crate::jobs::AgentRow>> {
-    match crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await {
-        Ok(roster) => Some(roster),
-        Err(e) => {
-            warn!(ticket = %ticket_id, job = %job_id, error = %e, "Failed to read phase roster — bailing to preserve interrupted round");
-            None
-        }
-    }
-}
-
-/// Shared dispatch logic for parallel verifiers (reviewers and QA): guards the
-/// job phase (derived from the VerifierInfo), then dispatches the round.
-async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo, job_id: String) {
-    if guard_job_phase(&ticket.id, vi.active_phase, &job_id).await {
-        return;
-    }
-    let is_reviewer = vi.role == Role::Reviewer;
-    if review::maybe_skip_review(&ticket, &ws, vi, &job_id).await {
-        return;
-    }
-
-    let conn = &crate::session::store().conn;
-
-    // Slot-resume detection: a non-empty roster marks an interrupted round —
-    // reconstruct Done slots from stored outcomes and re-run the not-Done ones
-    // with their stored tasks. An empty roster (body crashed before its first
-    // roster write) degrades to a fresh dispatch re-derived from live ticket
-    // state.
-    let Some(roster) = read_roster_or_bail(&ticket.id, &job_id).await else {
-        return;
-    };
-
-    if roster.is_empty() {
-        fresh_dispatch_verifiers(ticket, ws, vi, job_id, is_reviewer).await;
-        return;
-    }
-
-    // Resume: reuse the stored roster. The stored per-slot task is the round's
-    // prompt (no re-derivation from live ticket state); the count is the roster
-    // length (recomputed churn could differ across the interruption).
-    let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
-    let slots: Vec<AgentSlot> = roster.iter().map(agent_slot_from_roster_row).collect();
-    let split = crate::jobs::split_slot_resume(&roster);
-    let count = slots.len();
-    let verifier_label = if count == 1 { "verifier" } else { "verifiers" };
-    info!(
-        ticket = %ticket.id,
-        role = %vi.role.as_str(),
-        count,
-        verifier_label,
-        "Resuming {count} parallel {verifier_label} from stored roster",
-    );
-    let not_done: Vec<String> = split.not_done.iter().map(|r| r.agent_id.clone()).collect();
-    if let Err(e) = crate::jobs::rearm_roster_launched(conn, &job_id, &not_done).await {
-        warn!(ticket = %ticket.id, job = %job_id, error = %e, "Failed to re-arm resumed roster slots");
-    }
-    let (results, paused) = run_parallel_agents(
-        &ticket,
-        &ws,
-        vi.role,
-        &extraction_prompt,
-        ExtractionMode::ScoreVerdict,
-        &job_id,
-        &slots,
-        vi.active_phase,
-        true,
-    )
-    .await;
-    finish_verifier_dispatch(ticket, ws, vi, job_id, is_reviewer, results, paused).await;
-}
-
-/// Fresh verifier dispatch (empty roster): build a new roster, sync the phase
-/// job task, and run the round.
-async fn fresh_dispatch_verifiers(
-    ticket: Arc<Ticket>,
-    ws: Workspace,
-    vi: VerifierInfo,
-    job_id: String,
-    is_reviewer: bool,
-) {
-    let engineer_response = ticket
-        .comments
-        .iter()
-        .rev()
-        .find(|c| c.role == Role::Engineer.as_str())
-        .map(|c| &c.content)
-        .map_or("(no output)", String::as_str);
-
-    let prompt = substitute(
-        &crate::prompt::load_prompt(vi.prompt_template),
-        &[("{{agent_response}}", engineer_response)],
-    );
-
-    let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
-    let repo_path = ws.as_path();
-    let count = if is_reviewer {
-        review::compute_reviewer_count(&ticket, repo_path).await
-    } else {
-        qa::QA_PARALLEL_AGENT_COUNT
-    };
-    let verifier_label = if count == 1 { "verifier" } else { "verifiers" };
-    info!(
-        ticket = %ticket.id,
-        role = %vi.role.as_str(),
-        count,
-        verifier_label,
-        "Dispatching {count} parallel {verifier_label}",
-    );
-
-    let conn = &crate::session::store().conn;
-    sync_phase_job_task(conn, &job_id, &prompt).await;
-
-    let slots = build_agent_slots(
-        &ticket.id,
-        vi.role,
-        &prompt,
-        &load_verifier_angles(vi.role),
-        0,
-        count,
-    );
-    insert_round_slots(&job_id, &slots, crate::jobs::AgentKind::Verifier).await;
-    let (results, paused) = run_parallel_agents(
-        &ticket,
-        &ws,
-        vi.role,
-        &extraction_prompt,
-        ExtractionMode::ScoreVerdict,
-        &job_id,
-        &slots,
-        vi.active_phase,
-        false,
-    )
-    .await;
-    finish_verifier_dispatch(ticket, ws, vi, job_id, is_reviewer, results, paused).await;
-}
-
-/// Shared tail of verifier dispatch (fresh and resumed) after the parallel
-/// agents finish: guards the job phase, honours pause-freeze, then finalizes
-/// the round's verdicts.
-async fn finish_verifier_dispatch(
-    ticket: Arc<Ticket>,
-    ws: Workspace,
-    vi: VerifierInfo,
-    job_id: String,
-    is_reviewer: bool,
-    results: Vec<ParallelVerdict>,
-    paused: bool,
-) {
-    if guard_job_phase(&ticket.id, vi.active_phase, &job_id).await {
-        return;
-    }
-
-    // A pause-freeze is NOT a technical failure: leave the job in place for the
-    // unpause re-drive (the typed `paused` signal was captured at bail time, so
-    // it survives a workspace-unpause race that a live re-read of paused state
-    // would miss).
-    if paused {
-        pause_freezing(&ticket, &job_id).await;
-        return;
-    }
-
-    finalize_verifier_round(&ws, &ticket, vi, &results, &job_id, is_reviewer).await;
 }
 
 /// Determine whether to notify immediately or buffer the Done transition.
