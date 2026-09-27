@@ -51,17 +51,20 @@
 //!   word is judged under the literal name the shared balanced-quote strip reads
 //!   on both platforms ([`verb_key`]) — `'del' C:\ws\x.txt` is refused while
 //!   `'del' "%TEMP%\x.txt"` stays a temp write, so the quotes hide nothing;
-//! - an unquoted `,`/`=` is cmd's parameter delimiter, and `;`/`&`/`|`/`<`/`>`
-//!   are its separators and redirects — a spelling the bash parse reads as one
-//!   word only through a `\` escape, where cmd.exe still splits or redirects
-//!   the operand. Behind a switch the same delimiter is refused outright
+//! - an unquoted `,`/`=`/`;` is an argument delimiter to cmd.exe (several of its
+//!   internal commands split their ARGUMENTS at it), while `&`/`|`/`<`/`>` are its
+//!   separators and redirects — a spelling the bash parse reads as one word only
+//!   through a `\` escape, where cmd.exe still splits or redirects the operand.
+//!   Behind a switch the same delimiter is refused outright
 //!   ([`glued_delimiter_switch`]): cmd.exe splits the token there and hands the
 //!   text behind it to the verb as another argument, so the token is either a
 //!   switch the gate drops or one fused word it cannot parse — never the operand
 //!   cmd would hand over;
 //! - `*`/`?`/`~` (a glob the program reading the path expands), `^` (cmd's
-//!   escape, which hides a character the layer must see) and `!` (cmd's delayed
-//!   expansion, which the model does not follow) anywhere in the expanded text;
+//!   escape, which hides a character the layer must see) and `!` (the interpreter
+//!   this shell starts has delayed expansion off, but `setlocal
+//!   enabledelayedexpansion` inside a command, or a nested interpreter the command
+//!   starts, is not covered) anywhere in the expanded text;
 //! - every relative spelling: no relative path OPERAND is provable (see
 //!   below), so the temp gate accepts absolute paths only.
 //!
@@ -77,7 +80,12 @@
 //! All three are checked once, over the whole tree ([`check_line`]) — each is a
 //! property of the LINE rather than of a nesting position, so all three also hold
 //! inside a substituted command, a parenthesised group, a function body, a case
-//! branch and a pipeline member.
+//! branch and a pipeline member. They are also the one rule BOTH modes decide: the
+//! read-only guard reaches them inside its own walk, and the unrestricted mode —
+//! which has no walk to reach them through — through
+//! [`super::check_line_divergences`], so both modes refuse the same lines in the
+//! same words. That is why their message opens with the shared [`REFUSAL_FRAME`]
+//! rather than the guard's own mode-naming one.
 //!
 //! The line breaks of a command text are read by the shell itself
 //! ([`crate::tools::shell::windows_line`]) before this guard is consulted: in
@@ -212,6 +220,7 @@ use std::path::PathBuf;
 
 use tree_sitter::Node;
 
+use super::super::{REFUSAL_FRAME, framed_refusal};
 use super::scan;
 use super::{CheckContext, ShellPlatform, rejection_message};
 
@@ -588,6 +597,11 @@ fn resolve_raw(word: &str, ctx: &CheckContext) -> Option<String> {
         return None;
     }
     let expanded = expand_percent_vars(raw, ctx)?.replace('/', "\\");
+    // A glob, cmd's `^` escape and `!`, its delayed expansion: the interpreter this
+    // shell starts has delayed expansion off, but `setlocal enabledelayedexpansion`
+    // inside a command, or a nested interpreter the command starts, is not covered —
+    // and `^` hides the character behind it in any case. None of them is a path the
+    // layer can prove.
     if expanded.contains(['*', '?', '~', '^', '!']) {
         return None;
     }
@@ -728,14 +742,26 @@ fn is_var_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// The refusal for one of the whole-line divergences [`check_line`] decides: the
+/// shared frame names the refusal ([`REFUSAL_FRAME`]) rather than a mode, because
+/// these three are the one guard rule BOTH modes decide — read-only mode reaches
+/// them through the guard's own walk, the unrestricted mode through
+/// [`super::check_line_divergences`], where a frame claiming "Read-only mode"
+/// would be false. The text after the frame is the shared one
+/// ([`framed_refusal`]), so these refusals cannot read differently from the
+/// guard's own.
+fn refusal(cmd: &str, why: &str, suggestion: &str) -> String {
+    framed_refusal(REFUSAL_FRAME, cmd, why, suggestion)
+}
+
 /// The whole-line Windows divergences — a comment, an unquoted `;` and a
 /// heredoc — checked once over the whole syntax tree, before the walk. Each is a
 /// property of the LINE for cmd.exe rather than of a nesting position (see the
 /// module doc), so this scan is the layer's only decision point for any of them:
 /// a rule hooked into the walker instead would police the positions that walker
 /// happens to visit and skip the rest.
-pub(super) fn check_line(root: Node, src: &str, ctx: &CheckContext) -> Result<(), String> {
-    if ctx.platform != ShellPlatform::Windows {
+pub(super) fn check_line(root: Node, src: &str, platform: ShellPlatform) -> Result<(), String> {
+    if platform != ShellPlatform::Windows {
         return Ok(());
     }
     // An explicit stack, not recursion: this walks the raw tree, whose depth is
@@ -745,16 +771,16 @@ pub(super) fn check_line(root: Node, src: &str, ctx: &CheckContext) -> Result<()
     while let Some(node) = stack.pop() {
         match node.kind() {
             "comment" => {
-                return Err(rejection_message(
+                return Err(refusal(
                     src,
                     "cmd.exe has no comment syntax — `#` is an ordinary character, so what the \
                      shell parser drops as a comment is an argument or a separator to cmd.exe.",
-                    "drop the comment text — write only the commands you want to run (a `#` inside \
-                     quotes stays accepted).",
+                    "write only the commands you want to run, and quote a `#` you mean literally \
+                     (`echo \"a#b\"`).",
                 ));
             }
             "heredoc_redirect" => {
-                return Err(rejection_message(
+                return Err(refusal(
                     src,
                     "cmd.exe has no `<<` — it reads two input redirections, not a text block, so \
                      the body's later lines would run as commands this guard never read.",
@@ -762,12 +788,13 @@ pub(super) fn check_line(root: Node, src: &str, ctx: &CheckContext) -> Result<()
                 ));
             }
             ";" => {
-                return Err(rejection_message(
+                return Err(refusal(
                     src,
                     "cmd.exe does not split a command on `;` — several of its internal commands \
                      take it as an argument delimiter, so what the shell parser reads as a second \
                      command would be an extra operand of the first.",
-                    "sequence commands with `&&` (or `&`), which both readers split on.",
+                    "write two commands with `&&` (or `&`), which both readers split on, and quote \
+                     a `;` you mean literally (`echo \"a;b\"`).",
                 ));
             }
             _ => {}
@@ -1202,7 +1229,8 @@ fn destination_under_temp(paths: &[&str], ctx: &CheckContext) -> bool {
 mod tests {
     use super::*;
     use crate::tools::shell::readonly::{
-        CheckContext, ShellPlatform, ValidationState, check_command, is_null_target,
+        CheckContext, ShellPlatform, ValidationState, check_command, check_line_divergences,
+        is_null_target,
     };
     use std::path::Path;
 
@@ -1506,8 +1534,9 @@ mod tests {
     /// cmd's caret escape and its delayed (`!NAME!`) expansion are not modelled,
     /// and both hide the characters the layer must judge: cmd sees a workspace
     /// file where the lexical model sees a temp path, or a path that only exists
-    /// once `setlocal enabledelayedexpansion` expands a name the model does not
-    /// track.
+    /// once `setlocal enabledelayedexpansion` — which the interpreter this shell
+    /// starts with delayed expansion off does not rule out — expands a name the
+    /// model does not track.
     #[test]
     fn caret_escapes_and_delayed_expansion_fail_closed() {
         assert_rejected(r"del C:\ws\^..\..\ws\main.rs");
@@ -1577,6 +1606,11 @@ mod tests {
         assert_rejected(r"echo a;b");
         ok(r#"echo "a;b""#);
         ok(r#"dir "C:\ws;a""#);
+        // The refusal names the rule, not the mode it was decided in, and its advice
+        // names both ways out: `&&`/`&` for two commands, quoting for a literal `;`.
+        let err = check_command(r"echo a;b", &win_ctx()).unwrap_err();
+        assert!(err.starts_with("Command not run: "), "{err}");
+        assert!(err.contains("quote a `;` you mean literally"), "{err}");
     }
 
     /// cmd.exe has no comment syntax: to it the `#` is an ordinary character, so
@@ -1596,6 +1630,10 @@ mod tests {
         // Quoted or word-internal, the `#` is ordinary text for both readers.
         ok(r#"echo "a # b""#);
         ok(r"echo a#b");
+        // The shared frame and the advice that a literal `#` is kept by quoting.
+        let err = check_command(r"# & format C:", &win_ctx()).unwrap_err();
+        assert!(err.starts_with("Command not run: "), "{err}");
+        assert!(err.contains("quote a `#` you mean literally"), "{err}");
     }
 
     /// Every whole-line divergence is decided once, over the raw syntax tree,
@@ -1646,6 +1684,42 @@ mod tests {
             let err = check_command(cmd, &win_ctx()).unwrap_err();
             assert!(err.contains("no `<<`"), "{cmd}: {err}");
         }
+    }
+
+    /// The whole-line divergences as the shared entry the unrestricted mode calls:
+    /// it has no walk of its own to find them through, so it must get exactly the
+    /// text the read-only guard's walk produces for the same line — same frame,
+    /// same wording, on the same trimmed text. A cmd-only shape whose bash parse
+    /// has errors is not this rule's business — that is a shape the unrestricted
+    /// mode is there to run — so the entry refuses nothing for it, where the
+    /// read-only guard's fail-closed parse refusal (asserted here) does.
+    #[test]
+    fn line_divergences_are_refused_in_both_modes() {
+        for cmd in [r"del %TEMP%\a;C:\ws\x.exe", r"echo hi # & del C:\ws\x.txt"] {
+            let guard = check_command(cmd, &win_ctx()).expect_err(cmd);
+            assert_eq!(
+                check_line_divergences(cmd, ShellPlatform::Windows).expect_err(cmd),
+                guard,
+                "cmd `{cmd}`"
+            );
+            // Trimmed exactly as the guard trims: the padded spelling is the same
+            // text, refused with the same words.
+            let padded = format!("  {cmd}  ");
+            assert_eq!(
+                check_line_divergences(&padded, ShellPlatform::Windows).unwrap_err(),
+                guard,
+                "padded `{padded}`"
+            );
+            // Neither divergence is one for unix — the `;` splits and a comment
+            // executes nothing there — so the entry adds no refusal of its own.
+            assert!(
+                check_line_divergences(cmd, ShellPlatform::Unix).is_ok(),
+                "{cmd}"
+            );
+        }
+        // A shape only cmd.exe accepts: the parser reads no tree to refuse.
+        assert!(check_command("if exist x (echo a;b)", &win_ctx()).is_err());
+        assert!(check_line_divergences("if exist x (echo a;b)", ShellPlatform::Windows).is_ok());
     }
 
     /// A tripwire for the module doc's `# Accepted limits` section: one admitted

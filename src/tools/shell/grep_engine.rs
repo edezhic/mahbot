@@ -137,7 +137,7 @@ use crate::tools::shell::scan::strip_heredoc_bodies;
 use crate::util::UnwrapPoison;
 use crate::util::is_word_char;
 
-use super::{SHELL_PLATFORM, ShellPlatform};
+use super::{REFUSAL_FRAME, SHELL_PLATFORM, ShellPlatform};
 
 /// The cmd.exe line model, read by the runner's own decomposition too
 /// ([`super::plan`]), which is why the module and the words it hands out are
@@ -404,13 +404,6 @@ pub(super) struct GrepServe {
     /// single place every refusal's agent-facing message is rendered.
     pub refusal: Option<String>,
 }
-
-/// The frame every refusal of a run opens with — the cause follows, then the
-/// consequence that belongs to the entry point that refused. Spelled once here so
-/// the three renderers of it ([`unserved_failure`], the plan runner's
-/// `plan::refusal_message`, and [`crate::tools::shell::windows_line::refusal`])
-/// cannot word one cause two ways.
-pub(super) const REFUSAL_FRAME: &str = "Command not run: ";
 
 /// The agent-facing failure for a command the engine or the runner refuses on
 /// Windows (the value of [`GrepServe::refusal`] and the engine's own reported
@@ -2635,14 +2628,14 @@ fn parse_grep_words(
     // `-e` value and a filter spelling included, not just an operand — so a word
     // carrying a pair cannot be served with its literal text (see
     // [`windows::has_percent_expansion`] for the per-word reading and why it is
-    // enough here). A lone `%` and every `!` are ordinary characters here: the
-    // interpreter this process spawns is `cmd /C` without `/V:ON`. Redirects are
-    // exempt from this argv check: on unix the rewrite re-emits their tokens
-    // verbatim for `sh`, which expands them exactly as it would have in the
-    // original command; on Windows the runner applies them itself from those same
-    // tokens ([`super::plan::apply_redirects`]), which is why `parse_redirects`
-    // refuses a target carrying a `%…%` pair rather than expanding it — a shape
-    // the argv check alone would have let through.
+    // enough here). A lone `%` and every `!` are ordinary characters here: this
+    // process spawns `cmd /C` under its own pinned settings, `/V:OFF` among
+    // them. Redirects are exempt from this argv check: on unix the rewrite
+    // re-emits their tokens verbatim for `sh`, which expands them exactly as it
+    // would have in the original command; on Windows the runner applies them
+    // itself from those same tokens ([`super::plan::apply_redirects`]), which is
+    // why `parse_redirects` refuses a target carrying a `%…%` pair rather than
+    // expanding it — a shape the argv check alone would have let through.
     if platform == ShellPlatform::Windows
         && let Some(word) = argv.iter().find(|w| windows::has_percent_expansion(&w.raw))
     {
@@ -7154,7 +7147,7 @@ mod refusal_pins {
     }
 
     /// The narrowing: a lone `%` and every `!` are ordinary characters to the
-    /// interpreter this process spawns (`cmd /C`, no `/V:ON`), so the searches
+    /// interpreter this process spawns (`cmd /C` with `/V:OFF`), so the searches
     /// they appear in are served rather than refused.
     #[test]
     fn windows_serves_the_lone_percent_and_bang_searches() {

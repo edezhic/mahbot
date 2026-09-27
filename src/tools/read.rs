@@ -592,9 +592,11 @@ async fn execute_content(resolved_path: &Path, args: &serde_json::Value) -> anyh
                 return Ok(annotation);
             }
 
-            // Lossy fallback — replaces invalid bytes with U+FFFD
-            let lossy = String::from_utf8_lossy(&bytes).into_owned();
-            Ok(lossy)
+            // Lossy UTF-8 for every file but a background session's own output,
+            // which is a program's output and takes the shell's reading of one.
+            let text = crate::tools::shell::decode_session_output(resolved_path, &bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+            Ok(text)
         }
     }
 }

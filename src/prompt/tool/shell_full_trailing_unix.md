@@ -1,0 +1,1 @@
+Do NOT append a trailing `&` (shell background operator) to the command — `background: true` already detaches it, and a `&` makes the wrapping shell exit immediately, so the session ends at once and the process you meant to keep alive is destroyed with it.

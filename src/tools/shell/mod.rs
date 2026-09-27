@@ -28,6 +28,7 @@ mod readonly;
 mod scan;
 mod tree;
 mod windows_line;
+mod windows_text;
 
 pub(crate) use self::bg::BackgroundSessions;
 use self::profiles::{CARGO_COMPILE_PREFIXES, GEN_FALLBACK, PROFILES, Profile};
@@ -35,8 +36,9 @@ pub use self::readonly::ShellMode;
 use self::readonly::check_command;
 use self::tree::{RunOwner, Tree};
 
-/// The shell that runs a validated command string (`sh -c` on unix,
-/// `cmd.exe /C` on Windows). Every platform rule in this module tree reads
+/// The shell that runs a validated command string (`sh -c` on unix, `cmd.exe`
+/// with its own settings pinned — [`WINDOWS_COMMAND_SWITCHES`] — and `/C` on
+/// Windows). Every platform rule in this module tree reads
 /// this one value — the spawn side ([`build_shell_command`]), the reading of a
 /// command's line breaks ([`windows_line`], which decides the text the spawn
 /// hands over), the read-only guard's tables and the grep engine's command
@@ -63,6 +65,33 @@ pub(super) const SHELL_PLATFORM: ShellPlatform = if cfg!(windows) {
 /// ([`build_shell_command`]) and the GUI Shell page's terminal
 /// (`gui::shell::terminal_program`) cannot start different programs.
 pub(crate) const WINDOWS_COMMAND_INTERPRETER: &str = "cmd.exe";
+
+/// The switches the Windows command interpreter is always started with, ahead of
+/// `/C`: `/D` disables the machine's AutoRun scripts, `/E:ON` fixes command
+/// extensions on and `/V:OFF` fixes delayed expansion off. Those three are
+/// otherwise read from the machine's registry, where any of them would make the
+/// same command text behave differently; pinned here, this interpreter's own
+/// behaviour is the product's rather than the machine's. Two consequences are
+/// deliberate: the machine's AutoRun scripts no longer run for the commands this
+/// shell starts, and an interpreter a command starts for itself (`cmd`,
+/// `powershell`) keeps the machine's own settings, because only this one is
+/// pinned.
+const WINDOWS_COMMAND_SWITCHES: &str = "/D /E:ON /V:OFF";
+
+/// The frame every refusal of a run opens with — the cause follows, then the
+/// consequence that belongs to the entry point that refused. Spelled once here so
+/// the four renderers of it ([`grep_engine::unserved_failure`], the plan runner's
+/// [`plan::refusal_message`], [`windows_line::refusal`], and the read-only guard's
+/// own [`readonly::windows::refusal`]) cannot word one cause two ways.
+pub(super) const REFUSAL_FRAME: &str = "Command not run: ";
+
+/// The shared rendering of a refusal: the frame that names the refusing reader —
+/// the shared [`REFUSAL_FRAME`] above, or the read-only guard's own — the cause,
+/// the command itself and what to write instead. Both frames go through here so
+/// their tail cannot drift apart.
+pub(super) fn framed_refusal(frame: &str, cmd: &str, why: &str, suggestion: &str) -> String {
+    format!("{frame}{why}\nCommand: `{cmd}`\nSuggestion: {suggestion}")
+}
 
 /// Shell builtins/prefixes to skip when extracting the primary command.
 /// NOTE: `su` is intentionally NOT in this list. It can be used to run
@@ -483,7 +512,9 @@ fn is_mach_o(path: &Path) -> bool {
 /// own, commands start that program or fail to start at all, exactly as they would
 /// for the owner. Nothing here compensates for the owner's search path, and
 /// nothing about which program is started changes. Windows keeps its bare
-/// `cmd.exe` name (see [`program_command`]).
+/// `cmd.exe` name (see [`program_command`]), and hands it the settings every
+/// command of this shell runs under ([`WINDOWS_COMMAND_SWITCHES`]) rather than
+/// whichever ones that machine's registry happens to carry.
 ///
 /// On Windows the child is what the runner puts under a job object right after
 /// the spawn — the platform's own whole-tree mechanism ([`tree`]).
@@ -522,8 +553,10 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
         // The command goes inside the extra quote pair cmd.exe documents for
         // this hand-off (`cmd /?`, "the remainder of the command line after the
         // switch"): its quote processing strips that pair, so the command
-        // arrives verbatim — whatever quotes it carries of its own.
-        //
+        // arrives verbatim — whatever quotes it carries of its own. The
+        // settings the interpreter is started with lead the switch, so the text
+        // arrives under them and not under this machine's registry
+        // ([`WINDOWS_COMMAND_SWITCHES`]).
         // What arrives is the platform's reading of the agent's command
         // ([`windows_line`]): every plain break is already respelled as `&`, and a
         // line this reader would swallow at such a break — a comment or a label, a
@@ -532,7 +565,7 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
         // itself continues across — a caret's break, a break inside a group it opened
         // — still carry a line break here, and they are the platform's own reading,
         // not a raw text.
-        p.raw_arg(format!("/C \"{command}\""));
+        p.raw_arg(format!("{WINDOWS_COMMAND_SWITCHES} /C \"{command}\""));
         p
     };
 
@@ -1089,7 +1122,12 @@ fn engine_failure(
     stderr: &[u8],
     platform: ShellPlatform,
 ) -> Option<EngineFailure> {
-    let text = String::from_utf8_lossy(stderr);
+    // The engine child is a program this product started, and on one path it
+    // re-execs the platform's real `grep` in place, whose own stderr reaches this
+    // same stream — so it is read the way a program's output is read here, not as
+    // UTF-8 ([`windows_text::decode`]). The markers matched below are this
+    // product's own ASCII lines, which every code page agrees on.
+    let text = windows_text::decode(stderr);
     let marked = platform == ShellPlatform::Windows
         && text
             .lines()
@@ -1590,11 +1628,11 @@ fn program_error_tail(elapsed: Duration, stdout: &[u8], stderr: &[u8]) -> String
     msg
 }
 
-/// Decode both raw streams (lossy UTF-8 + ANSI strip) and combine stderr onto
-/// its own line when non-blank (never a leading blank line when stdout is
-/// empty). Never credential-scrubbed here: the `custom` tool's output is scrubbed
-/// by the agent-level pass, while an alarm's trigger deliberately shows a check
-/// exactly as the check produced it.
+/// Decode both raw streams ([`decode_and_strip_ansi`]'s reading + ANSI strip) and
+/// combine stderr onto its own line when non-blank (never a leading blank line
+/// when stdout is empty). Never credential-scrubbed here: the `custom` tool's
+/// output is scrubbed by the agent-level pass, while an alarm's trigger
+/// deliberately shows a check exactly as the check produced it.
 fn decode_raw_streams(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = decode_and_strip_ansi(stdout);
     let stderr = decode_and_strip_ansi(stderr);
@@ -1617,8 +1655,9 @@ fn tail_chars(s: &str, max_chars: usize) -> String {
 
 /// Appends the tail of an output buffer to `msg` with a label (e.g. "stdout" or "stderr").
 ///
-/// The transformation chain: lossy UTF-8 decode → strip ANSI escapes → scrub credentials
-/// → truncate to [`TIMEOUT_OUTPUT_TAIL_CHARS`] characters.
+/// The transformation chain: this platform's reading of a program's output
+/// ([`decode_and_strip_ansi`]) → strip ANSI escapes → scrub credentials →
+/// truncate to [`TIMEOUT_OUTPUT_TAIL_CHARS`] characters.
 fn append_output_tail(msg: &mut String, label: &str, data: &[u8]) {
     if !data.is_empty() {
         let scrubbed = strip_and_scrub(data);
@@ -1884,6 +1923,12 @@ impl ShellTool {
                 // background command loses no line either.
                 let exec_str = windows_line::executable(command_str, SHELL_PLATFORM, self.mode)
                     .map_err(anyhow::Error::msg)?;
+                // The one whole-line rule both modes share: read-only mode reaches
+                // it through `check_command`'s walk, this mode through its own entry
+                // — keyed on the agent's own text, not on the platform's respelt
+                // reading the spawn is handed.
+                readonly::check_line_divergences(command_str, SHELL_PLATFORM)
+                    .map_err(anyhow::Error::msg)?;
                 return self
                     .launch_background(
                         ws,
@@ -1932,11 +1977,21 @@ impl ShellTool {
                 }
             }
         } else {
-            // Full mode: no read-only validation; the engine is inherently
-            // read-only and preserves non-grep (incl. mutating) segments
-            // verbatim. Background-mode Full greps are deliberately NOT served
-            // (the early return above runs them on the platform's reading of the
-            // line, and a background command is never handed to the engine).
+            // Full mode: no read-only validation, but the whole-line divergences
+            // (`;`, `#`, a heredoc) are the one guard rule both modes decide —
+            // `check_command` reaches them in read-only mode, this entry here, and
+            // before the engine's refusal below so a `;`-line carrying a grep word
+            // still gets the guard's message. Keyed on the agent's own text, not on
+            // the platform's respelt reading the spawn is handed. Like every other
+            // guard refusal, this one files no grep telemetry: a refused line is
+            // not a search outcome, and nothing ran.
+            readonly::check_line_divergences(command_str, SHELL_PLATFORM)
+                .map_err(anyhow::Error::msg)?;
+            // The engine is inherently read-only and preserves non-grep (incl.
+            // mutating) segments verbatim. Background-mode Full greps are
+            // deliberately NOT served (the early return above runs them on the
+            // platform's reading of the line, and a background command is never
+            // handed to the engine).
             if let Some(rewritten) = grep_serve.rewritten.as_deref() {
                 exec_str = rewritten.to_string();
             }
@@ -2763,16 +2818,43 @@ fn render_command_line_notes(platform: ShellPlatform, mode: ShellMode) -> Option
     Some(notes)
 }
 
-/// The full-mode notes: the shared skeleton with this platform's stop semantics
-/// substituted in. What stopping a session does is the one thing the two
-/// platforms do differently, and a session must never be promised a mechanism
-/// its platform does not have — [`tree`] is where the mechanisms themselves are.
+/// The full-mode notes: the shared skeleton with this platform's answers
+/// substituted in. What stopping a session does, and what a trailing separator
+/// is, are the two things the platforms do differently — a session must never be
+/// promised a mechanism its platform does not have, and a separator must not be
+/// described by another platform's meaning. [`tree`] is where the stop mechanisms
+/// themselves are.
 fn render_full_mode_notes() -> String {
     let stop = stop_semantics();
+    let trailing = crate::prompt::load_prompt(match SHELL_PLATFORM {
+        ShellPlatform::Windows => "tool/shell_full_trailing_windows.md",
+        ShellPlatform::Unix => "tool/shell_full_trailing_unix.md",
+    })
+    .trim()
+    .to_owned();
     crate::prompt::substitute(
         &crate::prompt::load_prompt("tool/shell_full.md"),
-        &[("{{stop_semantics}}", &stop)],
+        &[
+            ("{{stop_semantics}}", &stop),
+            ("{{trailing_separator}}", &trailing),
+        ],
     )
+}
+
+/// This platform's own section — what its tool set is, what the two readers read
+/// differently, how its interpreter is started and how its programs' output is
+/// read back — rendered in **both** modes: none of it is a mode's rule, and an
+/// agent's command is read the same way whichever mode it is running in. `None`
+/// on the platform these notes would not be true of, so nothing is said there.
+fn render_platform_notes(platform: ShellPlatform) -> Option<String> {
+    match platform {
+        ShellPlatform::Windows => Some(
+            crate::prompt::load_prompt("tool/shell_platform_windows.md")
+                .trim()
+                .to_owned(),
+        ),
+        ShellPlatform::Unix => None,
+    }
 }
 
 /// What stopping a run does on this platform — one text for both the tool
@@ -2797,16 +2879,20 @@ impl Tool for ShellTool {
         // The base description and the grep-engine disclosure are shared
         // verbatim between the modes (a single copy each, so the two
         // descriptions cannot drift); only the read-only banner, the full-mode
-        // sections (stop semantics included) and the platform-selected notes
-        // (the grep engine's and the command-line reading's) are
-        // mode-/platform-specific.
+        // sections (stop semantics included) and the platform-selected texts —
+        // this platform's own rules, the grep notes and the command-line reading —
+        // are mode-/platform-specific.
         let base = crate::prompt::load_prompt("tool/shell.md");
         let mut sections: Vec<String> = match self.mode {
-            ShellMode::ReadOnly => vec![render_readonly_banner(), base, render_grep_notes()],
-            ShellMode::Full => vec![base, render_full_mode_notes(), render_grep_notes()],
+            ShellMode::ReadOnly => vec![render_readonly_banner(), base],
+            ShellMode::Full => vec![base, render_full_mode_notes()],
         };
         // A platform with nothing to add is handed the sections it had before this one
         // existed, with no blank line where it would have been.
+        if let Some(platform_notes) = render_platform_notes(SHELL_PLATFORM) {
+            sections.push(platform_notes);
+        }
+        sections.push(render_grep_notes());
         if let Some(command_lines) = render_command_line_notes(SHELL_PLATFORM, self.mode) {
             sections.push(command_lines);
         }
@@ -4090,13 +4176,25 @@ fn apply_profile_pipeline(
     finish_shell_output(combined, elapsed, pre_head_tail.as_deref())
 }
 
-/// Decode raw shell output bytes (lossy UTF-8) and strip ANSI escape sequences.
+/// Decode raw shell output bytes into text ([`windows_text::decode`]: this
+/// platform's own reading of a program's output) and strip ANSI escape
+/// sequences.
 ///
 /// This is the first step before further processing such as credential scrubbing
 /// ([`strip_and_scrub`]).
 fn decode_and_strip_ansi(data: &[u8]) -> String {
-    let decoded = String::from_utf8_lossy(data);
-    strip_ansi_escapes(&decoded)
+    strip_ansi_escapes(&windows_text::decode(data))
+}
+
+/// Read a file the product itself had a program write — a background session's
+/// output file, the one such file an agent reads back through the read tool —
+/// the way the shell reads a program's output ([`windows_text::decode`]).
+///
+/// `None` for every other path, so the read tool keeps its own reading for the
+/// files an agent or the owner points it at: only a path named like the product's
+/// own output is a program's output here ([`bg::is_output_file`]).
+pub(crate) fn decode_session_output(path: &Path, bytes: &[u8]) -> Option<String> {
+    bg::is_output_file(path).then(|| windows_text::decode(bytes))
 }
 
 /// Format the tool-facing exit-status note: `[exit status: N]`, or
@@ -4110,8 +4208,8 @@ pub(super) fn format_exit_status_note(exit_code: Option<i32>) -> String {
     }
 }
 
-/// Decode raw shell output bytes (lossy UTF-8), strip ANSI escape sequences,
-/// then scrub credentials.
+/// Decode raw shell output bytes ([`decode_and_strip_ansi`]'s reading), strip
+/// ANSI escape sequences, then scrub credentials.
 ///
 /// Builds on [`decode_and_strip_ansi`] by additionally applying credential
 /// scrubbing. Use this whenever you need to process raw shell bytes into
@@ -5192,9 +5290,8 @@ mod tests {
             .expect("launch message must name the output file");
         let path = PathBuf::from(path_line.trim_start_matches("output file:").trim());
         assert!(
-            path.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("bg_")),
-            "bg_* name shape: {path:?}"
+            bg::is_output_file(&path),
+            "the launch message must name the product's own output file: {path:?}"
         );
 
         // The session is registered in the agent-scoped registry.
@@ -5313,6 +5410,9 @@ mod tests {
             description.contains("[exit status: N]"),
             "Full description must document the completion annotation"
         );
+        // The platform-selected texts this description carries are checked by
+        // `platform_selected_texts_are_this_platforms_own`, which reads this host's
+        // platform; nothing here may depend on it.
 
         let schema = full.parameters_schema();
         let props = schema["properties"].as_object().expect("schema properties");
@@ -6713,10 +6813,12 @@ mod tests {
             ),
             (
                 "tool/shell_full.md",
-                ["{{stop_semantics}}"].as_slice(),
+                ["{{stop_semantics}}", "{{trailing_separator}}"].as_slice(),
                 [
                     "tool/shell_full_stop_unix.md",
                     "tool/shell_full_stop_windows.md",
+                    "tool/shell_full_trailing_unix.md",
+                    "tool/shell_full_trailing_windows.md",
                 ]
                 .as_slice(),
             ),
@@ -6768,6 +6870,58 @@ mod tests {
         text.split("\n\n").any(|para| para.trim().is_empty())
     }
 
+    /// This platform's own section is offered on the platform it is true of and
+    /// nowhere else, and it states the rules the shell now keeps there: the tool set
+    /// that is not present, `;` that separates nothing, `#` that comments nothing,
+    /// the settings the interpreter is started with (auto-run scripts included), and
+    /// which encoding a program's output is read back in. The renderer takes no mode,
+    /// so the same section is the one both modes receive.
+    #[test]
+    fn the_guidance_states_this_platforms_own_rules() {
+        assert!(render_platform_notes(ShellPlatform::Unix).is_none());
+        let guidance = render_platform_notes(ShellPlatform::Windows)
+            .expect("the platform with rules of its own has a section");
+        for sentence in [
+            "no POSIX tool set",
+            "`;` is not a command separator",
+            "`#` is not a comment",
+            "auto-run scripts",
+            "console encoding",
+        ] {
+            assert!(guidance.contains(sentence), "{sentence}: {guidance}");
+        }
+        assert!(!guidance.contains("{{"), "{guidance}");
+    }
+
+    /// This platform's own rules reach the agent in the description of both modes,
+    /// and the other platform's rules reach neither: the section is not
+    /// mode-specific, so a mode that dropped it would leave rules its own runs
+    /// depend on unstated.
+    #[test]
+    fn the_platform_notes_reach_both_modes() {
+        let this = render_platform_notes(SHELL_PLATFORM);
+        let other = render_platform_notes(match SHELL_PLATFORM {
+            ShellPlatform::Unix => ShellPlatform::Windows,
+            ShellPlatform::Windows => ShellPlatform::Unix,
+        });
+        for mode in [ShellMode::Full, ShellMode::ReadOnly] {
+            let description = ShellTool::new(mode).description();
+            assert!(!description.contains("{{"), "{description}");
+            if let Some(notes) = this.as_deref() {
+                assert!(
+                    description.contains(notes),
+                    "each mode's description must carry this platform's own rules"
+                );
+            }
+            if let Some(other) = other.as_deref() {
+                assert!(
+                    !description.contains(other),
+                    "no mode's description may carry the other platform's rules"
+                );
+            }
+        }
+    }
+
     /// The guidance the agent is handed — in both modes, on the platform whose
     /// interpreter reads one line — states the limit this reading refuses under, in
     /// numbers the constants decide.
@@ -6776,8 +6930,8 @@ mod tests {
         for mode in [ShellMode::Full, ShellMode::ReadOnly] {
             let guidance = command_line_notes(mode);
             // The three numbers of the limit's sentence are the constants': the
-            // platform's own line, what its path and `/C` switch take, and what that
-            // leaves for the text.
+            // platform's own line, what its path, its pinned settings and its `/C`
+            // switch take, and what that leaves for the text.
             for number in [
                 windows_line::COMMAND_LINE_CAP,
                 windows_line::TEXT_UNIT_LIMIT,
@@ -6847,35 +7001,45 @@ mod tests {
         assert!(render_command_line_notes(ShellPlatform::Unix, ShellMode::Full).is_none());
     }
 
-    /// The stop text is one text: the tool description's stop bullet and the `stop`
-    /// argument's own schema entry must both carry this platform's sentence, and
-    /// only this platform's — a session must never be promised a mechanism its
-    /// platform does not have (see `tree`).
-    #[test]
-    fn stop_text_is_this_platforms_own() {
-        let (this, other) = match SHELL_PLATFORM {
-            ShellPlatform::Unix => (
-                "tool/shell_full_stop_unix.md",
-                "tool/shell_full_stop_windows.md",
-            ),
-            ShellPlatform::Windows => (
-                "tool/shell_full_stop_windows.md",
-                "tool/shell_full_stop_unix.md",
-            ),
+    /// This platform's asset named `tool/shell_{stem}_{platform}.md`, and the other
+    /// platform's — the whole of what "platform-selected" means for a text the
+    /// description carries.
+    fn platform_text(stem: &str) -> (String, String) {
+        let read = |platform: &str| {
+            crate::prompt::load_prompt(&format!("tool/shell_{stem}_{platform}.md"))
+                .trim()
+                .to_owned()
         };
-        let this = crate::prompt::load_prompt(this).trim().to_owned();
-        let other = crate::prompt::load_prompt(other).trim().to_owned();
+        match SHELL_PLATFORM {
+            ShellPlatform::Unix => (read("unix"), read("windows")),
+            ShellPlatform::Windows => (read("windows"), read("unix")),
+        }
+    }
 
+    /// Every platform-selected text the description carries is this platform's own
+    /// and the other platform's is absent: a placeholder left behind would reach the
+    /// agent as its own name, and another platform's sentence would promise it a
+    /// mechanism this one does not have. The stop text is additionally the one text
+    /// the description's stop bullet and the `stop` argument's schema entry both
+    /// carry, so the two cannot promise different mechanisms either (see `tree`).
+    #[test]
+    fn platform_selected_texts_are_this_platforms_own() {
         let full = ShellTool::new(ShellMode::Full);
         let description = full.description();
-        assert!(
-            description.contains(&this),
-            "the description must carry this platform's stop text"
-        );
-        assert!(
-            !description.contains(&other),
-            "the description must not promise the other platform's stop text"
-        );
+        assert!(!description.contains("{{"), "{description}");
+        for stem in ["full_stop", "full_trailing", "grep_notes"] {
+            let (this, other) = platform_text(stem);
+            assert!(
+                description.contains(&this),
+                "the description must carry this platform's {stem} text"
+            );
+            assert!(
+                !description.contains(&other),
+                "the description must not carry the other platform's {stem} text"
+            );
+        }
+
+        let (this, other) = platform_text("full_stop");
         let schema = full.parameters_schema();
         let stop = schema["properties"]["stop"]["description"]
             .as_str()

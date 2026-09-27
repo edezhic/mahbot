@@ -153,8 +153,7 @@
 
 use std::borrow::Cow;
 
-use super::grep_engine::REFUSAL_FRAME;
-use super::{ShellMode, ShellPlatform};
+use super::{REFUSAL_FRAME, ShellMode, ShellPlatform};
 
 /// The platform's own limit on its single-line form: `cmd.exe`'s command line,
 /// the `/C "…"` hand-off this shell spawns with, counted in the platform's own
@@ -167,13 +166,17 @@ use super::{ShellMode, ShellPlatform};
 /// Public to the shell because the tool's own guidance states the same limit.
 pub(super) const COMMAND_LINE_CAP: usize = 8191;
 
+/// The reserve the interpreter's own command line takes before the text: 64
+/// characters for the interpreter's path (28 for the `cmd.exe` of a stock install,
+/// with room to spare for a longer system directory spelling) together with its
+/// ` /C "` switch and closing quote, plus the space before
+/// [`super::WINDOWS_COMMAND_SWITCHES`], plus the settings themselves.
+const HANDOFF_RESERVE: usize = 64 + super::WINDOWS_COMMAND_SWITCHES.len() + 1;
+
 /// What the `/C "…"` hand-off leaves of [`COMMAND_LINE_CAP`] for the command text
-/// itself: the interpreter's own path (28 characters for the `cmd.exe` of a stock
-/// install), the ` /C "` switch and the closing quote take the reserved 64, which
-/// leaves room for a system directory spelling longer than a stock install's. Both
-/// the refusal below and the tool's own guidance state this number, so neither
-/// advertises a limit the text is refused under while it is shorter.
-pub(super) const TEXT_UNIT_LIMIT: usize = COMMAND_LINE_CAP - 64;
+/// itself. Both the refusal below and the tool's own guidance state this number,
+/// so neither advertises a limit the text is refused under while it is shorter.
+pub(super) const TEXT_UNIT_LIMIT: usize = COMMAND_LINE_CAP - HANDOFF_RESERVE;
 
 /// A break inside the platform's own `"` span: its reader ends the command there.
 const BREAK_IN_DOUBLE_QUOTES: &str = "a line break falls inside a double-quoted argument, and this platform's reader \
@@ -699,8 +702,9 @@ pub(super) fn check_command_line(
     }
     let cause = format!(
         "a command line on this platform holds {COMMAND_LINE_CAP} units in all, and the \
-         interpreter's own path and its `/C` switch take about {} of them, so the command \
-         text must fit in {TEXT_UNIT_LIMIT}: this text needs {units}",
+         interpreter's own path, the settings it is started with and its `/C` switch take \
+         about {} of them, so the command text must fit in {TEXT_UNIT_LIMIT}: this text \
+         needs {units}",
         COMMAND_LINE_CAP - TEXT_UNIT_LIMIT
     );
     Err(refusal(&cause, mode))
@@ -1607,7 +1611,7 @@ fn is_label_word(word: &[u8]) -> bool {
 }
 
 /// The agent-facing refusal for one cause, in the reading's mode-selected form: the
-/// shared frame ([`REFUSAL_FRAME`], so the three refusal renderers cannot word it
+/// shared frame ([`REFUSAL_FRAME`], so the four refusal renderers cannot word it
 /// differently), the cause, that nothing ran, and the mode's remedy ([`remedy`], which
 /// owns the choice between the two).
 fn refusal(cause: &str, mode: ShellMode) -> String {

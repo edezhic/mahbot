@@ -4,7 +4,9 @@
 //! running after the initiating tool call returns. Output is written RAW
 //! (no scrubbing, no profile transforms) to a file in the temp area's
 //! `.agent` directory; the agent reads progress with the read tool and stops
-//! the session via the shell tool's `stop` argument.
+//! the session via the shell tool's `stop` argument. The file holds a program's
+//! own bytes, so the read tool reads it the way the shell reads a program's
+//! output rather than as a file the agent chose ([`is_output_file`]).
 //!
 //! Sessions are strictly agent-scoped: the registry lives inside the
 //! [`crate::Agent`] and is force-killed on agent teardown ([`BackgroundSessions::terminate_all`]).
@@ -713,7 +715,11 @@ fn create_bg_output_file() -> std::io::Result<(PathBuf, File)> {
         std::io::Error::new(std::io::ErrorKind::NotFound, "agent temp dir unavailable")
     })?;
     for _ in 0..MAX_OUTPUT_NAME_ATTEMPTS {
-        let path = dir.join(format!("bg_{:04x}.out", rand::random::<u16>()));
+        let name = format!(
+            "{OUTPUT_FILE_PREFIX}{:04x}{OUTPUT_FILE_SUFFIX}",
+            rand::random::<u16>()
+        );
+        let path = dir.join(name);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -724,6 +730,36 @@ fn create_bg_output_file() -> std::io::Result<(PathBuf, File)> {
         std::io::ErrorKind::AlreadyExists,
         "could not allocate a unique background output file name",
     ))
+}
+
+// The name shape and directory [`create_bg_output_file`] puts a session's output
+// in: `bg_XXXX.out` (4 hex digits) directly inside the shared `.agent` temp
+// directory.
+const OUTPUT_FILE_PREFIX: &str = "bg_";
+const OUTPUT_FILE_SUFFIX: &str = ".out";
+const OUTPUT_DIR_NAME: &str = ".agent";
+
+/// Whether `path` is named like one of this module's own output files, by the
+/// shape the consts above state — the reason the read tool may read a background
+/// session's output as a program's output ([`super::decode_session_output`]).
+///
+/// The names are the whole test: a file an agent creates at
+/// `<anywhere>/.agent/bg_1a2b.out` is read as a program's output too. The
+/// directory is deliberately not compared against the temp root, which would mean
+/// canonicalising both sides (the root reaches the read tool symlink-resolved).
+pub(super) fn is_output_file(path: &Path) -> bool {
+    let shaped = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(OUTPUT_FILE_PREFIX))
+        .and_then(|name| name.strip_suffix(OUTPUT_FILE_SUFFIX))
+        .is_some_and(|hex| hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()));
+    shaped
+        && path
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|dir| dir.to_str())
+            .is_some_and(|dir| dir == OUTPUT_DIR_NAME)
 }
 
 /// Bounded early-exit probe: poll the command child for up to [`LAUNCH_PROBE`].
@@ -770,7 +806,8 @@ fn append_exit_annotation(output_path: &Path, status: std::process::ExitStatus) 
 }
 
 /// Read up to `max_bytes` from the START of the output file (the shell's
-/// launch-error message lives at the start), credential-scrubbed, for the
+/// launch-error message lives at the start), read the way a program's output is
+/// read here ([`super::windows_text::decode`]), credential-scrubbed, for the
 /// synchronous launch-failure tool error.
 fn read_output_prefix(path: &Path, max_bytes: usize) -> Option<String> {
     use std::io::Read;
@@ -785,9 +822,9 @@ fn read_output_prefix(path: &Path, max_bytes: usize) -> Option<String> {
         buf.extend_from_slice(&chunk[..n]);
     }
     buf.truncate(max_bytes);
-    Some(crate::util::scrub_credentials(&String::from_utf8_lossy(
-        &buf,
-    )))
+    Some(crate::util::scrub_credentials(
+        &super::windows_text::decode(&buf),
+    ))
 }
 
 /// Poll `finished` until it is set or the bound elapses.
@@ -841,6 +878,33 @@ mod tests {
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
+    /// The product's own output path is recognised wherever the read tool looks at
+    /// it, and the near misses are not: a lookalike name outside a `.agent`
+    /// directory, a non-hex identifier, a file an agent named itself and the
+    /// `.agent` directory without the name shape all stay the read tool's own file.
+    /// The read tool's reading of a session's output rests on this predicate alone
+    /// ([`super::super::decode_session_output`]).
+    #[test]
+    fn only_the_products_own_output_path_is_recognised() {
+        let temp = std::env::temp_dir();
+        // The generated shape is one of these: `launch_quick_exit_appends_annotation`
+        // runs the predicate against the path a real session hands out.
+        for name in ["bg_1a2b.out", "bg_ffff.out", "bg_0000.out"] {
+            assert!(is_output_file(&temp.join(".agent").join(name)), "{name}");
+        }
+        for path in [
+            temp.join(".agent").join("bg_ghij.out"),
+            temp.join(".agent").join("bg_1a2bc.out"),
+            temp.join(".agent").join("bg_1a2b.out.txt"),
+            temp.join(".agent").join("spill_1a2b.txt"),
+            temp.join(".agent").join("notes.out"),
+            temp.join("bg_1a2b.out"),
+            PathBuf::from("bg_1a2b.out"),
+        ] {
+            assert!(!is_output_file(&path), "{}", path.display());
+        }
+    }
+
     /// Launch `command` in the mode every background session runs in, its own text
     /// standing as the reading the platform runs — the two differ on Windows alone,
     /// and no text here is a Windows multi-line shape.
@@ -863,17 +927,12 @@ mod tests {
         let path = launch_command(&sessions, ws.as_path(), "echo hello-bg")
             .await
             .expect("launch succeeds");
+        // The name this session hands out is the product's own output shape, which
+        // is what makes the read tool read it as a program's output
+        // ([`is_output_file`]).
         assert!(
-            path.parent()
-                .and_then(|p| p.file_name())
-                .is_some_and(|n| n == ".agent"),
-            "bg output must be flat in the .agent temp dir: {}",
-            path.display()
-        );
-        assert!(
-            path.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("bg_")),
-            "bg output must use the bg_* name shape: {}",
+            is_output_file(&path),
+            "bg output must be the product's own output name: {}",
             path.display()
         );
 

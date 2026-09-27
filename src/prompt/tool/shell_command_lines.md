@@ -20,4 +20,4 @@ Text blocks of the heredoc kind (`<<`) do not exist here, and a command that fee
 
 A variable set on one line and read on a later one does not see the value it was set to: the whole command is expanded before its first line runs. Set and read a variable inside one line, or read it in a later call.
 
-A command carrying more text than this platform's own command line holds — {{cap}} units in all, of which the interpreter's path and its `/C` switch take about {{overhead}}, leaving {{limit}} for the command text — is refused as a tool error naming the limit.
+A command carrying more text than this platform's own command line holds — {{cap}} units in all, of which the interpreter's path, the settings it is started with and its `/C` switch take about {{overhead}}, leaving {{limit}} for the command text — is refused as a tool error naming the limit.

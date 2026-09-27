@@ -2,7 +2,8 @@
 //!
 //! [`check_command`] validates shell commands against a set of rules that
 //! distinguish safe inspection commands from workspace-mutating ones.
-//! Used by [`crate::tools::shell::ShellTool`] when operating in [`ShellMode::ReadOnly`].
+//! Used by [`crate::tools::shell::ShellTool`] when operating in [`ShellMode::ReadOnly`];
+//! its [`check_line_divergences`] is the one rule the unrestricted mode consults too.
 //!
 //! # Design
 //!
@@ -48,7 +49,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 use super::scan::{self, CdScan};
 // The platform whose shell runs the validated command string, read from the
@@ -369,6 +370,36 @@ pub(super) fn check_command(command_str: &str, ctx: &CheckContext) -> Result<(),
     }
     let mut state = ValidationState::new(ctx);
     parse_and_walk(trimmed, &mut state)
+}
+
+/// The whole-line Windows divergences ([`windows::check_line`]) as their own
+/// entry: the read-only guard reaches them inside its own walk, and the
+/// unrestricted mode — which has no walk to reach them through — calls this, so
+/// both modes refuse the same lines with the same wording, decided in one place.
+/// A text the bash grammar cannot parse is not this rule's business and passes:
+/// the shapes that fail the parse (`if exist x ( … )`, `for %i in (…) do …`) are
+/// this platform's own, and the unrestricted mode is where they run.
+pub(super) fn check_line_divergences(
+    command_str: &str,
+    platform: ShellPlatform,
+) -> Result<(), String> {
+    if platform != ShellPlatform::Windows {
+        return Ok(());
+    }
+    // Trimmed exactly as [`check_command`] trims, so both modes judge the same
+    // text and render the same `Command:` line for it.
+    let trimmed = command_str.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let Ok(Some(tree)) = parse_bash(trimmed) else {
+        return Ok(());
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return Ok(());
+    }
+    windows::check_line(root, trimmed, platform)
 }
 
 /// The parser gaps the guard over-rejects on both platforms: it reads every
@@ -2798,16 +2829,24 @@ fn handle_eval_body(body_words: &[&str], state: &mut ValidationState) -> Result<
     parse_and_walk(&decoded, state)
 }
 
-/// Parse `text` with the bash grammar and walk it against `state` (used for
-/// the top-level command and for re-parsed `eval` bodies).
-fn parse_and_walk(text: &str, state: &mut ValidationState) -> Result<(), String> {
+/// Parse `text` with the bash grammar the guard reads every command with: `Err`
+/// when the parser cannot be created, `Ok(None)` when the parse yielded no tree.
+/// [`parse_and_walk`] refuses both fail-closed; [`check_line_divergences`] leaves a
+/// text it cannot read to the mode that can run it.
+fn parse_bash(text: &str) -> Result<Option<Tree>, String> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_bash::LANGUAGE.into())
         .map_err(|_| "failed to initialize the bash parser".to_string())?;
-    let tree = parser
-        .parse(text, None)
-        .ok_or_else(|| "failed to parse the command".to_string())?;
+    Ok(parser.parse(text, None))
+}
+
+/// Parse `text` with the bash grammar and walk it against `state` (used for
+/// the top-level command and for re-parsed `eval` bodies).
+fn parse_and_walk(text: &str, state: &mut ValidationState) -> Result<(), String> {
+    let Some(tree) = parse_bash(text)? else {
+        return Err("failed to parse the command".to_string());
+    };
     let root = tree.root_node();
     if root.has_error() {
         return Err(parse_error(text, state.ctx.platform));
@@ -2816,7 +2855,7 @@ fn parse_and_walk(text: &str, state: &mut ValidationState) -> Result<(), String>
     // are refused here, once for the whole command string and in every nesting
     // position: the layer decides them in this scan rather than in the walker
     // below, whose handlers are the unix-shaped ones. See [`windows::check_line`].
-    windows::check_line(root, text, state.ctx)?;
+    windows::check_line(root, text, state.ctx.platform)?;
     let mut w = W {
         src: text.to_string(),
         last_start: state.snapshot(),
@@ -3247,11 +3286,7 @@ fn segment_with_word_replaced(words: &[&str], idx: usize, value: &str) -> String
 
 /// The shared read-only rejection text.
 fn rejection_message(cmd: &str, why: &str, suggestion: &str) -> String {
-    format!(
-        "⚠️ Read-only mode: {why}\n\
-         Command: `{cmd}`\n\
-         Suggestion: {suggestion}"
-    )
+    super::framed_refusal("⚠️ Read-only mode: ", cmd, why, suggestion)
 }
 
 /// Rejection template helper.

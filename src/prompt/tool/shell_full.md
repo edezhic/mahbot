@@ -3,7 +3,7 @@
 For long-running non-interactive commands (e.g. starting a dev server that must keep running), set `background: true` (default false). The command then keeps running after this tool call returns:
 
 - The tool returns the path of the command's output file (in the OS temp area's `.agent` directory). All output — stdout and stderr — is written to that file RAW: no truncation, no filtering, no credential scrubbing. Do not run commands that print secrets in background mode.
-- Do NOT append a trailing `&` (shell background operator) to the command — `background: true` already detaches it, and a `&` makes the wrapping shell exit immediately, so the session ends at once and the process you meant to keep alive is destroyed with it.
+- {{trailing_separator}}
 - Read progress with the read tool on that path. When the command exits, the line `[exit status: N]` is appended to the end of the file UNCONDITIONALLY — including exit 0 (`[exit status: terminated by signal]` if a signal ended it). Its presence with ANY exit code is the only signal that the command finished; its absence means the command is still running. Do not treat a non-zero exit as a launch failure — it is a normal completion.
 - `timeout_secs` is IGNORED in background mode. The command runs until it exits, you stop it, or your run ends.
 - Stop the session with the same tool: pass only `stop: "<output-file-path>"` (the exact path returned by the launch). {{stop_semantics}} Stopping an already-finished session is a no-op. Do not combine `stop` with `background` or `command`.

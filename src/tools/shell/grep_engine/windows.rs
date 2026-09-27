@@ -38,12 +38,13 @@
 //! The one machine-wide limit this hand-off keeps: the rewrite names two paths
 //! this process did not choose — the running executable's installation path and,
 //! through it, the temp root the scratch file sits under. [`cmd_quote`] refuses
-//! a `%`, `!` or `"` in either, because cmd.exe re-reads those even inside
-//! quotes and a mangled path breaks the hand-off itself, so every search on such
-//! a machine fails (loudly, never silently) until the path changes. The narrower
-//! reading applied to the agent's own search text (two or more `%` characters
-//! in one word, see [`has_percent_expansion`]) answers a different question:
-//! that text rides the spec file and never appears on the command line.
+//! a `%`, `!` or `"` in either: cmd.exe rewrites all three even inside quotes —
+//! `%` always, `!` wherever delayed expansion is on, and a quote by closing the
+//! quoting — and a mangled path breaks the hand-off itself, so every search on
+//! such a machine fails (loudly, never silently) until the path changes. The
+//! narrower reading applied to the agent's own search text (two or more `%`
+//! characters in one word, see [`has_percent_expansion`]) answers a different
+//! question: that text rides the spec file and never appears on the command line.
 //!
 //! # Path identity
 //!
@@ -414,7 +415,9 @@ pub(in crate::tools::shell) fn unquote_word(raw: &str) -> String {
 /// stops treating `&`, `|`, `<`, `>`, `^`, `(`, `)`, `;` and `=` as anything
 /// but text inside a double-quoted argument — which is what makes a path like
 /// `C:\Program Files (x86)\…` servable at all. What cmd rewrites even inside
-/// quotes is `%` (always) and `!` (with delayed expansion), plus the quote
+/// quotes is `%` (always, before anything runs) and `!` (where delayed expansion
+/// is on — not in the interpreter this shell starts, which pins `/V:OFF`, but a
+/// nested one a command starts is not covered), plus the quote
 /// itself and a line terminator: those cannot be passed literally, so refusing
 /// the word is fail-closed. Both callers pass a path this process did not choose
 /// — the executable's installation path, and the scratch file under the temp
@@ -638,10 +641,9 @@ pub(super) fn has_unquoted_glob(tok: &str) -> bool {
 /// in the rewrite and is refused on the same approximation (over-refusing rather
 /// than mis-tracking). An undefined name expands to nothing, so the text between
 /// the percents is never what the program receives. A lone `%` is ordinary text,
-/// and so is every `!`: this process spawns `cmd /C` without `/V:ON`, so delayed
-/// expansion is off and `!name!` is delivered literally (a machine registry
-/// default could enable it — accepted, it is the literal reading the agent
-/// wrote).
+/// and so is every `!`: this process spawns `cmd /C` with `/V:OFF`, so delayed
+/// expansion is off whatever this machine's own settings say and `!name!` is
+/// delivered literally.
 #[must_use]
 pub(in crate::tools::shell) fn has_percent_expansion(word: &str) -> bool {
     word.matches('%').count() >= 2

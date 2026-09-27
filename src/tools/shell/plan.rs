@@ -694,7 +694,7 @@ fn state_verb(text: &str) -> Option<String> {
 /// descriptor and a missing target are the spellings a member's own redirect list
 /// can carry, a target word carrying two or more `%` is one cmd.exe would have
 /// expanded before the member ran ([`windows::has_percent_expansion`] — the shell
-/// tool spawns `cmd /C` without `/V:ON`, so `!` is ordinary text), and a
+/// tool spawns `cmd /C` with `/V:OFF`, so `!` is ordinary text), and a
 /// drive-relative target ([`windows::is_drive_relative`]) is one it resolves
 /// against another drive's current directory; the reason names the spelling,
 /// because the agent can change it and the runner cannot.
@@ -1651,7 +1651,7 @@ fn untrackable_cd(text: &str, why: &str) -> String {
 }
 
 /// The agent-facing failure for a line [`own_image_plan`] refused. Its frame is
-/// the shared [`grep_engine::REFUSAL_FRAME`], so the same cause cannot reach the
+/// the shared [`super::REFUSAL_FRAME`], so the same cause cannot reach the
 /// agent worded two ways through the two entry points; what follows the frame is
 /// the consequence of *this* one, that the answer is not the command's output,
 /// where the search's own entry point states that it is not an empty match set.
@@ -1659,7 +1659,7 @@ fn untrackable_cd(text: &str, why: &str) -> String {
 pub(super) fn refusal_message(cause: &str) -> String {
     format!(
         "{}{cause}. This is not the command's output.",
-        grep_engine::REFUSAL_FRAME
+        super::REFUSAL_FRAME
     )
 }
 

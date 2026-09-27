@@ -1,0 +1,1 @@
+Do NOT append a trailing `&` to the command — `background: true` already detaches the session, and on this platform `&` is not the shell's background operator: it separates two commands, so a trailing one detaches nothing and the command in front of it still runs in the foreground.

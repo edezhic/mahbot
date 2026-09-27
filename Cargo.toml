@@ -228,10 +228,12 @@ libc = "0.2"
 # Win32_System_Com is the CoInitializeEx apartment that call documents.
 # Win32_System_Environment carries CreateEnvironmentBlock/DestroyEnvironmentBlock —
 # used only by the owner-environment read (`shell_env::read_windows`).
+# Win32_Globalization carries GetOEMCP/MultiByteToWideChar — used only by the shell
+# tool's reading of a program's output (`tools::shell::windows_text`).
 # Wdk_System_SystemServices carries RtlGetVersion — the real Windows build, which
 # GetVersionExW misreports for an image with no compatibility manifest; used only by
 # the update path's host check (`self_update::windows_build`).
-windows-sys = { version = "0.52", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Com", "Win32_System_Console", "Win32_System_Environment", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.52", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Com", "Win32_System_Console", "Win32_System_Environment", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Acceleration-carrying candle for the embedder and the TTS ONNX runtime.
