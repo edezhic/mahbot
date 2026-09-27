@@ -858,7 +858,7 @@ fn report_ignored(text: &str, ignored: &[String]) -> String {
     if ignored.is_empty() {
         return text.to_string();
     }
-    crate::tools::shell::with_note(
+    crate::tools::with_note(
         text,
         &format!("[ignored arguments: {}]", ignored.join(", ")),
     )

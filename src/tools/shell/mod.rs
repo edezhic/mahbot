@@ -1,3 +1,51 @@
+//! The shell tool: a command string run by the platform's shell, with its output
+//! captured, its process tree contained, and its bounds enforced.
+//!
+//! Two modes ([`ShellMode`]) share everything below: `Full` is an agent's own
+//! shell, while `ReadOnly` only lets through the commands the guard ([`readonly`])
+//! allows. A third, deliberately separate surface — the background session
+//! ([`bg`]) — is how a `Full` agent starts a command meant to keep running after
+//! the tool call returns.
+//!
+//! # What decides a call
+//!
+//! The command's own EXIT STATUS decides the call, never the fate of the pipe
+//! readers: a command that exited 0 is a success and one that exited non-zero is
+//! its own failure, and its output is what its pipes delivered. Two bounds frame
+//! that output — the per-stream capture cap ([`SHELL_PIPE_READ_CAP`]) and the
+//! post-exit drain ([`DEFAULT_OUTPUT_DRAIN_TIMEOUT_SECS`]) — and neither turns a
+//! finished command into an error.
+//!
+//! A process the command left behind can keep a capture pipe open past the drain
+//! bound, so EOF never arrives. What happens then is the run's
+//! [`LeftoverPolicy`], chosen by the caller: an agent's command (`Keep`) reports
+//! the command's own exit status and the output collected so far, and leaves the
+//! leftover RUNNING with its output channel still held open on our side — it was
+//! started on purpose — reporting it in the result, and where its containment can
+//! be named, how to stop it ([`format_leftover_note`]). That "left running" is
+//! what the product provides while it RETAINS the channel; releasing it (past the
+//! retained-channel cap) ends the guarantee
+//! ([`crate::util::leftover_channels`]). A program this product
+//! runs for itself (a user's alarm, a custom tool's script) uses `End`: the run's
+//! tree is ended and the run is reported as a failure
+//! ([`ShellRunResult::EndedWithLeftovers`]).
+//!
+//! # The runner's own steps
+//!
+//! On Windows a line that runs this product's own image cannot be waited for by
+//! cmd.exe ([`plan`]), so such a line is decomposed and run by the runner itself;
+//! its result is the same [`ShellRunResult`] a shell run produces. The grep engine
+//! ([`grep_engine`]) rewrites searches the same way. The plan runner and the
+//! single-child runner share the capture ([`Readers`]), the containment
+//! ([`tree`]) and the bounds ([`Watchdog`]) below, so a change to any of them is a
+//! change to both.
+//!
+//! [`tree`]: self::tree
+//! [`bg`]: self::bg
+//! [`readonly`]: self::readonly
+//! [`plan`]: self::plan
+//! [`grep_engine`]: self::grep_engine
+
 use crate::{Tool, Workspace};
 use async_trait::async_trait;
 use directories::UserDirs;
@@ -14,6 +62,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::listing::{ListingEntry, format_listing, human_readable_size};
+use super::with_note;
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 use crate::util::UnwrapPoison;
 use crate::util::scrub_credentials;
@@ -150,6 +199,10 @@ const MAX_SHELL_TIMEOUT_SECS: u64 = 3600;
 /// Default bound on the post-exit output drain (seconds). After the main
 /// command exited, remaining output must drain within this bound — a leftover
 /// backgrounded process holding the pipes open otherwise blocks EOF forever.
+/// How the bound is resolved is the run's [`LeftoverPolicy`]: an agent's command
+/// reports its own exit status and leaves the leftover running
+/// ([`ShellRunResult::ExitedWithLeftovers`]); a program run ends its tree and is
+/// reported as a failure ([`ShellRunResult::EndedWithLeftovers`]).
 const DEFAULT_OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 10;
 /// Grace window given to pipe readers to notice cancellation and return
 /// buffered partial output after a process-group kill.
@@ -610,17 +663,39 @@ enum ShellRunResult {
         status: std::process::ExitStatus,
         elapsed: Duration,
     },
-    TimedOut {
+    /// The main process exited, and its OWN exit status and the output collected
+    /// up to the drain bound are the run's result; a process it left behind still
+    /// holds a capture pipe open, so EOF never arrived. Only
+    /// [`LeftoverPolicy::Keep`] produces it (an agent's command, the rewritten-line
+    /// plan run): the leftover was started deliberately and is left RUNNING — the
+    /// capture readers are detached so the channel stays open — and `scope` names the
+    /// containment the leftover is reached through, which differs per platform. On
+    /// unix it is the child's process group id, and the group still
+    /// exists while any member lives, so the note can offer `kill -TERM -<pgid>`. On
+    /// Windows it is the pid of the run's root process, which `child.wait()` has
+    /// already reaped by the time this path is reached — so the note lists the tree
+    /// by parent (`tasklist /FI "PPID eq <pid>"`) and stops each listed process
+    /// instead of addressing the released pid. `None` when it could not be
+    /// identified.
+    ExitedWithLeftovers {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
-        pid: Option<u32>,
+        status: std::process::ExitStatus,
+        scope: Option<u32>,
         elapsed: Duration,
     },
-    /// The main process exited but leftover processes kept the output pipes
-    /// open past the drain bound, so EOF never arrived. `pid` is the containment
-    /// root's when the containment ended the tree, and `None` otherwise — the
-    /// error names it as killed only in the former case.
-    DrainTimedOut {
+    /// The main process exited but a process it left behind held a capture pipe open
+    /// past the drain bound, so the run's tree was ended ([`LeftoverPolicy::End`] —
+    /// the program paths, [`run_program_outcome`] and [`run_program_with_timeout`]).
+    /// The partial output the readers had collected is carried for the failure prose,
+    /// but no exit status: a run this product ended for a leftover is not described
+    /// by the status of the process that happened to exit first.
+    EndedWithLeftovers {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        elapsed: Duration,
+    },
+    TimedOut {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
         pid: Option<u32>,
@@ -640,6 +715,25 @@ enum ShellRunResult {
         limit: u64,
     },
     SpawnFailed(std::io::Error),
+}
+
+/// What a run does when its main process exited but a leftover process still holds
+/// a capture pipe past the drain bound — one policy per run, so the two behaviours
+/// cannot drift apart.
+///
+/// `Keep` is the agent-facing behaviour (the shell tool's commands in both modes,
+/// and the rewritten-line plan runner): the command's own exit status and output are
+/// the result, and the leftover is left running because it was started on purpose
+/// ([`ShellRunResult::ExitedWithLeftovers`]). `End` is the program paths' behaviour
+/// (`run_program_outcome` — a user's alarm — and `run_program_with_timeout` — a
+/// custom tool's script): the run's tree is ended and the run is reported as a
+/// failure ([`ShellRunResult::EndedWithLeftovers`]).
+#[derive(Clone, Copy)]
+pub(super) enum LeftoverPolicy {
+    /// Keep the leftover: the run's own status is the answer.
+    Keep,
+    /// End the tree holding a leftover and report a failure.
+    End,
 }
 
 /// How the wait inside [`run_command_with_timeout`] ended — the three bounds
@@ -785,21 +879,28 @@ impl CaptureBudget {
     }
 }
 
-/// Read from an async stream up to what `budget` still allows, then continue
-/// reading and discarding any remaining data to drain the pipe (preventing
-/// back-pressure on the child process from a full pipe buffer).
+/// Read from an async stream up to what `budget` still allows, appending what is
+/// kept to `buf` — the stream's shared live buffer — and continuing to read and
+/// discard any remaining data to drain the pipe (preventing back-pressure on the
+/// child process from a full pipe buffer).
 ///
-/// Stops early when `cancel` is signalled, returning whatever has been read
-/// so far. This allows the timeout path to collect partial output even when
-/// grandchild processes inherited the pipe write end and prevent EOF.
+/// `buf` is what lets a run take a snapshot of a still-reading stream without
+/// cancelling its reader ([`Readers::snapshot_and_detach`]): the reader appends as
+/// it reads, under the lock, so whatever has arrived is visible at any moment. The
+/// budget is the same one that caps a finished reader's output, so the buffer can
+/// never grow past [`SHELL_PIPE_READ_CAP`] however long a leftover keeps writing.
+///
+/// Returns when `cancel` is signalled or the stream reaches EOF. The timeout path
+/// still collects partial output even when grandchild processes inherited the pipe
+/// write end and prevent EOF.
 async fn read_stream_limited(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
     budget: &CaptureBudget,
     cancel: tokio_util::sync::CancellationToken,
-) -> Vec<u8> {
+    buf: &std::sync::Mutex<Vec<u8>>,
+) {
     use tokio::io::AsyncReadExt;
 
-    let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         tokio::select! {
@@ -813,35 +914,47 @@ async fn read_stream_limited(
                         // member from writing (the drain half of the original
                         // per-pipe cap).
                         let keep = budget.claim(n);
-                        buf.extend_from_slice(&chunk[..keep]);
+                        if keep > 0 {
+                            buf.lock().unwrap_poison().extend_from_slice(&chunk[..keep]);
+                        }
                     }
                 }
             }
             () = cancel.cancelled() => break,
         }
     }
-    buf
 }
 
-/// Spawn a background task that reads from a pipe.
-/// The task stops early when `cancel` is signalled and returns
-/// whatever data has been buffered so far.
+/// Spawn a background task that reads from a pipe into `buf`.
+/// The task stops early when `cancel` is signalled; otherwise it runs to EOF.
+/// Its handles are detached rather than awaited on the leftover path, so it must
+/// never be the thing that decides a run (see [`Readers`]).
 fn spawn_pipe_reader(
     pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     budget: CaptureBudget,
     cancel: tokio_util::sync::CancellationToken,
-) -> tokio::task::JoinHandle<Vec<u8>> {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut pipe = pipe;
-        read_stream_limited(&mut pipe, &budget, cancel).await
+        read_stream_limited(&mut pipe, &budget, cancel, &buf).await;
     })
 }
 
-/// One capture reader of a run: what it fills, and the reading task or its
-/// output once it finished. A completed [`tokio::task::JoinHandle`] must never be
-/// awaited again (tokio panics on a re-poll), so its bytes are kept in its place.
+/// One capture reader of a run: the live buffer it fills, and the reading task or
+/// its end once it finished. A completed [`tokio::task::JoinHandle`] must never be
+/// awaited again (tokio panics on a re-poll), so its state is recorded in its place.
+///
+/// The bytes live in [`Reader::buf`], not in the task's return value: the task
+/// appends as it reads, which is what lets the leftover path take what has arrived
+/// without cancelling the reader ([`Readers::snapshot_and_detach`]).
 struct Reader {
     stream: Captured,
+    /// The live buffer this reader fills, bounded by the reader's
+    /// [`CaptureBudget`]: the reader appends under the lock as it reads, and the
+    /// collector takes (and so drains) it, so a leftover that keeps writing can
+    /// never grow it past the cap.
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     task: ReaderTask,
 }
 
@@ -865,18 +978,19 @@ impl Captured {
 }
 
 enum ReaderTask {
-    Reading(tokio::task::JoinHandle<Vec<u8>>),
-    Done(Vec<u8>),
+    Reading(tokio::task::JoinHandle<()>),
+    Done,
 }
 
 /// The capture readers of one run, in the order their bytes belong in the run's
 /// output.
 ///
-/// One home for the two things every run shape does with them: drain them under
-/// the output bound ([`Readers::drain`]) and collect what they hold
-/// ([`Readers::collect`]). The single-child runner has one reader per stream; the
-/// plan runner one per captured member stream ([`plan`]), all those of one stream
-/// charged to that stream's budget.
+/// One home for the three things every run shape does with them: drain them under
+/// the output bound ([`Readers::drain`]), collect what they hold after a cancel
+/// ([`Readers::collect`]), and take what has arrived without cancelling them when a
+/// leftover keeps a pipe open ([`Readers::snapshot_and_detach`]). The single-child
+/// runner has one reader per stream; the plan runner one per captured member
+/// stream ([`plan`]), all those of one stream charged to that stream's budget.
 #[derive(Default)]
 struct Readers {
     readers: Vec<Reader>,
@@ -891,17 +1005,21 @@ impl Readers {
         budget: CaptureBudget,
         cancel: tokio_util::sync::CancellationToken,
     ) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         self.readers.push(Reader {
             stream,
-            task: ReaderTask::Reading(spawn_pipe_reader(pipe, budget, cancel)),
+            buf: std::sync::Arc::clone(&buf),
+            task: ReaderTask::Reading(spawn_pipe_reader(pipe, budget, cancel, buf)),
         });
     }
 
     /// Drain every reader within `drain_limit`, taking the bytes of each that
     /// finishes in time. `true` when they all did — the run's output is complete;
     /// `false` when the bound expired with a reader still pending, which means a
-    /// leftover process still holds a capture pipe open. The caller then ends the
-    /// run and calls [`Readers::collect`] for what the readers hold.
+    /// leftover process still holds a capture pipe open. What the caller does next
+    /// is its [`LeftoverPolicy`]'s: `Keep` snapshots and detaches
+    /// ([`Readers::snapshot_and_detach`]), `End` cancels and collects
+    /// ([`Readers::collect`]).
     async fn drain(&mut self, drain_limit: Duration) -> bool {
         let limit = tokio::time::sleep(drain_limit);
         tokio::pin!(limit);
@@ -909,7 +1027,7 @@ impl Readers {
             if self
                 .readers
                 .iter()
-                .all(|reader| matches!(reader.task, ReaderTask::Done(_)))
+                .all(|reader| matches!(reader.task, ReaderTask::Done))
             {
                 return true;
             }
@@ -940,11 +1058,44 @@ impl Readers {
     /// ([`DRAIN_CANCEL_GRACE`]): the run's processes are gone by the time this is
     /// called, so the bound is for whatever leftover holder still has a pipe.
     async fn collect(&mut self) -> (Vec<u8>, Vec<u8>) {
-        let collected =
-            futures_util::future::join_all(self.readers.iter_mut().map(Reader::finish)).await;
+        futures_util::future::join_all(self.readers.iter_mut().map(Reader::finish)).await;
+        self.take()
+    }
+
+    /// Take what the readers hold right now, leaving any still-running reader
+    /// detached: the bytes are the live buffers' contents, no await and no cancel.
+    /// A pending reading task is handed to [`crate::util::leftover_channels`]
+    /// rather than dropped, so it keeps draining its pipe to EOF, and the leftover
+    /// holding it is neither blocked by a full pipe nor killed by a closed read end
+    /// (on unix a closed read end turns its next write into SIGPIPE/EPIPE). Past
+    /// that set's shared cap of 16 channels the OLDEST is released, and its leftover
+    /// faults on its next write.
+    ///
+    /// This is the leftover path's collection: what the command wrote before the
+    /// bound is the run's result, and the leftover keeps its channel
+    /// ([`LeftoverPolicy::Keep`]).
+    fn snapshot_and_detach(&mut self) -> (Vec<u8>, Vec<u8>) {
+        // A completed handle is already `Done`; a pending one is retained (not
+        // dropped) so its task keeps draining within the shared bound.
+        for reader in &mut self.readers {
+            if let ReaderTask::Reading(handle) =
+                std::mem::replace(&mut reader.task, ReaderTask::Done)
+            {
+                crate::util::leftover_channels::retain_channel(handle);
+            }
+        }
+        self.take()
+    }
+
+    /// Every reader's kept bytes, in the order the readers were created,
+    /// separated by stream. Each buffer is emptied by the take, and a detached
+    /// reader that keeps reading grows nothing further once its (shared, already
+    /// charged) budget is spent — the bound is the reader's, not this call's.
+    fn take(&mut self) -> (Vec<u8>, Vec<u8>) {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        for (reader, bytes) in self.readers.iter().zip(collected) {
+        for reader in &mut self.readers {
+            let bytes = std::mem::take(&mut *reader.buf.lock().unwrap_poison());
             match reader.stream {
                 Captured::Stdout => stdout.extend_from_slice(&bytes),
                 Captured::Stderr => stderr.extend_from_slice(&bytes),
@@ -955,52 +1106,55 @@ impl Readers {
 }
 
 impl Reader {
-    /// Fold a finished task's result in: the reader is done, and its bytes are
-    /// kept where the handle was.
-    fn store(&mut self, result: std::result::Result<Vec<u8>, tokio::task::JoinError>) {
-        let bytes = result.unwrap_or_else(|e| {
+    /// Fold a finished task's outcome in: the reader is done, and whatever it kept
+    /// is in its live buffer.
+    fn store(&mut self, result: std::result::Result<(), tokio::task::JoinError>) {
+        if let Err(e) = result {
             tracing::warn!(%e, "{} reader task panicked", self.stream.label());
-            Vec::new()
-        });
-        self.task = ReaderTask::Done(bytes);
+        }
+        self.task = ReaderTask::Done;
     }
 
-    /// Take whatever the reader holds — its bytes when it already finished, else
-    /// the cancellation grace for one whose pipe a leftover process still keeps
-    /// open.
-    async fn finish(&mut self) -> Vec<u8> {
-        match std::mem::replace(&mut self.task, ReaderTask::Done(Vec::new())) {
-            ReaderTask::Done(bytes) => bytes,
+    /// Wait for whatever the reader still holds — immediately when it already
+    /// finished, else the cancellation grace for one whose pipe a leftover process
+    /// still keeps open.
+    async fn finish(&mut self) {
+        match std::mem::replace(&mut self.task, ReaderTask::Done) {
+            ReaderTask::Done => {}
             ReaderTask::Reading(handle) => {
                 await_pipe_reader_with_cancellation_timeout(
                     handle,
                     self.stream.label(),
                     DRAIN_CANCEL_GRACE,
                 )
-                .await
+                .await;
             }
         }
     }
 }
 
 /// Await a pipe reader task with a grace timeout, used after killing a child
-/// process — the reader is given `cancellation_timeout` to notice cancellation
-/// and return whatever data it has buffered so far.
+/// process — the reader is given `cancellation_timeout` to notice cancellation and
+/// stop. A reader that misses the grace is handed to
+/// [`crate::util::leftover_channels`] instead of being dropped: it keeps draining
+/// its pipe to EOF, so nothing it belongs to stalls on a full pipe — until the
+/// shared cap of 16 channels is reached, past which the OLDEST is released and its
+/// leftover faults on its next write.
 async fn await_pipe_reader_with_cancellation_timeout(
-    handle: tokio::task::JoinHandle<Vec<u8>>,
+    mut handle: tokio::task::JoinHandle<()>,
     label: &str,
     cancellation_timeout: Duration,
-) -> Vec<u8> {
-    tokio::time::timeout(cancellation_timeout, handle)
+) {
+    if tokio::time::timeout(cancellation_timeout, &mut handle)
         .await
-        .ok()
-        .and_then(std::result::Result::ok)
-        .unwrap_or_else(|| {
-            tracing::warn!(
-                "{label} reader did not respond to cancellation within {cancellation_timeout:?}"
-            );
-            Vec::new()
-        })
+        .is_err()
+    {
+        tracing::warn!(
+            "{label} reader did not respond to cancellation within {cancellation_timeout:?} — \
+             it stays detached and keeps draining its pipe"
+        );
+        crate::util::leftover_channels::retain_channel(handle);
+    }
 }
 
 /// Output-drain bound for [`run_command_with_timeout`]: after the main command
@@ -1015,9 +1169,10 @@ fn output_drain_timeout() -> Duration {
 
 /// Signal the process group of a spawned shell (PGID == the child PID after
 /// `process_group(0)` in [`build_shell_command`]). Used to terminate the whole
-/// subprocess tree when a leftover backgrounded process keeps the output pipes
-/// open after the main process exited (drain timeout) or was killed (command
-/// timeout) — prevents orphaned pipe-holding strays from accumulating.
+/// subprocess tree when a stop ends a run — the command timeout or memory
+/// ceiling, or the drain bound under [`LeftoverPolicy::End`], where a leftover
+/// backgrounded process keeps the output pipes open after the main process
+/// exited — so orphaned strays cannot accumulate.
 ///
 /// Also used by [`self::bg`] for the two-stage background-session stop
 /// (SIGTERM then SIGKILL) and the teardown kill; there the target is the
@@ -1181,14 +1336,16 @@ fn engine_cause(text: &str, marked: bool) -> String {
 }
 
 /// Ends a run's whole process tree if the run is dropped before a stop path or
-/// the successful-completion path has taken responsibility for it — an expired
-/// drain cap aborting the task, a panic in a sibling tool, runtime teardown. The
-/// tree is the platform's ([`Tree`]): the child's process group on unix, the job
+/// the successful-completion path has taken responsibility for it — its tool call's
+/// future dropped (an abandoned call, runtime teardown), a panic in a sibling tool.
+/// The tree is the platform's ([`Tree`]): the child's process group on unix, the job
 /// on Windows.
 ///
 /// It must be disarmed on every path where the child is reaped or the tree is
-/// handed on: after a unix child is reaped a group kill risks PID reuse, and a
-/// Windows job retained for the process lifetime must not be ended by this guard.
+/// handed on: after a unix child is reaped a group kill risks PID reuse, a Windows
+/// job retained for the process lifetime must not be ended by this guard, and the
+/// leftover-keeping path ([`LeftoverPolicy::Keep`]) has deliberately left the tree
+/// alone — the leftover was started on purpose and must survive this guard.
 ///
 /// It holds only the tree, never the child, so it has no fallback when
 /// [`Tree::terminate`] reports `false` — a Windows run with no job (fail-open,
@@ -1219,8 +1376,11 @@ impl Drop for KillOnDrop {
 /// Spawn `cmd`, read stdout/stderr concurrently, and enforce `timeout`.
 /// After the main process exits, remaining output must drain within
 /// `drain_limit` — a leftover backgrounded process holding the pipes open
-/// turns the drain into a bounded [`ShellRunResult::DrainTimedOut`] instead
-/// of an indefinite hang.
+/// turns the drain into a bounded leftover result instead of an indefinite
+/// hang, resolved by `leftovers`: an agent's command (`Keep`) reports the
+/// command's own exit status with the leftover left running
+/// ([`ShellRunResult::ExitedWithLeftovers`]), a program run (`End`) ends the
+/// tree and is reported as a failure ([`ShellRunResult::EndedWithLeftovers`]).
 ///
 /// While the child runs, its whole process tree is also sampled for resident
 /// memory ([`mem`]); a sample over `memory_limit` ends the run the way the
@@ -1236,6 +1396,7 @@ async fn run_command_with_timeout(
     drain_limit: Duration,
     memory_limit: Option<u64>,
     owner: RunOwner,
+    leftovers: LeftoverPolicy,
 ) -> ShellRunResult {
     let start = std::time::Instant::now();
 
@@ -1303,23 +1464,50 @@ async fn run_command_with_timeout(
                     elapsed: start.elapsed(),
                 }
             } else {
-                // Drain bound exceeded: a leftover process still holds the
-                // pipes. End the tree the run is contained in — the process
-                // group on unix, the job on Windows — mirroring the timeout
-                // path, then cancel the readers and collect partial output so
-                // the caller gets a visible, recoverable error instead of
-                // a hang. Readers that already completed keep their output
-                // (a completed JoinHandle must not be re-awaited).
-                let ended = tree.terminate();
-                cancel.cancel();
-                let (stdout, stderr) = readers.collect().await;
-                ShellRunResult::DrainTimedOut {
-                    stdout,
-                    stderr,
-                    // Named as killed only when the tree really was ended (see
-                    // the variant).
-                    pid: pid.filter(|_| ended),
-                    elapsed: start.elapsed(),
+                match leftovers {
+                    // An agent's command: the leftover was started on purpose,
+                    // so it is left RUNNING and the command's own exit status and
+                    // the output collected up to the bound are the result. The
+                    // readers are detached, not cancelled (`snapshot_and_detach`),
+                    // so the leftover's write end stays open — a full pipe never
+                    // blocks it and a closed read end never turns its next write
+                    // into SIGPIPE/EPIPE. Past the shared cap of retained channels
+                    // the oldest is released instead, and its leftover faults on
+                    // its next write (see [`crate::util::leftover_channels`]). The
+                    // containment stays alive too: on
+                    // Windows the job's handle must not be closed, because that
+                    // would kill the very process this path must leave running
+                    // (`Tree::retain_after_completion`).
+                    LeftoverPolicy::Keep => {
+                        tree.retain_after_completion();
+                        let (stdout, stderr) = readers.snapshot_and_detach();
+                        ShellRunResult::ExitedWithLeftovers {
+                            stdout,
+                            stderr,
+                            status,
+                            scope: pid,
+                            elapsed: start.elapsed(),
+                        }
+                    }
+                    // A program run (an alarm, a custom tool): end the tree the
+                    // run is contained in — the process group on unix, the job on
+                    // Windows — mirroring the timeout path, then cancel the readers
+                    // and collect partial output so the caller gets a visible,
+                    // recoverable failure instead of a hang. Readers that already
+                    // completed keep their output (a completed JoinHandle must not
+                    // be re-awaited). The ended run carries no exit status: what the
+                    // program paths report is the failure, not the status of the
+                    // process that happened to exit first.
+                    LeftoverPolicy::End => {
+                        tree.terminate();
+                        cancel.cancel();
+                        let (stdout, stderr) = readers.collect().await;
+                        ShellRunResult::EndedWithLeftovers {
+                            stdout,
+                            stderr,
+                            elapsed: start.elapsed(),
+                        }
+                    }
                 }
             }
         }
@@ -1453,6 +1641,10 @@ fn program_outcome(success: bool, detail: String, stdout: &[u8], stderr: &[u8]) 
 /// [`DEFAULT_SHELL_TIMEOUT_SECS`], the per-pipe output cap and the post-exit
 /// drain bound. `owner` travels to [`run_command_with_timeout`] and decides the
 /// run's containment.
+///
+/// A direct run is never an agent's own command, so a leftover it leaves behind is
+/// ended rather than kept ([`LeftoverPolicy::End`]): an alarm or a custom tool must
+/// not be able to leave a process holding its output open.
 async fn run_program(
     ws: &Workspace,
     program: &Path,
@@ -1467,6 +1659,7 @@ async fn run_program(
         output_drain_timeout(),
         mem::default_limit(),
         owner,
+        LeftoverPolicy::End,
     )
     .await
 }
@@ -1507,7 +1700,12 @@ pub(crate) async fn run_program_outcome(
             &stdout,
             &stderr,
         ),
-        ShellRunResult::DrainTimedOut { stdout, stderr, .. } => program_outcome(
+        // `ExitedWithLeftovers` cannot come out of `run_program` — a direct run
+        // is always ENDED, never kept ([`LeftoverPolicy::End`]) — but both
+        // outcomes say the same thing here: the run's own exit was observed
+        // while a process it left behind held its output pipes.
+        ShellRunResult::ExitedWithLeftovers { stdout, stderr, .. }
+        | ShellRunResult::EndedWithLeftovers { stdout, stderr, .. } => program_outcome(
             false,
             "output drain overrun — a leftover process held the pipes".to_string(),
             &stdout,
@@ -1577,11 +1775,18 @@ pub(crate) async fn run_program_with_timeout(
             "timeout: {label} did not finish within {DEFAULT_SHELL_TIMEOUT_SECS}s and was killed\n{}",
             program_error_tail(elapsed, &stdout, &stderr),
         )),
-        ShellRunResult::DrainTimedOut {
+        // The same impossibility as `run_program_outcome`: a direct run is
+        // always ended, never kept — both outcomes are reported alike here.
+        ShellRunResult::ExitedWithLeftovers {
             stdout,
             stderr,
             elapsed,
             ..
+        }
+        | ShellRunResult::EndedWithLeftovers {
+            stdout,
+            stderr,
+            elapsed,
         } => Err(anyhow::anyhow!(
             "timeout: {label} exited but a leftover process kept its output pipes open \
              past the drain limit — hint: keep any process the script launches inside its \
@@ -1604,19 +1809,6 @@ pub(crate) async fn run_program_with_timeout(
             "io: cannot run {label}: {e} — hint: the program must exist and be executable"
         )),
     }
-}
-
-/// Append a bracketed note (`[exit status: 3]`, `[ignored arguments: x]`) under
-/// `text` as its own paragraph: the text's trailing whitespace is trimmed so
-/// the note is never preceded by a blank gap, and a run that produced nothing
-/// is left as just the note.
-pub(crate) fn with_note(text: &str, note: &str) -> String {
-    let mut out = text.trim_end().to_string();
-    if !out.is_empty() {
-        out.push_str("\n\n");
-    }
-    out.push_str(note);
-    out
 }
 
 /// Elapsed time plus the scrubbed tails of both streams, for a program run
@@ -1739,52 +1931,80 @@ fn format_memory_error(
     msg
 }
 
-fn format_drain_timeout_error(
-    mode: ShellMode,
-    command: &str,
-    elapsed: Duration,
-    drain_limit: Duration,
-    pid: Option<u32>,
-    stdout: &[u8],
-    stderr: &[u8],
-) -> String {
-    let mut msg = format!(
-        "Shell command output drain timed out.\n\
-         command: {command}\n\
-         elapsed: {:.1}s\n\
-         drain_limit: {:.0}s\n\
-         reason: the command exited but a leftover process kept the output \
-         pipes open past the drain limit, so EOF never arrived",
-        elapsed.as_secs_f64(),
-        drain_limit.as_secs_f64(),
-    );
-    if let Some(p) = pid {
-        // The pid is the run's containment root — what the drain timeout ended —
-        // not the already-reaped command, and it is named in this platform's own
-        // terms: a process group on unix, the process tree of the job on Windows.
-        let scope = match SHELL_PLATFORM {
-            ShellPlatform::Unix => "process group",
-            ShellPlatform::Windows => "process tree",
-        };
-        let _ = write!(msg, "\nkilled {scope}: {p}");
+/// The block appended to a completed command's output when the command exited but
+/// left a process behind that still holds an output channel
+/// ([`ShellRunResult::ExitedWithLeftovers`], the [`LeftoverPolicy::Keep`] path).
+///
+/// It is a NOTE on a completed command, never an error: the command's own exit
+/// status and the output above it are the result, so this block only reports what is
+/// still running and, in the mode that can act on it, how to stop it. Its lead is the
+/// second section of `tool/shell_leftover.md` — moved out of Rust so the asset is the
+/// one statement of it, including the survival bound the held channel gives the
+/// leftover ([`crate::util::leftover_channels`]). `platform` is taken as a value
+/// rather than read from [`SHELL_PLATFORM`] so both platforms' wording is drivable
+/// from any host's tests, and the stop recipe is the platform's own
+/// ([`leftover_stop_recipe`] — on Windows it lists the released root's children
+/// rather than addressing the released pid). The mode's own sentence is the SAME
+/// fragment [`render_leftover_notes`] renders into the tool description
+/// ([`leftover_mode_sentence`]), so no Rust literal can drift from it: Full mode
+/// emits the platform's stop recipe and then that fragment; ReadOnly emits the
+/// fragment alone, because its guard rejects the process-control commands
+/// (`kill`/`pkill`/`killall`, `taskkill`) the recipe names. `leftover_stop_recipe`
+/// stays available for the durable record written into the log store (shown on
+/// Logs → Issues), which is a record rather than guidance.
+fn format_leftover_note(mode: ShellMode, platform: ShellPlatform, scope: Option<u32>) -> String {
+    let mut msg = crate::prompt::load_prompt_sections("tool/shell_leftover.md")
+        .into_iter()
+        .nth(1)
+        .expect("tool/shell_leftover.md carries the note's lead as its second section");
+    // Full mode can stop what it names, so only there does the note carry this
+    // platform's stop recipe; ReadOnly's guard rejects the commands it names.
+    if matches!(mode, ShellMode::Full) {
+        let _ = write!(msg, "\n{}", leftover_stop_recipe(platform, scope));
     }
-    msg.push_str(match mode {
-        // Full mode has the mechanism this error is asking for — point at it
-        // instead of telling the agent it does not exist.
-        ShellMode::Full => {
-            "\nhint: launch long-running processes with `background: true` and \
-             stop them with `stop`, instead of letting a child outlive the command."
-        }
-        ShellMode::ReadOnly => {
-            "\nhint: the tool does not support processes that outlive the command; \
-             keep launched processes inside the command's lifetime. \
-             If background execution is genuinely required, state that in your final response."
-        }
-    });
-
-    append_output_tail(&mut msg, "stdout", stdout);
-    append_output_tail(&mut msg, "stderr", stderr);
+    let _ = write!(msg, "\n{}", leftover_mode_sentence(mode));
     msg
+}
+
+/// The mode's own leftover fragment — [`render_leftover_notes`] renders it into
+/// the tool description and [`format_leftover_note`] appends it to the per-call
+/// note, so one asset serves both and neither can drift from the other.
+fn leftover_mode_sentence(mode: ShellMode) -> String {
+    crate::prompt::load_prompt(match mode {
+        ShellMode::Full => "tool/shell_leftover_full.md",
+        ShellMode::ReadOnly => "tool/shell_leftover_read_only.md",
+    })
+    .trim()
+    .to_owned()
+}
+
+/// A leftover's containment and the way to stop it, in the exact wording Full mode's
+/// note embeds and the durable record's `detail` carries — the identification
+/// line plus the platform's stop command, or the honest unnamed case. Extracted so the
+/// agent's note and the record cannot drift.
+///
+/// The two platforms differ in what `scope` can name. On unix it is the leftover's
+/// process group id and the group still exists while any member lives, so
+/// `kill -TERM -<pgid>` is directly actionable. On Windows it is the pid of the run's
+/// root process, which the caller has already reaped with `child.wait()` by the time
+/// this path is reached — so `taskkill /PID <pid> /T /F` would address a released pid
+/// (failing, or worse, hitting a recycled unrelated tree). Windows records the parent
+/// pid on each child, so the tree left behind is still reachable by parent: the recipe
+/// lists it with `tasklist /FI "PPID eq <pid>"` and stops each listed process instead.
+fn leftover_stop_recipe(platform: ShellPlatform, scope: Option<u32>) -> String {
+    match (scope, platform) {
+        (Some(pid), ShellPlatform::Unix) => {
+            format!("leftover process group: {pid}\nstop it with: kill -TERM -{pid}")
+        }
+        (Some(pid), ShellPlatform::Windows) => format!(
+            "leftover process tree: started by pid {pid}, which has already exited\n\
+             list what it left: tasklist /FI \"PPID eq {pid}\"\n\
+             stop each one: taskkill /PID <listed pid> /T /F"
+        ),
+        (None, _) => "the leftover could not be identified, so it cannot be named for a stop — \
+                      remember it is still running."
+            .to_string(),
+    }
 }
 
 /// Shell command execution tool
@@ -2098,6 +2318,7 @@ impl ShellTool {
                 drain_limit,
                 mem::default_limit(),
                 RunOwner::Agent,
+                LeftoverPolicy::Keep,
             )
             .await
         };
@@ -2112,8 +2333,9 @@ impl ShellTool {
         // hang would otherwise surface it.
         match &mut result {
             ShellRunResult::Completed { stderr, .. }
+            | ShellRunResult::ExitedWithLeftovers { stderr, .. }
+            | ShellRunResult::EndedWithLeftovers { stderr, .. }
             | ShellRunResult::TimedOut { stderr, .. }
-            | ShellRunResult::DrainTimedOut { stderr, .. }
             | ShellRunResult::MemoryExceeded { stderr, .. } => {
                 if exec_str != base.as_ref() {
                     grep_engine::strip_stream_size_marker(stderr);
@@ -2142,8 +2364,10 @@ impl ShellTool {
         // call is refused (the Windows-only exception above), with the engine's
         // own stderr line — where it wrote why it could not serve — as the
         // named cause. There the refusal marker covers the pipe/chain case the
-        // exit status would otherwise mask. Timed-out/drain-timeout/spawn-failed
-        // results are not sentinel cases and keep their own handling below.
+        // exit status would otherwise mask. Timed-out/spawn-failed
+        // results are not sentinel cases and keep their own handling below; a
+        // leftover-holding result carries the command's own exit status and is
+        // read the same way a completed one is.
         //
         // Accepted limit of reading exit 3 as the engine's on both platforms: on
         // Windows that refuses the call, so a SERVED multi-member command whose
@@ -2155,7 +2379,10 @@ impl ShellTool {
         // run's one composed status, never a per-member one, so a member-3 is
         // not told apart from an engine-3 here.
         let engine_failure = match &result {
-            ShellRunResult::Completed { status, stderr, .. } if exec_str != base.as_ref() => {
+            ShellRunResult::Completed { status, stderr, .. }
+            | ShellRunResult::ExitedWithLeftovers { status, stderr, .. }
+                if exec_str != base.as_ref() =>
+            {
                 engine_failure(status.code(), stderr, SHELL_PLATFORM)
             }
             _ => None,
@@ -2188,6 +2415,7 @@ impl ShellTool {
                     drain_limit,
                     mem::default_limit(),
                     RunOwner::Agent,
+                    LeftoverPolicy::Keep,
                 )
                 .await
             }
@@ -2199,7 +2427,8 @@ impl ShellTool {
         // source of truth for grep decisions; this line is observability only.
         if exec_str != base.as_ref() {
             let exit_code = match &result {
-                ShellRunResult::Completed { status, .. } => status.code(),
+                ShellRunResult::Completed { status, .. }
+                | ShellRunResult::ExitedWithLeftovers { status, .. } => status.code(),
                 _ => None,
             };
             tracing::debug!(
@@ -2251,12 +2480,30 @@ impl ShellTool {
         self.write_grep_telemetry(ws, command_str, &grep_serve, served, reason, Some(&result))
             .await;
 
+        // A completed run and one that left a process holding its output are the
+        // same result — the command's own exit status and the output above it.
+        // Only the latter additionally reports the leftover, so its scope is read
+        // off the result before the match consumes it: `Some(None)` is a leftover
+        // whose containment could not be identified (a rewritten plan's, whose
+        // members are separate process groups), which is still a leftover to report.
+        let leftover_scope = match &result {
+            ShellRunResult::ExitedWithLeftovers { scope, .. } => Some(*scope),
+            _ => None,
+        };
+
         match result {
             ShellRunResult::Completed {
                 stdout,
                 stderr,
                 status,
                 elapsed,
+            }
+            | ShellRunResult::ExitedWithLeftovers {
+                stdout,
+                stderr,
+                status,
+                elapsed,
+                ..
             } => {
                 let stdout = decode_and_strip_ansi(&stdout);
                 let stderr = decode_and_strip_ansi(&stderr);
@@ -2280,8 +2527,54 @@ impl ShellTool {
                 } else {
                     with_note(&processed, &exit_note)
                 };
+
+                // A command that exited but left a process behind that still holds
+                // its output channel adds a leftover note on top of this completed
+                // result, and one durable record in the log store (shown on Logs →
+                // Issues). The note is built as
+                // its own step and applied once below, so the call has a single
+                // return and the "finished result plus a leftover note" shape is
+                // visible at a glance.
+                let leftover_note = match leftover_scope {
+                    Some(scope) => {
+                        // The durable record of what outlived the call — the one
+                        // record of the occurrence, shown on Logs → Issues: the
+                        // stop recipe (shown to the agent only in Full mode), the
+                        // containment it names, the run's elapsed time and the
+                        // calling agent's own attribution (see
+                        // [`crate::logs::record_stray_event`]).
+                        let scope_text = scope.map_or_else(String::new, |pid| pid.to_string());
+                        let workspace = ws.as_path().to_string_lossy().into_owned();
+                        crate::logs::record_stray_event(crate::logs::StrayEvent {
+                            source: crate::logs::STRAY_SOURCE_SHELL,
+                            message: "the command exited while a process it left running still held \
+                                      its output channel, so no more of that output could be \
+                                      collected",
+                            recipe: &leftover_stop_recipe(SHELL_PLATFORM, scope),
+                            scope: &scope_text,
+                            session: "",
+                            workspace: &workspace,
+                            duration_ms: Some(crate::util::millis_i64(elapsed)),
+                        })
+                        .await;
+                        Some(format_leftover_note(self.mode, SHELL_PLATFORM, scope))
+                    }
+                    None => None,
+                };
+                let combined = if let Some(note) = leftover_note {
+                    with_note(&combined, &note)
+                } else {
+                    combined
+                };
                 Ok((combined, exit_code))
             }
+            // A run whose tree was ended because a leftover held its output pipes
+            // past the drain limit must never be folded into a finished call.
+            ShellRunResult::EndedWithLeftovers { elapsed, .. } => anyhow::bail!(
+                "Shell command exited but a leftover process held its output pipes open \
+                 past the drain limit; the run's tree was ended (elapsed: {:.1}s)",
+                elapsed.as_secs_f64()
+            ),
             ShellRunResult::TimedOut {
                 stdout,
                 stderr,
@@ -2298,32 +2591,6 @@ impl ShellTool {
                 );
                 let msg =
                     format_timeout_error(command_str, elapsed, timeout, pid, &stdout, &stderr);
-                anyhow::bail!("{msg}");
-            }
-            ShellRunResult::DrainTimedOut {
-                stdout,
-                stderr,
-                pid,
-                elapsed,
-            } => {
-                tracing::info!(
-                    command = command_str,
-                    elapsed_secs = elapsed.as_secs_f64(),
-                    drain_limit_secs = drain_limit.as_secs_f64(),
-                    ?pid,
-                    stdout_bytes = stdout.len(),
-                    stderr_bytes = stderr.len(),
-                    "Shell command output drain timed out — leftover process held the pipes"
-                );
-                let msg = format_drain_timeout_error(
-                    self.mode,
-                    command_str,
-                    elapsed,
-                    drain_limit,
-                    pid,
-                    &stdout,
-                    &stderr,
-                );
                 anyhow::bail!("{msg}");
             }
             ShellRunResult::MemoryExceeded {
@@ -2387,20 +2654,22 @@ impl ShellTool {
         };
         let workspace = ws.as_path().to_string_lossy().into_owned();
         let (duration_ms, exit_code) = match result {
-            Some(ShellRunResult::Completed {
-                elapsed, status, ..
-            }) => (
-                Some(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)),
-                status.code(),
-            ),
+            Some(
+                ShellRunResult::Completed {
+                    elapsed, status, ..
+                }
+                | ShellRunResult::ExitedWithLeftovers {
+                    elapsed, status, ..
+                },
+            ) => (Some(crate::util::millis_i64(*elapsed)), status.code()),
+            // A stopped run and one whose tree was ended for a leftover
+            // ([`LeftoverPolicy::End`], never a tool call's own result) report a
+            // clock and no exit status.
             Some(
                 ShellRunResult::TimedOut { elapsed, .. }
-                | ShellRunResult::DrainTimedOut { elapsed, .. }
-                | ShellRunResult::MemoryExceeded { elapsed, .. },
-            ) => (
-                Some(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)),
-                None,
-            ),
+                | ShellRunResult::MemoryExceeded { elapsed, .. }
+                | ShellRunResult::EndedWithLeftovers { elapsed, .. },
+            ) => (Some(crate::util::millis_i64(*elapsed)), None),
             // A spawn failure has an attempt behind it but no clock to read: the
             // duration is the placeholder zero, and the absent exit status is
             // what marks the row.
@@ -2841,6 +3110,27 @@ fn render_full_mode_notes() -> String {
     )
 }
 
+/// The leftover-process section, rendered in **both** modes: what the agent is
+/// handed when a command exits while a process it started still holds the
+/// command's output channel ([`format_leftover_note`]). It renders ONLY the first
+/// section of `tool/shell_leftover.md` — the shared skeleton that states the note's
+/// own meaning (a FINISHED call whose result is the command's own output and exit
+/// status, the leftover left RUNNING with no further output from it collected, its
+/// containment named where one can be named) — so the description does not grow the
+/// per-call note's lead, which is the asset's second section. The mode's own
+/// sentence closes it: Full mode carries the platform's stop command where the
+/// containment is known and points at the `background: true` / `stop` mechanism,
+/// ReadOnly mode states that this mode has no process control at all. One skeleton,
+/// so the two modes cannot describe the same note differently.
+fn render_leftover_notes(mode: ShellMode) -> String {
+    let mode_sentence = leftover_mode_sentence(mode);
+    let skeleton = crate::prompt::load_prompt_sections("tool/shell_leftover.md")
+        .into_iter()
+        .next()
+        .expect("tool/shell_leftover.md carries the description skeleton as its first section");
+    crate::prompt::substitute(&skeleton, &[("{{mode_sentence}}", &mode_sentence)])
+}
+
 /// This platform's own section — what its tool set is, what the two readers read
 /// differently, how its interpreter is started and how its programs' output is
 /// read back — rendered in **both** modes: none of it is a mode's rule, and an
@@ -2879,14 +3169,15 @@ impl Tool for ShellTool {
         // The base description and the grep-engine disclosure are shared
         // verbatim between the modes (a single copy each, so the two
         // descriptions cannot drift); only the read-only banner, the full-mode
-        // sections (stop semantics included) and the platform-selected texts —
-        // this platform's own rules, the grep notes and the command-line reading —
-        // are mode-/platform-specific.
+        // sections (stop semantics included), the leftover-process section and
+        // the platform-selected texts — this platform's own rules, the grep
+        // notes and the command-line reading — are mode-/platform-specific.
         let base = crate::prompt::load_prompt("tool/shell.md");
         let mut sections: Vec<String> = match self.mode {
             ShellMode::ReadOnly => vec![render_readonly_banner(), base],
             ShellMode::Full => vec![base, render_full_mode_notes()],
         };
+        sections.push(render_leftover_notes(self.mode));
         // A platform with nothing to add is handed the sections it had before this one
         // existed, with no blank line where it would have been.
         if let Some(platform_notes) = render_platform_notes(SHELL_PLATFORM) {
@@ -5473,6 +5764,7 @@ mod tests {
             Duration::from_secs(10),
             mem::default_limit(),
             RunOwner::Agent,
+            LeftoverPolicy::Keep,
         )
         .await;
         match result {
@@ -5508,6 +5800,7 @@ mod tests {
             Duration::from_secs(10),
             mem::default_limit(),
             RunOwner::Agent,
+            LeftoverPolicy::Keep,
         )
         .await;
         match result {
@@ -5545,6 +5838,7 @@ mod tests {
             Duration::from_secs(10),
             mem::default_limit(),
             RunOwner::Agent,
+            LeftoverPolicy::Keep,
         )
         .await;
         let ShellRunResult::TimedOut {
@@ -5663,6 +5957,7 @@ mod tests {
             Duration::from_secs(5),
             Some(CEILING),
             RunOwner::Agent,
+            LeftoverPolicy::Keep,
         )
         .await;
 
@@ -5719,6 +6014,7 @@ mod tests {
             Duration::from_secs(5),
             mem::default_limit(),
             RunOwner::Agent,
+            LeftoverPolicy::Keep,
         )
         .await;
         assert!(
@@ -5747,6 +6043,7 @@ mod tests {
                 Duration::from_secs(5),
                 mem::default_limit(),
                 RunOwner::Agent,
+                LeftoverPolicy::Keep,
             ),
         )
         .await;
@@ -5758,19 +6055,29 @@ mod tests {
         wait_for_death(stopped_grandchild(&pid_path)).await;
     }
 
-    /// A leftover backgrounded process holding the output pipes open must not
-    /// hang the drain after the main command exits — it errors within the
-    /// drain bound, and the leftover process group is killed.
+    /// A leftover process holding the output pipes open past the drain bound is
+    /// not a failure for an agent's command: the run reports the command's own exit
+    /// status, and the leftover is left RUNNING with its channel still open — a
+    /// later write it makes reaches us rather than dying of SIGPIPE on a closed
+    /// read end — while its process group is named for a stop.
     #[cfg(unix)]
     #[tokio::test]
-    async fn output_drain_times_out_when_background_process_holds_pipes() {
+    async fn output_drain_leaves_the_leftover_running_and_its_channel_open() {
         let dir = TempDir::new().expect("tempdir");
         let pid_path = dir.path().join("bg.pid");
+        let marker = dir.path().join("after.txt");
         let pid_path_str = pid_path.to_str().expect("valid utf-8 path");
+        let marker_str = marker.to_str().expect("valid utf-8 path");
 
-        // Main command exits immediately; `sleep 999 &` inherits
-        // stdout/stderr (no redirect), so EOF never arrives after sh exits.
-        let cmd_str = format!("echo before-drain; sleep 999 & echo $! > {pid_path_str}");
+        // Main command exits immediately; the backgrounded subshell inherits
+        // stdout/stderr (no redirect), so EOF never arrives after sh exits. It
+        // writes again well after the run returned: if the read end had been
+        // dropped or the tree ended, that write would fail (SIGPIPE) and the
+        // marker below would never appear.
+        let cmd_str = format!(
+            "echo before-drain; (sleep 1.5; echo after-run; echo done > {marker_str}) & \
+             echo $! > {pid_path_str}"
+        );
         let mut cmd = build_shell_command(&cmd_str, dir.path());
 
         let result = run_command_with_timeout(
@@ -5779,43 +6086,104 @@ mod tests {
             Duration::from_millis(150),
             mem::default_limit(),
             RunOwner::Agent,
+            LeftoverPolicy::Keep,
         )
         .await;
-        let ShellRunResult::DrainTimedOut {
+        let ShellRunResult::ExitedWithLeftovers {
             stdout,
-            stderr,
+            status,
+            scope,
             elapsed,
             ..
         } = result
         else {
-            panic!("expected DrainTimedOut, got {result:?}");
+            panic!("expected ExitedWithLeftovers, got {result:?}");
         };
         let out = String::from_utf8_lossy(&stdout);
         assert!(out.contains("before-drain"), "partial stdout: {out}");
+        assert_eq!(status.code(), Some(0), "the command's own status");
+        assert!(scope.is_some(), "the containment root is named");
         assert!(
             elapsed < Duration::from_secs(5),
-            "drain should error within the bound: {elapsed:?}"
+            "the run must return within the bound: {elapsed:?}"
         );
 
-        let msg = format_drain_timeout_error(
-            ShellMode::ReadOnly,
-            "test",
-            elapsed,
-            Duration::from_millis(150),
-            None,
-            &stdout,
-            &stderr,
-        );
-        assert!(msg.contains("drain"), "msg: {msg}");
-        assert!(msg.contains("before-drain"), "msg: {msg}");
-
-        // The leftover grandchild must be dead (the drain path ends the run's
-        // containment). Poll briefly — SIGKILL delivery + reap is immediate, but
-        // the kernel may lag under load.
+        // The leftover survived the call (it is still in its sleep) ...
         let pid_content = std::fs::read_to_string(&pid_path)
             .expect("grandchild PID file must exist — grandchild was launched");
         let pid: i32 = pid_content.trim().parse().expect("valid PID from file");
-        wait_for_death(pid).await;
+        // SAFETY: signal 0 performs the existence check only.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the leftover must be left running"
+        );
+
+        // ... and the channel on our side stayed open, so its later write
+        // succeeded and it carried on to write the marker.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            marker.exists(),
+            "the leftover's later write must reach the still-open channel"
+        );
+    }
+
+    /// The leftover note is a note on a completed command, phrased in the
+    /// platform's own terms and the mode's — both platforms and both modes are
+    /// drivable from one host, which is why the platform is a value here. The stop
+    /// recipe is Full mode's only: ReadOnly's guard rejects the commands it names.
+    #[test]
+    fn leftover_note_names_the_scope_and_the_platforms_stop_command() {
+        let full_sentence = leftover_mode_sentence(ShellMode::Full);
+        let read_only_sentence = leftover_mode_sentence(ShellMode::ReadOnly);
+
+        let unix = format_leftover_note(ShellMode::Full, ShellPlatform::Unix, Some(1234));
+        assert!(unix.contains("leftover process group: 1234"), "{unix}");
+        assert!(unix.contains("kill -TERM -1234"), "{unix}");
+        // The note carries the very fragment the tool description renders.
+        assert!(unix.contains(&full_sentence), "{unix}");
+        assert!(!unix.contains(&read_only_sentence), "{unix}");
+        assert!(!unix.contains("drain"), "{unix}");
+        assert!(!unix.contains("timed out"), "{unix}");
+
+        // Windows: the run's root pid has already been reaped when this path is
+        // reached, so the recipe lists the tree by parent rather than addressing
+        // the released pid with `taskkill /PID <pid>`.
+        let windows = format_leftover_note(ShellMode::Full, ShellPlatform::Windows, Some(42));
+        assert!(
+            windows.contains("leftover process tree: started by pid 42, which has already exited"),
+            "{windows}"
+        );
+        assert!(
+            windows.contains(r#"tasklist /FI "PPID eq 42""#),
+            "{windows}"
+        );
+        assert!(
+            windows.contains("taskkill /PID <listed pid> /T /F"),
+            "{windows}"
+        );
+        assert!(!windows.contains("taskkill /PID 42"), "{windows}");
+
+        // ReadOnly prints no stop line: the guard this mode runs rejects
+        // `kill`/`pkill`/`killall` (and `taskkill`), so naming one would name a
+        // command the mode refuses. Its own fragment states the limitation instead.
+        let readonly = format_leftover_note(ShellMode::ReadOnly, ShellPlatform::Unix, Some(7));
+        assert!(readonly.contains(&read_only_sentence), "{readonly}");
+        assert!(!readonly.contains(&full_sentence), "{readonly}");
+        assert!(!readonly.contains("background: true"), "{readonly}");
+        assert!(!readonly.contains("kill"), "{readonly}");
+        assert!(!readonly.contains("taskkill"), "{readonly}");
+        let readonly_windows =
+            format_leftover_note(ShellMode::ReadOnly, ShellPlatform::Windows, Some(42));
+        assert!(!readonly_windows.contains("taskkill"), "{readonly_windows}");
+        assert!(!readonly_windows.contains("tasklist"), "{readonly_windows}");
+
+        let unknown = format_leftover_note(ShellMode::Full, ShellPlatform::Unix, None);
+        assert!(unknown.contains("could not be identified"), "{unknown}");
+        assert!(!unknown.contains("kill -TERM"), "{unknown}");
     }
 
     /// Short-lived backgrounded jobs that finish within the drain bound keep
@@ -5831,6 +6199,7 @@ mod tests {
             Duration::from_secs(5),
             mem::default_limit(),
             RunOwner::Agent,
+            LeftoverPolicy::Keep,
         )
         .await;
         let ShellRunResult::Completed { stdout, .. } = result else {
@@ -5840,29 +6209,91 @@ mod tests {
     }
 
     /// A leftover process holding only ONE pipe (stdout EOFs, stderr hangs)
-    /// still drains the completed side and errors without re-polling the
-    /// completed reader (tokio panics on JoinHandle re-poll).
+    /// still reports the completed side and the command's status without
+    /// re-polling the completed reader (tokio panics on JoinHandle re-poll).
     #[cfg(unix)]
     #[tokio::test]
-    async fn output_drain_timeout_keeps_completed_side() {
+    async fn output_drain_keeps_the_completed_side_of_a_leftover() {
         let dir = TempDir::new().expect("tempdir");
         // The backgrounded sleep redirects stdout (releasing the shell's
-        // stdout pipe → EOF) but inherits stderr, keeping it open forever.
-        let mut cmd = build_shell_command("echo out; sleep 999 >/dev/null &", dir.path());
+        // stdout pipe → EOF) but inherits stderr, keeping it open past the bound.
+        let mut cmd = build_shell_command("echo out; sleep 1.5 >/dev/null &", dir.path());
         let result = run_command_with_timeout(
             &mut cmd,
             Duration::from_secs(30),
             Duration::from_millis(150),
             mem::default_limit(),
             RunOwner::Agent,
+            LeftoverPolicy::Keep,
         )
         .await;
-        let ShellRunResult::DrainTimedOut { stdout, .. } = result else {
-            panic!("expected DrainTimedOut, got {result:?}");
+        let ShellRunResult::ExitedWithLeftovers { stdout, status, .. } = result else {
+            panic!("expected ExitedWithLeftovers, got {result:?}");
         };
+        assert_eq!(status.code(), Some(0));
         assert!(
             String::from_utf8_lossy(&stdout).contains("out"),
             "completed stdout side must be preserved: {stdout:?}"
+        );
+    }
+
+    /// The [`LeftoverPolicy::End`] path — the program paths' — ends the run's tree
+    /// at the drain bound: the leftover holder is killed, and the result is the
+    /// failure those callers report ([`ShellRunResult::EndedWithLeftovers`]).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_end_policy_kills_the_leftover_holder() {
+        let dir = TempDir::new().expect("tempdir");
+        let pid_path = dir.path().join("bg.pid");
+        let pid_path_str = pid_path.to_str().expect("valid utf-8 path");
+        let cmd_str = format!("echo before-end; sleep 5 & echo $! > {pid_path_str}");
+        let mut cmd = build_shell_command(&cmd_str, dir.path());
+
+        let result = run_command_with_timeout(
+            &mut cmd,
+            Duration::from_secs(30),
+            Duration::from_millis(150),
+            mem::default_limit(),
+            RunOwner::Agent,
+            LeftoverPolicy::End,
+        )
+        .await;
+        let ShellRunResult::EndedWithLeftovers { stdout, .. } = result else {
+            panic!("expected EndedWithLeftovers, got {result:?}");
+        };
+        assert!(
+            String::from_utf8_lossy(&stdout).contains("before-end"),
+            "the output collected up to the bound is the failure's to report: {stdout:?}"
+        );
+
+        let pid_content = std::fs::read_to_string(&pid_path)
+            .expect("grandchild PID file must exist — grandchild was launched");
+        let pid: i32 = pid_content.trim().parse().expect("valid PID from file");
+        wait_for_death(pid).await;
+    }
+
+    /// A command that exited 0 but left a process holding its output is a SUCCESS
+    /// through the tool: its own output plus a labelled leftover note, never a
+    /// drain error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_that_exited_0_with_a_leftover_is_a_success() {
+        let _env = set_env_var("MAHBOT_SHELL_DRAIN_TIMEOUT_SECS", Some("1"));
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = test_ws(tmp.path());
+
+        let (output, code) = ShellTool::new(ShellMode::Full)
+            .execute_with_status(&ws, json!({"command": "echo out; sleep 1.5 &"}))
+            .await
+            .expect("a completed command is not a tool error");
+
+        assert_eq!(code, Some(0), "the command's own status: {output}");
+        assert!(output.contains("out"), "output: {output}");
+        assert!(output.contains("[leftover process]"), "output: {output}");
+        assert!(output.contains("kill -TERM -"), "output: {output}");
+        assert!(
+            !output.contains("drain"),
+            "never the drain error on a finished command: {output}"
         );
     }
 
@@ -6788,8 +7219,10 @@ mod tests {
     /// replacement value. Each skeleton must keep exactly the keys its renderer
     /// supplies — a stray one would render literally into every agent's
     /// description. The renderers pick the fragment through `SHELL_PLATFORM`, or
-    /// (the command-line notes) through the mode, so a typo in a key would
-    /// otherwise panic on that platform's host only.
+    /// (the command-line notes and the leftover notes) through the mode, so a typo
+    /// in a key would otherwise panic on that platform's host only. The leftover
+    /// skeleton is sectioned instead: its second section is the per-call note's own
+    /// lead, rendered with no substitution at all, so it must carry no key.
     #[test]
     fn platform_prompt_assets_are_embedded() {
         for (skeleton, keys, fragments) in [
@@ -6841,6 +7274,15 @@ mod tests {
                 ]
                 .as_slice(),
             ),
+            (
+                "tool/shell_leftover.md",
+                ["{{mode_sentence}}"].as_slice(),
+                [
+                    "tool/shell_leftover_full.md",
+                    "tool/shell_leftover_read_only.md",
+                ]
+                .as_slice(),
+            ),
         ] {
             let shared = crate::prompt::load_prompt(skeleton);
             let mut rest = shared.clone();
@@ -6854,6 +7296,18 @@ mod tests {
                 assert!(!text.contains("{{"), "{asset} carries a placeholder");
             }
         }
+        // The leftover skeleton is split into sections: the first is what the tool
+        // description renders (its one key supplied by the renderer), the second the
+        // per-call note's lead, which takes no key at all — only section 0 is
+        // substituted, so an unrendered key there would reach the agent literally.
+        let leftover = crate::prompt::load_prompt_sections("tool/shell_leftover.md");
+        assert_eq!(leftover.len(), 2, "tool/shell_leftover.md lost a section");
+        assert!(leftover[0].contains("{{mode_sentence}}"), "{leftover:?}");
+        assert!(
+            !leftover[1].contains("{{"),
+            "the note lead carries an unrendered key: {}",
+            leftover[1]
+        );
     }
 
     /// The Windows section of the shell description's own notes, in `mode`: the
@@ -6999,6 +7453,60 @@ mod tests {
         // The platform whose interpreter already separates at a break is handed no
         // such section at all.
         assert!(render_command_line_notes(ShellPlatform::Unix, ShellMode::Full).is_none());
+    }
+
+    /// The leftover-process section reaches the agent in both modes, each mode's own
+    /// sentence and no other's: a mode handed the other's fragment would promise a
+    /// mechanism its runs do not have (or deny the one they do), and the section is
+    /// not platform-selected, so a mode that dropped it would leave the note's own
+    /// meaning unstated. A fragment that exists but is never rendered — or a sentence
+    /// the skeleton wrote twice, which `substitute` would replace twice — fails here
+    /// rather than reaching the agent, and the rendering is asserted to be the very
+    /// text both modes' descriptions carry.
+    #[test]
+    fn the_leftover_notes_name_each_modes_own_mechanism() {
+        let full = render_leftover_notes(ShellMode::Full);
+        let read_only = render_leftover_notes(ShellMode::ReadOnly);
+        let full_sentence = crate::prompt::load_prompt("tool/shell_leftover_full.md")
+            .trim()
+            .to_owned();
+        let read_only_sentence = crate::prompt::load_prompt("tool/shell_leftover_read_only.md")
+            .trim()
+            .to_owned();
+        assert_eq!(full.matches(&full_sentence).count(), 1, "{full}");
+        assert_eq!(
+            read_only.matches(&read_only_sentence).count(),
+            1,
+            "{read_only}"
+        );
+        assert!(!full.contains(&read_only_sentence), "{full}");
+        assert!(!read_only.contains(&full_sentence), "{read_only}");
+        // The note's own meaning is stated in both modes: a FINISHED call whose own
+        // output and exit status are the result, with the leftover named and left RUNNING.
+        for rendered in [&full, &read_only] {
+            assert!(!rendered.contains("{{"), "{rendered}");
+            for sentence in ["FINISHED", "RUNNING"] {
+                assert!(rendered.contains(sentence), "{sentence}: {rendered}");
+            }
+        }
+        // The mechanism each mode may name: Full mode points at the supported way to
+        // keep a process running; ReadOnly mode has none to point at.
+        for sentence in ["background: true", "`stop`"] {
+            assert!(full.contains(sentence), "{sentence}: {full}");
+        }
+        assert!(!read_only.contains("background: true"), "{read_only}");
+        // Both descriptions carry the section — a fragment that exists but is never
+        // rendered fails here.
+        for (mode, notes) in [
+            (ShellMode::Full, full.as_str()),
+            (ShellMode::ReadOnly, read_only.as_str()),
+        ] {
+            let description = ShellTool::new(mode).description();
+            assert!(
+                description.contains(notes.trim()),
+                "each mode's description must carry its leftover notes"
+            );
+        }
     }
 
     /// This platform's asset named `tool/shell_{stem}_{platform}.md`, and the other

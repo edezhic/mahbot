@@ -10,10 +10,11 @@
 //! stdout is exactly ONE line of JSON (the [`OutEnvelope`]); stderr carries
 //! human-readable diagnostics. Exit codes follow the contract: 0 success,
 //! 1 site/data step failure (schedulable), 2 environment failure (fix the
-//! environment, don't blind-retry), 3 usage error. Every step timeout is
-//! enforced MAHBOT-side via [`CliTimeout::Bounded`]. The wait action never
-//! exposes `--load`; its one raw-argv use is `open`'s internal best-effort
-//! post-navigation settle.
+//! environment, don't blind-retry), 3 usage error. Every step runs to the two
+//! clocks the [chrome policy](crate::chrome) defines — chrome-use's clock,
+//! declared to it, and the product's own kill above that — as [`StepClocks`]
+//! derives them for this surface. The wait action never exposes `--load`; its one
+//! raw-argv use is `open`'s internal best-effort post-navigation settle.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -24,9 +25,11 @@ use std::time::{Duration, Instant};
 use crate::chrome::actions;
 use crate::chrome::contract::{
     ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, ErrorPageProbe, ExpectOutcome,
-    OutEnvelope, OutKind, classify_call_failure, eval_count, eval_result, expect_outcome,
-    extract_net_error_code, extract_output, extract_snapshot_text, is_session_unresponsive_error,
-    is_unreachable_tab_error, net_error_phrase, parse_error_page_probe, sanitize_timeout_message,
+    OutEnvelope, OutKind, chrome_leftover_pipe_note, chrome_use_warning, classify_call_failure,
+    eval_count, eval_result, expect_outcome, extract_net_error_code, extract_output,
+    extract_snapshot_text, is_session_unresponsive_error, is_unreachable_tab_error,
+    net_error_phrase, parse_error_page_probe, parse_first, sanitize_timeout_message,
+    self_launched_browser_error, self_launched_browser_note, truncated_output_error,
     unreachable_tab_message, with_condition_timeout_note,
 };
 use crate::chrome::forms::{
@@ -36,73 +39,187 @@ use crate::chrome::forms::{
 };
 use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
 use crate::chrome::{
-    CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX, DEADLINE_SLACK, DEFAULT_OPEN_TIMEOUT,
-    is_blank_page_url, validate_url,
+    CHROME_USE_DECLARED_BUDGET, CHROME_USE_OWN_BUDGET, CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX,
+    ChromeCallClocks, CliRecovery, DEFAULT_OPEN_TIMEOUT, DEFAULT_STEP_TIMEOUT, KILL_SLACK,
+    SESSION_STOP_TIMEOUT, clocks, is_blank_page_url, kill_bound, probe_clocks, validate_url,
 };
 use crate::tools::chrome_daemon::{
-    CliStatus, chrome_running, cli_path, cli_probe, cli_version, display_available, relay_up,
+    CliStatus, SessionRecovery, cli_path, cli_probe, cli_version, ensure_ready_for_actions,
+    readiness, recover_unresponsive_session,
 };
 use crate::util::{TOOL_OUTPUT_BUDGET_BYTES, truncate_sandwich};
 use serde_json::{Value, json};
 
-/// Default step timeout (8 s) — every step uses it unless `--timeout` is given.
-/// `open` defaults higher: [`DEFAULT_OPEN_TIMEOUT`] (whole-operation budget).
-const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(8);
+/// Product-side bound on the daemon-free `session list` enumerate `session
+/// status` opens with: it only asks the daemon what sessions exist (it never
+/// drives the browser), so a probe bound well under chrome-use's own budget is
+/// what the product wants there — the relay self-heal would be pure waste.
+const SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// `session stop` bound: one stop waits out the session daemon's shutdown grace
-/// (8 s on the installed CLI) and then reconnects to reclaim the tabs the session
-/// created under chrome-use's own 20 s — the ≈28 s end to end the live-verified
-/// behaviours in [`crate::tools::chrome_daemon`] state. The 8 s default step bound
-/// would cut that off with a misleading timeout, which describes the commoner case —
-/// a stop cut off while it was still legitimately reclaiming its tabs — not just the
-/// narrower race in which it had already succeeded. The bound is therefore the 60 s
-/// the ended-run release gives one attempt (`chrome_release`'s
-/// `RELEASE_ATTEMPT_TIMEOUT`) — a bit over twice the worst case, and the same number,
-/// so the two cannot drift apart. At 25 s it fell ~3 s short of that worst case.
-const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// `session status` probe bound: a real command against the named session, so
-/// chrome-use's own session-unresponsive classification has room to fire
-/// (its AGENT_BROWSER_DEFAULT_TIMEOUT is 15s) instead of the CLI preempting it.
-/// Opt-in — never part of the default per-command path.
+/// `session status` probe bound: the product's own bounded liveness question —
+/// "does the session answer at all" — so it deliberately does not wait out
+/// chrome-use's own client tolerance, and declares that same short bound to
+/// chrome-use ([`probe_clocks`]) rather than a longer one it would never let run.
+/// A session that does not answer within it is [`Liveness::Unresponsive`] to
+/// [`probe_session_liveness`]. Opt-in — never part of the default per-command path.
 const SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The recovery flow for a wedged named session — the single source for both
-/// hint surfaces ([`with_session_wedge_hint`] and
-/// [`named_session_timeout_hint`]) so a wording change only happens here.
-/// References only verbs that exist in the mahbot surface.
+/// The manual recovery flow for a wedged named session — named only where the
+/// automatic recovery did not confirm or never started a stop
+/// ([`wedge_recovery_note`]). References only verbs that exist in the mahbot
+/// surface.
 const SESSION_RECOVERY_FLOW: &str = "`mahbot chrome session stop <name>`, then re-run the action with \
      `--session <name>` to re-create it (cookies persist in the profile; open \
      tabs do not)";
 
-/// The session-wedge remediation appended by [`StepFailure::envelope`] to an
-/// Environment-classified chrome-use message that reads as a session wedge
-/// (matched by [`is_session_unresponsive_error`]); any other kind or message
-/// is returned unchanged. Gated on `named`: the `<name>` recovery verbs are
-/// only actionable for a session the agent chose (the interactive tool runs
-/// its own per-run sessions with daemon auto-recovery, so the CLI-only verbs
-/// would mislead there anyway).
-fn with_session_wedge_hint(kind: OutKind, message: &str, named: bool) -> String {
-    if named && kind == OutKind::Environment && is_session_unresponsive_error(message) {
-        format!(
-            "{message} — wedged: recover with {SESSION_RECOVERY_FLOW}. \
-             Probe first with `mahbot chrome session status <name>` if unsure."
-        )
-    } else {
-        message.to_string()
+/// The sentence appended to a wedge-shaped envelope: what the automatic recovery
+/// did, or — where the stop was only issued and not confirmed, or never started —
+/// the manual flow that remains. Shares the recovery summary with the tool so the
+/// two surfaces cannot drift.
+fn wedge_recovery_note(recovery: SessionRecovery) -> String {
+    match recovery {
+        SessionRecovery::Stopped => recovery.summary().to_string(),
+        SessionRecovery::Unanswered | SessionRecovery::NotStarted => {
+            // The summary itself says what happened (the stop was issued and
+            // keeps running, or none could be started); what is appended is only
+            // the manual flow left to the caller.
+            format!(
+                "{} If it is still wedged, recover with {SESSION_RECOVERY_FLOW}.",
+                recovery.summary()
+            )
+        }
     }
 }
 
-/// Appended to Timeout failures on a NAMED session: the CLI's own deadline
-/// preempts chrome-use's session-unresponsive diagnostic, so a wedged session
-/// surfaces as a generic per-command timeout. Factual hint only — no
-/// automatic recovery (a slow site would thrash). Shares the recovery flow
-/// with [`with_session_wedge_hint`] so the two hint surfaces cannot drift.
-fn named_session_timeout_hint() -> String {
-    format!(
-        " — a wedged session can also time out on every command; probe it with \
-         `mahbot chrome session status <name>`, or recover with {SESSION_RECOVERY_FLOW}."
+/// What [`recover_session_wedge`] should do for one envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WedgeAction {
+    /// chrome-use's own session-unresponsive verdict: recover directly.
+    Recover,
+    /// The product's own clock ended the step: confirm liveness first, so a
+    /// merely slow site never costs its session.
+    Probe,
+    /// No wedge evidence: leave the session (and the envelope) alone.
+    Leave,
+}
+
+/// The wedge fact is WHO ended the step, not the envelope's kind on its own.
+/// chrome-use's own session-unresponsive classification is a diagnosis, so it
+/// recovers directly. A deadline-expiration label — Timeout, or the Redesign
+/// `open --expect --structural` gives a deadline expiration — counts only when
+/// the PRODUCT's own clock ended the step ([`CLI_STEP_KILLED_BY_CLOCK`]): only
+/// then was chrome-use cut off before it could classify anything, leaving the
+/// session's liveness genuinely unknown, whereas the same labels also carry
+/// chrome-use's own honest timeout verdicts. Every other failure is left alone —
+/// a failed `expect` / `open --expect` / `wait` produces a Timeout as its normal
+/// verdict, and neither it nor an unprobed error may stop a session and lose its
+/// tabs. Ephemeral sessions are left to the caller's own cleanup (the `<name>`
+/// verbs are unactionable for them).
+///
+/// Pure so tests pin the keying.
+#[must_use]
+fn wedge_action(env: &OutEnvelope, named: bool, killed_by_clock: bool) -> WedgeAction {
+    if !named {
+        return WedgeAction::Leave;
+    }
+    if env.kind == OutKind::Environment
+        && envelope_error(env).is_some_and(is_session_unresponsive_error)
+    {
+        return WedgeAction::Recover;
+    }
+    if matches!(env.kind, OutKind::Timeout | OutKind::Redesign) && killed_by_clock {
+        return WedgeAction::Probe;
+    }
+    WedgeAction::Leave
+}
+
+/// The envelope's `error` text, when it carries one.
+fn envelope_error(env: &OutEnvelope) -> Option<&str> {
+    env.payload.get("error").and_then(Value::as_str)
+}
+
+/// Append a sentence to an envelope's `error` text; a no-op when it carries none.
+fn append_error_note(env: &mut OutEnvelope, note: &str) {
+    if let Some(obj) = env.payload.as_object_mut()
+        && let Some(err) = obj.get("error").and_then(Value::as_str)
+    {
+        obj.insert("error".into(), json!(format!("{err} — {note}")));
+    }
+}
+
+/// Recover a wedge the envelope points at (bounded) and put what was done into
+/// its error text (see [`wedge_action`] for which envelopes count). An ephemeral
+/// session is left to the caller's own cleanup, and a session the agent chose is
+/// the only one whose recovery text can name the manual flow.
+async fn recover_session_wedge(
+    env: &mut OutEnvelope,
+    session: &str,
+    named: bool,
+    killed_by_clock: bool,
+) {
+    let note = match wedge_action(env, named, killed_by_clock) {
+        WedgeAction::Leave => return,
+        WedgeAction::Recover => wedge_recovery_note(recover_unresponsive_session(session).await),
+        WedgeAction::Probe => {
+            // The product's own kill preempted chrome-use's verdict, so the wedge
+            // is only a candidate: confirm it with the same bounded `get url`
+            // liveness probe the `session status` verb uses.
+            match probe_session_liveness(session).await {
+                Liveness::Unresponsive => {
+                    wedge_recovery_note(recover_unresponsive_session(session).await)
+                }
+                Liveness::Answered => {
+                    "The session answered a liveness probe, so this was a slow call rather than a \
+                     wedged session."
+                        .to_string()
+                }
+                Liveness::Inconclusive => {
+                    "The session's liveness could not be established, so its daemon was left \
+                     alone; retry the call, and stop the session by hand if it stays \
+                     unresponsive."
+                        .to_string()
+                }
+            }
+        }
+    };
+    append_error_note(env, &note);
+}
+
+/// What one bounded liveness probe of a named session established.
+#[derive(Debug, Clone, Copy)]
+enum Liveness {
+    /// The session produced a normal answer: it is alive, so a clock-killed step
+    /// was a slow call rather than a wedge.
+    Answered,
+    /// No answer within [`SESSION_PROBE_TIMEOUT`]: the session is wedged.
+    Unresponsive,
+    /// The probe could not be run, or its outcome could not be established (no
+    /// binary, spawn failure, unparseable envelope): nothing was learned about
+    /// the session, so nothing is recovered on its account.
+    Inconclusive,
+}
+
+/// Bounded liveness probe of a named session (read-only `get url`, the probe the
+/// `session status` verb uses). [`Liveness::Inconclusive`] is deliberately not
+/// [`Liveness::Answered`] and not [`Liveness::Unresponsive`]: a probe that could
+/// not run answers nothing about the session, so its daemon is left alone.
+async fn probe_session_liveness(session: &str) -> Liveness {
+    let Some(path) = cli_path() else {
+        return Liveness::Inconclusive;
+    };
+    match spawn_step(
+        &path,
+        &["get", "url"],
+        Some(session),
+        StepClocks::probe(SESSION_PROBE_TIMEOUT),
+        None,
     )
+    .await
+    {
+        Ok(_) => Liveness::Answered,
+        Err(f) if f.kind == OutKind::Timeout => Liveness::Unresponsive,
+        Err(_) => Liveness::Inconclusive,
+    }
 }
 
 /// Top-level `mahbot chrome -h` — rendered from the shared action registry.
@@ -125,7 +242,7 @@ fn top_help() -> String {
     }
     out.push_str("\nGlobal flags:\n");
     out.push_str(
-        "  --session <name>   use/name a session (not valid for status / session subcommands)\n\n",
+        "  --session <name>   use/name a session — letters, digits, '-' or '_' only (not valid for status / session subcommands)\n\n",
     );
     out.push_str("Output (stdout, one JSON line):\n");
     out.push_str(
@@ -165,7 +282,7 @@ fn action_help(name: &str) -> String {
     if cli.session {
         flag_rows.push((
             "--session <name>",
-            "use/name a session (not valid for status / session subcommands)",
+            "use/name a session — letters, digits, '-' or '_' only (not valid for status / session subcommands)",
         ));
     }
     if !flag_rows.is_empty() {
@@ -221,6 +338,16 @@ struct Invocation {
 }
 
 /// One parsed `mahbot chrome` action.
+///
+/// `timeout` on `Open`/`Wait`/`Expect` is the deadline the action declares for
+/// the step (the user's `--timeout`, or the action's own default — forwarded to
+/// chrome-use for wait/expect, and for `open` the budget that bounds the waits the
+/// operation drives); `bound` on the rest is the user's own `--timeout`, or `None`
+/// when they gave none — those verbs forward no `--timeout` chrome-use honours, so
+/// their clock is the one mahbot declares to chrome-use (its own client tolerance
+/// less the 2 s margin), a bound below that clock is REFUSED as a usage error
+/// (nothing could honour it) and a longer one widens only the product's own kill
+/// (see [`StepClocks`]).
 enum Action {
     Status,
     Open {
@@ -231,7 +358,7 @@ enum Action {
     },
     Count {
         selector: String,
-        timeout: Duration,
+        bound: Option<Duration>,
     },
     Wait {
         target: WaitTarget,
@@ -243,34 +370,34 @@ enum Action {
     },
     Eval {
         js: String,
-        timeout: Duration,
+        bound: Option<Duration>,
     },
     Extract {
         schema_file: String,
         limit: Option<usize>,
-        timeout: Duration,
+        bound: Option<Duration>,
     },
     Click {
         selector: String,
         if_present: bool,
-        timeout: Duration,
+        bound: Option<Duration>,
     },
     Fill {
         selector: String,
         source: TextInput,
-        timeout: Duration,
+        bound: Option<Duration>,
     },
     Type {
         selector: String,
         text: String,
         key_events: bool,
-        timeout: Duration,
+        bound: Option<Duration>,
     },
     Press {
         key: String,
         selector: Option<String>,
         hold: Option<u64>,
-        timeout: Duration,
+        bound: Option<Duration>,
     },
     SessionStop {
         name: String,
@@ -279,6 +406,28 @@ enum Action {
     SessionStatus {
         name: String,
     },
+}
+
+impl Action {
+    /// The shared-registry name of this action — the envelope's `action` field
+    /// and the help lookup key. The `session` subcommands emit under
+    /// `"session"`, the word the owner typed.
+    fn name(&self) -> &'static str {
+        match self {
+            Action::Status => "status",
+            Action::Open { .. } => "open",
+            Action::Count { .. } => "count",
+            Action::Wait { .. } => "wait",
+            Action::Expect { .. } => "expect",
+            Action::Eval { .. } => "eval",
+            Action::Extract { .. } => "extract",
+            Action::Click { .. } => "click",
+            Action::Fill { .. } => "fill",
+            Action::Type { .. } => "type",
+            Action::Press { .. } => "press",
+            Action::SessionStop { .. } | Action::SessionStatus { .. } => "session",
+        }
+    }
 }
 
 /// Where `fill` gets its text.
@@ -304,26 +453,27 @@ impl TextInput {
 }
 
 /// A failed chrome-use step: the classified [`OutKind`] plus the error text
-/// (empty for a mahbot-side deadline kill). `named` marks a step that ran in
-/// a named (non-ephemeral) session — it gates the session-wedge remediation
-/// hint, whose `session status/stop <name>` verbs are only actionable for a
-/// session the agent chose.
+/// (empty for a mahbot-side deadline kill). The session-wedge recovery and its
+/// text are applied after dispatch (see [`recover_session_wedge`]) — the one
+/// place the resolved session name is in scope.
 #[derive(Debug)]
 struct StepFailure {
     kind: OutKind,
     message: String,
-    named: bool,
 }
 
 impl StepFailure {
     /// The failure envelope for `action`, layering the failure detail onto
-    /// `base` params: a deadline kill reports `timeout_ms` plus a factual
-    /// `error`; any other failure reports the chrome-use `error` text with
-    /// the accurate remediation layered on (unreachable-tab guidance, or the
-    /// session-wedge hint for named sessions), and Network failures carry the
-    /// extracted net error token as `error_code` when the message contains
-    /// one.
-    fn envelope(self, action: &str, base: Value, timeout: Duration) -> OutEnvelope {
+    /// `base` params: a deadline kill reports `timeout_ms` (the product's own
+    /// bound for the step — its kill) plus a factual `error` that says the
+    /// product's own bound ended the call and which clock chrome-use was working
+    /// to; any other failure reports the chrome-use `error` text with the
+    /// accurate remediation layered on (unreachable-tab guidance), and Network
+    /// failures carry the extracted net error token as `error_code` when the
+    /// message contains one. The session-wedge recovery and its text are applied
+    /// later, where the session name is known (see
+    /// [`recover_session_wedge`]).
+    fn envelope(self, action: &str, base: Value, clocks: StepClocks) -> OutEnvelope {
         let mut obj = match base {
             Value::Object(m) => m,
             other => {
@@ -333,16 +483,20 @@ impl StepFailure {
             }
         };
         if self.kind == OutKind::Timeout && self.message.is_empty() {
-            obj.insert("timeout_ms".into(), json!(timeout.as_millis()));
+            obj.insert("timeout_ms".into(), json!(clocks.call.kill.as_millis()));
             obj.insert(
                 "error".into(),
-                json!(deadline_error(timeout, "the step did not complete")),
+                json!(deadline_error(
+                    clocks.call.chrome_side,
+                    clocks.call.kill,
+                    "the step did not complete"
+                )),
             );
         } else {
             let message = if is_unreachable_tab_error(&self.message) {
                 unreachable_tab_message(&self.message)
             } else {
-                with_session_wedge_hint(self.kind, &self.message, self.named)
+                self.message.clone()
             };
             obj.insert("error".into(), json!(message));
         }
@@ -364,10 +518,41 @@ type StepOutcome = Result<ChromeResponse, StepFailure>;
 /// any spawn attempt. Never read before `run_cli` resets it.
 static CHROME_USE_SPAWNED: AtomicBool = AtomicBool::new(false);
 
+/// Whether any chrome-use step this process ran exited while a process it left
+/// behind still held the step's output channel
+/// ([`CliOutput::leftover_pipes`]) — including the ephemeral close's own spawn,
+/// whose envelope is already out, so [`run_cli`] reports that leftover on stderr.
+/// The CLI handles ONE invocation per process, so this is the invocation's whole
+/// record; `dispatch` turns a step's leftover into a note on the envelope
+/// ([`chrome_leftover_pipe_note`]) — on a failure too — and never into a failure.
+/// Never read before `run_cli` resets it.
+static CHROME_USE_LEFTOVER_PIPES: AtomicBool = AtomicBool::new(false);
+
+/// Whether the PRODUCT's own clock ended a step whose outcome IS the caller's
+/// verdict ([`CliRun::TimedOut`]) ABOVE the clock chrome-use itself was working
+/// to — the step's kill rode above its `chrome_side` (every step declares that
+/// clock to chrome-use through `AGENT_BROWSER_DEFAULT_TIMEOUT`, see
+/// [`crate::chrome::spawn::apply_chrome_side`]). chrome-use was then cut off
+/// before it could classify anything, so what a named session's liveness is
+/// remains unknown to it, which is exactly what [`recover_session_wedge`] keys
+/// on. ONE rule decides the mark, applied where the step ends ([`spawn_step`]):
+/// only a step that may run chrome-use's relay self-heal
+/// ([`CliRecovery::Allowed`]) attributes anything, and only when its kill sat
+/// above that `chrome_side`. The product's own probes and the operation's
+/// best-effort sub-steps are [`CliRecovery::Suppressed`] — the product bounds
+/// them on purpose and their outcome never becomes the envelope — so they can
+/// never attribute. [`dispatch`] resets the mark before the action and reads it
+/// right after the action returns; a later step of a composite operation cannot
+/// erase an earlier decisive step's mark, and the wedge probe's own steps cannot
+/// leak into it.
+static CLI_STEP_KILLED_BY_CLOCK: AtomicBool = AtomicBool::new(false);
+
 /// `mahbot chrome` CLI entry — returns the process exit code.
 pub async fn run_cli(args: &[String]) -> i32 {
     // Re-enterable pub API: clear the previous call's spawn bookkeeping.
     CHROME_USE_SPAWNED.store(false, Ordering::Relaxed);
+    CHROME_USE_LEFTOVER_PIPES.store(false, Ordering::Relaxed);
+    CLI_STEP_KILLED_BY_CLOCK.store(false, Ordering::Relaxed);
     if let Some(a) = args.first()
         && (a == "-h" || a == "--help")
     {
@@ -401,7 +586,14 @@ pub async fn run_cli(args: &[String]) -> i32 {
     if let Some(s) = session.as_ref().filter(|s| s.ephemeral)
         && CHROME_USE_SPAWNED.load(Ordering::Relaxed)
     {
+        // The close runs after the envelope is emitted, so a helper it leaves
+        // behind cannot be noted in it — it is reported here, like every other
+        // diagnostic of that close.
+        CHROME_USE_LEFTOVER_PIPES.store(false, Ordering::Relaxed);
         close_ephemeral(&s.name).await;
+        if CHROME_USE_LEFTOVER_PIPES.load(Ordering::Relaxed) {
+            eprintln!("mahbot chrome: {}", chrome_leftover_pipe_note(&s.name));
+        }
     }
     envelope.kind.exit_code()
 }
@@ -480,12 +672,14 @@ fn extract_global_session(args: &[String]) -> Result<(Option<String>, Vec<String
             let val = args
                 .get(i)
                 .ok_or_else(|| "missing value for --session".to_string())?;
+            validate_session_name(val)?;
             session = Some(val.clone());
             i += 1;
         } else if let Some(val) = a.strip_prefix("--session=") {
             if val.is_empty() {
                 return Err("missing value for --session".to_string());
             }
+            validate_session_name(val)?;
             session = Some(val.to_string());
             i += 1;
         } else {
@@ -646,7 +840,7 @@ fn parse_open(
             url,
             expect: flags.value("expect").map(String::from),
             structural: flags.has("structural"),
-            timeout: parse_timeout_flag(&flags, DEFAULT_OPEN_TIMEOUT)?,
+            timeout: parse_forwarded_timeout(&flags)?.unwrap_or(DEFAULT_OPEN_TIMEOUT),
         },
         session: session.map(String::from),
     })
@@ -664,7 +858,7 @@ fn parse_count(
     Ok(Invocation {
         action: Action::Count {
             selector,
-            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
+            bound: parse_bound_timeout(&flags)?,
         },
         session: session.map(String::from),
     })
@@ -686,7 +880,7 @@ fn parse_wait(
     Ok(Invocation {
         action: Action::Wait {
             target,
-            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
+            timeout: parse_forwarded_timeout(&flags)?.unwrap_or(DEFAULT_STEP_TIMEOUT),
         },
         session: session.map(String::from),
     })
@@ -703,7 +897,7 @@ fn parse_expect(
     Ok(Invocation {
         action: Action::Expect {
             cond,
-            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
+            timeout: parse_forwarded_timeout(&flags)?.unwrap_or(DEFAULT_STEP_TIMEOUT),
         },
         session: session.map(String::from),
     })
@@ -834,7 +1028,7 @@ fn parse_eval(
     Ok(Invocation {
         action: Action::Eval {
             js,
-            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
+            bound: parse_bound_timeout(&flags)?,
         },
         session: session.map(String::from),
     })
@@ -858,7 +1052,7 @@ fn parse_extract(
         action: Action::Extract {
             schema_file,
             limit: parse_limit_flag(&flags)?,
-            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
+            bound: parse_bound_timeout(&flags)?,
         },
         session: session.map(String::from),
     })
@@ -877,7 +1071,7 @@ fn parse_click(
         action: Action::Click {
             selector,
             if_present: flags.has("if-present"),
-            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
+            bound: parse_bound_timeout(&flags)?,
         },
         session: session.map(String::from),
     })
@@ -908,7 +1102,7 @@ fn parse_fill(
         action: Action::Fill {
             selector,
             source,
-            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
+            bound: parse_bound_timeout(&flags)?,
         },
         session: session.map(String::from),
     })
@@ -935,7 +1129,7 @@ fn parse_type(
             selector,
             text,
             key_events: flags.has("key-events"),
-            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
+            bound: parse_bound_timeout(&flags)?,
         },
         session: session.map(String::from),
     })
@@ -966,7 +1160,7 @@ fn parse_press(
             key,
             selector: flags.value("selector").map(String::from),
             hold,
-            timeout: parse_timeout_flag(&flags, DEFAULT_STEP_TIMEOUT)?,
+            bound: parse_bound_timeout(&flags)?,
         },
         session: session.map(String::from),
     })
@@ -989,6 +1183,7 @@ fn parse_session(
             let (value_flags, bool_flags) = allowed;
             let (positionals, flags) = parse_flags(&rest[1..], value_flags, bool_flags)?;
             let name = take_positional(&positionals, 0, "name")?;
+            validate_session_name(&name)?;
             reject_extra_positionals(&positionals, 1)?;
             Ok(Invocation {
                 action: Action::SessionStop {
@@ -1005,6 +1200,7 @@ fn parse_session(
                 return Err("--force is not valid for session status".to_string());
             }
             let name = take_positional(&positionals, 0, "name")?;
+            validate_session_name(&name)?;
             reject_extra_positionals(&positionals, 1)?;
             Ok(Invocation {
                 action: Action::SessionStatus { name },
@@ -1031,7 +1227,67 @@ fn reject_extra_positionals(positionals: &[String], expected: usize) -> Result<(
     Ok(())
 }
 
-fn parse_timeout_flag(flags: &Flags, default: Duration) -> Result<Duration, String> {
+/// The value of a forwarded `--timeout` — the deadline this verb IS given
+/// (`wait`, `expect`, and `open`, whose `--expect` wait forwards its remaining
+/// budget), so chrome-use honours it in full. A value at or above chrome-use's own
+/// client tolerance ([`CHROME_USE_OWN_BUDGET`]) is refused: chrome-use cannot work
+/// past that tolerance, so a deadline at it makes the tool run out of tolerance
+/// instead of reporting its own reason, and its session-unresponsive verdict
+/// (which stops the session and loses its tabs) replaces the honest one. At least
+/// 1 s, and `None` when the user gave no `--timeout` (the verb's own default then
+/// applies at its parse site).
+fn parse_forwarded_timeout(flags: &Flags) -> Result<Option<Duration>, String> {
+    let Some(secs) = parse_timeout_secs(flags)? else {
+        return Ok(None);
+    };
+    if secs >= CHROME_USE_OWN_BUDGET.as_secs() {
+        return Err(format!(
+            "--timeout {secs}s is at or above chrome-use's own client tolerance ({}s): \
+             chrome-use cannot work past it, so a deadline that long makes it run out of \
+             tolerance instead of reporting its own reason, and its session-unresponsive \
+             verdict replaces the honest one. Use less than {}s.",
+            CHROME_USE_OWN_BUDGET.as_secs(),
+            CHROME_USE_OWN_BUDGET.as_secs()
+        ));
+    }
+    Ok(Some(Duration::from_secs(secs)))
+}
+
+/// The value of a bound `--timeout` — every verb chrome-use takes no per-call
+/// deadline for (count, eval, extract, click, fill, type, press). Nothing can make
+/// chrome-use give up earlier on those, so a bound below the clock the product
+/// declares to chrome-use ([`CHROME_USE_DECLARED_BUDGET`]) CANNOT be honoured: it
+/// is refused as a usage error rather than accepted and silently discarded. A
+/// bound at or above that clock is accepted — the call is never cut off below it,
+/// and above the clock it widens the product's own kill
+/// ([`StepClocks::tool_clock`]) — and `None` (no flag) leaves the call at the
+/// declared clock.
+fn parse_bound_timeout(flags: &Flags) -> Result<Option<Duration>, String> {
+    let Some(secs) = parse_timeout_secs(flags)? else {
+        return Ok(None);
+    };
+    let declared = CHROME_USE_DECLARED_BUDGET.as_secs();
+    if secs < declared {
+        return Err(format!(
+            "--timeout {secs}s cannot be honoured: chrome-use takes no per-call deadline for this \
+             verb, so the call runs to the {declared}s clock mahbot declares to chrome-use and \
+             mahbot never cuts the call off below it — the reported bound would not be the one you \
+             asked for. Give at least {declared}s (that is the shortest bound the call can be given), \
+             or omit --timeout. `wait`/`expect` — and `open`'s --expect wait — are the verbs that \
+             forward a deadline chrome-use honours in full."
+        ));
+    }
+    Ok(Some(Duration::from_secs(secs)))
+}
+
+/// The user's own `--timeout` in seconds, or `None` when they gave none — the one
+/// seconds parser behind [`parse_forwarded_timeout`] and [`parse_bound_timeout`],
+/// which the parse sites call by name. There is deliberately no per-step default
+/// any more: a step's declared clock is [`CHROME_USE_DECLARED_BUDGET`] unless the
+/// verb forwards a deadline chrome-use honours in full (`wait`/`expect`), and the
+/// actions that declare a deadline of their own (`wait`, `expect`, `open`) apply
+/// their default at their parse site.
+fn parse_timeout_secs(flags: &Flags) -> Result<Option<u64>, String> {
     match flags.value("timeout") {
         Some(v) => {
             let secs: u64 = v
@@ -1040,9 +1296,9 @@ fn parse_timeout_flag(flags: &Flags, default: Duration) -> Result<Duration, Stri
             if secs < 1 {
                 return Err("--timeout must be at least 1 second".to_string());
             }
-            Ok(Duration::from_secs(secs))
+            Ok(Some(secs))
         }
-        None => Ok(default),
+        None => Ok(None),
     }
 }
 
@@ -1063,6 +1319,9 @@ fn parse_limit_flag(flags: &Flags) -> Result<Option<usize>, String> {
 /// Resolve the session name and whether it is ephemeral: a named `--session`
 /// becomes `mahbot-chrome-<name>` (idempotent for an already-prefixed name);
 /// no flag yields an ephemeral `mahbot-chrome-ephemeral-<suffix>` session.
+///
+/// The flag's own value is validated at extraction ([`extract_global_session`]),
+/// so a name reaching here is already a plain identifier.
 fn resolve_session(flag: Option<&str>) -> (String, bool) {
     match flag {
         Some(name) => {
@@ -1084,10 +1343,35 @@ fn resolve_session(flag: Option<&str>) -> (String, bool) {
 /// the interactive tool's per-run sessions and link enrichment's sessions.
 const PROTECTED_SESSION_PREFIXES: [&str; 2] = ["agent-tab-", "link-enricher-"];
 
+/// Validate a caller-supplied session name. The name becomes part of a command
+/// recipe the agent is told to run (`mahbot chrome session stop <name> --force`
+/// in a leftover note), so it is restricted to the plain identifier the tool
+/// mints for its own sessions; anything else is a usage error rather than a
+/// name that could turn that recipe into a different command. The alphabet is
+/// chrome-use's own (`validation::is_valid_session_name`: alphanumerics, '-' and
+/// '_'): a '.' is refused, because chrome-use refuses it on `session stop` — a
+/// name the product accepted but chrome-use will not stop is a session that can
+/// be neither cleared by hand nor recovered, its daemon and tabs left behind.
+fn validate_session_name(name: &str) -> Result<(), String> {
+    let plain = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    if plain {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid session name {name:?} — use letters, digits, '-' or '_'"
+        ))
+    }
+}
+
 /// Resolve a session name for a session-word subcommand. A bare name is
 /// treated as a CLI session name and prefixed (consistent with `--session`);
 /// CLI-namespace and protected-namespace names pass through as-is (status may
 /// probe protected sessions read-only; only stop gates them behind --force).
+/// The name is validated when the invocation is parsed
+/// ([`validate_session_name`]).
 fn resolve_session_target(name: &str) -> String {
     if name.starts_with(CLI_SESSION_PREFIX)
         || PROTECTED_SESSION_PREFIXES
@@ -1116,14 +1400,78 @@ fn resolve_stop_target(name: &str, force: bool) -> Result<String, String> {
 
 // ── Dispatch ─────────────────────────────────────────────────────
 
+/// The pure argument checks the pre-action arm runs BEFORE the readiness gate:
+/// the usage errors an action can answer without probing anything, so they are
+/// never buried under an environment refusal. Only checks that are pure and
+/// already exist inside the action live here — `open`'s URL and `--expect`
+/// validation, which `open` re-runs for real.
+fn validate_action_args(action: &Action) -> Option<OutEnvelope> {
+    let Action::Open { url, expect, .. } = action else {
+        return None;
+    };
+    open_args(url, expect.as_deref()).err()
+}
+
 async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) {
     match &invocation.action {
-        Action::Status => (status().await, None),
-        Action::SessionStop { name, force } => (session_stop(name, *force).await, None),
-        Action::SessionStatus { name } => (session_status(name).await, None),
+        Action::Status => (stamped(status()).await, None),
+        Action::SessionStop { name, force } => (stamped(session_stop(name, *force)).await, None),
+        Action::SessionStatus { name } => (stamped(session_status(name)).await, None),
         action => {
-            let (name, ephemeral) = resolve_session(invocation.session.as_deref());
+            // The action's own clock: every envelope this arm returns — refusals
+            // included — is stamped with it (see [`stamp_elapsed`]).
             let started = Instant::now();
+            // The session this action runs in, resolved first so the argument
+            // refusal below carries it like every other action envelope.
+            let (name, ephemeral) = resolve_session(invocation.session.as_deref());
+            // Pure argument checks come next: a malformed URL or `--expect`
+            // selector is a usage error whatever the environment looks like, so
+            // it is answered as one, without a readiness probe that could bury
+            // the precise usage error under an environment refusal (see
+            // [`validate_action_args`]).
+            if let Some(mut refusal) = validate_action_args(action) {
+                surface_session(&mut refusal, &name);
+                stamp_elapsed(&mut refusal, started);
+                return (refusal, None);
+            }
+            // The pre-action gate: no action is dispatched until the connection
+            // to the owner's REAL browser is established, so the work can never
+            // quietly land in a browser chrome-use launches itself. The
+            // probe/cleanup verbs (`status`, `session …`) run before this arm and
+            // are deliberately not gated — they are what reports and repairs.
+            //
+            // A missing helper is its own case, checked BEFORE the gate: the
+            // gate's refusal is about a connection it cannot even probe, so
+            // running it (and its recovery pass) would answer an absent helper
+            // with the long speculative readiness refusal instead of this
+            // precise missing-install report — the same envelope `require_cli`
+            // builds.
+            if cli_path().is_none() {
+                let error = "chrome-use CLI not found";
+                eprintln!("mahbot chrome: {error}");
+                let mut env = env_failure(action.name(), json!({}), error);
+                // As in the readiness refusal below, the resolved session is
+                // surfaced like every other action envelope's.
+                surface_session(&mut env, &name);
+                stamp_elapsed(&mut env, started);
+                return (env, None);
+            }
+            if let Err(refusal) = ensure_ready_for_actions().await {
+                eprintln!("mahbot chrome: {refusal}");
+                let mut env = out_env(
+                    action.name(),
+                    false,
+                    OutKind::Environment,
+                    json!({ "error": refusal }),
+                );
+                // The refused action's session is surfaced like every other
+                // action envelope's, so a swallowed or defaulted `--session` is
+                // observable here too.
+                surface_session(&mut env, &name);
+                stamp_elapsed(&mut env, started);
+                return (env, None);
+            }
+            CLI_STEP_KILLED_BY_CLOCK.store(false, Ordering::Relaxed);
             let mut env = match action {
                 Action::Open {
                     url,
@@ -1131,56 +1479,81 @@ async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) 
                     structural,
                     timeout,
                 } => open(url, expect.as_deref(), *structural, *timeout, &name).await,
-                Action::Count { selector, timeout } => count(selector, *timeout, &name).await,
+                Action::Count { selector, bound } => count(selector, *bound, &name).await,
                 Action::Wait { target, timeout } => wait(target, *timeout, &name).await,
                 Action::Expect { cond, timeout } => expect(cond, *timeout, &name).await,
-                Action::Eval { js, timeout } => eval(js, *timeout, &name).await,
+                Action::Eval { js, bound } => eval(js, *bound, &name).await,
                 Action::Extract {
                     schema_file,
                     limit,
-                    timeout,
-                } => extract(schema_file, *limit, *timeout, &name).await,
+                    bound,
+                } => extract(schema_file, *limit, *bound, &name).await,
                 Action::Click {
                     selector,
                     if_present,
-                    timeout,
-                } => click(selector, *if_present, *timeout, &name).await,
+                    bound,
+                } => click(selector, *if_present, *bound, &name).await,
                 Action::Fill {
                     selector,
                     source,
-                    timeout,
-                } => fill(selector, source, *timeout, &name).await,
+                    bound,
+                } => fill(selector, source, *bound, &name).await,
                 Action::Type {
                     selector,
                     text,
                     key_events,
-                    timeout,
-                } => r#type(selector, text, *key_events, *timeout, &name).await,
+                    bound,
+                } => r#type(selector, text, *key_events, *bound, &name).await,
                 Action::Press {
                     key,
                     selector,
                     hold,
-                    timeout,
-                } => press(key, selector.as_deref(), *hold, *timeout, &name).await,
+                    bound,
+                } => press(key, selector.as_deref(), *hold, *bound, &name).await,
                 Action::Status | Action::SessionStop { .. } | Action::SessionStatus { .. } => {
                     unreachable!("handled by the outer match")
                 }
             };
+            // Read the kill attribution before ANY recovery call — hygiene
+            // only: the wedge probe's own steps are probes
+            // ([`CliRecovery::Suppressed`]), so they cannot re-attribute this
+            // action's ending.
+            let killed_by_clock = CLI_STEP_KILLED_BY_CLOCK.load(Ordering::Relaxed);
             // Surface the resolved session (named or defaulted ephemeral) so
             // a swallowed or silently defaulted `--session` is always
             // observable in the envelope.
             surface_session(&mut env, &name);
-            // Deadline-expiration kinds carry the observed wall time alongside
-            // the declared `timeout_ms` (redesign is open's `--structural`
-            // deadline-expiration label).
-            if matches!(env.kind, OutKind::Timeout | OutKind::Redesign)
-                && let Some(obj) = env.payload.as_object_mut()
-            {
-                obj.insert("elapsed_ms".into(), json!(started.elapsed().as_millis()));
+            // The call's own wall time rides every envelope this arm returns — a
+            // failing call's duration is read straight off it — while
+            // `timeout_ms` (the declared/kill bound) stays a separate fact.
+            stamp_elapsed(&mut env, started);
+            // A process chrome-use left behind still holding a step's output
+            // channel is a NOTE whatever the call's own outcome — also on a
+            // failure: the call finished, its exit status and output are the
+            // answer, and the leftover was started deliberately and is left
+            // running. It sits alongside `error` and never changes the kind or
+            // the exit code.
+            if CHROME_USE_LEFTOVER_PIPES.load(Ordering::Relaxed) {
+                surface_leftover_note(&mut env, &name);
             }
-            append_named_session_timeout_hint(&mut env, step_named(Some(&name)));
+            // A session that stopped answering is RECOVERED here — the one place
+            // the resolved session name is in scope — and the envelope's error
+            // text says what was done ([`recover_session_wedge`]). `named` is the
+            // resolution's own answer, not re-derived from the name.
+            recover_session_wedge(&mut env, &name, !ephemeral, killed_by_clock).await;
             (env, Some(CliSession { name, ephemeral }))
         }
+    }
+}
+
+/// Insert the leftover-helper note as a top-level envelope field on the result —
+/// success or failure (the payload is flattened, so a payload key is a top-level
+/// stdout key, sitting alongside `error`). The note names the chrome-use session
+/// the call drove, so it is built from the resolved session name
+/// ([`chrome_leftover_pipe_note`]).
+fn surface_leftover_note(env: &mut OutEnvelope, name: &str) {
+    if let Some(obj) = env.payload.as_object_mut() {
+        obj.insert("leftover".into(), json!(chrome_leftover_pipe_note(name)));
     }
 }
 
@@ -1194,39 +1567,146 @@ fn surface_session(env: &mut OutEnvelope, name: &str) {
     }
 }
 
-/// Append the named-session timeout hint to a Timeout envelope. `named` is
-/// [`step_named`] on the resolved session name — the same predicate that
-/// gates the wedge hint in [`with_session_wedge_hint`], so the two surfaces
-/// agree on every input. The CLI's own deadline preempts chrome-use's
-/// session-unresponsive diagnostic, so a wedged named session otherwise
-/// surfaces as a bare timeout — the factual hint leaves it recoverable (rc
-/// stays 1, hint only; no automatic recovery, a slow site would thrash).
-fn append_named_session_timeout_hint(env: &mut OutEnvelope, named: bool) {
-    if env.kind == OutKind::Timeout
-        && named
-        && let Some(obj) = env.payload.as_object_mut()
-        && let Some(err) = obj.get("error").and_then(Value::as_str).map(str::to_string)
-    {
-        let hint = named_session_timeout_hint();
-        obj.insert("error".into(), json!(format!("{err}{hint}")));
+/// Stamp one action envelope with how long the call took, from the instant the
+/// action's own clock started. Every envelope of an action that RAN carries it —
+/// a success, a failure of any kind, and an argument/environment refusal alike —
+/// because a call's duration is a fact about the call itself, not something a
+/// reader should have to infer or time for itself; the one envelope without it is
+/// the usage refusal of a command line that never parsed ([`run_cli`]), where no
+/// action ever started. `timeout_ms`, the declared or killed bound, stays a
+/// separate fact.
+fn stamp_elapsed(env: &mut OutEnvelope, started: Instant) {
+    if let Some(obj) = env.payload.as_object_mut() {
+        obj.insert("elapsed_ms".into(), json!(started.elapsed().as_millis()));
     }
+}
+
+/// [`stamp_elapsed`] around one of the diagnostic/control verbs, whose calls the
+/// dispatch arm does not clock itself.
+async fn stamped<F: std::future::Future<Output = OutEnvelope>>(f: F) -> OutEnvelope {
+    let started = Instant::now();
+    let mut env = f.await;
+    stamp_elapsed(&mut env, started);
+    env
 }
 
 // ── Step runner ──────────────────────────────────────────────────
 
-/// Run one chrome-use step, bounded by `timeout`. `session` scopes the call
-/// via `--session`; `None` leaves the call session-unscoped (`session stop`
-/// names its session via the positional instead). `input` pipes a stdin
-/// payload (only `fill --stdin` uses one). `chrome_deadline` sets the
-/// chrome-use-side deadline for verbs without a `--timeout` flag (i.e.
-/// `open`); verbs that forward `--timeout` pass `None`.
+/// The clocks one CLI step runs to. The two-clock rule itself — which clock is
+/// declared to chrome-use, and where the product's own kill rides — is
+/// [the chrome policy](crate::chrome)'s; each constructor below states which
+/// shape a step of this surface takes. A product-side kill reports the product's
+/// own bound for the step — its `kill` — as the envelope's `timeout_ms`.
+#[derive(Debug, Clone, Copy)]
+struct StepClocks {
+    /// The two clocks of this step ([`crate::chrome::ChromeCallClocks`]).
+    call: ChromeCallClocks,
+    /// Whether chrome-use's own relay self-heal may run inside this step.
+    recovery: CliRecovery,
+}
+
+impl StepClocks {
+    /// Assemble a step's clocks from the declared deadline and the recovery
+    /// policy bound ONCE for the step — the derived pair plus that same binding,
+    /// so a step's kill and the policy it spawns with can never disagree.
+    fn of(declared: Option<Duration>, recovery: CliRecovery) -> Self {
+        Self {
+            call: clocks(declared, recovery),
+            recovery,
+        }
+    }
+
+    /// `wait`/`expect`: the step forwards its declared deadline as `--timeout`,
+    /// which chrome-use honours in full, so the declared value IS the
+    /// chrome-side clock; its relay self-heal is allowed.
+    fn forwarded(deadline: Duration) -> Self {
+        Self::of(Some(deadline), CliRecovery::Allowed)
+    }
+
+    /// Every other agent-facing verb (click, count, eval, extract, fill, type,
+    /// press): the step forwards no `--timeout` chrome-use
+    /// honours, so [`CHROME_USE_DECLARED_BUDGET`] — one [`KILL_SLACK`] under
+    /// chrome-use's own client tolerance — is the clock it is given.
+    /// `own_bound` is the caller's `--timeout`, which [`parse_bound_timeout`]
+    /// accepts only at or above that clock (a shorter one is refused there:
+    /// chrome-use takes no per-call deadline for these verbs, so nothing could
+    /// honour it). A larger bound is one the PRODUCT must really let the call run
+    /// to, so it widens the kill alone: chrome-use cannot work past its own
+    /// tolerance, and declaring a larger deadline to it would make it run out of
+    /// that tolerance and fail as a wedged session instead of reporting its own
+    /// reason (see [the chrome policy](crate::chrome)). The reported `timeout_ms`
+    /// is then the bound the call really ran to, never one it was killed below.
+    /// Its relay self-heal is allowed.
+    fn tool_clock(own_bound: Option<Duration>) -> Self {
+        let recovery = CliRecovery::Allowed;
+        let bound = own_bound.unwrap_or(CHROME_USE_DECLARED_BUDGET);
+        Self {
+            call: ChromeCallClocks {
+                chrome_side: CHROME_USE_DECLARED_BUDGET,
+                kill: kill_bound(bound, recovery),
+            },
+            recovery,
+        }
+    }
+
+    /// The composite operation's OWN step (the `open` navigation): chrome-use
+    /// runs it to its own client tolerance — it neither reads nor honours a
+    /// `--timeout` for `open`'s navigate — so the clock declared to it is
+    /// [`CHROME_USE_DECLARED_BUDGET`] and the kill is
+    /// [`crate::chrome::kill_bound`] above it; its relay self-heal is allowed.
+    /// The operation's budget is deliberately NOT a kill bound here: a navigation
+    /// chrome-use was still working on must be allowed to report its own reason,
+    /// so the operation may legitimately outlive `--timeout`.
+    fn operation() -> Self {
+        Self::of(None, CliRecovery::Allowed)
+    }
+
+    /// A step of an operation the product bounds itself: `bound` is the
+    /// product-side budget for the step, `chrome_side` the clock declared to
+    /// chrome-use. It is a probe in everything but name (see the
+    /// [chrome policy](crate::chrome)): it declares `chrome_side` honestly to
+    /// chrome-use, suppresses the relay self-heal, and its kill rides
+    /// [`KILL_SLACK`] above `bound` ([`kill_bound`]) — so a product bound, never
+    /// chrome-use's verdict, is what ends it. Its failure never fails the
+    /// operation. Every one of the operation's best-effort sub-steps (the
+    /// error-page probe, the post-navigation settle, the content capture) takes this
+    /// shape.
+    fn bounded(chrome_side: Duration, bound: Duration) -> Self {
+        let recovery = CliRecovery::Suppressed;
+        Self {
+            call: ChromeCallClocks {
+                chrome_side,
+                kill: kill_bound(bound, recovery),
+            },
+            recovery,
+        }
+    }
+
+    /// The product's own probe (`session stop`, `session status`, the ephemeral
+    /// close): `bound` IS the kill and [`probe_clocks`] declares that same bound to
+    /// chrome-use — capped at [`CHROME_USE_DECLARED_BUDGET`] for a probe whose own
+    /// bound sits above it, as the `session stop` paths do — and its relay self-heal
+    /// is suppressed: the documented exception, where the product reports "the tool
+    /// did not answer" instead of spending the recovery window.
+    fn probe(bound: Duration) -> Self {
+        let recovery = CliRecovery::Suppressed;
+        Self {
+            call: probe_clocks(bound),
+            recovery,
+        }
+    }
+}
+
+/// Run one chrome-use step under `clocks` and classify its output. `session`
+/// scopes the call via `--session`; `None` leaves the call session-unscoped
+/// (`session stop` names its session via the positional instead). `input` pipes
+/// a stdin payload (only `fill --stdin` uses one).
 async fn spawn_step(
     path: &Path,
     args: &[&str],
     session: Option<&str>,
-    timeout: Duration,
+    clocks: StepClocks,
     input: Option<&[u8]>,
-    chrome_deadline: Option<Duration>,
 ) -> StepOutcome {
     // A session-scoped spawn attempt may materialize the ephemeral session
     // (a vanished-binary race still sets this; the close attempt is then a
@@ -1234,23 +1714,18 @@ async fn spawn_step(
     if session.is_some() {
         CHROME_USE_SPAWNED.store(true, Ordering::Relaxed);
     }
-    let failed = |kind: OutKind, message: String| {
-        Err(StepFailure {
-            kind,
-            message,
-            named: false,
-        })
-    };
-    let mut outcome = match spawn_cli(CliSpawn {
+    let failed = |kind: OutKind, message: String| Err(StepFailure { kind, message });
+    match spawn_cli(CliSpawn {
         path,
         args,
         session,
         json: true,
         capture_stderr: true,
-        timeout: CliTimeout::Bounded(timeout),
+        timeout: CliTimeout::Bounded(clocks.call.kill),
         cancel_kills: true,
         input: input.map(<[u8]>::to_vec),
-        chrome_deadline,
+        chrome_side: clocks.call.chrome_side,
+        recovery: clocks.recovery,
     })
     .await
     {
@@ -1258,28 +1733,43 @@ async fn spawn_step(
             OutKind::Environment,
             "chrome-use CLI could not be spawned/found".to_string(),
         ),
-        CliRun::TimedOut => Err(StepFailure {
-            kind: OutKind::Timeout,
-            message: String::new(),
-            named: false,
-        }),
-        CliRun::Output(out) => classify_step_output(
-            args.first() == Some(&"expect"),
-            out.status.code(),
-            out.status.success(),
-            &out.stdout,
-            String::from_utf8_lossy(&out.stderr).trim(),
-        ),
-    };
-    if let Err(f) = &mut outcome {
-        f.named = step_named(session);
+        CliRun::TimedOut => {
+            // The product's own clock ended this step. That is wedge evidence
+            // only when the step's outcome IS the caller's verdict
+            // ([`CliRecovery::Allowed`]) and its kill rode above the clock
+            // chrome-use itself was working to: every step declares that clock
+            // to chrome-use (as `AGENT_BROWSER_DEFAULT_TIMEOUT`), so a kill above
+            // it means the tool did not answer its own deadline. A step the
+            // product bounds itself (probes and the operation's best-effort
+            // sub-steps) is [`CliRecovery::Suppressed`] and can never attribute
+            // (see [`CLI_STEP_KILLED_BY_CLOCK`]).
+            if matches!(clocks.recovery, CliRecovery::Allowed)
+                && clocks.call.kill > clocks.call.chrome_side
+            {
+                CLI_STEP_KILLED_BY_CLOCK.store(true, Ordering::Relaxed);
+            }
+            Err(StepFailure {
+                kind: OutKind::Timeout,
+                message: String::new(),
+            })
+        }
+        CliRun::Output(out) => {
+            // The child's exit decides the step; a process it left behind holding
+            // the output channel is recorded here and reported as a NOTE on the
+            // envelope, never as a failure (see [`chrome_leftover_pipe_note`]).
+            // OR-ed, not stored: a composite operation runs several steps, and one
+            // step's clean finish must not erase an earlier step's leftover.
+            CHROME_USE_LEFTOVER_PIPES.fetch_or(out.leftover_pipes, Ordering::Relaxed);
+            classify_step_output(
+                args.first() == Some(&"expect"),
+                out.truncated,
+                out.status.code(),
+                out.status.success(),
+                &out.stdout,
+                String::from_utf8_lossy(&out.stderr).trim(),
+            )
+        }
     }
-    outcome
-}
-
-/// Whether a spawned step ran in a named (non-ephemeral) session.
-fn step_named(session: Option<&str>) -> bool {
-    session.is_some_and(|s| !s.starts_with(CLI_EPHEMERAL_PREFIX))
 }
 
 /// Classify one chrome-use output (the `CliRun::Output` payload) into a step
@@ -1287,21 +1777,21 @@ fn step_named(session: Option<&str>) -> bool {
 /// action whose `--json` envelope can succeed on a non-zero exit — a failed
 /// assertion arrives as `success:true` with exit 1, the verdict riding in
 /// `data` — so envelope-success is trusted over the exit code there and
-/// nowhere else.
+/// nowhere else. `truncated` is the product's own flag
+/// ([`crate::chrome::spawn::CliOutput::truncated`]): whenever there is no parsed
+/// envelope — whatever the exit status — an answer the product cut off names
+/// itself rather than reading as chrome-use's malformed output. The parse is the
+/// shared tolerant one ([`crate::chrome::contract::parse_first`]), so trailing
+/// bytes a leftover process wrote after the envelope are ignored.
 fn classify_step_output(
     expect_style: bool,
+    truncated: bool,
     exit_code: Option<i32>,
     status_success: bool,
     stdout: &[u8],
     stderr: &str,
 ) -> StepOutcome {
-    let failed = |kind: OutKind, message: String| {
-        Err(StepFailure {
-            kind,
-            message,
-            named: false,
-        })
-    };
+    let failed = |kind: OutKind, message: String| Err(StepFailure { kind, message });
     // Fallback message for a non-success exit / unparseable stdout.
     let fallback = || fallback_step_message(exit_code, stderr);
     let classified = |resp: ChromeResponse| {
@@ -1313,34 +1803,55 @@ fn classify_step_output(
         let kind = classify_call_failure(code.as_deref(), &msg);
         failed(kind, sanitize_timeout_message(kind, &msg))
     };
-    let parsed: Option<ChromeResponse> = serde_json::from_slice(stdout).ok();
+    let parsed: Option<ChromeResponse> = parse_first::<ChromeResponse>(stdout);
     if !status_success {
-        if expect_style && parsed.as_ref().is_some_and(ChromeResponse::is_success) {
-            return Ok(parsed.expect("success checked"));
-        }
-        return if let Some(resp) = parsed {
-            classified(resp)
-        } else {
-            // The stderr fallback can also carry a timeout phrasing plus the
-            // canned hint (chrome-use prints diagnostics there when stdout is
-            // non-JSON), so it is classified and sanitized too.
-            let msg = fallback();
-            let kind = classify_call_failure(None, &msg);
-            failed(kind, sanitize_timeout_message(kind, &msg))
+        return match parsed {
+            Some(resp) if expect_style && resp.is_success() => {
+                self_launched_failure(&resp).map_or(Ok(resp), Err)
+            }
+            Some(resp) => classified(resp),
+            None if truncated => failed(OutKind::Error, truncated_output_error()),
+            None => {
+                // The stderr fallback can also carry a timeout phrasing plus the
+                // canned hint (chrome-use prints diagnostics there when stdout is
+                // non-JSON), so it is classified and sanitized too.
+                let msg = fallback();
+                let kind = classify_call_failure(None, &msg);
+                failed(kind, sanitize_timeout_message(kind, &msg))
+            }
         };
     }
     match parsed {
-        Some(resp) if resp.is_success() => Ok(resp),
+        Some(resp) if resp.is_success() => self_launched_failure(&resp).map_or(Ok(resp), Err),
         Some(resp) => classified(resp),
         None => failed(
             OutKind::Error,
-            if stderr.is_empty() {
+            if truncated {
+                truncated_output_error()
+            } else if stderr.is_empty() {
                 "chrome-use returned non-JSON output".to_string()
             } else {
                 stderr.to_string()
             },
         ),
     }
+}
+
+/// A successful step whose envelope carries chrome-use's browser-replacement
+/// note is a plain failure, never a quiet success: the command ran in a browser
+/// chrome-use launched ITSELF rather than the owner's real one, so the page state
+/// the caller assumed is not there and nothing it read or wrote happened in the
+/// owner's session.
+///
+/// Classified [`OutKind::Environment`] (rc 2 — fix the environment rather than
+/// blind-retry), and deliberately NOT the daemon-down path: the daemon and the
+/// relay may be healthy, and only the connection to the real browser was lost, so
+/// daemon health is left untouched and auto-recovery is not woken.
+fn self_launched_failure(resp: &ChromeResponse) -> Option<StepFailure> {
+    self_launched_browser_note(resp).map(|note| StepFailure {
+        kind: OutKind::Environment,
+        message: self_launched_browser_error(&note),
+    })
 }
 
 #[must_use]
@@ -1413,8 +1924,19 @@ fn require_cli(action: &str, params: Value) -> Result<std::path::PathBuf, OutEnv
     cli_path().ok_or_else(|| env_failure(action, params, "chrome-use CLI not found"))
 }
 
-/// `status` — pure preflight: RAW probes only (never `evaluate_health`, never
-/// Chrome auto-launch, no environment mutation).
+/// `status` — pure preflight: the readiness report and RAW probes only (never
+/// Chrome auto-launch, no environment mutation, no recovery — only the on-demand
+/// verbs and the pre-action gate recover).
+///
+/// It reports what WAS established about the owner's real browser
+/// ([`crate::tools::chrome_daemon::Readiness::report`]) rather than a list of raw
+/// probes, and states the machine-readable `verdict` it amounts to: `ready`
+/// (rc 0), `blocked` (rc 2 — a fact established the connection cannot work), or
+/// `not-proven` (rc 0 — nothing could be established either way, and the
+/// pre-action gate would still dispatch an action). A CLI that cannot state its
+/// version is rc 2 as well. The `chrome_use`, `relay_up`, `chrome_running` and
+/// `display` keys stay for scripts that read them — the last three as the raw
+/// tri-state facts of the same snapshot the report renders.
 async fn status() -> OutEnvelope {
     // One `--version` spawn in the happy path: a parsed version proves the
     // CLI is available; `cli_probe` only re-runs to classify WHY it didn't.
@@ -1429,38 +1951,59 @@ async fn status() -> OutEnvelope {
             },
         },
     };
-    let relay_up = relay_up().await;
-    let chrome_running = chrome_running().await;
-    let display = display_available();
-
-    let mut failures: Vec<String> = Vec::new();
-    if !version_ok {
-        failures.push(format!("chrome-use CLI: {chrome_use}"));
-    }
-    match relay_up {
-        Some(true) => {}
-        Some(false) => failures.push("extension relay is down".to_string()),
-        None => failures.push("extension relay is unknown".to_string()),
-    }
-    match chrome_running {
-        Some(true) => {}
-        Some(false) => failures.push("Chrome is not running".to_string()),
-        None => failures.push("Chrome running is unknown".to_string()),
-    }
-    if !display {
-        failures.push("no usable display".to_string());
-    }
+    // One bounded, daemon-free readiness snapshot (cached for HEALTH_TTL), every
+    // fact tri-state — including the display fact, taken from the snapshot
+    // instead of re-probed here.
+    let readiness = readiness().await;
 
     let mut payload = serde_json::Map::new();
     payload.insert("chrome_use".into(), json!(chrome_use));
-    payload.insert("relay_up".into(), json!(relay_up));
-    payload.insert("chrome_running".into(), json!(chrome_running));
-    payload.insert("display".into(), json!(display));
+    payload.insert("relay_up".into(), json!(readiness.relay_up));
+    payload.insert("chrome_running".into(), json!(readiness.chrome_running));
+    payload.insert("display".into(), json!(readiness.display));
+    payload.insert(
+        "ready_for_actions".into(),
+        json!(readiness.ready_for_actions()),
+    );
+    // The three-way state in one word, so a machine read does not have to infer
+    // it from the report text: `ready` is PROVEN, `blocked` means a fact
+    // established the connection cannot work, and `not-proven` means nothing was
+    // established either way (the gate still dispatches an action there).
+    payload.insert(
+        "verdict".into(),
+        json!(if readiness.ready_for_actions() {
+            "ready"
+        } else if readiness.blocked() {
+            "blocked"
+        } else {
+            "not-proven"
+        }),
+    );
+    payload.insert("readiness".into(), json!(readiness.report()));
 
-    if failures.is_empty() {
+    if readiness.ready_for_actions() {
         return out_env("status", true, OutKind::Ok, Value::Object(payload));
     }
-    let error = failures.join("; ");
+    // Three states, mirroring the pre-action gate. A CLI that cannot state its
+    // version, and a fact that RULES THE CONNECTION OUT, are both environment
+    // failures. A snapshot that established nothing wrong — not proven, nothing
+    // ruled out — is a reporting gap: the gate would still dispatch an action,
+    // so the report's own verdict is the answer and this is not reported as a
+    // broken environment (the readiness snapshot cannot name an absent/broken
+    // CLI, which is why the version probe's verdict leads there).
+    let error = if !version_ok {
+        Some(format!(
+            "chrome-use CLI: {chrome_use}. {}",
+            readiness.refusal()
+        ))
+    } else if readiness.blocked() {
+        Some(readiness.refusal())
+    } else {
+        None
+    };
+    let Some(error) = error else {
+        return out_env("status", true, OutKind::Ok, Value::Object(payload));
+    };
     eprintln!("mahbot chrome: {error}");
     payload.insert("error".into(), json!(error));
     out_env(
@@ -1486,10 +2029,35 @@ fn network_failure_error(code: Option<&str>) -> String {
     }
 }
 
-/// The factual `error` text for a mahbot-side deadline kill; `what` names the
-/// step that did not complete.
-fn deadline_error(timeout: Duration, what: &str) -> String {
-    format!("deadline reached after {}ms — {what}", timeout.as_millis())
+/// The factual `error` text for a product-side deadline kill; `what` names the
+/// step that did not complete. `chrome_side` is the clock that step declared to
+/// chrome-use and `kill` the product's own bound that ended it.
+///
+/// It says plainly that the PRODUCT's own bound ended the call — never that
+/// chrome-use timed out. When the kill rode above the declared clock (a step
+/// whose outcome is the caller's verdict) it says so, so a truncated call is
+/// never mistaken for chrome-use's own verdict; otherwise (a probe, or the
+/// operation's own budget ending one of its best-effort sub-steps) it says the
+/// bound was the product's own.
+fn deadline_error(chrome_side: Duration, kill: Duration, what: &str) -> String {
+    let kill = kill.as_millis();
+    if kill > chrome_side.as_millis() {
+        format!(
+            "deadline reached after {kill}ms — {what}: that is the product's own bound, which \
+             rode above the {}ms deadline chrome-use itself was working to, so chrome-use never \
+             reported its own reason",
+            chrome_side.as_millis()
+        )
+    } else {
+        // The product bounded this step itself: its own probe bound, or the
+        // operation's own budget ending one of its best-effort sub-steps.
+        format!(
+            "deadline reached after {kill}ms — {what}: that is the product's own bound for the \
+             step (chrome-use was given {}ms), so a product-side bound — not chrome-use's \
+             verdict — ended the call",
+            chrome_side.as_millis()
+        )
+    }
 }
 
 /// Post-navigation settle cap for `open`'s plain path: a best-effort
@@ -1513,14 +2081,43 @@ fn settle_budget(remaining: Duration) -> Option<Duration> {
     (budget >= MIN_SETTLE_BUDGET).then_some(budget)
 }
 
+/// The pure argument checks of `open`, run both by [`dispatch`] (before the
+/// readiness gate) and by [`open`] itself. The URL must be one this product may
+/// navigate to, and the `--expect` selector goes through the shared wait-target
+/// policy (so the numeric silent-sleep form is rejected here too) — both checked
+/// before navigating, never after. The resolved wait target is the check's own
+/// by-product.
+fn open_args(url: &str, expect: Option<&str>) -> Result<Option<WaitTarget>, OutEnvelope> {
+    if let Err(e) = validate_url(url) {
+        return Err(out_env(
+            "open",
+            false,
+            OutKind::Usage,
+            json!({ "url": url, "error": e.to_string() }),
+        ));
+    }
+    expect
+        .map(|sel| wait_target(Some(sel), None, None))
+        .transpose()
+        .map_err(|e| {
+            out_env(
+                "open",
+                false,
+                OutKind::Usage,
+                json!({ "url": url, "error": e }),
+            )
+        })
+}
+
 /// `open` — navigate to `url`, optionally wait for `--expect` (redesign-aware
 /// via `--structural`), report the committed final URL and best-effort attach
 /// the page content (compact accessibility snapshot). On the plain path (no
 /// `--expect`, which already serves as the settle) the navigation is followed
 /// by a best-effort network settle, capped at [`SETTLE_CAP`]. `timeout` bounds
-/// the whole operation (navigation + error-page probe + settle / `--expect`
-/// wait + content capture); total wall time stays within `timeout +
-/// DEADLINE_SLACK`.
+/// the waits the operation drives — the error-page probe, the settle /
+/// `--expect` wait, and the content capture — NOT the navigation, which runs to
+/// the clock mahbot declares to chrome-use: the operation may therefore
+/// legitimately outlive `timeout`.
 #[expect(clippy::too_many_lines)]
 async fn open(
     url: &str,
@@ -1529,30 +2126,9 @@ async fn open(
     timeout: Duration,
     session: &str,
 ) -> OutEnvelope {
-    if let Err(e) = validate_url(url) {
-        return out_env(
-            "open",
-            false,
-            OutKind::Usage,
-            json!({ "url": url, "error": e.to_string() }),
-        );
-    }
-    // The `--expect` selector goes through the shared wait-target policy (so
-    // the numeric silent-sleep form is rejected here too) — validated before
-    // navigating, never after.
-    let wait_for = match expect
-        .map(|sel| wait_target(Some(sel), None, None))
-        .transpose()
-    {
-        Ok(t) => t,
-        Err(e) => {
-            return out_env(
-                "open",
-                false,
-                OutKind::Usage,
-                json!({ "url": url, "error": e }),
-            );
-        }
+    let wait_for = match open_args(url, expect) {
+        Ok(wait_for) => wait_for,
+        Err(refusal) => return refusal,
     };
     let path = match require_cli("open", json!({ "url": url })) {
         Ok(p) => p,
@@ -1560,23 +2136,24 @@ async fn open(
     };
 
     let started = Instant::now();
-    let total = timeout + DEADLINE_SLACK;
-    // chrome-use's open verb has no `--timeout` flag and uses the
-    // AGENT_BROWSER_DEFAULT_TIMEOUT env default (15 s today), so the override
-    // gives heavy SPAs the full declared budget as the chrome-side deadline;
-    // the mahbot-side kill rides DEADLINE_SLACK above it.
-    let resp = match spawn_step(
-        &path,
-        &["open", url],
-        Some(session),
-        total,
-        None,
-        Some(timeout),
-    )
-    .await
-    {
+    let total = timeout + KILL_SLACK;
+    // The operation's own step: neither `timeout` (the budget `--timeout`
+    // declared, the CLI's whole-operation default otherwise) nor `total` bounds
+    // the NAVIGATION. `--timeout` is no deadline chrome-use honours for `open`'s
+    // navigate: chrome-use runs it to the clock mahbot declares to it, and killing it
+    // on the operation's budget would end a call chrome-use was still working on
+    // — losing chrome-use's own reason for the failure, which is exactly what the
+    // product's kill must never do. The navigation's kill therefore rides
+    // `kill_bound` above chrome-use's own budget, and the operation may
+    // legitimately outlive `--timeout`. `total` is then the operation's own
+    // bookkeeping — `timeout` plus the slack reserved for the error-page probe —
+    // for that probe, the settle and the content capture; the `--expect` wait
+    // declares what remains of `timeout` instead (see below), and every other step
+    // of the operation rides [`StepClocks::bounded`].
+    let operation = StepClocks::operation();
+    let resp = match spawn_step(&path, &["open", url], Some(session), operation, None).await {
         Ok(resp) => resp,
-        Err(f) => return f.envelope("open", json!({ "url": url }), timeout),
+        Err(f) => return f.envelope("open", json!({ "url": url }), operation),
     };
     let final_url = resp
         .data
@@ -1596,20 +2173,20 @@ async fn open(
             }),
         );
     }
-    // The error-page probe is reserved up to the 2 s slack so it runs even
-    // when the navigation consumed the whole declared deadline; total wall
-    // time stays within declared + slack. Best-effort (inconclusive = pass);
-    // skipped when nothing is left. One eval yields both the error-page
+    // One of the operation's best-effort sub-steps (the policy exception in
+    // [`crate::chrome`]): the product reserves it up to the 2 s slack so it runs
+    // even when the navigation consumed the whole declared deadline, and its kill
+    // rides that slack above the reserved bound. Best-effort (inconclusive =
+    // pass); skipped when nothing is left. One eval yields both the error-page
     // verdict and the net error token Chrome renders in `div.error-code`
     // (empty until the neterror script runs — the generic message covers it).
-    let probe_budget = total.saturating_sub(started.elapsed()).min(DEADLINE_SLACK);
+    let probe_budget = total.saturating_sub(started.elapsed()).min(KILL_SLACK);
     if probe_budget >= Duration::from_millis(500)
         && let Ok(probe) = spawn_step(
             &path,
             &["eval", ERROR_PAGE_PROBE_JS],
             Some(session),
-            probe_budget,
-            None,
+            StepClocks::bounded(CHROME_USE_DECLARED_BUDGET, probe_budget),
             None,
         )
         .await
@@ -1643,21 +2220,42 @@ async fn open(
                 "selector not found — may be structural change, empty region, or content-dependent",
             )
         };
-        let wait_budget = total.saturating_sub(started.elapsed());
+        // The wait's declared deadline is what REMAINS of the caller's own
+        // --timeout — never the operation's bookkeeping `total`, whose extra
+        // slack belongs to the error-page probe. A declaration that crosses
+        // chrome-use's own client tolerance is what makes chrome-use run out of
+        // tolerance instead of answering, and `parse_forwarded_timeout` already
+        // refuses a --timeout at or above it, so the remaining part of one stays
+        // below it.
+        let wait_budget = timeout.saturating_sub(started.elapsed());
         // No budget left for the wait (or its capture) — emit the same timeout
-        // envelope the wait-timeout arm produces, without content.
+        // envelope the wait-timeout arm produces, without content. What ran out
+        // here is the OPERATION's own budget, spent before the wait step was given
+        // any of it, so no deadline was ever declared to chrome-use for that step:
+        // the envelope reports the operation's own budget, and says so rather than
+        // naming a chrome-use clock that was never given a value.
         if wait_budget < Duration::from_millis(250) {
             payload["timeout_ms"] = json!(timeout.as_millis());
-            payload["error"] = json!(deadline_error(timeout, "the target wait never started"));
+            payload["error"] = json!(format!(
+                "no budget left for the `--expect` wait: the operation's own --timeout budget \
+                 ({}ms) was spent by the navigation and the steps around it before the wait \
+                 could be given any of it, so chrome-use was never given a deadline for that \
+                 step — this is the product's own bound on `open`, not chrome-use's verdict. \
+                 Raise --timeout or retry now that the page is open.",
+                timeout.as_millis()
+            ));
             payload["hint"] = json!(hint);
             return out_env("open", false, timeout_kind, payload);
         }
-        // The wait's chrome-side deadline equals its remaining budget (the
-        // whole-operation ceiling), forwarded via --timeout; the mahbot bound
-        // matches it — whichever fires, the envelope below is identical.
+        // The wait forwards its remaining budget as --timeout, which chrome-use
+        // honours in full — so that remaining budget IS the step's chrome-side
+        // clock — and its failure IS the caller's verdict, so it runs to the
+        // forwarded clocks with the relay self-heal allowed: a relay drop during
+        // the wait is healed exactly the way it is for any reported step.
+        let wait_clocks = StepClocks::forwarded(wait_budget);
         let wargs = wait_args(&target, wait_budget.as_millis());
         let refs: Vec<&str> = wargs.iter().map(String::as_str).collect();
-        let waited = spawn_step(&path, &refs, Some(session), wait_budget, None, None).await;
+        let waited = spawn_step(&path, &refs, Some(session), wait_clocks, None).await;
         // The page is open regardless of the wait outcome, so the content
         // rides on failure envelopes too: it is exactly what diagnoses a
         // redesign. Same remaining-budget rule as the plain path — slow
@@ -1670,35 +2268,47 @@ async fn open(
         return match waited {
             Ok(_) => out_env("open", true, OutKind::Ok, payload),
             Err(f) if f.kind == OutKind::Timeout => {
-                payload["timeout_ms"] = json!(timeout.as_millis());
+                // chrome-use's own verdict reports the deadline it was given; a
+                // product kill reports the product's own bound (the kill).
+                let reported = if f.message.is_empty() {
+                    wait_clocks.call.kill
+                } else {
+                    wait_clocks.call.chrome_side
+                };
+                payload["timeout_ms"] = json!(reported.as_millis());
                 // The chrome-side timeout message when chrome-use phrased the
-                // timeout itself, a factual deadline text on a mahbot kill.
+                // timeout itself, a factual deadline text on a product kill.
                 if f.message.is_empty() {
-                    payload["error"] = json!(deadline_error(timeout, "the target never appeared"));
+                    payload["error"] = json!(deadline_error(
+                        wait_clocks.call.chrome_side,
+                        wait_clocks.call.kill,
+                        "the target never appeared"
+                    ));
                 } else {
                     payload["error"] = json!(f.message);
                 }
                 payload["hint"] = json!(hint);
                 out_env("open", false, timeout_kind, payload)
             }
-            Err(f) => f.envelope("open", payload, timeout),
+            Err(f) => f.envelope("open", payload, wait_clocks),
         };
     }
     // Best-effort settle: heavy SPAs keep the network busy right after the
-    // navigation commits, so the first following step can otherwise hit its
-    // 8s default under contention. Raw argv — the `wait` action deliberately
-    // does not expose `--load`. chrome-use ignores `--timeout` for this form
-    // (its chrome-side deadline is the seeded 15s AGENT_BROWSER_DEFAULT_TIMEOUT,
-    // 25s only as chrome-use's own fallback), so the real cap is the
-    // mahbot-side bound below. The result is discarded — a settle timeout
+    // navigation commits, so the first following step can otherwise start
+    // racing a still-settling page. Raw argv — the `wait` action deliberately
+    // does not expose `--load`. chrome-use honours no `--timeout` for this form:
+    // its clock is the AGENT_BROWSER_DEFAULT_TIMEOUT this step declares (the
+    // remaining operation budget), and the product's own bound on the step is the
+    // same number — one of the operation's best-effort sub-steps, so its kill
+    // rides [`KILL_SLACK`] above that bound and the operation still stays within
+    // its budget plus that slack. The result is discarded — a settle timeout
     // never downgrades a committed navigation.
     if let Some(budget) = settle_budget(total.saturating_sub(started.elapsed())) {
         let _ = spawn_step(
             &path,
             &["wait", "--load", "networkidle"],
             Some(session),
-            budget,
-            None,
+            StepClocks::bounded(budget, budget),
             None,
         )
         .await;
@@ -1706,7 +2316,11 @@ async fn open(
     // Content capture is best-effort and bounded: it runs on the budget the
     // navigation (+ error probe + settle) left over, and a failure, exhaustion,
     // or content-free page simply omits `content` — a successful navigation is
-    // never downgraded.
+    // never downgraded. The step declares the product's clock for a verb it
+    // forwards no `--timeout` to ([`CHROME_USE_DECLARED_BUDGET`]) while the
+    // product's own bound on it is the remaining operation budget — the
+    // operation's last best-effort sub-step, so its kill rides [`KILL_SLACK`]
+    // above that bound.
     let mut payload = json!({ "url": final_url });
     let budget = total.saturating_sub(started.elapsed());
     if let Some(content) = capture_open_content(&path, session, budget).await {
@@ -1716,7 +2330,8 @@ async fn open(
 }
 
 /// Best-effort compact page snapshot for the `open` envelope — the same
-/// content form the interactive chrome tool surfaces after an open. Skipped
+/// content form the interactive chrome tool surfaces after an open. One of the
+/// operation's bounded sub-steps ([`StepClocks::bounded`]): skipped
 /// under 500 ms of budget (mirroring the error-page probe); a failed step,
 /// an unrecognized response shape, or a content-free page yields no content.
 /// Non-empty content is byte-capped so the single-line JSON envelope stays
@@ -1725,9 +2340,15 @@ async fn capture_open_content(path: &Path, session: &str, budget: Duration) -> O
     if budget < Duration::from_millis(500) {
         return None;
     }
-    let resp = spawn_step(path, &["snapshot", "-c"], Some(session), budget, None, None)
-        .await
-        .ok()?;
+    let resp = spawn_step(
+        path,
+        &["snapshot", "-c"],
+        Some(session),
+        StepClocks::bounded(CHROME_USE_DECLARED_BUDGET, budget),
+        None,
+    )
+    .await
+    .ok()?;
     let text = resp.data.as_ref().and_then(extract_snapshot_text)?;
     let text = text.trim();
     if text.is_empty() {
@@ -1741,31 +2362,32 @@ async fn capture_open_content(path: &Path, session: &str, budget: Duration) -> O
 }
 
 /// Run the count-eval shim for `selector` — shared by the `count` action and
-/// the `extract` honest-empty gate.
+/// the `extract` honest-empty gate. The eval shim is a step of the action that
+/// called it, so it runs to that action's clocks.
 async fn count_via_eval(
     path: &Path,
     selector: &str,
     session: &str,
-    timeout: Duration,
+    clocks: StepClocks,
 ) -> Result<u64, StepFailure> {
     let js = count_eval_js(selector);
     let args = ["eval".to_string(), js];
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let resp = spawn_step(path, &refs, Some(session), timeout, None, None).await?;
+    let resp = spawn_step(path, &refs, Some(session), clocks, None).await?;
     eval_count(&resp).ok_or(StepFailure {
         kind: OutKind::Error,
         message: "count eval returned a non-numeric result".to_string(),
-        named: false,
     })
 }
 
 /// `count` — eval shim over `querySelectorAll` (chrome-use has no `count` verb).
-async fn count(selector: &str, timeout: Duration, session: &str) -> OutEnvelope {
+async fn count(selector: &str, bound: Option<Duration>, session: &str) -> OutEnvelope {
     let path = match require_cli("count", json!({ "selector": selector })) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    match count_via_eval(&path, selector, session, timeout).await {
+    let clocks = StepClocks::tool_clock(bound);
+    match count_via_eval(&path, selector, session, clocks).await {
         Ok(n) => {
             let kind = if n == 0 { OutKind::Empty } else { OutKind::Ok };
             out_env(
@@ -1775,33 +2397,25 @@ async fn count(selector: &str, timeout: Duration, session: &str) -> OutEnvelope 
                 json!({ "selector": selector, "count": n }),
             )
         }
-        Err(f) => f.envelope("count", json!({ "selector": selector }), timeout),
+        Err(f) => f.envelope("count", json!({ "selector": selector }), clocks),
     }
 }
 
 /// `wait` — bounded wait for a safe [`WaitTarget`] (the numeric sleep form is
 /// rejected at parse time). The requested `--timeout` IS chrome-use's deadline
-/// (its wait forms honor it), so its honest timeout error surfaces at the
-/// declared deadline; mahbot kills only once the deadline is actually
-/// exceeded (see [`DEADLINE_SLACK`]).
+/// (its wait forms honour it in full), so its honest timeout error surfaces at
+/// the declared clock; the product's kill rides the relay-recovery window +
+/// [`crate::chrome::KILL_SLACK`] above it (see [`StepClocks::forwarded`]).
 async fn wait(target: &WaitTarget, timeout: Duration, session: &str) -> OutEnvelope {
     let base = json!({ "target": target.describe() });
     let path = match require_cli("wait", base.clone()) {
         Ok(p) => p,
         Err(e) => return e,
     };
+    let clocks = StepClocks::forwarded(timeout);
     let args = wait_args(target, timeout.as_millis());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match spawn_step(
-        &path,
-        &refs,
-        Some(session),
-        timeout + DEADLINE_SLACK,
-        None,
-        None,
-    )
-    .await
-    {
+    match spawn_step(&path, &refs, Some(session), clocks, None).await {
         Ok(_) => out_env(
             "wait",
             true,
@@ -1810,7 +2424,7 @@ async fn wait(target: &WaitTarget, timeout: Duration, session: &str) -> OutEnvel
         ),
         Err(mut f) => {
             with_condition_timeout_note("wait", f.kind, &mut f.message);
-            f.envelope("wait", base, timeout)
+            f.envelope("wait", base, clocks)
         }
     }
 }
@@ -1853,20 +2467,12 @@ async fn expect(cond: &ExpectCond, timeout: Duration, session: &str) -> OutEnvel
         Ok(p) => p,
         Err(e) => return e,
     };
-    // Same rule as wait: the forwarded `--timeout` is chrome-use's own
-    // deadline; the mahbot-side kill rides DEADLINE_SLACK above it.
+    // Same rule as wait: the forwarded `--timeout` is chrome-use's own clock,
+    // and the product's kill rides the relay-recovery window + slack above it.
+    let clocks = StepClocks::forwarded(timeout);
     let args = expect_args(cond, timeout.as_millis());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match spawn_step(
-        &path,
-        &refs,
-        Some(session),
-        timeout + DEADLINE_SLACK,
-        None,
-        None,
-    )
-    .await
-    {
+    match spawn_step(&path, &refs, Some(session), clocks, None).await {
         Ok(resp) => match resp.data.as_ref().and_then(expect_outcome) {
             Some(outcome) => expect_envelope(&condition, outcome),
             None => out_env(
@@ -1878,24 +2484,25 @@ async fn expect(cond: &ExpectCond, timeout: Duration, session: &str) -> OutEnvel
         },
         Err(mut f) => {
             with_condition_timeout_note("expect", f.kind, &mut f.message);
-            f.envelope("expect", base, timeout)
+            f.envelope("expect", base, clocks)
         }
     }
 }
 
 /// `eval` — run JS and emit the unwrapped result as a JSON value (number,
 /// string, object, or null).
-async fn eval(js: &str, timeout: Duration, session: &str) -> OutEnvelope {
+async fn eval(js: &str, bound: Option<Duration>, session: &str) -> OutEnvelope {
     let path = match require_cli("eval", json!({ "js": js })) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    match spawn_step(&path, &["eval", js], Some(session), timeout, None, None).await {
+    let clocks = StepClocks::tool_clock(bound);
+    match spawn_step(&path, &["eval", js], Some(session), clocks, None).await {
         Ok(resp) => {
             let result = eval_result(&resp).cloned().unwrap_or(Value::Null);
             out_env("eval", true, OutKind::Ok, json!({ "result": result }))
         }
-        Err(f) => f.envelope("eval", json!({ "js": js }), timeout),
+        Err(f) => f.envelope("eval", json!({ "js": js }), clocks),
     }
 }
 
@@ -1905,7 +2512,7 @@ async fn eval(js: &str, timeout: Duration, session: &str) -> OutEnvelope {
 async fn extract(
     schema_file: &str,
     limit: Option<usize>,
-    timeout: Duration,
+    bound: Option<Duration>,
     session: &str,
 ) -> OutEnvelope {
     let schema = match std::fs::read_to_string(schema_file) {
@@ -1939,10 +2546,11 @@ async fn extract(
         Err(e) => return e,
     };
 
+    let clocks = StepClocks::tool_clock(bound);
     // Honest-empty gate: when the rows selector matches 0, report empty without
     // invoking chrome-use's phantom-row `extract`.
     if let Some(rows_sel) = schema.get("rows").and_then(Value::as_str) {
-        let count = count_via_eval(&path, rows_sel, session, timeout).await;
+        let count = count_via_eval(&path, rows_sel, session, clocks).await;
         match extract_gate(count) {
             ExtractGate::Empty => {
                 return out_env(
@@ -1953,7 +2561,7 @@ async fn extract(
                 );
             }
             ExtractGate::Proceed => {}
-            ExtractGate::Fail(f) => return f.envelope("extract", json!({}), timeout),
+            ExtractGate::Fail(f) => return f.envelope("extract", json!({}), clocks),
         }
     }
 
@@ -1967,20 +2575,25 @@ async fn extract(
         schema_file.to_string(),
     ];
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), timeout, None, None).await {
+    match spawn_step(&path, &refs, Some(session), clocks, None).await {
         Ok(resp) => out_env(
             "extract",
             true,
             OutKind::Ok,
             extract_output(resp.data.as_ref().unwrap_or(&Value::Null), limit),
         ),
-        Err(f) => f.envelope("extract", json!({}), timeout),
+        Err(f) => f.envelope("extract", json!({}), clocks),
     }
 }
 
 /// `click` — click a selector, forwarding `--if-present` verbatim when set
 /// (chrome-use itself treats an `--if-present` miss as a no-op success).
-async fn click(selector: &str, if_present: bool, timeout: Duration, session: &str) -> OutEnvelope {
+async fn click(
+    selector: &str,
+    if_present: bool,
+    bound: Option<Duration>,
+    session: &str,
+) -> OutEnvelope {
     let path = match require_cli("click", json!({ "selector": selector })) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1990,9 +2603,10 @@ async fn click(selector: &str, if_present: bool, timeout: Duration, session: &st
         args.push("--if-present".to_string());
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), timeout, None, None).await {
+    let clocks = StepClocks::tool_clock(bound);
+    match spawn_step(&path, &refs, Some(session), clocks, None).await {
         Ok(_) => out_env("click", true, OutKind::Ok, json!({ "selector": selector })),
-        Err(f) => f.envelope("click", json!({ "selector": selector }), timeout),
+        Err(f) => f.envelope("click", json!({ "selector": selector }), clocks),
     }
 }
 
@@ -2022,13 +2636,16 @@ async fn read_stdin_capped() -> Result<Vec<u8>, String> {
 }
 
 /// The fill/type/press success handling, pure for tests: a success envelope
-/// carrying chrome-use's degraded-success `warning`
-/// ([`crate::chrome::contract::chrome_use_warning`]) is classified as kind
-/// error (rc 1) with the warning surfaced — the action may not have taken
-/// effect, so it must never exit 0. A clean success emits kind ok with the
-/// action params plus chrome-use's `data`.
+/// carrying chrome-use's degraded-success `warning` ([`chrome_use_warning`]) is
+/// classified as kind error (rc 1) with the warning surfaced — the action may not
+/// have taken effect, so it must never exit 0. A clean success emits kind ok with
+/// the action params plus chrome-use's `data`.
+///
+/// The browser-replacement note is never one of these: [`classify_step_output`]
+/// already turned such an envelope into an Environment failure before it could
+/// reach here (see [`self_launched_browser_error`]).
 fn text_input_ok_envelope(action: &str, base: &Value, resp: ChromeResponse) -> OutEnvelope {
-    let warning = crate::chrome::contract::chrome_use_warning(&resp);
+    let warning = chrome_use_warning(&resp);
     let mut payload = base.as_object().cloned().unwrap_or_default();
     if let Some(d) = resp.data {
         payload.insert("data".into(), d);
@@ -2042,7 +2659,12 @@ fn text_input_ok_envelope(action: &str, base: &Value, resp: ChromeResponse) -> O
 
 /// `fill` — clear + verified fill. Exactly one text source (inline text,
 /// --file passthrough, or mahbot-piped --stdin).
-async fn fill(selector: &str, source: &TextInput, timeout: Duration, session: &str) -> OutEnvelope {
+async fn fill(
+    selector: &str,
+    source: &TextInput,
+    bound: Option<Duration>,
+    session: &str,
+) -> OutEnvelope {
     let action = "fill";
     let base = json!({ "selector": selector });
     let path = match require_cli(action, base.clone()) {
@@ -2077,9 +2699,10 @@ async fn fill(selector: &str, source: &TextInput, timeout: Duration, session: &s
         TextInput::Inline(_) => None,
     };
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), timeout, input.as_deref(), None).await {
+    let clocks = StepClocks::tool_clock(bound);
+    match spawn_step(&path, &refs, Some(session), clocks, input.as_deref()).await {
         Ok(resp) => text_input_ok_envelope(action, &base, resp),
-        Err(f) => f.envelope(action, base, timeout),
+        Err(f) => f.envelope(action, base, clocks),
     }
 }
 
@@ -2088,7 +2711,7 @@ async fn r#type(
     selector: &str,
     text: &str,
     key_events: bool,
-    timeout: Duration,
+    bound: Option<Duration>,
     session: &str,
 ) -> OutEnvelope {
     let action = "type";
@@ -2105,9 +2728,10 @@ async fn r#type(
     // BEFORE it (everything after is a verbatim value).
     argv.extend(text_value_argv(text));
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), timeout, None, None).await {
+    let clocks = StepClocks::tool_clock(bound);
+    match spawn_step(&path, &refs, Some(session), clocks, None).await {
         Ok(resp) => text_input_ok_envelope(action, &base, resp),
-        Err(f) => f.envelope(action, base, timeout),
+        Err(f) => f.envelope(action, base, clocks),
     }
 }
 
@@ -2118,7 +2742,7 @@ async fn press(
     key: &str,
     selector: Option<&str>,
     hold: Option<u64>,
-    timeout: Duration,
+    bound: Option<Duration>,
     session: &str,
 ) -> OutEnvelope {
     let action = "press";
@@ -2143,9 +2767,10 @@ async fn press(
         argv.extend(["--hold".to_string(), h.to_string()]);
     }
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), timeout, None, None).await {
+    let clocks = StepClocks::tool_clock(bound);
+    match spawn_step(&path, &refs, Some(session), clocks, None).await {
         Ok(resp) => text_input_ok_envelope(action, &base, resp),
-        Err(f) => f.envelope(action, base, timeout),
+        Err(f) => f.envelope(action, base, clocks),
     }
 }
 
@@ -2168,22 +2793,15 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
         Ok(p) => p,
         Err(e) => return e,
     };
-    match spawn_step(
-        &path,
-        &["session", "stop", &target],
-        None,
-        SESSION_STOP_TIMEOUT,
-        None,
-        None,
-    )
-    .await
-    {
+    // A product probe (the probe exception in [`StepClocks::probe`], see the
+    // policy in [`crate::chrome`]), not agent work: bounded by the product itself
+    // with chrome-use's relay self-heal suppressed. The bound is the shared
+    // [`SESSION_STOP_TIMEOUT`] — a product bound, not a declared deadline
+    // (chrome-use forwards no `--timeout` to `session stop`).
+    let clocks = StepClocks::probe(SESSION_STOP_TIMEOUT);
+    match spawn_step(&path, &["session", "stop", &target], None, clocks, None).await {
         Ok(_) => out_env("session", true, OutKind::Ok, json!({ "session": target })),
-        Err(f) => f.envelope(
-            "session",
-            json!({ "session": target }),
-            SESSION_STOP_TIMEOUT,
-        ),
+        Err(f) => f.envelope("session", json!({ "session": target }), clocks),
     }
 }
 
@@ -2192,30 +2810,29 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
 /// daemon) reports a stopped session as `empty` (rc 0); a listed session is
 /// probed with a real bounded `get url`. Any timeout on that probe is wedge
 /// evidence (the probe reads the current URL, it never navigates), so it
-/// re-classifies as Environment (rc 2) and picks up the wedge hint via
-/// [`StepFailure::envelope`].
+/// re-classifies as Environment (rc 2), says plainly that the session stopped
+/// answering, and names the recovery. This verb is a diagnostic and stops
+/// nothing; the paths that ACT on the browser — the action verbs, the watchdog
+/// and the ended-run release — recover such a session themselves
+/// ([`recover_unresponsive_session`]), so its text also says the next action
+/// does it automatically. An honest non-wedge cause passes through unnamed.
 async fn session_status(name: &str) -> OutEnvelope {
     let target = resolve_session_target(name);
     let path = match require_cli("session", json!({ "session": target })) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let list = match spawn_step(
-        &path,
-        &["session", "list"],
-        None,
-        DEFAULT_STEP_TIMEOUT,
-        None,
-        None,
-    )
-    .await
-    {
+    // Both steps are the product's own probes — the probe exception: bounded by
+    // the product, with chrome-use's relay self-heal suppressed
+    // ([`StepClocks::probe`]).
+    let enumerate = StepClocks::probe(SESSION_LIST_TIMEOUT);
+    let list = match spawn_step(&path, &["session", "list"], None, enumerate, None).await {
         Ok(resp) => resp,
         Err(f) => {
             return f.envelope(
                 "session",
                 json!({ "session": target, "stage": "enumerate" }),
-                DEFAULT_STEP_TIMEOUT,
+                enumerate,
             );
         }
     };
@@ -2227,16 +2844,8 @@ async fn session_status(name: &str) -> OutEnvelope {
             json!({ "session": target, "detail": "session is not running — nothing to probe" }),
         );
     }
-    match spawn_step(
-        &path,
-        &["get", "url"],
-        Some(&target),
-        SESSION_PROBE_TIMEOUT,
-        None,
-        None,
-    )
-    .await
-    {
+    let probe = StepClocks::probe(SESSION_PROBE_TIMEOUT);
+    match spawn_step(&path, &["get", "url"], Some(&target), probe, None).await {
         Ok(resp) => {
             let url = resp
                 .data
@@ -2254,41 +2863,38 @@ async fn session_status(name: &str) -> OutEnvelope {
         Err(mut f) => {
             // Any timeout on the probe is wedge evidence (it reads the
             // current URL, it never navigates) — re-classify as Environment
-            // with chrome-use's signature phrasing so the wedge hint attaches
-            // in `StepFailure::envelope`, exactly like chrome-use's own
-            // session-unresponsive classification. Namedness rides
-            // [`step_named`] (a literal `mahbot-chrome-ephemeral-*` argument
-            // is not a name the agent can recover through). Other failures
-            // pass through with their honest cause (not every failure is a
-            // wedge).
+            // with chrome-use's own signature phrasing, exactly like its
+            // session-unresponsive classification. The probe deliberately does
+            // NOT auto-recover (it is the diagnostic an owner runs to see the
+            // state), so its text names the manual flow instead — the one place
+            // the automatic recovery never ran. Other failures pass through with
+            // their honest cause (not every failure is a wedge).
             if f.kind == OutKind::Timeout {
                 f = StepFailure {
                     kind: OutKind::Environment,
                     message: format!(
-                        "session unresponsive: no answer to the liveness probe (get url) within {}s",
+                        "session unresponsive: the session stopped answering — no answer to the \
+                         liveness probe (get url) within {}s. This diagnostic stops nothing; \
+                         recover it with {SESSION_RECOVERY_FLOW}, or let the next action verb \
+                         recover it automatically.",
                         SESSION_PROBE_TIMEOUT.as_secs()
                     ),
-                    named: step_named(Some(&target)),
                 };
             }
             // A protected-namespace wedge needs `--force` to stop — make the
-            // recovery hint directly actionable for that edge. Only wedges
+            // recovery flow directly actionable for that edge. Only wedges
             // get the note (an honest non-wedge cause must not carry stop
             // guidance), and only protected ones (an ordinary session's stop
             // needs no --force).
             append_protected_stop_note(&mut f.message, &target);
-            f.envelope(
-                "session",
-                json!({ "session": target }),
-                SESSION_PROBE_TIMEOUT,
-            )
+            f.envelope("session", json!({ "session": target }), probe)
         }
     }
 }
 
 /// Append the protected-namespace `--force` note to a probe-failure message
 /// that reads as a session wedge on a protected (`agent-tab-*` /
-/// `link-enricher-*`) target: the shared wedge hint says
+/// `link-enricher-*`) target: the recovery flow names
 /// `session stop <name>`, which is only actionable with `--force` here. Pure
 /// so tests pin both gates (protected membership, wedge-shaped message).
 fn append_protected_stop_note(message: &mut String, target: &str) {
@@ -2329,7 +2935,8 @@ fn session_listed(resp: &ChromeResponse, target: &str) -> bool {
 }
 
 /// Best-effort close of an ephemeral session AFTER the action envelope is
-/// emitted — never changes the action's exit code; diagnostics only on stderr.
+/// emitted — never changes the action's exit code; its diagnostics, including
+/// the report of a helper it leaves behind, go to stderr.
 async fn close_ephemeral(name: &str) {
     let Some(path) = cli_path() else {
         eprintln!(
@@ -2337,6 +2944,11 @@ async fn close_ephemeral(name: &str) {
         );
         return;
     };
+    // A lifecycle close, not agent work (the probe exception in
+    // [`StepClocks::probe`]): the product bounds it itself, declares chrome-use's
+    // clock honestly, and suppresses the relay self-heal — derived through the
+    // one probe shape so it cannot drift from the CLI's other probes.
+    let clocks = StepClocks::probe(SESSION_STOP_TIMEOUT);
     match spawn_cli(CliSpawn {
         path: &path,
         args: &["session", "stop", name],
@@ -2344,15 +2956,21 @@ async fn close_ephemeral(name: &str) {
         json: true,
         capture_stderr: false,
         cancel_kills: true,
-        timeout: CliTimeout::Bounded(DEFAULT_STEP_TIMEOUT),
+        timeout: CliTimeout::Bounded(clocks.call.kill),
         input: None,
-        chrome_deadline: None,
+        chrome_side: clocks.call.chrome_side,
+        recovery: clocks.recovery,
     })
     .await
     {
-        CliRun::Output(out) if out.status.success() => {}
-        CliRun::Output(_) => {
-            eprintln!("mahbot chrome: failed to close ephemeral session '{name}'");
+        CliRun::Output(out) => {
+            // A helper the close itself leaves holding the call's output channel
+            // is recorded here for the caller ([`run_cli`]) to report — the
+            // action envelope went out before this ran, so it cannot carry it.
+            CHROME_USE_LEFTOVER_PIPES.fetch_or(out.leftover_pipes, Ordering::Relaxed);
+            if !out.status.success() {
+                eprintln!("mahbot chrome: failed to close ephemeral session '{name}'");
+            }
         }
         CliRun::SpawnFailure => {
             eprintln!(
@@ -2370,6 +2988,9 @@ async fn close_ephemeral(name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The clock arithmetic has one home; tests here derive their expectations
+    // from it instead of repeating its literals.
+    use crate::chrome::kill_bound;
 
     #[test]
     fn eval_count_unwraps_chrome_use_result_envelope() {
@@ -2427,6 +3048,110 @@ mod tests {
         let (name, ephemeral) = resolve_session(None);
         assert!(name.starts_with(CLI_EPHEMERAL_PREFIX));
         assert!(ephemeral);
+    }
+
+    /// The alphabet is chrome-use's own for `session stop`
+    /// (`validation::is_valid_session_name`: alphanumerics, '-' and '_'). A name
+    /// with a '.' parses and opens fine, but chrome-use then refuses to stop it,
+    /// so the session's daemon and tabs stay behind and neither the hand recipe
+    /// nor the automatic recovery can clear it — the name has to be refused here,
+    /// where the caller can still choose another one.
+    #[test]
+    fn session_names_stay_within_the_alphabet_chrome_use_can_stop() {
+        for name in ["qa-2933", "qa_2933", "Qa2933"] {
+            assert!(
+                validate_session_name(name).is_ok(),
+                "{name} must be accepted"
+            );
+        }
+        for name in ["qa.2933", "qa 2933", "", "../qa", "qa/2933", "qa;stop"] {
+            assert!(
+                validate_session_name(name).is_err(),
+                "{name:?} must be refused — chrome-use will not stop such a session"
+            );
+        }
+        assert!(
+            parse_invocation(&[
+                "session".into(),
+                "stop".into(),
+                "qa.2933".into(),
+                "--force".into()
+            ])
+            .is_err(),
+            "the refusal must also be wired into the stop verb, not only --session"
+        );
+    }
+
+    #[test]
+    fn step_clocks_ride_the_kill_above_the_clock_they_declare() {
+        // The arithmetic has one home ([`crate::chrome::clocks`] /
+        // [`crate::chrome::kill_bound`], pinned there); these assertions are about
+        // which shape the CLI takes, so they derive their expectations from it
+        // rather than repeating its literals.
+        let chrome_own = clocks(None, CliRecovery::Allowed);
+
+        // The operation's own step (`open`'s navigation): chrome-use runs it to
+        // its own client tolerance, and the operation's budget does NOT bound
+        // the kill — a navigation chrome-use is still working on must be free to
+        // report its own reason.
+        let navigation = StepClocks::operation();
+        assert_eq!(navigation.call.chrome_side, CHROME_USE_DECLARED_BUDGET);
+        assert_eq!(
+            navigation.call.kill,
+            kill_bound(CHROME_USE_DECLARED_BUDGET, CliRecovery::Allowed)
+        );
+
+        // A verb chrome-use accepts no `--timeout` for: with no user bound the kill
+        // is the one the declared clock derives, and a user bound IS the bound the
+        // call really runs to — the parse refuses anything below the declared clock
+        // (pinned at that layer), so the kill is never shorter than the declaration.
+        let no_bound = StepClocks::tool_clock(None);
+        assert_eq!(no_bound.call.chrome_side, CHROME_USE_DECLARED_BUDGET);
+        assert_eq!(no_bound.call.kill, chrome_own.kill);
+        let at_the_clock = StepClocks::tool_clock(Some(CHROME_USE_DECLARED_BUDGET));
+        assert_eq!(at_the_clock.call.kill, chrome_own.kill);
+
+        // A LONGER one (`eval --timeout 300`) is a bound the product must really
+        // let the call run to, so it widens the kill — and the kill alone: the
+        // clock DECLARED to chrome-use stays one kill margin under its own client
+        // tolerance, which nothing can raise without making chrome-use fail as a
+        // wedged session. The product's own kill is what the envelope reports as
+        // `timeout_ms`.
+        let wide = StepClocks::tool_clock(Some(Duration::from_secs(300)));
+        assert_eq!(wide.call.chrome_side, CHROME_USE_DECLARED_BUDGET);
+        assert_eq!(
+            wide.call.kill,
+            kill_bound(Duration::from_secs(300), CliRecovery::Allowed)
+        );
+        let env = StepFailure {
+            kind: OutKind::Timeout,
+            message: String::new(),
+        }
+        .envelope("eval", json!({ "js": "1" }), wide);
+        assert_eq!(env.payload["timeout_ms"], json!(wide.call.kill.as_millis()));
+        let declared_ms = format!("{}ms", CHROME_USE_DECLARED_BUDGET.as_millis());
+        assert!(
+            env.payload["error"]
+                .as_str()
+                .is_some_and(|e| e.contains(&declared_ms)),
+            "the kill must ride above the clock the call really ran to: {}",
+            env.payload["error"]
+        );
+
+        // A bounded step of the operation: a probe in everything but name — it
+        // suppresses the relay self-heal and its kill rests [`KILL_SLACK`] above
+        // the product's own bound, never chrome-use's clock.
+        let probe = StepClocks::bounded(CHROME_USE_DECLARED_BUDGET, Duration::from_secs(2));
+        assert_eq!(probe.call.kill, Duration::from_secs(2) + KILL_SLACK);
+        assert!(matches!(probe.recovery, CliRecovery::Suppressed));
+        let settle = StepClocks::bounded(Duration::from_secs(6), Duration::from_secs(6));
+        assert_eq!(settle.call.chrome_side, Duration::from_secs(6));
+        assert_eq!(settle.call.kill, Duration::from_secs(6) + KILL_SLACK);
+        // A bound above chrome-use's own clock is still the PRODUCT's bound: the
+        // step is cut off at it, not at chrome-use's clock.
+        let oversized = StepClocks::bounded(CHROME_USE_DECLARED_BUDGET, Duration::from_secs(600));
+        assert_eq!(oversized.call.kill, Duration::from_secs(600) + KILL_SLACK);
+        assert!(oversized.call.kill > chrome_own.kill);
     }
 
     #[test]
@@ -2563,36 +3288,6 @@ mod tests {
     }
 
     #[test]
-    fn with_session_wedge_hint_appends_only_for_named_environment_matches() {
-        let message = "CDP session is unresponsive after attaching (Connection reset).";
-        let wedge = format!(
-            "{message} — wedged: recover with {SESSION_RECOVERY_FLOW}. \
-             Probe first with `mahbot chrome session status <name>` if unsure."
-        );
-        // Named + Environment + matcher hit → hint appended.
-        assert_eq!(
-            with_session_wedge_hint(OutKind::Environment, message, true),
-            wedge
-        );
-        // Ephemeral session → unchanged (the `<name>` verbs are unactionable).
-        assert_eq!(
-            with_session_wedge_hint(OutKind::Environment, message, false),
-            message
-        );
-        // Timeout + matcher hit → unchanged (the matcher only fires for
-        // Environment-classified messages).
-        assert_eq!(
-            with_session_wedge_hint(OutKind::Timeout, message, true),
-            message
-        );
-        // Environment + plain text → unchanged.
-        assert_eq!(
-            with_session_wedge_hint(OutKind::Environment, "some other failure", true),
-            "some other failure"
-        );
-    }
-
-    #[test]
     fn protected_stop_note_targets_only_protected_wedges() {
         // A wedge-shaped failure on a protected target gets the note — with
         // the full actionable command, so no stitching with the shared hint.
@@ -2616,123 +3311,195 @@ mod tests {
 
     #[test]
     fn envelope_layers_accurate_remediation() {
-        // An Environment-classified session wedge on a named session picks up
-        // the wedge hint.
+        // The envelope itself does not carry the session-wedge text — that is
+        // applied after dispatch, where the session name is known (see
+        // `recover_session_wedge`). A wedge message passes through untouched.
         let env = StepFailure {
             kind: OutKind::Environment,
             message: "session unresponsive: no response within 45s".to_string(),
-            named: true,
         }
         .envelope(
             "session",
             json!({ "session": "mahbot-chrome-docs" }),
-            DEFAULT_STEP_TIMEOUT,
+            StepClocks::probe(SESSION_STOP_TIMEOUT),
         );
-        let err = env
-            .payload
-            .get("error")
-            .and_then(Value::as_str)
-            .expect("error present");
-        assert!(err.contains(&with_session_wedge_hint(
-            OutKind::Environment,
-            "session unresponsive: no response within 45s",
-            true
-        )));
-
-        // The same wedge on an ephemeral session is returned untouched (the
-        // `<name>` recovery verbs are unactionable there).
-        let env = StepFailure {
-            kind: OutKind::Environment,
-            message: "session unresponsive: no response within 45s".to_string(),
-            named: false,
-        }
-        .envelope("open", json!({ "url": "https://x" }), DEFAULT_STEP_TIMEOUT);
         assert_eq!(
             env.payload.get("error").and_then(Value::as_str),
             Some("session unresponsive: no response within 45s")
         );
 
-        // A non-wedge message is returned untouched (no hint).
+        // A non-wedge message is returned untouched too.
         let env = StepFailure {
             kind: OutKind::Environment,
             message: "relay isn't connected".to_string(),
-            named: true,
         }
         .envelope(
             "session",
             json!({ "session": "mahbot-chrome-docs" }),
-            DEFAULT_STEP_TIMEOUT,
+            StepClocks::probe(SESSION_STOP_TIMEOUT),
         );
         assert_eq!(
             env.payload.get("error").and_then(Value::as_str),
             Some("relay isn't connected")
         );
 
-        // A Timeout deadline kill still reports the factual deadline error.
+        // An orphaned-tab error still picks up its hand-close guidance here: it
+        // is the one remediation the envelope owns, because it is the one state
+        // nothing recovers.
         let env = StepFailure {
-            kind: OutKind::Timeout,
-            message: String::new(),
-            named: true,
+            kind: OutKind::Environment,
+            message: "the tab this session was driving can no longer be resolved".to_string(),
         }
         .envelope(
-            "session",
-            json!({ "session": "mahbot-chrome-docs" }),
-            Duration::from_secs(8),
-        );
-        let expected = deadline_error(Duration::from_secs(8), "the step did not complete");
-        assert_eq!(
-            env.payload.get("error").and_then(Value::as_str),
-            Some(expected.as_str())
-        );
-        assert!(env.payload.get("timeout_ms").is_some());
-    }
-
-    #[test]
-    fn append_named_session_timeout_hint_only_applies_to_named_timeouts() {
-        let timeout_error = "deadline reached after 8000ms — the step did not complete";
-        // A named Timeout envelope gets the hint appended to its error.
-        let mut env = out_env(
             "open",
-            false,
-            OutKind::Timeout,
-            json!({ "url": "https://x", "error": timeout_error }),
+            json!({ "url": "https://x" }),
+            StepClocks::operation(),
         );
-        append_named_session_timeout_hint(&mut env, true);
         let err = env
             .payload
             .get("error")
             .and_then(Value::as_str)
             .expect("error present");
         assert!(
-            err.ends_with(&named_session_timeout_hint()),
-            "named timeout hint missing: {err}"
+            err.contains("close the leftover tab in Chrome"),
+            "got: {err}"
         );
 
-        // An unnamed (ephemeral) session Timeout is untouched.
+        // A Timeout deadline kill of a product probe reports the probe's own
+        // bound, and says it is a product-side bound rather than chrome-use's
+        // verdict.
+        let clocks = StepClocks::probe(SESSION_PROBE_TIMEOUT);
+        let env = StepFailure {
+            kind: OutKind::Timeout,
+            message: String::new(),
+        }
+        .envelope(
+            "session",
+            json!({ "session": "mahbot-chrome-docs" }),
+            clocks,
+        );
+        let expected = deadline_error(
+            clocks.call.chrome_side,
+            clocks.call.kill,
+            "the step did not complete",
+        );
+        assert_eq!(
+            env.payload.get("error").and_then(Value::as_str),
+            Some(expected.as_str())
+        );
+        assert_eq!(env.payload["timeout_ms"], 20_000);
+        assert!(expected.contains("the product's own bound for the step"));
+        assert!(!expected.contains("rode above"));
+    }
+
+    #[test]
+    fn wedge_keying_uses_who_ended_the_step_not_the_kind_alone() {
+        let env = |kind: OutKind, error: &str| {
+            out_env(
+                "open",
+                false,
+                kind,
+                json!({ "url": "https://x", "error": error }),
+            )
+        };
+        // chrome-use's own session-unresponsive classification (Environment) is
+        // the one wedge signal that needs no confirmation: chrome-use diagnosed
+        // it rather than being cut off.
+        let diagnosed = env(
+            OutKind::Environment,
+            "session unresponsive: no response within 45s",
+        );
+        assert_eq!(wedge_action(&diagnosed, true, false), WedgeAction::Recover);
+        let cdp = env(
+            OutKind::Environment,
+            "CDP session is unresponsive after attaching (Connection reset).",
+        );
+        assert_eq!(wedge_action(&cdp, true, false), WedgeAction::Recover);
+
+        // A Timeout chrome-use itself reported — what a failed `expect` /
+        // `open --expect` / `wait` produces normally — is NOT a wedge: stopping
+        // that session would only lose its tabs.
+        let verdict = env(OutKind::Timeout, "Wait timed out after 15000ms");
+        assert_eq!(wedge_action(&verdict, true, false), WedgeAction::Leave);
+
+        // A Timeout the PRODUCT's own clock ended is only a candidate: chrome-use
+        // was cut off before it could classify anything, so the session's
+        // liveness is unknown and the bounded probe has to confirm it.
+        let killed = env(OutKind::Timeout, "deadline reached after 92000ms");
+        assert_eq!(wedge_action(&killed, true, true), WedgeAction::Probe);
+
+        // `open --expect --structural` labels a deadline expiration Redesign
+        // instead of Timeout, so a product-clock ending keys the same way.
+        let redesign = env(
+            OutKind::Redesign,
+            "possible DOM redesign or structural change",
+        );
+        assert_eq!(wedge_action(&redesign, true, true), WedgeAction::Probe);
+        assert_eq!(wedge_action(&redesign, true, false), WedgeAction::Leave);
+
+        // Other kinds and other Environment messages are no evidence either, and
+        // an ephemeral (unnamed for recovery) session is never touched.
+        let relay = env(OutKind::Environment, "relay isn't connected");
+        assert_eq!(wedge_action(&relay, true, true), WedgeAction::Leave);
+        let missing = env(OutKind::Error, "element not found");
+        assert_eq!(wedge_action(&missing, true, false), WedgeAction::Leave);
+        let net = env(OutKind::Network, "net::ERR_CONNECTION_REFUSED");
+        assert_eq!(wedge_action(&net, true, true), WedgeAction::Leave);
+        assert_eq!(wedge_action(&killed, false, true), WedgeAction::Leave);
+    }
+
+    /// The end of the keying: an envelope the action left for
+    /// [`WedgeAction::Leave`] reaches the caller untouched — no session stop, no
+    /// annotation.
+    #[tokio::test]
+    async fn wedge_recovery_leaves_a_normal_timeout_alone() {
+        let failure =
+            |error: &str| out_env("expect", false, OutKind::Timeout, json!({ "error": error }));
+        let mut env = failure("condition not met");
+        recover_session_wedge(&mut env, "mahbot-chrome-docs", true, false).await;
+        assert_eq!(env.payload["error"], "condition not met");
+
+        let mut env = failure("condition not met");
+        recover_session_wedge(&mut env, "mahbot-chrome-ephemeral-x", false, true).await;
+        assert_eq!(env.payload["error"], "condition not met");
+    }
+
+    #[test]
+    fn wedge_recovery_note_reports_what_was_done_or_the_manual_flow() {
+        // The automatic recovery stopped the session: its own summary, and no
+        // manual flow.
+        let stopped = wedge_recovery_note(SessionRecovery::Stopped);
+        assert_eq!(stopped, SessionRecovery::Stopped.summary());
+        assert!(!stopped.contains("recover with"), "got: {stopped}");
+        // The stop was issued but never confirmed, or could not be started: the
+        // summary itself carries that, and the manual flow is named — the only
+        // place it is.
+        for recovery in [SessionRecovery::Unanswered, SessionRecovery::NotStarted] {
+            let note = wedge_recovery_note(recovery);
+            assert!(note.starts_with(recovery.summary()), "got: {note}");
+            assert!(note.contains(SESSION_RECOVERY_FLOW), "got: {note}");
+            assert!(!note.contains("could not run"), "got: {note}");
+        }
+    }
+
+    #[test]
+    fn append_error_note_extends_the_error_text_only() {
+        let timeout_error = "deadline reached after 92000ms — the step did not complete";
         let mut env = out_env(
             "open",
             false,
             OutKind::Timeout,
             json!({ "url": "https://x", "error": timeout_error }),
         );
-        append_named_session_timeout_hint(&mut env, false);
+        append_error_note(&mut env, "what was done");
         assert_eq!(
             env.payload.get("error").and_then(Value::as_str),
-            Some(timeout_error)
+            Some(format!("{timeout_error} — what was done").as_str())
         );
-
-        // A named non-Timeout envelope is untouched.
-        let mut env = out_env(
-            "open",
-            false,
-            OutKind::Error,
-            json!({ "url": "https://x", "error": "some error" }),
-        );
-        append_named_session_timeout_hint(&mut env, true);
-        assert_eq!(
-            env.payload.get("error").and_then(Value::as_str),
-            Some("some error")
-        );
+        // Other payload keys and an error-less payload are untouched.
+        let mut env = out_env("open", false, OutKind::Ok, json!({ "url": "https://x" }));
+        append_error_note(&mut env, "what was done");
+        assert!(env.payload.get("error").is_none());
     }
 
     /// Direct pin of the spawn-level classification, including the crux of the
@@ -2749,6 +3516,7 @@ mod tests {
         // expect pass=false: success:true + exit 1 → the verdict is returned.
         let resp = classify_step_output(
             true,
+            false,
             Some(1),
             false,
             &envelope(
@@ -2769,6 +3537,7 @@ mod tests {
         // generic failure (fallback message, no envelope error).
         let r = classify_step_output(
             false,
+            false,
             Some(1),
             false,
             &envelope(json!({"success": true, "data": {"pass": false}})),
@@ -2782,6 +3551,7 @@ mod tests {
         // expect un-evaluable (no browser): success:false + exit 2 → environment.
         let r = classify_step_output(
             true,
+            false,
             Some(2),
             false,
             &envelope(
@@ -2797,6 +3567,7 @@ mod tests {
         // Honest timeout classification on a failed wait.
         let r = classify_step_output(
             false,
+            false,
             Some(1),
             false,
             &envelope(json!({"success": false, "error": "Wait timed out after 15000ms"})),
@@ -2811,6 +3582,7 @@ mod tests {
         assert!(
             outcome(&classify_step_output(
                 false,
+                false,
                 Some(0),
                 true,
                 &envelope(json!({"success": true, "data": {}})),
@@ -2820,12 +3592,19 @@ mod tests {
         );
 
         // Unparseable stdout: zero exit → non-JSON error; non-zero → stderr fallback.
-        let r = classify_step_output(false, Some(0), true, b"garbage", "");
+        let r = classify_step_output(false, false, Some(0), true, b"garbage", "");
         assert_eq!(
             outcome(&r),
             Err((OutKind::Error, "chrome-use returned non-JSON output".into()))
         );
-        let r = classify_step_output(false, Some(1), false, b"garbage", "relay is not connected");
+        let r = classify_step_output(
+            false,
+            false,
+            Some(1),
+            false,
+            b"garbage",
+            "relay is not connected",
+        );
         assert_eq!(
             outcome(&r),
             Err((OutKind::Environment, "relay is not connected".into()))
@@ -2849,6 +3628,7 @@ mod tests {
         // Timeout envelope: hint stripped, honest prefix kept.
         let r = classify_step_output(
             false,
+            false,
             Some(1),
             false,
             &envelope(
@@ -2865,6 +3645,7 @@ mod tests {
         // not stripped — only Timeout-classified messages are rewritten).
         let r = classify_step_output(
             false,
+            false,
             Some(1),
             false,
             &envelope(json!({"success": false, "error": format!("some other failure. {hint}")})),
@@ -2879,6 +3660,7 @@ mod tests {
         // phrasing with the canned hint in stderr → hint stripped.
         let r = classify_step_output(
             false,
+            false,
             Some(1),
             false,
             b"garbage",
@@ -2888,6 +3670,85 @@ mod tests {
             outcome(&r),
             Err((OutKind::Timeout, "Wait timed out after 15000ms".into()))
         );
+    }
+
+    /// A successful envelope carrying chrome-use's browser-replacement note is a
+    /// failure, never a quiet success — and it is deliberately NOT the
+    /// daemon-down path (the daemon is fine; the connection to the real browser
+    /// was lost). The benign degraded-success warnings keep today's behaviour.
+    #[test]
+    fn classify_step_output_fails_a_self_launched_browser() {
+        let envelope = |body: Value| serde_json::to_vec(&body).expect("serialize envelope");
+        let note = "This session's previous browser is gone (its browser connection was dead) \
+                    and a fresh one was launched for this command";
+        let r = classify_step_output(
+            false,
+            false,
+            Some(0),
+            true,
+            &envelope(json!({"success": true, "warning": note})),
+            "",
+        );
+        let Err(f) = r else {
+            panic!("a browser chrome-use started itself must not classify as success")
+        };
+        assert_eq!(f.kind, OutKind::Environment);
+        assert_eq!(f.message, self_launched_browser_error(note));
+
+        // The expect-style success path (envelope trusted over a non-zero exit)
+        // applies the same rule.
+        let r = classify_step_output(
+            true,
+            false,
+            Some(1),
+            false,
+            &envelope(json!({"success": true, "warning": note, "data": {"pass": true}})),
+            "",
+        );
+        let Err(f) = r else {
+            panic!("a browser chrome-use started itself must not classify as success")
+        };
+        assert_eq!(f.kind, OutKind::Environment);
+
+        // A degraded-success warning is NOT browser replacement: the step still
+        // succeeds and the action-specific envelope judges it.
+        let r = classify_step_output(
+            false,
+            false,
+            Some(0),
+            true,
+            &envelope(
+                json!({"success": true, "warning": "no key listeners on the focused element"}),
+            ),
+            "",
+        );
+        assert!(r.is_ok());
+    }
+
+    /// An unparseable answer the product itself cut off names the truncation,
+    /// while a genuinely malformed one keeps the generic text — a product
+    /// truncation must never read as chrome-use's malformed output, on a
+    /// non-zero exit too, where the stderr fallback would otherwise claim
+    /// chrome-use's own failure.
+    #[test]
+    fn classify_step_output_names_a_truncated_answer() {
+        let outcome = |r: &StepOutcome| match r {
+            Ok(resp) => Ok(resp.data.clone()),
+            Err(f) => Err((f.kind, f.message.clone())),
+        };
+        let r = classify_step_output(false, true, Some(0), true, b"garbage", "");
+        assert_eq!(outcome(&r), Err((OutKind::Error, truncated_output_error())));
+        let r = classify_step_output(false, false, Some(0), true, b"garbage", "");
+        assert_eq!(
+            outcome(&r),
+            Err((OutKind::Error, "chrome-use returned non-JSON output".into()))
+        );
+        // A non-zero exit with an unparsed, truncated answer names the
+        // truncation too, instead of the stderr fallback.
+        let r = classify_step_output(false, true, Some(1), false, b"garbage", "some stderr");
+        assert_eq!(outcome(&r), Err((OutKind::Error, truncated_output_error())));
+        let r = classify_step_output(false, false, Some(1), false, b"garbage", "some stderr");
+        assert_eq!(outcome(&r), Err((OutKind::Error, "some stderr".into())));
     }
 
     #[test]
@@ -2904,27 +3765,39 @@ mod tests {
 
     #[test]
     fn step_failure_envelope_reports_timeout_vs_error() {
-        let timeout = Duration::from_secs(8);
-        // A deadline kill now reports timeout_ms AND a factual error.
+        // A declared (forwarded) deadline kill: the envelope reports the
+        // product's own bound for the step (its kill) as `timeout_ms`, and the
+        // error names that bound and the clock chrome-use was working to.
+        let clocks = StepClocks::forwarded(Duration::from_secs(10));
         let env = StepFailure {
             kind: OutKind::Timeout,
             message: String::new(),
-            named: false,
         }
-        .envelope("wait", json!({ "selector": ".x" }), timeout);
-        assert_eq!(env.payload["timeout_ms"], 8000);
+        .envelope("wait", json!({ "selector": ".x" }), clocks);
+        assert_eq!(
+            env.payload["timeout_ms"],
+            json!(clocks.call.kill.as_millis())
+        );
+        let kill = kill_bound(Duration::from_secs(10), CliRecovery::Allowed).as_millis();
         assert_eq!(
             env.payload["error"],
-            "deadline reached after 8000ms — the step did not complete"
+            format!(
+                "deadline reached after {kill}ms — the step did not complete: that is the \
+                 product's own bound, which rode above the 10000ms deadline chrome-use itself \
+                 was working to, so chrome-use never reported its own reason"
+            )
         );
 
         // Any other failure reports the chrome-use error text, no timeout_ms.
         let env = StepFailure {
             kind: OutKind::Network,
             message: "net::ERR_NAME_NOT_RESOLVED".into(),
-            named: false,
         }
-        .envelope("open", json!({ "url": "https://x" }), timeout);
+        .envelope(
+            "open",
+            json!({ "url": "https://x" }),
+            StepClocks::operation(),
+        );
         assert_eq!(env.payload["error"], "net::ERR_NAME_NOT_RESOLVED");
         assert_eq!(env.payload["error_code"], "ERR_NAME_NOT_RESOLVED");
         assert!(env.payload.get("timeout_ms").is_none());
@@ -2934,9 +3807,12 @@ mod tests {
         let env = StepFailure {
             kind: OutKind::Network,
             message: "connection refused by peer".into(),
-            named: false,
         }
-        .envelope("open", json!({ "url": "https://x" }), timeout);
+        .envelope(
+            "open",
+            json!({ "url": "https://x" }),
+            StepClocks::operation(),
+        );
         assert!(env.payload.get("error_code").is_none());
     }
 
@@ -3005,6 +3881,104 @@ mod tests {
         assert!(env.payload.get("actual").is_none());
     }
 
+    /// The `--timeout` of a verb that DECLARES its value to chrome-use
+    /// (`wait`/`expect`, and `open` through its `--expect` wait) is capped below
+    /// chrome-use's own client tolerance ([`CHROME_USE_OWN_BUDGET`]). A deadline at
+    /// or above the tolerance makes chrome-use run OUT of tolerance instead of
+    /// answering, so its session-unresponsive classification — which stops the
+    /// session and loses its open tabs — replaces the honest "condition was not
+    /// met". The rule is enforced at parse time: a too-long deadline is refused with
+    /// a usage error instead of accepted and then silently mis-reported.
+    ///
+    /// A verb that forwards nothing is refused the OTHER way: chrome-use takes no
+    /// per-call deadline for it, so nothing can honour a bound below the clock
+    /// mahbot declares to chrome-use — such a request is refused rather than
+    /// accepted and discarded, while a bound at or above it (`eval --timeout 300`)
+    /// is one the call really runs to.
+    #[test]
+    fn timeout_flag_is_capped_below_chrome_use_client_tolerance() {
+        let err = parse_invocation(&["wait".into(), "#x".into(), "--timeout".into(), "45".into()])
+            .err()
+            .expect("a deadline at the tolerance must be refused");
+        assert!(
+            err.contains("45") && err.contains("client tolerance"),
+            "err must be the tolerance refusal, naming the value: {err}"
+        );
+
+        assert!(
+            parse_invocation(&["wait".into(), "#x".into(), "--timeout".into(), "44".into(),])
+                .is_ok(),
+            "one second below the tolerance must parse"
+        );
+
+        for args in [
+            &["expect".into(), "#x".into(), "visible".into()][..],
+            &["open".into(), "https://example.com".into()][..],
+        ] {
+            let mut argv = args.to_vec();
+            argv.extend(["--timeout".into(), "45".into()]);
+            let err = parse_invocation(&argv)
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} must refuse a deadline at the tolerance"));
+            // The tolerance refusal itself, not another rejection of the line: it
+            // names both the value asked for and the tolerance it crossed.
+            assert!(
+                err.contains("45") && err.contains("client tolerance"),
+                "{argv:?} must be refused on the value: {err}"
+            );
+        }
+
+        // A verb chrome-use takes no per-call deadline for: a bound below the clock
+        // mahbot declares to chrome-use cannot be honoured, so it is refused — with
+        // the value the caller asked for and the shortest one that IS honoured.
+        let declared = CHROME_USE_DECLARED_BUDGET.as_secs().to_string();
+        for action in [
+            &["count".into(), ".x".into()][..],
+            &["eval".into(), "1+1".into()][..],
+            &["extract".into(), "--schema-file".into(), "s.json".into()][..],
+            &["click".into(), "#a".into()][..],
+            &["fill".into(), "#a".into(), "t".into()][..],
+            &["type".into(), "#a".into(), "t".into()][..],
+            &["press".into(), "Enter".into()][..],
+        ] {
+            let mut argv = action.to_vec();
+            argv.extend(["--timeout".into(), "5".into()]);
+            let err = parse_invocation(&argv)
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} must refuse an unhonourable bound"));
+            assert!(
+                err.contains("--timeout 5s") && err.contains(&declared),
+                "{argv:?} must name the refused value and the shortest honoured one: {err}"
+            );
+        }
+        // At the declared clock it parses, and it is the bound the call runs to.
+        let at_the_clock = parse_invocation(&[
+            "eval".into(),
+            "1+1".into(),
+            "--timeout".into(),
+            declared.clone(),
+        ])
+        .expect("a bound at the declared clock is honoured");
+        assert!(matches!(
+            at_the_clock.action,
+            Action::Eval { bound: Some(b), .. } if b == CHROME_USE_DECLARED_BUDGET
+        ));
+
+        let wide = parse_invocation(&[
+            "eval".into(),
+            "1+1".into(),
+            "--timeout".into(),
+            "300".into(),
+        ])
+        .expect("a verb that forwards no deadline takes any bound");
+        match wide.action {
+            Action::Eval { bound, .. } => {
+                assert_eq!(bound, Some(Duration::from_secs(300)));
+            }
+            _ => panic!("expected Eval with the user's bound"),
+        }
+    }
+
     #[expect(clippy::too_many_lines)]
     #[test]
     fn parse_happy_paths_support_both_flag_forms() {
@@ -3060,8 +4034,8 @@ mod tests {
             _ => panic!("expected Open"),
         }
 
-        // open without --timeout defaults to the whole-operation budget (20 s),
-        // NOT the per-step 8 s.
+        // open without --timeout defaults to the whole-operation budget (20 s);
+        // the navigation itself runs to the clock mahbot declares to chrome-use.
         let inv =
             parse_invocation(&["open".into(), "https://example.com".into()]).expect("open parses");
         match inv.action {
@@ -3069,16 +4043,35 @@ mod tests {
             _ => panic!("expected Open"),
         }
 
-        // count / wait / eval.
-        for (action, sel) in [("count", ".x"), ("wait", ".x"), ("eval", "1+1")] {
-            let inv = parse_invocation(&[action.into(), sel.into(), "--timeout=7".into()])
+        // count / eval: a user `--timeout` is their own bound on the step (no
+        // default), and only a value at or above the clock mahbot declares to
+        // chrome-use parses — anything shorter is refused (see
+        // `timeout_flag_is_capped_below_chrome_use_client_tolerance`), while
+        // wait/expect forward their value as chrome-use's clock.
+        for (action, sel) in [("count", ".x"), ("eval", "1+1")] {
+            let inv = parse_invocation(&[action.into(), sel.into(), "--timeout=60".into()])
                 .expect("action parses");
             match inv.action {
-                Action::Count { timeout, .. }
-                | Action::Wait { timeout, .. }
-                | Action::Eval { timeout, .. } => assert_eq!(timeout, Duration::from_secs(7)),
-                _ => panic!("expected a timed action"),
+                Action::Count { bound, .. } | Action::Eval { bound, .. } => {
+                    assert_eq!(bound, Some(Duration::from_secs(60)));
+                }
+                _ => panic!("expected a bounded action"),
             }
+        }
+        // Without --timeout a forwarding-less verb carries no bound at all:
+        // the clock mahbot declares to chrome-use is its clock.
+        let inv = parse_invocation(&["count".into(), ".x".into()]).expect("count parses");
+        assert!(matches!(inv.action, Action::Count { bound: None, .. }));
+        let inv = parse_invocation(&["eval".into(), "1+1".into()]).expect("eval parses");
+        assert!(matches!(inv.action, Action::Eval { bound: None, .. }));
+
+        // wait / expect default to the condition deadline they declare AND
+        // forward as their `--timeout`, well under chrome-use's own client
+        // tolerance so the tool's own verdict always fires first.
+        let inv = parse_invocation(&["wait".into(), ".x".into()]).expect("wait parses");
+        match inv.action {
+            Action::Wait { timeout, .. } => assert_eq!(timeout, DEFAULT_STEP_TIMEOUT),
+            _ => panic!("expected Wait"),
         }
 
         // wait with --url / --text targets.
@@ -3188,11 +4181,11 @@ mod tests {
             Action::Extract {
                 schema_file,
                 limit,
-                timeout,
+                bound,
             } => {
                 assert_eq!(schema_file, "rows.json");
                 assert_eq!(limit, Some(3));
-                assert_eq!(timeout, DEFAULT_STEP_TIMEOUT);
+                assert_eq!(bound, None);
             }
             _ => panic!("expected Extract"),
         }
@@ -3327,7 +4320,7 @@ mod tests {
             "--hold".into(),
             "50".into(),
             "--timeout".into(),
-            "9".into(),
+            "60".into(),
         ])
         .expect("press parses");
         match inv.action {
@@ -3335,12 +4328,12 @@ mod tests {
                 key,
                 selector,
                 hold,
-                timeout,
+                bound,
             } => {
                 assert_eq!(key, "Enter");
                 assert_eq!(selector.as_deref(), Some("#t"));
                 assert_eq!(hold, Some(50));
-                assert_eq!(timeout, Duration::from_secs(9));
+                assert_eq!(bound, Some(Duration::from_secs(60)));
             }
             _ => panic!("expected Press"),
         }

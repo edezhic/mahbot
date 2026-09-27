@@ -7,6 +7,7 @@ pub(crate) mod folder_name;
 pub(crate) mod html;
 pub(crate) mod http;
 pub(crate) mod json;
+pub(crate) mod leftover_channels;
 pub mod lock;
 pub(crate) mod macros;
 pub(crate) mod managed_bin;
@@ -273,6 +274,13 @@ pub(crate) fn unix_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Elapsed time as the saturating millisecond count a durable row's
+/// `duration_ms` field holds (a 64-bit field, so nothing realistic saturates).
+#[must_use]
+pub(crate) fn millis_i64(elapsed: std::time::Duration) -> i64 {
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// Parse an env var as a whole number of seconds, falling back to `default_secs`.

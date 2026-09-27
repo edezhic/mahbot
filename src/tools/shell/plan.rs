@@ -194,8 +194,11 @@
 //!   the single-child runner's two pipes had.
 //! - A member's leftover descendants can hold a capture pipe open after the
 //!   member exited: the post-run drain bound is the same one the single-child run
-//!   gives, and its overrun is the same
-//!   [`super::ShellRunResult::DrainTimedOut`].
+//!   gives, and it is resolved the same way an agent's own command is — the last
+//!   member's own status is reported with
+//!   [`super::ShellRunResult::ExitedWithLeftovers`] and the leftover is left
+//!   running. No program path builds a plan, so there is no
+//!   [`super::LeftoverPolicy`] to pick here: the plan runner never ends a tree.
 //! - A stop ends the whole run's tree, not one member's: every member's process
 //!   group on unix — the groups of members already reaped included, which is what
 //!   reaches a descendant they left behind — and the run's own job on Windows
@@ -1738,8 +1741,13 @@ impl CaptureBudgets {
 ///
 /// The result maps onto the same [`ShellRunResult`] variants a shell run produces,
 /// so the caller cannot tell a plan run from one: `Completed`, `TimedOut`,
-/// `DrainTimedOut`, `MemoryExceeded`, `SpawnFailed`. The status of a `Completed`
+/// `ExitedWithLeftovers`, `MemoryExceeded`, `SpawnFailed`. The status of a completed
 /// run is the last executed group's last member's (see the module docs).
+///
+/// A leftover descendant still holding a capture pipe is left running: the last
+/// member's own status is the answer. A plan is only ever built for an agent's
+/// rewritten line, so nothing here ends a tree the way the program paths do
+/// ([`super::LeftoverPolicy::End`]).
 pub(super) async fn run(
     plan: &Plan,
     timeout: Duration,
@@ -1764,9 +1772,6 @@ pub(super) async fn run(
     let mut previous: Option<i32> = None;
     // The status the run reports: the last executed group's last member's.
     let mut reported: Option<std::process::ExitStatus> = None;
-    // The pid a stop names: the group the run was waiting for (see
-    // [`ShellRunResult::TimedOut`]).
-    let mut named_pid: Option<u32> = None;
 
     for group in pipe_groups(&plan.steps) {
         if !runs_after(plan.steps[group.start].join, previous) {
@@ -1788,7 +1793,9 @@ pub(super) async fn run(
                     return ShellRunResult::SpawnFailed(e);
                 }
             };
-        named_pid = members.first().map(|member| member.pid);
+        // The pid a stop names: the group the run was waiting for (see
+        // [`ShellRunResult::TimedOut`]).
+        let named_pid = members.first().map(|member| member.pid);
         match wait_group(&mut members, &mut watchdog, memory_limit).await {
             GroupEnd::Reaped => {
                 let last = members.last().and_then(|member| member.status);
@@ -1832,15 +1839,16 @@ pub(super) async fn run(
     // Every group ran or was skipped: the run ended on its own, so nothing is
     // killed here and the job is kept rather than closed.
     kill_guard.disarm();
-    if readers.drain(drain_limit).await {
+    let drained = readers.drain(drain_limit).await;
+    // The first group of a non-empty plan always runs, and a plan is built
+    // from a non-empty line: no status here means a plan nobody built
+    // ([`Plan::steps`] empty), which is a failed run rather than a panic.
+    let Some(status) = reported else {
+        return ShellRunResult::SpawnFailed(io::Error::other("the plan has no step to run"));
+    };
+    if drained {
         tree.retain_after_completion();
         let (stdout, stderr) = readers.collect().await;
-        // The first group of a non-empty plan always runs, and a plan is built
-        // from a non-empty line: no status here means a plan nobody built
-        // ([`Plan::steps`] empty), which is a failed run rather than a panic.
-        let Some(status) = reported else {
-            return ShellRunResult::SpawnFailed(io::Error::other("the plan has no step to run"));
-        };
         return ShellRunResult::Completed {
             stdout,
             stderr,
@@ -1849,17 +1857,21 @@ pub(super) async fn run(
         };
     }
     // The drain bound was exceeded: a leftover process still holds a capture
-    // pipe. End the run's tree — the members' process groups on unix, the job on
-    // Windows — then collect what the readers hold, mirroring the single-child
-    // path.
-    let ended = tree.terminate();
-    let (stdout, stderr) = collect_stopped(&cancel, &mut readers).await;
-    ShellRunResult::DrainTimedOut {
+    // pipe. A plan run is an agent's rewritten line, so the leftover is left
+    // running — the readers are detached rather than cancelled so its channel
+    // stays open, and the containment is kept (on Windows the job's handle must
+    // not be closed, because that would kill the very process this path must
+    // leave running). No containment is named: the leftover is not in one group
+    // the run can point at (on unix each member is its own process group, while
+    // the Windows containment is the whole run's job), and the note renders the
+    // unnamed case honestly.
+    tree.retain_after_completion();
+    let (stdout, stderr) = readers.snapshot_and_detach();
+    ShellRunResult::ExitedWithLeftovers {
         stdout,
         stderr,
-        // Named as killed only when the tree really was ended (see the variant),
-        // and this platform's containment is the whole run rather than one pid.
-        pid: named_pid.filter(|_| ended),
+        status,
+        scope: None,
         elapsed: start.elapsed(),
     }
 }
@@ -3619,23 +3631,35 @@ mod tests {
     }
 
     /// A member that leaves a descendant holding the capture pipe open past the
-    /// drain bound ends the run as `DrainTimedOut` rather than hanging on a stream
-    /// nothing will close — the same bound, and the same variant, the single-child
-    /// runner gives.
+    /// drain bound is not a failure: the last member's own status and the output
+    /// collected up to the bound are the run's result, the same split the
+    /// single-child runner gives — and the note names no containment, because the
+    /// leftover is not in one group this run can point at.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_leftover_holder_past_the_drain_bound_ends_the_run() {
+    async fn a_leftover_holder_past_the_drain_bound_keeps_its_status() {
         let result = run(
-            &shell_plan(&[("echo out; sleep 30 &", Join::First)]),
+            &shell_plan(&[("echo out; sleep 5 &", Join::First)]),
             Duration::from_secs(20),
             Duration::from_millis(300),
             None,
             RunOwner::Agent,
         )
         .await;
-        let ShellRunResult::DrainTimedOut { stdout, .. } = result else {
-            panic!("expected a drain timeout, got {result:?}");
+        let ShellRunResult::ExitedWithLeftovers {
+            stdout,
+            status,
+            scope,
+            ..
+        } = result
+        else {
+            panic!("expected ExitedWithLeftovers, got {result:?}");
         };
+        assert_eq!(status.code(), Some(0), "the member's own status");
+        assert!(
+            scope.is_none(),
+            "the leftover is not in one group the run can name"
+        );
         assert!(
             String::from_utf8_lossy(&stdout).contains("out"),
             "what the member wrote before the bound is collected: {}",

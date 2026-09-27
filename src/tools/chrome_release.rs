@@ -23,7 +23,11 @@
 //! Out of scope: the sessions an agent mints by shelling out to `mahbot chrome`
 //! (`mahbot-chrome-ephemeral-*`, closed best-effort by that call and the boot sweep).
 
-use super::chrome_daemon::{cli_path, run_cli_json_at};
+use super::chrome_daemon::{
+    NoVerdict, SESSION_RECOVERY_TIMEOUT, cli_path, recover_unresponsive_session_via,
+    run_cli_json_at,
+};
+use crate::chrome::contract::is_session_unresponsive_error;
 use crate::util::UnwrapPoison;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -35,19 +39,14 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-/// Bound for one release attempt: one `session stop`, whose whole legitimate cost is
-/// the ≈28 s the live-verified behaviours block of [`crate::tools::chrome_daemon`]
-/// states — about twice that, so the estimate drifting with a chrome-use release
-/// cannot charge a working stop as a failure, at the price of a degraded path that
-/// takes twice as long to give up (the ladder is [`RELEASE_MAX_ATTEMPTS`]).
-const RELEASE_ATTEMPT_TIMEOUT: Duration = Duration::from_mins(1);
 /// Concurrent `chrome-use` children per pass.
 const RELEASE_CONCURRENCY: usize = 8;
 /// Attempts one ended run's record gets before it is given up on and dropped with one
 /// INFO line — the price of a bounded record, and the terminal policy for a browser side
 /// that stays degraded. Attempts are spaced by [`release_backoff`] (≈75 s in gaps), and
-/// each one costs up to [`RELEASE_ATTEMPT_TIMEOUT`] per [`RELEASE_CONCURRENCY`] of the
-/// record's names: minutes for a small record, tens of minutes for one with dozens.
+/// each one costs up to [`crate::chrome::SESSION_STOP_TIMEOUT`] per
+/// [`RELEASE_CONCURRENCY`] of the record's names: minutes for a small record, tens of
+/// minutes for one with dozens.
 ///
 /// The give-up is silent: the record is dropped and those tabs stay open in the
 /// browser, with the INFO line below the only trace of it. Nothing user-facing reports
@@ -106,9 +105,10 @@ const MAX_PENDING_RELEASES: usize = 64;
 /// Last-chance release budget on the shutdown/self-update path, in the spirit of the
 /// chrome-side `SHUTDOWN_CLEANUP_TIMEOUT`: a degraded browser side cannot be waited out
 /// while the process is going down. It sits below what one `session stop` may
-/// legitimately need (see [`RELEASE_ATTEMPT_TIMEOUT`]), so a slow but working stop is
-/// cut off here and its record left for the next boot — these attempts are uncharged and
-/// the record is durable, so the shortfall costs a retry, not the release.
+/// legitimately need (see [`crate::chrome::SESSION_STOP_TIMEOUT`]), so a slow but
+/// working stop is cut off here and its record left for the next boot — these attempts
+/// are uncharged and the record is durable, so the shortfall costs a retry, not the
+/// release.
 const SHUTDOWN_RELEASE_FLUSH_BUDGET: Duration = Duration::from_secs(10);
 
 /// One ended run's unreleased session names.
@@ -878,6 +878,28 @@ pub async fn flush_and_close_all_chrome_sessions() {
 ///
 /// [`SkipReason::NoBinary`] when there is no binary to run, so an absent or mid-swap
 /// chrome-use does not spend the bounded attempts.
+///
+/// The ONE failure that runs the shared session recovery: chrome-use's own
+/// session-unresponsive classification, or a `session stop` the product had to end itself —
+/// either way ONLY for an attempt that had the FULL
+/// [`crate::chrome::SESSION_STOP_TIMEOUT`] to answer in (the bound that covers the ≈28 s
+/// honest stop stated in the live-verified behaviours block of
+/// [`crate::tools::chrome_daemon`]). Both are the wedged-session symptom, so the recovery
+/// stops that session's daemon through THIS pass's resolved helper, at the recovery's own
+/// fixed [`SESSION_RECOVERY_TIMEOUT`], before the attempt is recorded as failed and the
+/// existing retry/give-up policy continues. An attempt that never produced a chrome-use
+/// child is not that symptom: nothing was ever asked of the session, so its silence proves
+/// nothing about it (see [`is_wedged_release_failure`]).
+///
+/// Requiring the full budget is what keeps nothing spawned during a flush from outliving
+/// the exit: the shutdown flush cuts an attempt to [`SHUTDOWN_RELEASE_FLUSH_BUDGET`], so
+/// a flush-era wedge spawns no second, never-killed `session stop` — a wedged session is
+/// recovered only after a full attempt, and the flush-era one is left to the next boot,
+/// whose durable release record still holds the session. The flush-era wedge is still
+/// reported as a failed attempt.
+///
+/// The recovery runs at most once per attempt, and the policy's own
+/// [`RELEASE_MAX_ATTEMPTS`] is what bounds it overall.
 async fn release_one(name: &str, timeout: Duration) -> ReleaseOutcome {
     let Some(cli) = release_cli() else {
         debug!(
@@ -886,20 +908,53 @@ async fn release_one(name: &str, timeout: Duration) -> ReleaseOutcome {
         );
         return ReleaseOutcome::Skipped(SkipReason::NoBinary);
     };
+    // The recovery stop is never killed, so it is spawned only for an attempt that
+    // really had the full budget: an attempt the shutdown flush truncated spawns no
+    // stop that would outlive the exiting process.
+    let full_budget = timeout >= crate::chrome::SESSION_STOP_TIMEOUT;
     match run_cli_json_at(&cli, &["session", "stop"], Some(name), timeout).await {
         Ok(_) => {
             debug!(session = name, "agent-run chrome session released");
             ReleaseOutcome::Released
         }
-        Err(err) => {
+        Err(verdict) => {
+            if is_wedged_release_failure(&verdict, full_budget) {
+                let recovery =
+                    recover_unresponsive_session_via(&cli, name, SESSION_RECOVERY_TIMEOUT).await;
+                debug!(
+                    session = name,
+                    recovery = recovery.summary(),
+                    "agent-run chrome session release hit a wedged session — recovered before the attempt is charged"
+                );
+            }
             debug!(
                 session = name,
-                error = err.as_deref().unwrap_or("no response"),
+                error = verdict.text(),
                 "agent-run chrome session release failed — the session still owns its tabs, or chrome-use could not answer"
             );
             ReleaseOutcome::Failed
         }
     }
+}
+
+/// Whether a failed release attempt is the wedged-session signature: chrome-use's own
+/// session-unresponsive classification, or — only for an attempt that had the full
+/// [`crate::chrome::SESSION_STOP_TIMEOUT`] to answer in — a `session stop` the product had
+/// to end itself: killed at its bound, or an answer carrying no readable verdict (see
+/// [`NoVerdict`]). The full budget is part of the test for BOTH cases, because the recovery
+/// the signature triggers is never killed (see [`release_one`]). A call that never produced
+/// a chrome-use child ([`NoVerdict::SpawnFailure`]) is deliberately NOT the signature:
+/// nothing was ever asked of the session, so reading a transient spawn failure as a wedge
+/// would stop a session's daemon for nothing. The post-timeout health probe reads the same
+/// silence the other way round, and for a reason of its own — see
+/// [`crate::tools::chrome_daemon::health_after_call_timeout`].
+fn is_wedged_release_failure(verdict: &NoVerdict, full_budget: bool) -> bool {
+    full_budget
+        && match verdict {
+            NoVerdict::Reported(text) => is_session_unresponsive_error(text),
+            NoVerdict::TimedOut | NoVerdict::Unreadable => true,
+            NoVerdict::SpawnFailure => false,
+        }
 }
 
 /// Every knob of the release path — one accessor so the test seam swaps the whole set
@@ -928,7 +983,7 @@ fn release_settings() -> ReleaseSettings {
         return settings;
     }
     ReleaseSettings {
-        attempt_timeout: RELEASE_ATTEMPT_TIMEOUT,
+        attempt_timeout: crate::chrome::SESSION_STOP_TIMEOUT,
         retry_base: RELEASE_RETRY_BASE,
         boot_grace: RELEASE_BOOT_GRACE,
         store: crate::config::CONFIG
@@ -1138,15 +1193,16 @@ mod tests {
             let mode = dir.path().join("mode");
             let log = dir.path().join("log");
             // The stub records every invocation's argv; `mode` decides whether
-            // it answers with the verified envelope, refuses, or hangs. An exit
-            // code alone is deliberately NOT a success mode — the release gates
-            // on the envelope.
+            // it answers with the verified envelope, refuses, reports the wedge
+            // verdict chrome-use itself would, or hangs. An exit code alone is
+            // deliberately NOT a success mode — the release gates on the envelope.
             fs::write(
                 &cli,
                 format!(
                     "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\ncase \"$(cat {mode})\" in\n  \
                      hang) exec sleep 5 ;;\n  \
                      fail) printf '%s' '{{\"success\":false,\"error\":\"boom\"}}'; exit 1 ;;\n  \
+                     wedged) printf '%s' '{{\"success\":false,\"error\":\"session unresponsive\"}}'; exit 1 ;;\n  \
                      ok) printf '%s' '{{\"success\":true}}' ;;\n\
                      esac\nexit 0\n",
                     log = log.display(),
@@ -1324,8 +1380,11 @@ mod tests {
         );
     }
 
-    /// A `session stop` that outlives the attempt bound (slow browser side) is a
-    /// failed attempt, not a release.
+    /// A `session stop` that outlives an attempt the shutdown truncated below the full
+    /// [`crate::chrome::SESSION_STOP_TIMEOUT`] is one failed attempt, not a release — and
+    /// NOT the wedge the shared session recovery exists for: that verdict needs the full
+    /// honest budget, so a flush running out of time never spawns a second, never-killed
+    /// stop and leaves the session to the boot-time restore path.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn a_timed_out_release_counts_as_one_failed_attempt() {
@@ -1344,6 +1403,11 @@ mod tests {
             vec![(run_session_names("run-slow", &["agent-tab-s-slow"]), 1)],
             "a timed-out attempt is one failed attempt, and the name stays queued"
         );
+        assert_eq!(
+            guard.log_lines().len(),
+            1,
+            "a truncated attempt spawns no recovery stop"
+        );
 
         // The short bound has served its purpose; the success that follows must
         // not race a cold or loaded stub spawn.
@@ -1353,6 +1417,90 @@ mod tests {
         assert!(
             pending_releases_snapshot().is_empty(),
             "released on the next pass"
+        );
+    }
+
+    /// chrome-use's OWN session-unresponsive verdict is the wedge signature, and it runs
+    /// the shared session recovery once before the attempt is charged — the recovery
+    /// requires the full attempt budget, so the attempt genuinely had it.
+    #[tokio::test]
+    #[serial_test::serial(chrome_release)]
+    async fn a_session_unresponsive_release_runs_the_shared_recovery() {
+        // The recovery records the wedge in the process-wide health singleton — take
+        // the health test lock so no sibling health test observes it, and leave it
+        // pristine.
+        let _health = crate::tools::chrome_daemon::with_health_test_lock().await;
+        let guard = ReleaseGuard::install(crate::chrome::SESSION_STOP_TIMEOUT).await;
+        queue_names("run-wedged", &["agent-tab-w-wedged"]);
+        guard.set_mode("wedged");
+
+        release_due().await;
+
+        assert_eq!(
+            pending_names_and_attempts(),
+            vec![(run_session_names("run-wedged", &["agent-tab-w-wedged"]), 1)],
+            "the failed attempt is charged once"
+        );
+        assert_eq!(
+            guard.log_lines().len(),
+            2,
+            "the `session stop` that reported the wedge plus the recovery's own"
+        );
+        crate::tools::chrome_daemon::reset_health();
+    }
+
+    /// The classification the recovery turns on: chrome-use's own unresponsive verdict,
+    /// a call the product killed at its bound, and an answer carrying no readable verdict
+    /// all count, while a call that never produced a chrome-use child does not — nothing
+    /// was ever asked of that session — and a truncated attempt never recovers.
+    #[test]
+    fn only_a_silent_or_unresponsive_stop_is_the_wedge_signature() {
+        assert!(is_wedged_release_failure(
+            &NoVerdict::Reported("session unresponsive".into()),
+            true
+        ));
+        assert!(is_wedged_release_failure(&NoVerdict::TimedOut, true));
+        assert!(is_wedged_release_failure(&NoVerdict::Unreadable, true));
+        assert!(!is_wedged_release_failure(
+            &NoVerdict::Reported("session stop failed".into()),
+            true
+        ));
+        assert!(!is_wedged_release_failure(&NoVerdict::SpawnFailure, true));
+        for verdict in [
+            NoVerdict::Reported("session unresponsive".into()),
+            NoVerdict::TimedOut,
+            NoVerdict::Unreadable,
+        ] {
+            assert!(!is_wedged_release_failure(&verdict, false));
+        }
+    }
+
+    /// The same session-unresponsive verdict, but from an attempt whose budget the
+    /// guard holds truncated below the full budget, is one failed attempt and NO
+    /// recovery: a wedged session is recovered only after a full attempt, so nothing
+    /// is spawned for a release that could not afford one. That session is left to the
+    /// next due pass, whose durable record still holds it.
+    #[tokio::test]
+    #[serial_test::serial(chrome_release)]
+    async fn a_truncated_wedge_attempt_budget_spawns_no_recovery_stop() {
+        let guard = ReleaseGuard::install(Duration::from_secs(1)).await;
+        queue_names("run-wedged-flush", &["agent-tab-w-flush"]);
+        guard.set_mode("wedged");
+
+        release_due().await;
+
+        assert_eq!(
+            pending_names_and_attempts(),
+            vec![(
+                run_session_names("run-wedged-flush", &["agent-tab-w-flush"]),
+                1
+            )],
+            "the truncated wedge is still one failed attempt"
+        );
+        assert_eq!(
+            guard.log_lines().len(),
+            1,
+            "a truncated wedge spawns no recovery stop"
         );
     }
 
@@ -1772,6 +1920,8 @@ mod tests {
     /// The shutdown flush spends its budget on the records whose hold (or retry
     /// backoff) elapsed and leaves the held ones alone: a held record waits for a
     /// run the restart may re-drive, and being durable it is picked up next boot.
+    /// A hanging browser side is cut off at the budget — a truncated attempt, so
+    /// no recovery stop is spawned — and the record is left for that next boot.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn the_shutdown_flush_releases_the_queue_within_its_budget() {

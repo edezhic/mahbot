@@ -33,7 +33,7 @@ Capture a screenshot of the current tab and inject it into your conversation as 
 * `wait { selector: "#results" }` — wait until a CSS selector matches something.
 * `wait { url: "pattern" }` — wait until the URL matches a pattern.
 * `wait { text: "Loaded" }` — wait until this text appears in the page.
-Give exactly ONE target. Waits are bounded (~10 s) — a timeout is reported as an error, never an infinite block.
+Give exactly ONE target. A wait declares ~10 s to chrome-use (`expect` declares ~20 s) — a timeout is reported as an error, never an infinite block.
 
 ### 7. Assert a condition: `expect`
 A bounded PASS/FAIL assertion — prefer it over open-and-eyeball when you need a definite answer:
@@ -115,6 +115,14 @@ When `find` or `click` can't locate an element, use `eval` to inspect the DOM:
 * Elements outside the viewport may not be interactable. If interaction fails, try a `find` with a CSS selector first, or use `eval` to check position.
 * Elements with `tabindex="-1"` may not be clickable via role-based locators but can still be found with `by: "first"` CSS selector.
 * The snapshot's accessible names may differ from HTML attributes (`aria-label` vs `placeholder`, etc.) — use `eval` to inspect actual attributes.
+
+## Bounds, leftovers and the real browser
+
+* Every call runs to a clock chrome-use itself works to, and the tool's own kill rides above it (plus chrome-use's relay-recovery window and 2 s slack) — chrome-use always gives up first, so its own reason, never a synthetic timeout, is what you normally see. `wait` (~10 s) and `expect` (~20 s) are the verbs that declare a deadline chrome-use honours in full; every other action, `open`'s navigation included, runs to the clock the product declares to chrome-use — the tool's own client tolerance (45 s) less the product's 2 s margin — because a declaration AT that tolerance makes the tool run out of tolerance instead of answering, which then reads as a wedged session (the session is stopped and its open tabs are lost). A timeout is information: with a healthy daemon it usually means a slow page, so retry once before changing approach.
+* `mahbot chrome`, the browser command you can run through the shell, works to the same clocks: its `wait`/`expect` default to 8 s, and its `--timeout` is refused (rc 3) at or above chrome-use's 45 s tolerance on the verbs that forward a deadline (`wait`, `expect`, `open` — for `open` the declared deadline is what remains of that flag when the `--expect` wait starts, so a value just under the tolerance still declares less). On the verbs chrome-use takes no per-call deadline for (`count`, `eval`, `extract`, `click`, `fill`, `type`, `press`) the declared clock is the smallest accepted `--timeout` and changes nothing; a value above it raises only mahbot's own kill — the bound `timeout_ms` reports — and anything below it is refused as a usage error rather than silently ignored. Its `--session` names are validated rather than reshaped: a name takes letters, digits, '-' or '_' only (chrome-use's own alphabet — a '.' is refused, because chrome-use will not stop a session whose name has one), and anything else is refused (rc 3) — unlike this tool's `tab`, which is sanitized into a per-run session.
+* A leftover note reports chrome-use's own helper still holding the call's output channel. A FINISHED call carries it — its exit status and output are the result — and a FAILING call carries it too: the failure is the failure, and the leftover is a separate process chrome-use deliberately leaves running. The helper is named, left RUNNING, and stopped with the `session stop` that addresses it; no further output from it is collected — mahbot holds at most the 16 most recent such channels, releasing the oldest first, so a helper that writes after its channel is released can end on the broken pipe. The helper is chrome-use's own and also stops itself on chrome-use's idle timeout.
+* The tool only drives the owner's real, logged-in browser: before an action it establishes that a real browser is reachable through the relay, and recovers the connection if it is not. A call that ran in a browser chrome-use launched itself is a plain FAILURE, never a quiet success — retry once the connection is back, and read it as an environment fault, not as page state.
+* A session that stopped answering is recovered automatically on every path (this tool, the `mahbot chrome` CLI, the watchdog, the ended-run release) — you do not stop and recreate a wedged session yourself.
 
 ## chrome-use troubleshooting
 

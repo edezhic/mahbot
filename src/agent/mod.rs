@@ -62,6 +62,18 @@ pub(crate) fn tool_identity() -> anyhow::Result<(String, String)> {
     Ok((agent_id, user_name))
 }
 
+/// The calling agent's identity for a row written STRAIGHT to the log store:
+/// `(agent_id, role)`, empty outside an agent run (inbound enrichment, tests).
+/// The tracing writer takes this attribution from the current span; a row that
+/// bypasses the writer takes it from the same task-local.
+pub(crate) fn tool_record_attribution() -> (String, String) {
+    CURRENT_TOOL_AGENT_TRACKING
+        .try_with(|t| t.as_ref().map(|t| (t.agent_id.clone(), t.role.clone())))
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
 /// Synchronous read of [`CURRENT_TOOL_CHANNEL`]. Same contract as
 /// [`tool_user_name`].
 pub(crate) fn tool_channel() -> String {

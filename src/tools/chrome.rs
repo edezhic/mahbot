@@ -1,18 +1,21 @@
 //! Chrome automation tool.
 
 use crate::chrome::contract::{
-    ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, classify_call_failure, eval_count,
+    ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, chrome_leftover_pipe_note,
+    chrome_session_stop_command, chrome_use_warning, classify_call_failure, eval_count,
     expect_outcome, extract_output, extract_snapshot_text, is_daemon_unavailable_code,
-    is_daemon_unavailable_error, is_unreachable_tab_error, net_error_phrase,
-    parse_error_page_probe, sanitize_timeout_message, unreachable_tab_message,
-    with_condition_timeout_note,
+    is_daemon_unavailable_error, is_session_unresponsive_error, is_unreachable_tab_error,
+    net_error_phrase, parse_error_page_probe, parse_first, sanitize_timeout_message,
+    self_launched_browser_error, self_launched_browser_note, truncated_output_error,
+    unreachable_tab_message, with_condition_timeout_note,
 };
 use crate::chrome::escape_js_single_quoted;
 use crate::chrome::forms::{
     ExpectCond, ExtractGate, count_eval_js, expect_args, extract_gate, parse_count_op,
     parse_predicate, parse_state, validate_extract_getters, wait_args, wait_target,
 };
-use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
+use crate::chrome::spawn::{CliOutput, CliRun, CliSpawn, CliTimeout, spawn_cli};
+use crate::chrome::{CHROME_USE_DECLARED_BUDGET, ChromeCallClocks, CliRecovery, clocks};
 use crate::util::{UnwrapPoison, is_http_url};
 use crate::{Tool, Workspace};
 use anyhow::Context;
@@ -26,7 +29,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 /// Actions for navigating and extracting content from web pages.
@@ -182,6 +185,12 @@ const AGENT_TAB_PREFIX: &str = "agent-tab-";
 /// Logical name of the per-run default session.
 const DEFAULT_TAB: &str = "default";
 
+/// The workspace a chrome-use dispatch records when the surface driving it has
+/// none of its own: link enrichment summarizes a channel message, not a
+/// workspace, so there is no path to name (see
+/// [`crate::logs::StrayEvent::workspace`]).
+const NO_WORKSPACE: &str = "";
+
 /// Physical session namespace of one agent run: `agent-tab-<key>-`, where `key`
 /// is a hex digest of the run's agent id — the identity the daemon re-reads from
 /// durable state when it re-drives an interrupted run. Every segment of one run
@@ -253,6 +262,20 @@ impl Drop for ChromeRunSessions {
     }
 }
 
+/// One chrome action's output plus the leftover fact of every chrome-use call it
+/// ran (the same pair [`ChromeTool::run_command`] returns): `true` when a call
+/// finished while a process it left behind still held that call's output channel
+/// ([`crate::chrome::spawn::CliOutput::leftover_pipes`]).
+///
+/// The child's exit status still decides the call and `output` is the answer; the
+/// leftover is a NOTE on it ([`crate::chrome::contract::chrome_leftover_pipe_note`]),
+/// never a failure — which is why it travels beside the output instead of turning
+/// into an `Err`.
+struct ActionOutput<T> {
+    output: T,
+    leftover_pipes: bool,
+}
+
 /// Chrome tool for fetching content from web pages.
 ///
 /// Each operation requires a `tab` name — separate chrome sessions
@@ -296,14 +319,23 @@ impl ChromeTool {
 
     /// Resolve a logical tab name to the physical chrome-use session name:
     /// this run's namespace prefix plus the sanitized tab (the sanitizer
-    /// yields exactly chrome-use's allowed charset). Idempotent — an already
-    /// prefixed (physical) name passes through unchanged, so an echoed-back
-    /// session name can never double-prefix into a different session. The
-    /// shared non-agent instance (empty prefix) passes names through
-    /// unchanged.
+    /// yields exactly chrome-use's allowed charset). A name that already
+    /// carries this namespace keeps it — but its tail is sanitized the same way
+    /// a freshly minted one is, so every name this returns is `prefix` + a
+    /// plain identifier and an echoed-back session name can never double-prefix
+    /// into a different session. The shared non-agent instance (empty prefix)
+    /// sanitizes the name the same way.
     fn resolve_session(&self, tab: &str) -> String {
-        if self.session_prefix.is_empty() || tab.starts_with(&self.session_prefix) {
-            return tab.to_string();
+        if let Some(tail) = tab.strip_prefix(&self.session_prefix) {
+            // A name already carrying this namespace passes through — but its
+            // tail is sanitized the same way a freshly minted one is, so every
+            // name this returns is `prefix` + a plain identifier (the leftover
+            // note's stop recipe is built from it).
+            return format!(
+                "{}{}",
+                self.session_prefix,
+                sanitize_filename_component(tail)
+            );
         }
         let clean = sanitize_filename_component(tab);
         if clean == tab {
@@ -360,22 +392,43 @@ impl ChromeTool {
         // concurrent same-tab access doesn't race between navigation
         // and text extraction.
         let _guard = self.acquire_tab_lock(tab).await;
-        let opened = self.run_command(&["open", url], tab).await?;
+        // The elapsed time of the whole enrichment dispatch, carried onto the
+        // durable record a leftover helper leaves behind below.
+        let started = Instant::now();
+        let mut leftover_pipes = false;
+
+        let opened = self.run_command(&["open", url], tab, NO_WORKSPACE).await?;
+        leftover_pipes |= opened.leftover_pipes;
+        let opened = opened.output;
 
         // A real navigation that ends on the scratch `about:blank` or Chrome's
         // error page never loaded — fail loudly instead of returning empty
         // content.
-        self.bail_on_failed_navigation(tab, url, &opened).await?;
+        self.bail_on_failed_navigation(tab, url, &opened, NO_WORKSPACE)
+            .await?;
 
         // Wait for network idle (best-effort — no hard error on timeout).
-        let _ = self
-            .run_command(&["wait", "--load", "networkidle"], tab)
-            .await;
+        if let Ok(call) = self
+            .run_command(&["wait", "--load", "networkidle"], tab, NO_WORKSPACE)
+            .await
+        {
+            leftover_pipes |= call.leftover_pipes;
+        }
 
         // Extract clean visible text via innerText JS eval (not snapshot).
-        let text = self.get_inner_text("body", tab).await?;
+        let text = self.get_inner_text("body", tab, NO_WORKSPACE).await?;
+        leftover_pipes |= text.leftover_pipes;
 
-        Ok(text)
+        // A helper this enrichment left behind gets its one durable record, like
+        // the tool's own dispatch path. No note goes on the returned page text —
+        // this call's result is the page, and the record is where the leftover
+        // fact lives.
+        if leftover_pipes {
+            Self::record_leftover(&self.resolve_session(tab), NO_WORKSPACE, started.elapsed())
+                .await;
+        }
+
+        Ok(text.output)
     }
 
     /// Close a chrome session tab by name — verified: the session's tab group
@@ -400,6 +453,7 @@ impl ChromeTool {
         tab: &str,
         url: &str,
         response: &ChromeResponse,
+        workspace: &str,
     ) -> anyhow::Result<()> {
         let Some(committed_url) = response
             .data
@@ -414,10 +468,10 @@ impl ChromeTool {
             // rendered (the same probe the CLI `open` uses); the generic
             // message is the fallback when nothing recognizable renders.
             let code = self
-                .run_command(&["eval", ERROR_PAGE_PROBE_JS], tab)
+                .run_command(&["eval", ERROR_PAGE_PROBE_JS], tab, workspace)
                 .await
                 .ok()
-                .and_then(|r| parse_error_page_probe(&r))
+                .and_then(|call| parse_error_page_probe(&call.output))
                 .filter(|p| p.is_error_page)
                 .and_then(|p| p.code);
             match code {
@@ -445,9 +499,20 @@ impl ChromeTool {
     }
 
     /// Fail with an actionable error when the chrome-use CLI is missing or the
-    /// daemon is down, distinguishing the two causes and never reporting a
-    /// transient probe failure (spawn EAGAIN/EMFILE, timeout) as "not
-    /// installed". One CLI probe; the daemon-health evaluation is cached.
+    /// connection to the owner's real browser is not established, distinguishing
+    /// the causes and never reporting a transient probe failure (spawn
+    /// EAGAIN/EMFILE, timeout) as "not installed". One CLI probe; the readiness
+    /// gate is cached.
+    ///
+    /// The gate ([`super::chrome_daemon::ensure_ready_for_actions`]) is what
+    /// decides — a cached Down/Unknown verdict must never short-circuit it: the
+    /// gate is the thing that RE-ESTABLISHES the connection (one bounded
+    /// recovery pass, then a re-probe) before an action is dispatched, so
+    /// bailing on the cached verdict would leave the connection down for as long
+    /// as its cached readiness snapshot stands (10 s). When the gate refuses and
+    /// the stored verdict classified a cause,
+    /// [`super::chrome_daemon::refusal_message`] appends that cause's concrete
+    /// remedy to the fact list.
     async fn ensure_available() -> anyhow::Result<()> {
         match super::chrome_daemon::cli_probe().await {
             super::chrome_daemon::CliStatus::Available => {}
@@ -482,39 +547,61 @@ impl ChromeTool {
                 anyhow::bail!(msg);
             }
         }
-        if !super::chrome_daemon::is_available().await {
-            anyhow::bail!("{}", super::chrome_daemon::daemon_down_message());
+        if let Err(refusal) = super::chrome_daemon::ensure_ready_for_actions().await {
+            anyhow::bail!("{}", super::chrome_daemon::refusal_message(&refusal));
         }
         Ok(())
     }
 
     /// Declared chrome-side condition-wait deadlines, forwarded to chrome-use
-    /// via `--timeout` (see `build_args`); the mahbot-side kill rides
-    /// [`crate::chrome::DEADLINE_SLACK`] above them (see `call_timeout`).
+    /// via `--timeout` (see [`Self::build_args`]). chrome-use honours them in
+    /// full: its own timeout surfaces at the declared deadline, so its own reason
+    /// reaches the agent rather than a mahbot cut-off.
     const WAIT_DEADLINE: Duration = Duration::from_secs(10);
     const EXPECT_DEADLINE: Duration = Duration::from_secs(20);
 
-    /// Mahbot-side per-call kill bounds. chrome-use's own `--timeout` is
-    /// ignored by `wait --load networkidle` (which instead uses the seeded
-    /// AGENT_BROWSER_DEFAULT_TIMEOUT — 15s; 25s is chrome-use's fallback — so
-    /// the mahbot-side bound below always dominates) and a wedged daemon hangs
-    /// the CLI in its ~152s retry loop, so the tool
-    /// bounds every dispatch itself: open = [`crate::chrome::DEFAULT_OPEN_TIMEOUT`]
-    /// plus slack (whole-operation budget), wait/expect = their declared
-    /// deadlines plus slack (condition waits), everything else=8s (the
-    /// daemon-side `run_cli_bounded` bound).
-    fn call_timeout(args: &[&str]) -> Duration {
-        use crate::chrome::{DEADLINE_SLACK, DEFAULT_OPEN_TIMEOUT};
+    /// The recovery policy of every action this tool runs: each one is agent
+    /// work, so chrome-use's own relay self-heal is always allowed. Used both
+    /// where [`Self::call_clocks`] derives the clocks and where
+    /// [`Self::spawn_call`] spawns the child, so the kill and the policy the
+    /// call spawns with cannot drift apart.
+    const ACTION_RECOVERY: CliRecovery = CliRecovery::Allowed;
+
+    /// The two clocks of one dispatch, derived in ONE place
+    /// ([`crate::chrome::clocks`]).
+    ///
+    /// `wait`/`expect` forward their declared deadline as `--timeout`, which
+    /// chrome-use honours in full — the declared value IS their chrome-side
+    /// clock. Every other verb forwards no deadline (`open`'s navigate included:
+    /// chrome-use does not bound it by the forwarded env value), so the clock
+    /// declared to chrome-use is [`CHROME_USE_DECLARED_BUDGET`] — one kill margin
+    /// under the tool's own client tolerance, so chrome-use always gives up with
+    /// its own verdict first. Every action takes [`Self::ACTION_RECOVERY`]: the
+    /// tool's actions are exactly the work chrome-use's self-heal is meant to
+    /// protect.
+    fn call_clocks(args: &[&str]) -> ChromeCallClocks {
         match args.first() {
-            Some(&"open") => DEFAULT_OPEN_TIMEOUT + DEADLINE_SLACK,
-            Some(&"wait") => Self::WAIT_DEADLINE + DEADLINE_SLACK,
-            Some(&"expect") => Self::EXPECT_DEADLINE + DEADLINE_SLACK,
-            _ => Duration::from_secs(8),
+            Some(&"wait") => clocks(Some(Self::WAIT_DEADLINE), Self::ACTION_RECOVERY),
+            Some(&"expect") => clocks(Some(Self::EXPECT_DEADLINE), Self::ACTION_RECOVERY),
+            _ => clocks(None, Self::ACTION_RECOVERY),
         }
     }
 
     /// Run an chrome-use command and parse the JSON response.
-    async fn run_command(&self, args: &[&str], tab: &str) -> anyhow::Result<ChromeResponse> {
+    ///
+    /// The child's own EXIT decides the call ([`crate::chrome::spawn`]); a process
+    /// it left behind still holding the call's output channel is carried as
+    /// [`ActionOutput::leftover_pipes`], a NOTE on that result rather than an error
+    /// ([`crate::chrome::contract::chrome_leftover_pipe_note`]). A call that FAILS
+    /// while holding such a leftover keeps its own failure — the helper is named
+    /// in the failure text and gets the leftover's one durable record
+    /// ([`Self::record_leftover`]).
+    async fn run_command(
+        &self,
+        args: &[&str],
+        tab: &str,
+        workspace: &str,
+    ) -> anyhow::Result<ActionOutput<ChromeResponse>> {
         let cli = super::chrome_daemon::cli_path().with_context(|| {
             format!(
                 "chrome-use CLI is not available. {}",
@@ -533,90 +620,198 @@ impl ChromeTool {
         logged_args.extend(["--json", "--session", &session]);
         debug!("chrome-use args: {:?}", logged_args);
 
-        // `open` takes no --timeout flag (chrome-use uses its env default), so
-        // its chrome-side deadline is set to the declared budget via the env
-        // override; the mahbot kill rides DEADLINE_SLACK above and only fires
-        // when the deadline is actually exceeded.
-        let bound = Self::call_timeout(args);
-        let chrome_deadline =
-            (args.first() == Some(&"open")).then_some(crate::chrome::DEFAULT_OPEN_TIMEOUT);
+        let clocks = Self::call_clocks(args);
 
-        let run = spawn_cli(CliSpawn {
-            path: &cli,
-            args,
-            session: Some(&session),
-            json: true,
-            capture_stderr: true,
-            timeout: CliTimeout::Bounded(bound),
-            // A timed-out/cancelled call must not leave the chrome-use child
-            // running its retry loop in the background.
-            cancel_kills: true,
-            input: None,
-            chrome_deadline,
-        })
-        .await;
-        let output = match run {
-            CliRun::Output(output) => output,
-            CliRun::SpawnFailure => anyhow::bail!("Failed to execute chrome-use CLI"),
-            CliRun::TimedOut => {
-                // Distinguish "daemon down/wedged" (fail fast with daemon
-                // guidance; wakes the watchdog) from "daemon healthy, that
-                // call was just slow". The probe covers the wedge case a
-                // status check cannot see — see health_after_call_timeout.
-                // Probed with the RESOLVED session: that is what the timed-out
-                // call actually dispatched against.
-                if let Some(down_message) =
-                    super::chrome_daemon::health_after_call_timeout(&session).await
-                {
-                    anyhow::bail!("{down_message}");
-                }
-                let secs = Self::call_timeout(args).as_secs();
-                anyhow::bail!(
-                    "chrome-use did not answer within {secs}s for `{}` — the call was aborted. \
-                     The daemon looked healthy, so this is usually a slow page or a wedged CLI; \
-                     retry once before trying another approach.",
-                    args.join(" ")
-                );
-            }
-        };
+        // The elapsed time of this dispatch, carried on the durable rows it may
+        // write (see [`Self::record_leftover`]).
+        let started = Instant::now();
+        let output = Self::spawn_call(&cli, args, &session, clocks).await?;
+        let elapsed = started.elapsed();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        match parse_run_output(
+        let leftover = output.leftover_pipes;
+        // Every failure of this call leaves through `failed` below, so the
+        // leftover this call holds is named and recorded for all of them alike —
+        // and it never becomes the failure itself.
+        let failed = match parse_run_output(
             args.first().copied(),
+            output.truncated,
             output.status.success(),
             &stdout,
             &stderr,
         ) {
-            ParsedRun::Ok(resp) => Ok(resp),
+            ParsedRun::Ok(resp) => {
+                // A successful envelope that carries chrome-use's
+                // browser-replacement note is NOT a success: the work went to a
+                // browser chrome-use launched itself, not the owner's real one.
+                // Deliberately NOT the daemon-down path — the daemon and the
+                // relay may be healthy, and what was lost is the connection to
+                // the real browser — so health is left untouched (see
+                // `self_launched_browser_error`). The call FAILS, so its failure
+                // text is already its durable record; nothing else is written.
+                if let Some(note) = self_launched_browser_note(&resp) {
+                    anyhow::anyhow!("{}", self_launched_browser_error(&note))
+                } else {
+                    return Ok(ActionOutput {
+                        output: resp,
+                        leftover_pipes: leftover,
+                    });
+                }
+            }
             ParsedRun::Unparseable => {
-                anyhow::bail!("Failed to parse chrome-use JSON response")
+                if output.truncated {
+                    anyhow::anyhow!("{}", truncated_output_error())
+                } else {
+                    anyhow::anyhow!("Failed to parse chrome-use JSON response")
+                }
             }
             ParsedRun::Failed {
                 error,
                 code,
                 retryable,
             } => {
-                let error_msg = if error.is_empty() {
-                    format!("chrome-use exited with code {}", output.status)
-                } else {
-                    enhance_chrome_error(error)
-                };
-                // Classify once: strip chrome-use's stale-relay hint from
-                // Timeout messages (mahbot's surface has no `connect` verb;
-                // Environment diagnostics pass through untouched), then
-                // append the action's remediation note from the same kind.
-                let kind = classify_call_failure(code.as_deref(), &error_msg);
-                let error_msg = sanitize_timeout_message(kind, &error_msg);
-                Self::fail_fast_if_daemon_down(&error_msg, code.as_deref())?;
-                let mut error_msg = with_retry_hint(error_msg, retryable);
-                with_condition_timeout_note(
+                Self::failed_run_message(
+                    error,
+                    output.status,
+                    code.as_deref(),
+                    retryable,
                     args.first().copied().unwrap_or(""),
-                    kind,
-                    &mut error_msg,
-                );
-                anyhow::bail!("{}: {error_msg}", kind.as_str());
+                    &session,
+                )
+                .await
             }
+        };
+        if leftover {
+            // A helper chrome-use started and left running is a fact of its own
+            // beside the failure: recorded durably, and appended to the failure
+            // text the agent reads (see [`chrome_leftover_pipe_note`]). The
+            // failure keeps its own text and classification — a leftover never
+            // decides the outcome.
+            Self::record_leftover(&session, workspace, elapsed).await;
+            return Err(anyhow::anyhow!(
+                "{}",
+                crate::tools::with_note(&failed.to_string(), &chrome_leftover_pipe_note(&session))
+            ));
+        }
+        Err(failed)
+    }
+
+    /// Spawn one chrome-use call under `clocks` and collect its output. A spawn
+    /// failure and a product-clock timeout are the call's own errors, and the
+    /// timeout path probes the session first
+    /// ([`super::chrome_daemon::health_after_call_timeout`] — with the RESOLVED
+    /// session, which is what the call dispatched against): a wedged daemon is
+    /// then reported as such and recovered, while a merely slow page keeps the
+    /// product-bound "did not answer" text.
+    async fn spawn_call(
+        cli: &Path,
+        args: &[&str],
+        session: &str,
+        clocks: crate::chrome::ChromeCallClocks,
+    ) -> anyhow::Result<CliOutput> {
+        match spawn_cli(CliSpawn {
+            path: cli,
+            args,
+            session: Some(session),
+            json: true,
+            capture_stderr: true,
+            timeout: CliTimeout::Bounded(clocks.kill),
+            // A timed-out/cancelled call must not leave the chrome-use child
+            // running its retry loop in the background.
+            cancel_kills: true,
+            input: None,
+            chrome_side: clocks.chrome_side,
+            recovery: Self::ACTION_RECOVERY,
+        })
+        .await
+        {
+            CliRun::Output(output) => Ok(output),
+            CliRun::SpawnFailure => anyhow::bail!("Failed to execute chrome-use CLI"),
+            CliRun::TimedOut => {
+                // Distinguish "daemon down/wedged" (fail fast with daemon
+                // guidance; wakes the watchdog) from "daemon healthy, that
+                // call was just slow". The probe covers the wedge case a
+                // status check cannot see — see health_after_call_timeout.
+                if let Some(down_message) =
+                    super::chrome_daemon::health_after_call_timeout(session).await
+                {
+                    anyhow::bail!("{down_message}");
+                }
+                anyhow::bail!(
+                    "chrome-use did not answer within {}s for `{}` — that is mahbot's own bound, \
+                     which rides above the {}s deadline chrome-use itself was working to (plus its \
+                     relay self-heal window), so the call was aborted before chrome-use could \
+                     report its own reason. The daemon looked healthy, so this is usually a slow \
+                     page or a wedged CLI; retry once before trying another approach.",
+                    clocks.kill.as_secs(),
+                    args.join(" "),
+                    clocks.chrome_side.as_secs()
+                );
+            }
+        }
+    }
+
+    /// The durable record, written into the log store (shown on Logs → Issues),
+    /// of the helper a FINISHED chrome-use call left behind: chrome-use's own
+    /// session daemon, still holding that call's output channel — started
+    /// deliberately, left running, and stoppable by the recipe
+    /// ([`chrome_session_stop_command`]) the record carries as its detail, so the
+    /// agent's note ([`chrome_leftover_pipe_note`]) and the record cannot drift.
+    /// The row says what happened and who ran it, taken from the calling agent's
+    /// own attribution ([`crate::agent::tool_record_attribution`]).
+    ///
+    /// One record per reported fact, never duplicated within a call: the failure
+    /// branches of [`Self::run_command`] write it for their call, and the two
+    /// successful paths that keep no failure text — [`Tool::execute`] for the
+    /// action's own dispatch and [`Self::fetch_page_text`] for a link-enrichment
+    /// fetch — write it once for the call whose chrome-use calls held the
+    /// leftover. `elapsed` is the time the record's call took — that chrome-use
+    /// call's dispatch for a failure record, the whole dispatch for the other two.
+    async fn record_leftover(session: &str, workspace: &str, elapsed: Duration) {
+        crate::logs::record_stray_event(crate::logs::StrayEvent {
+            source: crate::logs::STRAY_SOURCE_CHROME_TOOL,
+            message: "chrome-use exited while a helper it had started still held the call's output \
+                      channel, so no more of its output could be collected",
+            recipe: &chrome_session_stop_command(session),
+            scope: session,
+            session,
+            workspace,
+            duration_ms: Some(crate::util::millis_i64(elapsed)),
+        })
+        .await;
+    }
+
+    /// The failure text of a `ParsedRun::Failed` call: chrome-use's own error
+    /// (or the exit status when the envelope carried none), the retry hint, the
+    /// verb's condition-timeout note, and — when it fires — the daemon-down
+    /// guidance that REPLACES the classification.
+    async fn failed_run_message(
+        error: String,
+        exit: std::process::ExitStatus,
+        code: Option<&str>,
+        retryable: Option<bool>,
+        verb: &str,
+        session: &str,
+    ) -> anyhow::Error {
+        let error_msg = if error.is_empty() {
+            format!("chrome-use exited with code {exit}")
+        } else {
+            enhance_chrome_error(error)
+        };
+        // Classify once: strip chrome-use's stale-relay hint from Timeout
+        // messages (mahbot's surface has no `connect` verb; Environment
+        // diagnostics pass through untouched), then append the action's
+        // remediation note from the same kind.
+        let kind = classify_call_failure(code, &error_msg);
+        let error_msg = sanitize_timeout_message(kind, &error_msg);
+        let mut error_msg = with_retry_hint(error_msg, retryable);
+        with_condition_timeout_note(verb, kind, &mut error_msg);
+        // The daemon-down guidance REPLACES the classification when it fires, so
+        // it is that text a leftover note follows.
+        match Self::fail_fast_if_daemon_down(&error_msg, code, session).await {
+            Err(guidance) => guidance,
+            Ok(()) => anyhow::anyhow!("{}: {error_msg}", kind.as_str()),
         }
     }
 
@@ -627,12 +822,31 @@ impl ChromeTool {
     /// Unreachable-tab errors are their own state: the daemon and relay are up,
     /// only the session's tab is orphaned — fail fast with hand-close guidance
     /// and leave health untouched (recovery cannot fix a Chrome-side orphan,
-    /// and hiding the daemon would block other sessions for UNHEALTHY_TTL).
-    fn fail_fast_if_daemon_down(error: &str, code: Option<&str>) -> anyhow::Result<()> {
+    /// and hiding the daemon would block other sessions until the next healthy
+    /// probe).
+    ///
+    /// A SESSION-unresponsive signature is recovered instead of only marked
+    /// down: [`super::chrome_daemon::recover_unresponsive_session`] records the
+    /// wedge (which wakes the watchdog, so the background path recovers too) and
+    /// stops `session`'s daemon so the next call gets a clean one — the error
+    /// text says what was done.
+    async fn fail_fast_if_daemon_down(
+        error: &str,
+        code: Option<&str>,
+        session: &str,
+    ) -> anyhow::Result<()> {
         if is_unreachable_tab_error(error) {
             anyhow::bail!("{}", unreachable_tab_message(error));
         }
         if is_daemon_unavailable_error(error) || is_daemon_unavailable_code(code) {
+            if is_session_unresponsive_error(error) {
+                let recovery = super::chrome_daemon::recover_unresponsive_session(session).await;
+                anyhow::bail!(
+                    "{} {}",
+                    super::chrome_daemon::daemon_down_message(),
+                    recovery.summary()
+                );
+            }
             super::chrome_daemon::note_unhealthy(error);
             anyhow::bail!("{}", super::chrome_daemon::daemon_down_message());
         }
@@ -640,22 +854,39 @@ impl ChromeTool {
     }
 
     /// Extract visible rendered text via `innerText`, falling back to `get text`
-    /// (`textContent`) when eval fails or returns empty.
-    async fn get_inner_text(&self, selector: &str, tab: &str) -> anyhow::Result<String> {
+    /// (`textContent`) when eval fails or returns empty. The leftover flag is the
+    /// same record every chrome-use call carries
+    /// ([`ActionOutput::leftover_pipes`]), over all the calls this action ran.
+    async fn get_inner_text(
+        &self,
+        selector: &str,
+        tab: &str,
+        workspace: &str,
+    ) -> anyhow::Result<ActionOutput<String>> {
         const FALLBACK_NOTE: &str =
             "(used get text fallback — textContent, may include script/style text)";
 
         let js = inner_text_eval_js(selector);
-        if let Ok(resp) = self.run_command(&["eval", &js], tab).await
-            && let Some(data) = resp.data.as_ref()
-            && let Some(text) = extract_snapshot_text(data)
-            && !text.trim().is_empty()
-        {
-            return Ok(text);
+        let mut leftover_pipes = false;
+        if let Ok(call) = self.run_command(&["eval", &js], tab, workspace).await {
+            leftover_pipes |= call.leftover_pipes;
+            if let Some(data) = call.output.data.as_ref()
+                && let Some(text) = extract_snapshot_text(data)
+                && !text.trim().is_empty()
+            {
+                return Ok(ActionOutput {
+                    output: text,
+                    leftover_pipes,
+                });
+            }
         }
 
-        let resp = self.run_command(&["get", "text", selector], tab).await?;
-        let mut text = resp
+        let call = self
+            .run_command(&["get", "text", selector], tab, workspace)
+            .await?;
+        leftover_pipes |= call.leftover_pipes;
+        let mut text = call
+            .output
             .data
             .as_ref()
             .and_then(extract_snapshot_text)
@@ -664,7 +895,10 @@ impl ChromeTool {
             text.push('\n');
             text.push_str(FALLBACK_NOTE);
         }
-        Ok(text)
+        Ok(ActionOutput {
+            output: text,
+            leftover_pipes,
+        })
     }
 
     /// The chrome-use CLI takes a different argument shape per action — this
@@ -945,7 +1179,9 @@ async fn close_all_chrome_sessions_inner() {
         return;
     };
 
-    // List active sessions
+    // List active sessions — a lifecycle probe, not agent work: chrome-use's own
+    // declared budget is the only clock that ends it (this call passes no product
+    // kill of its own), and its relay self-heal is suppressed.
     let list_output = match spawn_cli(CliSpawn {
         path: &cmd,
         args: &["session", "list"],
@@ -955,7 +1191,8 @@ async fn close_all_chrome_sessions_inner() {
         timeout: CliTimeout::Unbounded,
         cancel_kills: true,
         input: None,
-        chrome_deadline: None,
+        chrome_side: CHROME_USE_DECLARED_BUDGET,
+        recovery: CliRecovery::Suppressed,
     })
     .await
     {
@@ -970,27 +1207,30 @@ async fn close_all_chrome_sessions_inner() {
         }
     };
 
-    let mut sessions: Vec<String> = match serde_json::from_slice::<Value>(&list_output.stdout) {
-        Ok(v) => {
-            // Gate only on an explicit failure verdict; a payload with neither
-            // verdict key proceeds (tolerance-first — unknown future envelopes
-            // still get their sessions closed if they carry a sessions array).
-            if ChromeResponse::from_value(&v).verdict() == Some(false) {
-                tracing::warn!(
-                    "chrome-use session list failed: {}",
-                    v.get("error")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("unknown error")
-                );
-                return;
-            }
-            parse_session_list(&v)
-        }
-        Err(e) => {
-            tracing::warn!("failed to parse chrome-use session list output: {e}");
-            return;
-        }
+    let Some(v) = parse_first::<Value>(&list_output.stdout) else {
+        // No JSON value at all: the answer was empty, or the product cut the
+        // collection off. Both are named from facts already in hand — a second
+        // parse of the same bytes could only re-derive them.
+        tracing::warn!(
+            bytes = list_output.stdout.len(),
+            truncated = list_output.truncated,
+            "chrome-use session list answered no JSON value; skipping chrome cleanup"
+        );
+        return;
     };
+    // Gate only on an explicit failure verdict; a payload with neither
+    // verdict key proceeds (tolerance-first — unknown future envelopes
+    // still get their sessions closed if they carry a sessions array).
+    if ChromeResponse::from_value(&v).verdict() == Some(false) {
+        tracing::warn!(
+            "chrome-use session list failed: {}",
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown error")
+        );
+        return;
+    }
+    let mut sessions: Vec<String> = parse_session_list(&v);
 
     if sessions.is_empty() {
         tracing::debug!("No open chrome-use sessions to close");
@@ -1008,49 +1248,47 @@ async fn close_all_chrome_sessions_inner() {
 
     let close_futures: Vec<_> = sessions
         .iter()
-        .map(|session_id| {
-            // Borrows of cmd/session_id are valid — the futures are awaited
-            // (join_all) inside this function's scope.
-            let cmd = &cmd;
-            async move {
-                match spawn_cli(CliSpawn {
-                    path: cmd.as_path(),
-                    args: &["--session", session_id, "close"],
-                    session: None,
-                    json: false,
-                    capture_stderr: false,
-                    cancel_kills: true,
-                    timeout: CliTimeout::Unbounded,
-                    input: None,
-                    chrome_deadline: None,
-                })
-                .await
-                {
-                    CliRun::Output(out) if out.status.success() => {
-                        tracing::debug!("Closed chrome-use session: {session_id}");
-                    }
-                    CliRun::Output(out) => {
-                        tracing::warn!(
-                            "chrome-use close session '{session_id}' exited with status: {}",
-                            out.status
-                        );
-                    }
-                    CliRun::SpawnFailure => {
-                        tracing::warn!(
-                            "failed to close chrome-use session '{session_id}': spawn failed"
-                        );
-                    }
-                    CliRun::TimedOut => {
-                        tracing::warn!(
-                            "failed to close chrome-use session '{session_id}': timed out"
-                        );
-                    }
-                }
-            }
-        })
+        .map(|session_id| close_chrome_session(&cmd, session_id))
         .collect();
 
     join_all(close_futures).await;
+}
+
+/// Best-effort close of one chrome-use session — a lifecycle probe, not agent
+/// work: chrome-use's own declared budget is the only clock that ends it (this
+/// call passes no product kill of its own), and its relay self-heal is
+/// suppressed.
+async fn close_chrome_session(cmd: &Path, session_id: &str) {
+    match spawn_cli(CliSpawn {
+        path: cmd,
+        args: &["--session", session_id, "close"],
+        session: None,
+        json: false,
+        capture_stderr: false,
+        cancel_kills: true,
+        timeout: CliTimeout::Unbounded,
+        input: None,
+        chrome_side: CHROME_USE_DECLARED_BUDGET,
+        recovery: CliRecovery::Suppressed,
+    })
+    .await
+    {
+        CliRun::Output(out) if out.status.success() => {
+            tracing::debug!("Closed chrome-use session: {session_id}");
+        }
+        CliRun::Output(out) => {
+            tracing::warn!(
+                "chrome-use close session '{session_id}' exited with status: {}",
+                out.status
+            );
+        }
+        CliRun::SpawnFailure => {
+            tracing::warn!("failed to close chrome-use session '{session_id}': spawn failed");
+        }
+        CliRun::TimedOut => {
+            tracing::warn!("failed to close chrome-use session '{session_id}': timed out");
+        }
+    }
 }
 
 #[async_trait]
@@ -1096,7 +1334,7 @@ impl Tool for ChromeTool {
         })
     }
 
-    async fn execute(&self, _ws: &Workspace, args: Value) -> anyhow::Result<String> {
+    async fn execute(&self, ws: &Workspace, args: Value) -> anyhow::Result<String> {
         let (tab, action, normalized_notes) = Self::normalize_call(&args)?;
 
         debug!(tab, action = ?action, "chrome action");
@@ -1109,37 +1347,77 @@ impl Tool for ChromeTool {
         // same tab. Different tabs run fully concurrently.
         let _guard = self.acquire_tab_lock(&tab).await;
 
-        if let ChromeAction::GetInnerText { selector } = &action {
-            let output = self.get_inner_text(selector, &tab).await?;
+        // The workspace is carried onto the durable rows below, and the elapsed
+        // time is measured around the chrome-use dispatch this action runs (it
+        // may be several calls — `run_command` measures each call of its own).
+        let workspace = ws.as_path().to_string_lossy().into_owned();
+        let started = Instant::now();
+
+        // Each action path reports whether the chrome-use call it drove exited
+        // while a process it left behind still held the call's output channel: the
+        // call finished either way, and that leftover is a note on the result
+        // below, never an error (see [`chrome_leftover_pipe_note`]).
+        let ActionOutput {
+            output: body,
+            leftover_pipes,
+        } = if let ChromeAction::GetInnerText { selector } = &action {
+            let ActionOutput {
+                output,
+                leftover_pipes,
+            } = self.get_inner_text(selector, &tab, &workspace).await?;
             let body = if output.is_empty() {
                 format!("[Tab: {tab}] (no output)")
             } else {
                 format!("[Tab: {tab}] {output}")
             };
-            return Ok(super::with_normalization_notes(body, &normalized_notes));
-        }
-
-        if let ChromeAction::Screenshot { .. } = &action {
-            let output = self.capture_screenshot(&tab).await?;
-            return Ok(super::with_normalization_notes(output, &normalized_notes));
-        }
-
-        if let ChromeAction::Extract { schema, limit } = &action {
+            ActionOutput {
+                output: super::with_normalization_notes(body, &normalized_notes),
+                leftover_pipes,
+            }
+        } else if let ChromeAction::Screenshot { .. } = &action {
+            let ActionOutput {
+                output,
+                leftover_pipes,
+            } = self.capture_screenshot(&tab, &workspace).await?;
+            ActionOutput {
+                output: super::with_normalization_notes(output, &normalized_notes),
+                leftover_pipes,
+            }
+        } else if let ChromeAction::Extract { schema, limit } = &action {
             let (schema, schema_note) = Self::normalize_extract_schema(schema)?;
-            let output = self.run_extract(&schema, *limit, &tab).await?;
+            let ActionOutput {
+                output,
+                leftover_pipes,
+            } = self.run_extract(&schema, *limit, &tab, &workspace).await?;
             let mut notes = normalized_notes;
             notes.extend(schema_note);
-            return Ok(super::with_normalization_notes(output, &notes));
+            ActionOutput {
+                output: super::with_normalization_notes(output, &notes),
+                leftover_pipes,
+            }
+        } else {
+            let ActionOutput {
+                output: (response, snapshot),
+                leftover_pipes,
+            } = self.run_action(&action, &tab, &workspace).await?;
+            let body =
+                Self::format_action_output(&action, &tab, response, &snapshot, &normalized_notes);
+            ActionOutput {
+                output: body,
+                leftover_pipes,
+            }
+        };
+        if leftover_pipes {
+            let session = self.resolve_session(&tab);
+            // The durable record of the helper chrome-use left behind, in the
+            // same wording the agent's note carries (see [`Self::record_leftover`]).
+            Self::record_leftover(&session, &workspace, started.elapsed()).await;
+            return Ok(crate::tools::with_note(
+                &body,
+                &chrome_leftover_pipe_note(&session),
+            ));
         }
-
-        let (response, snapshot) = self.run_action(&action, &tab).await?;
-        Ok(Self::format_action_output(
-            &action,
-            &tab,
-            response,
-            &snapshot,
-            &normalized_notes,
-        ))
+        Ok(body)
     }
 
     async fn image_payload(
@@ -1182,7 +1460,7 @@ impl ChromeTool {
     /// logical name; missing/empty falls back to the per-run default logical session,
     /// which [`ChromeTool::resolve_session`] maps into this run's namespace (a function
     /// of the agent id — see [`run_session_namespace`]). Defaulting is echoed in tool
-    /// output (logical names only — physical session names never surface to the model).
+    /// output (the note carries the logical name only).
     fn normalize_tab(args: &Value) -> (String, Option<String>) {
         if let Some(tab) = super::get_opt_str(args, "tab").filter(|s| !s.is_empty()) {
             (tab.to_string(), None)
@@ -1193,13 +1471,18 @@ impl ChromeTool {
     }
 
     /// Capture a screenshot of the current tab to a PNG under the safe temp
-    /// root, record its path, and return a textual result describing it. The
-    /// per-tab lock is already held by the caller.
-    async fn capture_screenshot(&self, tab: &str) -> anyhow::Result<String> {
+    /// root, record its path, and return a textual result describing it (plus the
+    /// same leftover record every chrome-use call carries). The per-tab lock is
+    /// already held by the caller.
+    async fn capture_screenshot(
+        &self,
+        tab: &str,
+        workspace: &str,
+    ) -> anyhow::Result<ActionOutput<String>> {
         let path = Self::screenshot_output_path(tab)?;
         let path_str = path.to_string_lossy().into_owned();
         let str_args = ["screenshot", path_str.as_str()];
-        let _response = self.run_command(&str_args, tab).await?;
+        let call = self.run_command(&str_args, tab, workspace).await?;
         // The CLI may report success yet write nothing (e.g. a capture that
         // produced no pixels) — fail loudly so the model does not chase a
         // phantom image.
@@ -1213,10 +1496,13 @@ impl ChromeTool {
         // marker that the payload path fails open on — gate the emission here.
         let (width, height) = validate_png(&path)?;
         *self.last_screenshot.lock().unwrap_poison() = Some(path_str.clone());
-        Ok(format!(
-            "[Tab: {tab}] Captured a chrome screenshot: {path_str} ({width}x{height}). \
-             [IMAGE:{path_str}]"
-        ))
+        Ok(ActionOutput {
+            output: format!(
+                "[Tab: {tab}] Captured a chrome screenshot: {path_str} ({width}x{height}). \
+                 [IMAGE:{path_str}]"
+            ),
+            leftover_pipes: call.leftover_pipes,
+        })
     }
 
     /// Build a screenshot output path under the pinned temp root (or OS temp
@@ -1341,41 +1627,62 @@ impl ChromeTool {
 
     /// Orchestrate a single chrome action: build the args, dispatch, and (for
     /// `Open`) the blank-navigation guard, the best-effort network-idle wait,
-    /// and the compact auto-snapshot. Returns the RAW response and the snapshot
-    /// text — no LLM-facing framing (that lives in [`Self::format_action_output`]).
+    /// and the compact auto-snapshot. Returns the RAW response, the snapshot
+    /// text, and the leftover fact of every chrome-use step the action ran — no
+    /// LLM-facing framing (that lives in [`Self::format_action_output`]; the
+    /// leftover is a note on the result, see [`chrome_leftover_pipe_note`]).
     async fn run_action(
         &self,
         action: &ChromeAction,
         tab: &str,
-    ) -> anyhow::Result<(ChromeResponse, String)> {
+        workspace: &str,
+    ) -> anyhow::Result<ActionOutput<(ChromeResponse, String)>> {
         let cli_args = Self::build_args(action)?;
         let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
-        let response = self.run_command(&str_args, tab).await?;
+        let call = self.run_command(&str_args, tab, workspace).await?;
+        let mut leftover_pipes = call.leftover_pipes;
+        let response = call.output;
 
         // A real navigation that ends on the scratch `about:blank` or Chrome's
         // error page never loaded — fail loudly (closing the blank-page tab
         // best-effort) instead of reporting success with no content.
         if let ChromeAction::Open { url } = action {
-            self.bail_on_failed_navigation(tab, url, &response).await?;
+            self.bail_on_failed_navigation(tab, url, &response, workspace)
+                .await?;
         }
 
         // After open, wait for network idle, then auto-snapshot
-        // so the LLM sees page content immediately.
+        // so the LLM sees page content immediately. Both are composite
+        // sub-steps of this one tool call, but each runs as a chrome-use call of
+        // its own under [`Self::call_clocks`], so — unlike the CLI's
+        // product-bounded `open` operation — no sub-step here is cut off below
+        // chrome-use's own clock.
         let snapshot = if matches!(action, ChromeAction::Open { .. }) {
             let wait_args = ["wait", "--load", "networkidle"];
-            let _ = self.run_command(&wait_args, tab).await;
+            if let Ok(call) = self.run_command(&wait_args, tab, workspace).await {
+                leftover_pipes |= call.leftover_pipes;
+            }
 
             // Compact snapshot to return page content; when it comes back
             // empty (canvas/PDF/SPA shells, capture failure) fall back to
             // visible text so open still yields something readable.
             let snap = self
-                .run_command(&["snapshot", "-c"], tab)
+                .run_command(&["snapshot", "-c"], tab, workspace)
                 .await
                 .ok()
-                .and_then(|r| r.data.as_ref().and_then(extract_snapshot_text))
+                .and_then(|call| {
+                    leftover_pipes |= call.leftover_pipes;
+                    call.output.data.as_ref().and_then(extract_snapshot_text)
+                })
                 .unwrap_or_default();
             if snap.trim().is_empty() {
-                self.get_inner_text("body", tab).await.unwrap_or_default()
+                self.get_inner_text("body", tab, workspace)
+                    .await
+                    .map(|out| {
+                        leftover_pipes |= out.leftover_pipes;
+                        out.output
+                    })
+                    .unwrap_or_default()
             } else {
                 snap
             }
@@ -1383,7 +1690,10 @@ impl ChromeTool {
             String::new()
         };
 
-        Ok((response, snapshot))
+        Ok(ActionOutput {
+            output: (response, snapshot),
+            leftover_pipes,
+        })
     }
 
     /// Shape the raw [`ChromeResponse`] into the LLM-facing text: the
@@ -1400,11 +1710,13 @@ impl ChromeTool {
         // chrome-use's degraded-success `warning` only applies to the
         // text-input actions (`type` read-back mismatch, `press` with no key
         // listeners / provably nowhere) — don't scan the shared path for them.
+        // The browser-replacement note is never one of these: [`Self::run_command`]
+        // already failed the call for it before any response reaches here.
         let warning = if matches!(
             action,
             ChromeAction::Fill { .. } | ChromeAction::Type { .. } | ChromeAction::Press { .. }
         ) {
-            crate::chrome::contract::chrome_use_warning(&response)
+            chrome_use_warning(&response)
         } else {
             None
         };
@@ -1564,37 +1876,47 @@ impl ChromeTool {
         schema: &Value,
         limit: Option<usize>,
         tab: &str,
-    ) -> anyhow::Result<String> {
+        workspace: &str,
+    ) -> anyhow::Result<ActionOutput<String>> {
+        let mut leftover_pipes = false;
         let rows_sel = schema.get("rows").and_then(Value::as_str);
         if let Some(sel) = rows_sel {
             let js = count_eval_js(sel);
-            let resp = self.run_command(&["eval", &js], tab).await?;
-            let count = eval_count(&resp).ok_or_else(|| {
+            let call = self.run_command(&["eval", &js], tab, workspace).await?;
+            leftover_pipes |= call.leftover_pipes;
+            let count = eval_count(&call.output).ok_or_else(|| {
                 anyhow::anyhow!(
                     "count eval for the rows selector '{sel}' returned a non-numeric result"
                 )
             });
             match extract_gate(count) {
                 ExtractGate::Empty => {
-                    return serde_json::to_string_pretty(&extract_output(
-                        &Value::Array(vec![]),
-                        limit,
-                    ))
-                    .context("serialize extract output");
+                    return Ok(ActionOutput {
+                        output: serde_json::to_string_pretty(&extract_output(
+                            &Value::Array(vec![]),
+                            limit,
+                        ))
+                        .context("serialize extract output")?,
+                        leftover_pipes,
+                    });
                 }
                 ExtractGate::Proceed => {}
                 ExtractGate::Fail(e) => return Err(e),
             }
         }
         let schema_str = serde_json::to_string(schema)?;
-        let resp = self
-            .run_command(&["extract", "--schema", &schema_str], tab)
+        let call = self
+            .run_command(&["extract", "--schema", &schema_str], tab, workspace)
             .await?;
-        let Some(data) = resp.data.as_ref() else {
+        leftover_pipes |= call.leftover_pipes;
+        let Some(data) = call.output.data.as_ref() else {
             anyhow::bail!("extract returned no data");
         };
-        serde_json::to_string_pretty(&extract_output(data, limit))
-            .context("serialize extract output")
+        Ok(ActionOutput {
+            output: serde_json::to_string_pretty(&extract_output(data, limit))
+                .context("serialize extract output")?,
+            leftover_pipes,
+        })
     }
 }
 
@@ -1673,7 +1995,10 @@ enum ParsedRun {
         code: Option<String>,
         retryable: Option<bool>,
     },
-    /// Zero exit but unparseable stdout.
+    /// An answer that could not be parsed: stdout was not a chrome-use envelope,
+    /// or the product cut it off
+    /// ([`crate::chrome::spawn::CliOutput::truncated`]) — the caller names the
+    /// cut-off case (see [`truncated_output_error`]).
     Unparseable,
 }
 
@@ -1681,16 +2006,21 @@ enum ParsedRun {
 /// whose `--json` envelope can succeed on a non-zero exit — a failed
 /// assertion arrives as `success:true` with exit 1, the verdict riding in
 /// `data.pass` — so envelope-success is trusted over the exit code there and
-/// nowhere else. Pure so tests pin the mapping.
+/// nowhere else. `truncated` is the product's own flag: an answer the product
+/// cut off names itself rather than reading as chrome-use's malformed output,
+/// whatever the exit status. The parse is the shared tolerant one
+/// ([`crate::chrome::contract::parse_first`]), so trailing bytes a leftover
+/// process wrote after the envelope are ignored. Pure so tests pin the mapping.
 fn parse_run_output(
     action: Option<&str>,
+    truncated: bool,
     status_success: bool,
     stdout: &str,
     stderr: &str,
 ) -> ParsedRun {
-    let parsed: Option<ChromeResponse> = serde_json::from_str(stdout).ok();
+    let parsed: Option<ChromeResponse> = parse_first::<ChromeResponse>(stdout.as_bytes());
     let Some(resp) = parsed else {
-        return if status_success {
+        return if status_success || truncated {
             ParsedRun::Unparseable
         } else {
             ParsedRun::Failed {
@@ -2408,30 +2738,40 @@ mod tests {
             .expect("role + name/exact must still validate");
     }
 
-    // ── call_timeout policy ──────────────────────────────────────────────
+    // ── call_clocks policy ───────────────────────────────────────────────
 
     #[test]
-    fn call_timeout_policy() {
+    fn call_clocks_declare_the_verb_clock_and_kill_above_it() {
+        // The kill's arithmetic has ONE home and one pinning test
+        // ([`crate::chrome::clocks`] / [`crate::chrome::kill_bound`]), so these
+        // expectations are expressed through the derivation itself: what this
+        // test pins is the tool's own policy — WHICH clock each verb declares.
+        let call_clocks = ChromeTool::call_clocks;
+        // wait/expect forward their declared deadline as `--timeout`, so it IS
+        // the chrome-side clock.
         assert_eq!(
-            ChromeTool::call_timeout(&["open", "https://example.com"]),
-            Duration::from_secs(22)
+            call_clocks(&["wait", "--load", "networkidle"]),
+            crate::chrome::clocks(Some(ChromeTool::WAIT_DEADLINE), CliRecovery::Allowed)
         );
         assert_eq!(
-            ChromeTool::call_timeout(&["wait", "--load", "networkidle"]),
-            Duration::from_secs(12)
+            call_clocks(&["expect", "visible", "#x"]),
+            crate::chrome::clocks(Some(ChromeTool::EXPECT_DEADLINE), CliRecovery::Allowed)
         );
-        assert_eq!(
-            ChromeTool::call_timeout(&["expect", "visible", "#x"]),
-            Duration::from_secs(22)
-        );
+        // Every other verb — `open` included, whose navigate chrome-use does not
+        // bound by the forwarded env value — has no command-level deadline, so
+        // the clock mahbot declares to chrome-use IS its clock: the call runs to that
+        // clock and chrome-use reports first, which is what the product's kill
+        // must always allow.
         for args in [
+            &["open", "https://example.com"][..],
             &["click", "@e1"][..],
             &["eval", "1+1"][..],
             &["snapshot", "-c"][..],
+            &["extract", "--schema", "{}"][..],
         ] {
             assert_eq!(
-                ChromeTool::call_timeout(args),
-                Duration::from_secs(8),
+                call_clocks(args),
+                crate::chrome::clocks(None, CliRecovery::Allowed),
                 "args: {args:?}"
             );
         }
@@ -2764,8 +3104,9 @@ mod tests {
         // it can never resolve to someone else's session.
         let other_physical = b.resolve_session("docs");
         assert_ne!(a.resolve_session(&other_physical), other_physical);
-        // The shared non-agent instance passes names through unchanged —
-        // link enrichment keeps its own daemon-sweepable namespace.
+        // The shared non-agent instance sanitizes the name the same way — link
+        // enrichment's own plain names pass through unchanged, keeping their
+        // daemon-sweepable namespace.
         assert_eq!(
             ChromeTool::default().resolve_session("link-enricher-3"),
             "link-enricher-3"
@@ -2838,7 +3179,9 @@ mod tests {
              The tab this session was driving can no longer be resolved (it was closed, or a \
              flaky relay dropped it)",
             Some("browser_not_launched"),
+            "agent-tab-x-default",
         )
+        .await
         .unwrap_err();
         assert!(
             err.to_string().contains("close the leftover tab in Chrome"),
@@ -2850,7 +3193,9 @@ mod tests {
         let err = ChromeTool::fail_fast_if_daemon_down(
             "Failed to read: Resource temporarily unavailable (os error 35) (after 5 retries - daemon may be busy or unresponsive)",
             None,
+            "agent-tab-x-default",
         )
+        .await
         .unwrap_err();
         assert!(
             err.to_string().contains("chrome daemon is down"),
@@ -2862,7 +3207,9 @@ mod tests {
         let err = ChromeTool::fail_fast_if_daemon_down(
             "chrome-use error: browser not launched",
             Some("browser_not_launched"),
+            "agent-tab-x-default",
         )
+        .await
         .unwrap_err();
         assert!(
             err.to_string().contains("chrome daemon is down"),
@@ -2875,16 +3222,28 @@ mod tests {
             ChromeTool::fail_fast_if_daemon_down(
                 "chrome-use error: Navigation failed: net::ERR_CONNECTION_REFUSED",
                 Some("connection_failed"),
+                "agent-tab-x-default",
             )
+            .await
             .is_ok()
         );
         assert!(
-            ChromeTool::fail_fast_if_daemon_down("chrome-use error: Element not found", None)
-                .is_ok()
+            ChromeTool::fail_fast_if_daemon_down(
+                "chrome-use error: Element not found",
+                None,
+                "agent-tab-x-default",
+            )
+            .await
+            .is_ok()
         );
         assert!(
-            ChromeTool::fail_fast_if_daemon_down("chrome-use error: timed out", Some("timeout"))
-                .is_ok()
+            ChromeTool::fail_fast_if_daemon_down(
+                "chrome-use error: timed out",
+                Some("timeout"),
+                "agent-tab-x-default",
+            )
+            .await
+            .is_ok()
         );
         // Restore the global health singleton so later agent-constructing
         // tests don't inherit a hidden chrome tool.
@@ -2972,7 +3331,8 @@ mod tests {
         }
 
         // Wait: exactly one target; the forwarded --timeout is the declared
-        // chrome-side deadline (the mahbot kill rides DEADLINE_SLACK above it).
+        // chrome-side clock, and the product's kill rides the relay-recovery
+        // window + slack above it ([`ChromeTool::call_clocks`]).
         let wait_selector = ChromeAction::Wait {
             selector: Some("#r".into()),
             url: None,
@@ -3167,7 +3527,7 @@ mod tests {
     fn parse_run_output_pins_envelope_over_exit_code() {
         // expect pass=false: success:true + exit 1 → the verdict is returned.
         let body = json!({"success": true, "data": {"pass": false, "actual": 3, "timedOut": true}});
-        let resp = match parse_run_output(Some("expect"), false, &body.to_string(), "") {
+        let resp = match parse_run_output(Some("expect"), false, false, &body.to_string(), "") {
             ParsedRun::Ok(resp) => resp,
             other => panic!("expected Ok, got {other:?}"),
         };
@@ -3177,13 +3537,13 @@ mod tests {
 
         // …but only for expect: the same payload on another action is a failure.
         assert!(matches!(
-            parse_run_output(Some("open"), false, &body.to_string(), ""),
+            parse_run_output(Some("open"), false, false, &body.to_string(), ""),
             ParsedRun::Failed { .. }
         ));
 
         // A failure envelope on any exit → Failed with its details.
         let err_body = json!({"success": false, "error": "Browser not launched", "code": "browser_not_launched"});
-        match parse_run_output(Some("expect"), false, &err_body.to_string(), "") {
+        match parse_run_output(Some("expect"), false, false, &err_body.to_string(), "") {
             ParsedRun::Failed { error, code, .. } => {
                 assert_eq!(error, "Browser not launched");
                 assert_eq!(code.as_deref(), Some("browser_not_launched"));
@@ -3193,10 +3553,10 @@ mod tests {
 
         // Unparseable stdout: zero exit → Unparseable; non-zero → stderr fallback.
         assert!(matches!(
-            parse_run_output(None, true, "garbage", ""),
+            parse_run_output(None, false, true, "garbage", ""),
             ParsedRun::Unparseable
         ));
-        match parse_run_output(None, false, "garbage", "relay is down\n") {
+        match parse_run_output(None, false, false, "garbage", "relay is down\n") {
             ParsedRun::Failed {
                 error,
                 code,
@@ -3208,10 +3568,30 @@ mod tests {
             other => panic!("expected Failed, got {other:?}"),
         }
 
+        // A process the command left behind writing into the inherited channel
+        // after chrome-use's own answer: the trailing bytes are ignored, so a
+        // zero-exit call stays the success its envelope says it is.
+        let with_leftover = format!(
+            "{}\nsomeone the command left behind is still writing\n",
+            json!({"ok": true, "data": {"text": "hi"}})
+        );
+        assert!(matches!(
+            parse_run_output(None, false, true, &with_leftover, ""),
+            ParsedRun::Ok(_)
+        ));
+
+        // An answer the product cut off at its cap names itself whatever the
+        // exit status: the truncation, not chrome-use's exit, is the reason.
+        assert!(matches!(
+            parse_run_output(None, true, false, "garbage", "relay is down\n"),
+            ParsedRun::Unparseable
+        ));
+
         // Happy path.
         assert!(matches!(
             parse_run_output(
                 Some("open"),
+                false,
                 true,
                 &json!({"success": true}).to_string(),
                 ""

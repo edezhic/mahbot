@@ -1217,7 +1217,8 @@ mod tests {
     }
 
     /// A command that exits while leaving a stray grandchild in the group
-    /// (`sh -c 'sleep 5 &'` — the foreground path's drain-timeout scenario)
+    /// (`sh -c 'sleep 5 &'` — the shape of the foreground path's leftover-holding
+    /// run, which a background session must NOT leave behind)
     /// must not leak the stray: the waiter closes the lifeline, the watcher
     /// SIGKILLs the group, and the stray dies with the session.
     #[cfg(unix)]

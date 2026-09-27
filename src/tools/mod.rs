@@ -219,6 +219,19 @@ pub(crate) fn with_normalization_notes(output: String, notes: &[String]) -> Stri
     format!("[normalized] {}\n{output}", notes.join("; "))
 }
 
+/// Append a bracketed note (`[exit status: 3]`, `[leftover process] …`) under
+/// `text` as its own paragraph: the text's trailing whitespace is trimmed so the
+/// note is never preceded by a blank gap, and a run that produced nothing is left
+/// as just the note.
+pub(crate) fn with_note(text: &str, note: &str) -> String {
+    let mut out = text.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(note);
+    out
+}
+
 /// Build a JSON schema for tool parameters.
 ///
 /// Wraps `properties` in the standard `{"type": "object", "properties": {...}}`

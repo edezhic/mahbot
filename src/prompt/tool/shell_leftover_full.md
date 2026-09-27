@@ -1,0 +1,1 @@
+Where the leftover is named, the note gives this platform's stop command for it; where it cannot be named, locating and stopping it is yours to do. Anything meant to keep running must be started with `background: true` and stopped with `stop`, instead of being left as a child that outlives the command.

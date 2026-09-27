@@ -41,6 +41,41 @@ pub(crate) struct ActionDesc {
     pub(crate) cli: Option<CliHelp>,
 }
 
+/// The `--timeout` description shared by the verbs that forward no `--timeout`
+/// chrome-use honours (click, count, eval, extract, fill, type, press): such a
+/// call's clock is the one mahbot declares to chrome-use — chrome-use's own
+/// client tolerance less mahbot's 2 s margin — and the product's kill
+/// rides the relay-recovery window + slack above it — mahbot never cuts the call
+/// off before that clock, so chrome-use's own reason, not a synthetic mahbot
+/// timeout, is what the caller sees. chrome-use takes no per-call deadline for
+/// these verbs, so the product cannot make the call give up earlier: a `--timeout`
+/// below that declared clock is REFUSED (rc 3) instead of accepted and silently
+/// discarded. A larger one widens the bound mahbot itself kills at — never the
+/// clock chrome-use works to, which nothing can raise (declaring a larger deadline
+/// to chrome-use would make it run out of its own client tolerance instead of
+/// reporting its own reason), so it is a bound the call really runs to. Only
+/// `wait`/`expect` forward a deadline chrome-use honours in full, so only there
+/// does the `--timeout` become the call's own clock.
+const OWN_BOUND_FLAG: &str = "your own bound on the step (default: none — the clock mahbot \
+     declares to chrome-use is the call's clock and the product never cuts the call off before it; \
+     a value above that clock raises only the bound mahbot itself kills at, by the relay-recovery \
+     window and slack, and anything below it is refused as a usage error because chrome-use takes \
+     no per-call deadline for this verb — a --timeout is honoured in full by wait/expect only)";
+
+/// The `--timeout` description for the verbs chrome-use honours a `--timeout`
+/// on (wait, expect): the declared value IS the chrome-use-side deadline, so
+/// chrome-use's own timeout surfaces at it and the product only kills above it
+/// plus the relay-recovery window. A value at or above chrome-use's own client
+/// tolerance is refused as a usage error. `open` derives the wait's declaration
+/// from what REMAINS of the flag when the wait starts, so a larger `--timeout`
+/// there never pushes the declaration past the tolerance this parse layer
+/// refuses.
+const FORWARDED_DEADLINE_FLAG: &str = "condition deadline in seconds (default 8) — chrome-use \
+     honours it in full and gives up first, so its own 'condition was not met' verdict is what \
+     you see; the product's kill rides above it plus chrome-use's relay-recovery window. Must \
+     stay under 45, chrome-use's own client tolerance — a value at or above it is refused, \
+     because the tool would run out of tolerance instead of answering";
+
 pub(crate) static ACTIONS: LazyLock<Vec<ActionDesc>> = LazyLock::new(build_actions);
 
 /// Build the shared action registry (registry order = CLI help order).
@@ -49,14 +84,14 @@ fn build_actions() -> Vec<ActionDesc> {
     vec![
         ActionDesc {
             name: "status",
-            purpose: "check chrome-use CLI, extension relay, Chrome, and display health",
+            purpose: "report what was established about the owner's real browser",
             tool: None,
             cli: Some(CliHelp {
                 syntax: "",
                 flags: &[],
                 session: false,
                 kinds: &[OutKind::Ok, OutKind::Environment, OutKind::Usage],
-                details: "Pure preflight — probes chrome-use, the extension relay, a running Chrome, and a usable display. Never launches Chrome and never mutates the environment. Rejects --session.",
+                details: "Pure preflight — reports what was established (chrome-use, the native host, the extension relay, the real profile being driven, a real browser reachable through the relay, a running Chrome, a usable display), never a file/process health check. Exits 2 (environment) only for a chrome-use that cannot state its version or a fact that rules the connection out; a not-proven report exits 0 with `verdict: not-proven` and an action is still attempted. Never launches Chrome, never recovers, never mutates the environment. Rejects --session.",
                 examples: &["mahbot chrome status"],
             }),
         },
@@ -82,7 +117,15 @@ fn build_actions() -> Vec<ActionDesc> {
                     ),
                     (
                         "--timeout <secs>",
-                        "whole-operation deadline in seconds (default 20)",
+                        "the condition deadline for the --expect wait, in seconds (default 20) — \
+                         the wait declares what REMAINS of it when it starts, and chrome-use \
+                         honours that in full and gives up first, so its own verdict is the \
+                         open's; the error-page probe and the settle/content capture are \
+                         best-effort and product-bounded; the navigation runs to that same declared \
+                         clock, which no value here shortens, so the open may \
+                         outlive it; a value at or above chrome-use's own client tolerance (45) \
+                         is refused as a usage error, because the tool would then run out of \
+                         tolerance instead of answering",
                     ),
                 ],
                 session: true,
@@ -96,7 +139,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "The URL must be http(s). Reports the committed final URL plus the page content — a best-effort compact accessibility snapshot, truncated at ~5 KB and absent when the capture fails, the step budget is exhausted, or the page is content-free. An uncommitted navigation (tab still on about:blank) or a Chrome error page is kind network with the requested url; a rendered net error code (e.g. DNS_PROBE_FINISHED_NXDOMAIN, ERR_CONNECTION_REFUSED) surfaces as error_code plus a specific cause in error. An invalid URL is kind usage (rc 3). After navigation (plain path, no --expect) a best-effort network settle runs — capped at ~10s and skipped when the remaining budget cannot also cover content capture — so heavy SPAs (Gmail, YouTube) have largely settled before the next step; a settle timeout never fails the open. The settle reduces, not eliminates, first-step lag: the first count/eval after open can still exceed its 8s default under contention — give that step a larger --timeout, or use --expect as the settle instead. `--expect` is a wait-for-selector convenience after navigation, not a general assertion — use the expect action for condition checks. The `--timeout` deadline covers the whole operation — navigation, the error-page probe, the `--expect` wait or the settle, and content capture — with total wall clock ≤ declared + 2s.",
+                details: "The URL must be http(s). Reports the committed final URL plus the page content — a best-effort compact accessibility snapshot, truncated at ~5 KB and absent when the capture fails, the step budget is exhausted, or the page is content-free. An uncommitted navigation (tab still on about:blank) or a Chrome error page is kind network with the requested url; a rendered net error code (e.g. DNS_PROBE_FINISHED_NXDOMAIN, ERR_CONNECTION_REFUSED) surfaces as error_code plus a specific cause in error. An invalid URL is kind usage (rc 3). After navigation (plain path, no --expect) a best-effort network settle runs — capped at ~10s and skipped when the remaining budget cannot also cover content capture — so heavy SPAs (Gmail, YouTube) have largely settled before the next step; a settle timeout never fails the open. The settle reduces, not eliminates, first-step lag: the first count/eval after open can still be slow under contention, but such a step now runs to the clock mahbot declares to chrome-use and reports chrome-use's own reason — pass --expect to have the open itself wait for the page instead. `--expect` is a wait-for-selector convenience after navigation, not a general assertion — use the expect action for condition checks. The `--timeout` deadline bounds the `--expect` wait, which declares to chrome-use what REMAINS of it at the moment it starts — a declaration chrome-use honours in full and gives up first on, so its verdict is the open's — and bounds the product's own best-effort work (the error-page probe, the settle, content capture). A `--timeout` at or above chrome-use's own client tolerance (45s) is refused (rc 3). It does NOT bound the navigation, which runs to the clock mahbot declares to chrome-use like every verb chrome-use accepts no `--timeout` for, so the open may outlive the declared deadline.",
                 examples: &[
                     "mahbot chrome open https://example.com",
                     "mahbot chrome open https://example.com --expect \"#main\" --structural --timeout 15",
@@ -109,7 +152,7 @@ fn build_actions() -> Vec<ActionDesc> {
             tool: None,
             cli: Some(CliHelp {
                 syntax: "<selector> [--timeout <secs>]",
-                flags: &[("--timeout <secs>", "step deadline in seconds (default 8)")],
+                flags: &[("--timeout <secs>", OWN_BOUND_FLAG)],
                 session: true,
                 kinds: &[
                     OutKind::Ok,
@@ -153,10 +196,7 @@ fn build_actions() -> Vec<ActionDesc> {
                 flags: &[
                     ("--url <pattern>", "wait until the URL matches this pattern"),
                     ("--text <text>", "wait until this text appears in the page"),
-                    (
-                        "--timeout <secs>",
-                        "condition deadline in seconds (default 8; chrome-use's own deadline — mahbot kills 2s past it)",
-                    ),
+                    ("--timeout <secs>", FORWARDED_DEADLINE_FLAG),
                 ],
                 session: true,
                 kinds: &[
@@ -168,7 +208,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "Exactly one target: a selector positional, --url, or --text. A numeric first token (chrome-use's silent-sleep form) is rejected as usage. --timeout IS chrome-use's deadline, honored in full; mahbot kills only 2s past it (chrome-use's honest timeout error surfaces at the deadline). --fn/--load are not exposed (the one internal --load use is open's post-navigation settle).",
+                details: "Exactly one target: a selector positional, --url, or --text. A numeric first token (chrome-use's silent-sleep form) is rejected as usage. --timeout IS chrome-use's deadline, honoured in full — chrome-use's own timeout error surfaces at it, and the product kills only above it plus the relay-recovery window. --fn/--load are not exposed (the one internal --load use is open's post-navigation settle).",
                 examples: &[
                     "mahbot chrome wait \"#results\" --timeout 15",
                     "mahbot chrome wait --text \"Loaded\" --timeout 10",
@@ -213,10 +253,7 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
             cli: Some(CliHelp {
                 syntax: "(<selector> <visible|hidden|present> | count <sel> <op> <n> | text|value <sel> <equals|contains|matches> <value> | attr <sel> <name> <pred> <value> | url <pred> <pattern>) [--timeout <secs>]",
-                flags: &[(
-                    "--timeout <secs>",
-                    "condition deadline in seconds (default 8; chrome-use's own deadline — mahbot kills 2s past it)",
-                )],
+                flags: &[("--timeout <secs>", FORWARDED_DEADLINE_FLAG)],
                 session: true,
                 kinds: &[
                     OutKind::Ok,
@@ -249,7 +286,7 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
             cli: Some(CliHelp {
                 syntax: "<js> [--timeout <secs>]",
-                flags: &[("--timeout <secs>", "step deadline in seconds (default 8)")],
+                flags: &[("--timeout <secs>", OWN_BOUND_FLAG)],
                 session: true,
                 kinds: &[
                     OutKind::Ok,
@@ -291,7 +328,7 @@ fn build_actions() -> Vec<ActionDesc> {
                         "--limit <n>",
                         "trim rows mahbot-side; total still reports the honest count",
                     ),
-                    ("--timeout <secs>", "step deadline in seconds (default 8)"),
+                    ("--timeout <secs>", OWN_BOUND_FLAG),
                 ],
                 session: true,
                 kinds: &[
@@ -327,7 +364,7 @@ fn build_actions() -> Vec<ActionDesc> {
                         "--if-present",
                         "a missed click is a no-op success (chrome-use semantics)",
                     ),
-                    ("--timeout <secs>", "step deadline in seconds (default 8)"),
+                    ("--timeout <secs>", OWN_BOUND_FLAG),
                 ],
                 session: true,
                 kinds: &[
@@ -370,7 +407,7 @@ fn build_actions() -> Vec<ActionDesc> {
                         "read the fill value from a UTF-8 file (large/multiline text — chrome-use reads the file)",
                     ),
                     ("--stdin", "read the fill value from this process's stdin"),
-                    ("--timeout <secs>", "step deadline in seconds (default 8)"),
+                    ("--timeout <secs>", OWN_BOUND_FLAG),
                 ],
                 session: true,
                 kinds: &[
@@ -416,7 +453,7 @@ fn build_actions() -> Vec<ActionDesc> {
                         "--key-events",
                         "send real per-character keyDown/keyUp — for autocomplete/combobox fields",
                     ),
-                    ("--timeout <secs>", "step deadline in seconds (default 8)"),
+                    ("--timeout <secs>", OWN_BOUND_FLAG),
                 ],
                 session: true,
                 kinds: &[
@@ -462,7 +499,7 @@ fn build_actions() -> Vec<ActionDesc> {
                         "--hold <ms>",
                         "hold the key down for this long before releasing",
                     ),
-                    ("--timeout <secs>", "step deadline in seconds (default 8)"),
+                    ("--timeout <secs>", OWN_BOUND_FLAG),
                 ],
                 session: true,
                 kinds: &[
@@ -502,7 +539,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     OutKind::Environment,
                     OutKind::Usage,
                 ],
-                details: "Manages named CLI sessions. stop refuses protected sessions (agent-tab-* / link-enricher-*) unless --force; names are prefixed mahbot-chrome- unless already prefixed. status is an opt-in liveness probe (worst case ~30s: session-list preflight + a real bounded get-url against the session): a not-running session reports empty (rc 0); a wedged one reports environment (rc 2) with the recovery hint. Recovery = graceful `session stop <name>`, then re-create by re-running the action with `--session <name>` — cookies persist in the profile, open tabs/tab-group identity do not. The global `status` action is session-unaware and can report healthy while a named session is wedged.",
+                details: "Manages named CLI sessions — a `<name>` takes letters, digits, '-' or '_' only (chrome-use's own alphabet: a '.' is refused, since chrome-use refuses to stop such a session). stop refuses protected sessions (agent-tab-* / link-enricher-*) unless --force; names are prefixed mahbot-chrome- unless already prefixed. status is an opt-in liveness probe (worst case ~30s: session-list preflight + a real bounded get-url against the session): a not-running session reports empty (rc 0); a wedged one reports environment (rc 2). The probe only reports — it mutates nothing, so a diagnosis never closes tabs on its own; the recovery itself is automatic everywhere the session is actually driven: every on-demand action verb recovers a session that stopped answering and says so in its error (only when mahbot's own bound ended the step, or chrome-use classified the session unresponsive — a step chrome-use timed out on its own, e.g. an expect whose condition was not met, is not a wedge and costs no session), `session stop <name>` clears it, and the ended-run release and the background watchdog recover one too. After a recovery, re-run the action with `--session <name>` to re-create the session — cookies persist in the profile, open tabs/tab-group identity do not. The global `status` action is session-unaware: it can report the connection ready while a named session is wedged.",
                 examples: &[
                     "mahbot chrome session stop docs",
                     "mahbot chrome session status docs",

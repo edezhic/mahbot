@@ -93,6 +93,141 @@ pub(crate) fn chrome_use_warning(resp: &ChromeResponse) -> Option<Value> {
         .find_map(|map| map.get("warning").cloned())
 }
 
+/// Stable fragments of chrome-use's browser-replacement note — the warning it
+/// attaches to a command it ran in a browser it launched ITSELF after the
+/// session's previous browser went away ("This session's previous browser is
+/// gone (<reason>) and a fresh one was launched for this command"). Matched as
+/// fragments rather than as one whole sentence: the parenthesized reason is
+/// chrome-use's own diagnosis ("its browser connection was dead", "its browser
+/// process had exited", …) and drifts with it.
+const SELF_LAUNCHED_BROWSER_PHRASES: [&str; 2] =
+    ["previous browser is gone", "a fresh one was launched"];
+
+/// The browser-replacement note on a chrome-use envelope: `Some(text)` with the
+/// tool's own warning text when this command ran in a browser chrome-use
+/// launched itself instead of the owner's real one, `None` otherwise.
+///
+/// Deliberately distinct from the degraded-success warnings the same
+/// [`chrome_use_warning`] field carries (`type` read-back mismatch, `press`
+/// key-listener notes): those mean the action may not have taken effect in the
+/// browser the model was driving, this one means the browser was not the
+/// owner's at all, so callers must report it as a plain failure rather than a
+/// success with a note (see [`self_launched_browser_error`]).
+#[must_use]
+pub(crate) fn self_launched_browser_note(resp: &ChromeResponse) -> Option<String> {
+    let warning = chrome_use_warning(resp)?;
+    let text = warning
+        .as_str()
+        .map_or_else(|| warning.to_string(), str::to_string);
+    let lower = text.to_ascii_lowercase();
+    SELF_LAUNCHED_BROWSER_PHRASES
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+        .then_some(text)
+}
+
+/// The failure text for a call whose envelope carried
+/// [`self_launched_browser_note`]: the tool's own note, what it means, and what
+/// to do next. Shared by both frontends so the two surfaces cannot drift.
+///
+/// This is NOT the daemon-down path: the daemon and the relay may be perfectly
+/// healthy, and what was lost is the connection to the owner's real browser — so
+/// the call must never be reported as a quiet success, and the daemon must not be
+/// marked unhealthy for it (a daemon restart cannot bring a gone browser back).
+#[must_use]
+pub(crate) fn self_launched_browser_error(note: &str) -> String {
+    format!(
+        "chrome-use launched a browser of its own for this command ({note}). The work ended up in \
+         a browser chrome-use started itself, not the owner's real logged-in Chrome — the tool \
+         could not resolve the connection to the real browser, so the page state this action \
+         assumed is not there and nothing read or written here happened in the owner's session. \
+         Retry the action; if it keeps happening the relay or the chrome-use extension is the \
+         problem rather than the page — the chrome daemon itself is healthy, so check the \
+         extension at chrome://extensions and the relay, then retry."
+    )
+}
+
+/// The failure text for output the product had to cut off, either at the bytes
+/// it collects ([`crate::chrome::spawn::PIPE_READ_CAP`]) or when the collection
+/// window ended while bytes were still arriving: the envelope cannot be parsed
+/// because the PRODUCT cut it off, which is a different fact from chrome-use
+/// answering something malformed. Shared by both frontends so the two surfaces
+/// cannot drift.
+#[must_use]
+pub(crate) fn truncated_output_error() -> String {
+    format!(
+        "the answer chrome-use wrote was cut off by mahbot before it could be read in full — it \
+         exceeded the {} MiB mahbot collects per stream, or a process the command left behind kept \
+         writing past the collection window — so it could not be parsed. The command itself may \
+         well have succeeded: retry with a narrower action (a smaller selector or page region) \
+         rather than reading this as malformed output from chrome-use.",
+        crate::chrome::spawn::PIPE_READ_CAP / (1024 * 1024)
+    )
+}
+
+/// Parse the FIRST JSON value chrome-use wrote, ignoring anything after it — the
+/// ONE reading of a chrome-use answer, used by every path that reads one (the
+/// interactive tool's dispatch, the `mahbot chrome` CLI's step classification, the
+/// session-list sweep, and the daemon's own readiness/session probes).
+///
+/// A process the command left behind can write into the inherited output channel
+/// after chrome-use's own answer, and those trailing bytes must not turn a
+/// finished command's answer into malformed output.
+pub(crate) fn parse_first<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
+    serde_json::Deserializer::from_slice(bytes)
+        .into_iter::<T>()
+        .next()?
+        .ok()
+}
+
+/// The note a caller appends to a chrome-use result whose child exited while a
+/// process it left behind still held the call's output channel
+/// ([`crate::chrome::spawn::CliOutput::leftover_pipes`]) — on a FAILING result
+/// too, where the failure stays the failure and this is a separate fact.
+///
+/// What still runs is chrome-use's OWN helper, the daemon it starts for the
+/// session (`session` names that session, so the product's own stop verb can
+/// address it); chrome-use stops it on its own idle timeout, so a caller that
+/// leaves it alone loses nothing. Shared by both frontends so the two surfaces
+/// cannot drift.
+#[must_use]
+pub(crate) fn chrome_leftover_pipe_note(session: &str) -> String {
+    format!(
+        "[leftover helper] a helper chrome-use starts itself — the daemon of chrome-use session \
+         `{session}` — still holds the call's output channel, so no more of its output could be \
+         collected. chrome-use starts that helper on its own and stops it on its own idle timeout; \
+         to stop it now, run `{}`.",
+        chrome_session_stop_command(session)
+    )
+}
+
+/// The `session stop` command that addresses chrome-use session `session`'s
+/// leftover helper — the recipe [`chrome_leftover_pipe_note`] embeds and the
+/// durable record written into the log store (shown on Logs → Issues) carries as
+/// its `detail`. Extracted so the agent's note and the durable record are the
+/// same text and cannot drift.
+///
+/// The name is rendered bare, and that is safe because the set the recipe can
+/// carry — `[A-Za-z0-9_-]`, the alphabet both producers, and chrome-use's own
+/// `validation::is_valid_session_name`, restrict themselves to — holds only
+/// characters that are inert in a shell, and the names are prefix-anchored. The
+/// tool's `sanitize_filename_component` emits that set (a '.' becomes '_'), and
+/// the CLI's `validate_session_name` accepts no more than chrome-use will stop
+/// (see [`crate::chrome::cli`] for why a '.' is refused). So the recipe cannot be
+/// turned into a different command by a name. Quoting is deliberately not used
+/// here — the recipe is run by the agent's shell, which may be `cmd.exe`, where
+/// the product's unix single-quote form would become part of the argument (and
+/// silently address the wrong session).
+///
+/// `--force` is part of the recipe because the interactive tool's sessions live
+/// under the protected `agent-tab-*` prefix (the same flag the CLI's own stop
+/// guard asks for); for a `mahbot-chrome-*` session, which the CLI mints for
+/// itself, the flag is simply unused.
+#[must_use]
+pub(crate) fn chrome_session_stop_command(session: &str) -> String {
+    format!("mahbot chrome session stop {session} --force")
+}
+
 /// Core envelope-success predicate with failure precedence: an explicit
 /// `false` on either key loses over a contradicting success key (conservative
 /// — the error text surfaces), and a payload with neither key is not a
@@ -429,7 +564,7 @@ pub(crate) fn classify_call_failure(code: Option<&str>, error: &str) -> OutKind 
     }
     // chrome-use's internal action timeout (AGENT_BROWSER_DEFAULT_TIMEOUT).
     // Chrome-side deadlines equal the declared budget, and the mahbot-side
-    // kill rides DEADLINE_SLACK above them, so chrome-use's honest phrased
+    // kill rides KILL_SLACK above them, so chrome-use's honest phrased
     // timeouts normally surface first; the classifier still catches them for
     // every verb. Matched
     // by its specific phrasings ("Wait timed out after Nms", "waitFor timed
@@ -602,6 +737,27 @@ mod tests {
         assert!(!mixed.is_success());
     }
 
+    /// The tolerant parse is what keeps a leftover process from deciding the call:
+    /// bytes written into the inherited channel after chrome-use's own envelope
+    /// must not turn a finished command's answer into malformed output, while an
+    /// answer the product cut short still has no first value to read.
+    #[test]
+    fn parse_first_ignores_anything_after_the_first_value() {
+        let envelope = br#"{"ok":true,"data":{"count":1}}"#;
+        assert!(parse_first::<ChromeResponse>(envelope).is_some_and(|r| r.is_success()));
+
+        let mut trailing = envelope.to_vec();
+        trailing.extend_from_slice(b"\nsomeone the command left behind is still writing\n");
+        let parsed = parse_first::<ChromeResponse>(&trailing).expect("trailing bytes ignored");
+        assert_eq!(parsed.data.expect("data present")["count"], 1);
+        assert!(parse_first::<Value>(&trailing).is_some());
+
+        // A cut-off answer and a non-JSON one have no first value, so each keeps
+        // its own report instead of reading as chrome-use's malformed output.
+        assert!(parse_first::<ChromeResponse>(br#"{"ok":true,"data":{"co"#).is_none());
+        assert!(parse_first::<ChromeResponse>(b"chrome-use is not installed\n").is_none());
+    }
+
     #[test]
     fn verdict_covers_both_envelopes() {
         let v = |json: serde_json::Value| ChromeResponse::from_value(&json).verdict();
@@ -621,6 +777,68 @@ mod tests {
             Some(false)
         );
         assert_eq!(v(serde_json::json!({"data": {}})), None);
+    }
+
+    #[test]
+    fn self_launched_browser_note_matches_the_replacement_warning_only() {
+        let note =
+            |v: serde_json::Value| self_launched_browser_note(&ChromeResponse::from_value(&v));
+        // The replacement note itself, top-level and inside data — the drift the
+        // matcher tolerates is its parenthesized reason.
+        assert!(
+            note(serde_json::json!({
+                "success": true,
+                "warning": "This session's previous browser is gone (its browser connection was dead) and a fresh one was launched for this command"
+            }))
+            .is_some()
+        );
+        assert!(
+            note(serde_json::json!({
+                "ok": true,
+                "data": { "warning": "This session's previous browser is gone (its browser process had exited) and a fresh one was launched for this command" }
+            }))
+            .is_some()
+        );
+        // The degraded-success warnings keep today's behaviour: a `type`
+        // read-back mismatch and a key-listener note are not browser
+        // replacement, and a clean envelope carries nothing at all.
+        assert!(
+            note(serde_json::json!({
+                "success": true,
+                "warning": "typed text was rewritten by the page: expected 'ab', read back 'a'"
+            }))
+            .is_none()
+        );
+        assert!(
+            note(serde_json::json!({
+                "success": true,
+                "data": { "warning": "no key listeners on the focused element" }
+            }))
+            .is_none()
+        );
+        assert!(note(serde_json::json!({ "success": true, "data": {} })).is_none());
+    }
+
+    #[test]
+    fn leftover_note_names_the_session_the_stop_and_the_idle_timeout() {
+        let note = chrome_leftover_pipe_note("mahbot-chrome-agent-tab-abc-default");
+        assert!(
+            note.contains("mahbot-chrome-agent-tab-abc-default"),
+            "{note}"
+        );
+        assert!(
+            note.contains("mahbot chrome session stop mahbot-chrome-agent-tab-abc-default --force"),
+            "{note}"
+        );
+        assert!(note.contains("idle timeout"), "{note}");
+        // Mode-neutral: a SUCCESS and a FAILURE both carry this note, so it
+        // claims no exit status of its own and never reads as a failure's text.
+        assert!(
+            note.contains("no more of its output could be collected"),
+            "{note}"
+        );
+        assert!(!note.contains("result"), "{note}");
+        assert!(!note.contains("failed"), "{note}");
     }
 
     #[test]
@@ -835,7 +1053,7 @@ mod tests {
         );
         // chrome-use's internal action timeout (AGENT_BROWSER_DEFAULT_TIMEOUT)
         // — kind timeout, rc 1. Chrome-side deadlines equal the declared
-        // budget (the mahbot kill rides DEADLINE_SLACK above), but the
+        // budget (the mahbot kill rides KILL_SLACK above), but the
         // classifier still catches it for every verb.
         assert_eq!(
             classify_call_failure(None, "Wait timed out after 15000ms"),

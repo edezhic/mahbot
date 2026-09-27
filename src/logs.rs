@@ -103,6 +103,46 @@ pub(crate) struct GrepTelemetryRow<'a> {
     pub exit_code: Option<i32>,
 }
 
+/// The facts of one event that outlived the call that produced it — the process
+/// a command or a chrome-use call left running — recorded by
+/// [`record_stray_event`] as ONE durable row in the log store.
+///
+/// A call that ran in a browser chrome-use started itself needs no record of its
+/// own: that call FAILS, so its failure text — the browser note the agent is
+/// shown — is already its durable record.
+pub(crate) struct StrayEvent<'a> {
+    /// The surface that reported it ([`STRAY_SOURCE_SHELL`],
+    /// [`STRAY_SOURCE_CHROME_TOOL`]) — the log entry's `target`.
+    pub source: &'a str,
+    /// What outlived the call, stated plainly — the row's `message`, so the row
+    /// says what happened rather than reading as a bare command. Metadata only as
+    /// far as shells are concerned: no raw command lines, no page content, no
+    /// credentials.
+    pub message: &'a str,
+    /// The stop recipe for what was left running, carried verbatim into the row's
+    /// `fields` as `detail`. The record is a record: it carries the recipe even
+    /// where the call's own note offers none — a ReadOnly shell call records it
+    /// too, because it is the mode's own guard, not the recipe, that keeps it out
+    /// of that mode's note.
+    pub recipe: &'a str,
+    /// What must be addressed to stop it (a shell leftover's process group /
+    /// process tree root, or the chrome-use session whose helper was left
+    /// behind); empty when unknown. For a chrome leftover it IS the session whose
+    /// helper was left behind — the same name the row's `session` below carries —
+    /// so that surface names both by definition.
+    pub scope: &'a str,
+    /// The physical chrome-use session driven; empty for the shell.
+    pub session: &'a str,
+    /// The workspace the call ran in — empty only where the surface has none.
+    pub workspace: &'a str,
+    /// How long the recorded call took, when the surface measured it.
+    pub duration_ms: Option<i64>,
+}
+
+/// The durable record's `target` — the surface that reported the event.
+pub(crate) const STRAY_SOURCE_SHELL: &str = "shell";
+pub(crate) const STRAY_SOURCE_CHROME_TOOL: &str = "chrome-tool";
+
 impl LogStore {
     /// Open (or create) the log database at `root/db/logs.db`.
     ///
@@ -303,6 +343,45 @@ impl LogStore {
             )
             .await?;
         Ok(())
+    }
+}
+
+/// Record one event that outlived its call as ONE durable row in the log store:
+/// written straight to the store (never through the tracing writer, which batches
+/// lines and may drop them), at `WARN`, which the Issues view shows and the
+/// retention pass keeps. The row says what happened and carries the recipe that
+/// stops it, so the occurrence stays readable after the fact; the agent's own note
+/// on the call is the caller-visible text, never a second record.
+///
+/// The row is attributed to the calling agent from
+/// [`crate::agent::tool_record_attribution`] here, rather than from the caller:
+/// both call sites are tool calls, and that helper documents the attribution.
+///
+/// Fail-open by design: a failed write never affects the call's result, and a
+/// process with no logs store at all (the `mahbot chrome` CLI dispatches before
+/// [`init_tracing`] ever runs, so [`LOG_STORE`] is unset there) writes nothing.
+pub(crate) async fn record_stray_event(event: StrayEvent<'_>) {
+    let Some(store) = LOG_STORE.get() else {
+        return;
+    };
+    let (agent_id, agent_role) = crate::agent::tool_record_attribution();
+    let entry = LogEntry {
+        timestamp: crate::db::now(),
+        level: "WARN".to_string(),
+        target: event.source.to_string(),
+        message: event.message.to_string(),
+        fields: serde_json::json!({
+            "detail": event.recipe,
+            "scope": event.scope,
+            "session": event.session,
+            "duration_ms": event.duration_ms,
+        }),
+        workspace: event.workspace.to_string(),
+        agent_id,
+        agent_role,
+    };
+    if let Err(e) = store.insert_batch(&[entry]).await {
+        tracing::debug!(error = %e, "could not persist the leftover-process record");
     }
 }
 

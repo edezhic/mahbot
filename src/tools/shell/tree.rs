@@ -1,17 +1,23 @@
 //! Whole-tree containment for a command run.
 //!
 //! Ending a run must end everything the run started. A stop — its timeout, the
-//! point where its output collection is given up on
-//! ([`super::ShellRunResult::DrainTimedOut`]) or the run being torn down (its tool
-//! call dropped, its agent destroyed) — takes the whole tree on both platforms.
-//! An abrupt death of the service takes it too, but only where something holds the
-//! tree on the run's behalf: a background session's watcher or job handle (`bg`)
-//! and, on Windows, every run. Two cases are not a stop:
+//! point where the *program* paths give up on its output collection
+//! ([`super::LeftoverPolicy::End`]'s drain overrun, reported as
+//! [`super::ShellRunResult::EndedWithLeftovers`]) or the run being torn down (its
+//! tool call dropped, its agent destroyed) — takes the whole tree on both
+//! platforms. An abrupt death of the service takes it too, but only where something
+//! holds the tree on the run's behalf: a background session's watcher or job handle
+//! (`bg`) and, on Windows, every run. Three cases are not a stop:
 //!
 //! - a *foreground* run that finished on its own is left alone; its stragglers
 //!   outlive both the command and, on unix, the service, exactly as they always
 //!   did. Windows keeps the containment in force instead, so nothing it left
 //!   behind can outlive the service ([`Tree::retain_after_completion`]).
+//! - an *agent's* run whose output collection hit the drain bound because a
+//!   leftover held a pipe is left alone too ([`super::LeftoverPolicy::Keep`]): the
+//!   leftover was started on purpose, so it keeps running and the containment is
+//!   retained rather than ended ([`Tree::retain_after_completion`] — a closed job
+//!   handle would kill exactly the process the run must leave running).
 //! - a *background session* belongs to the agent rather than to a tool call, so
 //!   its leftovers go when its command does, on both platforms (`bg`: the unix
 //!   watcher's group kill when the lifeline closes, this module's `terminate` on
@@ -45,7 +51,7 @@
 //!
 //! [`RunOwner`] draws the boundary and it is the *only* thing the two owners
 //! differ in. [`RunOwner::Agent`] — the shell tool in both modes, which is also
-//! the path a ticket's diagnostics commands take, and the `custom` tool's script
+//! the path the pipeline's diagnostics stage takes, and the `custom` tool's script
 //! run — gets the job. [`RunOwner::Service`] — a user's alarm program — does
 //! not: it is not an agent's work and keeps exactly the treatment it had before
 //! job containment existed. Everything the service launches for its own
@@ -250,8 +256,8 @@ impl Tree {
     /// where anything it left running lives, which is what a stop after the reap is
     /// for. A group that is fully gone leaves its pgid free for reuse, so a signal
     /// meant for it can land elsewhere — an accepted window, not the purpose of the
-    /// retention, and the alternative (forgetting the pid) is what loses the leftover
-    /// kill the drain path relies on.
+    /// retention, and the alternative (forgetting the pid) is what loses the
+    /// leftover kill the [`super::LeftoverPolicy::End`] drain path relies on.
     pub(super) fn terminate(&self) -> bool {
         for pid in self.pids.lock().unwrap_poison().iter() {
             super::kill_process_group(*pid, libc::SIGKILL);
@@ -341,9 +347,10 @@ impl Tree {
     /// closed instead — there is nothing for the handle to keep in.
     ///
     /// The handle is therefore leaked on purpose, one per completed command that
-    /// left a live descendant. Dropping it would give up the only thing standing
-    /// between those processes and outliving the service, so the leak is the
-    /// feature — do not "fix" it.
+    /// left a live descendant — the clean-completion path and the agent's
+    /// leftover-holding one ([`super::LeftoverPolicy::Keep`]) alike. Dropping it
+    /// would give up the only thing standing between those processes and outliving
+    /// the service, so the leak is the feature — do not "fix" it.
     pub(super) fn retain_after_completion(self) {
         let Some(job) = self.job else {
             return;
