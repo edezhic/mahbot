@@ -405,15 +405,20 @@ pub(crate) struct ReadonlyRows {
     pub truncated: bool,
 }
 
-/// Message prefix of a known Turso quick_check false positive.
+/// Message prefix of a Turso quick_check false positive, kept as a narrow
+/// exact-message guard.
 ///
-/// Turso's FTS keeps tantivy chunks in an internal backing index while the
-/// dir table stays empty, so the index-cardinality comparison always
-/// mismatches once the index has content (upstream tursodatabase/turso#7611,
-/// unfixed through 0.7.x). Only this exact count-mismatch message is masked;
-/// other messages naming the same internal index (missing/non-unique entries)
-/// signal real corruption and stay reported. Re-check if upstream lands a fix
-/// or renames internals.
+/// Turso's FTS keeps tantivy chunks in an internal backing index while the dir
+/// table stays empty, so the index-cardinality comparison mismatched on every
+/// populated index (upstream tursodatabase/turso#7611, reported against 0.7.x,
+/// still open). Re-checked on the 0.8.0 upgrade: upstream now skips that
+/// comparison for its own backing-btree indexes (the skip landed in 0.8.0-pre.8
+/// and is in the engine we ship), so the row is not emitted at all and this
+/// mask is currently a no-op. It stays because it is exact and one-directional
+/// — only this count-mismatch message is masked, other messages naming the same
+/// internal index (missing/non-unique entries) signal real corruption and stay
+/// reported, and the never-REINDEX-the-FTS guard below leans on the same
+/// prefix.
 const KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE: &str =
     "wrong # of entries in index __turso_internal_fts_dir_";
 
@@ -4792,9 +4797,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ft, 5, "FTS table data must survive the rebuild");
-        // The rebuilt FTS dir must answer MATCH queries — quick_check masks
-        // the __turso_internal_fts_dir_ count row for a broken index too, so
-        // the MATCH assertion is the only check that pins the rebuild.
+        // The rebuilt FTS dir must answer MATCH queries — quick_check does not
+        // pin it (the engine skips the cardinality comparison for its own
+        // backing-btree indexes), so the MATCH assertion is the only check that
+        // pins the rebuild.
         let matched: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM ft WHERE title MATCH 'title'",

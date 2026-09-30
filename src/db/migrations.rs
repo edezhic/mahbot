@@ -44,9 +44,11 @@
 //! retired job rows, since a rename would collide on the per-ticket unique
 //! index, and the retired→retired chronicle hops, which never happened), and
 //! `45`, which invalidates the stored per-workspace lifecycle descriptions
-//! that still name a retired stage.
+//! that still name a retired stage. The tail's index rebuild is `46`, which
+//! drops and recreates the ticket-title FTS index in the engine's 0.8.0
+//! on-disk layout (see [`REBUILD_TICKET_TITLE_FTS_INDEX`]).
 //!
-//! Future schema changes resume the chain at id `46` with monotonically
+//! Future schema changes resume the chain at id `47` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -532,6 +534,27 @@ UPDATE tickets SET phase = 'verification' WHERE phase IN ('in_review', 'in_qa');
 UPDATE ticket_chronicle SET source_phase = 'verification' WHERE source_phase IN ('in_review', 'in_qa');\
 UPDATE ticket_chronicle SET target_phase = 'verification' WHERE target_phase IN ('in_review', 'in_qa');";
 
+/// Catalog `46`: rebuild the ticket-title FTS index in the engine's 0.8.0
+/// on-disk layout. A no-op on stores that never had it (a fresh install's
+/// baseline already created it) and a one-shot rebuild on every store that
+/// did.
+///
+/// Turso 0.8.0's FTS rewrite added two document-identity fast fields to every
+/// segment without bumping the storage format number, so an index written by
+/// an earlier engine is not refused at open — it fails the moment a segment
+/// carrying it is read, and only some operations touch that path (search can
+/// break while the rest of the store works). `CREATE INDEX IF NOT EXISTS`
+/// alone could not fix it: it returns before touching an index that already
+/// exists, so the rebuild has to DROP first. The DDL is repeated from
+/// [`BASELINE_CORE_SCHEMA`] by design — the catalog is the only place that
+/// defines schema, and a `CREATE` that diverged from the baseline would leave
+/// the store's `sqlite_master` text changed. Running inside the entry's
+/// transaction makes the drop and the recreate atomic: a failed rebuild rolls
+/// the drop back and the boot is refused with the index still intact.
+const REBUILD_TICKET_TITLE_FTS_INDEX: &str = "\
+DROP INDEX IF EXISTS idx_tickets_title_fts; \
+CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets USING fts (title) WITH (tokenizer = 'ngram');";
+
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
 /// Entries `24`–`26` are the consolidated current-shape baseline; entries
@@ -582,6 +605,8 @@ UPDATE ticket_chronicle SET target_phase = 'verification' WHERE target_phase IN 
 /// - `45` invalidates the stored per-workspace lifecycle descriptions in
 ///   `workspace_contexts` that still name a retired stage, so no agent is
 ///   handed the retired two-stage arrangement.
+/// - `46` rebuilds the ticket-title FTS index in the engine's 0.8.0 on-disk
+///   layout (see [`REBUILD_TICKET_TITLE_FTS_INDEX`]).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -692,6 +717,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "45",
         target: TargetDb::Core,
         body: MigrationBody::Rust(drop_retired_lifecycle_descriptions),
+    },
+    Migration {
+        id: "46",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(REBUILD_TICKET_TITLE_FTS_INDEX),
     },
 ];
 
@@ -2548,10 +2578,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             applied,
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-                "40", "41", "42", "43", "44", "45"
+                "40", "41", "42", "43", "44", "45", "46"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–45 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–46 tail exactly"
         );
     }
 
@@ -2817,7 +2847,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`45`) as a
+    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`46`) as a
     /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
     /// column upfill, the delta-28 `jobs.caller_agent_id` /
     /// `session_metadata.created_at` column upfills (plus the delta-28
@@ -2832,9 +2862,12 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `command`) —
     /// plus the delta-36 data rewrite, which detaches the seeded guest from
     /// `users.selected_workspace` (row counts unchanged; the snapshot compares
-    /// only counts, chat content and tickets). All asserted explicitly. This
-    /// also proves Turso honors `IF NOT EXISTS` on the FTS index when the
-    /// baseline re-runs it.
+    /// only counts, chat content and tickets). All asserted explicitly. The
+    /// entry-46 FTS rebuild is invisible to the snapshot by construction (the
+    /// index keeps its name and DDL text and the internal backing objects are
+    /// excluded), so this also proves Turso honors `IF NOT EXISTS` on the FTS
+    /// index when the baseline re-runs it and that dropping and recreating the
+    /// index leaves the rest of the store alone.
     ///
     /// The stage-merge tail (`44`/`45`) is a no-op here too: the seeded rows
     /// name none of the retired stages, so no job is deleted, no phase is
@@ -2865,7 +2898,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40", "41", "42", "43", "44", "45",
+            "40", "41", "42", "43", "44", "45", "46",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -2874,7 +2907,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..45"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..46"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -3179,7 +3212,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40", "41", "42", "43", "44", "45",
+            "40", "41", "42", "43", "44", "45", "46",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3188,7 +3221,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..45"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..46"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
