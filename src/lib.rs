@@ -767,7 +767,8 @@ pub struct Agent {
     workspace: Arc<crate::Workspace>,
     /// Agent-owned tool set.
     tools: Vec<Box<dyn crate::Tool>>,
-    /// Chrome sessions this run opened — released when the run ends.
+    /// Chrome sessions this run opened — closed through the browser's own
+    /// extension when the run ends.
     chrome_sessions: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
     /// Cached tool specs — computed once from `tools` at construction time.
     pub(crate) tool_specs: Vec<ToolSpec>,

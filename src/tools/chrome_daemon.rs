@@ -26,13 +26,12 @@
 //! Verified tab-sweep: mahbot-owned session tab groups (`link-enricher-*`) are
 //! closed through the CLI and verified by round-over-round re-enumeration. A
 //! bare `session stop` cannot settle them: a group can hold tabs the session
-//! ADOPTED, which stop never closes and never reports (the ended-run release in
-//! [`crate::tools::chrome_release`] relies on stop only for tabs its run itself
-//! CREATED), and this file's own stop (`stop_session_daemon`) is bounded by
-//! `CLI_TIMEOUT` — which expires as the daemon's shutdown grace does, so the
-//! reclaim that follows never runs and a scratch tab it misses is orphaned
-//! forever (no other mechanism ever reclaims it). What a stop proves and what it
-//! costs is stated by the live-verified behaviours below.
+//! ADOPTED, which stop never closes and never reports, and this file's own stop
+//! (`stop_session_daemon`) is bounded by `CLI_TIMEOUT` — which expires as the
+//! daemon's shutdown grace does, so the reclaim that follows never runs and a
+//! scratch tab it misses is orphaned forever (no other mechanism ever reclaims
+//! it). What a stop proves and what it costs is stated by the live-verified
+//! behaviours below.
 //!
 //! ## Readiness and the pre-action gate
 //!
@@ -85,8 +84,8 @@
 //!
 //! A session that stops answering is RECOVERED on every path, never merely
 //! hinted at: the interactive tool's fail-fast and timeout paths, the `mahbot
-//! chrome` CLI's action verbs and their timeout path, the ended-run release, and
-//! the daemon-side session calls. [`recover_unresponsive_session`] records the
+//! chrome` CLI's action verbs and their timeout path, and the daemon-side session
+//! calls. [`recover_unresponsive_session`] records the
 //! wedge under the same `DaemonWedge` classification the fail-fast path uses —
 //! which wakes the watchdog, so the BACKGROUND health path recovers too — and
 //! stops that session's daemon within the product's own bound, so the next call
@@ -228,7 +227,10 @@ enum ProbeFailure {
     /// auto-recovery launches the user's real Chrome (never a daemon restart).
     ChromeNotRunning,
     /// The session's tab lost its debugger attach (orphaned) — the daemon and
-    /// relay are up; only closing the tab by hand unblocks the session.
+    /// relay are up and only that session's tab is orphaned. The tab belongs to
+    /// the session: the product closes the session's tabs itself at run end (and
+    /// when the session is stopped/recovered), so nothing is left for the user;
+    /// the session cannot drive that tab again.
     UnreachableTab,
     /// The daemon socket hung or errored (daemon-side wedge).
     DaemonWedge,
@@ -790,9 +792,9 @@ async fn run_cli_json_opt(args: &[&str], session: Option<&str>) -> Result<Value,
         })
 }
 
-/// Why a bounded `--json` call carried no verdict — the distinction the ended-run
-/// release turns on ([`crate::tools::chrome_release`]): a session that stayed silent
-/// is a wedge candidate, while a call that never ran was never asked anything.
+/// Why a bounded `--json` call carried no verdict — the distinction every caller
+/// turns on: a call that never produced a child of ours was never asked anything,
+/// while one killed at the product's own bound stayed silent.
 #[derive(Debug)]
 pub(crate) enum NoVerdict {
     /// chrome-use answered with a structured error — its own text, for a caller
@@ -805,7 +807,8 @@ pub(crate) enum NoVerdict {
     /// `SpawnFailure` — so nothing was asked of the session.
     SpawnFailure,
     /// The child's answer carried no readable verdict: bytes the envelope contract
-    /// cannot parse, or a failure envelope that named no error.
+    /// cannot parse, a failure envelope that named no error, or an envelope whose
+    /// verdict is not `true` and which named no error either.
     Unreadable,
 }
 
@@ -1394,8 +1397,10 @@ pub(crate) enum ExtensionState {
 /// successful envelope is shape-uncertain (old CLI, or a CLI that omits the key
 /// for other reasons) — never claim the unfixable absent cause from it; it
 /// fails open through the transient-relay path as `Unknown`. A FAILED status
-/// command also yields `Unknown` (see [`extension_state`]).
-fn extension_state_from(status: &Value) -> ExtensionState {
+/// command also yields `Unknown` (see [`extension_state`]). Shared with the
+/// run-end release's own door check (`crate::tools::chrome_tabs`), so the
+/// absence rule has one home.
+pub(crate) fn extension_state_from(status: &Value) -> ExtensionState {
     match status.get("data").and_then(|d| d.get("chromeExtension")) {
         // A missing key on a SUCCESSFUL envelope is shape-uncertain (old CLI, or a
         // CLI that omits the key for other reasons) — never claim the unfixable
@@ -1562,31 +1567,32 @@ struct SweepTab {
 //   installed CLI, 1 s before leeguooooo/chrome-use#192), then SIGKILLs. That
 //   shutdown close is best-effort and NOT proof of anything. What follows it IS:
 //   chrome-use then reconnects to the browser endpoint and reclaims the session's
-//   PERSISTED created-tab ownership record under its own 20 s timeout — ≈28 s end
-//   to end on the installed CLI, the whole of what one stop may legitimately spend,
-//   which is the budget the ended-run release's attempt bound has to clear (this
-//   file's `CLI_TIMEOUT` deliberately fails fast instead) — dropping a tab's id only
-//   when its close was acknowledged, and exits non-zero while the record still holds
-//   anything. So a successful stop proves that every tab the session CREATED is
-//   gone, and proves nothing for a tab the session ADOPTED (stop never closes
-//   adopted tabs) — which is why the sweep verifies by round-over-round
-//   re-enumeration rather than by the stop's own exit code.
+//   PERSISTED created-tab ownership record under its own 20 s timeout — ≈28 s end to
+//   end on the installed CLI, the whole of what one stop may legitimately spend (which
+//   is why the ended-run release gives a stop that much of its own pass budget before
+//   its stop-by-name fallback, and why a stop it had to cut short there concludes
+//   nothing) — dropping a tab's id only when its close was acknowledged, and exits
+//   non-zero while the record still holds anything. So a successful stop proves that
+//   every tab the session CREATED is gone, and proves nothing for a tab the session
+//   ADOPTED (stop never closes adopted tabs) — which is why the sweep verifies by
+//   round-over-round re-enumeration rather than by the stop's own exit code.
 //
 // Residual limits (accepted): the sweep's scratch tab is about:blank and the
 // extension refuses to re-attach `about:` URLs (its `eligible()`/`SKIP_URL`
 // filter). An orphan that lost its attach while the daemon kept a stale
 // binding (relay blip, kill during an outage) fails every command with the
-// unreachable-tab signatures — the sweep logs the 'close it by hand in
-// Chrome' signal and keeps retrying; live orphans whose attach survived
-// heal automatically. An orphan the extension fully dropped (Chrome
+// unreachable-tab signatures — the sweep logs the unreachable-tab signal and
+// keeps retrying; live orphans whose attach survived heal automatically. An
+// orphan the extension fully dropped (Chrome
 // service-worker restart unmarks ineligible about: tabs and never re-attaches
 // them; the relay's group is fed only by attach announcements) is invisible
 // to every CLI path: `tab list` succeeds with only the fresh scratch and the
 // sweep converges to Clean with no log. That case is undetectable by design —
-// no CLI path can enumerate a tab the extension no longer announces; it stays
-// in Chrome until closed by hand. Dead-daemon link-enricher orphans are
-// similarly not enumerable (their session names are per-message and the
-// daemon inventory drops dead pids) — documented residual.
+// no CLI path can enumerate a tab the extension no longer announces. An
+// `agent-tab-*` orphan of that shape is still reached by the run-end release,
+// which enumerates the live tab groups by title instead: it closes what the
+// extension owns there and reports what it does not. A link-enricher orphan
+// stays in Chrome until closed by hand.
 /// Close every tab in a mahbot-owned session's tab group except the sweep's own
 /// scratch, verifying closure by round-over-round re-enumeration. Shared by the
 /// startup sweep and the link-enricher per-fetch close, which keep to mahbot-owned
@@ -1700,9 +1706,11 @@ pub(crate) fn is_mahbot_session_name(name: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SweepWarn {
     /// Leftover tab the daemon can no longer re-drive (stale binding on an
-    /// about:blank tab the extension never re-attaches) — manual intervention
-    /// required. Only fires while a command still errors; an orphan the
-    /// extension fully dropped is invisible (see the pinned-behaviors note).
+    /// about:blank tab the extension never re-attaches) — the tab belongs to the
+    /// session and is closed by the product when the session's run ends (or the
+    /// session itself is stopped), not by hand. Only fires while a command still
+    /// errors; an orphan the extension fully dropped is invisible (see the
+    /// pinned-behaviors note).
     UnreachableTab,
     /// Relay/daemon unreachable mid-sweep; retried next sweep/startup.
     CannotEnumerate,
@@ -1728,8 +1736,9 @@ fn sweep_warn_transition(cause: SweepWarn) {
     match cause {
         SweepWarn::UnreachableTab => warn!(
             "tab sweep: a leftover tab is unreachable (the extension lost its debugger attach; \
-             about:blank tabs are never re-attached) — close the leftover tab in Chrome to \
-             unblock this session; the sweep keeps retrying"
+             about:blank tabs are never re-attached) — the tab belongs to the session and the \
+             product closes the session's tabs itself when the run ends (or the session is \
+             stopped); the sweep keeps retrying meanwhile"
         ),
         SweepWarn::CannotEnumerate => warn!(
             "tab sweep: cannot enumerate session tabs (relay/daemon unreachable or malformed \
@@ -1935,10 +1944,8 @@ fn note_session_wedge() {
 }
 
 /// Bounded `session stop` through an already-resolved binary — the session-level
-/// recovery every unresponsive-session path shares. The bound is the caller's:
-/// the daemon paths use [`SESSION_RECOVERY_TIMEOUT`], and the ended-run release
-/// runs this recovery only after an attempt that already had its own full
-/// budget and still did not answer, so it takes the same bound. A sweep that
+/// recovery the daemon's own unresponsive-session paths share, under a caller's
+/// own bound ([`SESSION_RECOVERY_TIMEOUT`] for those paths). A sweep that
 /// recovers a wedged session therefore overshoots its own [`SWEEP_TOTAL_BUDGET`] by that
 /// bound — deliberately, because an unrecovered wedge is worse (the sweep is
 /// best-effort and self-healing).
@@ -2019,19 +2026,6 @@ pub(crate) async fn recover_unresponsive_session(session: &str) -> SessionRecove
     }
 }
 
-/// [`recover_unresponsive_session`] through a caller-resolved binary. The
-/// ended-run release resolves its own helper (its settings carry the test seam
-/// and the real path), so it must not reach for the product-wide resolution
-/// here — the same recovery, the same wedge record, the caller's own bound.
-pub(crate) async fn recover_unresponsive_session_via(
-    path: &Path,
-    session: &str,
-    bound: Duration,
-) -> SessionRecovery {
-    note_session_wedge();
-    session_stop_via(path, session, bound).await
-}
-
 fn set_health(outcome: ProbeOutcome) {
     let mut h = health().lock().unwrap_poison();
     h.apply_outcome(outcome, Instant::now(), true);
@@ -2050,7 +2044,7 @@ pub(crate) fn is_advertised() -> bool {
 /// Mark the daemon unhealthy immediately (fail-fast path) with the cause the
 /// error text points to, and wake the watchdog so recovery starts without
 /// waiting for the next interval. Unreachable-tab errors never reach this path
-/// — the chrome tool's fail-fast guard bails with hand-close guidance first
+/// — the chrome tool's fail-fast guard bails with unreachable-tab guidance first
 /// (recovery cannot fix a Chrome-side orphan, so none is attempted).
 pub(crate) fn note_unhealthy(error: &str) {
     // Same classification as the watchdog's health evaluation — the two
@@ -2116,8 +2110,9 @@ pub(crate) fn daemon_down_message() -> String {
         },
         Some(ProbeFailure::UnreachableTab) => {
             "A browser tab the session was driving is unreachable (the extension lost its \
-             debugger attach; about:blank tabs are never re-attached) — close the leftover \
-             tab in Chrome to unblock the session."
+             debugger attach; about:blank tabs are never re-attached). The tab belongs to the \
+             session and the product closes the session's tabs itself when the run ends (or \
+             the session is stopped/recovered), so no manual step is needed."
         }
         Some(ProbeFailure::DaemonWedge) | None => "The chrome daemon is down or unresponsive.",
     };
@@ -2225,10 +2220,8 @@ pub(crate) async fn health_after_call_timeout(session: &str) -> Option<String> {
     // mahbot-side bound cuts the CLI off before its own ~152 s retry loop can
     // surface the daemon-unavailable text, so no answer from any child of ours —
     // none spawned for it, or killed at that bound — means the session's daemon
-    // stopped answering. The ended-run release classifies the same silence the other
-    // way round (`is_wedged_release_failure`), where nothing was ever asked of the
-    // session: here a host that can spawn no chrome-use at all also has no browser
-    // to drive, so the daemon guidance is what the caller needs either way.
+    // stopped answering. Here a host that can spawn no chrome-use at all also has no
+    // browser to drive, so the daemon guidance is what the caller needs either way.
     let probe = match cli_path() {
         Some(path) => run_cli_bounded_at(&path, &["get", "url"], Some(session), CLI_TIMEOUT).await,
         None => CliRun::SpawnFailure,
@@ -2876,8 +2869,9 @@ fn report_cause(failure: ProbeFailure) {
         }
         ProbeFailure::UnreachableTab => warn!(
             "a browser tab the session was driving is unreachable (the extension lost its \
-             debugger attach; about:blank tabs are never re-attached) — close the leftover \
-             tab in Chrome to unblock the session"
+             debugger attach; about:blank tabs are never re-attached). The tab belongs to the \
+             session and the product closes the session's tabs itself when the run ends (or \
+             the session is stopped)"
         ),
         // Informational: the restart it announces is automatic and this cause is
         // deduplicated per transition, so a self-cleared wedge should not sit in

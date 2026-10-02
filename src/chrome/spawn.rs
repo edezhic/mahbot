@@ -147,7 +147,7 @@ pub(crate) fn ensure_chrome_env(cmd: &mut Command) {
     }
     // 5-minute idle timeout — the chrome-use daemon still stops after 5 idle
     // minutes, but chrome-use ≥1.5.101 PRESERVES external Chrome tabs on idle
-    // (only an explicit close/session stop cleans them up), so mahbot releases
+    // (only an explicit close/session stop cleans them up), so mahbot closes
     // the sessions a run opened when it ends, via `crate::tools::chrome_release`.
     cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", "300000");
     // Enable human-like interaction speed for bot-detection avoidance.

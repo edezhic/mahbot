@@ -177,10 +177,12 @@ const fn true_val() -> bool {
 /// lives under `agent-tab-`: that keeps it out of the daemon orphan sweep, and
 /// inside the protected-session set of the `mahbot chrome` frontend, which refuses
 /// a bare `session stop` on one without `--force` — so the prefix must not change.
-/// An `agent-tab-*` session belongs to the run that opened it: mahbot's own sweeps
-/// leave every one of them alone, and that run's release is their closer (the
-/// `--force` frontend verb above is the deliberate exception).
-const AGENT_TAB_PREFIX: &str = "agent-tab-";
+/// An `agent-tab-*` session belongs to the run that opened it: the run's own release
+/// is its closer, and until that run is over the sweeps leave it alone — the
+/// protected-session verb above and the run-end release's reclaim sweep (which closes
+/// only a group no live run, no record and no resumable job claims) are the two
+/// deliberate exceptions.
+pub(crate) const AGENT_TAB_PREFIX: &str = "agent-tab-";
 
 /// Logical name of the per-run default session.
 const DEFAULT_TAB: &str = "default";
@@ -208,12 +210,35 @@ const NO_WORKSPACE: &str = "";
 /// name it was opened under is the one the run recorded.
 ///
 /// The price of deriving the name rather than minting it: a session opened under a
-/// scheme no agent id derives from is addressable by no release, so nothing can
-/// reclaim it — the cost paid by the runs in flight when per-boot random names were
-/// replaced.
-fn run_session_namespace(agent_id: &str) -> String {
+/// scheme no agent id derives from is addressable by no run's release — the cost paid
+/// by the runs in flight when per-boot random names were replaced. Its tabs are still
+/// reclaimable, because the release sweep enumerates the live `agent-tab-*` titles and
+/// derives the namespace from the name ([`session_namespace`]); what is lost for such a
+/// name is only the run it came from.
+pub(crate) fn run_session_namespace(agent_id: &str) -> String {
     let hex = crate::util::hex_string(&Sha256::digest(agent_id.as_bytes()));
     format!("{AGENT_TAB_PREFIX}{}-", &hex[..12])
+}
+
+/// The namespace a physical session name carries back — the inverse of
+/// [`run_session_namespace`], for a name read out of the browser rather than derived
+/// from an agent id. A name that is not one of this product's run sessions carries no
+/// namespace and names only itself, so the one naming scheme stays in one place.
+pub(crate) fn session_namespace(name: &str) -> &str {
+    let Some(key) = name
+        .strip_prefix(AGENT_TAB_PREFIX)
+        .and_then(|rest| rest.split_once('-'))
+        .map(|(key, _)| key)
+    else {
+        return name;
+    };
+    if key.is_empty() {
+        name
+    } else {
+        // The separator found by `split_once` is the byte at this end.
+        let namespace_len = AGENT_TAB_PREFIX.len() + key.len() + 1;
+        &name[..namespace_len]
+    }
 }
 
 /// Every chrome session name ONE agent run's chrome tooling opened, recorded so
@@ -379,10 +404,10 @@ impl ChromeTool {
     ///
     /// Falls back to `textContent` if the JavaScript eval fails.
     ///
-    /// The tab is left open — an agent run's tab is kept until the run ends (its
-    /// release closes it); the per-tab lock is held for the full duration
-    /// (navigate + extract) so concurrent callers targeting the same tab are
-    /// serialized consistently.
+    /// The tab stays open for the run — the product closes the run's tabs itself
+    /// when the run ends, retrying until the browser says they are gone; the
+    /// per-tab lock is held for the full duration (navigate + extract) so
+    /// concurrent callers targeting the same tab are serialized consistently.
     pub async fn fetch_page_text(&self, url: &str, tab: &str) -> anyhow::Result<String> {
         crate::chrome::validate_url(url)?;
 
@@ -820,10 +845,11 @@ impl ChromeTool {
     /// the actionable guidance immediately — the CLI already retried
     /// internally, so adding more retries would only burn more time.
     /// Unreachable-tab errors are their own state: the daemon and relay are up,
-    /// only the session's tab is orphaned — fail fast with hand-close guidance
-    /// and leave health untouched (recovery cannot fix a Chrome-side orphan,
-    /// and hiding the daemon would block other sessions until the next healthy
-    /// probe).
+    /// only the session's tab is orphaned — fail fast with the unreachable-tab
+    /// guidance (the tab is the product's to close, at run end or on recovery,
+    /// not the agent's to touch) and leave health untouched (recovery cannot fix
+    /// a Chrome-side orphan, and hiding the daemon would block other sessions
+    /// until the next healthy probe).
     ///
     /// A SESSION-unresponsive signature is recovered instead of only marked
     /// down: [`super::chrome_daemon::recover_unresponsive_session`] records the
@@ -1321,13 +1347,19 @@ impl Tool for ChromeTool {
                 "tab": {
                     "type": "string",
                     "description": "Logical name for this chrome session. \
-                     Missing or empty uses the run's default tab, released when \
-                     your run ends. Sessions live in a private per-run namespace, \
-                     so a name here never addresses another run's session — and a \
-                     run re-driven under its own identity re-attaches the names it \
-                     was working with. Use an explicit name (e.g. \"docs\", \
-                     \"github\") only to keep multiple pages open simultaneously. \
-                     Same tab = serialized operations on that page."
+                     Missing or empty uses the run's default tab — the product \
+                     closes the run's tabs itself when the run ends, retrying \
+                     until the browser says they are gone; a leftover it \
+                     cannot close, and a host-level gap it cannot decide from, \
+                     are reported on its Issues view rather than left as a \
+                     cleanup for the agent or the owner. \
+                     Sessions live in a private \
+                     per-run namespace, so a name here never addresses another \
+                     run's session — and a run re-driven under its own identity \
+                     re-attaches the names it was working with. Use an explicit \
+                     name (e.g. \"docs\", \"github\") only to keep multiple pages \
+                     open simultaneously. Same tab = serialized operations on \
+                     that page."
                 }
             },
             "required": ["action", "tab"]
@@ -3121,14 +3153,18 @@ mod tests {
         // Distinct logical names never collapse into one session even when
         // the sanitizer maps them to the same safe string.
         assert_ne!(a.resolve_session("a b"), a.resolve_session("a/b"));
+        // The namespace a physical name carries back is the one it was built
+        // with: the scheme is read in both directions, never re-derived.
+        assert_eq!(session_namespace(&physical), run_session_namespace("run-a"));
+        assert_eq!(session_namespace("link-enricher-3"), "link-enricher-3");
     }
 
     #[test]
     fn agent_sessions_are_never_orphan_swept() {
         // The namespace keeps the protected `agent-tab-` root, so the
         // daemon's orphan-protection sweep can never close a live run's
-        // session; the run's own release (verified `session stop`) reclaims
-        // them, not this sweep.
+        // session; the run's own release (through the browser's extension)
+        // reclaims them, not this sweep.
         let tool = ChromeTool::new(ChromeRunSessions::for_run("run-namespace"));
         for tab in [DEFAULT_TAB, "docs"] {
             assert!(!crate::tools::chrome_daemon::is_mahbot_session_name(
@@ -3171,9 +3207,9 @@ mod tests {
         // Pristine start (a sibling health test may have left a Down fixture).
         crate::tools::chrome_daemon::reset_health();
         // An orphaned-tab error (even envelope-wrapped with the auto-connect
-        // and daemon-wrapper text) fails fast with hand-close guidance but
-        // does NOT mark the daemon unhealthy — the relay and daemon are up, so
-        // recovery must not wake for it.
+        // and daemon-wrapper text) fails fast with the unreachable-tab guidance
+        // but does NOT mark the daemon unhealthy — the relay and daemon are up,
+        // so recovery must not wake for it.
         let err = ChromeTool::fail_fast_if_daemon_down(
             "Auto-launch failed: Could not drive your Chrome through the ab-connect extension. \
              The tab this session was driving can no longer be resolved (it was closed, or a \
@@ -3184,8 +3220,9 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            err.to_string().contains("close the leftover tab in Chrome"),
-            "expected hand-close guidance, got: {err}"
+            err.to_string()
+                .contains("the product closes a session's tabs itself"),
+            "expected the tabs left to the product, got: {err}"
         );
         assert!(crate::tools::chrome_daemon::is_advertised());
         // Daemon-unavailable signature → actionable guidance, daemon marked

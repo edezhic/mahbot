@@ -992,51 +992,46 @@ const SECOND_COPY_REMAINS: UnfinishedStep = UnfinishedStep {
     stops_update: false,
 };
 
-/// Record a partly-finished update durably, and tell the admin about it once — when
-/// it is not already being told about the same failing step by the ordinary failure
-/// line (see [`UnfinishedStep::stops_update`]).
+/// Record a partly-finished update durably, and tell the admin about it once — when this
+/// call is what recorded the row, and when the ordinary failure line is not already telling
+/// him about the same failing step (see [`UnfinishedStep::stops_update`]).
 ///
-/// The record is written straight into the logs store — which is what the
-/// product's own issues view reads — because the tracing writer is asynchronous
-/// and the update path calls `exit(0)`, so a `tracing::warn!` here would be lost
-/// with the process. It names only the step that failed, never a path and never a
-/// value read from the owner or his environment, and a reason the store already
-/// holds is not written again — across restarts, which is where the repeat would
-/// otherwise come from. A read of what the store already holds that fails is no
-/// answer at all: the step is recorded regardless, because a possible second row for
-/// one reason is better than silence about it.
+/// The record is the shared Issues-view one ([`crate::logs::record_issue_once`]),
+/// which writes straight into the logs store — the update path calls `exit(0)`, so a
+/// `tracing::warn!` alone would be lost with the process — and never writes a reason
+/// the store already holds. It names only the step that failed, never a path and
+/// never a value read from the owner or his environment.
+///
+/// Which shape warns: a fact no row carries
+/// ([`crate::logs::IssueWrite::NotRecorded`] — no store, or a write the shared writer warned
+/// about itself) is warned here, because this path exits right after. Which shape notifies: only
+/// a row this call wrote ([`crate::logs::IssueWrite::Written`]). A reason the store already holds
+/// ([`crate::logs::IssueWrite::AlreadyRecorded`]) was told by the run that recorded it and earns
+/// no line here; the non-fatal steps below get their line only on the run that does record them.
 async fn record_update_unfinished(admin_target: Option<&str>, step: UnfinishedStep) {
-    let Some(store) = crate::logs::LOG_STORE.get() else {
-        warn!(
-            reason = step.reason,
-            "Logs store is not up — an unfinished update cannot be recorded"
-        );
-        return;
-    };
-    match store
-        .has_reason(UPDATE_UNFINISHED_MESSAGE, step.reason)
-        .await
-    {
-        // This reason has been recorded before: one fact, told once.
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(e) => warn!(
-            error = %e,
-            "Could not read whether this unfinished update was already recorded — recording it again"
-        ),
-    }
-    let entry = crate::logs::LogEntry {
-        timestamp: crate::db::now(),
-        level: "WARN".to_string(),
-        target: UPDATE_UNFINISHED_TARGET.to_string(),
-        message: UPDATE_UNFINISHED_MESSAGE.to_string(),
-        fields: serde_json::json!({ "reason": step.reason }),
-        ..Default::default()
-    };
-    // The row is the durable record of what happened here.
-    if let Err(e) = store.insert_batch(&[entry]).await {
-        warn!(error = %e, "Could not record an unfinished update");
-        return;
+    let recorded = crate::logs::record_issue_once(
+        UPDATE_UNFINISHED_MESSAGE,
+        step.reason,
+        UPDATE_UNFINISHED_TARGET,
+        serde_json::json!({}),
+    )
+    .await;
+    match recorded {
+        // This call is what recorded the row: fall through and let the non-fatal steps below
+        // tell the admin, since the ordinary failure line does not mention them.
+        crate::logs::IssueWrite::Written => {}
+        // A reason the store already holds was told by the run that recorded it.
+        crate::logs::IssueWrite::AlreadyRecorded => return,
+        // No row carries the fact, and this path exits right after: the process's own output is
+        // the last place it can be seen. The shared writer's warning is about the store, not
+        // about what was lost, so this line names the fact itself.
+        crate::logs::IssueWrite::NotRecorded => {
+            warn!(
+                reason = step.reason,
+                "an unfinished update could not be recorded in the Issues view"
+            );
+            return;
+        }
     }
     // The row above is the whole of what a fatal step adds: the ordinary failure
     // line already tells him which step failed.

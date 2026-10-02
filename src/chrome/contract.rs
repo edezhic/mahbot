@@ -515,14 +515,39 @@ pub(crate) fn is_daemon_unavailable_code(code: Option<&str>) -> bool {
     matches!(code, Some("browser_not_launched"))
 }
 
+/// Structural failures that provably never reached the browser — the mirror of the
+/// vendor's own structural error classes: the relay signature, the daemon
+/// signature (which already folds in the session-wedge texts, see
+/// [`is_daemon_unavailable_error`]), "browser not launched", "requires
+/// ab-connect", "only works over the extension relay", "event stream closed",
+/// "command timed out", "stale target" and "target closed". A caller uses this to
+/// keep such a failure from being read as the browser answering about the work it
+/// was asked to do; an extension ownership refusal relayed in the same error field
+/// is NOT one of these — that IS the browser's own answer, about a tab.
+pub(crate) fn unreached_browser_error(msg: &str) -> bool {
+    if is_relay_unavailable_error(msg) || is_daemon_unavailable_error(msg) {
+        return true;
+    }
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("browser not launched")
+        || lower.contains("requires ab-connect")
+        || lower.contains("only works over the extension relay")
+        || lower.contains("event stream closed")
+        || lower.contains("command timed out")
+        || lower.contains("stale target")
+        || lower.contains("target closed")
+}
+
 /// Error signatures of a leftover tab the daemon can no longer re-drive: its
 /// binding went stale (relay blip, kill during an outage) while the extension
-/// keeps the attach. The extension never re-attaches `about:` URLs, so only
-/// closing the tab by hand unblocks the session. An orphan the extension fully
-/// dropped (service-worker restart) never produces these. Real chrome calls
-/// hitting this state fail fast with the same guidance without marking the
-/// daemon unhealthy — see [`unreachable_tab_message`]. The "or the relay lost
-/// it" variant is a permanent orphan (the relay dropped the attach);
+/// keeps the attach. The extension never re-attaches `about:` URLs, so nothing
+/// re-drives that tab — its session has to move to another name, while the tab
+/// itself is the session's and the product closes it (at run end, or when the
+/// session is stopped/recovered), never the reader by hand. An orphan the
+/// extension fully dropped (service-worker restart) never produces these. Real
+/// chrome calls hitting this state fail fast with the same guidance without
+/// marking the daemon unhealthy — see [`unreachable_tab_message`]. The "or the
+/// relay lost it" variant is a permanent orphan (the relay dropped the attach);
 /// "navigated across processes" is a recoverable OAuth/SSO retarget and must
 /// stay OUT.
 pub(crate) fn is_unreachable_tab_error(msg: &str) -> bool {
@@ -538,13 +563,17 @@ pub(crate) fn is_unreachable_tab_error(msg: &str) -> bool {
 
 /// Actionable error for a real call that hit an orphaned tab: the daemon and
 /// relay are up, only the session's tab is unreachable (the extension never
-/// re-attaches about:blank tabs). Fail fast with hand-close guidance and do
-/// NOT mark the daemon unhealthy — recovery cannot fix a Chrome-side orphan.
+/// re-attaches about:blank tabs). Fail fast without marking the daemon
+/// unhealthy — recovery cannot fix a Chrome-side orphan — and without asking
+/// anyone to close it: the tab belongs to the session, which the product closes
+/// itself (at run end, and when a wedged session is recovered).
 pub(crate) fn unreachable_tab_message(error: &str) -> String {
     format!(
         "{error}. The chrome-use extension lost its debugger attach to this tab and never \
-         re-attaches about:blank tabs — close the leftover tab in Chrome to unblock this \
-         session (the chrome daemon itself is healthy)."
+         re-attaches about:blank tabs, so this session cannot drive it again. The tab is \
+         this session's, and the product closes a session's tabs itself — at run end, and \
+         when a wedged session is recovered — so leave it alone; use another `tab` name \
+         for a page this session can drive (the chrome daemon itself is healthy)."
     )
 }
 
@@ -1306,6 +1335,32 @@ mod tests {
         ));
         let m = unreachable_tab_message("this session owns no resolvable tab");
         assert!(m.ends_with("the chrome daemon itself is healthy)."));
-        assert!(m.contains("close the leftover tab in Chrome"));
+        assert!(m.contains("the product closes a session's tabs itself"));
+        assert!(!m.contains("close the leftover tab in Chrome"));
+    }
+
+    #[test]
+    fn unreached_browser_error_covers_structural_classes_but_not_a_refusal() {
+        for msg in [
+            "relay isn't connected",
+            "daemon may be busy or unresponsive",
+            "session unresponsive: no response within 45s",
+            "Browser not launched",
+            "this action requires ab-connect",
+            "tabs.remove only works over the extension relay",
+            "event stream closed before the call was answered",
+            "command timed out after 30000ms",
+            "stale target: the tab has moved",
+            "Target closed",
+        ] {
+            assert!(unreached_browser_error(msg), "should detect: {msg}");
+        }
+        // The extension's own ownership refusal arrives in the same error field, and
+        // it IS the browser answering — never an unreached class.
+        assert!(!unreached_browser_error(
+            "call: tabs.remove refused — tab 7 is not owned by this relay \
+             (agent-created or adopted tabs only)"
+        ));
+        assert!(!unreached_browser_error("Element not found"));
     }
 }

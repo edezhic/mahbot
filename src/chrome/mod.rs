@@ -132,8 +132,23 @@ pub(crate) const CHROME_USE_DECLARED_BUDGET: Duration =
 /// ≈28 s end to end the live-verified behaviours of [`crate::tools::chrome_daemon`]
 /// state. About twice that, so the estimate drifting with a chrome-use release
 /// cannot charge a working stop as a failure. Shared by the CLI's stop verbs and
-/// the ended-run release ([`crate::tools::chrome_release`]) so a working stop is
-/// never cut off early on one path and not the other.
+/// the ended-run release's own pass budget ([`crate::tools::chrome_release`]'s
+/// [`ATTEMPT_TIMEOUT`](crate::tools::chrome_release::ATTEMPT_TIMEOUT)), which holds
+/// it alongside one reserve for each phase of browser reads
+/// ([`crate::tools::chrome_tabs::READ_PHASE_RESERVE`] each). There the whole bound is
+/// reserved for the ended-run confirmation (`chrome_tabs::stop_budget`): a stop that
+/// pass can no longer hold in full is not spawned at all, its own bound is never cut,
+/// and the names such an unspawned stop would have covered stay retries for a later
+/// pass rather than being concluded by the reads, which only decide the names whose
+/// stops the pass held. The let-go stops take whatever the pass has left
+/// (`chrome_tabs::spawn_budget`) instead: [`release_own_session`]'s is the record-hygiene
+/// `--force` form — the ledger route is what closes the release module's own scratch group —
+/// and [`forget_settled_sessions`]' graceful stops are what close such a group, asking as many
+/// sessions to stop as the budget holds; the second charges only a stop that got the whole
+/// bound, so one this bound cut short is never read as a route that failed.
+///
+/// [`release_own_session`]: crate::tools::chrome_tabs::release_own_session
+/// [`forget_settled_sessions`]: crate::tools::chrome_tabs::forget_settled_sessions
 pub(crate) const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The relay self-heal chrome-use may run inside a call whose relay connection

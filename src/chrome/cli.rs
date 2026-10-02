@@ -2812,8 +2812,8 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
 /// evidence (the probe reads the current URL, it never navigates), so it
 /// re-classifies as Environment (rc 2), says plainly that the session stopped
 /// answering, and names the recovery. This verb is a diagnostic and stops
-/// nothing; the paths that ACT on the browser — the action verbs, the watchdog
-/// and the ended-run release — recover such a session themselves
+/// nothing; the paths that ACT on the browser — the action verbs and the watchdog
+/// — recover such a session themselves
 /// ([`recover_unresponsive_session`]), so its text also says the next action
 /// does it automatically. An honest non-wedge cause passes through unnamed.
 async fn session_status(name: &str) -> OutEnvelope {
@@ -3343,9 +3343,10 @@ mod tests {
             Some("relay isn't connected")
         );
 
-        // An orphaned-tab error still picks up its hand-close guidance here: it
-        // is the one remediation the envelope owns, because it is the one state
-        // nothing recovers.
+        // An orphaned-tab error still picks up its unreachable-tab guidance here:
+        // it is the one remediation the envelope owns, because it is the one state
+        // nothing recovers (the tab itself is the product's to close, never the
+        // agent's to touch).
         let env = StepFailure {
             kind: OutKind::Environment,
             message: "the tab this session was driving can no longer be resolved".to_string(),
@@ -3361,7 +3362,7 @@ mod tests {
             .and_then(Value::as_str)
             .expect("error present");
         assert!(
-            err.contains("close the leftover tab in Chrome"),
+            err.contains("the product closes a session's tabs itself"),
             "got: {err}"
         );
 

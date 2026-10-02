@@ -8,6 +8,7 @@ pub mod bun;
 pub mod chrome;
 pub mod chrome_daemon;
 pub mod chrome_release;
+pub(crate) mod chrome_tabs;
 // Computer-use tool (GUI observe/act). Only Linux offers it: on macOS the
 // capability is withdrawn and the implementation is kept compiled but dormant
 // and private there (see `computer/macos.rs`), so nothing in the product can

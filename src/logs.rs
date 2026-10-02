@@ -360,28 +360,143 @@ impl LogStore {
 /// Fail-open by design: a failed write never affects the call's result, and a
 /// process with no logs store at all (the `mahbot chrome` CLI dispatches before
 /// [`init_tracing`] ever runs, so [`LOG_STORE`] is unset there) writes nothing.
+/// A write that was attempted and failed is a `debug!` — the fact is lost either
+/// way, and the agent's own note on the call, which carries no less, is what the
+/// caller is shown.
 pub(crate) async fn record_stray_event(event: StrayEvent<'_>) {
     let Some(store) = LOG_STORE.get() else {
         return;
     };
     let (agent_id, agent_role) = crate::agent::tool_record_attribution();
+    let written = write_warn_row(
+        store,
+        LogEntry {
+            target: event.source.to_string(),
+            message: event.message.to_string(),
+            fields: serde_json::json!({
+                "detail": event.recipe,
+                "scope": event.scope,
+                "session": event.session,
+                "duration_ms": event.duration_ms,
+            }),
+            workspace: event.workspace.to_string(),
+            agent_id,
+            agent_role,
+            ..LogEntry::default()
+        },
+    )
+    .await;
+    if let Err(error) = written {
+        tracing::debug!(
+            %error,
+            target = %event.source,
+            "could not persist the leftover-process record"
+        );
+    }
+}
+
+/// What became of one fact the Issues view is owed ([`record_issue_once`]): a row's own
+/// outcome, the fact already being in the view, and the one way no row carries it.
+pub(crate) enum IssueWrite {
+    /// This call is what put the row in the store.
+    Written,
+    /// The store already held the very fact: nothing was written now, and a caller that tells
+    /// the owner about every row it writes has already had its turn.
+    AlreadyRecorded,
+    /// No row carries the fact: there is no logs store to write to (the `mahbot chrome` CLI
+    /// dispatches before [`init_tracing`] ever runs, so [`LOG_STORE`] is unset there), or the
+    /// write was attempted and failed ([`record_issue_once`] says what each caller does then).
+    NotRecorded,
+}
+
+/// Write one durable `WARN` row straight to the logs store — never through the tracing
+/// writer, which batches lines and may drop them. `WARN` is what the Issues view shows and
+/// what the retention pass keeps, so this is the one place a fact the product must not lose
+/// is made to outlive the process: [`record_stray_event`] and [`record_issue_once`] differ in
+/// what they carry, not in how.
+///
+/// Nothing is logged here: what a failed write means differs by caller — [`record_stray_event`]
+/// notes it at `debug!` because the agent's own answer already carries the fact, and
+/// [`record_issue_once`] warns, because its fact is what the Issues view is owed. Returns
+/// `Ok(())` when this call put the row in the store, `Err` with the store's own error text when
+/// the write was attempted and failed.
+async fn write_warn_row(store: &LogStore, entry: LogEntry) -> Result<(), String> {
     let entry = LogEntry {
         timestamp: crate::db::now(),
         level: "WARN".to_string(),
-        target: event.source.to_string(),
-        message: event.message.to_string(),
-        fields: serde_json::json!({
-            "detail": event.recipe,
-            "scope": event.scope,
-            "session": event.session,
-            "duration_ms": event.duration_ms,
-        }),
-        workspace: event.workspace.to_string(),
-        agent_id,
-        agent_role,
+        ..entry
     };
-    if let Err(e) = store.insert_batch(&[entry]).await {
-        tracing::debug!(error = %e, "could not persist the leftover-process record");
+    store
+        .insert_batch(&[entry])
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Record one durable row for the product's own Issues view, at most once for a
+/// `(message, reason)` pair: the row is written straight to the store (never
+/// through the tracing writer, which batches and can drop lines) at `WARN`, which
+/// the Issues view shows and the retention pass never reaps — so a repeat is a
+/// duplicate, not news. A store read that fails records anyway, and says so at `WARN`:
+/// the dedupe was skipped, so the row is written without it. Fail-open: no
+/// store (the `mahbot chrome` CLI dispatches before [`init_tracing`]) writes
+/// nothing.
+///
+/// `fields` is the row's `fields` JSON object; `reason` is written into it here, so
+/// the dedupe key and the stored row can never disagree. The row has no tool
+/// attribution (empty agent and workspace): it is written from a background task,
+/// not a tool call.
+///
+/// Reports what became of the fact ([`IssueWrite`]): [`IssueWrite::Written`] for the row this
+/// call made, [`IssueWrite::AlreadyRecorded`] for a reason the Issues view already held, and
+/// [`IssueWrite::NotRecorded`] for the one way no row carries it — no store at all, or a write
+/// that was attempted and failed. A caller holding its OWN de-dupe may mark the reason as told on
+/// [`IssueWrite::Written`] or [`IssueWrite::AlreadyRecorded`]; on a failed write this function
+/// warns with the store's own error text — a warning about the store, not about what was lost —
+/// and a caller whose process exits immediately after ([`crate::self_update`]) adds its own line
+/// naming the fact, so the two are deliberately complementary rather than a repeat.
+pub(crate) async fn record_issue_once(
+    message: &str,
+    reason: &str,
+    target: &str,
+    fields: serde_json::Value,
+) -> IssueWrite {
+    let Some(store) = LOG_STORE.get() else {
+        return IssueWrite::NotRecorded;
+    };
+    match store.has_reason(message, reason).await {
+        // This reason is already in the Issues view: one fact, told once.
+        Ok(true) => return IssueWrite::AlreadyRecorded,
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not read whether this issue was already recorded — recording it again"
+        ),
+    }
+    // `reason` goes into the row's own `fields` here, so the dedupe key ([`LogStore::has_reason`])
+    // and the stored row can never disagree.
+    let mut fields = fields;
+    if let Some(object) = fields.as_object_mut() {
+        object.insert(
+            "reason".to_string(),
+            serde_json::Value::String(reason.to_string()),
+        );
+    }
+    match write_warn_row(
+        store,
+        LogEntry {
+            target: target.to_string(),
+            message: message.to_string(),
+            fields,
+            ..LogEntry::default()
+        },
+    )
+    .await
+    {
+        Ok(()) => IssueWrite::Written,
+        Err(error) => {
+            tracing::warn!(%error, "could not record an issue for the Issues view");
+            IssueWrite::NotRecorded
+        }
     }
 }
 

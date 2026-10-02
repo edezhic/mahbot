@@ -2673,8 +2673,14 @@ where
 /// The one limit this rule owns: a run still working when the process exits, and
 /// a run killed outright (SIGKILL), never run destructors — the self-update path's
 /// `exit(0)` bypasses them by design — so nothing is ever queued for that run's
-/// chrome sessions and the tabs it opened stay open; nothing else records them,
-/// because the shutdown sweep deliberately leaves `agent-tab-*` alone.
+/// chrome sessions. The reclaim pass still closes those tabs: it sweeps the
+/// browser's live `agent-tab-*` groups and closes any whose namespace no guard claims —
+/// not a live run's, not one inside a record's hold, not one a queued or parked record
+/// still claims, and not one durable state names for a job that has not been
+/// terminalized ([`crate::tools::chrome_release::ProtectedNamespaces`]). It asks the
+/// browser at a run end that queued names, at a revisit a leftover owes, and — when the
+/// durable record file handed it something — at the start of a process, so a run end hook
+/// that never fired leaves nothing behind and a start with nothing pending opens no page.
 struct RunEndCleanup {
     agent_id: String,
     chrome: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
@@ -2713,9 +2719,14 @@ impl Drop for RunEndCleanup {
         // computer tool does not exist, so there is no such state.
         #[cfg(not(target_os = "macos"))]
         crate::tools::computer::cleanup_agent_state(&self.agent_id);
-        // Hand the run's chrome sessions to the release queue. The tracker's own
-        // `Drop` unregisters the run's namespace once the run's last owner goes.
-        crate::tools::chrome_release::queue_run_session_release(&self.chrome, self.held);
+        // Hand the run's chrome sessions to the release queue, under the run's own
+        // agent id so a leftover report can name the run it came from. The tracker's
+        // own `Drop` unregisters the run's namespace once the run's last owner goes.
+        crate::tools::chrome_release::queue_run_session_release(
+            &self.chrome,
+            self.held,
+            &self.agent_id,
+        );
     }
 }
 

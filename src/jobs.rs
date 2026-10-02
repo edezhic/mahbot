@@ -510,8 +510,8 @@ pub(crate) struct NewAgent {
 /// recency marker — the phase-only purge keys off it).
 async fn checkpoint_job(conn: &Connection, id: &str, retry_count: i64) -> Result<()> {
     // Boot resume re-arms the row unconditionally — status is reset to
-    // Launched regardless of its prior value (list_active_jobs selects
-    // status != 'done').
+    // Launched regardless of its prior value (list_active_jobs takes the
+    // non-terminal set).
     let status = RowStatus::Launched;
     let now = db::now();
     conn.execute(
@@ -1151,13 +1151,17 @@ pub(crate) async fn job_retry_count(conn: &Connection, job_id: &str) -> i64 {
 
 // ── Queries ─────────────────────────────────────────────────────────────
 
+/// `RowStatus::Done` as this module's SQL spells it — `as_str` is a `const fn`, so the terminal
+/// status has one spelling here and cannot drift from the enum.
+const DONE_STATUS: &str = RowStatus::Done.as_str();
+
 /// Load all non-terminal jobs (launched|failed) for the boot scan.
 async fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
     let rows = conn
         .query(
             &format!(
                 "SELECT {JOB_COLUMNS} FROM jobs \
-                 WHERE status != 'done' ORDER BY created_at"
+                 WHERE status != '{DONE_STATUS}' ORDER BY created_at"
             ),
             (),
         )
@@ -1176,6 +1180,31 @@ pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Resu
         .await
         .context("list agents for job")?;
     rows.iter().map(agent_row_from).collect()
+}
+
+/// The roster agent ids of every job that has not been terminalized, minus the slots that already
+/// finished: the ids a cut round resumes IN PLACE from (the slot-resume here re-dispatches the
+/// stored roster's NOT-Done slots — [`RowStatus::Done`] ones are reconstructed from their stored
+/// outcomes instead), so the only durable names a stored round can come back under. A caller uses
+/// this to tell a run that may still return from one that is over; a purged or terminalized job
+/// drops out — the same non-terminal set [`list_active_jobs`] takes — and a done slot's id leaves
+/// with its slot, since nothing will be re-dispatched under it again.
+pub(crate) async fn resumable_roster_agent_ids(conn: &Connection) -> Result<Vec<String>> {
+    let rows = conn
+        .query(
+            &format!(
+                "SELECT DISTINCT a.agent_id FROM agents a \
+                 WHERE a.job_id IN (SELECT id FROM jobs WHERE status != '{DONE_STATUS}') \
+                 AND a.status != '{DONE_STATUS}'"
+            ),
+            (),
+        )
+        .await
+        .context("list the roster agent ids of non-terminal jobs")?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| row.get::<String>(0).ok())
+        .collect())
 }
 
 /// Graceful-drain completion watcher.
