@@ -105,7 +105,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// First retry gap and its cap: the gap doubles per attempt. A record whose tabs are
 /// still there is retried on that ladder — a leftover must not cost a spawn every few
@@ -584,7 +584,9 @@ fn restore_pending_releases() {
 /// record file (compact JSON, atomic tmp+rename): fail-open, a no-op with no storage root, and a
 /// record with no names is never written. Both locks are held across the write as well as the
 /// snapshot (parked before queue, the order [`ReleasePass::take`] parks in), because two
-/// persists sharing the one `.json.tmp` could publish a torn file the next boot ignores.
+/// persists sharing the one `.json.tmp` could publish a torn file the next boot ignores. A failed
+/// serialization or write leaves the previous file in place rather than publishing a payload that
+/// would read as a drained queue, and says so instead of swallowing the failure.
 fn persist_pending_releases() {
     let Some(path) = release_settings().store else {
         return;
@@ -616,13 +618,26 @@ fn persist_pending_releases() {
             left_open: entry.left_open,
         })
         .collect();
-    let json = serde_json::to_string(&records).unwrap_or_default();
+    let json = match serde_json::to_string(&records) {
+        Ok(json) => json,
+        Err(err) => {
+            // Never fall back to an empty payload: publishing one over the live file would
+            // read as a drained queue and erase everything still queued.
+            warn!(error = %err, "agent-run chrome release record not written: serialization failed");
+            return;
+        }
+    };
     let tmp = path.with_extension("json.tmp");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&tmp, json);
-    let _ = std::fs::rename(&tmp, &path);
+    if let Err(err) = std::fs::write(&tmp, json) {
+        warn!(error = %err, "agent-run chrome release record not written");
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp, &path) {
+        warn!(error = %err, "agent-run chrome release record not published");
+    }
 }
 
 /// Whole epoch seconds — the unit the record file stores deadlines in.
@@ -2041,7 +2056,8 @@ const LEFT_OPEN_MESSAGE: &str =
 /// cannot settle is left unnamed rather than written off as one run's, since the host cannot
 /// establish which tabs are whose. No run, no session and no tab is ever named, and the message
 /// must not claim a close failed (there may have been nothing to close).
-const NO_DOOR_MESSAGE: &str = "the browser side here cannot list agent-run tab groups, so leftovers no record names cannot be closed";
+const NO_DOOR_MESSAGE: &str = "the browser side here cannot list agent-run tab groups, so \
+                               leftovers no record names cannot be closed";
 /// The report for this module's own scratch group a let-go could not confirm gone: the one
 /// visible tab this product can leave in the owner's strip, so it must be surfaced rather than
 /// accepted quietly — but the reads that look for the group can themselves fail, so the row says
