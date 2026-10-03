@@ -1,0 +1,3 @@
+You can point this coder round at another directory: pass `target` as an absolute path to a directory outside the registered workspaces. The coder then reads, writes and runs commands in that directory, and the target applies to this call only — leave `target` out to work in your own workspace as before, and the result names the directory that was really used.
+
+A registered workspace name never works here: this tool refuses a registered workspace, any directory inside one, the filesystem root and MahBot's own data directory (a personal workspace directory is fine) — work in a registered workspace goes through that workspace's board and its Manager, never through a coder round. A refused target starts nothing and never falls back to your own workspace.

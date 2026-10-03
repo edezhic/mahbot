@@ -46,9 +46,10 @@
 //! `45`, which invalidates the stored per-workspace lifecycle descriptions
 //! that still name a retired stage. The tail's index rebuild is `46`, which
 //! drops and recreates the ticket-title FTS index in the engine's 0.8.0
-//! on-disk layout (see [`REBUILD_TICKET_TITLE_FTS_INDEX`]).
+//! on-disk layout (see [`REBUILD_TICKET_TITLE_FTS_INDEX`]), and the tail's
+//! newest upfill is `47`, which adds the `jobs.exec_dir` column.
 //!
-//! Future schema changes resume the chain at id `47` with monotonically
+//! Future schema changes resume the chain at id `48` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -110,9 +111,9 @@ pub(crate) struct Migration {
 /// on upgraded databases), not in this batch — the batch cannot reference a
 /// column that a later Rust delta adds.
 ///
-/// `jobs` is created WITH `caller_agent_id` and `mode` as its trailing
-/// columns, matching the shape the retired `ALTER TABLE ...` plus deltas
-/// `28`/`30` produce, so `idx_jobs_phase_ticket` (which references
+/// `jobs` is created WITH `caller_agent_id`, `mode` and `exec_dir` as its
+/// trailing columns, matching the shape the retired `ALTER TABLE ...` plus
+/// deltas `28`/`30`/`47` produce, so `idx_jobs_phase_ticket` (which references
 /// `jobs.ticket_id`) is safe to create in the same batch. Every statement
 /// is `IF NOT EXISTS`.
 const BASELINE_CORE_SCHEMA: &str = "\
@@ -188,7 +189,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at     TEXT NOT NULL,
     ticket_id      TEXT REFERENCES tickets(id),
     caller_agent_id TEXT,
-    mode           TEXT
+    mode           TEXT,
+    exec_dir       TEXT
 );
 CREATE TABLE IF NOT EXISTS agents (
     job_id     TEXT REFERENCES jobs(id) ON DELETE CASCADE,
@@ -723,6 +725,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Sql(REBUILD_TICKET_TITLE_FTS_INDEX),
     },
+    Migration {
+        id: "47",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_jobs_exec_dir),
+    },
 ];
 
 /// Apply the migration catalog to `conn` for one physical database.
@@ -1004,6 +1011,21 @@ async fn run_add_jobs_mode(conn: &Connection) -> anyhow::Result<()> {
     .await
     .with_context(|| "Failed to backfill jobs.mode")?;
     Ok(())
+}
+
+fn add_jobs_exec_dir(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_jobs_exec_dir(conn))
+}
+
+/// Upfill the delegation `jobs.exec_dir` column for databases created
+/// before delta `47`: the absolute directory a targeted delegation round
+/// runs in (NULL = the caller's own workspace, `jobs.workspace_name`).
+/// Fresh installs get the column from entry `24`'s `CREATE TABLE`, so the
+/// probe makes this a no-op there. Guarded by [`add_column_if_missing`], so
+/// this body is idempotent (non-transactional like every Rust body,
+/// re-runnable until recorded).
+async fn run_add_jobs_exec_dir(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "jobs", "exec_dir").await
 }
 
 fn add_session_metadata_sleep_ended(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1449,6 +1471,7 @@ mod tests {
                 "ticket_id",
                 "caller_agent_id",
                 "mode",
+                "exec_dir",
             ],
         ),
         (
@@ -2551,7 +2574,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`45` tail, and converges to the exact current core
+    /// upfills and the `36`–`47` tail, and converges to the exact current core
     /// shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -2578,10 +2601,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             applied,
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-                "40", "41", "42", "43", "44", "45", "46"
+                "40", "41", "42", "43", "44", "45", "46", "47"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–46 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–47 tail exactly"
         );
     }
 
@@ -2898,7 +2921,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40", "41", "42", "43", "44", "45", "46",
+            "40", "41", "42", "43", "44", "45", "46", "47",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -2907,15 +2930,16 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..46"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..47"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
         // jobs/session_metadata (delta 28), users (deltas 29/38/39/40),
         // jobs.mode (delta 30), session_metadata.sleep_ended (delta 31),
         // alarms.command (delta 32, retired by deltas 41/42/43),
-        // chat_history.broadcast_id (delta 33) and
-        // tickets/ticket_chronicle (delta 34) change in shape and the delta-28
+        // chat_history.broadcast_id (delta 33),
+        // tickets/ticket_chronicle (delta 34) and jobs.exec_dir (delta 47)
+        // change in shape and the delta-28
         // `idx_jobs_caller_agent` index is added. Delta `36` rewrites
         // `users.selected_workspace` data (detaching the seeded guest),
         // which leaves row counts unchanged — the snapshot compares only
@@ -2949,9 +2973,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_jobs_cols = before.cols["jobs"].clone();
         expected_jobs_cols.push("caller_agent_id".to_string());
         expected_jobs_cols.push("mode".to_string());
+        expected_jobs_cols.push("exec_dir".to_string());
         assert_eq!(
             after_jobs_cols["jobs"], expected_jobs_cols,
-            "reopen must append exactly caller_agent_id/mode to jobs columns"
+            "reopen must append exactly caller_agent_id/mode/exec_dir to jobs columns"
         );
         let after_sm_cols = column_sets(&conn, &["session_metadata"]).await;
         let mut expected_sm_cols = before.cols["session_metadata"].clone();
@@ -3212,7 +3237,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40", "41", "42", "43", "44", "45", "46",
+            "40", "41", "42", "43", "44", "45", "46", "47",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3221,7 +3246,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..46"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..47"
         );
 
         let after_users_cols = column_names(&conn, "users").await;

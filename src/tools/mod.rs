@@ -18,6 +18,7 @@ mod computer;
 #[cfg(not(target_os = "macos"))]
 pub mod computer;
 pub(crate) mod custom;
+pub(crate) mod delegation;
 pub(crate) mod edit;
 pub(crate) mod image_gen;
 pub(crate) mod implement;
@@ -395,7 +396,10 @@ pub(crate) struct CoreJobArgs<'a> {
     pub caller_role: crate::Role,
     pub user_name: &'a str,
     pub channel: &'a str,
-    pub resume: bool,
+    /// The fresh-spawn row record — the resume discriminator: `Some` spawns
+    /// (writes the jobs row), `None` resumes (reuses the stored roster and
+    /// outcomes, never inserts a row).
+    pub spawn: Option<SpawnRecord<'a>>,
     /// Caller session pin persisted on the jobs row at fresh spawn so the
     /// live resume-completion step can find caller-owned launched jobs.
     /// Always `None` on resume — the row already carries it.
@@ -404,6 +408,21 @@ pub(crate) struct CoreJobArgs<'a> {
     /// round so it is retried; async & boot-resume paths warn-and-continue
     /// (the outcome is recomputable on the next resume).
     pub fail_on_checkpoint_error: bool,
+}
+
+/// The jobs-row fields a fresh dispatch writes. Read ONLY when the call
+/// actually spawns (see [`CoreJobArgs::spawn`]); a resume inserts no row and
+/// carries no record — so a resume can never hand a target's name to the
+/// delivery key.
+pub(crate) struct SpawnRecord<'a> {
+    /// The CALLER's own workspace name: the durable delivery/routing key
+    /// (`jobs.workspace_name`). Never the target.
+    pub delivery_name: &'a str,
+    /// The target directory the round executes in, when the caller asked for one
+    /// — including one that happens to name the caller's own directory — so the
+    /// reply always names the directory really used and a restart resumes into
+    /// the same identity. Persisted as `jobs.exec_dir`.
+    pub exec_dir: Option<&'a str>,
 }
 
 /// The single outcome form of the durable sync cores (analyze/implement):
@@ -462,7 +481,8 @@ impl SyncDurableCore {
     }
 
     /// Shared sync dispatch: read the task-locals the way the two wrappers do
-    /// today, generate a fresh job id, run the core with `resume: false`, then
+    /// today, generate a fresh job id, run the core as a fresh spawn
+    /// (`spawn: Some(..)` — the core writes the jobs row), then
     /// terminalize-on-terminal / surface [`CallSuspended`] on drain-cut.
     pub(crate) async fn run_sync_dispatch(
         self,
@@ -487,7 +507,10 @@ impl SyncDurableCore {
             caller_role,
             user_name: &user_name,
             channel: &channel,
-            resume: false,
+            spawn: Some(SpawnRecord {
+                delivery_name: &ws.name,
+                exec_dir: None,
+            }),
             caller_agent_id: caller_agent_id.as_deref(),
             fail_on_checkpoint_error: caller_agent_id.is_some(),
         };
@@ -521,7 +544,8 @@ impl SyncDurableCore {
     }
 
     /// Shared sync resume: run the [`crate::jobs::resume_job_preamble_discrete`]
-    /// preamble, then the core with `resume: true`, mapping the outcome to
+    /// preamble, then the core as a resume (`spawn: None` — it reuses the
+    /// stored roster and outcomes and inserts no row), mapping the outcome to
     /// [`crate::jobs::SyncResumeOutcome`].
     ///
     /// `sync_resume` selects checkpoint-error propagation: a live sync resume
@@ -564,7 +588,7 @@ impl SyncDurableCore {
             caller_role,
             user_name: &caller.user_name,
             channel: &caller.channel,
-            resume: true,
+            spawn: None,
             caller_agent_id: None,
             fail_on_checkpoint_error: sync_resume,
         };
@@ -609,46 +633,62 @@ impl SyncDurableCore {
     /// channel for this core's round results (success and failure paths). The
     /// caller-generated `job_id` is embedded in the envelope body so the
     /// delivered result is correlatable with the immediate ack placeholder.
+    /// `exec_dir` names the directory the round really ran in, when the caller
+    /// asked for a target.
     #[must_use]
     pub(crate) fn build_async_message(
         self,
         job_id: &str,
         result: &anyhow::Result<String>,
+        exec_dir: Option<&str>,
     ) -> String {
         let tag = match self {
             Self::Analyze => "analyze-tool-result",
             Self::Implement => "implement-tool-result",
         };
-        build_async_result_envelope(job_id, result, tag)
+        build_async_result_envelope(job_id, result, tag, exec_dir)
     }
 
     /// Durable async dispatch (SPAWN → run → CHECKPOINT → COMPLETE): run the
-    /// core with `resume: false` and no session pin, then terminalize into the
+    /// core as a fresh spawn (`spawn: Some(..)` — it writes the jobs row) and no
+    /// session pin, then terminalize into the
     /// durable envelope under the caller-generated `job_id` (the id is created
     /// in the tool's `execute()` BEFORE the spawn so the immediate ack and the
     /// delivered envelope share one id). Returns `None` only when the round
     /// was cut by drain/shutdown — the job stays status='launched' for boot
     /// resume and NOTHING is routed now. On error the envelope still routes
     /// (errors wrapped in the core's envelope tag) and the job is terminalized.
+    ///
+    /// `delivery` is the caller's own workspace (the durable delivery key);
+    /// `target`, when present, is the directory the round executes in — the
+    /// sub-agents' root, context and search key, while delivery stays the
+    /// caller's.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn dispatch_durable(
         self,
-        ws: &crate::Workspace,
+        delivery: &crate::Workspace,
+        target: Option<&crate::Workspace>,
         task: &str,
         caller_role: crate::Role,
         user_name: &str,
         channel: &str,
         job_id: &str,
     ) -> Option<AgentJob> {
+        let exec = target.unwrap_or(delivery);
+        let exec_dir = target.map(|t| t.path.as_str());
         let result = match self
             .run(
-                ws,
+                exec,
                 task,
                 CoreJobArgs {
                     job_id,
                     caller_role,
                     user_name,
                     channel,
-                    resume: false,
+                    spawn: Some(SpawnRecord {
+                        delivery_name: &delivery.name,
+                        exec_dir,
+                    }),
                     caller_agent_id: None,
                     fail_on_checkpoint_error: false,
                 },
@@ -671,31 +711,64 @@ impl SyncDurableCore {
             Ok(SyncCoreOutcome::Terminal(result)) => result,
             Err(e) => Err(e),
         };
+        // The round is over: drop the synthetic `dir-…` engine it may have
+        // created (a registered target's own engine is left alone). The
+        // drain-cut early return above deliberately skips this — that job
+        // resumes in the same directory.
+        if let Some(target) = target {
+            crate::tools::delegation::release_exec_engine(target);
+        }
         Some(
             crate::jobs::complete_durable_job(
                 job_id,
-                self.build_async_message(job_id, &result),
+                self.build_async_message(job_id, &result, exec_dir),
                 self.message_kind(),
                 caller_role,
                 user_name,
                 channel,
-                &ws.name,
+                &delivery.name,
             )
             .await,
         )
     }
 
-    /// Boot-resume a durable round: run the core with `resume: true` through
+    /// Boot-resume a durable round: resolve the execution workspace (the
+    /// recorded target directory when the round had one, else the caller's own
+    /// workspace), run the core as a resume (`spawn: None` — it reuses the stored
+    /// roster and outcomes and inserts no row) through
     /// [`Self::resume_sync_core`], then terminalize into a durable envelope and
     /// route it to the ORIGINAL caller (role/user/channel persisted on the job
-    /// row at spawn), never the Manager.
+    /// row at spawn), never the Manager. The delivery workspace stays the
+    /// caller's own (`delivery`) so the result lands in the conversation that
+    /// asked.
     ///
     /// Aborts quietly on shutdown/drain: no routing, no terminalization — the
     /// job row stays for the next boot (checkpointed outcomes are reused, so
     /// already-completed LLM work is never lost or duplicated).
-    pub(crate) async fn resume_durable_round(self, job_id: &str, ws: &crate::Workspace) {
+    pub(crate) async fn resume_durable_round(
+        self,
+        job_id: &str,
+        delivery: &crate::Workspace,
+        exec_dir: Option<&str>,
+    ) {
         let label = self.label();
-        let (caller_role, caller, result) = match self.resume_sync_core(ws, job_id, false).await {
+        let resumed = match exec_dir {
+            None => self.resume_sync_core(delivery, job_id, false).await,
+            Some(dir) => match crate::tools::delegation::workspace_at_dir(dir).await {
+                Ok(exec) => {
+                    let resumed = self.resume_sync_core(&exec, job_id, false).await;
+                    // The resume is over: drop the synthetic `dir-…` engine it
+                    // may have created (the next resume re-creates it on demand).
+                    crate::tools::delegation::release_exec_engine(&exec);
+                    resumed
+                }
+                // The recorded target directory is gone: the round ends through
+                // the resume-failure arm below with that plain message — never
+                // left hanging.
+                Err(e) => Err(e),
+            },
+        };
+        let (caller_role, caller, result) = match resumed {
             Ok(crate::jobs::SyncResumeOutcome::Terminal(caller_role, caller, result)) => {
                 (caller_role, caller, result)
             }
@@ -704,10 +777,11 @@ impl SyncDurableCore {
             Ok(crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::Gone) => {
                 return;
             }
-            // Resume infra failure (roster load / checkpoint) — deliver an error
-            // envelope to the ORIGINAL caller, exactly like a round-level failure.
-            // The job row is still present (the core never terminalizes), so the
-            // caller identity can be re-loaded for the route.
+            // Resume infra failure (roster load / checkpoint) or an unusable
+            // recorded target directory — deliver an error envelope to the
+            // ORIGINAL caller, exactly like a round-level failure. The job row
+            // is still present (the core never terminalizes), so the caller
+            // identity can be re-loaded for the route.
             Err(e) => {
                 let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
                     &crate::session::store().conn,
@@ -721,12 +795,12 @@ impl SyncDurableCore {
                 };
                 let envelope = crate::jobs::complete_durable_job(
                     job_id,
-                    self.build_async_message(job_id, &Err(e)),
+                    self.build_async_message(job_id, &Err(e), exec_dir),
                     self.message_kind(),
                     caller_role,
                     &caller.user_name,
                     &caller.channel,
-                    &ws.name,
+                    &delivery.name,
                 )
                 .await;
                 crate::agent::message_router::route(
@@ -749,12 +823,12 @@ impl SyncDurableCore {
         }
         let envelope = crate::jobs::complete_durable_job(
             job_id,
-            self.build_async_message(job_id, &result),
+            self.build_async_message(job_id, &result, exec_dir),
             self.message_kind(),
             caller_role,
             &caller.user_name,
             &caller.channel,
-            &ws.name,
+            &delivery.name,
         )
         .await;
         crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
@@ -795,21 +869,35 @@ impl SyncDurableCore {
     /// Note: src/tools/research.rs deliberately does NOT share this scaffold —
     /// its Ok(None) also covers manual cancel, it logs "ended without delivery",
     /// and it omits the pre-route aborting() guard (at-least-once rationale).
+    ///
+    /// `delivery` is the caller's own workspace (the durable delivery key);
+    /// `target`, when present, is the directory the round executes in.
     pub(crate) fn spawn_dispatch(
         self,
-        ws: &crate::Workspace,
+        delivery: &crate::Workspace,
+        target: Option<&crate::Workspace>,
         task: &str,
         caller_role: crate::Role,
         job_id: String,
     ) {
         let user_name = crate::agent::tool_user_name();
         let channel = crate::agent::tool_channel();
-        let (ws, task) = (ws.clone(), task.to_string());
-        let ws_name = ws.name.clone();
+        let (delivery, task) = (delivery.clone(), task.to_string());
+        let target = target.cloned();
+        let ws_name = delivery.name.clone();
         tokio::spawn(async move {
+            let exec_dir = target.as_ref().map(|t| t.path.as_str());
             let round = std::panic::AssertUnwindSafe(async {
-                self.dispatch_durable(&ws, &task, caller_role, &user_name, &channel, &job_id)
-                    .await
+                self.dispatch_durable(
+                    &delivery,
+                    target.as_ref(),
+                    &task,
+                    caller_role,
+                    &user_name,
+                    &channel,
+                    &job_id,
+                )
+                .await
             })
             .catch_unwind()
             .await;
@@ -823,10 +911,16 @@ impl SyncDurableCore {
                     let panic = crate::util::panic_message(&*panic);
                     let tag = self.tool_name();
                     tracing::error!(panic = %panic, "{tag} round dispatch panicked");
+                    // The round is over (as a panic): drop the synthetic
+                    // `dir-…` engine it may have created before the envelope.
+                    if let Some(exec) = target.as_ref() {
+                        crate::tools::delegation::release_exec_engine(exec);
+                    }
                     AgentJob {
                         content: self.build_async_message(
                             &job_id,
                             &Err(anyhow::anyhow!("{tag} round dispatch panicked: {panic}")),
+                            exec_dir,
                         ),
                         workspace_name: ws_name,
                         user_name,
@@ -849,19 +943,30 @@ impl SyncDurableCore {
 
 /// Wrap a sub-agent/tool result in the async `<tag>` envelope delivered to
 /// the caller's agent channel. The `job_id` is embedded as the first body line
-/// so the delivered result is correlatable with the immediate ack placeholder.
-/// Failures carry an explicit marker — findings are never silently dropped.
-/// Shared with the deep research tool.
+/// so the delivered result is correlatable with the immediate ack placeholder;
+/// when the round ran in a target directory (`exec_dir`), a `Directory:` line
+/// follows it in the same shape so the caller is never in doubt which directory
+/// the round really ran in. Failures carry an explicit marker — findings are
+/// never silently dropped. Shared with the deep research tool.
 pub(crate) fn build_async_result_envelope(
     job_id: &str,
     result: &anyhow::Result<String>,
     tag: &str,
+    exec_dir: Option<&str>,
 ) -> String {
+    // A registered workspace's stored path carries a trailing separator; the
+    // reply names the directory in its bare spelling either way.
+    let dir_line = exec_dir.map_or_else(String::new, |dir| {
+        format!(
+            "\n\nDirectory: {}",
+            dir.trim_end_matches(std::path::MAIN_SEPARATOR)
+        )
+    });
     match result {
-        Ok(text) => format!("<{tag}>\n\nJob: {job_id}\n\n{text}</{tag}>"),
+        Ok(text) => format!("<{tag}>\n\nJob: {job_id}{dir_line}\n\n{text}</{tag}>"),
         Err(e) => {
             tracing::debug!(error = %e, %tag, "async tool result failed");
-            format!("<{tag}>\n\nJob: {job_id}\n\nAn error occurred: {e}</{tag}>")
+            format!("<{tag}>\n\nJob: {job_id}{dir_line}\n\nAn error occurred: {e}</{tag}>")
         }
     }
 }

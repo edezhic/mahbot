@@ -1749,6 +1749,7 @@ mod tests {
             &[],
             &crate::jobs::SpawnChild::Analyze,
             Some(&agent_id),
+            None,
         )
         .await
         .unwrap();

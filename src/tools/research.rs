@@ -552,6 +552,7 @@ async fn dispatch_durable_research(
             &[],
             &crate::jobs::SpawnChild::Research,
             None,
+            None,
         )
         .await
     };
@@ -783,7 +784,7 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
 /// embedded so the delivered report is correlatable with the immediate ack,
 /// and failures are wrapped with an explicit marker, never silently dropped.
 fn build_async_research_message(job_id: &str, result: &anyhow::Result<String>) -> String {
-    build_async_result_envelope(job_id, result, "research-result")
+    build_async_result_envelope(job_id, result, "research-result", None)
 }
 
 // ── Evidence accumulation ────────────────────────────────────────────────

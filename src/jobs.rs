@@ -170,6 +170,9 @@ pub(crate) struct JobRow {
     /// Explicit dispatch mode (see [`JobMode`]) — the discriminator that
     /// replaces the NULL-sentinel overload of `caller_agent_id`.
     mode: JobMode,
+    /// The absolute directory a targeted delegation round runs in; `None` = the
+    /// caller's own workspace (`workspace_name`).
+    pub exec_dir: Option<String>,
 }
 
 /// A row of the `agents` table. Carries the slot `idx` (in addition to the
@@ -204,6 +207,7 @@ crate::columns! {
         TICKET_ID       => "ticket_id",
         CALLER_AGENT_ID => "caller_agent_id",
         MODE            => "mode",
+        EXEC_DIR        => "exec_dir",
     }
 }
 
@@ -215,6 +219,7 @@ fn job_row_from(row: &Row) -> anyhow::Result<JobRow> {
         retry_count: row.get(COL_JOB_RETRY_COUNT)?,
         ticket_id: row.get(COL_JOB_TICKET_ID)?,
         caller_agent_id: row.get(COL_JOB_CALLER_AGENT_ID)?,
+        exec_dir: row.get(COL_JOB_EXEC_DIR)?,
         // Defensive fallback: the migration backfills every row, so a NULL or
         // bogus value here is a legacy edge — treat it as async rather than
         // dropping the job at boot.
@@ -399,6 +404,7 @@ pub(crate) async fn spawn_job(
     agents: &[NewAgent],
     child: &SpawnChild,
     caller_agent_id: Option<&str>,
+    exec_dir: Option<&str>,
 ) -> Result<()> {
     let tx = conn.begin_tx().await?;
     insert_job_tx(
@@ -412,6 +418,7 @@ pub(crate) async fn spawn_job(
         agents,
         child,
         caller_agent_id,
+        exec_dir,
     )
     .await?;
     tx.commit().await?;
@@ -435,6 +442,7 @@ async fn insert_job_tx(
     agents: &[NewAgent],
     child: &SpawnChild,
     caller_agent_id: Option<&str>,
+    exec_dir: Option<&str>,
 ) -> Result<()> {
     let kind = child.kind_str();
     let ticket_id = child_ticket_id(child);
@@ -449,8 +457,8 @@ async fn insert_job_tx(
     let now = db::now();
     tx.execute(
         "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
-         ticket_id, retry_count, created_at, updated_at, caller_agent_id, mode) \
-         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10, ?11)",
+         ticket_id, retry_count, created_at, updated_at, caller_agent_id, mode, exec_dir) \
+         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10, ?11, ?12)",
         params![
             id,
             kind,
@@ -463,6 +471,7 @@ async fn insert_job_tx(
             now.clone(),
             caller_agent_id,
             mode.as_str(),
+            exec_dir,
         ],
     )
     .await
@@ -705,6 +714,7 @@ pub(crate) async fn transition_research_to_cleanup(
             task: cleanup_task.to_string(),
         }],
         &SpawnChild::ResearchCleanup,
+        None,
         None,
     )
     .await?;
@@ -1324,10 +1334,16 @@ pub(crate) enum ResumableJob {
     Analyze {
         job_id: String,
         workspace_name: String,
+        /// The recorded target directory for the round; `None` = the caller's
+        /// own workspace.
+        exec_dir: Option<String>,
     },
     Implement {
         job_id: String,
         workspace_name: String,
+        /// The recorded target directory for the round; `None` = the caller's
+        /// own workspace.
+        exec_dir: Option<String>,
     },
     /// A research-run cleanup Sanitation agent interrupted by a crash. The
     /// jobs row id == the run id, so the row is the cleanup's resume marker
@@ -1692,6 +1708,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
                 ResumableJob::Analyze {
                     job_id: job.id.clone(),
                     workspace_name: job.workspace_name.clone(),
+                    exec_dir: job.exec_dir.clone(),
                 }
             });
             resumed_other += 1;
@@ -1706,6 +1723,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
             resumable.push(ResumableJob::Implement {
                 job_id: job.id.clone(),
                 workspace_name: job.workspace_name.clone(),
+                exec_dir: job.exec_dir.clone(),
             });
             resumed_other += 1;
         } else if job.kind == "research_cleanup" {
@@ -1934,24 +1952,29 @@ mod tests {
         // workspace for the async analyze to be check-pointed.
         crate::util::test::create_test_workspace("/tmp/boot_recovery_ws", ws_name).await;
 
-        for (job_id, kind, child, caller) in [
+        for (job_id, kind, child, caller, exec_dir) in [
             (
                 "owned_analyze",
                 AgentKind::Analyst,
                 SpawnChild::Analyze,
                 Some("pin_a"),
+                None,
             ),
             (
                 "owned_implement",
                 AgentKind::Coder,
                 SpawnChild::Implement,
                 Some("pin_b"),
+                None,
             ),
             (
                 "null_analyze",
                 AgentKind::Analyst,
                 SpawnChild::Analyze,
                 None,
+                // A targeted round: the recorded directory must survive the boot
+                // scan so the resume runs in the same directory.
+                Some("/tmp/boot_recovery_target"),
             ),
         ] {
             spawn_job(
@@ -1970,6 +1993,7 @@ mod tests {
                 }],
                 &child,
                 caller,
+                exec_dir,
             )
             .await
             .unwrap();
@@ -1999,6 +2023,17 @@ mod tests {
                 |r| matches!(r, ResumableJob::Analyze { job_id, .. } if job_id == "null_analyze")
             ),
             "the async analyze is selected for boot resume"
+        );
+        assert!(
+            resumable.iter().any(|r| matches!(
+                r,
+                ResumableJob::Analyze {
+                    job_id,
+                    exec_dir: Some(dir),
+                    ..
+                } if job_id == "null_analyze" && dir == "/tmp/boot_recovery_target"
+            )),
+            "the targeted round's recorded directory survives the boot scan"
         );
         assert!(
             !resumable.iter().any(
@@ -2111,6 +2146,7 @@ mod tests {
                 }],
                 &child,
                 caller,
+                None,
             )
             .await
             .unwrap();
@@ -2187,6 +2223,7 @@ mod tests {
                 }],
                 &child,
                 caller,
+                None,
             )
             .await
             .unwrap();

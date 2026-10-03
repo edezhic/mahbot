@@ -725,6 +725,7 @@ mod tests {
             &[],
             &crate::jobs::SpawnChild::Research,
             None,
+            None,
         )
         .await
         .unwrap();

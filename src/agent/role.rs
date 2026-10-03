@@ -395,8 +395,16 @@ impl Role {
                 t
             }
             Role::Assistant => {
+                // The optional `target` argument belongs to the admin's
+                // Assistant alone: a guest's round always runs in its own
+                // workspace, and any `target` it passes is inert.
+                let analyze = if is_admin {
+                    AnalyzeTool::targeted(Role::Assistant)
+                } else {
+                    AnalyzeTool::new(DispatchMode::Async, Role::Assistant)
+                };
                 let mut t: Vec<Box<dyn Tool>> = vec![
-                    Box::new(AnalyzeTool::new(DispatchMode::Async, Role::Assistant)),
+                    Box::new(analyze),
                     Box::new(AddAlarmTool),
                     Box::new(ListAlarmsTool),
                     Box::new(RemoveAlarmTool),
@@ -425,10 +433,7 @@ impl Role {
                 }
                 if is_admin {
                     t.push(Box::new(ShellTool::new(ShellMode::Full)));
-                    t.push(Box::new(ImplementTool::new(
-                        DispatchMode::Async,
-                        Role::Assistant,
-                    )));
+                    t.push(Box::new(ImplementTool::targeted(Role::Assistant)));
                     t.push(Box::new(ResearchTool::new(Role::Assistant)));
                     // The admin's session is a trusted local session, so the
                     // Assistant can also observe/act on the local GUI directly
@@ -733,6 +738,29 @@ mod tests {
         assert!(
             admin_path_desc.contains("policy allowlist"),
             "the admin's Assistant read must advertise the general allowlist boundary, got: {admin_path_desc}"
+        );
+
+        // The optional `target` delegation argument is the admin's alone: the
+        // admin's `analyze` and `implement` advertise it, the guest's `analyze`
+        // (the guest has no `implement`) does not.
+        let advertises_target = |tools: &[Box<dyn Tool>], name: &str| {
+            tools.iter().find(|t| t.name() == name).is_some_and(|t| {
+                t.parameters_schema()["properties"]
+                    .as_object()
+                    .is_some_and(|props| props.contains_key("target"))
+            })
+        };
+        assert!(
+            advertises_target(&admin, "analyze"),
+            "the admin's Assistant analyze must advertise `target`"
+        );
+        assert!(
+            advertises_target(&admin, "implement"),
+            "the admin's Assistant implement must advertise `target`"
+        );
+        assert!(
+            !advertises_target(&guest, "analyze"),
+            "a guest's Assistant analyze must not advertise `target`"
         );
     }
 

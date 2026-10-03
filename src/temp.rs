@@ -937,6 +937,7 @@ async fn dispatch_temp_cleanup(roots: &[CleanupRoot]) -> Result<()> {
         }],
         &crate::jobs::SpawnChild::TempCleanup,
         None,
+        None,
     )
     .await
     .map_err(|e| {

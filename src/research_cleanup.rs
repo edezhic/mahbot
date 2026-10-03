@@ -503,6 +503,7 @@ async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Result<Option<S
         }],
         &crate::jobs::SpawnChild::ResearchCleanup,
         None,
+        None,
     )
     .await
     .map_err(|e| {
@@ -1348,6 +1349,7 @@ mod tests {
             crate::Role::Sanitation,
             &[],
             &crate::jobs::SpawnChild::ResearchCleanup,
+            None,
             None,
         )
         .await

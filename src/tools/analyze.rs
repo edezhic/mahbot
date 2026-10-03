@@ -7,6 +7,12 @@
 //! sub-agents are dispatched in a background task and the result is injected
 //! back to the caller's agent channel via [`crate::agent::message_router::route`].
 //!
+//! The admin Assistant's instance additionally accepts an optional `target`
+//! argument — a registered workspace name, or an absolute directory path — that
+//! moves this round's execution root for that call only; every other holder's
+//! interface is unchanged, with a `target` they pass inert. Argument mechanics
+//! and refusals live in [`super::delegation`].
+//!
 //! Analyst batches run three decorrelated analysts (distinct research angles)
 //! that report structured claim-level findings; consolidation runs the shared
 //! LLM grouping pass ([`crate::consensus`]) — semantic grouping + contradiction
@@ -60,6 +66,10 @@ pub struct AnalyzeTool {
     /// The role of the calling agent. Used to route async results to the
     /// correct agent channel (Manager → manager_{ws}, Assistant → direct_{...}).
     pub caller_role: Role,
+    /// Whether the optional `target` argument is accepted — the admin
+    /// Assistant's instance only. Every other holder keeps the argument-less
+    /// interface; a `target` they pass is inert.
+    accepts_target: bool,
 }
 
 impl AnalyzeTool {
@@ -68,6 +78,20 @@ impl AnalyzeTool {
         Self {
             dispatch_mode,
             caller_role,
+            accepts_target: false,
+        }
+    }
+
+    /// The admin Assistant's variant: accepts the optional `target` argument.
+    ///
+    /// Always the async dispatch — a target can only be honoured by a durable
+    /// background round, which records the directory it runs in for resume.
+    #[must_use]
+    pub const fn targeted(caller_role: Role) -> Self {
+        Self {
+            dispatch_mode: DispatchMode::Async,
+            caller_role,
+            accepts_target: true,
         }
     }
 }
@@ -84,26 +108,36 @@ impl Tool for AnalyzeTool {
     /// The async variant appends the `tool/analyze_async.md` note so an agent
     /// reading the schema instantly understands that the findings arrive later
     /// as an injected follow-up result message, not in the tool's return value.
+    /// The admin Assistant's targeted variant first appends the
+    /// `tool/analyze_target.md` note explaining the optional `target` argument.
     fn description(&self) -> String {
-        let base = crate::prompt::load_prompt(&format!("tool/{}.md", self.name()));
+        let mut desc = crate::prompt::load_prompt(&format!("tool/{}.md", self.name()));
+        if self.accepts_target {
+            let target_note =
+                crate::prompt::load_prompt(&format!("tool/{}_target.md", self.name()));
+            desc = format!("{desc}\n\n{target_note}");
+        }
         if self.dispatch_mode.is_async() {
             let async_note = crate::prompt::load_prompt(&format!("tool/{}_async.md", self.name()));
-            format!("{base}\n\n{async_note}")
-        } else {
-            base
+            desc = format!("{desc}\n\n{async_note}");
         }
+        desc
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        super::tool_params_schema(
-            &json!({
-                "analyze": {
-                    "type": "string",
-                    "description": "The question to delegate to the analysts"
-                }
-            }),
-            &["analyze"],
-        )
+        let mut properties = json!({
+            "analyze": {
+                "type": "string",
+                "description": "The question to delegate to the analysts"
+            }
+        });
+        if self.accepts_target {
+            properties["target"] = json!({
+                "type": "string",
+                "description": "Optional directory to run this round in: the name of a registered workspace, or an absolute path to a directory. Omit to run in your own workspace."
+            });
+        }
+        super::tool_params_schema(&properties, &["analyze"])
     }
 
     /// Sub-agents dispatched by AnalyzeTool are always Analysts, who have no
@@ -131,9 +165,20 @@ impl Tool for AnalyzeTool {
         // Spawn/identity/drain-cut/panic/route semantics live in
         // `SyncDurableCore::spawn_dispatch`.
         if self.dispatch_mode.is_async() {
+            // The optional `target` is the admin's alone and only a durable
+            // background round can honour it — resolved here, where it is used.
+            // A refused target dispatches nothing and never falls back to the
+            // caller's own workspace — resolution is exact and decided here.
+            let target = if self.accepts_target {
+                super::delegation::resolve(super::delegation::DelegationKind::Analyze, &args)
+                    .await?
+            } else {
+                None
+            };
             let job_id = crate::generate_id();
             super::SyncDurableCore::Analyze.spawn_dispatch(
                 ws,
+                target.as_ref(),
                 analyze,
                 self.caller_role,
                 job_id.clone(),
@@ -150,6 +195,7 @@ impl Tool for AnalyzeTool {
         // (the job stays launched) and the session's universal
         // resume-completion step settles it before the next LLM call (this
         // dispatch itself never binds to prior jobs — it spawns fresh).
+        // (a target is impossible here: `targeted()` is async-only)
         run_sync_analyze(ws, analyze, self.caller_role).await
     }
 }
@@ -174,63 +220,72 @@ pub(crate) async fn run_analyze_with_job(
         caller_role,
         user_name,
         channel,
-        resume,
+        spawn,
         caller_agent_id,
         fail_on_checkpoint_error,
     } = args;
+    let resume = spawn.is_none();
     let deadline = std::time::Instant::now() + round_timeout();
 
-    // Fresh dispatch: build the roster and spawn the job BEFORE any analyst
-    // session write (caller identity persisted on the job row so a later
-    // resume delivers to the ORIGINAL caller). Resume: reuse the stored roster
-    // (agent ids + final tasks) — never regenerate ids (the PK would conflict
-    // AND the new ids would not match the stored roster rows).
-    let (slots, pre_done) = if resume {
-        let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
-        let slots: Vec<AnalyzeSlot> = rows
-            .iter()
-            .map(|r| AnalyzeSlot {
-                agent_id: r.agent_id.clone(),
-                task: r.task.clone(),
-            })
-            .collect();
-        // Done slots are reconstructed from their stored outcomes; the rest
-        // re-run with their stored tasks.
-        let pre_done: Vec<(String, String)> = rows
-            .iter()
-            .filter(|r| r.status == crate::jobs::RowStatus::Done.as_str())
-            .filter_map(|r| r.outcome.clone().map(|o| (r.agent_id.clone(), o)))
-            .collect();
-        (slots, pre_done)
-    } else {
-        let suffix = crate::generate_suffix();
-        let angles = load_analyst_angles();
-        let mut slots: Vec<AnalyzeSlot> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
-        let mut agents: Vec<crate::jobs::NewAgent> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
-        for i in 0..PARALLEL_ANALYST_COUNT {
-            let slot = analyst_slot(ws, &angles, &suffix, i, analyze);
-            agents.push(crate::jobs::NewAgent {
-                agent_id: slot.agent_id.clone(),
-                kind: crate::jobs::AgentKind::Analyst,
-                idx: Some(i64::try_from(i).unwrap_or(i64::MAX)),
-                task: slot.task.clone(),
-            });
-            slots.push(slot);
+    let (slots, pre_done) = match &spawn {
+        // Resume: reuse the stored roster (agent ids + final tasks) — never
+        // regenerate ids (the PK would conflict AND the new ids would not match
+        // the stored roster rows).
+        None => {
+            let rows =
+                crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
+            let slots: Vec<AnalyzeSlot> = rows
+                .iter()
+                .map(|r| AnalyzeSlot {
+                    agent_id: r.agent_id.clone(),
+                    task: r.task.clone(),
+                })
+                .collect();
+            // Done slots are reconstructed from their stored outcomes; the rest
+            // re-run with their stored tasks.
+            let pre_done: Vec<(String, String)> = rows
+                .iter()
+                .filter(|r| r.status == crate::jobs::RowStatus::Done.as_str())
+                .filter_map(|r| r.outcome.clone().map(|o| (r.agent_id.clone(), o)))
+                .collect();
+            (slots, pre_done)
         }
-        crate::jobs::spawn_job(
-            &crate::session::store().conn,
-            job_id,
-            analyze,
-            &ws.name,
-            user_name,
-            channel,
-            caller_role,
-            &agents,
-            &crate::jobs::SpawnChild::Analyze,
-            caller_agent_id,
-        )
-        .await?;
-        (slots, Vec::new())
+        // Fresh dispatch: build the roster and spawn the job BEFORE any analyst
+        // session write (caller identity persisted on the job row so a later
+        // resume delivers to the ORIGINAL caller).
+        Some(spawn) => {
+            let suffix = crate::generate_suffix();
+            let angles = load_analyst_angles();
+            let mut slots: Vec<AnalyzeSlot> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
+            let mut agents: Vec<crate::jobs::NewAgent> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
+            for i in 0..PARALLEL_ANALYST_COUNT {
+                let slot = analyst_slot(ws, &angles, &suffix, i, analyze);
+                agents.push(crate::jobs::NewAgent {
+                    agent_id: slot.agent_id.clone(),
+                    kind: crate::jobs::AgentKind::Analyst,
+                    idx: Some(i64::try_from(i).unwrap_or(i64::MAX)),
+                    task: slot.task.clone(),
+                });
+                slots.push(slot);
+            }
+            crate::jobs::spawn_job(
+                &crate::session::store().conn,
+                job_id,
+                analyze,
+                spawn.delivery_name,
+                user_name,
+                channel,
+                caller_role,
+                &agents,
+                &crate::jobs::SpawnChild::Analyze,
+                caller_agent_id,
+                // The round's execution directory (the caller's target, when one
+                // was asked for) so a restart resumes into the same directory.
+                spawn.exec_dir,
+            )
+            .await?;
+            (slots, Vec::new())
+        }
     };
 
     // Run the launched slots; reconstruct done slots from stored outcomes.
@@ -386,10 +441,11 @@ async fn run_analyze_slots(
 }
 
 /// Boot-resume a durable analyze round — thin wrapper over
-/// [`crate::tools::SyncDurableCore::resume_durable_round`].
-pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace) {
+/// [`crate::tools::SyncDurableCore::resume_durable_round`]. `exec_dir` is the
+/// recorded target directory the round ran in, when it had one.
+pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace, exec_dir: Option<&str>) {
     crate::tools::SyncDurableCore::Analyze
-        .resume_durable_round(job_id, ws)
+        .resume_durable_round(job_id, ws, exec_dir)
         .await;
 }
 
@@ -1535,6 +1591,7 @@ fn render_extraction_failures(outcomes: &[AnalystOutcome]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::UnwrapPoison as _;
     use crate::util::test::{FakeProvider, install_fake_provider};
     use crate::workspace::test_ws;
     use serde_json::json;
@@ -2180,14 +2237,21 @@ mod tests {
             .err(crate::retry::FailureClass::Transport, "down");
         let result =
             consolidate_with_script(agreed_outcomes("raw report", "raw report 2"), fake).await;
-        let envelope =
-            crate::tools::SyncDurableCore::Analyze.build_async_message("job123", &result);
+        let envelope = crate::tools::SyncDurableCore::Analyze.build_async_message(
+            "job123",
+            &result,
+            Some("/tmp/round-target"),
+        );
         assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
         assert!(
             envelope.contains("unconsolidated — consolidation failed"),
             "{envelope}"
         );
         assert!(envelope.contains("raw report"), "{envelope}");
+        assert!(
+            envelope.contains("\n\nJob: job123\n\nDirectory: /tmp/round-target\n\n"),
+            "the target directory must follow the job id: {envelope}"
+        );
         assert!(
             envelope.ends_with("</analyze-tool-result>"),
             "envelope must close: {envelope}"
@@ -2197,13 +2261,22 @@ mod tests {
     #[tokio::test]
     async fn async_envelope_wraps_sub_agent_errors() {
         // The async dispatch path's error branch: a failed sub-agent is
-        // wrapped in the same envelope with the error text.
-        let envelope = crate::tools::SyncDurableCore::Analyze
-            .build_async_message("job123", &Err(anyhow::anyhow!("sub-agent exploded")));
+        // wrapped in the same envelope with the error text. The delivery
+        // directory line is absent when the round ran in the caller's own
+        // workspace.
+        let envelope = crate::tools::SyncDurableCore::Analyze.build_async_message(
+            "job123",
+            &Err(anyhow::anyhow!("sub-agent exploded")),
+            None,
+        );
         assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
         assert!(
             envelope.contains("An error occurred: sub-agent exploded"),
             "{envelope}"
+        );
+        assert!(
+            !envelope.contains("Directory:"),
+            "no directory line without a target: {envelope}"
         );
         assert!(
             envelope.ends_with("</analyze-tool-result>"),
@@ -2371,6 +2444,7 @@ mod tests {
             }],
             &crate::jobs::SpawnChild::Analyze,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2387,7 +2461,7 @@ mod tests {
         // Resume: must NOT hit the jobs.id PK conflict, must reuse the stored
         // roster slot, then terminalize into a durable envelope delivered to
         // the ORIGINAL caller (Assistant, not Manager).
-        resume_analyze_round(job_id, &ws).await;
+        resume_analyze_round(job_id, &ws, None).await;
 
         let job_rows = conn
             .query(
@@ -2415,6 +2489,343 @@ mod tests {
         assert_eq!(envelope.user_name, "caller-user");
     }
 
+    /// A targeted round whose recorded directory is gone must END with a plain
+    /// failure — the job terminalizes and the caller receives the reason, never
+    /// left launched and silent forever.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    async fn resume_targeted_round_with_a_vanished_directory_fails_loudly() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_resume_targeted");
+        let job_id = "analyze_job_resume_targeted";
+        let target = "/definitely/not/here/analyze-target";
+        let conn = &crate::session::store().conn;
+        crate::jobs::spawn_job(
+            conn,
+            job_id,
+            "question?",
+            &ws.name,
+            "caller-user",
+            "telegram",
+            crate::Role::Assistant,
+            &[crate::jobs::NewAgent {
+                agent_id: format!("{job_id}_analyst"),
+                kind: crate::jobs::AgentKind::Analyst,
+                idx: Some(0),
+                task: "question?".to_string(),
+            }],
+            &crate::jobs::SpawnChild::Analyze,
+            None,
+            Some(target),
+        )
+        .await
+        .unwrap();
+
+        resume_analyze_round(job_id, &ws, Some(target)).await;
+
+        let job_rows = conn
+            .query(
+                "SELECT id FROM jobs WHERE id = ?1",
+                crate::db::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(job_rows.len(), 0, "the round must terminalize, not hang");
+        let pending = conn
+            .query(
+                "SELECT envelope FROM pending_jobs WHERE id = ?1",
+                crate::db::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "the failure is delivered to the caller");
+        let envelope: crate::agent::message_router::AgentJob =
+            serde_json::from_str(&pending[0].get::<String>(0).unwrap()).unwrap();
+        assert_eq!(
+            envelope.workspace_name, ws.name,
+            "the delivery key stays the caller's own workspace, never the target"
+        );
+        assert!(
+            envelope.content.contains("no longer available"),
+            "{}",
+            envelope.content
+        );
+        assert!(
+            envelope.content.contains(&format!("Directory: {target}")),
+            "{}",
+            envelope.content
+        );
+    }
+
+    /// A provider that parks every chat call until the test opens the gate, so
+    /// the round's durable state can be observed while it is still running.
+    /// The Assistant consumer the delivered envelope routes into is parked
+    /// indefinitely: it would otherwise reclaim (delete) the pending row before
+    /// the test can read it.
+    struct GatedProvider {
+        calls: std::sync::Mutex<Vec<String>>,
+        open: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Provider for GatedProvider {
+        async fn chat_scoped(
+            &self,
+            request: crate::ChatRequest,
+        ) -> Result<crate::ChatResponse, crate::providers::ScopedCallError> {
+            self.calls.lock().unwrap_poison().push(
+                request
+                    .messages
+                    .iter()
+                    .map(|m| format!("{m:?}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            if request.meta.as_ref().is_some_and(|m| m.role == "assistant") {
+                std::future::pending::<()>().await;
+            }
+            let mut open = self.open.clone();
+            while !*open.borrow_and_update() {
+                if open.changed().await.is_err() {
+                    break;
+                }
+            }
+            Ok(crate::ChatResponse {
+                text: Some("ANALYST FINDING".to_string()),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// End-to-end for an ANALYST-targeted round: the analysts run in the target
+    /// directory's synthetic workspace while the durable job and the delivered
+    /// envelope stay keyed to the caller's own workspace, and `jobs.exec_dir`
+    /// records the directory really used (so a restart resumes into it). The
+    /// gated provider parks the round until the durable row has been observed.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn targeted_round_records_exec_dir_and_delivers_to_the_caller() {
+        crate::util::test::init_management_test_stores().await;
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let provider = Arc::new(GatedProvider {
+            calls: std::sync::Mutex::new(Vec::new()),
+            open: gate_rx,
+        });
+        let _provider_guard = install_fake_provider(provider.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        // The spelling a resolved target stores (see `stored_workspace_path`):
+        // canonical, without the platform's verbatim prefix.
+        let target_path =
+            crate::util::strip_verbatim_prefix(&std::fs::canonicalize(dir.path()).unwrap())
+                .to_str()
+                .unwrap()
+                .to_string();
+        let caller = test_ws("/tmp/test_ws_analyze_target");
+
+        // The admin Assistant's tool path: a target-bearing analyze call (the
+        // caller identity the tool reads from its task-locals).
+        let ack = crate::agent::CURRENT_TOOL_USER_NAME
+            .scope("admin".to_string(), async {
+                crate::agent::CURRENT_TOOL_CHANNEL
+                    .scope("gui".to_string(), async {
+                        AnalyzeTool::targeted(Role::Assistant)
+                            .execute(
+                                &caller,
+                                json!({ "analyze": "what is here", "target": target_path }),
+                            )
+                            .await
+                    })
+                    .await
+            })
+            .await
+            .expect("dispatch acked");
+        let job_id = ack
+            .split("job ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .expect("the ack names the job id")
+            .to_string();
+
+        // The round parks on the gated provider: the job row exists and records
+        // the target directory while the durable delivery key stays the caller's.
+        let conn = &crate::session::store().conn;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (workspace_name, exec_dir) = loop {
+            let rows = conn
+                .query(
+                    "SELECT workspace_name, exec_dir FROM jobs WHERE id = ?1",
+                    crate::db::params![job_id.clone()],
+                )
+                .await
+                .unwrap();
+            if let Some(row) = rows.first() {
+                break (
+                    row.get::<String>(0).unwrap(),
+                    row.get::<Option<String>>(1).unwrap(),
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked round's job row never appeared"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert_eq!(
+            workspace_name, caller.name,
+            "the durable delivery key never moves"
+        );
+        assert_eq!(
+            exec_dir.as_deref(),
+            Some(target_path.as_str()),
+            "jobs.exec_dir records the directory the round really ran in"
+        );
+
+        gate_tx.send(true).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let envelope = loop {
+            let rows = conn
+                .query(
+                    "SELECT envelope FROM pending_jobs WHERE id = ?1",
+                    crate::db::params![job_id.clone()],
+                )
+                .await
+                .unwrap();
+            if let Some(row) = rows.first() {
+                break serde_json::from_str::<crate::agent::message_router::AgentJob>(
+                    &row.get::<String>(0).unwrap(),
+                )
+                .unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the targeted round never delivered its envelope"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        };
+        assert_eq!(envelope.workspace_name, caller.name);
+        assert!(
+            envelope.content.contains("ANALYST FINDING"),
+            "{}",
+            envelope.content
+        );
+        assert!(
+            envelope
+                .content
+                .contains(&format!("Directory: {target_path}")),
+            "{}",
+            envelope.content
+        );
+
+        // The analysts really saw the target directory: its path is in their
+        // system prompt, and their sessions are keyed to its synthetic
+        // workspace — never the caller's.
+        let calls = provider.calls.lock().unwrap_poison().join("\n");
+        assert!(
+            calls.contains(&target_path),
+            "the analyst system prompt carries the execution workspace's path"
+        );
+        let target_name = crate::tools::delegation::workspace_at_dir(&target_path)
+            .await
+            .unwrap()
+            .name;
+        assert!(target_name.starts_with("dir-"), "got {target_name}");
+        let target_sessions = conn
+            .query(
+                "SELECT agent_id FROM session_metadata WHERE workspace_name = ?1",
+                crate::db::params![target_name],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !target_sessions.is_empty(),
+            "the analysts' sessions are keyed to the target's synthetic workspace"
+        );
+        let caller_sessions = conn
+            .query(
+                "SELECT agent_id FROM session_metadata WHERE workspace_name = ?1",
+                crate::db::params![caller.name],
+            )
+            .await
+            .unwrap();
+        assert!(
+            caller_sessions.is_empty(),
+            "nothing ran in the caller's own workspace"
+        );
+    }
+
+    /// A `target` is inert for every holder but the admin's Assistant: the
+    /// guest's tool keeps today's interface (no new error, even for a value the
+    /// admin's tool refuses) and still runs the round in the caller's own
+    /// workspace, even when the value names a real directory.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn a_target_is_inert_for_a_guest_assistant() {
+        crate::util::test::init_management_test_stores().await;
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let _provider_guard =
+            install_fake_provider(Arc::new(FakeProvider::new().ok("ANALYST FINDING")));
+        let caller = test_ws("/tmp/test_ws_guest_inert_target");
+        let dir = tempfile::tempdir().unwrap();
+        let target_path =
+            crate::util::strip_verbatim_prefix(&std::fs::canonicalize(dir.path()).unwrap())
+                .to_str()
+                .unwrap()
+                .to_string();
+
+        let tool = AnalyzeTool::new(DispatchMode::Async, Role::Assistant);
+        // A value the admin's tool refuses (a bogus name) must not become a new
+        // error for the guest.
+        for target in ["not_a_registered_workspace", target_path.as_str()] {
+            let ack = tool
+                .execute(&caller, json!({ "analyze": "q", "target": target }))
+                .await
+                .expect("an inert target must not surface a new error");
+            assert!(ack.contains("dispatched"), "{ack}");
+        }
+
+        // Both rounds run in the caller's own workspace — never the target.
+        let conn = &crate::session::store().conn;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM session_metadata WHERE workspace_name = ?1",
+                    crate::db::params![caller.name.clone()],
+                )
+                .await
+                .unwrap();
+            if rows[0].get::<i64>(0).unwrap() > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the guest's round never ran in the caller's own workspace"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let target_name = crate::tools::delegation::workspace_at_dir(&target_path)
+            .await
+            .unwrap()
+            .name;
+        let target_sessions = conn
+            .query(
+                "SELECT agent_id FROM session_metadata WHERE workspace_name = ?1",
+                crate::db::params![target_name],
+            )
+            .await
+            .unwrap();
+        assert!(
+            target_sessions.is_empty(),
+            "the inert target directory never ran anything"
+        );
+    }
+
     /// Seed a caller-owned analyze job with a single roster slot. `outcome`
     /// `Some` marks the slot Done with that stored outcome (reconstructable);
     /// `None` leaves it launched.
@@ -2437,6 +2848,7 @@ mod tests {
             }],
             &crate::jobs::SpawnChild::Analyze,
             Some(pin),
+            None,
         )
         .await
         .unwrap();
@@ -2480,6 +2892,7 @@ mod tests {
             }],
             &crate::jobs::SpawnChild::Research,
             Some(pin),
+            None,
         )
         .await
         .unwrap();
@@ -2511,6 +2924,7 @@ mod tests {
                 ticket_id: ticket_id.clone(),
             },
             Some(pin),
+            None,
         )
         .await
         .unwrap();

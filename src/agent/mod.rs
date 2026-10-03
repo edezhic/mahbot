@@ -6196,6 +6196,7 @@ mod tests {
                 }],
                 &crate::jobs::SpawnChild::Analyze,
                 Some(pin),
+                None,
             )
             .await
             .unwrap();

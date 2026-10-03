@@ -144,10 +144,12 @@ pub async fn run_management() {
             | crate::jobs::ResumableJob::Analyze {
                 job_id,
                 workspace_name,
+                ..
             }
             | crate::jobs::ResumableJob::Implement {
                 job_id,
                 workspace_name,
+                ..
             }
             | crate::jobs::ResumableJob::ResearchCleanup {
                 job_id,
@@ -169,16 +171,30 @@ pub async fn run_management() {
                     crate::tools::research::resume_research_run(&job_id, &workspace).await;
                 });
             }
-            crate::jobs::ResumableJob::Analyze { job_id, .. } => {
+            crate::jobs::ResumableJob::Analyze {
+                job_id, exec_dir, ..
+            } => {
                 info!(job = %job_id, "Resuming analyze round at boot");
                 tokio::spawn(async move {
-                    crate::tools::analyze::resume_analyze_round(&job_id, &workspace).await;
+                    crate::tools::analyze::resume_analyze_round(
+                        &job_id,
+                        &workspace,
+                        exec_dir.as_deref(),
+                    )
+                    .await;
                 });
             }
-            crate::jobs::ResumableJob::Implement { job_id, .. } => {
+            crate::jobs::ResumableJob::Implement {
+                job_id, exec_dir, ..
+            } => {
                 info!(job = %job_id, "Resuming implement round at boot");
                 tokio::spawn(async move {
-                    crate::tools::implement::resume_implement_round(&job_id, &workspace).await;
+                    crate::tools::implement::resume_implement_round(
+                        &job_id,
+                        &workspace,
+                        exec_dir.as_deref(),
+                    )
+                    .await;
                 });
             }
             crate::jobs::ResumableJob::ResearchCleanup { job_id, .. } => {
@@ -405,6 +421,7 @@ async fn dispatch_working_phases(ws: &Workspace) {
                 phase,
                 ticket_id: ticket.id.clone(),
             },
+            None,
             None,
         )
         .await

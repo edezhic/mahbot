@@ -436,6 +436,7 @@ async fn phase_job_is_unique_and_terminalizes() {
             ticket_id: ticket_id.clone(),
         },
         None,
+        None,
     )
     .await
     .unwrap();
@@ -454,6 +455,7 @@ async fn phase_job_is_unique_and_terminalizes() {
             phase,
             ticket_id: ticket_id.clone(),
         },
+        None,
         None,
     )
     .await
@@ -586,6 +588,7 @@ async fn halfway_bounce(ws: &Workspace, bounce_count: i64) -> Ticket {
             ticket_id: id.clone(),
         },
         None,
+        None,
     )
     .await
     .unwrap();
@@ -637,6 +640,7 @@ async fn bounce_to_development_returns_ticket_without_tripping() {
             phase: TicketPhase::Verification,
             ticket_id: id.clone(),
         },
+        None,
         None,
     )
     .await
@@ -696,6 +700,7 @@ async fn bounce_breaker_trips_to_failed() {
             phase: TicketPhase::Verification,
             ticket_id: id.clone(),
         },
+        None,
         None,
     )
     .await
@@ -775,6 +780,7 @@ async fn reset_phase_attempt_destroys_attempt_and_pauses() {
             ticket_id: id.clone(),
         },
         None,
+        None,
     )
     .await
     .unwrap();
@@ -844,6 +850,7 @@ async fn reset_phase_attempt_analysis_does_not_pause() {
             ticket_id: id.clone(),
         },
         None,
+        None,
     )
     .await
     .unwrap();
@@ -899,6 +906,7 @@ async fn spawn_phase_job(
             phase,
             ticket_id: ticket_id.to_string(),
         },
+        None,
         None,
     )
     .await
@@ -2689,6 +2697,7 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
         }],
         &crate::jobs::SpawnChild::Analyze,
         Some(&pin),
+        None,
     )
     .await
     .unwrap();

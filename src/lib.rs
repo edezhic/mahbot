@@ -320,10 +320,10 @@ impl Workspace {
         last_path_component(self.as_path())
     }
 
-    /// Create a per-run workspace (research run roots, the temp cleaner).
-    /// `name` becomes the search-engine registry key (e.g. the research
-    /// `job_id`); the workspace is never registered in the `workspaces` table
-    /// and its lifetime is bounded by the run it serves.
+    /// Create a per-run workspace (research run roots, the temp cleaner,
+    /// targeted delegation rounds). `name` becomes the search-engine registry
+    /// key (e.g. the research `job_id`); the workspace is never registered in
+    /// the `workspaces` table and its lifetime is bounded by the run it serves.
     #[must_use]
     pub fn ephemeral_run(name: &str, path: &Path) -> Self {
         Self {
@@ -340,7 +340,7 @@ impl Workspace {
 /// [`crate::util::strip_verbatim_prefix`]) — the spelling the shell, the prompts
 /// and [`crate::tools::path`] should not have to carry. Falls back to the raw path
 /// when the directory does not exist yet.
-fn stored_workspace_path(path: &Path) -> PathBuf {
+pub(crate) fn stored_workspace_path(path: &Path) -> PathBuf {
     crate::util::with_block_in_place(|| {
         std::fs::canonicalize(path).map_or_else(
             |_| path.to_path_buf(),
