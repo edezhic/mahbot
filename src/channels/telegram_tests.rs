@@ -1946,23 +1946,101 @@ fn video_filename_normalization() {
     );
 }
 
-// ── Album merge tests ───────────────────────────────────────────
+// ── Album placement + merge tests ───────────────────────────────
+
+/// One polled update of a photo album: only the field the placement plan reads.
+fn album_member_update(message_id: i64, group: &str) -> serde_json::Value {
+    test_update(&[(
+        "message",
+        serde_json::json!({ "message_id": message_id, "media_group_id": group }),
+    )])
+}
+
+/// A button press whose keyboard sits on an album photo: the press carries its
+/// own `message`, whose `media_group_id` puts it in that album's raw shape.
+fn album_button_press_update(group: &str) -> serde_json::Value {
+    test_update(&[(
+        "callback_query",
+        test_callback_query(&[(
+            "message",
+            serde_json::json!({ "message_id": 42, "media_group_id": group }),
+        )]),
+    )])
+}
 
 #[test]
-fn merge_album_members_joins_content_and_unions_attachment_dirs() {
+fn poll_plan_parses_each_album_at_its_first_member() {
+    // An album of two, separated by a plain message, plus a one-member album:
+    // the album is parsed whole at its first member, the message between its
+    // members stays where it is, and the later member is skipped there.
+    let updates = vec![
+        album_member_update(41, "g1"),
+        test_update(&[]),
+        album_member_update(42, "g1"),
+        album_member_update(43, "g2"),
+    ];
+    assert_eq!(
+        poll_plan(&updates),
+        vec![
+            PollPlacement::Album(vec![0, 2]),
+            PollPlacement::Single,
+            PollPlacement::Skip,
+            PollPlacement::Album(vec![3]),
+        ]
+    );
+}
+
+#[test]
+fn poll_plan_keeps_a_button_press_out_of_its_album() {
+    // A press carries the message its button sits on, so a press on an album
+    // photo must never join that album: joined, the photo would be handed over a
+    // second time as an inbound message, or — where the press is the first member
+    // of the batch, so the album is parsed there — the album's other members
+    // would stay skipped and be lost.
+    let press_first = vec![
+        album_button_press_update("g1"),
+        album_member_update(42, "g1"),
+        album_member_update(43, "g1"),
+    ];
+    assert_eq!(
+        poll_plan(&press_first),
+        vec![
+            PollPlacement::Callback,
+            PollPlacement::Album(vec![1, 2]),
+            PollPlacement::Skip,
+        ]
+    );
+
+    let press_between = vec![
+        album_member_update(41, "g1"),
+        album_button_press_update("g1"),
+        album_member_update(43, "g1"),
+    ];
+    assert_eq!(
+        poll_plan(&press_between),
+        vec![
+            PollPlacement::Album(vec![0, 2]),
+            PollPlacement::Callback,
+            PollPlacement::Skip,
+        ]
+    );
+}
+
+#[test]
+fn album_members_merge_into_one_message() {
     let first_chat = "-100";
     let second_chat = "-200";
     let first = ChannelMessage {
         message_id: Some(41),
         chat_id: Some(first_chat.into()),
-        content: "first".into(),
+        content: "a".into(),
         attachment_dirs: vec![crate::util::telegram_staging_dir_name(first_chat, 41)],
         ..test_msg("alice", "", "telegram", "chat")
     };
     let second = ChannelMessage {
         message_id: Some(42),
         chat_id: Some(second_chat.into()),
-        content: "second".into(),
+        content: "b".into(),
         attachment_dirs: vec![
             crate::util::telegram_staging_dir_name(second_chat, 42),
             crate::util::telegram_staging_dir_name(second_chat, 43),
@@ -1970,17 +2048,75 @@ fn merge_album_members_joins_content_and_unions_attachment_dirs() {
         ..test_msg("bob", "", "telegram", "other")
     };
 
-    let merged = merge_album_members(vec![first, second]).expect("album has a member");
+    // The first member starts the album unchanged...
+    let album = merge_album_member(None, first.clone());
+    assert_eq!(album.content, "a");
+    assert_eq!(album.attachment_dirs, first.attachment_dirs);
 
-    assert_eq!(merged.content, "first\nsecond");
+    // ...and a later member joins its content with a newline and its staging
+    // dirs onto the album.
+    let album = merge_album_member(Some(album), second);
+    assert_eq!(album.content, "a\nb");
     assert_eq!(
-        merged.attachment_dirs,
+        album.attachment_dirs,
         vec![
             crate::util::telegram_staging_dir_name(first_chat, 41),
             crate::util::telegram_staging_dir_name(second_chat, 42),
             crate::util::telegram_staging_dir_name(second_chat, 43),
         ]
     );
+}
+
+// ── Control message tests ───────────────────────────────────────
+
+#[test]
+fn is_control_message_covers_commands_and_callbacks() {
+    assert!(is_control_message(&test_msg(
+        "alice", "/pause", "telegram", "chat"
+    )));
+    assert!(is_control_message(&test_msg(
+        "alice",
+        "/maintenance on",
+        "telegram",
+        "chat"
+    )));
+    assert!(is_control_message(&test_msg(
+        "alice",
+        "/image_models",
+        "telegram",
+        "chat"
+    )));
+    // The dispatch loop decodes `__act__` payloads from the text alone, so the
+    // collector must too — otherwise a burst would fuse the payload into an
+    // agent turn while the same text sent alone would be an action.
+    assert!(is_control_message(&test_msg(
+        "alice",
+        "__act__set_workspace|ws",
+        "telegram",
+        "chat"
+    )));
+
+    let mut callback = test_msg("alice", "anything", "telegram", "chat");
+    callback.callback_query_id = Some("1".to_string());
+    assert!(is_control_message(&callback));
+    // The press carries no control input of its own, so it still reaches the
+    // agent on the dispatch path — it is only barred from being collected.
+    assert!(control_input(&callback).is_none());
+
+    // Only Telegram routes commands; elsewhere a slash is ordinary text.
+    assert!(!is_control_message(&test_msg(
+        "alice", "/pause", "gui", "chat"
+    )));
+    // Plain text, and text that merely looks like a command, is not control.
+    assert!(!is_control_message(&test_msg(
+        "alice", "hello", "telegram", "chat"
+    )));
+    assert!(!is_control_message(&test_msg(
+        "alice",
+        "/etc/hosts",
+        "telegram",
+        "chat"
+    )));
 }
 
 // ── Forwarded message tests ─────────────────────────────────────
@@ -2481,6 +2617,7 @@ fn test_msg(user_name: &str, content: &str, channel: &str, reply_target: &str) -
         chat_id: None,
         message_id: None,
         attachment_dirs: Vec::new(),
+        parts: Vec::new(),
     }
 }
 

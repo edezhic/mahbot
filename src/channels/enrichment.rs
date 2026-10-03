@@ -1132,6 +1132,7 @@ mod tests {
             chat_id: Some(TEST_CHAT_ID.into()),
             message_id: None,
             attachment_dirs: Vec::new(),
+            parts: Vec::new(),
         }
     }
 

@@ -81,12 +81,49 @@ const ACTION_PREFIX: &str = "__act__";
 /// - `__act__clear_session|` → `("clear_session", "")`
 /// - `__act__clear_session` → `("clear_session", "")`
 #[must_use]
-pub fn decode_action(content: &str) -> Option<(String, String)> {
+pub(crate) fn decode_action(content: &str) -> Option<(String, String)> {
     let rest = content.strip_prefix(ACTION_PREFIX)?;
     match rest.split_once('|') {
         Some((action, payload)) => Some((action.to_string(), payload.to_string())),
         None => Some((rest.to_string(), String::new())),
     }
+}
+
+/// The control-plane input a message carries: something the dispatch loop handles
+/// itself, without the assistant. `None` for a message the agent path handles —
+/// including a button press whose payload is neither kind, which has always gone
+/// to the agent.
+#[derive(Debug)]
+pub enum ControlInput {
+    /// An `__act__` action payload, as `(action, payload)`.
+    Action((String, String)),
+    /// A bot command.
+    Command(crate::BotCommand),
+}
+
+/// Which control-plane input an inbound message carries, or `None` when the agent
+/// path handles it. A bot command counts only on Telegram: other channels route
+/// `/`-prefixed text as ordinary text.
+#[must_use]
+pub fn control_input(msg: &ChannelMessage) -> Option<ControlInput> {
+    if let Some(action) = decode_action(&msg.content) {
+        return Some(ControlInput::Action(action));
+    }
+    if msg.channel == "telegram"
+        && let Some(cmd) = crate::parse_bot_command(&msg.content)
+    {
+        return Some(ControlInput::Command(cmd));
+    }
+    None
+}
+
+/// True for a message the burst collector must never hold: one carrying control
+/// input ([`control_input`]), or a button press. This is a superset of
+/// [`control_input`] — the dispatch loop lets a press whose payload is neither
+/// kind fall through to the agent, but a burst must not hold it either.
+#[must_use]
+pub(crate) fn is_control_message(msg: &ChannelMessage) -> bool {
+    msg.callback_query_id.is_some() || control_input(msg).is_some()
 }
 
 /// Metadata for an incoming document or photo attachment.
@@ -315,6 +352,7 @@ impl MessageContext {
             chat_id: (!self.chat_id.is_empty()).then_some(self.chat_id),
             message_id: (self.message_id != 0).then_some(self.message_id),
             attachment_dirs: Vec::new(),
+            parts: Vec::new(),
         }
     }
 
@@ -1463,6 +1501,11 @@ fn to_telegram_html(text: &str) -> String {
     markdown_to_telegram_html(&decode_html_entities(text))
 }
 
+/// Prefix of the forward attribution prepended to a forwarded message's content.
+/// The burst collector recognises a forwarded part by it (see
+/// `channels::telegram_group`).
+pub(super) const FORWARD_ATTRIBUTION_PREFIX: &str = "[Forwarded from ";
+
 impl TelegramChannel {
     /// Internal constructor shared by [`new`](Self::new) and
     /// [`with_offset`](Self::with_offset).
@@ -2124,7 +2167,7 @@ impl TelegramChannel {
         self.refuse_with_notice(ctx, &notice, content).await
     }
 
-    /// Build a forwarding attribution prefix from Telegram forward fields.
+    /// Build a forwarding attribution prefix from Telegram's forward fields.
     ///
     /// Returns `Some("[Forwarded from ...] ")` when the message is forwarded,
     /// `None` otherwise.
@@ -2135,17 +2178,17 @@ impl TelegramChannel {
                 .get("title")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown channel");
-            Some(format!("[Forwarded from channel: {title}] "))
+            Some(format!("{FORWARD_ATTRIBUTION_PREFIX}channel: {title}] "))
         } else if let Some(from_user) = message.get("forward_from") {
             // Forwarded from a user (privacy allows identity)
             let label = format_sender_label(from_user);
-            Some(format!("[Forwarded from {label}] "))
+            Some(format!("{FORWARD_ATTRIBUTION_PREFIX}{label}] "))
         } else {
             // Forwarded from a user who hides their identity
             message
                 .get("forward_sender_name")
                 .and_then(serde_json::Value::as_str)
-                .map(|name| format!("[Forwarded from {name}] "))
+                .map(|name| format!("{FORWARD_ATTRIBUTION_PREFIX}{name}] "))
         }
     }
 
@@ -2577,12 +2620,41 @@ impl TelegramChannel {
         }
     }
 
-    /// Process a batch of Telegram updates, sending parsed messages through the
-    /// message pipeline.
+    /// Parse one polled update into a message: a text message, an attachment, or
+    /// (logged and skipped) nothing. A parsed update gets its acknowledgement
+    /// reaction, as it always has.
+    async fn parse_polled_update(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
+        let msg = if let Some(msg) = self.parse_update_message(update).await {
+            msg
+        } else if let Some(msg) = self.try_parse_attachment_message(update).await {
+            msg
+        } else {
+            Self::handle_non_parseable_message(update);
+            return None;
+        };
+
+        // Send ACK reaction for every individual update (fire-and-forget)
+        if let Some((reaction_chat_id, reaction_message_id)) =
+            Self::extract_update_message_target(update)
+        {
+            self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
+        }
+        Some(msg)
+    }
+
+    /// Process a batch of Telegram updates, feeding parsed messages to the
+    /// burst collector through `tx`.
+    ///
+    /// Each update is handed over as soon as it has been parsed, and the
+    /// hand-over awaits a free queue slot, so a slow attachment download or a
+    /// stalled pipeline delays the updates behind it in the same poll. The one
+    /// thing parsed out of turn is an album (media group): its members are parsed
+    /// together at the position of the album's first member, so an album is
+    /// delivered where the user sent it instead of after the rest of the poll.
     ///
     /// Handles text messages (via [`Self::parse_update_message`] /
-    /// [`Self::try_parse_attachment_message`]), callback queries, and photo album
-    /// buffering (media groups are merged into a single message).
+    /// [`Self::try_parse_attachment_message`]), callback queries, and photo
+    /// albums (media groups are merged into a single message).
     ///
     /// Returns `true` if the pipeline is still alive, `false` if the channel was
     /// closed (`tx.send()` failed) — the caller should exit the long-poll loop.
@@ -2591,95 +2663,143 @@ impl TelegramChannel {
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
         updates: Vec<serde_json::Value>,
     ) -> bool {
-        let mut album_groups: HashMap<String, Vec<ChannelMessage>> = HashMap::new();
+        let plan = poll_plan(&updates);
 
-        for update in updates {
-            // Check for callback_query first — it has a different structure
-            if let Some(cq) = update.get("callback_query") {
-                let cq_id = cq["id"].as_str().map(ToString::to_string);
-                let cq_data = cq["data"].as_str().unwrap_or("");
-
-                // For __act__ callbacks, do NOT answer early — the action handler
-                // (handle_action_callback in main.rs) will answer with the appropriate
-                // toast text. Dismiss the spinner now for all other callbacks.
-                if !cq_data.starts_with(ACTION_PREFIX)
-                    && let Some(ref id) = cq_id
-                {
-                    self.answer_callback_query(id, None).await;
+        for (update, placement) in updates.iter().zip(plan) {
+            match placement {
+                // A button press is not a message: its `message` is the message
+                // the button sits on (see `poll_plan`).
+                PollPlacement::Callback => {
+                    if !self.handle_callback_press(tx, update).await {
+                        return false;
+                    }
                 }
-
-                let Some(msg) = self.parse_callback_query(cq).await else {
-                    continue;
-                };
-                if tx.send(msg).await.is_err() {
-                    return false;
+                PollPlacement::Skip => {}
+                PollPlacement::Single => {
+                    if let Some(msg) = self.parse_polled_update(update).await
+                        && tx.send(msg).await.is_err()
+                    {
+                        return false;
+                    }
                 }
-                continue;
-            }
-
-            let msg = if let Some(m) = self.parse_update_message(&update).await {
-                m
-            } else if let Some(m) = self.try_parse_attachment_message(&update).await {
-                m
-            } else {
-                Self::handle_non_parseable_message(&update);
-                continue;
-            };
-
-            // Send ACK reaction for every individual update (fire-and-forget)
-            if let Some((reaction_chat_id, reaction_message_id)) =
-                Self::extract_update_message_target(&update)
-            {
-                self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
-            }
-
-            // Check for media group (album) membership
-            let media_group_id = update
-                .get("message")
-                .and_then(|m| m.get("media_group_id"))
-                .and_then(|v| v.as_str())
-                .map(String::from);
-
-            if let Some(group_id) = media_group_id {
-                // Buffer — combine after collecting all group members
-                album_groups.entry(group_id).or_default().push(msg);
-            } else {
-                // Not part of a media group — send immediately
-                if tx.send(msg).await.is_err() {
-                    return false;
+                PollPlacement::Album(members) => {
+                    let mut album = None;
+                    for member in members {
+                        if let Some(msg) = self.parse_polled_update(&updates[member]).await {
+                            album = Some(merge_album_member(album, msg));
+                        }
+                    }
+                    if let Some(album) = album
+                        && tx.send(album).await.is_err()
+                    {
+                        return false;
+                    }
                 }
-            }
-        }
-
-        // Flush all buffered album groups — combine content with \n separator
-        for (_group_id, group_messages) in album_groups.drain() {
-            let Some(merged) = merge_album_members(group_messages) else {
-                continue;
-            };
-            if tx.send(merged).await.is_err() {
-                return false;
             }
         }
 
         true
     }
+
+    /// Handle one button press, and report whether the pipeline is still alive.
+    /// The press is parsed on its own — never as the message it sits on — and
+    /// handed over as control input.
+    async fn handle_callback_press(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        update: &serde_json::Value,
+    ) -> bool {
+        let cq = &update["callback_query"];
+        let cq_id = cq["id"].as_str().map(ToString::to_string);
+        let cq_data = cq["data"].as_str().unwrap_or("");
+
+        // For __act__ callbacks, do NOT answer early — the action handler
+        // (handle_action_callback in main.rs) will answer with the appropriate
+        // toast text. Dismiss the spinner now for all other callbacks.
+        if !cq_data.starts_with(ACTION_PREFIX)
+            && let Some(ref id) = cq_id
+        {
+            self.answer_callback_query(id, None).await;
+        }
+
+        let Some(msg) = self.parse_callback_query(cq).await else {
+            return true;
+        };
+        tx.send(msg).await.is_ok()
+    }
 }
 
-/// Merge a Telegram album (media group) into the single message the pipeline
-/// processes: members arrive as separate updates, so their contents are
-/// concatenated and every member's inbound staging directory is carried over
-/// (see [`ChannelMessage::attachment_dirs`]); addressing fields come from the
-/// first member. `None` for an empty group (an internal invariant failure that
-/// must not abort the inbound listener).
-fn merge_album_members(members: Vec<ChannelMessage>) -> Option<ChannelMessage> {
-    let mut members = members.into_iter();
-    let mut acc = members.next()?;
-    for next in members {
-        acc.content.push('\n');
-        acc.content.push_str(&next.content);
-        acc.attachment_dirs.extend(next.attachment_dirs);
+/// Fold a parsed album member into the album message built so far: content
+/// joined with a newline (the album reads as one message) and the member's
+/// staging directories kept, since each member downloads into its own. The
+/// first member starts the album.
+fn merge_album_member(album: Option<ChannelMessage>, member: ChannelMessage) -> ChannelMessage {
+    match album {
+        Some(mut album) => {
+            album.content.push('\n');
+            album.content.push_str(&member.content);
+            album.attachment_dirs.extend(member.attachment_dirs);
+            album
+        }
+        None => member,
     }
-    Some(acc)
+}
+
+/// How one update of a poll is parsed.
+///
+/// An album's members can be separated by other updates in the poll, so an album
+/// is parsed whole at the position of its first member and its other members are
+/// skipped where they sit — that is what keeps the user's send order.
+#[derive(Debug, PartialEq, Eq)]
+enum PollPlacement {
+    /// Parse and hand over this update on its own.
+    Single,
+    /// An album's first member: parse every listed update (this one first) and
+    /// merge them into the one message an album is.
+    Album(Vec<usize>),
+    /// A later album member, already carried by its album's first member.
+    Skip,
+    /// A button press, handled as control input. It carries the message its
+    /// button sits on, which is why it is placed apart: reading that message here
+    /// would put an album photo into its album a second time, or — when the press
+    /// is the album's first member of the batch — leave the album's other members
+    /// skipped and lost.
+    Callback,
+}
+
+/// Read each album's (media group's) member positions from the raw updates, so
+/// the poll can be walked once: nothing has to be parsed for this, album
+/// membership is a field of the raw update.
+fn poll_plan(updates: &[serde_json::Value]) -> Vec<PollPlacement> {
+    let mut plan: Vec<PollPlacement> = updates
+        .iter()
+        .map(|update| match update.get("callback_query") {
+            Some(_) => PollPlacement::Callback,
+            None => PollPlacement::Single,
+        })
+        .collect();
+    let mut albums: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (at, update) in updates.iter().enumerate() {
+        if plan[at] == PollPlacement::Callback {
+            continue;
+        }
+        if let Some(group) = update
+            .get("message")
+            .and_then(|message| message.get("media_group_id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            albums.entry(group).or_default().push(at);
+        }
+    }
+    for members in albums.into_values() {
+        let (first, rest) = members.split_first().expect("an album has a member");
+        let first = *first;
+        for &later in rest {
+            plan[later] = PollPlacement::Skip;
+        }
+        plan[first] = PollPlacement::Album(members);
+    }
+    plan
 }
 
 #[async_trait]
@@ -2791,6 +2911,14 @@ impl Channel for TelegramChannel {
         }
 
         tracing::debug!("Startup probe succeeded; entering main long-poll loop.");
+
+        // Collected bursts are assembled off the poll loop, so getUpdates keeps
+        // being issued while a group waits; the queue's bound and what dropping
+        // its sender does are `telegram_group`'s.
+        let (parts_tx, parts_rx) =
+            tokio::sync::mpsc::channel(crate::channels::telegram_group::QUEUE_CAPACITY);
+        crate::channels::telegram_group::spawn_collector(parts_rx, tx);
+
         let shutdown_token = crate::shutdown::shutdown_token();
         let per_channel_cancel = self.cancel.clone();
 
@@ -2831,7 +2959,10 @@ impl Channel for TelegramChannel {
                         PollOutcome::Transport => continue,
                     };
 
-                    if !self.process_updates(&tx, updates).await {
+                    if !self.process_updates(&parts_tx, updates).await {
+                        tracing::warn!(
+                            "Telegram listener stopping: the message pipeline is closed"
+                        );
                         return Ok(());
                     }
                 }

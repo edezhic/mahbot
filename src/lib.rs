@@ -457,7 +457,9 @@ pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
 /// construction sites (voice, onboarding, GUI chat), keeping Telegram-only
 /// fields (`callback_query_id`, `chat_id`, `message_id`, and the other
 /// `Option`s) out of their literals. Never dispatch `ChannelMessage::default()`
-/// directly — an empty `channel`/`user_name`/`content` is not routable.
+/// directly — an empty `channel`/`user_name`/`content` is not routable. The one
+/// shape that legitimately carries an empty `content` is a collected burst,
+/// whose text lives in its [`parts`](Self::parts).
 ///
 /// When adding a new non-`Option` field, remember that spread sites will
 /// silently pick up its default instead of failing to compile.
@@ -496,6 +498,12 @@ pub struct ChannelMessage {
     /// directory named by `util::telegram_staging_dir_name`, so this is the set
     /// of directories the message may read, copy from and delete.
     pub attachment_dirs: Vec<String>,
+    /// The individual messages a collected burst is composed of, in send order,
+    /// when the Telegram channel merged several into one request (see
+    /// `channels::telegram_group`). Empty for a message delivered on its own, the
+    /// envelope then being the message itself. One level deep — a part never
+    /// carries parts of its own. Set only by the Telegram burst collector.
+    pub parts: Vec<ChannelMessage>,
 }
 
 /// An outbound message to deliver on a channel.

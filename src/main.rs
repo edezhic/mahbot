@@ -22,10 +22,9 @@ use tokio_util::sync::CancellationToken;
 
 use mahbot::agent::message_router;
 use mahbot::channels::broadcast_and_persist_incoming_message;
-use mahbot::channels::telegram::{decode_action, user_command_entries};
+use mahbot::channels::telegram::{ControlInput, control_input, user_command_entries};
 use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
-use mahbot::parse_bot_command;
 use mahbot::session::clear_session;
 use mahbot::util::UnwrapPoison;
 use mahbot::{BotCommand, Channel, ChannelMessage, Role, Workspace};
@@ -893,39 +892,30 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
             },
         };
 
-        // Handle action callbacks (__act__ prefix) — route to a handler that
-        // updates config / clears session without involving the Manager agent.
-        // Spawned so a slow catalog validation in
-        // set_image_model never stalls the shared dispatch loop.
-        if let Some(decoded) = decode_action(&msg.content) {
-            spawn(handle_action_callback(msg, decoded));
-            continue;
+        // This classification decides what the control plane does itself; the
+        // burst collector's gate (`is_control_message`) is it plus the button
+        // press, so nothing handled here is ever collected into a burst.
+        match control_input(&msg) {
+            // An action payload is handled without the agent. Spawned so a slow
+            // catalog validation in set_image_model never stalls this loop.
+            Some(ControlInput::Action(decoded)) => {
+                spawn(handle_action_callback(msg, decoded));
+            }
+            Some(ControlInput::Command(cmd)) => {
+                handle_bot_command(&msg, cmd).await;
+            }
+            // An ordinary message — or a button press whose payload is neither an
+            // action nor a command — goes to the agent, as it always has.
+            None => {
+                spawn(process_channel_message(msg));
+            }
         }
-
-        if handle_bot_command(&msg).await {
-            continue;
-        }
-
-        spawn(process_channel_message(msg));
     }
 }
 
-/// Handle Telegram bot text commands. Returns `true` if the message was
-/// handled (loop should `continue`), `false` if it should be processed by
-/// the agent pipeline.
-///
-/// Only Telegram gets command handling; GUI and other channels route
-/// these messages as normal text (returns false to fall through to
-/// `process_channel_message`).
-async fn handle_bot_command(msg: &ChannelMessage) -> bool {
-    let Some(cmd) = parse_bot_command(&msg.content) else {
-        return false;
-    };
-
-    if msg.channel != "telegram" {
-        return false;
-    }
-
+/// Handle a bot command on Telegram, already classified and parsed by
+/// [`control_input`].
+async fn handle_bot_command(msg: &ChannelMessage, cmd: BotCommand) {
     match cmd {
         BotCommand::Start => handle_start_command(msg).await,
         BotCommand::Clear => handle_clear_session(msg).await,
@@ -964,7 +954,6 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
             }
         }
     }
-    true
 }
 
 /// `base` with `tail` appended as a second sentence, or `base` alone when there is
@@ -1606,32 +1595,50 @@ async fn answer_telegram_callback(msg: &ChannelMessage, toast: Option<String>) {
     }
 }
 
-async fn process_channel_message(mut msg: ChannelMessage) {
-    tracing::info!(
-        "💬 [{}] from {}: {}",
-        msg.channel,
-        msg.user_name,
-        mahbot::util::truncate(&msg.content, 80)
-    );
+async fn process_channel_message(msg: ChannelMessage) {
+    // A collected burst arrives as one message whose `parts` are the individual
+    // messages in send order (see `channels::telegram_group`); a message that
+    // arrived on its own is the one-part case of the same flow, so both go
+    // through one path. Either way the parts are never empty — a lone message is
+    // wrapped into one, a collected burst always holds at least two.
+    let user_name = msg.user_name.clone();
+    let channel = msg.channel.clone();
+    let reply_target = msg.reply_target.clone();
+    let mut parts = if msg.parts.is_empty() {
+        vec![msg]
+    } else {
+        msg.parts
+    };
 
-    let ws = mahbot::users::resolve_workspace_for_user_name(&msg.user_name).await;
+    let ws = mahbot::users::resolve_workspace_for_user_name(&user_name).await;
 
     // Every account routes to the single Assistant role, and the Assistant
     // always works in the user's personal workspace regardless of the selected
-    // workspace — resolved before enrichment and before `msg.workspace` is set
-    // so uploads, broadcast, persist and chat_history stay consistent with the
-    // routed workspace.
-    let ws =
-        mahbot::users::effective_workspace_for_role(mahbot::Role::Assistant, ws, &msg.user_name);
+    // workspace — resolved before enrichment and before the burst's workspace is
+    // set so uploads, broadcast, persist and chat_history stay consistent with
+    // the routed workspace.
+    let ws = mahbot::users::effective_workspace_for_role(mahbot::Role::Assistant, ws, &user_name);
 
-    // Populate workspace on the message so downstream broadcasts and
+    // Populate workspace on every part so downstream broadcasts and
     // chat_history writes carry the correct (effective) workspace.
-    msg.workspace = ws.name.clone();
+    for part in &mut parts {
+        part.workspace.clone_from(&ws.name);
+    }
 
-    // Save original content before enrichment so we persist the raw
-    // user-typed text to chat_history (avoids storing large data URIs from
-    // image processing).
-    let original_content = msg.content.clone();
+    // The raw user-typed text of every part, so chat_history stores what the
+    // user wrote rather than the enriched form (which can carry large data URIs
+    // from image processing) — captured together with the log line, before
+    // enrichment rewrites the content.
+    let mut originals = Vec::with_capacity(parts.len());
+    for part in &parts {
+        tracing::info!(
+            "💬 [{}] from {}: {}",
+            part.channel,
+            part.user_name,
+            mahbot::util::truncate(&part.content, 80)
+        );
+        originals.push(part.content.clone());
+    }
 
     // ── Media-marker enrichment (audio transcription, image processing) ──
     // Runs BEFORE broadcast so the GUI receives the enriched form instead of
@@ -1639,55 +1646,72 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // honest "not supported" note). Media-marker enrichment turns images into
     // native data-URI parts carrying the original bytes (re-encoded to a
     // bounded JPEG only when they would exceed the encoded-payload cap) and
-    // videos into a workspace copy + transcription. Link enrichment runs
-    // separately AFTER broadcast to avoid showing AI-generated URL summaries in
-    // the user's own message bubble.
+    // videos into a workspace copy + transcription.
+    // The parts are independent and this is the expensive step — transcription,
+    // image decoding — so the whole burst is enriched at once, exactly as the
+    // parts were when each was its own task.
     // Every routed turn is the Assistant's, so a workspace path is always
     // attached: workspace copies and the video transcription it triggers
     // are always seen.
-    mahbot::channels::enrich_message(&mut msg, Some(ws.as_path())).await;
+    futures_util::future::join_all(
+        parts
+            .iter_mut()
+            .map(|part| mahbot::channels::enrich_message(part, Some(ws.as_path()))),
+    )
+    .await;
 
-    // ── Broadcast, persist, and mirror ─────────────────────────────────
-    // `persist_content` decides what reaches chat history: the raw original
-    // text, or the data-URI-stripped enriched content when the markers name
-    // inbound attachments whose temp paths must not be persisted.
-    let content_for_history = mahbot::channels::persist_content(&original_content, &msg.content);
-    broadcast_and_persist_incoming_message(&msg, &msg.content, &content_for_history).await;
+    // ── Broadcast, persist, link enrichment, reply marker ───────────────
+    // Each part is handled on its own, in send order, so the user's own
+    // messages keep their exact appearance while the assistant receives the
+    // whole burst as one request below. The part bubbles appear once the
+    // slowest part of the burst is enriched, which is what keeps them in the
+    // order they were sent instead of interleaved with a late transcription.
+    for (part, original_content) in parts.iter_mut().zip(&originals) {
+        // Broadcast/mirror. `persist_content` decides what reaches chat
+        // history: the raw original text, or the data-URI-stripped enriched
+        // content when the markers name inbound attachments whose temp paths
+        // must not be persisted.
+        let content_for_history =
+            mahbot::channels::persist_content(original_content, &part.content);
+        broadcast_and_persist_incoming_message(part, &part.content, &content_for_history).await;
 
-    // ── Link enrichment (URL summaries for agent context) ─────────────
-    // Runs after broadcast so AI-generated summaries don't appear in the
-    // user's own message bubble.
-    let enriched = mahbot::channels::enrich_links(&msg.content).await;
-    if let Cow::Owned(s) = enriched {
-        tracing::info!(
-            channel = %msg.channel,
-            user_name = %msg.user_name,
-            "Link enricher: prepended URL summaries to message"
-        );
-        msg.content = s;
+        // ── Link enrichment (URL summaries for agent context) ─────────────
+        // Runs after broadcast so AI-generated summaries don't appear in the
+        // user's own message bubble.
+        let enriched = mahbot::channels::enrich_links(&part.content).await;
+        if let Cow::Owned(s) = enriched {
+            tracing::info!(
+                channel = %part.channel,
+                user_name = %part.user_name,
+                "Link enricher: prepended URL summaries to message"
+            );
+            part.content = s;
+        }
+
+        // ── Reply marker ────────────────────────────────────────────────
+        // Prepend the reply marker AFTER link enrichment (so URL summaries never
+        // see it) and BEFORE routing. Broadcast + persist ran above on the
+        // marker-free content, so the marker never reaches chat_history.
+        if let Some(reply) = part.reply_reference.clone() {
+            part.content = mahbot::channels::apply_reply_marker(&part.content, &reply);
+        }
     }
 
-    // ── Reply marker ────────────────────────────────────────────────
-    // Prepend the reply marker AFTER link enrichment (so URL summaries never
-    // see it) and BEFORE routing. Broadcast + persist ran above on the
-    // marker-free content, so the marker never reaches chat_history.
-    if let Some(reply) = msg.reply_reference.clone() {
-        msg.content = mahbot::channels::apply_reply_marker(&msg.content, &reply);
-    }
+    let content = mahbot::channels::compose_group_content(parts);
 
     // ── Route through the agent-ID message router ─────────────────
     // Every account routes to the single Assistant, so there is no role to
     // resolve — and no role-store read that could fail closed — before routing.
     // Every message resolves to a deterministic agent ID and routes through the
     // per-agent consumer loop: different agent IDs get different consumer
-    // loops = true parallelism.
+    // loops = true parallelism. The whole burst is routed as one request.
     message_router::route_user_message(
-        msg.content,
+        content,
         ws.name,
-        msg.user_name,
-        msg.channel,
+        user_name,
+        channel,
         mahbot::Role::Assistant,
-        Some(msg.reply_target),
+        Some(reply_target),
     )
     .await;
 }

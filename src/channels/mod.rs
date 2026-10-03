@@ -3,10 +3,12 @@ pub(crate) mod chat_history;
 mod enrichment;
 pub(crate) mod reply;
 pub mod telegram;
+mod telegram_group;
 use enrichment::has_inbound_temp_marker;
 pub use enrichment::{enrich_links, enrich_message};
 pub use reply::{ReplyReference, apply_reply_marker};
 pub use telegram::mirror_gui_message_to_telegram;
+pub use telegram_group::compose_group_content;
 
 use crate::channels::chat_history::ChatHistoryInsert;
 use crate::db;
