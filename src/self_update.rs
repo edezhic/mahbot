@@ -29,14 +29,10 @@
 //!
 //! A copy that updates by downloading also updates *itself*: the periodic release
 //! check ([`run_update_availability_refresh`]) starts the very same update with no
-//! prompt as soon as it finds a strictly newer release — no new surface, no
-//! confirmation, and no waiting for a quiet moment; a round the restart cuts is
-//! re-driven after the boot, like the round of any other update. A copy the
-//! install-kind classification calls a working tree
-//! ([`UpdateMode::SourceTree`]) never does that on its own — installing there
-//! means rebuilding that tree, which must not run unattended — so the trigger acts
-//! only for one classified as downloaded, and never while the environment hook is
-//! driving an update of its own. The whole rule is [`auto_update_target`].
+//! prompt — no new surface, no confirmation, and no waiting for a quiet moment; a
+//! round the restart cuts is re-driven after the boot, like the round of any other
+//! update. Which copies update themselves, and for which release, is the whole of
+//! [`auto_update_target`].
 //!
 //! ## Where the new file comes from
 //!
@@ -780,15 +776,15 @@ pub(crate) struct UpdateAvailability {
 /// and progress. Both the GUI (button visibility, tooltip, finalize guards)
 /// and the Telegram command menu (`/update` visibility + dispatch gate) read
 /// this, so the two surfaces cannot diverge. Writers: `available` is
-/// boot-seeded by [`update_cache`] and updated by [`refresh_update_cache`]
-/// (the periodic background task reads `in_progress` but only ever writes
-/// `available`); `in_progress` is written by [`execute_update`] and claimed
-/// atomically by the triggers a person or the check can start (see
-/// [`claim_update_start`]); `auto_failed` is written by the unattended trigger
-/// alone. Reset implicitly on boot — a fresh process has no stale `available`
-/// state from a previous run, so an already-installed update is never advertised
-/// across a restart, and a release whose unattended attempt failed is tried once
-/// more by that fresh process.
+/// boot-seeded by [`update_cache`] and updated by [`refresh_update_cache`], which
+/// never writes `in_progress`; `in_progress` is written by [`execute_update`] and
+/// claimed atomically by the triggers — the window's button, the `/update`
+/// command, and the unattended one the periodic task drives (see
+/// [`claim_update_start`] and [`start_automatic_update_if_found`]); `auto_failed`
+/// is written by the unattended trigger alone. Reset implicitly on boot — a fresh
+/// process has no stale `available` state from a previous run, so an
+/// already-installed update is never advertised across a restart, and a release
+/// whose unattended attempt failed is tried once more by that fresh process.
 struct UpdateCache {
     /// Whether an update is available. A copy built from sources: statically
     /// true (its working tree is reachable). A downloaded copy: derived from the
@@ -801,10 +797,11 @@ struct UpdateCache {
     /// Whether an update is currently in flight. Set at [`execute_update`]
     /// entry, cleared on failure; a successful update exits the process.
     in_progress: AtomicBool,
-    /// The release whose own unattended attempt failed, if any — never
-    /// attempted by a later check again (a strictly newer release still is),
-    /// which is what keeps a release that downloads but does not install from
-    /// re-draining the product on every tick. See [`auto_update_target`].
+    /// The release whose own unattended attempt failed, if any — no later check
+    /// attempts it again, nor anything not strictly newer than it (a strictly
+    /// newer release still is), which is what keeps a release that downloads but
+    /// does not install from re-draining the product on every tick. See
+    /// [`auto_update_target`].
     auto_failed: std::sync::Mutex<Option<semver::Version>>,
 }
 
@@ -856,9 +853,9 @@ fn auto_failed_version() -> Option<semver::Version> {
     update_cache().auto_failed.lock().unwrap_poison().clone()
 }
 
-/// Remember a release the unattended trigger's attempt failed for, so no later
-/// check in this process retries it (see [`auto_update_target`]). The version
-/// remembered is the one the check offered for that attempt.
+/// Remember the release the unattended trigger's attempt went after and failed
+/// for, so no later check in this process retries it (see [`auto_update_target`]).
+/// Called by [`execute_update`] for that trigger's own attempt, and only there.
 fn record_auto_update_failure(version: &semver::Version) {
     *update_cache().auto_failed.lock().unwrap_poison() = Some(version.clone());
 }
@@ -1009,24 +1006,25 @@ const UNATTENDED_SETTLE: Duration = Duration::from_secs(15);
 ///   is there. Such a copy updates only when it is asked to.
 /// * a version named through [`UPDATE_TO_VERSION_ENV`] (`named`): that update is
 ///   the hook's own, and it must not be raced by this trigger.
-/// * a release that is not *strictly* newer than the running version. The shared
-///   availability flag is permanently true on a source copy and a named version
-///   may be older, so the flag alone is not a trigger.
-/// * the release the check offered for an attempt that failed (`failed`): a
-///   release that downloads but does not install must not be re-fetched and the
-///   product re-drained for it on every check.
+/// * a release the shared availability flag offers that is not newer than the
+///   running version: the flag is permanently true on a source copy and a named
+///   version may be older, so the flag alone is not a trigger.
+/// * a release no newer than one whose own unattended attempt already failed
+///   (`failed`): a release that downloads but does not install must not be
+///   re-fetched and the product re-drained for it on every check, and a stale
+///   availability state must not re-offer it either.
 fn auto_update_target(
     mode: UpdateMode,
-    named: Option<&semver::Version>,
+    named: bool,
     latest: Option<&semver::Version>,
     current: &semver::Version,
     failed: Option<&semver::Version>,
 ) -> Option<semver::Version> {
-    if mode != UpdateMode::Downloaded || named.is_some() {
+    if mode != UpdateMode::Downloaded || named {
         return None;
     }
     let latest = latest.filter(|&latest| latest > current)?;
-    (failed != Some(latest)).then(|| latest.clone())
+    (failed.is_none_or(|failed| latest > failed)).then(|| latest.clone())
 }
 
 /// The unattended trigger: run the release check's finding by itself.
@@ -1046,7 +1044,7 @@ async fn start_automatic_update_if_found() {
     };
     let Some(target) = auto_update_target(
         update_mode(),
-        update_target_override().as_ref(),
+        update_target_override().is_some(),
         update_latest().as_ref(),
         &current,
         auto_failed_version().as_ref(),
@@ -1068,15 +1066,15 @@ async fn start_automatic_update_if_found() {
     }
     // Detached, like the environment-driven hook: the update owns the drain
     // hand-off and must outlive the shutdown token it triggers itself, while
-    // this loop is cancelled by exactly that token.
+    // this loop is cancelled by exactly that token. The attempt is pinned to
+    // `target` and its failure is remembered as `target` before the in-progress
+    // flag is cleared (see [`execute_update`]), so the next check can neither
+    // retry the release nor start another attempt in the window before the
+    // memory lands. The failure is then told the way every caller tells it — the
+    // ordinary admin line, plus the process's own log line, since an unattended
+    // attempt with no admin bound has no other surface.
     tokio::spawn(async move {
-        if let Err(e) = execute_update().await {
-            // The release is remembered first, so the next check neither retries
-            // it nor re-drains the product for it; then the failure is told the
-            // way every caller tells it — the ordinary admin line, plus the
-            // process's own log line, since an unattended attempt with no admin
-            // bound has no other surface.
-            record_auto_update_failure(&target);
+        if let Err(e) = execute_update(Some(&target)).await {
             error!(error = %e, "The automatic update did not complete");
             report_update_failure(&e).await;
         }
@@ -1268,9 +1266,16 @@ async fn resolve_update_admin_target() -> Option<String> {
 /// is the one caller that does not claim — it can never run beside the unattended
 /// trigger, so `UPDATE_MUTEX` alone serializes it.
 ///
+/// `auto_target` is the release the unattended trigger decided its own attempt
+/// goes after: the attempt is pinned to exactly that release, and on failure the
+/// same release is remembered as failed *before* the in-progress flag is cleared.
+/// Every other caller passes `None`, so only the unattended trigger's own
+/// failures are ever remembered, and no check can start another attempt for the
+/// release in the window between the attempt ending and the memory landing.
+///
 /// On success, this function never returns (`std::process::exit(0)`).
 /// On failure, returns an error.
-pub(crate) async fn execute_update() -> Result<()> {
+pub(crate) async fn execute_update(auto_target: Option<&semver::Version>) -> Result<()> {
     // Concurrent guard — only one update at a time. A second trigger while an
     // update is in progress gets an immediate error.
     let Some(_guard) = UPDATE_MUTEX.try_lock().ok() else {
@@ -1284,9 +1289,16 @@ pub(crate) async fn execute_update() -> Result<()> {
     update_cache().in_progress.store(true, Ordering::SeqCst);
     let result = match update_mode() {
         UpdateMode::SourceTree => execute_source_tree_update().await,
-        UpdateMode::Downloaded => execute_downloaded_update().await,
+        UpdateMode::Downloaded => execute_downloaded_update(auto_target).await,
     };
     if result.is_err() {
+        // The unattended trigger's own attempt is remembered while the flag is
+        // still held, so the next check cannot start another attempt for the
+        // release in the window before it clears. A failed manual attempt is
+        // never remembered.
+        if let Some(target) = auto_target {
+            record_auto_update_failure(target);
+        }
         update_cache().in_progress.store(false, Ordering::SeqCst);
     }
     result
@@ -1311,7 +1323,7 @@ pub async fn run_env_named_update() {
     if !crate::shutdown::sleep_or_shutdown_or_drain(UNATTENDED_SETTLE).await {
         return;
     }
-    if let Err(e) = execute_update().await {
+    if let Err(e) = execute_update(None).await {
         error!(error = %e, "The update to the version named in the environment did not complete");
     }
 }
@@ -1398,7 +1410,14 @@ async fn execute_source_tree_update() -> Result<()> {
 /// The downloaded-copy self-update: fetch this system's ready-made release file,
 /// extract it, put it at the standard per-user location, and restart. See
 /// [`execute_update`] for the concurrent-guard and exit contracts.
-async fn execute_downloaded_update() -> Result<()> {
+///
+/// `pinned` is the release the unattended trigger decided this attempt goes
+/// after, when this is that trigger's own call — the attempt is bound to exactly
+/// that release instead of re-deriving one here, so the release attempted and the
+/// release remembered on failure are the same one. Every other caller passes
+/// `None` (the environment hook's named version is taken from
+/// [`update_target_override`] instead, and the two are never set together).
+async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<()> {
     // 1. A system with no published file for it is refused before anything happens
     //    at all: downloading one and putting it in place would leave this copy
     //    replaced by a file that cannot load — no working copy, the one state an
@@ -1407,13 +1426,17 @@ async fn execute_downloaded_update() -> Result<()> {
         anyhow::bail!("{reason} — no update was made.");
     }
 
-    // 2. The version to move to. A version named through [`UPDATE_TO_VERSION_ENV`]
-    //    is taken outright — any version other than the running one is a step it
+    // 2. The version to move to. The unattended trigger's pinned release is taken
+    //    outright — the check that offered it already proved it strictly newer than
+    //    the running version. A version named through [`UPDATE_TO_VERSION_ENV`] is
+    //    taken outright too — any version other than the running one is a step it
     //    deliberately asked for; the ordinary path reads the newest published
     //    release and only ever moves forward, so a published release is never a
     //    step back. Nothing at all is installed when the version cannot be
     //    determined.
-    let target = if let Some(named) = update_target_override() {
+    let target = if let Some(pinned) = pinned {
+        pinned.clone()
+    } else if let Some(named) = update_target_override() {
         named
     } else {
         let latest = fetch_latest_release_version().await?.ok_or_else(|| {
@@ -2014,7 +2037,7 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
     // also told directly so a non-primary invoker isn't left guessing.
     let invoker_target = msg.reply_target.clone();
     tokio::spawn(async move {
-        if let Err(e) = execute_update().await {
+        if let Err(e) = execute_update(None).await {
             // Single failure report: the admin's bound Telegram target (the normal update
             // notification path), plus the invoking admin when they differ.
             let failure = update_failure_notification(&e);
@@ -2342,8 +2365,8 @@ mod tests {
 
     /// The unattended trigger's whole rule, one case per clause: only a
     /// downloaded copy, only when no version was named for it by the environment
-    /// hook, only for a strictly newer release, and never twice for one whose own
-    /// attempt already failed.
+    /// hook, only for a strictly newer release, and never for a release no newer
+    /// than one whose own attempt already failed.
     #[test]
     fn test_auto_update_target() {
         let v = |s: &str| semver::Version::parse(s).unwrap();
@@ -2351,7 +2374,7 @@ mod tests {
         let newer = v("1.2.4");
         let newest = v("1.3.0");
         let is = |mode: UpdateMode,
-                  named: Option<&semver::Version>,
+                  named: bool,
                   latest: Option<&semver::Version>,
                   failed: Option<&semver::Version>| {
             auto_update_target(mode, named, latest, &current, failed)
@@ -2359,41 +2382,49 @@ mod tests {
 
         // A strictly newer release, and only that one, fires.
         assert_eq!(
-            is(UpdateMode::Downloaded, None, Some(&newer), None),
+            is(UpdateMode::Downloaded, false, Some(&newer), None),
             Some(newer.clone())
         );
         assert_eq!(
-            is(UpdateMode::Downloaded, None, Some(&newest), None),
+            is(UpdateMode::Downloaded, false, Some(&newest), None),
             Some(newest.clone())
         );
-        assert_eq!(is(UpdateMode::Downloaded, None, None, None), None);
-        assert_eq!(is(UpdateMode::Downloaded, None, Some(&current), None), None);
+        assert_eq!(is(UpdateMode::Downloaded, false, None, None), None);
         assert_eq!(
-            is(UpdateMode::Downloaded, None, Some(&v("1.2.2")), None),
+            is(UpdateMode::Downloaded, false, Some(&current), None),
+            None
+        );
+        assert_eq!(
+            is(UpdateMode::Downloaded, false, Some(&v("1.2.2")), None),
             None
         );
 
         // A copy built from a working tree never fires by itself — its
         // availability is true by construction, which is exactly why the flag
         // alone is not the trigger.
-        assert_eq!(is(UpdateMode::SourceTree, None, Some(&newer), None), None);
-        assert_eq!(is(UpdateMode::SourceTree, None, None, None), None);
+        assert_eq!(is(UpdateMode::SourceTree, false, Some(&newer), None), None);
+        assert_eq!(is(UpdateMode::SourceTree, false, None, None), None);
 
         // A version named through the environment hook is that hook's update.
-        assert_eq!(
-            is(UpdateMode::Downloaded, Some(&newer), Some(&newer), None),
-            None
-        );
+        assert_eq!(is(UpdateMode::Downloaded, true, Some(&newer), None), None);
 
         // A release whose own unattended attempt failed is not tried again; a
         // strictly newer one still is.
         assert_eq!(
-            is(UpdateMode::Downloaded, None, Some(&newer), Some(&newer)),
+            is(UpdateMode::Downloaded, false, Some(&newer), Some(&newer)),
             None
         );
         assert_eq!(
-            is(UpdateMode::Downloaded, None, Some(&newest), Some(&newer)),
+            is(UpdateMode::Downloaded, false, Some(&newest), Some(&newer)),
             Some(newest.clone())
+        );
+
+        // A stale advertisement — one older than the release whose attempt
+        // failed — re-offers nothing either: only a strictly newer release passes
+        // a remembered failure, never whatever was cached before it.
+        assert_eq!(
+            is(UpdateMode::Downloaded, false, Some(&newer), Some(&newest)),
+            None
         );
     }
 

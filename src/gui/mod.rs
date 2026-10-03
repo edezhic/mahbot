@@ -1461,7 +1461,7 @@ impl Dashboard {
                     toast,
                     Task::perform(
                         async {
-                            match crate::self_update::execute_update().await {
+                            match crate::self_update::execute_update(None).await {
                                 Ok(()) => Ok("ok".to_string()),
                                 Err(e) => {
                                     // Reported to the admin exactly as the

@@ -327,12 +327,11 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::computer::warm_capture_probe(),
     );
 
-    // Periodic refresh of the shared update-availability cache. This is the
-    // single writer of the cache: both the GUI update button and the Telegram
-    // `/update` menu read the cached state, so the two surfaces cannot diverge.
-    // Ticks immediately, then every 10 minutes, and every tick is also what
-    // starts the unattended update of a downloaded copy when the check finds a
-    // strictly newer release (see `mahbot::self_update`).
+    // Periodic refresh of the shared update-availability cache, which both the
+    // GUI update button and the Telegram `/update` menu read, so the two surfaces
+    // cannot diverge. Ticks immediately, then every 10 minutes, and every tick is
+    // also what starts the unattended update of a downloaded copy when the check
+    // finds a strictly newer release (see `mahbot::self_update`).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
