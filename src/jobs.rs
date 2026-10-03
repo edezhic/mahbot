@@ -1894,7 +1894,9 @@ pub(crate) async fn purge_terminal_session_pins() -> usize {
         }
     }
     if deleted > 0 {
-        info!(deleted, "Removed session pins for terminal tickets");
+        // Debug: a routine count of pins reclaimed — a failed delete keeps its
+        // warn record above.
+        debug!(deleted, "Removed session pins for terminal tickets");
     }
     deleted
 }

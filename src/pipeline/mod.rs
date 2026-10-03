@@ -430,7 +430,9 @@ async fn dispatch_working_phases(ws: &Workspace) {
             warn!(ticket = %ticket.id, phase = %phase, error = %e, "Failed to create phase job (concurrent creation is a no-op)");
             continue;
         }
-        info!(ticket = %ticket.id, phase = %phase, job = %job_id, "Created phase job — dispatching phase body");
+        // Debug: routine dispatch traffic — a failed creation keeps its warn
+        // record above.
+        debug!(ticket = %ticket.id, phase = %phase, job = %job_id, "Created phase job — dispatching phase body");
         spawn_phase_body(phase, Arc::new(ticket), ws.clone(), job_id);
     }
 }

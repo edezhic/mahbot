@@ -9,9 +9,9 @@ use crate::{Role, Workspace};
 use super::{
     AgentSlot, BoardStore, ExtractionMode, FinalizeOutcome, JointRound, ParallelVerdict,
     TicketPhase, TransitionCtx, Write, agent_slot_from_roster_row, build_agent_slots,
-    build_round_grouping, deserialize_verdict_outcome, guard_job_phase, info, insert_round_slots,
-    issue_grade, pause_freezing, render_joint_comment, reset_phase_attempt, run_parallel_agents,
-    warn, with_comment_and_transition,
+    build_round_grouping, debug, deserialize_verdict_outcome, guard_job_phase, info,
+    insert_round_slots, issue_grade, pause_freezing, render_joint_comment, reset_phase_attempt,
+    run_parallel_agents, warn, with_comment_and_transition,
 };
 
 /// Default number of parallel analyst agents per round. Reviewers use a
@@ -863,7 +863,8 @@ async fn process_analyst_verdicts(
     ) {
         return;
     }
-    info!(
+    // Debug: the routine completion record for a backlog ticket that advanced.
+    debug!(
         ticket = %ticket.id,
         nonempty_count = extracted_count,
         "Backlog analysis complete — moved to planning ({extracted_count}/{dispatched} extracted)",

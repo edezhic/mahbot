@@ -215,11 +215,10 @@ pub(crate) fn set_snapshot(env: Option<OwnerEnv>) {
 /// until shutdown. Spawned as a background task; it never returns except on
 /// shutdown.
 ///
-/// A success is logged at INFO (the 8-hour INFO retention must never leave the
-/// owner without a row — this is his only place to see whether his environment
-/// was picked up), and carries counts, shape and timing only. A failure is
-/// logged at WARN (which survives retention and is what the app's issue view
-/// shows) with the consecutive-failure count, the next retry delay and the
+/// A success is logged at DEBUG (the routine per-refresh heartbeat, dropped by the
+/// default level before storage), and carries counts, shape and timing only. A
+/// failure is logged at WARN (which survives retention and is what the app's issue
+/// view shows) with the consecutive-failure count, the next retry delay and the
 /// failure's own short description. Neither line, and nothing else here, ever
 /// carries a value out of the environment.
 ///
@@ -286,7 +285,9 @@ pub async fn run_reader_loop() {
                 };
                 #[cfg(windows)]
                 let search = "not applicable (the served path is the only search)";
-                tracing::info!(
+                // Debug: the routine per-refresh heartbeat — a failed read is
+                // reported at warn below.
+                tracing::debug!(
                     names,
                     path_entries,
                     elapsed_ms,
@@ -339,7 +340,7 @@ pub async fn run_reader_loop() {
 ///
 /// Returns whether a verdict for the environment in effect stands afterwards — an
 /// environment already measured is a no-op, and a run that produced no verdict is
-/// attempted again by the next read; the success arm records the flag on its INFO
+/// attempted again by the next read; the success arm records the flag on its DEBUG
 /// line. `env` is the pairs that read produced (or, after a failed read, the ones
 /// in effect), passed through so the reader derives them once.
 ///

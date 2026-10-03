@@ -617,7 +617,9 @@ pub(crate) async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) ->
     let count = match working_tree_churn(repo_path).await {
         Ok(total) => {
             let base = crate::pipeline::verdict::review_base_from_signals(total, tiny, low, high);
-            info!(
+            // Debug: per-round calibration bookkeeping; an uncomputable churn
+            // keeps its warn record below.
+            debug!(
                 ticket = %ticket.id,
                 total_churn = total,
                 reviewer_base = base,
