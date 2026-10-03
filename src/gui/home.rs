@@ -395,6 +395,9 @@ pub enum HomeMessage {
     /// stale and dropped, so per-keystroke and out-of-order writes are
     /// impossible.
     DraftSaveSettled { generation: u64 },
+    /// Bring the persisted draft back into the composer; dispatched once when
+    /// the chat starts.
+    RestoreDraft,
     /// Chat history cleared successfully — divider inserted.
     ChatCleared,
     /// Chat history clear failed.
@@ -473,10 +476,9 @@ pub struct HomeState {
     undo_stack: super::common::UndoStack,
     /// Captured {author, snippet} of the message being replied to. `Some`
     /// while a reply preview is shown above the composer; cleared on send,
-    /// cancel, chat clear, or workspace switch.
+    /// cancel, or chat clear.
     pending_reply: Option<ReplyReference>,
-    /// Persisted composer-draft store (draft text + pending reply per user
-    /// and resolved send-target workspace).
+    /// Persisted composer draft (text + pending reply-to).
     drafts: Arc<crate::channels::chat_draft::DraftStore>,
     /// Debounce state for the asynchronous draft persistence.
     draft_save: super::common::DebounceState,
@@ -657,13 +659,13 @@ impl HomeState {
         self.pagination_gen = self.pagination_gen.wrapping_add(1);
     }
 
-    /// Reset session display state: messages, dedup set, history flag, pagination.
+    /// Reset session display state: messages, dedup set, history flag,
+    /// pagination; the composer is left alone.
     fn reset_chat_state(&mut self) {
         self.messages.clear();
         self.seen_ids.clear();
         self.history_loaded = false;
         self.onboarding_script_active = false;
-        self.pending_reply = None;
         // The transcript this failure described is gone; the read that follows
         // reports its own outcome.
         self.history_error = None;
@@ -673,38 +675,32 @@ impl HomeState {
     /// draft store and schedule a debounced persist after `delay_ms`.
     ///
     /// The in-memory mutation happens synchronously at schedule time — the
-    /// file write lags behind the debounce, so the in-memory map is always
+    /// file write lags behind the debounce, so the in-memory draft is always
     /// current.
     fn capture_draft(&mut self, delay_ms: u64) -> Task<HomeMessage> {
         if self.onboarding_script_active {
             return Task::none();
         }
-        let ws = self.resolve_workspace_name();
         let text = self.editor_content.text();
         let reply = self.pending_reply.clone();
-        self.drafts
-            .set(crate::users::ADMIN_USER_NAME, &ws, text, reply);
+        self.drafts.set(text, reply);
         self.draft_save
             .trigger(delay_ms)
             .map(|generation| HomeMessage::DraftSaveSettled { generation })
     }
 
-    /// Restore the persisted composer draft for the current context, or clear
-    /// the composer when none exists (per-context swap, not leak).
-    fn restore_chat_draft(&mut self) {
-        let ws = self.resolve_workspace_name();
-        let entry = self.drafts.get(crate::users::ADMIN_USER_NAME, &ws);
-        self.editor_content
-            .set_text(entry.as_ref().map_or("", |e| e.text.as_str()));
-        self.undo_stack.clear();
-        self.pending_reply = entry.and_then(|e| e.reply);
+    /// Bring the persisted draft back into the composer; called once when the
+    /// chat starts.
+    fn restore_draft(&mut self) {
+        let draft = self.drafts.get();
+        self.editor_content.set_text(&draft.text);
+        self.pending_reply = draft.reply;
     }
 
-    /// Remove the persisted draft for the current context and schedule a
-    /// persist — used on send, after the composer has been cleared.
-    fn drop_current_draft(&mut self) {
-        let ws = self.resolve_workspace_name();
-        self.drafts.remove(crate::users::ADMIN_USER_NAME, &ws);
+    /// Remove the stored draft and schedule a persist — used on send, after the
+    /// composer has been cleared.
+    fn drop_draft(&mut self) {
+        self.drafts.remove();
         self.drafts.clone().persist_async();
     }
 
@@ -1243,8 +1239,10 @@ impl HomeState {
         match msg {
             HomeMessage::WorkspaceChanged(ws_name) => {
                 self.selected_workspace.clone_from(&ws_name);
+                // A picker change loads a different transcript; the composer is
+                // intentionally untouched — its draft text and pending reply
+                // belong to the chat, not the workspace.
                 self.reset_chat_state();
-                self.restore_chat_draft();
                 // At the Personal picker the view merges the admin's DB-selected
                 // project workspace — re-read it so Users-page edits (which
                 // flow through WorkspaceChanged) are reflected, then load in
@@ -1331,10 +1329,8 @@ impl HomeState {
                 // `ChatCleared` callback issues reports its own outcome.
                 self.history_error = None;
                 self.reset_pagination_state();
-                // Capture synchronously (not from the ChatCleared callback):
-                // the reply is dropped but the draft text is kept, and the
-                // entry must be snapshotted under the context that was
-                // visible when the clear was requested.
+                // Capture synchronously (not from the ChatCleared callback): the
+                // reply is dropped but the draft text is kept.
                 let draft = self.capture_draft(DRAFT_SETTLE_MS);
                 // Build agent ID and schedule async cleanup.
                 let sender = crate::users::ADMIN_USER_NAME.to_string();
@@ -1429,6 +1425,10 @@ impl HomeState {
                 if self.draft_save.should_process(generation) {
                     self.drafts.clone().persist_async();
                 }
+                Task::none()
+            }
+            HomeMessage::RestoreDraft => {
+                self.restore_draft();
                 Task::none()
             }
             HomeMessage::ChatClearError(e) => {
@@ -1758,21 +1758,21 @@ impl HomeState {
             if let Err(e) = tx.send(msg) {
                 tracing::error!("Home: failed to send message via GUI_MESSAGE_TX: {e}");
                 self.sending = false;
-                self.drop_current_draft();
+                self.drop_draft();
                 return Task::none();
             }
         } else {
             tracing::error!("Home: GUI_MESSAGE_TX not initialized");
             self.sending = false;
-            self.drop_current_draft();
+            self.drop_draft();
             return Task::none();
         }
 
         // The send was queued — drop the pending reply so the preview clears.
         self.pending_reply = None;
-        // The composer is cleared: remove the persisted draft for this context
-        // so it cannot resurrect on a later restore.
-        self.drop_current_draft();
+        // The composer is cleared: remove the persisted draft so it cannot
+        // resurrect on a later restore.
+        self.drop_draft();
 
         // Snap to end on optimistic push if auto-scroll enabled.
         Task::batch([self.sending_timeout_task(), self.maybe_snap()])
@@ -1929,32 +1929,47 @@ mod tests {
     }
 
     #[test]
-    fn draft_capture_and_workspace_swap() {
+    fn the_chat_has_one_draft_and_a_workspace_switch_leaves_it_alone() {
         let mut state = make_home_state("ws1");
-        let admin = crate::users::ADMIN_USER_NAME;
 
-        // Typing captures synchronously into the store under the current key.
+        // Typing captures synchronously into the one draft.
         let _ = state.update(HomeMessage::InputChanged(EditorAction::Insert('h')));
-        assert_eq!(
-            state.drafts.get(admin, "ws1").map(|e| e.text).as_deref(),
-            Some("h")
-        );
+        assert_eq!(state.drafts.get().text, "h");
 
-        // The workspace swap moves the context: the incoming context restores —
-        // no entry means the composer is cleared (per-context swap, not leak).
+        // The workspace swap does not touch the composer: the text stays, and
+        // the draft is still the same single draft.
         let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws2".to_string())));
-        assert_eq!(state.editor_content.text(), "");
-
-        // The resolved context captures under its own key...
-        let _ = state.update(HomeMessage::InputChanged(EditorAction::Insert('b')));
-        assert_eq!(
-            state.drafts.get(admin, "ws2").map(|e| e.text).as_deref(),
-            Some("b")
-        );
-
-        // ...and switching back swaps again, restoring the first draft.
+        assert_eq!(state.editor_content.text(), "h");
         let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws1".to_string())));
         assert_eq!(state.editor_content.text(), "h");
+        assert_eq!(state.drafts.get().text, "h");
+    }
+
+    #[test]
+    fn restore_brings_back_the_text_and_its_pending_reply() {
+        let mut state = make_home_state("ws1");
+        let reply = reply_reference_for(ChatDirection::Agent, Some("assistant"), "hi there");
+        state.drafts.set("typed".to_string(), Some(reply.clone()));
+
+        // Boot pushes the workspace selection and the draft restore in one
+        // batch (order not guaranteed): either order must leave the composer
+        // holding the stored draft.
+        let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws2".to_string())));
+        let _ = state.update(HomeMessage::RestoreDraft);
+        assert_eq!(state.editor_content.text(), "typed");
+        assert_eq!(state.pending_reply, Some(reply));
+
+        // ...and a later picker change leaves it alone.
+        let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws1".to_string())));
+        assert_eq!(state.editor_content.text(), "typed");
+        assert!(state.pending_reply.is_some());
+
+        // The other batch order: restore first, then the selection push.
+        let mut state = make_home_state("ws1");
+        state.drafts.set("typed".to_string(), None);
+        let _ = state.update(HomeMessage::RestoreDraft);
+        let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws2".to_string())));
+        assert_eq!(state.editor_content.text(), "typed");
     }
 
     #[test]

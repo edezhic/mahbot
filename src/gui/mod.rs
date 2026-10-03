@@ -965,7 +965,11 @@ impl Dashboard {
         // The boot read always yields a name — a shared workspace or the
         // admin's `personal:admin` fallback.
         self.selected_workspace_name = Some(restored_name.to_owned());
-        self.propagate_workspace_selection(restored_name)
+        let propagate = self.propagate_workspace_selection(restored_name);
+        // The composer's draft comes back with the chat itself, not with a
+        // picker change.
+        let restore_draft = Task::done(home::HomeMessage::RestoreDraft).map(Message::Home);
+        Task::batch([propagate, restore_draft])
     }
 
     /// Navigate to a page, refreshing page-specific state as needed.
@@ -1888,9 +1892,9 @@ impl Dashboard {
         // Notify the Home page so it can reload chat history: the selection as
         // stored, with no substitution. A selection the loaded map has not
         // caught up with yet — a project activated from the chat while a reload
-        // read was in flight — is still the account's active choice, and Home
-        // (its transcript read key and its per-workspace draft) must key on the
-        // same choice the picker and the DB carry. Same rule as
+        // read was in flight — is still the account's active choice, and Home's
+        // transcript read key must key on the same choice the picker and the DB
+        // carry. Same rule as
         // `sync_workspace_surfaces`: an unresolved selection is never shown the
         // personal workspace.
         let home_task: Task<Message> =
