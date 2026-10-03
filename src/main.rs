@@ -136,12 +136,18 @@ async fn bootstrap_mahbot() -> Result<()> {
 
     spawn_background_tasks(log_store.clone());
 
-    info!("MahBot initialized — dashboard ready");
+    info!(
+        version = mahbot::self_update::VERSION,
+        "MahBot initialized — dashboard ready"
+    );
 
     let admin_target = mahbot::self_update::resolve_admin_telegram_target().await;
     tokio::spawn(async move {
-        mahbot::self_update::notify_admin("✅ MahBot is back online.", admin_target.as_deref())
-            .await;
+        mahbot::self_update::notify_admin(
+            &mahbot::self_update::back_online_message(),
+            admin_target.as_deref(),
+        )
+        .await;
     });
 
     Ok(())
@@ -324,7 +330,9 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     // Periodic refresh of the shared update-availability cache. This is the
     // single writer of the cache: both the GUI update button and the Telegram
     // `/update` menu read the cached state, so the two surfaces cannot diverge.
-    // Ticks immediately, then every 10 minutes.
+    // Ticks immediately, then every 10 minutes, and every tick is also what
+    // starts the unattended update of a downloaded copy when the check finds a
+    // strictly newer release (see `mahbot::self_update`).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,

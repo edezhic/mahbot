@@ -25,6 +25,19 @@
 //! running exe, copies the new one in, and schedules deferred deletion) — the product
 //! no longer copies itself into any toolchain's directory, in either mode.
 //!
+//! ## Which copies update themselves
+//!
+//! A copy that updates by downloading also updates *itself*: the periodic release
+//! check ([`run_update_availability_refresh`]) starts the very same update with no
+//! prompt as soon as it finds a strictly newer release — no new surface, no
+//! confirmation, and no waiting for a quiet moment; a round the restart cuts is
+//! re-driven after the boot, like the round of any other update. A copy the
+//! install-kind classification calls a working tree
+//! ([`UpdateMode::SourceTree`]) never does that on its own — installing there
+//! means rebuilding that tree, which must not run unattended — so the trigger acts
+//! only for one classified as downloaded, and never while the environment hook is
+//! driving an update of its own. The whole rule is [`auto_update_target`].
+//!
 //! ## Where the new file comes from
 //!
 //! The product is its own release host: [`RELEASE_REPO`] (`CARGO_PKG_REPOSITORY`)
@@ -50,7 +63,10 @@
 //! release base, the second names the version to move to — a test release is
 //! deliberately undiscoverable, so the one being driven must be named outright.
 //! Both are unset in every ordinary run, where the release base is [`RELEASE_REPO`]
-//! and the version to move to is the newest published one.
+//! and the version to move to is the newest published one. Moving only the base
+//! leaves the hook inert (it drives an update only for a named version) while the
+//! check — and with it the unattended trigger — reads the newest release from that
+//! other host, which is how an update against a stand-in host is exercised.
 //!
 //! Single-instance enforcement is an exclusive whole-file lock on `mahbot.lock`,
 //! released explicitly before the hand-off spawn — see [`acquire_lock`] and
@@ -85,9 +101,10 @@ use tracing::{debug, error, info, warn};
 ///
 /// Cargo sets this from the `version` field in `Cargo.toml` for every build, so it
 /// is the authoritative version of the running binary. The GUI surfaces it on the
-/// Settings page, and a downloaded copy's self-update compares the release host's
-/// version against it.
-pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Settings page, the binary's own start-up log line names it, a downloaded copy's
+/// self-update compares the release host's version against it, and the start-up
+/// message tells the owner what is running.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── File-lock based single-instance guard ─────────────────────────────────
 
@@ -765,10 +782,13 @@ pub(crate) struct UpdateAvailability {
 /// this, so the two surfaces cannot diverge. Writers: `available` is
 /// boot-seeded by [`update_cache`] and updated by [`refresh_update_cache`]
 /// (the periodic background task reads `in_progress` but only ever writes
-/// `available`); `in_progress` is written by [`execute_update`] and the
-/// `/update` dispatch gate (compare-exchange). Reset implicitly on boot — a
-/// fresh process has no stale `available` state from a previous run, so an
-/// already-installed update is never advertised across a restart.
+/// `available`); `in_progress` is written by [`execute_update`] and claimed
+/// atomically by the triggers a person or the check can start (see
+/// [`claim_update_start`]); `auto_failed` is written by the unattended trigger
+/// alone. Reset implicitly on boot — a fresh process has no stale `available`
+/// state from a previous run, so an already-installed update is never advertised
+/// across a restart, and a release whose unattended attempt failed is tried once
+/// more by that fresh process.
 struct UpdateCache {
     /// Whether an update is available. A copy built from sources: statically
     /// true (its working tree is reachable). A downloaded copy: derived from the
@@ -781,6 +801,11 @@ struct UpdateCache {
     /// Whether an update is currently in flight. Set at [`execute_update`]
     /// entry, cleared on failure; a successful update exits the process.
     in_progress: AtomicBool,
+    /// The release whose own unattended attempt failed, if any — never
+    /// attempted by a later check again (a strictly newer release still is),
+    /// which is what keeps a release that downloads but does not install from
+    /// re-draining the product on every tick. See [`auto_update_target`].
+    auto_failed: std::sync::Mutex<Option<semver::Version>>,
 }
 
 static UPDATE_CACHE: OnceLock<UpdateCache> = OnceLock::new();
@@ -793,6 +818,7 @@ fn update_cache() -> &'static UpdateCache {
         available: AtomicBool::new(update_mode() == UpdateMode::SourceTree),
         latest: std::sync::Mutex::new(None),
         in_progress: AtomicBool::new(false),
+        auto_failed: std::sync::Mutex::new(None),
     })
 }
 
@@ -819,6 +845,40 @@ pub(crate) fn update_latest() -> Option<semver::Version> {
 #[must_use]
 pub(crate) fn update_in_progress() -> bool {
     update_availability().in_progress
+}
+
+/// The release whose own unattended attempt failed, if any (see
+/// [`auto_update_target`]). `None` when no unattended attempt has failed in this
+/// process, and for every release a *manual* attempt failed for — only the
+/// unattended trigger's own failures are remembered.
+#[must_use]
+fn auto_failed_version() -> Option<semver::Version> {
+    update_cache().auto_failed.lock().unwrap_poison().clone()
+}
+
+/// Remember a release the unattended trigger's attempt failed for, so no later
+/// check in this process retries it (see [`auto_update_target`]). The version
+/// remembered is the one the check offered for that attempt.
+fn record_auto_update_failure(version: &semver::Version) {
+    *update_cache().auto_failed.lock().unwrap_poison() = Some(version.clone());
+}
+
+/// Claim the shared in-progress flag for an update this caller is about to run,
+/// returning `false` when one is already running.
+///
+/// Every trigger a person or the release check can start — the window's button,
+/// the `/update` command and the unattended one — claims here before running
+/// [`execute_update`], so an update can never start twice: neither from two of
+/// the same kind nor from two different ones. The claim is what lets a trigger
+/// tell "an update is already running" apart *before* it becomes the contention
+/// error [`execute_update`] returns, so the loser simply stands down instead of
+/// reporting a collision as a failure. [`execute_update`] keeps the flag set and
+/// clears it on failure.
+pub(crate) fn claim_update_start() -> bool {
+    update_cache()
+        .in_progress
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
 }
 
 /// Pure visibility predicate for the `/update` menu entry in Telegram: the
@@ -913,20 +973,114 @@ async fn refresh_update_cache() {
     }
 }
 
-/// Periodic refresh of the shared update-availability cache.
+/// Periodic refresh of the shared update-availability cache, and the unattended
+/// update of a downloaded copy.
 ///
 /// Spawned from the binary's background task set (cancellable via the global
 /// shutdown token). Ticks immediately so a fresh downloaded copy isn't hidden
 /// until the first 10-minute interval elapses, then every 10 minutes. Runs on
 /// all platforms/modes to keep the contract uniform — a copy built from sources
-/// is a no-op network-wise but keeps `available` seeded.
+/// is a no-op network-wise but keeps `available` seeded. Every tick is also what
+/// gives [`start_automatic_update_if_found`] the finding it decides on.
 pub async fn run_update_availability_refresh() {
     loop {
         refresh_update_cache().await;
+        start_automatic_update_if_found().await;
         if !crate::shutdown::sleep_or_shutdown_or_drain(Duration::from_mins(10)).await {
             return;
         }
     }
+}
+
+/// How long an unattended update — the automatic one and the environment-driven
+/// hook — waits for the product to come fully up: the stores, the channels and the
+/// notification path. An attempt that fails in that window would otherwise have
+/// nowhere to report it.
+const UNATTENDED_SETTLE: Duration = Duration::from_secs(15);
+
+/// The release this copy must move to by itself, if any — the whole rule of the
+/// unattended trigger, pure so it can be read and tested as one thing.
+///
+/// Never a trigger:
+///
+/// * a copy built from a working tree ([`UpdateMode::SourceTree`]): installing
+///   there means rebuilding that tree, which must not run on its own — possibly
+///   from half-finished edits, and again on every check for as long as the tree
+///   is there. Such a copy updates only when it is asked to.
+/// * a version named through [`UPDATE_TO_VERSION_ENV`] (`named`): that update is
+///   the hook's own, and it must not be raced by this trigger.
+/// * a release that is not *strictly* newer than the running version. The shared
+///   availability flag is permanently true on a source copy and a named version
+///   may be older, so the flag alone is not a trigger.
+/// * the release the check offered for an attempt that failed (`failed`): a
+///   release that downloads but does not install must not be re-fetched and the
+///   product re-drained for it on every check.
+fn auto_update_target(
+    mode: UpdateMode,
+    named: Option<&semver::Version>,
+    latest: Option<&semver::Version>,
+    current: &semver::Version,
+    failed: Option<&semver::Version>,
+) -> Option<semver::Version> {
+    if mode != UpdateMode::Downloaded || named.is_some() {
+        return None;
+    }
+    let latest = latest.filter(|&latest| latest > current)?;
+    (failed != Some(latest)).then(|| latest.clone())
+}
+
+/// The unattended trigger: run the release check's finding by itself.
+///
+/// Called after every availability refresh. The update it starts is the ordinary
+/// one, in full: the same download, the same drain (with its hard cap), the same
+/// checkpoint, restart and recovery of interrupted work — nobody pressed
+/// anything, and nothing else about it differs.
+async fn start_automatic_update_if_found() {
+    // An update in flight owns the flag, and the refresh skipped its check with
+    // it — so the cached finding is the one that started it, not a new one.
+    if update_in_progress() {
+        return;
+    }
+    let Ok(current) = current_version() else {
+        return;
+    };
+    let Some(target) = auto_update_target(
+        update_mode(),
+        update_target_override().as_ref(),
+        update_latest().as_ref(),
+        &current,
+        auto_failed_version().as_ref(),
+    ) else {
+        return;
+    };
+
+    // The product must be fully up before an unattended attempt starts, so an
+    // early failure is reportable rather than lost.
+    if !crate::shutdown::sleep_or_shutdown_or_drain(UNATTENDED_SETTLE).await {
+        return;
+    }
+    // Claim the update atomically, exactly as the manual triggers do. An update
+    // that started while this waited — manual or automatic — wins, and losing
+    // the claim is not a failure: nothing is reported and the release is not
+    // remembered as failed.
+    if !claim_update_start() {
+        return;
+    }
+    // Detached, like the environment-driven hook: the update owns the drain
+    // hand-off and must outlive the shutdown token it triggers itself, while
+    // this loop is cancelled by exactly that token.
+    tokio::spawn(async move {
+        if let Err(e) = execute_update().await {
+            // The release is remembered first, so the next check neither retries
+            // it nor re-drains the product for it; then the failure is told the
+            // way every caller tells it — the ordinary admin line, plus the
+            // process's own log line, since an unattended attempt with no admin
+            // bound has no other surface.
+            record_auto_update_failure(&target);
+            error!(error = %e, "The automatic update did not complete");
+            report_update_failure(&e).await;
+        }
+    });
 }
 
 // ── Update mutex ──────────────────────────────────────────────────────────
@@ -1107,8 +1261,12 @@ async fn resolve_update_admin_target() -> Option<String> {
 /// - [`UpdateMode::Downloaded`]: download this system's ready-made release file,
 ///   put it at the standard per-user location, restart.
 ///
-/// Called from the GUI update button and the Telegram `/update` command.
-/// Only one update runs at a time — concurrent calls return an error immediately.
+/// Called from the GUI update button, the Telegram `/update` command, and the
+/// unattended trigger of a downloaded copy ([`start_automatic_update_if_found`]);
+/// those three claim the shared in-progress flag ([`claim_update_start`]) before
+/// they get here, so only one update runs at a time. The environment-driven hook
+/// is the one caller that does not claim — it can never run beside the unattended
+/// trigger, so `UPDATE_MUTEX` alone serializes it.
 ///
 /// On success, this function never returns (`std::process::exit(0)`).
 /// On failure, returns an error.
@@ -1118,11 +1276,11 @@ pub(crate) async fn execute_update() -> Result<()> {
     let Some(_guard) = UPDATE_MUTEX.try_lock().ok() else {
         anyhow::bail!("{UPDATE_IN_PROGRESS_MSG}");
     };
-    // Mark the shared in-progress state so both the GUI and the Telegram
-    // `/update` gate report the update, and the GUI's exit-request/finalize
-    // guards key off it (a Telegram-initiated update must also protect the
-    // finalize/checkpoint window). Cleared on failure; a successful update
-    // exits the process.
+    // Mark the shared in-progress state (already claimed by the caller, and
+    // idempotent here) so both the GUI and the Telegram `/update` gate report
+    // the update, and the GUI's exit-request/finalize guards key off it (a
+    // Telegram-initiated update must also protect the finalize/checkpoint
+    // window). Cleared on failure; a successful update exits the process.
     update_cache().in_progress.store(true, Ordering::SeqCst);
     let result = match update_mode() {
         UpdateMode::SourceTree => execute_source_tree_update().await,
@@ -1147,13 +1305,10 @@ pub(crate) async fn execute_update() -> Result<()> {
 /// its own and does nothing. See the module doc — this and
 /// [`RELEASE_BASE_URL_ENV`] are the only test-only paths in this file.
 pub async fn run_env_named_update() {
-    /// Long enough for the stores and the channels to be up when the update runs.
-    const SETTLE_DELAY: Duration = Duration::from_secs(15);
-
     if update_target_override().is_none() || update_mode() != UpdateMode::Downloaded {
         return;
     }
-    if !crate::shutdown::sleep_or_shutdown_or_drain(SETTLE_DELAY).await {
+    if !crate::shutdown::sleep_or_shutdown_or_drain(UNATTENDED_SETTLE).await {
         return;
     }
     if let Err(e) = execute_update().await {
@@ -1742,15 +1897,37 @@ pub async fn notify_admin(message: &str, target: Option<&str>) {
 /// what failed. A failed cargo step names itself (see [`CargoStepFailure`]);
 /// every other failure reports its own error text.
 ///
-/// Shared by both entry points, so the `/update` command and the window's Update
-/// button report the same line. The desktop toast composes its own (see the
-/// error's [`Display`](std::fmt::Display)).
+/// Shared by the three user-facing entry points, so the `/update` command, the
+/// window's Update button and the unattended trigger report the same line. The
+/// desktop toast composes its own (see the error's
+/// [`Display`](std::fmt::Display)).
 pub(crate) fn update_failure_notification(err: &anyhow::Error) -> String {
     let statement = match err.downcast_ref::<CargoStepFailure>() {
         Some(failure) => format!("{}{}", failure.admin_head, failure.body),
         None => format!("{err:#}"),
     };
     format!("❌ {statement}")
+}
+
+/// Report a failed update to the admin exactly as the manual callers do — the
+/// shared failure line, to the admin's bound Telegram target.
+///
+/// Used by the callers with no surface of their own beyond that line: the
+/// unattended trigger and the window's own error toast. A failure is never
+/// silent, and a caller that reported here never composes a second sentence
+/// about the same attempt.
+pub(crate) async fn report_update_failure(err: &anyhow::Error) {
+    let admin_target = resolve_update_admin_target().await;
+    notify_admin(&update_failure_notification(err), admin_target.as_deref()).await;
+}
+
+/// The start-up message the owner is told what is running by — the ordinary
+/// "back online" line, which now names the running version's build. An unattended
+/// update reports itself through the same lines a manual one does; this is what
+/// says the version that came up is the new one, with no additional surface.
+#[must_use]
+pub fn back_online_message() -> String {
+    format!("✅ MahBot is back online — running v{VERSION}")
 }
 
 /// Reply used when a command requires the admin. Used by both
@@ -1814,16 +1991,13 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
         return;
     }
 
-    // Atomically claim the in-progress flag before spawning. This closes the
-    // TOCTOU where a concurrent `/update` could pass the pre-check above, then
-    // lose `UPDATE_MUTEX.try_lock` inside `execute_update` and be reported
-    // through the failure message as "An update is already in progress."
+    // Claim the in-progress flag before spawning. This closes the TOCTOU where
+    // a concurrent trigger (another `/update`, the window's button, or the
+    // unattended one) could pass the pre-check above, then lose
+    // `UPDATE_MUTEX.try_lock` inside `execute_update` and be reported through
+    // the failure message as "An update is already in progress."
     // `execute_update` keeps the flag set and clears it on failure.
-    if update_cache()
-        .in_progress
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    if !claim_update_start() {
         crate::channels::telegram::send_reply(&msg.reply_target, UPDATE_IN_PROGRESS_MSG).await;
         return;
     }
@@ -2164,6 +2338,63 @@ mod tests {
         let bare = dir.path().join("bare");
         std::fs::create_dir_all(&bare).unwrap();
         assert_eq!(classify_update_mode(&bare), UpdateMode::Downloaded);
+    }
+
+    /// The unattended trigger's whole rule, one case per clause: only a
+    /// downloaded copy, only when no version was named for it by the environment
+    /// hook, only for a strictly newer release, and never twice for one whose own
+    /// attempt already failed.
+    #[test]
+    fn test_auto_update_target() {
+        let v = |s: &str| semver::Version::parse(s).unwrap();
+        let current = v("1.2.3");
+        let newer = v("1.2.4");
+        let newest = v("1.3.0");
+        let is = |mode: UpdateMode,
+                  named: Option<&semver::Version>,
+                  latest: Option<&semver::Version>,
+                  failed: Option<&semver::Version>| {
+            auto_update_target(mode, named, latest, &current, failed)
+        };
+
+        // A strictly newer release, and only that one, fires.
+        assert_eq!(
+            is(UpdateMode::Downloaded, None, Some(&newer), None),
+            Some(newer.clone())
+        );
+        assert_eq!(
+            is(UpdateMode::Downloaded, None, Some(&newest), None),
+            Some(newest.clone())
+        );
+        assert_eq!(is(UpdateMode::Downloaded, None, None, None), None);
+        assert_eq!(is(UpdateMode::Downloaded, None, Some(&current), None), None);
+        assert_eq!(
+            is(UpdateMode::Downloaded, None, Some(&v("1.2.2")), None),
+            None
+        );
+
+        // A copy built from a working tree never fires by itself — its
+        // availability is true by construction, which is exactly why the flag
+        // alone is not the trigger.
+        assert_eq!(is(UpdateMode::SourceTree, None, Some(&newer), None), None);
+        assert_eq!(is(UpdateMode::SourceTree, None, None, None), None);
+
+        // A version named through the environment hook is that hook's update.
+        assert_eq!(
+            is(UpdateMode::Downloaded, Some(&newer), Some(&newer), None),
+            None
+        );
+
+        // A release whose own unattended attempt failed is not tried again; a
+        // strictly newer one still is.
+        assert_eq!(
+            is(UpdateMode::Downloaded, None, Some(&newer), Some(&newer)),
+            None
+        );
+        assert_eq!(
+            is(UpdateMode::Downloaded, None, Some(&newest), Some(&newer)),
+            Some(newest.clone())
+        );
     }
 
     /// The asset-name and URL derivation is the contract the release workflow and

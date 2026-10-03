@@ -3017,13 +3017,16 @@ fn workspace_picker_button_payload_fits_telegram_limit() {
 
 /// The self-update notifications must reach the admin as plain, single
 /// messages: no character may be turned into markup, and none may be split by
-/// the chunker (a split message reads as several notifications).
+/// the chunker (a split message reads as several notifications). The start-up
+/// line is one of them — it is where an unattended update's new version is
+/// named to the owner.
 #[test]
 fn test_update_notification_texts_render_as_plain_single_messages() {
     for text in [
         crate::self_update::UPDATE_BUILD_COMPLETE_MSG,
         crate::self_update::UPDATE_DOWNLOAD_COMPLETE_MSG,
         crate::self_update::UPDATE_RESTART_MSG,
+        &crate::self_update::back_online_message(),
     ] {
         assert_eq!(to_telegram_html(text), text, "not plain text: {text}");
         assert_eq!(

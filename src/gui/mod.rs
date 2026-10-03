@@ -1444,6 +1444,14 @@ impl Dashboard {
                 if !availability.available || availability.in_progress {
                     return Task::none();
                 }
+                // Claim the update before spawning it, exactly as the `/update`
+                // command does: an update that fires by itself can start between
+                // the check above and the task below, and a second attempt must
+                // stand down here instead of colliding inside `execute_update`
+                // and reporting the collision as a failure.
+                if !crate::self_update::claim_update_start() {
+                    return Task::none();
+                }
                 // Save window state before update (synchronous).
                 self.persist_window_state();
                 // Transient confirmation that the update has kicked off; the
@@ -1456,20 +1464,11 @@ impl Dashboard {
                             match crate::self_update::execute_update().await {
                                 Ok(()) => Ok("ok".to_string()),
                                 Err(e) => {
-                                    // Report to the admin (Telegram) as well as
-                                    // the GUI toast, preserving the prior behavior
-                                    // where the update path notified on failure.
-                                    // `execute_update` no longer notifies; each caller
-                                    // composes its own failure text.
-                                    let msg = format!("❌ Update failed:\n{e:#}");
-                                    let target =
-                                        crate::self_update::resolve_admin_telegram_target().await;
-                                    crate::self_update::notify_admin(
-                                        &crate::self_update::update_failure_notification(&e),
-                                        target.as_deref(),
-                                    )
-                                    .await;
-                                    Err(msg)
+                                    // Reported to the admin exactly as the
+                                    // unattended trigger reports it, while the
+                                    // window shows its own toast.
+                                    crate::self_update::report_update_failure(&e).await;
+                                    Err(format!("❌ Update failed:\n{e:#}"))
                                 }
                             }
                         },
