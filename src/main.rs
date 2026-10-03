@@ -932,9 +932,11 @@ async fn handle_bot_command(msg: &ChannelMessage, cmd: BotCommand) {
         // which requires a selected shared workspace). The handler applies its
         // own admin gate + availability pre-check.
         BotCommand::Update => mahbot::self_update::handle_update_command(msg).await,
-        // Admin-gated commands: denial for guests. `/workspace` shares the gate
-        // but not the body: `handle_admin_command` requires an already-active
-        // shared workspace — the very choice `/workspace` exists to make.
+        // Admin-gated commands: denial for guests. `/workspace` and `/board`
+        // share the gate but not the body: `handle_admin_command` requires an
+        // already-active shared workspace — the very choice `/workspace` exists
+        // to make — while `/board` spans every workspace and must neither read
+        // nor depend on that choice.
         BotCommand::Board
         | BotCommand::Archive
         | BotCommand::Pause
@@ -944,10 +946,10 @@ async fn handle_bot_command(msg: &ChannelMessage, cmd: BotCommand) {
         | BotCommand::MaintenanceOff
         | BotCommand::Workspace => {
             if mahbot::users::is_admin(&msg.user_name).await {
-                if cmd == BotCommand::Workspace {
-                    handle_workspace_command(msg).await;
-                } else {
-                    handle_admin_command(msg, cmd).await;
+                match cmd {
+                    BotCommand::Workspace => handle_workspace_command(msg).await,
+                    BotCommand::Board => handle_board_listing(msg).await,
+                    _ => handle_admin_command(msg, cmd).await,
                 }
             } else {
                 send_telegram_reply(msg, mahbot::self_update::ADMIN_ONLY_CMD_MSG.to_string()).await;
@@ -1212,9 +1214,10 @@ async fn resolve_admin_workspace(msg: &ChannelMessage) -> Result<Option<Workspac
     }
 }
 
-/// Handle the admin-gated commands that act on the active workspace (`/board`,
-/// `/archive`, `/pause`, `/unpause`, `/maintenance`). All reuse the same store
-/// methods the GUI calls, so the two surfaces can never diverge.
+/// Handle the admin-gated commands that act on the active workspace
+/// (`/archive`, `/pause`, `/unpause`, `/maintenance`). All reuse the same store
+/// methods the GUI calls, so the two surfaces can never diverge. `/board` and
+/// `/workspace` are dispatched in [`handle_bot_command`] and never reach here.
 async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
     // The pause/resume pair reports trailing text rather than dropping it:
     // `/pause <name>` used to act on the active workspace while reading as if it
@@ -1262,7 +1265,6 @@ async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
     };
 
     match (cmd, maintenance_arg) {
-        (BotCommand::Board, _) => handle_board_listing(msg, &ws).await,
         (BotCommand::Archive, _) => {
             let count = mahbot::pipeline::board::store()
                 .archive_all_done_and_cancelled(Some(&ws.name))
@@ -1292,8 +1294,8 @@ async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
         (BotCommand::MaintenanceOn, _) => toggle_workspace_state(msg, &ws, true, true).await,
         (BotCommand::MaintenanceOff, _) => toggle_workspace_state(msg, &ws, false, true).await,
         // Impossible: an invalid `/maintenance` argument returned early above,
-        // and `/workspace` — the only other admin-gated command — never reaches
-        // this handler (see the dispatch arm).
+        // and `/board` / `/workspace` — the other admin-gated commands — are
+        // dispatched in `handle_bot_command` and never reach this handler.
         _ => unreachable!(),
     }
 }
@@ -1342,44 +1344,30 @@ async fn toggle_workspace_state(
     send_telegram_reply(msg, format!("{verb} for '{}'.", ws.display_name())).await;
 }
 
-/// Handle `/board` — list the active workspace's non-archived tickets in the
-/// exact order the GUI board column shows them (shared ordering helper).
+/// Handle `/board` — list every workspace's non-archived tickets in the exact
+/// order the GUI board column shows them (shared ordering helper), formatted by
+/// [`board_listing_text`](mahbot::channels::telegram::board_listing_text).
 ///
-/// Every project-reporting reply names the workspace it refers to: the admin
-/// can switch workspaces from the same chat, so a bare ticket list would leave
-/// the subject ambiguous.
-async fn handle_board_listing(msg: &ChannelMessage, ws: &Workspace) {
+/// The listing spans every workspace, never the account's selected one: it
+/// neither reads nor depends on that selection. A long listing goes out across
+/// several messages through the channel's own chunking, as it always has.
+async fn handle_board_listing(msg: &ChannelMessage) {
     let tickets = match mahbot::pipeline::board::store()
-        .list_all_tickets(Some(&ws.name), None)
+        .list_all_tickets(None, None)
         .await
     {
         Ok(t) => t,
         Err(e) => {
-            send_telegram_reply(
-                msg,
-                format!("Failed to load the board for {}: {e}", ws.display_name()),
-            )
-            .await;
+            send_telegram_reply(msg, format!("Failed to load the board: {e}")).await;
             return;
         }
     };
     let ordered = mahbot::pipeline::board::BoardStore::board_display_order(&tickets);
-    if ordered.is_empty() {
-        send_telegram_reply(msg, format!("{} — no tickets", ws.display_name())).await;
-        return;
-    }
-    // The line opens with a per-phase emoji rather than a `•`/`*` bullet: a
-    // leading `*` would pair with a `*` in a ticket title and swallow the id
-    // and title into an italic span. The ticket ID is monospace; each line
-    // converts independently, so markdown-special characters in a title cannot
-    // corrupt other lines.
-    let listing = ordered
-        .iter()
-        .map(|t| mahbot::channels::telegram::format_board_line(&t.phase, &t.id, &t.title))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let header = format!("{} — {} tickets", ws.display_name(), ordered.len());
-    send_telegram_reply(msg, format!("{header}\n{listing}")).await;
+    send_telegram_reply(
+        msg,
+        mahbot::channels::telegram::board_listing_text(&ordered),
+    )
+    .await;
 }
 
 /// Handle an action callback (`__act__` prefix).

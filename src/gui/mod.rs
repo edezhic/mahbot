@@ -413,6 +413,11 @@ pub enum Message {
     /// Named `DiffModal` rather than `Diff` to avoid ambiguity with the
     /// removed `Page::Diff` variant and the existing page-message convention.
     DiffModal(diff::DiffMessage),
+    /// The read-only foreign commit view's own [`diff::DiffMessage`]s — a
+    /// sidebar ticket of a project that is not the picked one. Routing is by
+    /// origin, not by what is on screen, so a task still in flight from the
+    /// picked view can never land in another project's view.
+    ForeignDiff(diff::DiffMessage),
     /// Git sub-state message.
     Git(git::GitMessage),
     Shell(shell::ShellMessage),
@@ -422,6 +427,14 @@ pub enum Message {
     // ── Diff modal ──────────────────────────────────────────────
     /// Open the diff modal. Optional commit hash — `None` = working tree diff.
     OpenDiffModal(Option<String>),
+    /// A sidebar ticket's project, looked up in the store because the
+    /// dashboard's workspace map had no entry for it yet. `path` is `None`
+    /// when the project is gone.
+    TicketCommitProjectResolved {
+        workspace: String,
+        commit_hash: String,
+        path: Option<String>,
+    },
     /// Close the diff modal.
     CloseDiffModal,
     /// TTS model download progress event.
@@ -442,6 +455,7 @@ impl Message {
             Message::Home(home::HomeMessage::Toast(tm))
             | Message::Board(board::BoardMessage::Toast(tm))
             | Message::DiffModal(diff::DiffMessage::Toast(tm))
+            | Message::ForeignDiff(diff::DiffMessage::Toast(tm))
             | Message::Git(git::GitMessage::Toast(tm))
             | Message::Editor(editor::EditorMessage::Toast(tm))
             | Message::Sessions(sessions::SessionsMessage::Toast(tm))
@@ -666,7 +680,21 @@ pub struct Dashboard {
     settings_state: settings::SettingsState,
 
     // ── Diff modal ──────────────────────────────────────────────
+    /// Whether the picked workspace's diff view is open.
     show_diff_modal: bool,
+    /// The read-only view of another project's commit, opened from a sidebar
+    /// ticket card whose workspace is not the picked one: the project named in
+    /// the view's header while it is open, `None` while it is closed. Mutually
+    /// exclusive with [`Self::show_diff_modal`], and independent of the picked
+    /// workspace's own diff state — viewing a foreign commit never re-points
+    /// the working-tree view.
+    foreign_workspace: Option<String>,
+    /// That view's own state, held for the dashboard's lifetime so its load
+    /// generation keeps increasing across opens: a load left in flight when the
+    /// view is closed can then never be accepted by the next one. A state
+    /// rebuilt per open would restart at generation 1 and could paint one
+    /// project's commit under another project's header.
+    foreign_diff_state: diff::DiffState,
 
     // ── Git state ───────────────────────────────────────────────
     /// All git-related state (branch info, sync, branch modal).
@@ -712,6 +740,8 @@ impl Dashboard {
             editor_state: editor::EditorState::new(),
             settings_state: settings::SettingsState::new(),
             show_diff_modal: false,
+            foreign_workspace: None,
+            foreign_diff_state: diff::DiffState::new(),
             git_state: git::GitState::new(),
             #[cfg(target_os = "macos")]
             tts_download_progress: None,
@@ -1075,13 +1105,17 @@ impl Dashboard {
     }
 
     /// Handle Escape key: dismiss modals in priority order (self-update
-    /// confirmation → diff modal → git branch modal → page-level escape
-    /// dispatch).
+    /// confirmation → foreign commit view → diff modal → git branch modal →
+    /// page-level escape dispatch).
     fn process_escape(&mut self) -> Task<Message> {
-        // Modal close priority: self-update confirmation first, then diff
-        // modal, then branch modal, then page-level escapes.
+        // Modal close priority: self-update confirmation first, then the
+        // foreign commit view, then the picked diff modal, then the branch
+        // modal, then page-level escapes.
         if self.show_update_confirm {
             self.show_update_confirm = false;
+            Task::none()
+        } else if self.foreign_workspace.is_some() {
+            self.foreign_workspace = None;
             Task::none()
         } else if self.show_diff_modal {
             self.show_diff_modal = false;
@@ -1292,8 +1326,18 @@ impl Dashboard {
                 Task::none()
             }
             Message::CloseDiffModal => {
+                // The backdrop closes whichever view is showing, dropping that
+                // view's commit ref with it so a later open cannot inherit a
+                // stale one. `ClearCommitState` never returns work.
+                let was_foreign = self.foreign_workspace.take().is_some();
                 self.show_diff_modal = false;
-                Task::done(Message::DiffModal(diff::DiffMessage::ClearCommitState))
+                let state = if was_foreign {
+                    &mut self.foreign_diff_state
+                } else {
+                    &mut self.diff_state
+                };
+                let _ = state.update(diff::DiffMessage::ClearCommitState);
+                Task::none()
             }
             // Navigation has explicit before/after-ready handling
             Message::Navigation(_) if !self.ready => Task::none(),
@@ -1333,13 +1377,14 @@ impl Dashboard {
                 .update(msg, self.log_store.as_ref().expect("ready"))
                 .map(Message::Logs),
             Message::Board(msg) => {
-                // Intercept ViewCommitDiff for cross-page navigation
+                // Intercept a ticket's commit diff for cross-page navigation
                 // before it reaches board_state.update.
                 if let board::BoardMessage::ViewCommitDiff {
-                    ref commit_hash, ..
+                    ref commit_hash,
+                    ref workspace_name,
                 } = msg
                 {
-                    return self.open_diff_modal(Some(commit_hash.clone()));
+                    return self.open_ticket_commit_diff(workspace_name, commit_hash.clone());
                 }
                 self.board_state.update(msg).map(Message::Board)
             }
@@ -1349,10 +1394,26 @@ impl Dashboard {
             // Intercept CloseModal from successful manual commit — auto-close
             // the diff modal while keeping the diff state in working-tree view.
             // ClearCommitState is intentionally not emitted; the commit handler
-            // already cleared commit state and kicked off a diff refresh.
+            // already cleared commit state and kicked off a diff refresh. A
+            // foreign view is untouched: it has a channel of its own and closes
+            // through its own controls.
             Message::DiffModal(diff::DiffMessage::CloseModal) => {
                 self.show_diff_modal = false;
                 Task::none()
+            }
+            // "Back to working tree" in the foreign view leaves that project
+            // for the picked workspace's working tree — the other project's
+            // working tree is not a place to land.
+            Message::ForeignDiff(diff::DiffMessage::BackToWorkingTree) => {
+                self.open_diff_modal(None)
+            }
+            Message::ForeignDiff(msg) => {
+                if self.foreign_workspace.is_none() {
+                    return Task::none();
+                }
+                self.foreign_diff_state
+                    .update(msg)
+                    .map(Message::ForeignDiff)
             }
             Message::DiffModal(msg) => {
                 // A manual commit is a ref-only change (HEAD + `.git/index`)
@@ -1360,6 +1421,11 @@ impl Dashboard {
                 // promptly — otherwise diff_stats/behind_ahead stay stale until
                 // the periodic timer.
                 let commit_succeeded = matches!(&msg, diff::DiffMessage::CommitResult(Ok(_)));
+                // Every `Message::DiffModal` belongs to the picked workspace's
+                // view — its subscription, its rendered controls, the
+                // dashboard's pushes to it. The foreign view speaks
+                // `Message::ForeignDiff`, so neither state can receive the
+                // other's messages.
                 let diff_task = self.diff_state.update(msg).map(Message::DiffModal);
                 if commit_succeeded {
                     Task::batch([
@@ -1390,12 +1456,24 @@ impl Dashboard {
             Message::Settings(msg) => self.process_settings_message(msg),
             // ── Diff modal ────────────────────────────────────────
             Message::OpenDiffModal(commit_hash) => self.open_diff_modal(commit_hash),
+            Message::TicketCommitProjectResolved {
+                workspace,
+                commit_hash,
+                path,
+            } => match path {
+                Some(path) => self.show_foreign_commit(&workspace, path, commit_hash),
+                None => self.push_toast(
+                    format!("Project '{workspace}' is unavailable."),
+                    ToastKind::Error,
+                ),
+            },
             // ── Git state (routed to self.git_state) ─────────────────
             Message::Git(msg) => {
-                // Cross-modal close: if opening the branch modal,
-                // close the diff modal from Dashboard side.
+                // Cross-modal close: if opening the branch modal, close both
+                // diff views from the Dashboard side — one overlay at a time.
                 if matches!(msg, git::GitMessage::OpenModal) {
                     self.show_diff_modal = false;
+                    self.foreign_workspace = None;
                 }
                 let snapshot = matches!(msg, git::GitMessage::WorktreeSnapshot(..));
                 let task = self.git_state.update(msg).map(Message::Git);
@@ -1580,7 +1658,9 @@ impl Dashboard {
                 name: Some(name),
             } => {
                 // Stale reads are dropped (see `active_workspace_gen`); an
-                // unchanged value must not re-run the heavy propagate.
+                // unchanged value is a no-op rather than a re-run of the
+                // propagate — the Home transcript reload and the pushes to the
+                // workspace-scoped surfaces.
                 if generation != self.active_workspace_gen
                     || self.selected_workspace_name.as_deref() == Some(name.as_str())
                 {
@@ -1651,14 +1731,17 @@ impl Dashboard {
         }
     }
 
-    /// Open the diff modal, closing any board or branch modal first.
+    /// Open the picked workspace's diff modal, closing any board or branch
+    /// modal first, and leaving any foreign commit view behind.
     ///
     /// When `commit_hash` is `Some`, navigates to that commit; when `None`,
     /// navigates to the working tree (clearing any stale commit state).
     ///
-    /// The change/diff view is workspace-scoped, so this refuses to open while
-    /// nothing is resolved — including the board's ticket commit link.
+    /// The change/diff view is workspace-scoped, so it never opens while
+    /// nothing is resolved; losing the resolution has already closed it (see
+    /// [`Self::sync_workspace_surfaces`]).
     fn open_diff_modal(&mut self, commit_hash: Option<String>) -> Task<Message> {
+        self.foreign_workspace = None;
         if self.resolved_workspace().is_none() {
             return Task::none();
         }
@@ -1678,6 +1761,75 @@ impl Dashboard {
             None => Task::done(Message::DiffModal(diff::DiffMessage::BackToWorkingTree)),
         };
         Task::batch([close_board, diff_task])
+    }
+
+    /// Open a sidebar ticket's commit diff against the ticket's own project.
+    ///
+    /// A ticket of the picked workspace opens the ordinary diff view. A ticket
+    /// of another project is shown read-only — that project's own commit
+    /// history, named in the view, with no file-changing control and without
+    /// re-pointing the picked workspace's view. A ticket whose project cannot
+    /// be resolved reports that instead of showing another project's history.
+    fn open_ticket_commit_diff(&mut self, workspace: &str, commit_hash: String) -> Task<Message> {
+        if self
+            .resolved_workspace()
+            .is_some_and(|(name, _)| name == workspace)
+        {
+            return self.open_diff_modal(Some(commit_hash));
+        }
+        // The workspace map is read at boot and kept live by CDC, but a click
+        // on the sidebar can beat that first read — the store is the authority,
+        // so a miss falls back to it rather than reporting a project that
+        // exists as unavailable.
+        let Some(path) = self
+            .workspaces
+            .get(workspace)
+            .map(|ws| ws.path.clone())
+            .filter(|path| !path.is_empty())
+        else {
+            let (workspace, commit_hash) = (workspace.to_string(), commit_hash);
+            let lookup_name = workspace.clone();
+            return Task::perform(
+                async move {
+                    crate::workspace::get_by_name(&lookup_name)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|ws| ws.path)
+                        .filter(|path| !path.is_empty())
+                },
+                move |path| Message::TicketCommitProjectResolved {
+                    workspace,
+                    commit_hash,
+                    path,
+                },
+            );
+        };
+        self.show_foreign_commit(workspace, path, commit_hash)
+    }
+
+    /// Show `commit_hash` of `workspace` (at `path`) as the read-only foreign
+    /// commit view: the picked workspace's own view is left untouched.
+    fn show_foreign_commit(
+        &mut self,
+        workspace: &str,
+        path: String,
+        commit_hash: String,
+    ) -> Task<Message> {
+        self.foreign_workspace = Some(workspace.to_string());
+        self.show_diff_modal = false;
+        let view = self
+            .foreign_diff_state
+            .update(diff::DiffMessage::CommitInWorkspace {
+                path,
+                hash: commit_hash,
+            });
+        // Close any board modal, as `open_diff_modal` does: one overlay at a time.
+        let close_board = self
+            .board_state
+            .update(board::BoardMessage::CloseModal)
+            .map(Message::Board);
+        Task::batch([close_board, view.map(Message::ForeignDiff)])
     }
 
     /// Apply a workspace selection in memory and broadcast it to all pages,
@@ -1725,31 +1877,14 @@ impl Dashboard {
         Task::batch(std::iter::once(propagate).chain(db_write))
     }
 
-    /// Propagate the global workspace selection to the board and to the Home
-    /// page, then push the resolved workspace to the workspace-scoped
-    /// surfaces (see [`Self::sync_workspace_surfaces`]).
+    /// Propagate the global workspace selection to the Home page, then push the
+    /// resolved workspace to the workspace-scoped surfaces (see
+    /// [`Self::sync_workspace_surfaces`]).
+    ///
+    /// The ticket sidebar is deliberately not one of the surfaces this touches:
+    /// it lists every workspace's tickets, so a switch must leave it — its
+    /// search included — exactly as it is.
     fn propagate_workspace_selection(&mut self, name: &str) -> Task<Message> {
-        // Set board's workspace filter directly, then refresh.
-        // Clear any active search when switching workspaces so stale results
-        // from the previous workspace don't persist.
-        self.board_state.workspace_name = Some(name.to_string());
-        self.board_state.search_query.clear();
-        self.board_state.search_results.clear();
-        self.board_state.search_error = None;
-        self.board_state.search_generation += 1;
-        // The previous workspace's load failure does not describe the board
-        // being loaded now.
-        self.board_state.load_state.clear_error();
-        // Bump the board generation so a stale in-flight snapshot from the
-        // previous workspace is dropped on arrival.
-        self.board_state.board_generation += 1;
-        // On switch the next snapshot REPLACES the board (the previous
-        // workspace's tickets must not linger), and the removal-tracking set is
-        // cleared so old-workspace removals are not applied to the new snapshot.
-        self.board_state.replace_on_refresh = true;
-        self.board_state.delta_removed_ids.clear();
-        let board_refresh = self.board_state.refresh().map(Message::Board);
-
         // Notify the Home page so it can reload chat history: the selection as
         // stored, with no substitution. A selection the loaded map has not
         // caught up with yet — a project activated from the chat while a reload
@@ -1763,7 +1898,7 @@ impl Dashboard {
                 .map(Message::Home);
 
         let surfaces = self.sync_workspace_surfaces();
-        Task::batch([board_refresh, home_task, surfaces])
+        Task::batch([home_task, surfaces])
     }
 
     /// Push the resolved workspace to the four workspace-scoped surfaces — the
@@ -1892,7 +2027,10 @@ impl Dashboard {
     /// `pending_research_cancel` is likewise excluded: it is rendered inside
     /// the Running Agents page body, not as an overlay over other pages.
     fn overlay_modal_open(&self) -> bool {
-        self.show_diff_modal || self.show_update_confirm || self.git_state.is_modal_open()
+        self.foreign_workspace.is_some()
+            || self.show_diff_modal
+            || self.show_update_confirm
+            || self.git_state.is_modal_open()
     }
 
     #[expect(clippy::too_many_lines)]
@@ -1954,16 +2092,17 @@ impl Dashboard {
                     )],
                 )
                 .into();
-                // Wrap sidebar in a right-click context menu with "Archive done
-                // & cancelled", plus the bulk pause item when a
-                // queued ticket is listed.
+                // Sidebar right-click menu: the two bulk actions over the list
+                // the sidebar shows — each label carries that all-workspaces
+                // scope, so it is read before acting. Pausing is offered only
+                // when a queued ticket is listed.
                 let mut menu_items = vec![menus::MenuItem::new(
-                    "Archive done & cancelled".into(),
+                    "Archive done & cancelled (all workspaces)".into(),
                     Message::Board(board::BoardMessage::ArchiveAllCompleted),
                 )];
-                if self.board_state.has_visible_queued_tickets() {
+                if self.board_state.has_queued_tickets() {
                     menu_items.push(menus::MenuItem::new(
-                        "Pause all queued tickets".into(),
+                        "Pause all queued tickets (all workspaces)".into(),
                         Message::Board(board::BoardMessage::PauseAllQueued),
                     ));
                 }
@@ -2055,10 +2194,19 @@ impl Dashboard {
         };
 
         // ── Diff modal overlay ─────────────────────────────────────
-        // `show_diff_modal` is only ever set for a resolved workspace, and
-        // `sync_workspace_surfaces` clears it when the resolution is lost.
-        let diff_overlay: Element<'_, Message> = if self.show_diff_modal {
-            render_diff_modal(&self.diff_state)
+        // The picked workspace's view is the default; a sidebar ticket card
+        // from another project opens the read-only foreign view instead, and
+        // the two are mutually exclusive. `sync_workspace_surfaces` closes the
+        // picked one when its resolution is lost and never touches the foreign
+        // one.
+        let diff_overlay: Element<'_, Message> = if let Some(foreign) = &self.foreign_workspace {
+            render_diff_modal(
+                &self.foreign_diff_state,
+                Some(foreign),
+                Message::ForeignDiff,
+            )
+        } else if self.show_diff_modal {
+            render_diff_modal(&self.diff_state, None, Message::DiffModal)
         } else {
             widgets::empty_stack_placeholder()
         };
@@ -2111,7 +2259,16 @@ fn modal_overlay<'a>(
 }
 
 /// Render the diff modal (80% width, 100% height, centered).
-fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
+///
+/// `foreign_workspace` is `Some(name)` while the modal shows another project's
+/// commit (opened from a sidebar ticket card). That view is read-only and its
+/// Back button leaves it for the picked workspace, so the commit header names
+/// the project: it must never be taken for the picked workspace's history.
+fn render_diff_modal<'a>(
+    diff_state: &'a diff::DiffState,
+    foreign_workspace: Option<&'a str>,
+    wrap: fn(diff::DiffMessage) -> Message,
+) -> Element<'a, Message> {
     let viewing_commit = diff_state.is_viewing_commit();
 
     // Outer header: commit message (large, bold) + short hash (muted) for
@@ -2122,9 +2279,15 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
             .unwrap_or("(no commit message)")
             .to_string();
         let hash = diff_state.commit_short_hash().unwrap_or("???????");
+        let subject = match foreign_workspace {
+            Some(workspace) => format!("{hash} in workspace {workspace}"),
+            None => hash.to_string(),
+        };
         column![
             widgets::section_heading(msg),
-            text(hash).size(theme::TEXT_12).color(theme::TEXT_SECONDARY),
+            text(subject)
+                .size(theme::TEXT_12)
+                .color(theme::TEXT_SECONDARY),
         ]
         .spacing(theme::SPACE_2)
         .padding(iced::Padding {
@@ -2148,7 +2311,7 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
     };
 
     let diff_content: Element<'_, diff::DiffMessage> = diff_state.view();
-    let inner = column![header, diff_content.map(Message::DiffModal)].spacing(0);
+    let inner = column![header, diff_content.map(wrap)].spacing(0);
 
     modal_overlay(inner, Message::CloseDiffModal)
 }
@@ -2156,8 +2319,10 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
 // ── Ticket sidebar (Home page, right side) ────────────────────────
 
 /// Ticket sidebar shown on the right side of the Home page.
-/// Displays all non-archived tickets grouped by phase. A right-click
-/// context menu on this panel offers "Archive done & cancelled".
+/// Displays every workspace's non-archived tickets, grouped by phase. A
+/// right-click context menu on this panel offers the two bulk actions over
+/// that list — archiving its done and cancelled tickets, pausing its queued
+/// ones.
 fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
     let search_active = !board_state.search_query.text().is_empty();
 
@@ -2420,8 +2585,14 @@ impl Dashboard {
             iced::Subscription::run(tts_download_subscription).map(Message::TtsDownloadEvent),
             // Diff modal subscription (keyboard shortcuts, auto-refresh).
             // Only active when the modal is open to avoid intercepting
-            // global keyboard shortcuts unnecessarily.
-            if self.show_diff_modal {
+            // global keyboard shortcuts unnecessarily. The foreign commit view
+            // owns it while it is the one shown, so the two never both
+            // subscribe.
+            if self.foreign_workspace.is_some() {
+                self.foreign_diff_state
+                    .subscription()
+                    .map(Message::ForeignDiff)
+            } else if self.show_diff_modal {
                 self.diff_state.subscription().map(Message::DiffModal)
             } else {
                 iced::Subscription::none()
@@ -3669,6 +3840,8 @@ fn shell_execute_address(address: &[u16]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::board::TicketPhase;
+    use crate::util::test::TicketFixture;
 
     /// Build a minimal [`Workspace`] with a name + derived path for map fixtures.
     fn ws(name: &str) -> Workspace {
@@ -3776,22 +3949,18 @@ mod tests {
             "a superseded read must not revert the live selection"
         );
 
-        // A failed read changes nothing, and an unchanged value must not re-run
-        // the heavy propagate (the board generation it bumps stays put).
+        // A failed read changes nothing, and an unchanged value is a no-op
+        // rather than a re-run of the propagate — the Home transcript reload
+        // and the pushes to the workspace-scoped surfaces.
         let _ = dash.update(Message::ActiveWorkspaceSynced {
             generation: 1,
             name: None,
         });
-        let board_gen = dash.board_state.board_generation;
         let _ = dash.update(Message::ActiveWorkspaceSynced {
             generation: 1,
             name: Some("ws1".to_string()),
         });
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
-        assert_eq!(
-            dash.board_state.board_generation, board_gen,
-            "an unchanged value must not re-propagate the selection"
-        );
 
         // Two reads in flight: the one dispatched first cannot land last and
         // revert the newer answer, because the newer dispatch bumped the guard.
@@ -3954,17 +4123,100 @@ mod tests {
         assert_eq!(dash.pushed_workspace, None);
     }
 
-    /// A workspace switch drops the board failure that described the previous
-    /// workspace: its banner must not paint over the board being loaded now.
+    /// A sidebar ticket of another project opens its commit read-only and named,
+    /// without re-pointing the picked workspace's own change view; the ticket's
+    /// own project uses the ordinary view, and a project that no longer resolves
+    /// is reported instead of falling back to another project's history.
     #[test]
-    fn workspace_switch_clears_the_previous_board_failure() {
+    fn foreign_ticket_commit_diff_keeps_the_picked_view() {
+        let mut dash = ready_dashboard();
+        dash.workspaces = HashMap::from([
+            ("ws1".to_string(), ws("ws1")),
+            ("ws2".to_string(), ws("ws2")),
+        ]);
+        let _ = dash.apply_workspace_selection("ws1");
+
+        let _ = dash.open_ticket_commit_diff("ws2", "abc1234".to_string());
+        assert_eq!(dash.foreign_workspace.as_deref(), Some("ws2"));
+        // The dashboard's own foreign state is the one that loaded: a state
+        // rebuilt per open would be a different one, and its generation would
+        // restart at 1 — a load left in flight from a previous view could then
+        // land in this one.
+        assert!(
+            dash.foreign_diff_state.is_viewing_commit(),
+            "the foreign view shows ws2's commit"
+        );
+        assert!(
+            !dash.show_diff_modal,
+            "the picked workspace's view must not be the one showing"
+        );
+
+        // A picker-driven workspace push is the picked view's own message: the
+        // foreign view keeps the other project's commit on screen, and the
+        // picked state — not the foreign one — is the one re-pointed.
+        let _ = dash.update(Message::DiffModal(diff::DiffMessage::WorkspaceSelected(
+            "/p/ws3".to_string(),
+        )));
+        assert_eq!(dash.foreign_workspace.as_deref(), Some("ws2"));
+        assert!(
+            dash.foreign_diff_state.is_viewing_commit(),
+            "the foreign view must not be re-pointed at the picked workspace"
+        );
+
+        // "Back to working tree" in a foreign view returns to the picked
+        // workspace, never to the other project's working tree.
+        let _ = dash.update(Message::ForeignDiff(diff::DiffMessage::BackToWorkingTree));
+        assert!(dash.foreign_workspace.is_none());
+        assert!(dash.show_diff_modal);
+
+        // A ticket of the picked workspace takes the ordinary view.
+        let _ = dash.open_ticket_commit_diff("ws1", "abc1234".to_string());
+        assert!(dash.foreign_workspace.is_none());
+        assert!(dash.show_diff_modal);
+
+        // A project the map does not know is looked up in the store, and
+        // reported when it is gone — never substituted with another project's
+        // history. The ordinary view that was open stands untouched.
+        let _ = dash.open_ticket_commit_diff("gone", "abc1234".to_string());
+        assert!(dash.foreign_workspace.is_none());
+        assert!(
+            dash.show_diff_modal,
+            "the view that was open stands untouched"
+        );
+        let _ = dash.update(Message::TicketCommitProjectResolved {
+            workspace: "gone".to_string(),
+            commit_hash: "abc1234".to_string(),
+            path: None,
+        });
+        assert!(matches!(
+            dash.toasts.as_slice(),
+            [Toast {
+                message,
+                kind: ToastKind::Error,
+                ..
+            }] if message == "Project 'gone' is unavailable."
+        ));
+    }
+
+    /// A workspace switch must not touch the ticket sidebar: it lists every
+    /// workspace's tickets, so its load failure and an in-progress search — the
+    /// query and the results it produced — must survive a switch untouched.
+    #[test]
+    fn workspace_switch_leaves_the_ticket_sidebar_untouched() {
         let mut dash = ready_dashboard();
         dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
         dash.board_state.load_state.fail("db down".to_string());
+        let _ = dash.update(Message::Board(board::BoardMessage::SearchInputChanged(
+            editor_widget::EditorAction::Paste("foo".into()),
+        )));
+        dash.board_state.search_results =
+            vec![TicketFixture::new("T-1", TicketPhase::Backlog).build()];
 
         let _ = dash.propagate_workspace_selection("ws1");
 
-        assert!(dash.board_state.load_state.error().is_none());
+        assert_eq!(dash.board_state.load_state.error(), Some("db down"));
+        assert_eq!(dash.board_state.search_query.text(), "foo");
+        assert_eq!(dash.board_state.search_results.len(), 1);
     }
 
     /// A reload that lands after a newer one has answered is dropped: its

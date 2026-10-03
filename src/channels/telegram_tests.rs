@@ -1,5 +1,5 @@
 use super::*;
-use crate::util::test::canonical_without_verbatim_prefix;
+use crate::util::test::{TicketFixture, canonical_without_verbatim_prefix};
 
 /// Create a Telegram Update JSON with sensible defaults, then apply
 /// shallow top-level overrides for test-specific fields.
@@ -208,6 +208,40 @@ fn board_listing_isolates_hostile_titles() {
             "unbalanced {open}/{close} in: {html}"
         );
     }
+}
+
+/// The `/board` reply text speaks for all workspaces: a header that says so over
+/// one line per ticket, each entry marked by its own ticket id prefix — and an
+/// empty case in the same voice.
+#[test]
+fn board_listing_text_speaks_for_all_workspaces() {
+    assert_eq!(board_listing_text(&[]), "All workspaces — no tickets");
+
+    let tickets = [
+        TicketFixture::new("mahbot-1", TicketPhase::Backlog)
+            .title("First")
+            .build(),
+        TicketFixture::new("mahbot_rlx-2", TicketPhase::InDevelopment)
+            .title("Second")
+            .build(),
+    ];
+    let ordered: Vec<&Ticket> = tickets.iter().collect();
+    let text = board_listing_text(&ordered);
+
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some("All workspaces — 2 tickets"));
+    for ticket in &tickets {
+        let line = lines.next().expect("one line per ticket");
+        assert!(
+            line.contains(&ticket.id) && line.contains(&ticket.title),
+            "each entry is its own ticket's id and title, in order: {text:?}"
+        );
+    }
+    assert!(lines.next().is_none(), "nothing is added after the listing");
+
+    // One ticket is named in the singular, as the empty listing is called out.
+    let one = [&tickets[0]];
+    assert!(board_listing_text(&one).starts_with("All workspaces — 1 ticket\n"));
 }
 
 // ── Inline formatting tests ──────────────────────────────────────

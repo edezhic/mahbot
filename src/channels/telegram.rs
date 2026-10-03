@@ -1,6 +1,6 @@
 use crate::channels::ReplyReference;
 use crate::channels::reply::normalize_reply_text;
-use crate::pipeline::board::TicketPhase;
+use crate::pipeline::board::{Ticket, TicketPhase};
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
 use crate::util::media_target::{self, MediaTarget};
 use crate::util::{
@@ -43,7 +43,7 @@ const IMAGE_MODELS_COMMAND_DESC: &str = "Select image generation model";
 /// Description for the `/video_models` command.
 const VIDEO_MODELS_COMMAND_DESC: &str = "Select video model";
 /// Description for the `/board` command (admin).
-const BOARD_COMMAND_DESC: &str = "List active workspace tickets";
+const BOARD_COMMAND_DESC: &str = "List tickets from all workspaces";
 /// Description for the `/archive` command (admin).
 const ARCHIVE_COMMAND_DESC: &str = "Archive done & cancelled tickets";
 /// Description for the `/pause` command (admin).
@@ -3291,9 +3291,40 @@ fn phase_emoji(phase: TicketPhase) -> &'static str {
 /// Format one `/board` listing line: the phase emoji, monospace ticket ID,
 /// then the title. Shared by the Telegram `/board` handler and its tests so
 /// the format cannot silently drift between them.
+///
+/// The line opens with the phase emoji rather than a `•`/`*` bullet: a leading
+/// `*` would pair with a `*` in a ticket title and swallow the id and title
+/// into an italic span. The ticket ID is monospace, and each line converts to
+/// Telegram HTML independently, so markdown-special characters in a title
+/// cannot corrupt another line's formatting.
 #[must_use]
 pub fn format_board_line(phase: &TicketPhase, id: &str, title: &str) -> String {
     format!("{} `{}` {}", phase_emoji(*phase), id, title)
+}
+
+/// The complete `/board` reply text for `tickets` (already in the board's
+/// display order): an all-workspaces header followed by one
+/// [`format_board_line`] per ticket.
+///
+/// The listing spans every workspace, so the header names none of them and the
+/// workspace marker of each entry is the ticket id's own prefix. The empty
+/// listing says so in the same all-workspaces voice.
+#[must_use]
+pub fn board_listing_text(tickets: &[&Ticket]) -> String {
+    if tickets.is_empty() {
+        return "All workspaces — no tickets".to_string();
+    }
+    let listing = tickets
+        .iter()
+        .map(|t| format_board_line(&t.phase, &t.id, &t.title))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let noun = if tickets.len() == 1 {
+        "ticket"
+    } else {
+        "tickets"
+    };
+    format!("All workspaces — {} {noun}\n{listing}", tickets.len())
 }
 
 /// The label of one workspace-picker button: the same name the desktop shows
@@ -3355,10 +3386,11 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
     let mut entries: Vec<(String, String)> = Vec::new();
 
     if crate::users::is_admin(user_name).await {
-        // The workspace switcher heads the admin menu: the active workspace is
-        // chosen first, and only then do the other admin commands act on it. It
-        // is shown only while there is something to switch between, so a
-        // single-workspace install never carries a one-item picker.
+        // The workspace switcher heads the admin menu: it picks the active
+        // workspace that the commands under it act on — all of them except
+        // `/board`, which spans every workspace. It is shown only while there
+        // is something to switch between, so a single-workspace install never
+        // carries a one-item picker.
         if crate::users::workspace_switcher_available().await {
             entries.push(("workspace".to_string(), WORKSPACE_COMMAND_DESC.to_string()));
         }

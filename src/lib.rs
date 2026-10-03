@@ -400,7 +400,7 @@ pub enum BotCommand {
     VideoModels,
     /// `/workspace` — switch the admin's active shared workspace (admin).
     Workspace,
-    /// `/board` — list the active workspace's tickets (admin).
+    /// `/board` — list every workspace's tickets (admin).
     Board,
     /// `/archive` — archive done & cancelled tickets (admin).
     Archive,

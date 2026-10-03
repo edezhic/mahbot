@@ -13,7 +13,8 @@
 //!
 //! Also provides [`TicketBuilder`], a builder for creating test tickets that was
 //! historically defined in the `board` module and imported from there by sibling
-//! modules. Moved here so all test infrastructure lives in one place.
+//! modules, and [`TicketFixture`], the in-memory `Ticket` value the GUI and
+//! channel tests share. Moved here so all test infrastructure lives in one place.
 //!
 //! Also provides [`JobRowBuilder`], a builder for inserting test `jobs` rows
 //! (the durability/resume substrate in the consolidated domain database) that
@@ -34,7 +35,7 @@
 #![cfg(test)]
 
 use crate::db;
-use crate::pipeline::board::{BoardStore, Ticket, TicketParams, TicketPhase};
+use crate::pipeline::board::{BoardStore, Ticket, TicketComment, TicketParams, TicketPhase};
 use crate::util::UnwrapPoison;
 use crate::workspace::test_ws_named;
 use std::path::{Path, PathBuf};
@@ -885,6 +886,76 @@ impl<'a> TicketBuilder<'a> {
                 priority: self.priority,
             },
         )
+    }
+}
+
+/// In-memory [`Ticket`] fixture, for tests that need a `Ticket` value without a
+/// store — distinct from the DB-insert [`TicketBuilder`].
+pub(crate) struct TicketFixture(Ticket);
+
+impl TicketFixture {
+    pub(crate) fn new(id: &str, phase: TicketPhase) -> Self {
+        Self(Ticket {
+            id: id.into(),
+            title: "Test ticket".into(),
+            description: String::new(),
+            phase,
+            workspace_name: "test_ws".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            comments: Vec::new(),
+            prerequisites: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            commit_hash: None,
+            lines_added: None,
+            lines_removed: None,
+            reporter: "test".into(),
+            is_archived: false,
+            priority: 0,
+            reviewed_head: None,
+            reviewed_tree: None,
+            done_at: None,
+            bounce_count: 0,
+        })
+    }
+
+    pub(crate) fn title(mut self, title: &str) -> Self {
+        self.0.title = title.into();
+        self
+    }
+
+    pub(crate) fn workspace(mut self, workspace: &str) -> Self {
+        self.0.workspace_name = workspace.into();
+        self
+    }
+
+    pub(crate) fn archived(mut self, archived: bool) -> Self {
+        self.0.is_archived = archived;
+        self
+    }
+
+    pub(crate) fn created_at(mut self, created_at: &str) -> Self {
+        self.0.created_at = created_at.into();
+        self
+    }
+
+    pub(crate) fn done_at(mut self, done_at: Option<&str>) -> Self {
+        self.0.done_at = done_at.map(str::to_string);
+        self
+    }
+
+    pub(crate) fn comment(mut self, role: &str, content: &str, created_at: &str) -> Self {
+        self.0.comments.push(TicketComment {
+            role: role.into(),
+            content: content.into(),
+            created_at: created_at.into(),
+        });
+        self
+    }
+
+    pub(crate) fn build(self) -> Ticket {
+        self.0
     }
 }
 

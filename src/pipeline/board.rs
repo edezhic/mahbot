@@ -2111,7 +2111,7 @@ impl BoardStore {
             return Ok(Vec::new());
         }
 
-        // Param order mirrors search_by_fts: ?1 = workspace, ?2 = query.
+        // Param order: ?1 = workspace, ?2 = query.
         let sql = format!(
             "SELECT t.id, fts_score(t.title, ?2) AS score \
              FROM tickets t \
@@ -2147,8 +2147,8 @@ impl BoardStore {
         }
     }
 
-    /// Search tickets (both active and archived) by FTS keyword match, scoped
-    /// to an optional workspace.
+    /// Search tickets (both active and archived) by FTS keyword match across
+    /// every workspace.
     ///
     /// Sanitizes the input query (strips non-alphanumeric characters) before
     /// matching against the `ngram`-tokenized FTS index on `title`.
@@ -2160,31 +2160,25 @@ impl BoardStore {
     /// to the caller: the GUI sidebar renders the failure instead of silently
     /// showing an empty (or incomplete) result as "No matching tickets". Each is
     /// also logged, so a failed sidebar search leaves a trail outside the GUI.
-    pub async fn search_by_fts(
-        &self,
-        query: &str,
-        limit: usize,
-        workspace_name: Option<&str>,
-    ) -> Result<Vec<Ticket>> {
+    pub async fn search_by_fts(&self, query: &str, limit: usize) -> Result<Vec<Ticket>> {
         let sanitized = crate::db::sanitize_fts_query(query);
         if sanitized.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Use an explicit `FROM tickets t` alias so `fts_score(t.title, ?2)`
+        // Use an explicit `FROM tickets t` alias so `fts_score(t.title, ?1)`
         // resolves correctly — the `select_tickets` helper does not support
         // table aliases in FTS scoring expressions.
         let sql = format!(
             "SELECT {TICKET_COLUMNS} \
              FROM tickets t \
-             WHERE (?1 IS NULL OR t.workspace_name = ?1) \
-               AND t.title MATCH ?2 \
-             ORDER BY fts_score(t.title, ?2) DESC \
+             WHERE t.title MATCH ?1 \
+             ORDER BY fts_score(t.title, ?1) DESC \
              LIMIT {limit}"
         );
         let rows = self
             .conn
-            .query(&sql, db::params![workspace_name, sanitized])
+            .query(&sql, db::params![sanitized])
             .await
             .inspect_err(|e| warn!(error = %e, "Ticket FTS search failed"))?;
         let mut tickets = Vec::with_capacity(rows.len());

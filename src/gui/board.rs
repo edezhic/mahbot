@@ -126,6 +126,9 @@ pub(crate) enum BoardMessage {
     /// Navigate to the commit diff view for this ticket.
     ViewCommitDiff {
         commit_hash: String,
+        /// The ticket's own workspace — the project the commit belongs to,
+        /// which may not be the picked one.
+        workspace_name: String,
     },
 
     /// Toggle expansion of a diagnostics comment.
@@ -162,26 +165,25 @@ pub struct BoardState {
     description_md: Option<Vec<markdown::Item>>,
     /// Cached parsed markdown for comments (re-parsed when ticket changes).
     comments_md: Vec<(usize, Vec<markdown::Item>)>,
-    /// Current workspace name filter (set by the footer workspace picker).
-    pub(crate) workspace_name: Option<String>,
-    /// Bumped on every workspace selection / baseline refresh. The
+    /// Bumped on every refresh request by [`Self::refresh`]. The
     /// [`BoardMessage::Refreshed`] handler drops a stale snapshot whose
-    /// generation no longer matches, preventing a previous workspace's tickets
-    /// from clobbering the newly-selected one.
+    /// generation no longer matches, so an older in-flight read cannot
+    /// overwrite the newest one.
     pub(crate) board_generation: u64,
     /// Ticket ids a CDC delta archived/removed since the last baseline. A
     /// baseline snapshot read before such a delta must not re-add the ticket,
     /// so `apply_refreshed` skips these ids from the snapshot.
     pub(crate) delta_removed_ids: HashSet<String>,
-    /// True right after a workspace switch, so the next [`Refreshed`] REPLACES
-    /// the board (the previous workspace's tickets must not linger). Set again
-    /// on a lag recovery ([`BoardMessage::BoardRefreshNeeded`]) so the recovery
-    /// snapshot is authoritative and drops tickets a lost removal delta would
-    /// have removed. Cleared on the first snapshot; subsequent same-workspace
-    /// refreshes merge.
+    /// True on a lag recovery ([`BoardMessage::BoardRefreshNeeded`]) so the
+    /// recovery snapshot is authoritative and replaces the board, dropping
+    /// tickets a lost removal delta would have removed. Cleared on the first
+    /// snapshot; subsequent refreshes merge.
     pub(crate) replace_on_refresh: bool,
     /// Loaded commit stats for the open ticket.
     commit_stats: Option<CommitStats>,
+    /// Failure from the last commit-stats fetch for the open ticket, rendered
+    /// in the modal so a fetch failure is not silently swallowed.
+    commit_stats_error: Option<String>,
     /// Whether a commit stats fetch is in progress.
     commit_stats_loading: bool,
     /// Incremented on each new fetch; stale callbacks discarded.
@@ -243,11 +245,11 @@ impl BoardState {
             action_loading: None,
             description_md: None,
             comments_md: Vec::new(),
-            workspace_name: None,
             board_generation: 0,
             delta_removed_ids: HashSet::new(),
             replace_on_refresh: false,
             commit_stats: None,
+            commit_stats_error: None,
             commit_stats_loading: false,
             commit_stats_generation: 0,
             pending_cancel: None,
@@ -307,6 +309,7 @@ impl BoardState {
         self.comments_md.clear();
         self.expanded_comments.clear();
         self.commit_stats = None;
+        self.commit_stats_error = None;
         self.commit_stats_loading = false;
         self.commit_stats_generation += 1;
         self.reset_comment_state();
@@ -323,14 +326,16 @@ impl BoardState {
         self.undo_stack.clear();
     }
 
-    pub fn refresh(&self) -> Task<BoardMessage> {
-        let ws_name = self.workspace_name.clone();
+    /// Request a full board snapshot — every workspace's non-archived
+    /// tickets. Bumps [`Self::board_generation`] so only the newest request's
+    /// snapshot applies.
+    pub fn refresh(&mut self) -> Task<BoardMessage> {
+        self.board_generation += 1;
         let generation = self.board_generation;
         Task::perform(
             async move {
-                let board = crate::pipeline::board::store();
-                board
-                    .list_all_tickets(ws_name.as_deref(), None)
+                crate::pipeline::board::store()
+                    .list_all_tickets(None, None)
                     .await
                     .map_err(|e| e.to_string())
             },
@@ -339,58 +344,36 @@ impl BoardState {
                     tickets,
                     generation,
                 },
-                Err(e) => BoardMessage::RefreshError {
-                    error: e,
-                    generation,
-                },
+                Err(error) => BoardMessage::RefreshError { error, generation },
             },
         )
     }
 
-    /// Non-archived `queued` tickets in the currently displayed
-    /// list — the normal `tickets`, or `search_results` when a search is active
-    /// (`search_query` non-empty). Mirrors the sidebar's own
-    /// `search_query.text().is_empty()` gate so the pause action always targets
-    /// what is actually rendered.
-    fn displayed_queued_tickets(&self) -> impl Iterator<Item = &Ticket> {
-        let search_active = !self.search_query.text().is_empty();
-        let source = if search_active {
-            &self.search_results
-        } else {
-            &self.tickets
-        };
-        source
+    /// Non-archived queued tickets in the listed board — the bulk pause's
+    /// scope. The search never narrows it: the bulk actions cover the list,
+    /// not what a query matched.
+    fn queued_tickets(&self) -> impl Iterator<Item = &Ticket> {
+        self.tickets
             .iter()
             .filter(|t| !t.is_archived && t.phase == TicketPhase::Queued)
     }
 
-    /// Whether the "Pause all queued tickets" context-menu item
-    /// should be offered — at least one non-archived Queued ticket is visible.
-    pub(crate) fn has_visible_queued_tickets(&self) -> bool {
-        self.displayed_queued_tickets().next().is_some()
+    /// Whether the "Pause all queued tickets" context-menu item should be
+    /// offered — at least one non-archived Queued ticket is listed.
+    pub(crate) fn has_queued_tickets(&self) -> bool {
+        self.queued_tickets().next().is_some()
     }
 
-    /// Workspaces to drain for the bulk pause. A concrete (non-empty,
-    /// non-personal) `workspace_name` selects that workspace; otherwise (`None`,
-    /// the empty string, or a `personal:{user}` name — personal workspaces have
-    /// no board pipeline and must be treated as "no concrete workspace") the set
-    /// is the distinct workspaces of the displayed non-archived Queued tickets.
-    /// Each workspace is drained once.
-    fn pause_all_queued_workspaces(&self) -> Vec<String> {
-        match self.workspace_name.as_deref() {
-            Some(ws) if !ws.is_empty() && !crate::users::is_personal_workspace(ws) => {
-                vec![ws.to_string()]
-            }
-            _ => {
-                let mut workspaces: Vec<String> = Vec::new();
-                for ticket in self.displayed_queued_tickets() {
-                    if !workspaces.contains(&ticket.workspace_name) {
-                        workspaces.push(ticket.workspace_name.clone());
-                    }
-                }
-                workspaces
+    /// Workspaces to drain for the bulk pause: the distinct workspaces of the
+    /// listed non-archived Queued tickets, deduplicated. Each is drained once.
+    fn queued_workspaces(&self) -> Vec<String> {
+        let mut workspaces: Vec<String> = Vec::new();
+        for ticket in self.queued_tickets() {
+            if !workspaces.contains(&ticket.workspace_name) {
+                workspaces.push(ticket.workspace_name.clone());
             }
         }
+        workspaces
     }
 
     /// Apply a CDC ticket change delta to the board, idempotently by ticket id.
@@ -414,19 +397,6 @@ impl BoardState {
         let Some(id) = event.ticket_id().map(str::to_string) else {
             return Task::none();
         };
-        // Honor the workspace filter (ticket ids are globally unique, so an unknown
-        // workspace is safe to process; a mismatching one is skipped).
-        if let Some(ws) = &self.workspace_name {
-            let event_ws = event
-                .after
-                .as_ref()
-                .or(event.before.as_ref())
-                .and_then(|r| r.get("workspace_name"))
-                .and_then(crate::db::cdc::CdcValue::as_text);
-            if event_ws.is_some_and(|ew| ew != ws) {
-                return Task::none();
-            }
-        }
         let detail_refresh = if self.selected_ticket.as_ref().is_some_and(|t| t.id == id) {
             let changed = match &event.after {
                 Some(after) => {
@@ -488,25 +458,25 @@ impl BoardState {
 
     /// Apply a baseline snapshot.
     ///
-    /// - Right after a workspace switch or a lag recovery (`replace_on_refresh`)
-    ///   the snapshot is authoritative and replaces the board, so the previous
-    ///   workspace's tickets (or a ticket a lost removal delta would have
-    ///   removed) cannot linger. This also clears `delta_removed_ids` — the new
-    ///   selection has its own removal history.
-    /// - Otherwise (same-workspace recovery refresh) it merges by per-ticket
-    ///   `updated_at` freshness: a snapshot ticket older than the cached one is
-    ///   left alone (so a newer delta already applied is never clobbered), but a
-    ///   newer snapshot ticket updates the board (recovering a lost delta). This
-    ///   is correct even if two snapshots arrive out of order, and — unlike a
-    ///   global `change_id` watermark — is immune to `change_id` restarting after
-    ///   `turso_cdc` is fully pruned.
-    /// - Tickets a delta archived/removed (`delta_removed_ids`) are never re-added
-    ///   by a stale snapshot. A board ticket **absent** from the snapshot is kept:
-    ///   with no guaranteed snapshot/delta ordering, an omission is ambiguous (the
-    ///   snapshot may predate the ticket's creation/delta). Dropping it risks a
-    ///   permanent loss (a live ticket that never changes again), while keeping it
-    ///   is self-healing — a removal delta arrives and removes it, or a lag
-    ///   recovery snapshot replaces the board.
+    /// - On a lag recovery (`replace_on_refresh`) the snapshot is authoritative
+    ///   and replaces the board, so a ticket a lost removal delta would have
+    ///   removed cannot linger. This also clears `delta_removed_ids` — the
+    ///   recovery snapshot carries its own removal history.
+    /// - Otherwise it merges by per-ticket `updated_at` freshness: a snapshot
+    ///   ticket older than the cached one is left alone (so a newer delta
+    ///   already applied is never clobbered), but a newer snapshot ticket
+    ///   updates the board (recovering a lost delta). This is correct even if
+    ///   two snapshots arrive out of order, and — unlike a global `change_id`
+    ///   watermark — is immune to `change_id` restarting after `turso_cdc` is
+    ///   fully pruned.
+    /// - Tickets a delta archived/removed (`delta_removed_ids`) are never
+    ///   re-added by a stale snapshot. A board ticket **absent** from the
+    ///   snapshot is kept: with no guaranteed snapshot/delta ordering, an
+    ///   omission is ambiguous (the snapshot may predate the ticket's
+    ///   creation/delta). Dropping it risks a permanent loss (a live ticket that
+    ///   never changes again), while keeping it is self-healing — a removal
+    ///   delta arrives and removes it, or a lag recovery snapshot replaces the
+    ///   board.
     fn apply_refreshed(&mut self, tickets: Vec<Ticket>) {
         if self.replace_on_refresh {
             self.tickets = tickets;
@@ -553,14 +523,9 @@ impl BoardState {
         }
     }
 
-    /// Upsert a re-fetched ticket into the board list, honoring the workspace
-    /// filter and the archive state.
+    /// Upsert a re-fetched ticket into the board list, honoring the archive
+    /// state.
     fn apply_ticket_upsert(&mut self, ticket: Ticket) {
-        if let Some(ws) = &self.workspace_name {
-            if &ticket.workspace_name != ws {
-                return;
-            }
-        }
         if ticket.is_archived {
             self.tickets.retain(|t| t.id != ticket.id);
             // Track the removal so a stale snapshot read before the archive
@@ -631,10 +596,10 @@ impl BoardState {
     /// caches, replaces the selected ticket, and reconciles the
     /// commit-stats display with the incoming ticket:
     ///
-    /// - a commit hash that appeared or changed triggers a fresh stats
-    ///   fetch (gated on the new hash being `Some`, so a hash can never
+    /// - a (project, commit) pair that appeared or changed triggers a fresh
+    ///   stats fetch (gated on the hash being `Some`, so a hash can never
     ///   leave the loading state stuck),
-    /// - an unchanged hash keeps the already-loaded stats (the refresh is
+    /// - an unchanged pair keeps the already-loaded stats (the refresh is
     ///   event-driven — unconditional fetches would hammer the git CLI and
     ///   flash "Loading commit stats" each refresh),
     /// - no hash clears stale stats and any stuck loading flag.
@@ -652,26 +617,29 @@ impl BoardState {
             Some(markdown::parse(&ticket.description).collect())
         };
         self.comments_md = Self::parse_comments_md(&ticket.comments);
-        let hash_changed = self
-            .selected_ticket
-            .as_ref()
-            .and_then(|t| t.commit_hash.as_ref())
-            != ticket.commit_hash.as_ref();
+        // Commit statistics belong to a (project, commit) pair: two projects can
+        // share git history, so the hash alone cannot say whether what is
+        // loaded still describes the ticket being shown.
+        let stats_current = self.selected_ticket.as_ref().is_some_and(|t| {
+            t.workspace_name == ticket.workspace_name && t.commit_hash == ticket.commit_hash
+        });
         let ticket_id = ticket.id.clone();
         let has_hash = ticket.commit_hash.is_some();
         self.selected_ticket = Some(ticket);
 
-        if hash_changed && has_hash {
+        if !stats_current && has_hash {
             self.commit_stats = None;
+            self.commit_stats_error = None;
             self.commit_stats_loading = true;
             self.commit_stats_generation += 1;
             Task::done(BoardMessage::FetchCommitStats(ticket_id))
         } else if !has_hash {
             self.commit_stats = None;
+            self.commit_stats_error = None;
             self.commit_stats_loading = false;
             Task::none()
         } else {
-            // Unchanged hash — keep the loaded stats (if any).
+            // Same project and commit — keep the loaded stats (if any).
             Task::none()
         }
     }
@@ -903,9 +871,9 @@ impl BoardState {
                 tickets,
                 generation,
             } => {
-                // Workspace/generation guard: drop a stale snapshot from a
-                // previous workspace/refresh so it cannot clobber the current
-                // selection.
+                // Stale-generation guard: drop a snapshot whose refresh was
+                // superseded by a newer one so it cannot clobber the
+                // current list.
                 if generation == self.board_generation {
                     self.apply_refreshed(tickets);
                 }
@@ -913,7 +881,7 @@ impl BoardState {
             }
             BoardMessage::RefreshError { error, generation } => {
                 // Stale-result guard, mirroring `Refreshed`: a failed read for a
-                // workspace/refresh the board has since left must not paint its
+                // refresh the board has since superseded must not paint its
                 // failure over the current list.
                 if generation == self.board_generation {
                     self.load_state.fail(error);
@@ -1208,23 +1176,20 @@ impl BoardState {
                 // Arms must remain for match exhaustiveness even though functionally dead.
                 Task::none()
             }
-            BoardMessage::ArchiveAllCompleted => {
-                let ws = self.workspace_name.clone();
-                Task::perform(
-                    async move {
-                        let board = crate::pipeline::board::store();
-                        board
-                            .archive_all_done_and_cancelled(ws.as_deref())
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    BoardMessage::ArchiveAllCompletedResult,
-                )
-            }
+            BoardMessage::ArchiveAllCompleted => Task::perform(
+                async move {
+                    let board = crate::pipeline::board::store();
+                    board
+                        .archive_all_done_and_cancelled(None)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+                BoardMessage::ArchiveAllCompletedResult,
+            ),
             BoardMessage::ArchiveAllCompletedResult(Ok(count)) => {
                 let toast = Task::done(BoardMessage::Toast(super::ToastMessage::SuccessMsg(
                     format!(
-                        "Archived {count} ticket{}",
+                        "Archived {count} ticket{} across all workspaces",
                         if count == 1 { "" } else { "s" }
                     ),
                 )));
@@ -1235,7 +1200,7 @@ impl BoardState {
                 Task::done(BoardMessage::Toast(super::ToastMessage::Error(e)))
             }
             BoardMessage::PauseAllQueued => {
-                let workspaces = self.pause_all_queued_workspaces();
+                let workspaces = self.queued_workspaces();
                 Task::perform(
                     async move {
                         let board = crate::pipeline::board::store();
@@ -1252,11 +1217,14 @@ impl BoardState {
                 )
             }
             BoardMessage::PauseAllQueuedResult(Ok(count)) => {
-                // Count is the total moved across the drained workspace(s). A
-                // search filter only gates visibility, so this may exceed (or
-                // lag) the currently listed Queued tickets.
+                // Count is the total moved across the drained workspaces: the
+                // listed non-archived Queued tickets, each workspace drained
+                // once.
                 let toast = Task::done(BoardMessage::Toast(super::ToastMessage::SuccessMsg(
-                    format!("Paused {count} ticket{}", if count == 1 { "" } else { "s" }),
+                    format!(
+                        "Paused {count} ticket{} across all workspaces",
+                        if count == 1 { "" } else { "s" }
+                    ),
                 )));
                 Task::batch([self.refresh(), toast])
             }
@@ -1315,10 +1283,13 @@ impl BoardState {
                 match result {
                     Ok(stats) => {
                         self.commit_stats = Some(stats);
+                        self.commit_stats_error = None;
                     }
-                    Err(_) => {
-                        // Non-critical: silently leave stats as None
+                    Err(e) => {
+                        // Non-critical: show the failure rather than rendering
+                        // nothing under the commit-hash line.
                         self.commit_stats = None;
+                        self.commit_stats_error = Some(e);
                     }
                 }
                 Task::none()
@@ -1348,7 +1319,6 @@ impl BoardState {
                 }
 
                 let generation = self.search_generation;
-                let ws = self.workspace_name.clone();
                 Task::perform(
                     async move {
                         // Debounce: wait 300ms before executing the FTS query
@@ -1366,7 +1336,7 @@ impl BoardState {
                         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                         let board = crate::pipeline::board::store();
                         board
-                            .search_by_fts(&query, 20, ws.as_deref())
+                            .search_by_fts(&query, 20)
                             .await
                             .map_err(|e| e.to_string())
                     },
@@ -1534,6 +1504,7 @@ impl BoardState {
                 "ticket commit diff",
                 Some(BoardMessage::ViewCommitDiff {
                     commit_hash: hash.clone(),
+                    workspace_name: ticket.workspace_name.clone(),
                 }),
                 [theme::PAD_2, theme::PAD_6],
                 theme::button_text,
@@ -1754,6 +1725,7 @@ impl BoardState {
             ticket,
             self.commit_stats.as_ref(),
             self.commit_stats_loading,
+            self.commit_stats_error.as_deref(),
         ) {
             sections.push(el);
         }
@@ -1824,6 +1796,14 @@ impl BoardState {
 
         let mut meta_els: Vec<Element<'_, BoardMessage>> = vec![
             text(&ticket.id)
+                .size(theme::TEXT_12)
+                .color(theme::TEXT_SECONDARY)
+                .into(),
+            text(" · ")
+                .size(theme::TEXT_12)
+                .color(theme::TEXT_SECONDARY)
+                .into(),
+            text(format!("Workspace: {}", ticket.workspace_name))
                 .size(theme::TEXT_12)
                 .color(theme::TEXT_SECONDARY)
                 .into(),
@@ -1906,12 +1886,14 @@ impl BoardState {
         .into()
     }
 
-    /// Render commit stats: summary header + per-file rows, or loading indicator.
-    /// Returns `None` when the ticket has no commit hash.
+    /// Render commit stats: summary header + per-file rows, or a loading
+    /// indicator, or the fetch failure. Returns `None` when the ticket has no
+    /// commit hash.
     fn render_commit_stats<'a>(
         ticket: &'a Ticket,
         stats: Option<&'a CommitStats>,
         loading: bool,
+        error: Option<&'a str>,
     ) -> Option<Element<'a, BoardMessage>> {
         let hash = ticket.commit_hash.as_ref()?;
 
@@ -1923,7 +1905,19 @@ impl BoardState {
             );
         }
 
-        let stats = stats?;
+        let Some(stats) = stats else {
+            let error = error?;
+            return Some(
+                column![
+                    Space::new().height(8),
+                    text(format!("Commit stats unavailable: {error}"))
+                        .size(theme::TEXT_12)
+                        .color(theme::STATUS_WARNING),
+                ]
+                .spacing(theme::SPACE_4)
+                .into(),
+            );
+        };
 
         let total_additions: i64 = stats.files.iter().map(|f| f.additions).sum();
         let total_deletions: i64 = stats.files.iter().map(|f| f.deletions).sum();
@@ -2166,6 +2160,7 @@ mod tests {
     use super::super::editor_widget::{EditorAction, EditorBuffer};
     use super::super::highlight::HighlightLanguage;
     use super::*;
+    use crate::util::test::TicketFixture;
 
     fn make_board_state() -> BoardState {
         let mut state = BoardState::new();
@@ -2328,76 +2323,6 @@ mod tests {
 
     // ── TicketDetailsRefreshed (periodic refresh of the open modal) ─
 
-    /// In-memory ticket fixture, distinct from the DB-insert helpers
-    /// (`TicketBuilder` / `make_ticket`) in `util::test`.
-    struct TicketFixture(Ticket);
-
-    impl TicketFixture {
-        fn new(id: &str, phase: TicketPhase) -> Self {
-            Self(Ticket {
-                id: id.into(),
-                title: "Test ticket".into(),
-                description: String::new(),
-                phase,
-                workspace_name: "test_ws".into(),
-                created_at: "2026-01-01T00:00:00Z".into(),
-                updated_at: "2026-01-01T00:00:00Z".into(),
-                comments: Vec::new(),
-                prerequisites: Vec::new(),
-                supersedes: None,
-                superseded_by: None,
-                commit_hash: None,
-                lines_added: None,
-                lines_removed: None,
-                reporter: "test".into(),
-                is_archived: false,
-                priority: 0,
-                reviewed_head: None,
-                reviewed_tree: None,
-                done_at: None,
-                bounce_count: 0,
-            })
-        }
-
-        fn title(mut self, title: &str) -> Self {
-            self.0.title = title.into();
-            self
-        }
-
-        fn workspace(mut self, workspace: &str) -> Self {
-            self.0.workspace_name = workspace.into();
-            self
-        }
-
-        fn archived(mut self, archived: bool) -> Self {
-            self.0.is_archived = archived;
-            self
-        }
-
-        fn created_at(mut self, created_at: &str) -> Self {
-            self.0.created_at = created_at.into();
-            self
-        }
-
-        fn done_at(mut self, done_at: Option<&str>) -> Self {
-            self.0.done_at = done_at.map(str::to_string);
-            self
-        }
-
-        fn comment(mut self, role: &str, content: &str, created_at: &str) -> Self {
-            self.0.comments.push(crate::pipeline::board::TicketComment {
-                role: role.into(),
-                content: content.into(),
-                created_at: created_at.into(),
-            });
-            self
-        }
-
-        fn build(self) -> Ticket {
-            self.0
-        }
-    }
-
     fn make_ticket(id: &str, phase: TicketPhase) -> Ticket {
         TicketFixture::new(id, phase).build()
     }
@@ -2508,7 +2433,7 @@ mod tests {
             "stats generation should bump for the new fetch"
         );
 
-        // Unchanged hash → keep the loaded stats, no refetch.
+        // Unchanged project + hash → keep the loaded stats, no refetch.
         let mut state = make_board_state();
         state.selected_ticket.as_mut().unwrap().commit_hash = Some(HASH.into());
         state.commit_stats = Some(CommitStats { files: Vec::new() });
@@ -2526,6 +2451,27 @@ mod tests {
         assert!(
             state.commit_stats.is_some(),
             "already-loaded stats should be kept"
+        );
+
+        // The same hash in another project is a different (project, commit):
+        // the stats loaded for the first one say nothing about the second, so
+        // they are refetched rather than shown under the wrong project.
+        let mut state = make_board_state();
+        state.selected_ticket.as_mut().unwrap().commit_hash = Some(HASH.into());
+        state.commit_stats = Some(CommitStats { files: Vec::new() });
+        state.commit_stats_error = Some("Workspace 'first' not found".into());
+        let mut elsewhere = make_ticket("T-1", TicketPhase::Done);
+        elsewhere.commit_hash = Some(HASH.into());
+        elsewhere.workspace_name = "other_ws".into();
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
+            state.comment_generation,
+            Box::new(elsewhere),
+        ));
+        assert!(state.commit_stats_loading, "another project refetches");
+        assert!(state.commit_stats.is_none());
+        assert!(
+            state.commit_stats_error.is_none(),
+            "the first project's failure must not follow the hash"
         );
 
         // Hash vanished (latent) → loading must not stay stuck.
@@ -2652,7 +2598,7 @@ mod tests {
         });
         assert!(
             state.tickets.is_empty(),
-            "a stale-generation snapshot must not clobber the current workspace"
+            "a stale-generation snapshot must not clobber the current list"
         );
     }
 
@@ -2670,7 +2616,7 @@ mod tests {
     }
 
     #[test]
-    fn refreshed_replace_on_switch_drops_previous_workspace_tickets() {
+    fn refreshed_replace_on_lag_recovery_drops_lost_tickets() {
         let mut state = BoardState::new();
         state.replace_on_refresh = true;
         state.tickets = vec![make_ticket("T-old", TicketPhase::Backlog)];
@@ -2681,7 +2627,7 @@ mod tests {
         assert_eq!(
             state.tickets.len(),
             1,
-            "replace must drop old-workspace tickets"
+            "replace must drop the pre-recovery tickets"
         );
         assert_eq!(state.tickets[0].id, "T-new");
         assert!(!state.replace_on_refresh, "replace flag is one-shot");
@@ -2708,8 +2654,7 @@ mod tests {
         let mut ticket = make_ticket("T-1", TicketPhase::Backlog);
         ticket.updated_at = "2026-08-27T04:00:00.000000+00:00".into();
         state.tickets = vec![ticket];
-        // Simulate a workspace switch already consumed: now a same-workspace
-        // recovery refresh merges.
+        // Simulate a lag recovery already consumed: the next refresh merges.
         state.replace_on_refresh = false;
         // A newer snapshot updates the stale cached ticket.
         let mut newer = make_ticket("T-1", TicketPhase::Analysis);
@@ -2760,8 +2705,11 @@ mod tests {
     #[test]
     fn ticket_change_tracks_removal_for_snapshot_merge() {
         let mut state = BoardState::new();
-        state.workspace_name = Some("test_ws".into());
-        state.tickets = vec![make_ticket("T-1", TicketPhase::Done)];
+        // The delta carries no workspace filter: a removal is applied to a
+        // ticket of any workspace.
+        let mut ticket = make_ticket("T-1", TicketPhase::Done);
+        ticket.workspace_name = "other_ws".into();
+        state.tickets = vec![ticket];
         let event = crate::db::cdc::ChangeEvent {
             table: "tickets".into(),
             change_id: 5,
@@ -2783,29 +2731,30 @@ mod tests {
     }
 
     #[test]
-    fn ticket_upsert_respects_workspace_filter_and_dedupes_by_id() {
+    fn ticket_upsert_accepts_other_workspaces_and_dedupes_by_id() {
         let mut state = BoardState::new();
-        state.workspace_name = Some("test_ws".into());
         let mut other = make_ticket("T-a", TicketPhase::Backlog);
         other.workspace_name = "other_ws".into();
         state.apply_ticket_upsert(other);
-        assert!(
-            state.tickets.is_empty(),
-            "a ticket not in the selected workspace must be dropped"
+        assert_eq!(
+            state.tickets.len(),
+            1,
+            "a ticket of any workspace is accepted"
         );
 
         let ticket = make_ticket("T-1", TicketPhase::InDevelopment);
         state.apply_ticket_upsert(ticket.clone());
-        assert_eq!(state.tickets.len(), 1);
+        assert_eq!(state.tickets.len(), 2);
         // Idempotent upsert by id — no duplicate.
         state.apply_ticket_upsert(ticket);
-        assert_eq!(state.tickets.len(), 1);
+        assert_eq!(state.tickets.len(), 2);
 
         // Archiving removes the ticket from the list.
         let mut archived = make_ticket("T-1", TicketPhase::Done);
         archived.is_archived = true;
         state.apply_ticket_upsert(archived);
-        assert!(state.tickets.is_empty());
+        assert_eq!(state.tickets.len(), 1);
+        assert!(state.tickets.iter().all(|t| t.id != "T-1"));
     }
 
     #[test]
@@ -3213,105 +3162,79 @@ mod tests {
     }
 
     #[test]
-    fn pause_all_queued_visibility_uses_normal_list_when_no_search() {
+    fn has_queued_tickets_true_when_a_queued_ticket_is_listed() {
         let mut state = make_board_state();
         state.tickets = vec![
             ticket_in("ws1", "t1", TicketPhase::Queued, false),
             ticket_in("ws1", "t2", TicketPhase::Backlog, false),
         ];
-        assert!(state.has_visible_queued_tickets());
+        assert!(state.has_queued_tickets());
     }
 
     #[test]
-    fn pause_all_queued_visibility_false_without_queued() {
+    fn has_queued_tickets_false_without_queued() {
         let mut state = make_board_state();
         state.tickets = vec![
             ticket_in("ws1", "t1", TicketPhase::Backlog, false),
             ticket_in("ws1", "t2", TicketPhase::Planning, false),
         ];
-        assert!(!state.has_visible_queued_tickets());
+        assert!(!state.has_queued_tickets());
     }
 
     #[test]
-    fn pause_all_queued_visibility_ignores_archived_tickets() {
+    fn has_queued_tickets_ignores_archived_tickets() {
         let mut state = make_board_state();
         state.tickets = vec![ticket_in("ws1", "t1", TicketPhase::Queued, true)];
-        assert!(!state.has_visible_queued_tickets());
+        assert!(!state.has_queued_tickets());
     }
 
     #[test]
-    fn pause_all_queued_visibility_uses_search_results_when_search_active() {
+    fn has_queued_tickets_ignores_an_active_search() {
         let mut state = make_board_state();
-        // The hidden `tickets` list contains a Queued ticket, but the active
-        // search shows `search_results`; the item must reflect only what is
-        // currently rendered.
+        // An active search only gates what the sidebar renders; the bulk gate
+        // still reads the listed board, so a Queued ticket there keeps the
+        // context-menu item available even when the search shows none.
         state.tickets = vec![ticket_in("ws1", "t1", TicketPhase::Queued, false)];
         state.search_query = super::super::common::SingleLineEditorState::new("foo");
         state.search_results = vec![ticket_in("ws1", "t2", TicketPhase::Backlog, false)];
-        assert!(!state.has_visible_queued_tickets());
+        assert!(state.has_queued_tickets());
     }
 
     #[test]
-    fn pause_all_queued_workspaces_concrete_workspace() {
+    fn queued_workspaces_are_derived_from_listed_queued_tickets() {
         let mut state = make_board_state();
-        state.workspace_name = Some("ws1".into());
         state.tickets = vec![ticket_in("ws1", "t1", TicketPhase::Queued, false)];
-        assert_eq!(state.pause_all_queued_workspaces(), vec!["ws1".to_string()]);
+        assert_eq!(state.queued_workspaces(), vec!["ws1".to_string()]);
     }
 
     #[test]
-    fn pause_all_queued_workspaces_empty_string_is_no_concrete() {
+    fn queued_workspaces_derives_and_dedupes() {
         let mut state = make_board_state();
-        // An empty-string name (no concrete selection; legacy sentinel) must
-        // be treated as "no concrete workspace" so the drain set is derived
-        // from the displayed tickets. `personal:{user}` names take the same
-        // branch via `is_personal_workspace`.
-        state.workspace_name = Some(String::new());
-        state.tickets = vec![
-            ticket_in("ws1", "t1", TicketPhase::Queued, false),
-            ticket_in("ws2", "t2", TicketPhase::Queued, false),
-        ];
-        assert_eq!(
-            state.pause_all_queued_workspaces(),
-            vec!["ws1".to_string(), "ws2".to_string()]
-        );
-        state.workspace_name = Some("personal:alice".to_string());
-        assert_eq!(
-            state.pause_all_queued_workspaces(),
-            vec!["ws1".to_string(), "ws2".to_string()]
-        );
-    }
-
-    #[test]
-    fn pause_all_queued_workspaces_none_derives_and_dedupes() {
-        let mut state = make_board_state();
-        state.workspace_name = None;
         state.tickets = vec![
             ticket_in("ws1", "t1", TicketPhase::Queued, false),
             ticket_in("ws1", "t2", TicketPhase::Queued, false),
             ticket_in("ws2", "t3", TicketPhase::Queued, false),
             ticket_in("ws3", "t4", TicketPhase::Planning, false),
         ];
-        // Distinct workspaces of the displayed non-archived Queued tickets only.
+        // Distinct workspaces of the listed non-archived Queued tickets only.
         assert_eq!(
-            state.pause_all_queued_workspaces(),
+            state.queued_workspaces(),
             vec!["ws1".to_string(), "ws2".to_string()]
         );
     }
 
     #[test]
-    fn pause_all_queued_workspaces_uses_search_results_when_search_active() {
+    fn queued_workspaces_ignore_an_active_search() {
         let mut state = make_board_state();
-        state.workspace_name = None;
+        // The active search shows tickets in other workspaces, but the bulk
+        // pause covers the listed board: the workspace set comes from
+        // `state.tickets`, never the search results.
         state.tickets = vec![ticket_in("hidden", "t1", TicketPhase::Queued, false)];
         state.search_query = super::super::common::SingleLineEditorState::new("foo");
         state.search_results = vec![
             ticket_in("ws1", "t2", TicketPhase::Queued, false),
             ticket_in("ws2", "t3", TicketPhase::Queued, false),
         ];
-        assert_eq!(
-            state.pause_all_queued_workspaces(),
-            vec!["ws1".to_string(), "ws2".to_string()]
-        );
+        assert_eq!(state.queued_workspaces(), vec!["hidden".to_string()]);
     }
 }

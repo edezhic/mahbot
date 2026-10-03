@@ -146,6 +146,16 @@ pub enum DiffMessage {
     /// Navigate to a specific commit diff view (`commit_hash`) of the workspace
     /// this view already resolves, keeping that workspace across the navigation.
     NavigateToCommit(String),
+    /// Show `commit_hash` of the workspace at `path` — a project other than the
+    /// one the dashboard picked for the working-tree view. Points the view and
+    /// navigates in one step: there is no separate workspace push to deliver
+    /// for that project.
+    CommitInWorkspace {
+        /// Filesystem path of the project the commit belongs to.
+        path: String,
+        /// Commit hash to display.
+        hash: String,
+    },
     /// Return from historical commit view to working tree diff.
     BackToWorkingTree,
     /// Commit message fetched for a historical commit (commit_hash, message).
@@ -382,6 +392,42 @@ impl DiffState {
         })
     }
 
+    /// Show `hash` as the commit this view displays, against the workspace it
+    /// already resolves: loads the commit's diff and fetches its message.
+    ///
+    /// The callers own the resolved path — [`DiffMessage::NavigateToCommit`]
+    /// keeps the one this view has, [`DiffMessage::CommitInWorkspace`] points
+    /// it at another project first.
+    fn show_commit(&mut self, hash: String) -> Task<DiffMessage> {
+        self.clear_diff_state();
+        // clear_diff_state() resets all viewing state (file tree, buffers,
+        // error, etc.) including current_commit_ref. We re-establish
+        // current_commit_ref below; the rest stays cleared for the new
+        // commit's diff to load into.
+        // Set commit ref before spawning task
+        // (prevents Tick race: subscription checks .is_some() to skip).
+        self.current_commit_ref = Some(hash.clone());
+        self.diff_has_loaded = false;
+
+        // Load the diff and fetch the commit message in parallel — both
+        // against the workspace this view resolves, which it keeps across the
+        // navigation.
+        let msg_path = self.resolved_workspace_path.clone();
+        let msg_hash = hash.clone();
+        let msg_hash_for_git = hash.clone();
+        let msg_task = Task::perform(
+            async move {
+                let path = msg_path?;
+                crate::git::commands::run_git_commit_message(&path, Some(&msg_hash_for_git))
+                    .await
+                    .ok()
+            },
+            move |msg| DiffMessage::CommitMessageFetched(msg_hash, msg),
+        );
+
+        Task::batch([self.spawn_diff_load(Some(hash)), msg_task])
+    }
+
     #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: DiffMessage) -> Task<DiffMessage> {
         match msg {
@@ -460,34 +506,12 @@ impl DiffState {
                     Task::none()
                 }
             }
-            DiffMessage::NavigateToCommit(hash) => {
-                self.clear_diff_state();
-                // clear_diff_state() resets all viewing state (file tree, buffers,
-                // error, etc.) including current_commit_ref. We re-establish
-                // current_commit_ref below; the rest stays cleared for the new
-                // commit's diff to load into.
-                // Set commit ref before spawning task
-                // (prevents Tick race: subscription checks .is_some() to skip).
-                self.current_commit_ref = Some(hash.clone());
-                self.diff_has_loaded = false;
-
-                // Load the diff and fetch the commit message in parallel — both
-                // against the workspace the dashboard resolved, which this view
-                // keeps across the navigation.
-                let msg_path = self.resolved_workspace_path.clone();
-                let msg_hash = hash.clone();
-                let msg_hash_for_git = hash.clone();
-                let msg_task = Task::perform(
-                    async move {
-                        let path = msg_path?;
-                        crate::git::commands::run_git_commit_message(&path, Some(&msg_hash_for_git))
-                            .await
-                            .ok()
-                    },
-                    move |msg| DiffMessage::CommitMessageFetched(msg_hash, msg),
-                );
-
-                Task::batch([self.spawn_diff_load(Some(hash)), msg_task])
+            DiffMessage::NavigateToCommit(hash) => self.show_commit(hash),
+            DiffMessage::CommitInWorkspace { path, hash } => {
+                // `show_commit` clears the viewing state but not the resolved
+                // path, which is what this arm is here to point.
+                self.resolved_workspace_path = Some(PathBuf::from(path));
+                self.show_commit(hash)
             }
             DiffMessage::BackToWorkingTree => {
                 if self.resolved_workspace_path.is_none() {
