@@ -32,6 +32,10 @@
 #                calls a hosting-service API
 #   licences:    LICENSE-MIT and LICENSE-APACHE, beside every release
 #
+# Every release also carries a body: the titles of the commits made since the last
+# ordinary release, oldest first, one per line, with the machine's own version bumps
+# left out — nothing else is added to it.
+#
 # Nothing becomes visible before all six files have arrived, and then all of it
 # does at once: the files go onto a draft first and the draft is flipped visible in
 # one step, so a test release (a version carrying a pre-release part) can never be
@@ -238,6 +242,9 @@ jobs:
       TAG: v${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # All of the history and every tag: the body's range is read from them.
+          fetch-depth: 0
 
       - name: Download the six files
         uses: actions/download-artifact@v4
@@ -263,6 +270,34 @@ jobs:
           done
           [ "$missing" -eq 0 ]
 
+      # What the release says changed: every commit title since the last ordinary
+      # release, oldest first, one per line, and nothing else. Built before the
+      # draft is touched, so a failure here leaves an existing draft of this mark
+      # exactly as it was.
+      - name: Build the changelog
+        run: |
+          set -euo pipefail
+
+          # The base is the newest ordinary release below this one. Only a tag with a
+          # bare three-part version is an ordinary release, so a test release — a
+          # pre-release part — is never a base; and this mark's own bare version is
+          # the boundary, so a test release and the ordinary release that follows it
+          # are counted from the same tag below them and no mark is its own base.
+          boundary="v${VERSION%%-*}"
+          base="$(
+            {
+              git tag --list 'v*' | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+'
+              printf '%s\n' "$boundary"
+            } \
+              | sort -V \
+              | awk -v t="$boundary" '$0 == t { print previous; exit } { previous = $0 }'
+          )"
+
+          # The machine's own version bumps are what the release does, not what it
+          # says changed; every other title is kept exactly as it is written.
+          git log --reverse --pretty=format:%s "$base..$TAG" \
+            | awk '!/^Bump version to /' > "$RUNNER_TEMP/changelog.txt"
+
       - name: Prepare the draft
         run: |
           printf '%s\n' "$VERSION" > "$RUNNER_TEMP/release/version.txt"
@@ -275,6 +310,7 @@ jobs:
           fi
 
           gh release create "$TAG" --draft --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/changelog.txt" \
             "$RUNNER_TEMP/release"/mahbot-*.tar.gz "$RUNNER_TEMP/release"/mahbot-*.zip \
             "$RUNNER_TEMP/release/version.txt" LICENSE-MIT LICENSE-APACHE
 
