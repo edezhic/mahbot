@@ -39,6 +39,9 @@ pub(crate) mod embedder;
 pub(crate) mod git;
 pub mod gui;
 pub mod jobs;
+/// Legacy binary Office reading (Word/Excel/PowerPoint): the CFB-container arm
+/// of the shared document converter ([`crate::document`]).
+pub(crate) mod legacy;
 pub mod logs;
 pub(crate) mod onboarding;
 /// Minimal ONNX runtime whose only consumer is the TTS pipeline

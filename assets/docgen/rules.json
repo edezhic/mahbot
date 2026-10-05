@@ -4,9 +4,17 @@
   "image_extensions": ["png", "jpg", "jpeg"],
   "image_side_px": { "min": 1, "max": 20000, "min_exclusive": false },
   "pdf_size_points": { "min": 0, "max": 20000, "min_exclusive": true },
+  "text_size_points": { "min": 0.5, "max": 819, "min_exclusive": false },
   "pdf_point_abs_max": 20000,
   "color_digits": 6,
   "degrees_step": 90,
   "sheet_name_max": 31,
-  "sheet_name_forbidden": "[]:*?/\\"
+  "sheet_name_forbidden": "[]:*?/\\",
+  "edit_text_max": 20000,
+  "edits_max": 200,
+  "bullets_max": 100,
+  "paragraph_level_max": 8,
+  "sheet_row_max": 1048576,
+  "sheet_column_max": 16384,
+  "number_format_max": 200
 }

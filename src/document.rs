@@ -8,7 +8,9 @@
 //! whether a file is one of the containers this module extracts from.
 //!
 //! Format detection and the PDF arm live here; the ZIP-container OOXML formats
-//! (Word, Excel, PowerPoint) live in [`crate::ooxml`].
+//! (Word, Excel, PowerPoint) live in [`crate::ooxml`], and their pre-OOXML
+//! binary ancestors (`.doc`/`.xls`/`.ppt`, a CFB container) in
+//! [`crate::legacy`].
 //!
 //! # Invariants
 //!
@@ -36,8 +38,9 @@
 //!   is not a page that has none.
 //! - **Content-first detection.** Magic bytes decide the format; the extension
 //!   only disambiguates formats that share a container (a ZIP is a
-//!   `.docx`/`.xlsx`/`.pptx` only when the name says so) or that have no magic
-//!   (plain text).
+//!   `.docx`/`.xlsx`/`.pptx`, and a CFB is an encrypted OOXML package or a
+//!   legacy `.doc`/`.xls`/`.ppt`, only when the name says so) or that have no
+//!   magic (plain text).
 //! - **`out_dir` is created on demand** and is the only place artifacts are
 //!   written, with names taken from the source/entry file name — never from a
 //!   full ZIP entry path, so a crafted archive cannot write outside it.
@@ -83,9 +86,9 @@ const PDF_MAGIC: &[u8] = b"%PDF-";
 /// Magic bytes at the start of a ZIP local file header — the OOXML packages
 /// (Word/Excel/PowerPoint) and plain archives alike.
 const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
-/// CFB/OLE container magic — what an *encrypted* OOXML package is wrapped in,
-/// and also what a legacy `.doc`/`.xls`/`.ppt` is. Shared with the `document`
-/// tool, which gives an OOXML-named one the same password-protected verdict.
+/// CFB/OLE container magic — what an *encrypted* OOXML package and a legacy
+/// `.doc`/`.xls`/`.ppt` are both wrapped in. Shared with the `document` tool,
+/// which gives an OOXML-named one the same password-protected verdict.
 pub(crate) const CFB_MAGIC: &[u8] = &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 /// Extensions treated as plain text regardless of content.
 const PLAIN_TEXT_EXTENSIONS: &[&str] = &[
@@ -157,11 +160,27 @@ enum DocumentKind {
     Docx,
     Xlsx,
     Pptx,
+    /// A legacy binary Word document (`.doc`, a CFB container).
+    LegacyDoc,
+    /// A legacy binary Excel workbook (`.xls`, a CFB container).
+    LegacyXls,
+    /// A legacy binary PowerPoint presentation (`.ppt`, a CFB container).
+    LegacyPpt,
     /// An encrypted OOXML package: a CFB container, which needs a password
     /// rather than a conversion.
     EncryptedOoxml,
     PlainText,
     Unsupported,
+}
+
+/// Whether `head` opens a ZIP container — an OOXML package of the three families
+/// this module converts, or a plain archive, which only the name tells apart. The
+/// `document` tool's refusal for an old-format name asks this, both for a
+/// `fill_template` sample and for an edit input, so a file whose bytes are a
+/// package is described by them rather than by its name.
+#[must_use]
+pub(crate) fn is_zip_container(head: &[u8]) -> bool {
+    head.starts_with(ZIP_MAGIC)
 }
 
 /// Classify `bytes` named `path`: magic bytes first, the extension only where
@@ -173,15 +192,19 @@ fn classify(bytes: &[u8], path: &Path) -> DocumentKind {
     if bytes.starts_with(PDF_MAGIC) {
         return DocumentKind::Pdf;
     }
-    // Checked before the ZIP attempt: an encrypted OOXML package is a CFB
-    // container, and its bytes would otherwise look like corruption. Only an
-    // OOXML-named one gets the password-protected verdict — CFB is also what a
-    // legacy .doc/.xls/.ppt is, and those are not a format this converts.
+    // Checked before the ZIP attempt: an encrypted OOXML package and a legacy
+    // `.doc`/`.xls`/`.ppt` are both CFB containers, and their bytes would
+    // otherwise look like corruption. An OOXML-named one is a password prompt;
+    // a legacy-named one is a format this converts (from its own reader).
     if bytes.starts_with(CFB_MAGIC) {
-        return if crate::ooxml::family_of(path).is_some() {
-            DocumentKind::EncryptedOoxml
-        } else {
-            DocumentKind::Unsupported
+        if crate::ooxml::family_of(path).is_some() {
+            return DocumentKind::EncryptedOoxml;
+        }
+        return match crate::legacy::family_of(path) {
+            Some(crate::legacy::Family::Doc) => DocumentKind::LegacyDoc,
+            Some(crate::legacy::Family::Xls) => DocumentKind::LegacyXls,
+            Some(crate::legacy::Family::Ppt) => DocumentKind::LegacyPpt,
+            None => DocumentKind::Unsupported,
         };
     }
     if bytes.starts_with(ZIP_MAGIC) {
@@ -215,6 +238,9 @@ pub(crate) fn needs_extraction(head: &[u8], file_name: &str) -> bool {
             | DocumentKind::Docx
             | DocumentKind::Xlsx
             | DocumentKind::Pptx
+            | DocumentKind::LegacyDoc
+            | DocumentKind::LegacyXls
+            | DocumentKind::LegacyPpt
             | DocumentKind::EncryptedOoxml
     )
 }
@@ -223,6 +249,10 @@ pub(crate) fn needs_extraction(head: &[u8], file_name: &str) -> bool {
 /// into `out_dir` (created if missing). Synchronous and CPU-bound — callers run
 /// it on a blocking thread. Format detection is content-first (magic bytes),
 /// with the file extension as a secondary signal.
+///
+/// Reached from the crate through [`convert_document_file`]; the tests in this
+/// module call it directly. `out_dir` only matters to the arms that extract
+/// rasters.
 #[must_use]
 fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome {
     match classify(bytes, Path::new(file_name)) {
@@ -233,6 +263,9 @@ fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome
         DocumentKind::Docx => crate::ooxml::convert_docx(bytes, out_dir),
         DocumentKind::Xlsx => crate::ooxml::convert_xlsx(bytes, out_dir),
         DocumentKind::Pptx => crate::ooxml::convert_pptx(bytes, out_dir),
+        DocumentKind::LegacyDoc => crate::legacy::convert(bytes, crate::legacy::Family::Doc),
+        DocumentKind::LegacyXls => crate::legacy::convert(bytes, crate::legacy::Family::Xls),
+        DocumentKind::LegacyPpt => crate::legacy::convert(bytes, crate::legacy::Family::Ppt),
         DocumentKind::PlainText => DocOutcome::Text {
             text: String::from_utf8_lossy(bytes).into_owned(),
             images: Vec::new(),
@@ -1601,24 +1634,40 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_ooxml_reports_password_protected() {
+    fn cfb_magic_classifies_by_name() {
         let mut bytes = CFB_MAGIC.to_vec();
         bytes.extend_from_slice(b"OLE container body that is not a zip");
         let dir = tempfile::tempdir().expect("tempdir");
+        // An OOXML-named CFB container is a password prompt.
         for name in ["secret.docx", "book.xlsx", "deck.pptx"] {
             assert!(matches!(
                 convert_document(&bytes, name, dir.path()),
                 DocOutcome::Unreadable { reason } if reason == "password-protected"
             ));
         }
-        // The same container under a legacy Office name is just a format we do
-        // not convert — CFB is not by itself evidence of encryption.
-        for name in ["old.doc", "old.xls", "old.ppt"] {
+        // A legacy-named one is a format this converts: the container is not a
+        // valid document, so the reader's verdict is corruption — never
+        // `Unsupported`, which would fall back to the raw bytes.
+        for (name, format) in [
+            ("old.doc", ".doc"),
+            ("old.xls", ".xls"),
+            ("old.ppt", ".ppt"),
+        ] {
             assert!(matches!(
                 convert_document(&bytes, name, dir.path()),
-                DocOutcome::Unsupported
+                DocOutcome::Unreadable { reason }
+                    if reason == format!("corrupt or unreadable {format}")
             ));
+            assert!(
+                needs_extraction(&bytes, name),
+                "{name} must be extracted, not returned as bytes"
+            );
         }
+        // An unnamed CFB container is not a format this converts.
+        assert!(matches!(
+            convert_document(&bytes, "blob.bin", dir.path()),
+            DocOutcome::Unsupported
+        ));
     }
 
     #[test]

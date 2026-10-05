@@ -17,12 +17,14 @@
 //! file, and always reads the RESULT FILE — never stdout, which is only the
 //! run's diagnostics. Both files live in the kit's `scratch/` directory, which
 //! is emptied when the kit is prepared. A result is `{"ok": bool, "outputs":
-//! [...], "missing": [...], "placeholders": N, "unsupported": [...], "class":
-//! "...", "error": "..."}`, where `placeholders` is a `fill_template` result
-//! only, `unsupported` lists the distinct characters the embedded PDF font could
-//! not draw for a PDF-writing operation, and `class` is present only on a
-//! failure the kit blamed on the request ("usage": the caller can fix it, see
-//! [`read_result`]). A failure of the run itself (a timeout, a kill, a spawn
+//! [...], "missing": [...], "placeholders": N, "unsupported": [...], "notes":
+//! [...], "class": "...", "error": "..."}`, where `placeholders` is a
+//! `fill_template` result only, `unsupported` lists the distinct characters the
+//! embedded PDF font could not draw for a PDF-writing operation, `notes` are the
+//! caveats an editing operation discovered at run time — already-bracketed,
+//! user-facing sentences the reply appends verbatim — and `class` is present only
+//! on a failure the kit blamed on the request ("usage": the caller can fix it,
+//! see [`read_result`]). A failure of the run itself (a timeout, a kill, a spawn
 //! failure) never reaches the result file and is reported by the runner, with
 //! its own class token.
 //!
@@ -98,6 +100,12 @@ pub(crate) struct KitOutcome {
     /// empty for every operation that draws no text. Each entry is one
     /// character, missing from the produced file rather than present in it.
     pub unsupported: Vec<String>,
+    /// The caveats an editing operation discovered at run time — already
+    /// bracketed, user-facing sentences the reply appends verbatim: a chart or
+    /// pivot that keeps the values it cached, references or anchors a row or
+    /// column shift left naming the old cells, text that lost several runs'
+    /// formatting. Empty for every operation that reports none.
+    pub notes: Vec<String>,
 }
 
 /// Run one kit operation and report what it produced.
@@ -117,6 +125,7 @@ pub(crate) async fn run(request: Value) -> Result<KitOutcome> {
             .and_then(Value::as_u64)
             .and_then(|count| usize::try_from(count).ok()),
         unsupported: string_array(&value, "unsupported"),
+        notes: string_array(&value, "notes"),
     })
 }
 

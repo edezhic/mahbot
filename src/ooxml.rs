@@ -554,7 +554,9 @@ impl Cell {
 }
 
 /// The spreadsheet column letters for a zero-based column index (`0` is `A`).
-fn column_letters(mut index: u32) -> String {
+/// Shared with [`crate::legacy`], so a cell address is written by one
+/// implementation.
+pub(crate) fn column_letters(mut index: u32) -> String {
     let mut letters: Vec<char> = Vec::new();
     loop {
         let digit = u32::from(b'A') + index % 26;
@@ -569,8 +571,10 @@ fn column_letters(mut index: u32) -> String {
 }
 
 /// The zero-based column index of a cell reference (`"B12"` -> `1`), or `None`
-/// when it does not start with a column letter.
-fn column_index(reference: &str) -> Option<u32> {
+/// when it does not start with a column letter. Shared with
+/// [`crate::tools::document`], so a cell reference is read by one
+/// implementation.
+pub(crate) fn column_index(reference: &str) -> Option<u32> {
     let mut index = 0u32;
     let mut seen = false;
     for byte in reference.bytes() {
@@ -809,8 +813,9 @@ fn push_lines(lines: &mut Vec<String>, current: &mut String) {
 
 // ── Shared package plumbing ─────────────────────────────────────
 
-/// `header` then one indented line per entry.
-fn text_lines(header: &str, lines: &[String]) -> String {
+/// `header` then one indented line per entry. Shared with [`crate::legacy`], so
+/// the text shapes stay one implementation.
+pub(crate) fn text_lines(header: &str, lines: &[String]) -> String {
     let indented = lines
         .iter()
         .map(|line| format!("  {line}"))
@@ -819,8 +824,9 @@ fn text_lines(header: &str, lines: &[String]) -> String {
     format!("{header}\n{indented}")
 }
 
-/// [`text_lines`], or `header (marker)` when there is nothing to list.
-fn text_block(header: &str, empty_marker: &str, lines: &[String]) -> String {
+/// [`text_lines`], or `header (marker)` when there is nothing to list. Shared
+/// with [`crate::legacy`] for the same reason.
+pub(crate) fn text_block(header: &str, empty_marker: &str, lines: &[String]) -> String {
     if lines.is_empty() {
         return format!("{header} {empty_marker}");
     }

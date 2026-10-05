@@ -300,6 +300,16 @@ const colName = (index) => {
   while (n > 0) { const rest = (n - 1) % 26; name = String.fromCharCode(65 + rest) + name; n = Math.floor((n - 1) / 26); }
   return name;
 };
+// The text a formula cell holds: the object names `formula` alone, and the text
+// — with its one optional leading `=` and the spacing removed — is a formula, so
+// a second `=` is refused rather than written into the `<f>` element as text.
+// The rule the tool's boundary states, as the kit's own last line; the tool's
+// paired refusal test drives both sides, keeping the two aligned.
+function formulaOf(reference, value) {
+  const formula = typeof value.formula === "string" ? value.formula.trim().replace(/^=/, "").trim() : "";
+  if (Object.keys(value).length === 1 && formula && !formula.startsWith("=")) return formula;
+  throw new UsageError(`cell ${reference}: an object value must be {"formula": "SUM(A1:A2)"}`);
+}
 function xlsxCell(reference, value) {
   // A null is neither a scalar nor a formula cell: the docx/pptx/pdf arms
   // refuse one through `scalarOf`, and writing the literal "null" into a cell
@@ -308,16 +318,7 @@ function xlsxCell(reference, value) {
   // A request is JSON, so a number reaching here is finite by construction.
   if (typeof value === "number") return `<c r="${reference}"><v>${value}</v></c>`;
   if (typeof value === "boolean") return `<c r="${reference}" t="b"><v>${value ? 1 : 0}</v></c>`;
-  if (value && typeof value === "object") {
-    // The rule the tool's boundary states, as the kit's own last line: the
-    // object holds `formula` alone, and the text — with its one optional leading
-    // `=` and the spacing removed — is a formula, so a second `=` is refused
-    // rather than written into the `<f>` element as text. The tool's paired
-    // refusal test drives both sides, keeping the two aligned.
-    const formula = typeof value.formula === "string" ? value.formula.trim().replace(/^=/, "").trim() : "";
-    if (Object.keys(value).length === 1 && formula && !formula.startsWith("=")) return `<c r="${reference}"><f>${xmlEscape(formula)}</f></c>`;
-    throw new UsageError(`cell ${reference}: an object value must be {"formula": "SUM(A1:A2)"}`);
-  }
+  if (value && typeof value === "object") return `<c r="${reference}"><f>${xmlEscape(formulaOf(reference, value))}</f></c>`;
   const text = String(value);
   return text === "" ? "" : `<c r="${reference}" t="inlineStr"><is><t xml:space="preserve">${xmlEscape(text)}</t></is></c>`;
 }
@@ -604,11 +605,8 @@ const PLACEHOLDER = /\{([^{}]+)\}/g;
 // The run element of a part, capturing its text. `prefix` is the run element's
 // name up to the tag itself: `a:` in a drawing part, empty in a workbook part.
 const runPattern = (prefix) => new RegExp(`<${prefix}t(?:\\s[^>]*)?>([\\s\\S]*?)</${prefix}t>`, "g");
-// The workbook's shared-string table and one `<si>` of it (empty or not).
+// The workbook's shared-string table, its `<si>` entries read as elements.
 const SHARED_STRINGS_PART = "xl/sharedStrings.xml";
-const SHARED_STRING = "<si(?:\\s[^>]*)?>[\\s\\S]*?</si>|<si(?:\\s[^>]*)?/>";
-// One `<a:p>` paragraph of a drawing part.
-const DRAWING_PARAGRAPH = "<a:p(?:\\s[^>]*)?>[\\s\\S]*?</a:p>";
 
 // Replace `text`'s placeholders with their values, recording every name the
 // sample declared (`seen`) and every one no value was given for (`missing`). The
@@ -649,6 +647,14 @@ function runText(element, runs) {
   return xmlUnescape([...element.matchAll(runs)].map((match) => match[1]).join(""));
 }
 
+// The element holding one run's text, in the namespace `prefix` names. A
+// WordprocessingML `w:t` and a SpreadsheetML `<t>` declare `xml:space`, and both
+// get it so a significant space survives; DrawingML's `<a:t>` declares no
+// attributes at all, so it is written bare — the attribute is not part of that
+// format, and a presentation holding it offers to repair the file. Element text
+// reaches a reader whole either way, so no significant space is lost without it.
+const textElement = (prefix, text) => (prefix === "a:" ? `<a:t>${text}</a:t>` : `<${prefix}t xml:space="preserve">${text}</${prefix}t>`);
+
 // `element` with its first run holding `text` and every further run emptied;
 // the formatting around those runs (their run properties) is kept.
 function rewriteRuns(element, runs, prefix, text) {
@@ -656,16 +662,17 @@ function rewriteRuns(element, runs, prefix, text) {
   return element.replace(runs, () => {
     const content = first ? text : "";
     first = false;
-    return `<${prefix}t xml:space="preserve">${xmlEscape(content)}</${prefix}t>`;
+    return textElement(prefix, xmlEscape(content));
   });
 }
 
-// Substitute the placeholders of every `container` of `xml`, one at a time: the
-// container's runs are joined, substituted once, and written back into its
-// first run.
+// Substitute the placeholders of every `container` element of `xml`, one at a
+// time: the container's runs are joined, substituted once, and written back into
+// its first run. `container` is a complete-element pattern (see
+// `elementPattern`), so both shapes a file may write the element in are matched.
 function fillTextContainers(xml, container, prefix, values, seen, missing) {
   const runs = runPattern(prefix);
-  return xml.replace(new RegExp(container, "g"), (element) => {
+  return xml.replace(container, (element) => {
     const text = placeholderText(element, runs);
     if (text === null) return element;
     return rewriteRuns(element, runs, prefix, substituteText(text, values, seen, missing));
@@ -674,12 +681,13 @@ function fillTextContainers(xml, container, prefix, values, seen, missing) {
 
 // Open a sample package, blaming the REQUEST when it cannot be opened at all —
 // an encrypted or truncated file is a bad input the caller can do something
-// about, not a kit fault.
+// about, not a kit fault. The family is named as the extension it was read as,
+// so the sentence reads the same for every one of them.
 function openPackage(file, kind) {
   try {
     return new PizZip(fs.readFileSync(file));
   } catch (error) {
-    throw new UsageError(`cannot open ${nodePath.basename(file)} as a ${kind} package: ${(error && error.message) || error}`);
+    throw new UsageError(`${nodePath.basename(file)} is not a readable .${kind} package: ${(error && error.message) || error}`);
   }
 }
 
@@ -735,14 +743,17 @@ function packageFamily(zip) {
   return null;
 }
 
-// A package whose parts are another family's cannot be filled as this one: the
+// A package whose parts are another family's cannot be used as this one: the
 // mismatch is named here rather than left to the library, whose message for it
-// talks about its own paid modules instead of the file.
-function ensurePackageFamily(zip, expected) {
+// talks about its own paid modules instead of the file. The caller passes its
+// own voice: `noun` names the file it handed over ("sample" for a fill, "input"
+// for an edit) and `hint` builds the advice that fits its own action from the
+// family the package really is, so the check itself stays one. The family is
+// named as the extension it is, the way the file is named.
+function ensurePackageFamily(zip, expected, noun, hint) {
   const family = packageFamily(zip);
-  if (family && family !== expected) {
-    throw new UsageError(`the sample is really a ${family} package, not the ${expected} one its name says — hint: rename it to match its content`);
-  }
+  if (!family || family === expected) return;
+  throw new UsageError(`the ${noun} is really a .${family} package, not the .${expected} one its name says — hint: ${hint(family)}`);
 }
 
 function fillDocxOrPptx(req) {
@@ -752,7 +763,7 @@ function fillDocxOrPptx(req) {
   // document, which the library reads on its own.
   const expected = req.format === "pptx" ? "pptx" : "docx";
   const zip = openPackage(req.template, expected);
-  ensurePackageFamily(zip, expected);
+  ensurePackageFamily(zip, expected, "sample", () => "rename it to match its content");
   let doc;
   try {
     doc = new Docxtemplater(zip, {
@@ -776,7 +787,7 @@ function fillDocxOrPptx(req) {
   for (const name of Object.keys(out.files)) {
     if (!/^ppt\/notesSlides\/notesSlide\d+\.xml$/.test(name)) continue;
     const xml = out.file(name).asText();
-    const filled = fillTextContainers(xml, DRAWING_PARAGRAPH, "a:", req.values, tags, missing);
+    const filled = fillTextContainers(xml, elementPattern("a:p"), "a:", req.values, tags, missing);
     if (filled !== xml) out.file(name, filled);
   }
   return { buffer: out.generate({ type: "nodebuffer", compression: "DEFLATE" }), missing: [...missing], placeholders: tags.size };
@@ -797,7 +808,7 @@ function sharedStringOf(cell, shared) {
 // index order: what a `t="s"` cell's index refers to (`""` for an `<si/>` with
 // no runs, which still occupies its index).
 function sharedStringTexts(xml) {
-  return [...xml.matchAll(new RegExp(SHARED_STRING, "g"))].map((match) => runText(match[0], runPattern("")));
+  return [...xml.matchAll(elementPattern("si"))].map((match) => runText(match[0], runPattern("")));
 }
 
 // The zero-based column a cell reference's letters name (`"B12"` -> 1).
@@ -851,7 +862,7 @@ function fillXlsx(req) {
   const missing = new Set();
   const seen = new Set();
   const zip = openPackage(req.template, "xlsx");
-  ensurePackageFamily(zip, "xlsx");
+  ensurePackageFamily(zip, "xlsx", "sample", () => "rename it to match its content");
   const rewrite = (name, fill) => {
     const part = zip.file(name);
     if (!part) return;
@@ -866,8 +877,2542 @@ function fillXlsx(req) {
   }
   // A real Excel file keeps its strings in the shared table and writes only an
   // index into the cell, so a placeholder there is invisible to the cell pass.
-  rewrite(SHARED_STRINGS_PART, (xml) => fillTextContainers(xml, SHARED_STRING, "", req.values, seen, missing));
+  rewrite(SHARED_STRINGS_PART, (xml) => fillTextContainers(xml, elementPattern("si"), "", req.values, seen, missing));
   return { buffer: zip.generate({ type: "nodebuffer", compression: "DEFLATE" }), missing: [...missing], placeholders: seen.size };
+}
+
+// ── surgical package edits ─────────────────────────────────────
+// `docx_edit`, `xlsx_edit` and `pptx_edit` change an existing package part by
+// part instead of rewriting it through a writer library: every part an edit does
+// not name is carried into the output with the exact content it had, which keeps
+// a chart, a comment or a media file the caller never mentioned intact. The raw
+// archive bytes are not identical — a fresh DEFLATE stream re-compresses every
+// part — but the CONTENT of every part no edit touched is.
+//
+// Each edit walks the part it applies to — a `part` call charges the text it
+// opens, and an arm that folds a whole edit list over one part charges each edit's
+// own walk (the docx arm) — so a call costs the part text its edits walk, added
+// up. Past this much the run would reach its own time limit, which the caller
+// reads as a product fault: refusing here instead names a call the caller can fix
+// by splitting it. The unit is the part text's own length, which is its byte count
+// for the XML these parts hold.
+const EDIT_WORK_MAX = 4 * 1024 ** 3;
+
+// The refusal a call past that budget states, naming the size it walked and the
+// fix. One place, so the arms that charge work cannot word it differently.
+const editWorkRefusal = (work) => new UsageError(`the edits rewrite about ${Math.round(work / 1024 / 1024)} MB of the document's parts, more than one call applies (limit ${Math.round(EDIT_WORK_MAX / 1024 / 1024)} MB) — hint: split the edits into several calls`);
+
+function openEdit(req, family) {
+  const zip = openPackage(req.input, family);
+  ensurePackageFamily(zip, family, "input", (real) => `use ${real}_edit to edit it`);
+  // The family's own part is what an edit rewrites, so a package that declares
+  // no family at all — `ensurePackageFamily` refuses another family, not the
+  // absence of one — is refused here rather than left to a no-op. The sentence
+  // names what the file lacks, since a caller can act on that.
+  if (!packageFamily(zip)) throw new UsageError(`cannot edit ${nodePath.basename(req.input)}: it holds no document, workbook or presentation part, so it is not a .${family} package`);
+  // The parts the input held, for the signature check below. A folder entry ends
+  // with `/` and `zip.file` does not resolve one, so the names kept are the
+  // parts.
+  const baseline = Object.keys(zip.files).filter((name) => !name.endsWith("/"));
+  // A package that carries a digital signature part cannot be edited into a file
+  // the signature still matches: the parts it signs change while the signature
+  // does not, so a changed package says so in one note rather than staying
+  // silent about it.
+  const signed = baseline.some((name) => name.startsWith("_xmlsignatures/"));
+  const notes = [];
+  let changed = false;
+  let touched = false;
+  let work = 0;
+  // Charge one walk over a part's text against the call's budget. `part` charges
+  // the pass it makes; an arm whose edits walk a part outside one `part` call
+  // charges its own walks with this, so the budget covers them too.
+  const charge = (length) => {
+    work += length;
+    if (work > EDIT_WORK_MAX) throw editWorkRefusal(work);
+  };
+  return {
+    zip,
+    charge,
+    // A user-facing note, already bracketed: the Rust side appends it verbatim.
+    // Kept once each, in the order the edits first raised it.
+    note: (message) => { if (!notes.includes(message)) notes.push(message); },
+    // Whether the call changed the sheet's CONTENT — a value written or an address
+    // moved — rather than only the markup around it: an insert past the used range
+    // adds a line without moving anything and a repeated write states what the cell
+    // already held, and the caveats about a workbook's charts and pivots are owed
+    // for a change of content, not for a rewrite. Recorded by the edits themselves
+    // (`markContent`), because only they know what their write meant.
+    content: () => touched,
+    // Record a change of content (see `content`).
+    markContent: () => { touched = true; },
+    // Rewrite a part only when the change really changed it; a part the family
+    // does not have is left alone.
+    part(name, change) {
+      const file = zip.file(name);
+      if (!file) return;
+      const xml = file.asText();
+      charge(xml.length);
+      const written = change(xml);
+      if (written !== xml) { zip.file(name, written); changed = true; }
+    },
+    // Add a part the input did not have, or put one back with new content —
+    // `pptx_edit`'s slide add is the operation that means to. A name the package
+    // already holds with the same content is not a change.
+    add(name, content) {
+      const held = zip.file(name);
+      if (held && held.asText() === content) return;
+      zip.file(name, content);
+      changed = true;
+    },
+    remove(name) {
+      if (!zip.file(name)) return;
+      zip.remove(name);
+      changed = true;
+    },
+    // The result an edit hands back.
+    finish() {
+      if (changed && signed) notes.push("[the input carries a digital signature, which was carried through unchanged — the file changed, so the signature no longer matches it]");
+      return { buffer: zip.generate({ type: "nodebuffer", compression: "DEFLATE" }), notes };
+    },
+  };
+}
+
+// The edits one call carries, bounded before any of them runs.
+function editList(req) {
+  if (!Array.isArray(req.edits)) throw new UsageError("edits must be a list");
+  if (req.edits.length > RULES.edits_max) throw new UsageError(`a call may carry at most ${RULES.edits_max} edits, got: ${req.edits.length}`);
+  return req.edits;
+}
+
+// One string an edit names — a find, a replacement, an inserted text — as the
+// kit's last line after the tool's own boundary: text, and inside the cap the
+// two sides share.
+function editText(value, what) {
+  if (typeof value !== "string") throw new UsageError(`${what} must be text`);
+  if ([...value].length > RULES.edit_text_max) throw new UsageError(`${what} must be at most ${RULES.edit_text_max} characters`);
+  return value;
+}
+
+// Every span `find` occurs at in `text`, left to right and non-overlapping. The
+// offsets are code points, the unit `locateSlot` counts in: a raw `indexOf`
+// offset is a UTF-16 code unit, so a supplementary character before a match
+// would shift it by one and make the edit rewrite the wrong slot.
+function occurrences(text, find) {
+  const spans = [];
+  const width = [...find].length;
+  let from = 0;
+  // The code points of `text` before `from`, kept in step with the UTF-16 cursor
+  // `indexOf` advances.
+  let walked = 0;
+  while (true) {
+    const at = text.indexOf(find, from);
+    if (at < 0) break;
+    walked += [...text.slice(from, at)].length;
+    spans.push({ start: walked, end: walked + width });
+    from = at + find.length;
+    walked += width;
+  }
+  return spans;
+}
+
+// ── docx_edit ──────────────────────────────────────────────────
+// The three spellings a tag is written in — `<w:p/>`, `<w:p …>`, `</w:p>` — as
+// the balanced walker `tagSpans` reads them. One definition of the rule, so a
+// family walked later cannot be handed a pattern missing a spelling.
+const tagPattern = (name) => new RegExp(`<${name}(?:\\s[^>]*)?/>|<${name}(?:\\s[^>]*)?>|</${name}>`, "g");
+
+// A text edit addresses the joined, unescaped text of a `<w:p>` paragraph's
+// `<w:t>` runs. A field's cached result is not body text, and a run inside a
+// text box belongs to its own paragraph, so the runs of a field region, of a
+// `<w:fldSimple>`, and of a nested paragraph are excluded from the text an edit
+// addresses. The header, footer, footnote and endnote parts are not read at
+// all: only `word/document.xml` is edited.
+const DOCX_PARAGRAPH = tagPattern("w:p");
+const DOCX_RUN = tagPattern("w:r");
+const DOCX_FIELD = tagPattern("w:fldSimple");
+const DOCX_CELL = tagPattern("w:tc");
+const DOCX_TXBX = tagPattern("w:txbxContent");
+const DOCX_TABLE = tagPattern("w:tbl");
+// A run's text, the same pattern the filler substitutes through.
+const DOCX_TEXT = runPattern("w:");
+// The refusal every op that searched and found nothing states: the parts a body
+// edit does not look at are named, because the text there is real and the
+// caller may well expect it found.
+const missingFind = (find) => `the text ${JSON.stringify(find)} is not in the document's body (headers, footers, footnotes and fields are not searched)`;
+
+// The one balanced scan every "walk the elements of one tag family" caller here
+// is built on. It returns one entry per COMPLETE element of `pattern`'s family:
+// `start`/`end` are byte offsets, `depth` is the element's own nesting level
+// among its family (`1` for a top-level one), and `selfClosing` says whether it
+// was written `<name/>`. A self-closing element is complete where it opens, a
+// child-bearing one where its own close balances it, so the entries come out in
+// the order the scan finishes them — the order each walk this replaced produced.
+function tagSpans(xml, pattern) {
+  const spans = [];
+  const stack = [];
+  for (const match of xml.matchAll(pattern)) {
+    const tag = match[0];
+    if (tag.endsWith("/>")) {
+      spans.push({ start: match.index, end: match.index + tag.length, depth: stack.length + 1, selfClosing: true });
+      continue;
+    }
+    if (tag.startsWith("</")) {
+      const open = stack.pop();
+      if (open) spans.push({ start: open.start, end: match.index + tag.length, depth: open.depth, selfClosing: false });
+    } else {
+      stack.push({ start: match.index, depth: stack.length + 1 });
+    }
+  }
+  return spans;
+}
+
+// The `[start, end]` span of every complete `<w:p>` of a fragment, in the order
+// the scan reaches their closing tags (a nested one before the one that holds
+// it). A self-closing `<w:p/>` holds nothing an edit can address and is dropped.
+function docxParagraphs(xml) {
+  return tagSpans(xml, DOCX_PARAGRAPH)
+    .filter((span) => !span.selfClosing)
+    .map(({ start, end }) => ({ start, end }));
+}
+
+// The spans of the paragraphs nested in `fragment`, i.e. every complete `<w:p>`
+// that is not `fragment`'s own element (the only one at depth 1), each a
+// `[start, end]` pair.
+function nestedParagraphSpans(fragment) {
+  return tagSpans(fragment, DOCX_PARAGRAPH)
+    .filter((span) => !span.selfClosing && span.depth > 1)
+    .map(({ start, end }) => [start, end]);
+}
+
+// The nested paragraphs that are not themselves inside another nested one,
+// i.e. `fragment`'s direct child paragraphs — the ones a recursive edit walks.
+function childParagraphSpans(fragment) {
+  const nested = nestedParagraphSpans(fragment);
+  return nested.filter(([start, end]) => !nested.some(([outerStart, outerEnd]) => outerStart < start && outerEnd > end));
+}
+
+// The spans of the `<w:fldSimple>` elements of a fragment: everything inside one
+// is a field, which a text edit does not address.
+function fieldSimpleSpans(fragment) {
+  return tagSpans(fragment, DOCX_FIELD).map(({ start, end }) => [start, end]);
+}
+
+// The `[start, end]` spans of every field of a whole part: each `<w:fldSimple>`,
+// and the region from a `<w:fldChar begin>` to its `<w:fldChar end>`. Computed
+// over the part rather than per paragraph, because a field's begin and end may
+// sit in different paragraphs — a per-paragraph counter would leave the second
+// paragraph's cached result looking like body text and make the "fields are not
+// searched" promise false.
+function fieldRegions(xml) {
+  const regions = [];
+  const stack = [];
+  for (const match of xml.matchAll(tagPattern("w:fldChar"))) {
+    const type = (match[0].match(/\bw:fldCharType="([^"]*)"/) || [])[1];
+    if (type === "begin") stack.push(match.index);
+    else if (type === "end" && stack.length) regions.push([stack.pop(), match.index + match[0].length]);
+  }
+  return [...fieldSimpleSpans(xml), ...regions];
+}
+
+// The part of each excluded span that falls inside `[start, end]`, moved to that
+// slice's own origin — how a span found over a whole part reaches the fragment a
+// recursive edit works on.
+const clipSpans = (spans, start, end) => spans
+  .map(([from, to]) => [Math.max(from, start), Math.min(to, end)])
+  .filter(([from, to]) => from < to)
+  .map(([from, to]) => [from - start, to - start]);
+
+// The text a docx edit ADDRESSES in a fragment: the joined text of its own runs,
+// with the field regions that reach into it excluded. The fragments a text edit
+// matches, and the text a removal tests `find` against.
+function addressedText(fragment, excluded = []) {
+  return docxRuns(fragment, excluded).slots.map((slot) => xmlUnescape(slot.raw)).join("");
+}
+
+// The text containers that must keep at least one block-level child — ECMA-376
+// requires one in `CT_Tc` and in `CT_TxbxContent` — with the name the refusal
+// gives them.
+const DOCX_BLOCK_CONTAINERS = [
+  { pattern: DOCX_CELL, name: "table cell" },
+  { pattern: DOCX_TXBX, name: "text box" },
+];
+
+// The paragraphs a container holds of its OWN — the ones that keep it valid. A
+// paragraph of a table nested in it is that table's cell's, not this container's,
+// and one drawn in a text box sits inside a paragraph (paragraph depth 2), which
+// `topParagraphs` already leaves out.
+function ownParagraphSpans(container) {
+  const tables = tagSpans(container, DOCX_TABLE).filter((span) => !span.selfClosing);
+  return topParagraphs(container).filter((paragraph) => !tables.some((span) => span.start < paragraph.start && paragraph.end <= span.end));
+}
+
+// Refuse a removal that would leave a container ECMA-376 requires a paragraph in
+// with none of its own. A container loses all of its own paragraphs exactly when
+// every one of them holds `find`, so the check runs once over the part before the
+// removal — the form that asked each removed paragraph for its enclosing
+// container re-walked the whole part once per paragraph, which made a
+// `remove_paragraph` matching many paragraphs quadratic in the part's size.
+function requireParagraphLeft(xml, find) {
+  const regions = fieldRegions(xml);
+  for (const { pattern, name } of DOCX_BLOCK_CONTAINERS) {
+    for (const span of tagSpans(xml, pattern)) {
+      if (span.selfClosing) continue;
+      const own = ownParagraphSpans(xml.slice(span.start, span.end));
+      if (!own.length) continue;
+      const everyOneGoes = own.every((paragraph) => {
+        const start = span.start + paragraph.start;
+        const end = span.start + paragraph.end;
+        return addressedText(xml.slice(start, end), clipSpans(regions, start, end)).includes(find);
+      });
+      if (everyOneGoes) throw new UsageError(`removing every paragraph holding ${JSON.stringify(find)} would leave a ${name} with no paragraph — a ${name} must keep one`);
+    }
+  }
+}
+
+// The `[start, end]` spans of a fragment's `<w:r>` elements, each with the depth
+// it sits at: a run that draws a text box holds the text box's runs.
+function runSpans(fragment) {
+  return tagSpans(fragment, DOCX_RUN).map(({ start, end, depth }) => ({ start, end, depth }));
+}
+
+// The `[start, end]` span of the `<name>…</name>` element — self-closing or
+// child-bearing — that starts exactly at `at`, or `undefined` when there is
+// none. Found by balancing, because the first `</name>` a lazy match reaches may
+// close a nested element of the same name (a `<w:rPrChange>` holds its own
+// `<w:rPr>`). Deliberately NOT a `tagSpans` call: the tag name is known only at
+// run time and the scan starts at `at`, while `tagSpans` walks a fixed family
+// over the whole part — this runs once per run, so re-scanning the whole part
+// each time would be quadratic.
+function elementSpan(xml, at, name) {
+  const open = new RegExp(`<${name}(?:\\s[^>]*)?>|<${name}(?:\\s[^>]*)?/>`, "g");
+  open.lastIndex = at;
+  const first = open.exec(xml);
+  if (!first || first.index !== at) return undefined;
+  if (first[0].endsWith("/>")) return { start: at, end: at + first[0].length };
+  const token = tagPattern(name);
+  token.lastIndex = at + first[0].length;
+  let depth = 1;
+  let match;
+  while ((match = token.exec(xml)) !== null) {
+    if (match[0].startsWith("</")) { depth -= 1; if (depth === 0) return { start: at, end: match.index + match[0].length }; }
+    else if (!match[0].endsWith("/>")) depth += 1;
+  }
+  return undefined;
+}
+
+// The `<w:rPr>` a run holds as its OWN first child, or `undefined` when it has
+// none. A run's properties are the element directly inside `<w:r>`, never one a
+// nested `<w:rPrChange>` holds (a tracked formatting revision would otherwise
+// take the edit meant for the run).
+function runProperties(runXml) {
+  const open = runXml.match(/<w:r(?:\s[^>]*)?>/);
+  if (!open) return undefined;
+  const rest = runXml.slice(open.index + open[0].length);
+  const lead = rest.length - rest.trimStart().length;
+  if (!/^<w:rPr(?:\s[^>]*)?>|^<w:rPr(?:\s[^>]*)?\/>/.test(rest.trimStart())) return undefined;
+  const span = elementSpan(runXml, open.index + open[0].length + lead, "w:rPr");
+  return span ? runXml.slice(span.start, span.end) : undefined;
+}
+
+// A paragraph's own runs and text slots. `slots` are the `<w:t>` elements whose
+// joined text an edit addresses, each with its span, its raw text, and whether
+// the raw text holds an entity — a slot whose text does is written back through
+// `xmlEscape`, one whose text does not keeps its own bytes. A run is skipped
+// when it carries the paragraph-mark property (a `<w:rPr>` with a `<w:sectPr>`,
+// where a Word section break sits), when it is not a depth-1 run, or when it
+// lies inside a nested paragraph or a field. `extra` are the field regions that
+// reach into the fragment, relative to it, for a field whose begin and end sit
+// in different paragraphs (see `fieldRegions`).
+function docxRuns(fragment, extra = []) {
+  const excluded = [...nestedParagraphSpans(fragment), ...fieldSimpleSpans(fragment), ...extra];
+  const inExcluded = (at) => excluded.some(([start, end]) => at >= start && at < end);
+  const runs = [];
+  const slots = [];
+  for (const span of runSpans(fragment)) {
+    if (span.depth !== 1 || inExcluded(span.start)) continue;
+    const runXml = fragment.slice(span.start, span.end);
+    if (/<w:rPr(?:\s[^>]*)?>[\s\S]*?<w:sectPr\b/.test(runXml)) continue;
+    const index = runs.length;
+    runs.push({ start: span.start, end: span.end, rpr: runProperties(runXml) });
+    for (const match of runXml.matchAll(DOCX_TEXT)) {
+      const at = span.start + match.index;
+      if (inExcluded(at)) continue;
+      slots.push({ start: at, end: at + match[0].length, raw: match[1], unescaped: /&(#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/.test(match[1]), run: index });
+    }
+  }
+  return { runs, slots };
+}
+
+// The paragraph elements no other paragraph contains: the roots a recursive edit
+// starts from, so a nested paragraph is edited once and not a second time as
+// part of its ancestor. Read from the scan's own nesting depth rather than by
+// asking every paragraph whether another one holds it, which is quadratic in the
+// part's paragraph count.
+function topParagraphs(xml) {
+  return tagSpans(xml, DOCX_PARAGRAPH)
+    .filter((span) => !span.selfClosing && span.depth === 1)
+    .map(({ start, end }) => ({ start, end }));
+}
+
+// `element` with `change` applied to it and, first, to each of its nested
+// paragraphs. A nested edit rewrites its bytes, so both the paragraph's own runs
+// and its field regions are located only after the nested edits are in: the runs
+// are re-found in the rewritten text, and a region that lies entirely after a
+// nested edit moves by that edit's byte delta. (A region is never inside the
+// edited span: an edit addresses body text, and a field's text is not
+// addressable.) `excluded` are the field regions that reach into the element,
+// relative to it.
+function editParagraph(element, excluded, change) {
+  const children = childParagraphSpans(element);
+  let out = element;
+  let regions = excluded;
+  for (let i = children.length - 1; i >= 0; i -= 1) {
+    const [start, end] = children[i];
+    const before = out.slice(start, end);
+    const edited = editParagraph(before, clipSpans(regions, start, end), change);
+    out = out.slice(0, start) + edited + out.slice(end);
+    const delta = edited.length - before.length;
+    if (delta) regions = regions.map(([from, to]) => (from >= end ? [from + delta, to + delta] : [from, to]));
+  }
+  return change(out, regions) ?? out;
+}
+
+// `xml` with every top-level paragraph put through `change`, from the last to
+// the first so an earlier paragraph's byte positions stay valid. The field
+// regions are found over the whole part once, then clipped to each paragraph.
+// The result is assembled as the pieces of the part between and around the
+// rewritten paragraphs and joined once: rewriting `xml` in place on every
+// paragraph would copy the whole part once per paragraph.
+function mapParagraphs(xml, change) {
+  const regions = fieldRegions(xml);
+  const tops = topParagraphs(xml);
+  const pieces = [];
+  let end = xml.length;
+  for (let i = tops.length - 1; i >= 0; i -= 1) {
+    const top = tops[i];
+    const element = xml.slice(top.start, top.end);
+    const edited = editParagraph(element, clipSpans(regions, top.start, top.end), change);
+    pieces.push(xml.slice(top.end, end), edited);
+    end = top.start;
+  }
+  pieces.push(xml.slice(0, end));
+  return pieces.reverse().join("");
+}
+
+// The slot a character offset in the joined text falls in, with the offset from
+// that slot's start. An offset exactly at a slot's end belongs to the next slot
+// when it OPENS a fragment (a fragment that begins where one run's text ends
+// begins in the next run) and to the slot it ends when it CLOSES one (the run a
+// fragment ends in is the one whose text ends at that offset).
+function locateSlot(slots, offset, atEnd = false) {
+  let walked = 0;
+  for (let index = 0; index < slots.length; index += 1) {
+    const length = [...xmlUnescape(slots[index].raw)].length;
+    if (offset < walked + length || (atEnd && offset === walked + length) || index === slots.length - 1) return { index, offset: offset - walked };
+    walked += length;
+  }
+  return { index: 0, offset: 0 };
+}
+
+// A slot's own text, written back the way it was read: a slot whose text held
+// an entity is escaped again, one that held none keeps its own bytes — escaping
+// a raw `&` that was already an entity would double it.
+const slotText = (slot, text) => (slot.unescaped ? xmlEscape(text) : text);
+
+// One slot's `<t>`, rewritten from the sub-edits the occurrences in it produced.
+// Each edit is `[from, to, text]` over the slot's own code points, replacing
+// `[from, to)` with the already-escaped `text`; they are non-overlapping and
+// ascending, so they are applied from the last to the first, where an earlier
+// offset is still the one the slot's own text has. The characters no edit
+// touches keep their own bytes (re-escaped only when the slot's raw text held an
+// entity, see `slotText`), while every replacement is already `xmlEscape`d.
+function rewrittenSlot(slot, edits, prefix) {
+  const points = [...xmlUnescape(slot.raw)];
+  let at = points.length;
+  let text = "";
+  for (let i = edits.length - 1; i >= 0; i -= 1) {
+    const [from, to, replacement] = edits[i];
+    text = replacement + slotText(slot, points.slice(to, at).join("")) + text;
+    at = from;
+  }
+  return textElement(prefix, slotText(slot, points.slice(0, at).join("")) + text);
+}
+
+// `xml` with every one of `offsets` rewritten in a single pass. `offsets` is the
+// WHOLE list of code-point `{start, end}` spans for one paragraph's joined text,
+// taken together with the `runs`/`slots` of that same text, so no occurrence's
+// positions can go stale against another's. For each span, the replacement is
+// written into the slot it starts in — the fragment's first run is the one whose
+// text takes the replacement, and the one whose formatting it keeps — every slot
+// strictly between the first and the last is emptied, and the slot it ends in
+// keeps the characters after it. The replacement takes the formatting of the run
+// its span starts in, so a span covering any run with different formatting raises
+// a note saying so; a removal substitutes nothing, takes no formatting with it,
+// and raises nothing. `prefix` is the run/text namespace (`w:` for the docx edit,
+// `a:` for the pptx one).
+function replaceOccurrences(xml, runs, slots, offsets, replacement, note, prefix) {
+  const escaped = xmlEscape(replacement);
+  // Whether the span's slots cover a run whose own properties differ from the run
+  // the span starts in: the replacement is written into the first run, so every
+  // such run loses the formatting it had. Every covered slot is asked rather than
+  // the two ends alone, because a differently formatted run in the middle is lost
+  // exactly the same way.
+  const foldsFormatting = (first, last) => {
+    for (let index = first; index <= last; index += 1) {
+      if (runs[slots[index].run].rpr !== runs[slots[first].run].rpr) return true;
+    }
+    return false;
+  };
+  // The sub-edits each slot takes, keyed by its index, added in the order the
+  // occurrences are found, which keeps each slot's own list ascending.
+  const edits = new Map();
+  const add = (index, from, to, text) => {
+    const list = edits.get(index);
+    if (list) list.push([from, to, text]);
+    else edits.set(index, [[from, to, text]]);
+  };
+  for (const { start, end } of offsets) {
+    const first = locateSlot(slots, start);
+    const last = locateSlot(slots, end, true);
+    if (replacement && foldsFormatting(first.index, last.index)) {
+      note("[the replaced text spanned several differently formatted runs — it took the formatting of the first one]");
+    }
+    if (first.index === last.index) {
+      add(first.index, first.offset, last.offset, escaped);
+      continue;
+    }
+    add(first.index, first.offset, [...xmlUnescape(slots[first.index].raw)].length, escaped);
+    add(last.index, 0, last.offset, "");
+    for (let index = first.index + 1; index < last.index; index += 1) {
+      add(index, 0, [...xmlUnescape(slots[index].raw)].length, "");
+    }
+  }
+  // Each slot is written once, from the last to the first so an earlier slot's
+  // position in `xml` is the one it still has.
+  let out = xml;
+  for (const index of [...edits.keys()].sort((a, b) => b - a)) {
+    const slot = slots[index];
+    out = out.slice(0, slot.start) + rewrittenSlot(slot, edits.get(index), prefix) + out.slice(slot.end);
+  }
+  return out;
+}
+
+// The pattern of an element of `name` in BOTH shapes a file may write it: a file
+// may spell it `<name/>` or `<name>…</name>`, and a pattern keeping only one
+// shape drops the other — the defect every hand-spelled copy of this rule has
+// invited (an `<Override>` that survived a removal, a `<dimension>` that stopped
+// being shifted, an old `<w:sz>` left beside the new one). `middle` is what the
+// open tag holds between the name and the tag's own close (`>` or `/>`); the
+// default states nothing but whatever attributes the tag carries. Built per call,
+// so no `lastIndex` of a global pattern is carried from one use to the next.
+const elementForms = (name, middle = "(?:\\s[^>]*)?") => new RegExp(`<${name}${middle}/>|<${name}${middle}>[\\s\\S]*?</${name}>`, "g");
+const elementPattern = (name) => elementForms(name);
+
+// ECMA-376's `EG_RPrBase`: the order a run's own `<w:rPr>` children must come in.
+// Word drops a child written out of sequence, so a property appended at the end
+// of the body would be reported as applied while the run renders as it did.
+// `<w:rPrChange>` is not part of the sequence; the caller keeps it last.
+const RUN_PROPERTY_ORDER = ["rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline", "shadow", "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern", "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout", "specVanish", "oMath"];
+
+// Where a run property sorts in that sequence; a name the sequence does not hold
+// sorts after every one it does, so nothing is written before an element this
+// kit cannot place.
+const runPropertyRank = (name) => {
+  const rank = RUN_PROPERTY_ORDER.indexOf(name);
+  return rank < 0 ? RUN_PROPERTY_ORDER.length : rank;
+};
+
+// `body` with `element` written where `EG_RPrBase` puts it: after every child the
+// sequence puts before it and before the first it puts after it. A body is flat —
+// the one child that holds others, `<w:rPrChange>`, is split off before a body
+// reaches here — so each child is one complete `<w:name>` element.
+function insertRunProperty(body, name, element) {
+  const rank = runPropertyRank(name);
+  for (const match of body.matchAll(/<w:([A-Za-z0-9_]+)(?:\s[^>]*)?\/>|<w:([A-Za-z0-9_]+)(?:\s[^>]*)?>[\s\S]*?<\/w:\2>/g)) {
+    if (runPropertyRank(match[1] ?? match[2]) > rank) return body.slice(0, match.index) + element + body.slice(match.index);
+  }
+  return body + element;
+}
+
+// The run-properties body with a bold/italic toggle set or removed. Setting one
+// writes it at its place in the sequence, so a toggle added to a body that
+// already holds a later property (`<w:sz>`, `<w:u>`) is not written where Word
+// would drop it.
+function runToggle(body, name, on) {
+  const without = body.replace(elementPattern(`w:${name}`), "");
+  return on ? insertRunProperty(without, name, `<w:${name}/>`) : without;
+}
+
+// The `<w:rPr>` the format request needs, from the run's own: a boolean writes
+// or drops a `<w:b>`/`<w:i>`, and `size` replaces the run's own `<w:sz>`/
+// `<w:szCs>` — in either shape — with the half-point value, the unit `<w:sz>`
+// counts in. Each property is written at its own place in `EG_RPrBase` (see
+// `insertRunProperty`). A `null` property counts as absent — the caller's own
+// boundary treats a null-valued key that way — so only a stated one is written.
+//
+// A `<w:rPrChange>` holds the properties a tracked formatting revision recorded
+// — the state before that revision, not the run's own formatting — so only the
+// elements before it are read and rewritten: a revision keeps its own bytes (a
+// request is never answered by changing one), and the properties this writes go
+// in front of it, which is the one place `<w:rPr>` accepts it, `<w:rPrChange>`
+// being the child that must come last. A request that leaves no property at all
+// writes nothing: an empty `<w:rPr>` is a change that states nothing. A run whose
+// own body the request emptied but which records a revision keeps that revision:
+// it is content the request never named, and removing it would be the request
+// answering itself by deleting a recorded change.
+function formattedRunProperties(runXml, edit) {
+  const current = runProperties(runXml);
+  const inner = current ? current.replace(/^<w:rPr(?:\s[^>]*)?\/?>/, "").replace(/<\/w:rPr>$/, "") : "";
+  const revisionAt = inner.search(/<w:rPrChange(?:\s[^>]*)?\/?>/);
+  const revision = revisionAt < 0 ? undefined : elementSpan(inner, revisionAt, "w:rPrChange");
+  let body = revision ? inner.slice(0, revision.start) : inner;
+  if (edit.bold != null) body = runToggle(body, "b", edit.bold);
+  if (edit.italic != null) body = runToggle(body, "i", edit.italic);
+  if (edit.size != null) {
+    const without = body.replace(elementPattern("w:sz"), "").replace(elementPattern("w:szCs"), "");
+    body = insertRunProperty(without, "szCs", `<w:szCs w:val="${edit.size}"/>`);
+    body = insertRunProperty(body, "sz", `<w:sz w:val="${edit.size}"/>`);
+  }
+  if (!body && !revision) return "";
+  return `<w:rPr>${body}${revision ? inner.slice(revision.start) : ""}</w:rPr>`;
+}
+
+// `xml` with `edit`'s formatting applied to the runs a matched fragment covers.
+// Run properties live on the run, not on a character, so a fragment covering
+// part of a run formats that whole run — splitting a run to format half of it
+// would rewrite bytes the preservation promise is about. Nothing outside those
+// runs changes.
+function formatRuns(xml, runs, runIndices, edit) {
+  const pieces = [];
+  for (const index of [...runIndices].sort((a, b) => a - b)) {
+    const run = runs[index];
+    const runXml = xml.slice(run.start, run.end);
+    const open = runXml.match(/<w:r(?:\s[^>]*)?>/)[0];
+    const next = formattedRunProperties(runXml, edit);
+    // A run's properties sit immediately after its open tag, before its content,
+    // and are replaced by their own balanced span: a lazy regex would stop at the
+    // close of the `<w:rPr>` a nested `<w:rPrChange>` holds, writing the toggle
+    // into that nested element instead of the run's own.
+    const lead = runXml.slice(open.length).length - runXml.slice(open.length).trimStart().length;
+    const own = run.rpr ? elementSpan(runXml, open.length + lead, "w:rPr") : undefined;
+    pieces.push({
+      start: run.start,
+      end: run.end,
+      xml: own ? runXml.slice(0, own.start) + next + runXml.slice(own.end) : open + next + runXml.slice(open.length),
+    });
+  }
+  pieces.sort((a, b) => b.start - a.start);
+  let out = xml;
+  for (const piece of pieces) out = out.slice(0, piece.start) + piece.xml + out.slice(piece.end);
+  return out;
+}
+
+// The `<w:body>` position a paragraph added "at the end" goes to: before the
+// body's OWN `<w:sectPr>` section properties when it has them, since those must
+// stay the body's last element, else at the very end of the body. The first
+// `<w:sectPr>` in the body is not necessarily the body's own — a section break
+// sits inside a paragraph's `<w:pPr>` — so only a `<w:sectPr>` outside every
+// paragraph counts, and the body's own is the last of those.
+function bodyEnd(xml) {
+  const body = xml.match(/<w:body(?:\s[^>]*)?>[\s\S]*<\/w:body>/);
+  if (!body) throw new UsageError("the document has no body to add a paragraph to");
+  const open = body[0].indexOf(">") + 1;
+  const content = body[0].slice(open, body[0].lastIndexOf("</w:body>"));
+  const paragraphs = docxParagraphs(content);
+  const insideParagraph = (at) => paragraphs.some((span) => at >= span.start && at < span.end);
+  let at = content.length;
+  for (const match of content.matchAll(elementPattern("w:sectPr"))) {
+    if (!insideParagraph(match.index)) at = match.index;
+  }
+  return body.index + open + at;
+}
+
+// `xml` with a paragraph holding `text` added: after the FIRST paragraph whose
+// text holds `after`, or at the end of the body. The first match in part order
+// is the anchor on purpose — the same rule the presentation's `add_paragraph`
+// uses (see `addSlideParagraph`) — so a fragment that matches several paragraphs
+// always lands the new one in the same place. The set searched is the document's
+// OWN paragraphs (`topParagraphs`): a table cell's is one of them, a text box's
+// is not — it is a paragraph nested inside another — and an `after` naming text
+// there is refused with a message saying where the text lies rather than
+// anchoring the new paragraph inside the box.
+function addParagraph(xml, edit) {
+  const text = editText(edit.text, "text");
+  const paragraph = `<w:p><w:r><w:t xml:space="preserve">${xmlEscape(text)}</w:t></w:r></w:p>`;
+  if (edit.after === undefined) {
+    const at = bodyEnd(xml);
+    return xml.slice(0, at) + paragraph + xml.slice(at);
+  }
+  const after = editText(edit.after, "after");
+  if (!after) throw new UsageError("after must not be empty");
+  const regions = fieldRegions(xml);
+  const textOf = (candidate) => {
+    const { slots } = docxRuns(xml.slice(candidate.start, candidate.end), clipSpans(regions, candidate.start, candidate.end));
+    return slots.map((slot) => xmlUnescape(slot.raw)).join("");
+  };
+  const span = topParagraphs(xml).find((candidate) => textOf(candidate).includes(after));
+  if (!span) {
+    // The fragment may still be text this document holds and the text ops can
+    // edit — a text box's own paragraph — so the refusal says where it is
+    // instead of the body's "not searched" wording, which reads as "not in the
+    // file".
+    const buried = docxParagraphs(xml).find((candidate) => textOf(candidate).includes(after));
+    if (buried) throw new UsageError(`the text ${JSON.stringify(after)} is inside a text box: an add_paragraph after anchors in the document's own paragraphs (a table cell's counts), and a text box's paragraph is a nested one`);
+    throw new UsageError(missingFind(after));
+  }
+  return xml.slice(0, span.end) + paragraph + xml.slice(span.end);
+}
+
+// `element` with every paragraph — itself or a nested one — whose joined text
+// holds `find` removed, `null` when the whole element goes. A nested paragraph
+// is removed on its own: it is only the paragraph the text is in that goes, not
+// the one that draws the text box around it. `excluded` are the field regions
+// that reach into the element, relative to it. A nested edit rewrites bytes, so
+// the field regions and the element's own runs are located only after it —
+// exactly as `editParagraph` does.
+function removeParagraph(element, excluded, find, found) {
+  const children = childParagraphSpans(element);
+  let out = element;
+  let regions = excluded;
+  for (let i = children.length - 1; i >= 0; i -= 1) {
+    const [start, end] = children[i];
+    const before = out.slice(start, end);
+    const removed = removeParagraph(before, clipSpans(regions, start, end), find, found);
+    if (removed === null) out = out.slice(0, start) + out.slice(end);
+    else if (removed !== before) out = out.slice(0, start) + removed + out.slice(end);
+    const delta = (removed === null ? 0 : removed.length) - before.length;
+    if (delta) regions = regions.map(([from, to]) => (from >= end ? [from + delta, to + delta] : [from, to]));
+  }
+  if (!addressedText(out, regions).includes(find)) return out;
+  found.value = true;
+  return null;
+}
+
+// `xml` with the top-level paragraphs put through `removeParagraph`, from the
+// last to the first so an earlier one's byte positions stay valid. The result is
+// assembled as the pieces of the part around the removed paragraphs and joined
+// once, the way `mapParagraphs` does.
+function removeParagraphs(xml, find, found) {
+  // A container a paragraph is removed from must keep a paragraph — ECMA-376
+  // requires one in a `<w:tc>` and in a `<w:txbxContent>` — and the removal is
+  // refused rather than written out as a part no reader may hold. The check runs
+  // over the whole part once, before anything goes.
+  requireParagraphLeft(xml, find);
+  const regions = fieldRegions(xml);
+  const tops = topParagraphs(xml);
+  const pieces = [];
+  let end = xml.length;
+  for (let i = tops.length - 1; i >= 0; i -= 1) {
+    const top = tops[i];
+    const element = xml.slice(top.start, top.end);
+    const removed = removeParagraph(element, clipSpans(regions, top.start, top.end), find, found);
+    pieces.push(xml.slice(top.end, end));
+    if (removed !== null) pieces.push(removed);
+    end = top.start;
+  }
+  pieces.push(xml.slice(0, end));
+  return pieces.reverse().join("");
+}
+
+// One docx edit applied to `xml`: the edit addresses the joined text of a
+// paragraph's runs, and every occurrence of `find` is rewritten.
+function applyDocxEdit(xml, edit, note) {
+  const op = edit && edit.op;
+  if (op === "add_paragraph") return addParagraph(xml, edit);
+  const find = editText(edit && edit.find, "find");
+  if (!find) throw new UsageError("find must not be empty");
+  if (op === "remove_paragraph") {
+    const found = { value: false };
+    const out = removeParagraphs(xml, find, found);
+    if (!found.value) throw new UsageError(missingFind(find));
+    return out;
+  }
+  if (!["replace_text", "insert_text", "remove_text", "format_text"].includes(op)) throw new UsageError(`unknown docx edit: ${JSON.stringify(op)}`);
+  const format = { bold: edit.bold, italic: edit.italic };
+  if (op === "format_text") {
+    if (edit.bold == null && edit.italic == null && edit.size == null) throw new UsageError("format_text needs at least one of bold, italic or size");
+    if (edit.size != null) {
+      if (!inSpan(edit.size, RULES.text_size_points)) throw new UsageError(`size must be ${spanBounds(RULES.text_size_points)} points, got: ${JSON.stringify(edit.size)}`);
+      // `<w:sz>` counts half-points, and the shared bound's ends are the one and
+      // the 1638 half-points a `<w:sz>` can hold, so rounding a size the rule
+      // allows never reaches the zero a reader cannot draw.
+      format.size = String(Math.round(edit.size * 2));
+    }
+  }
+  let replacement = "";
+  if (op === "replace_text") replacement = editText(edit.replace, "replace");
+  else if (op === "insert_text") {
+    const insert = editText(edit.insert, "insert");
+    if (!insert) throw new UsageError("insert must not be empty");
+    const position = edit.position === undefined ? "after" : edit.position;
+    if (position !== "after" && position !== "before") throw new UsageError(`position must be "after" or "before", got: ${JSON.stringify(position)}`);
+    replacement = position === "before" ? insert + find : find + insert;
+  }
+  let inserted = false;
+  const out = mapParagraphs(xml, (element, excluded) => {
+    const { runs, slots } = docxRuns(element, excluded);
+    const text = slots.map((slot) => xmlUnescape(slot.raw)).join("");
+    const offsets = occurrences(text, find);
+    if (!offsets.length) return null;
+    inserted = true;
+    if (op === "format_text") {
+      // The runs the matched fragments cover, found once and formatted together:
+      // a later edit could not move an earlier one's run.
+      const runIndices = new Set();
+      for (const span of offsets) {
+        const first = locateSlot(slots, span.start);
+        const last = locateSlot(slots, span.end, true);
+        for (let i = first.index; i <= last.index; i += 1) runIndices.add(slots[i].run);
+      }
+      return formatRuns(element, runs, runIndices, format);
+    }
+    // Every occurrence is written in one pass over the same runs and slots, so
+    // no occurrence's offsets can go stale against another's.
+    return replaceOccurrences(element, runs, slots, offsets, replacement, note, "w:");
+  });
+  if (!inserted) throw new UsageError(missingFind(find));
+  return out;
+}
+
+function docxEdit(req) {
+  const editor = openEdit(req, "docx");
+  const edits = editList(req);
+  editor.part("word/document.xml", (xml) => {
+    for (const edit of edits) {
+      // Each edit walks the whole body text, and what it walks is a part it does
+      // not open through `part` — so it charges its own walk, and the budget
+      // covers a long edit list over a large body rather than one document
+      // length.
+      editor.charge(xml.length);
+      xml = applyDocxEdit(xml, edit, (message) => editor.note(message));
+    }
+    return xml;
+  });
+  return editor.finish();
+}
+
+// ── xlsx_edit ──────────────────────────────────────────────────
+// A cell's address is its own `r` or, when a writer left it out, its position in
+// the row — the rule the reader and the filler already use.
+const ROW_ELEMENT = elementPattern("row");
+const CELL_ELEMENT = elementPattern("c");
+const styleOf = (cell) => (cell.match(/\bs="(\d+)"/) || [])[1];
+
+// The `<row>` elements of a sheet, each with the number it holds and its span: a
+// row that left `r` out stands for the one after its predecessor.
+function sheetRows(xml) {
+  const rows = [];
+  let number = 0;
+  for (const match of xml.matchAll(ROW_ELEMENT)) {
+    const attribute = (match[0].match(/\br="(\d+)"/) || [])[1];
+    number = attribute ? Number(attribute) : number + 1;
+    rows.push({ start: match.index, end: match.index + match[0].length, number, xml: match[0] });
+  }
+  return rows;
+}
+
+// The `<c>` elements of one row, each with the zero-based column it addresses: a
+// cell that left `r` out stands for the position it sits in.
+function rowCells(rowXml) {
+  const cells = [];
+  let column = 0;
+  for (const match of rowXml.matchAll(CELL_ELEMENT)) {
+    const attribute = (match[0].match(/\br="([A-Za-z]+\d+)"/) || [])[1];
+    const index = attribute ? columnOf(attribute) : column;
+    column = index + 1;
+    cells.push({ start: match.index, end: match.index + match[0].length, column: index, xml: match[0] });
+  }
+  return cells;
+}
+
+// The largest row number and column the sheet's cells use, for the reach of a
+// row or column operation.
+function usedRange(xml) {
+  let rowMax = 0;
+  let columnMax = 0;
+  for (const row of sheetRows(xml)) {
+    rowMax = Math.max(rowMax, row.number);
+    for (const cell of rowCells(row.xml)) columnMax = Math.max(columnMax, cell.column + 1);
+  }
+  return { rowMax, columnMax };
+}
+
+// The workbook's sheets in its own order, each `<sheet>` element's name beside the
+// part it addresses: the target of the relationship its `r:id` names, resolved by
+// the one OPC resolver `resolvePart` — an absolute `/xl/worksheets/sheet1.xml`, a
+// relative `worksheets/sheet1.xml` and a target spelled with `..` all name the part
+// the resolver folds them to — and, for a relationship the workbook does not
+// declare, the conventional part name for that position, the same fallback the
+// reader makes. `named` says which of the two it was.
+function workbookSheets(zip) {
+  const workbook = zip.file("xl/workbook.xml");
+  if (!workbook) return [];
+  const targets = relationshipMap(zip.file("xl/_rels/workbook.xml.rels")?.asText() ?? "");
+  return [...workbook.asText().matchAll(/<sheet\b[^>]*\/>|<sheet\b[^>]*>/g)].map((match, index) => {
+    const id = xmlAttribute(match[0], "r:id");
+    const target = id === undefined ? undefined : targets.get(id);
+    return {
+      name: xmlUnescape(xmlAttribute(match[0], "name") ?? ""),
+      part: target ? resolvePart("xl/", target) : `xl/worksheets/sheet${index + 1}.xml`,
+      named: target !== undefined,
+    };
+  });
+}
+
+// The part a sheet NAME addresses, through `xl/workbook.xml` and its
+// relationships. The name is matched the way Excel matches one — ignoring case,
+// in the workbook's own order — while a refusal keeps the file's spelling.
+function sheetPart(zip, name) {
+  const sheets = workbookSheets(zip);
+  const wanted = typeof name === "string" ? name.toLowerCase() : null;
+  const index = wanted === null ? -1 : sheets.findIndex((sheet) => sheet.name.toLowerCase() === wanted);
+  if (index < 0) throw new UsageError(`there is no sheet named ${JSON.stringify(name)}: this workbook has ${listed(sheets.map((sheet) => sheet.name)) || "no sheets"}`);
+  const { part, named } = sheets[index];
+  if (!zip.file(part)) {
+    throw new UsageError(named
+      ? `the sheet ${JSON.stringify(sheets[index].name)} names the part ${part}, which the package does not have`
+      : `the sheet ${JSON.stringify(sheets[index].name)} has no worksheet part: the workbook's relationships do not name one and the package has no ${part}`);
+  }
+  return { part, name: sheets[index].name };
+}
+
+// The row and zero-based column an A1 address names, refusing a reference to a
+// cell no workbook's grid holds.
+function cellAddress(value, what = "cell") {
+  const match = typeof value === "string" ? value.match(/^([A-Za-z]+)(\d+)$/) : null;
+  if (!match) throw new UsageError(`${what} must be an A1 address like B7, got: ${JSON.stringify(value)}`);
+  const row = Number(match[2]);
+  if (row < 1 || row > RULES.sheet_row_max) throw new UsageError(`${what} ${value}: the row must be between 1 and ${RULES.sheet_row_max}`);
+  const column = columnOf(match[1]);
+  if (column + 1 > RULES.sheet_column_max) throw new UsageError(`${what} ${value}: the column must be between A and ${colName(RULES.sheet_column_max - 1)}`);
+  return { row, column };
+}
+
+function rowNumber(value) {
+  if (!Number.isInteger(value) || value < 1 || value > RULES.sheet_row_max) throw new UsageError(`row must be a whole number between 1 and ${RULES.sheet_row_max}, got: ${JSON.stringify(value)}`);
+  return value;
+}
+
+function columnNumber(value) {
+  if (typeof value !== "string" || !/^[A-Za-z]{1,3}$/.test(value) || columnOf(value) + 1 > RULES.sheet_column_max) {
+    throw new UsageError(`column must be column letters between A and ${colName(RULES.sheet_column_max - 1)}, got: ${JSON.stringify(value)}`);
+  }
+  return columnOf(value) + 1;
+}
+
+// The `<c>` a value makes at `reference`, with the style a `number_format` chose
+// or the cell's own. Every attribute but the style is dropped: a `cm`/`vm`
+// metadata reference names a value the cell no longer holds and the reader
+// rebuilds it, so keeping it would point at nothing.
+function valueCell(reference, value, style) {
+  const attribute = style === null || style === undefined ? "" : ` s="${style}"`;
+  if (value && typeof value === "object") return `<c r="${reference}"${attribute}><f>${xmlEscape(formulaOf(reference, value))}</f></c>`;
+  // The scalar rule the tool's boundary states, as the kit's own last line.
+  const scalar = scalarOf(value, `cell ${reference}`);
+  if (typeof scalar === "number") return `<c r="${reference}"${attribute}><v>${scalar}</v></c>`;
+  if (typeof scalar === "boolean") return `<c r="${reference}"${attribute} t="b"><v>${scalar ? 1 : 0}</v></c>`;
+  return `<c r="${reference}"${attribute} t="inlineStr"><is><t xml:space="preserve">${xmlEscape(scalar)}</t></is></c>`;
+}
+
+// The `<xf>` entries of a `<cellXfs>` block, in either shape: an entry may hold
+// an `<alignment>` or a `<protection>` (both legal `CT_Xf`), and a filter that
+// kept only the self-closing ones would drop those entries and shift every cell's
+// `s=` index.
+const CELL_XFS = elementPattern("xf");
+
+// The `<numFmt>` entries of a `<numFmts>` block, both shapes for the same reason
+// as the `<xf>` match above: a part that spelled an entry the paired way would
+// otherwise be dropped and its id handed to a different format.
+const NUM_FMT = elementPattern("numFmt");
+
+// `xf` — either form — with its number format set to `id` and `applyNumberFormat`
+// stated. Cloning the entry a cell already uses keeps that cell's font, fill,
+// border and alignment; the attribute is set even when the entry states it, since
+// the entry is cloned for the format the caller asked for and a `0` the cell's own
+// entry left behind would write the id and leave the format inert.
+function withNumberFormat(xf, id) {
+  let out = xf.replace(/\bnumFmtId="[^"]*"/, () => `numFmtId="${id}"`);
+  if (!/\bnumFmtId=/.test(out)) out = out.replace(/^<xf\b/, (open) => `${open} numFmtId="${id}"`);
+  out = /\bapplyNumberFormat=/.test(out)
+    ? out.replace(/\bapplyNumberFormat="[^"]*"/, () => 'applyNumberFormat="1"')
+    : out.replace(/^<xf\b/, (open) => `${open} applyNumberFormat="1"`);
+  return out;
+}
+
+// The `<cellXfs>` index a cell takes for `formatCode`: the cell's own entry —
+// `cellStyle`, when it indexes a real `<xf>` — cloned with the format changed,
+// or a fresh minimal entry for a cell with no style. An identical entry already
+// in the list is reused rather than appended twice, and the index returned is the
+// entry's real position in the list. The lookup is through the workbook's own
+// `<numFmts>` table: a built-in id the file does not spell out resolves to
+// whatever code the reader's locale gives it, so it is not guessed at, and a
+// format code is compared as text.
+function numberFormatStyle(styles, formatCode, cellStyle) {
+  const length = [...formatCode].length;
+  if (length > RULES.number_format_max) throw new UsageError(`a number format must be at most ${RULES.number_format_max} characters, got: ${length}`);
+  const formats = new Map();
+  for (const match of styles.matchAll(NUM_FMT)) {
+    const id = Number((match[0].match(/\bnumFmtId="(\d+)"/) || [])[1]);
+    const code = (match[0].match(/\bformatCode="([^"]*)"/) || [])[1];
+    if (Number.isFinite(id) && code !== undefined) formats.set(id, xmlUnescape(code));
+  }
+  const cellXfs = styles.match(elementPattern("cellXfs"));
+  if (!cellXfs) throw new UsageError("the workbook's xl/styles.xml has no <cellXfs> to hold a number format");
+  const xfs = [...cellXfs[0].matchAll(CELL_XFS)].map((match) => match[0]);
+  let edited = styles;
+  let id = [...formats.entries()].find(([, code]) => code === formatCode)?.[0];
+  if (id === undefined) {
+    id = Math.max(163, ...formats.keys()) + 1;
+    // The entries keep their raw spelling, so a format the file already had is
+    // not rewritten by this one being added. `<numFmts>` sits directly after
+    // `<styleSheet>`, before `<fonts>`. Everything rewritten in is the file's own
+    // text or the caller's code, so a function replacement is used: a `$` in
+    // either would otherwise be a substitution pattern (`$&`, `$$`, `` $` ``,
+    // `$'`) and corrupt the part.
+    const entries = [...styles.matchAll(NUM_FMT)].map((match) => match[0]);
+    const block = `<numFmts count="${entries.length + 1}">${entries.join("")}<numFmt numFmtId="${id}" formatCode="${xmlEscape(formatCode)}"/></numFmts>`;
+    const numFmts = styles.match(elementPattern("numFmts"));
+    edited = numFmts
+      ? edited.replace(numFmts[0], () => block)
+      : edited.replace(/(<styleSheet\b[^>]*>)/, (whole, open) => open + block);
+  }
+  const own = cellStyle !== undefined && cellStyle !== null && Number.isInteger(Number(cellStyle)) && xfs[Number(cellStyle)] !== undefined ? xfs[Number(cellStyle)] : undefined;
+  const xf = own === undefined
+    ? `<xf numFmtId="${id}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`
+    : withNumberFormat(own, id);
+  const existing = xfs.indexOf(xf);
+  if (existing >= 0) return { styles: edited, index: existing };
+  edited = edited.replace(cellXfs[0], () => `<cellXfs count="${xfs.length + 1}">${xfs.join("")}${xf}</cellXfs>`);
+  return { styles: edited, index: xfs.length };
+}
+
+// Whether a line moves for an insert (a line at or after the point) or a delete
+// (only the lines after it — the deleted line itself is gone).
+const moves = (line, at, delta) => (delta > 0 ? line >= at : line > at);
+
+// A moved line number, kept inside the sheet's grid: a line at the sheet's own
+// last row or column stays there instead of naming one past the edge, which no
+// reader of the sheet has. The two caps are the shared rules the tool's own
+// boundary validates a caller's row and column against.
+const shiftNumber = (value, at, delta, max) => (moves(value, at, delta) ? Math.min(value + delta, max) : value);
+const shiftColumn = (column, at, delta) => shiftNumber(column + 1, at, delta, RULES.sheet_column_max) - 1;
+
+// One token of a range — `$A$1`, `B:D`, `3:7`, a single cell — moved; a token in
+// another shape (a defined name, `Sheet1!A1`) is left exactly as it is.
+function shiftToken(token, kind, at, delta) {
+  const cellToken = token.match(/^(\$?)([A-Za-z]{1,3})(\$?)(\d+)$/);
+  if (cellToken) {
+    const column = kind === "column" ? shiftColumn(columnOf(cellToken[2]), at, delta) : columnOf(cellToken[2]);
+    const row = kind === "row" ? shiftNumber(Number(cellToken[4]), at, delta, RULES.sheet_row_max) : Number(cellToken[4]);
+    return `${cellToken[1]}${colName(column)}${cellToken[3]}${row}`;
+  }
+  const columnToken = token.match(/^(\$?)([A-Za-z]{1,3})$/);
+  if (columnToken) {
+    if (kind !== "column") return token;
+    return `${columnToken[1]}${colName(shiftColumn(columnOf(columnToken[2]), at, delta))}`;
+  }
+  const rowToken = token.match(/^(\$?)(\d+)$/);
+  if (rowToken) return kind === "row" ? `${rowToken[1]}${shiftNumber(Number(rowToken[2]), at, delta, RULES.sheet_row_max)}` : token;
+  return token;
+}
+
+// A range or an address (`A1:C5`, `$A$1:$B$2`, `B:D`, `3:7`), both ends moved;
+// a value in another shape is returned byte-identical.
+function shiftRef(reference, kind, at, delta) {
+  const parts = reference.split(":");
+  const shifted = parts.map((part) => shiftToken(part, kind, at, delta));
+  return shifted.every((part, index) => part === parts[index]) ? reference : shifted.join(":");
+}
+
+// A `[low, high]` line range with the line `at` deleted: the deleted line is
+// gone from the range when it was inside it, so the range shrinks by one, and a
+// range that was that line alone vanishes. A range entirely after the point
+// moves down. `null` when nothing is left.
+function deleteRange(low, high, at) {
+  const nextLow = low > at ? low - 1 : low;
+  const nextHigh = high >= at ? high - 1 : high;
+  return nextHigh < nextLow ? null : { low: nextLow, high: nextHigh };
+}
+
+// A token naming whole lines (`B:D` on a column shift, `3:7` on a row shift, with
+// the `$` markers either end may carry): its line range with one line deleted —
+// the deleted line leaves the range, a range entirely after the point moves down,
+// a range the delete covered whole is `null` (nothing of it is left), and one the
+// delete does not reach comes back byte-identical. `undefined` for any other
+// token, so the caller keeps its own handling of cells and of names.
+function deleteLineRef(reference, kind, at) {
+  const pattern = kind === "column" ? /^(\$?)([A-Za-z]{1,3})$/ : /^(\$?)(\d+)$/;
+  const parts = reference.split(":");
+  const lines = parts.map((part) => part.match(pattern));
+  if (parts.length > 2 || lines.some((line) => line === null)) return undefined;
+  const numbers = lines.map((line) => (kind === "column" ? columnOf(line[2]) + 1 : Number(line[2])));
+  const low = Math.min(...numbers);
+  const high = Math.max(...numbers);
+  const span = deleteRange(low, high, at);
+  if (span === null) return null;
+  if (span.low === low && span.high === high) return reference;
+  const highest = numbers.indexOf(high);
+  return lines
+    .map((line, index) => {
+      const number = index === highest ? span.high : span.low;
+      return `${line[1]}${kind === "column" ? colName(number - 1) : number}`;
+    })
+    .join(":");
+}
+
+// A range with one line deleted on the shift's axis. A merge shrinks the way a
+// spreadsheet's merged cells do: a range the delete narrowed to one cell is no
+// longer a merge and is dropped, but one that was ALREADY a single cell and the
+// delete merely moved keeps its own spelling — dropping it would lose content
+// the edit did not name. A region (a `<dimension>`, an `sqref` token, an
+// autofilter) keeps the narrowed cell spelled once instead. A range the delete
+// does not move is returned byte-identical, each end's `$` markers and the
+// higher end kept; an insert shifts both ends the ordinary way. `null` when
+// nothing of the range is left, or, for a merge, when it no longer merges.
+function deleteRangeRef(reference, kind, at, delta, merge) {
+  if (delta > 0) return shiftRef(reference, kind, at, delta);
+  // A whole-line token is a range of the axis' own lines, not of cells, so it is
+  // moved by the line rules rather than the cell ones below. A merge is always a
+  // cell range.
+  if (!merge) {
+    const line = deleteLineRef(reference, kind, at);
+    if (line !== undefined) return line;
+  }
+  const parts = reference.split(":");
+  const cells = parts.map((part) => part.match(/^(\$?)([A-Za-z]{1,3})(\$?)(\d+)$/));
+  if (cells.some((cell) => cell === null) || (merge ? parts.length !== 2 : parts.length > 2)) {
+    return merge ? shiftRef(reference, kind, at, delta) : reference;
+  }
+  const columns = cells.map((cell) => columnOf(cell[2]) + 1);
+  const rows = cells.map((cell) => Number(cell[4]));
+  const lowColumn = Math.min(...columns);
+  const highColumnValue = Math.max(...columns);
+  const lowRow = Math.min(...rows);
+  const highRowValue = Math.max(...rows);
+  const columnSpan = kind === "column" ? deleteRange(lowColumn, highColumnValue, at) : { low: lowColumn, high: highColumnValue };
+  const rowSpan = kind === "row" ? deleteRange(lowRow, highRowValue, at) : { low: lowRow, high: highRowValue };
+  if (columnSpan === null || rowSpan === null) return null;
+  if (columnSpan.low === lowColumn && columnSpan.high === highColumnValue && rowSpan.low === lowRow && rowSpan.high === highRowValue) return reference;
+  const highColumn = columns.indexOf(highColumnValue);
+  const highRow = rows.indexOf(highRowValue);
+  const rebuilt = cells.map((cell, index) => {
+    const column = index === highColumn ? columnSpan.high : columnSpan.low;
+    const row = index === highRow ? rowSpan.high : rowSpan.low;
+    return `${cell[1]}${colName(column - 1)}${cell[3]}${row}`;
+  });
+  if (columnSpan.high === columnSpan.low && rowSpan.high === rowSpan.low) {
+    if (!merge) return rebuilt[0];
+    // A merge that no longer merges is dropped; one that was already a single
+    // cell and is merely moved keeps its own two-end spelling.
+    return lowColumn === highColumnValue && lowRow === highRowValue ? rebuilt.join(":") : null;
+  }
+  return rebuilt.join(":");
+}
+
+// A single-cell reference with one line deleted: the delete removes the element
+// when it names the very cell that goes (a hyperlink addresses one cell, so a
+// delete of that cell's row or column drops the link rather than leaving it to
+// re-attach to whatever cell shifts into its address), and shifts it otherwise.
+// An insert only shifts.
+function deleteCellRef(reference, kind, at, delta) {
+  if (delta > 0) return shiftRef(reference, kind, at, delta);
+  const cell = reference.match(/^(\$?)([A-Za-z]{1,3})(\$?)(\d+)$/);
+  if (cell === null) return shiftRef(reference, kind, at, delta);
+  if ((kind === "row" && Number(cell[4]) === at) || (kind === "column" && columnOf(cell[2]) + 1 === at)) return null;
+  return shiftRef(reference, kind, at, delta);
+}
+
+// The children the counted containers below are walked with: one element of the
+// container's own name, self-closing or child-bearing.
+const MERGE_CELL = elementPattern("mergeCell");
+const HYPERLINK = elementPattern("hyperlink");
+const COL_ENTRY = elementPattern("col");
+const DATA_VALIDATION = elementPattern("dataValidation");
+const PROTECTED_RANGE = elementPattern("protectedRange");
+const IGNORED_ERROR = elementPattern("ignoredError");
+
+// A container of counted children (`<mergeCells>`, `<hyperlinks>`, `<cols>`,
+// `<dataValidations>`, `<protectedRanges>`, `<ignoredErrors>`): each child's own
+// text is passed through `change`, which returns the child's new text or `null`
+// to drop it. An emptied container is dropped whole, because every one of these
+// elements requires a child, and a `count` the file stated follows the survivors.
+// A count is never INVENTED: `CT_Cols`, `CT_Hyperlinks`, `CT_ProtectedRanges` and
+// `CT_IgnoredErrors` declare no attributes at all, so one written for them would
+// make the part invalid, and an element the file wrote without a count keeps its
+// open tag exactly as it was written.
+//
+// The children are rewritten where they stand and nothing else in the block is
+// touched: a member this pass does not name — the `extLst` the schema's own
+// `CT_IgnoredErrors` allows, say — and the text between children are content the
+// edit never named, so they stay exactly as they were written. A block that held
+// none of its own children is returned untouched rather than dropped: it held
+// nothing already, so removing it is not this pass's to do. A block whose own
+// children ALL went with the edit is dropped whole, and a member it happened to
+// hold goes with it: the schema requires a child, so an emptied container cannot
+// stay at all, and this is the one case where an unnamed member cannot.
+function countedContainer(block, child, change) {
+  let held = 0;
+  let kept = 0;
+  const body = block.replace(child, (entry) => {
+    held += 1;
+    const next = change(entry);
+    if (next === null) return "";
+    kept += 1;
+    return next;
+  });
+  if (!held) return block;
+  if (!kept) return "";
+  const open = block.slice(0, block.indexOf(">") + 1);
+  return `${open.replace(/\bcount="\d*"/, `count="${kept}"`)}${body.slice(open.length)}`;
+}
+
+// What an element carrying an `sqref` is, in the words a reader of the answer
+// knows it by: the note says a conditional format, a data validation, a protected
+// range or a selection is gone, not the XML element's own name.
+function describeRange(name) {
+  if (name === "conditionalFormatting") return "conditional format's range";
+  if (name === "dataValidation") return "data validation's range";
+  if (name === "protectedRange") return "protected range";
+  if (name === "ignoredError") return "ignored error";
+  if (name === "selection") return "selection";
+  // A carrier outside these is named by its range alone: a raw element name is
+  // markup, not something a reader of the answer knows the sheet by.
+  return "range";
+}
+
+// The whitespace-separated range tokens of a value — what an `sqref` attribute and
+// an extended `<xm:sqref>` child both hold — each one moved by the shift the way
+// `deleteRangeRef` moves a region: a token the delete covered whole is dropped, so
+// an empty result means nothing of the range is left. `null` says the same to the
+// caller, which drops the element, and the note such a drop owes is written here,
+// once, for every element that carries a range — `what` naming it in the words a
+// reader of the answer knows it by. A value holding no token at all named no range,
+// so there was nothing to move and nothing the edit covered: `[]` says that, and
+// the element stays as it is — one the edit never named is not the edit's to drop.
+const movedRange = (range, what, kind, at, delta, note) => {
+  const tokens = range.split(/\s+/).filter(Boolean);
+  if (!tokens.length) return [];
+  const kept = tokens.map((token) => deleteRangeRef(token, kind, at, delta, false)).filter((token) => token !== null);
+  if (kept.length) return kept;
+  note(`[the deleted ${kind} covered the whole ${what}, ${JSON.stringify(range)}, which is gone with it]`);
+  return null;
+};
+
+// One element carrying an `sqref` attribute, its range moved: the element with
+// its range rewritten, or `null` to drop it — the note a full-cover delete owes
+// is written once, in `movedRange`. A value holding no token named no range, so
+// there was nothing to move and the element stays exactly as it is — one the
+// edit never named is not the edit's to drop.
+function shiftedSqref(whole, name, value, kind, at, delta, note) {
+  const kept = movedRange(value, describeRange(name), kind, at, delta, note);
+  if (kept === null) return null;
+  if (!kept.length) return whole;
+  return whole.replace(/\bsqref="[^"]*"/, () => `sqref="${kept.join(" ")}"`);
+}
+
+// The counted containers whose children carry an `sqref` themselves, with the
+// name each child is known by. Their children are moved inside the container's
+// own pass, NEVER by the bare-element pass above: that is what lets a container
+// the delete emptied go with its last child, exactly the way the merge, column
+// and hyperlink containers are handled — an emptied one is schema-invalid
+// (ECMA-376 requires a child) and an answer that kept it as an empty group with
+// a stale count would be reporting a corrupt file as a success.
+const SQUREF_CONTAINERS = [
+  ["dataValidations", DATA_VALIDATION, "dataValidation"],
+  ["protectedRanges", PROTECTED_RANGE, "protectedRange"],
+  ["ignoredErrors", IGNORED_ERROR, "ignoredError"],
+];
+
+// A whole element that carries an `sqref` of addresses, with one line deleted:
+// each token shrinks the way a merge range does (`deleteRangeRef` in region mode —
+// a rectangle narrows on the deleted axis, a token the delete covered whole is
+// gone) and the rewritten element keeps every surviving token. When no token is
+// left the element goes with them, and `note` says what was dropped, because an
+// edit that removes a conditional-format range, a data validation, a protected
+// range or a pane selection must not do it silently. Anchored on the open tag
+// (`[^<>]*` never crosses a `<` or `>`), so a cell whose own TEXT reads
+// `sqref="…"` is content and stays as it is.
+function shiftSqrefs(xml, kind, at, delta, note) {
+  const element = /<([A-Za-z0-9_]+(?::[A-Za-z0-9_]+)?)\b[^<>]*\bsqref="([^"]*)"[^<>]*\/>|<([A-Za-z0-9_]+(?::[A-Za-z0-9_]+)?)\b[^<>]*\bsqref="([^"]*)"[^<>]*>[\s\S]*?<\/\3>/g;
+  const inContainer = new Set(SQUREF_CONTAINERS.map(([, , name]) => name));
+  let moved = xml.replace(element, (whole, selfName, selfValue, name, value) => {
+    const elementName = selfName ?? name;
+    // A counted container's child is moved by that container's own pass below.
+    if (inContainer.has(elementName)) return whole;
+    const next = shiftedSqref(whole, elementName, selfValue ?? value, kind, at, delta, note);
+    return next === null ? "" : next;
+  });
+  for (const [container, child, name] of SQUREF_CONTAINERS) {
+    moved = moved.replace(elementPattern(container), (block) => countedContainer(block, child, (entry) => {
+      const value = (entry.match(/\bsqref="([^"]*)"/) || [])[1];
+      return value === undefined ? entry : shiftedSqref(entry, name, value, kind, at, delta, note);
+    }));
+  }
+  return moved;
+}
+
+// One `<col>` entry with a column operation applied: an insert shifts `min`/`max`
+// the way a column address moves — a range covering the sheet's whole grid keeps
+// its last column — a delete shrinks the range and drops the entry when its own
+// column is the deleted one, leaving it would give two entries the same range.
+function columnEntry(tag, at, delta) {
+  const min = Number((tag.match(/\bmin="(\d+)"/) || [])[1]);
+  const max = Number((tag.match(/\bmax="(\d+)"/) || [])[1]);
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return tag;
+  if (delta > 0) {
+    const moved = (value) => shiftNumber(value, at, delta, RULES.sheet_column_max);
+    return tag.replace(/\b(min|max)="(\d+)"/g, (whole, name, value) => `${name}="${moved(Number(value))}"`);
+  }
+  const next = deleteRange(min, max, at);
+  if (next === null) return null;
+  return tag.replace(/\bmin="\d+"/, () => `min="${next.low}"`).replace(/\bmax="\d+"/, () => `max="${next.high}"`);
+}
+
+// The `<brk id>` page breaks of a `<rowBreaks>`/`<colBreaks>` block. A break's id
+// is a BOUNDARY — the number of lines above it — not a line, so a break at or below
+// the line that went moves up with it instead of keeping a number the data below
+// moved out of, and one at the sheet's top cannot go past it. `max` is the axis'
+// own last line, so an insert pushing a break down keeps it inside the grid. The
+// rewrite is anchored on the `<brk>` element's own tag, so an unrelated `id=` the
+// block happens to hold is left as it is.
+const shiftBreaks = (block, at, delta, max) => block.replace(/<brk\b[^<>]*>/g, (tag) => tag.replace(/(\bid=")(\d+)(")/g, (whole, before, value, after) => {
+  const id = Number(value);
+  if (id < at) return whole;
+  const next = delta > 0 ? Math.min(id + delta, max) : Math.max(id + delta, 1);
+  return `${before}${next}${after}`;
+}));
+
+// A cell range (`A1`, `A1:B2`) or a whole-line range (`B:D`, `3:7`), each end with
+// or without its `$` markers.
+const A1_OR_LINE = "(?:\\$?[A-Za-z]{1,3}\\$?\\d+(?::\\$?[A-Za-z]{1,3}\\$?\\d+)?|\\$?[A-Za-z]{1,3}:\\$?[A-Za-z]{1,3}|\\$?\\d+:\\$?\\d+)";
+
+// An A1 reference or whole-line range inside a conditional-format or
+// data-validation formula, with the sheet qualifier such a reference may carry.
+// Moved the way the range the rule names is moved: a reference to a line the
+// delete took is gone, so a range shrinks to the end that survives and a
+// reference to the cell itself becomes Excel's own `#REF!` instead of naming
+// whatever cell shifts into its place, while an insert moves both ends the
+// ordinary way. Anything that is not a reference is left as it is: a quoted
+// string is a list of values, a defined name is not an address, and a reference
+// qualified with ANOTHER sheet's name (`Sheet2!A1`) names a range this shift does
+// not move — only a reference to the sheet being shifted, bare or under its own
+// name, moves. A sheet name needs no quoting when it carries no space or
+// punctuation, so the bare qualifier takes letters of ANY script: a workbook's
+// `Данные!$B$2:$B$4` is as ordinary a reference as `Sheet1!A1`, and an
+// ASCII-only class would leave the whole range invisible to the shift. The
+// qualifier is part of the match, so a qualified range cannot be
+// half-rewritten by its tail matching alone, and a `:` in front of a match (a 3-D
+// `Sheet1:Sheet3!A1`) blocks it the way it blocked the tail before. A whole-line
+// range takes the same guard on its own tail (`!`): a 3-D reference spelled with
+// sheet names that carry no digits (`Jan:Mar!A1`) reads as one, and the `!` is
+// what tells it apart.
+const A1_REFERENCE = new RegExp([
+  '"(?:[^"]|"")*"',
+  `(?<![\\w.!$[:])(?:'((?:[^']|'')*)'|([\\p{L}_][\\p{L}\\p{N}_.]*))!(${A1_OR_LINE})(?![\\w(!])`,
+  `(?<![\\w.!$[:])(${A1_OR_LINE})(?![\\w(!])`,
+].join("|"), "gu");
+
+// One match of `A1_REFERENCE` split into what it names: the reference itself, and
+// the sheet its qualifier names — `undefined` for a bare reference, which belongs
+// to the sheet the formula sits on — with a quoted name's doubled quotes folded.
+// The qualifier is XML markup (`R&amp;D`) while the name it stands for is not, so
+// it is unescaped the way the workbook's own name is before the two are compared.
+const refMatch = (whole, quotedSheet, bareSheet, qualified, local) => ({
+  reference: qualified ?? local,
+  sheet: qualified === undefined ? undefined : xmlUnescape(quotedSheet ?? bareSheet).replace(/''/g, "'"),
+});
+
+// `text` with every reference to the sheet named `sheet` moved by the shift.
+// `sheet` is the name the workbook spells for the sheet being edited, so a
+// reference the file qualified with its own name (`Sheet1!$A$1:$A$5`, which is
+// how Excel writes a validation list on the sheet itself) moves with it, while a
+// reference to any other sheet keeps its text.
+function shiftFormula(text, kind, at, delta, sheet) {
+  const wanted = typeof sheet === "string" ? sheet.toLowerCase() : null;
+  return text.replace(A1_REFERENCE, (whole, ...groups) => {
+    const { reference, sheet: qualifier } = refMatch(whole, ...groups);
+    // A quoted string is a list of values rather than a reference: it matches with
+    // the whole text and nothing else.
+    if (reference === undefined) return whole;
+    if (qualifier !== undefined && qualifier.toLowerCase() !== wanted) return whole;
+    const next = deleteRangeRef(reference, kind, at, delta, false);
+    if (next === null) return "#REF!";
+    return whole.slice(0, whole.length - reference.length) + next;
+  });
+}
+
+// The references `text` spells under a qualifier naming the sheet `sheet` — what a
+// formula held by ANOTHER part writes about this one, where a bare reference
+// belongs to the sheet the formula itself sits on.
+function qualifiedRefs(text, sheet) {
+  const wanted = sheet.toLowerCase();
+  const out = [];
+  for (const match of text.matchAll(A1_REFERENCE)) {
+    const { reference, sheet: qualifier } = refMatch(...match);
+    if (qualifier !== undefined && qualifier.toLowerCase() === wanted) out.push(reference);
+  }
+  return out;
+}
+
+// The extended twins Excel writes beside a base conditional format or data
+// validation in an `<extLst>`: the same rule in the `x14:`/`xm:` spelling, whose
+// range sits in an `<xm:sqref>` CHILD element where the base form has an `sqref`
+// attribute and whose formula sits in an `<xm:f>` child (inside an
+// `<x14:formulaN>` wrapper). They mirror the base rules the attribute pass moved,
+// so they move with them — and a rule whose range the delete took goes with it
+// rather than staying as one that applies to nothing.
+const XM_SQREF = elementPattern("xm:sqref");
+const X14_CONDITIONAL_FORMATTING = elementPattern("x14:conditionalFormatting");
+const X14_DATA_VALIDATION = elementPattern("x14:dataValidation");
+// Only `<xm:f>` holds formula text: an `<x14:formula1>` merely WRAPS one, so
+// matching the wrapper too would hand the reference rewriter its child markup and
+// let it read a tag name as a range.
+const EXTENDED_FORMULA = /<(xm:f)(?:\s[^<>]*)?>([\s\S]*?)<\/\1>/g;
+
+// The text of an `<xm:sqref>` element — the same whitespace-separated range list
+// an `sqref` attribute holds. Empty for a self-closing element, which holds none.
+const sqrefElementText = (element) => {
+  const open = element.match(/^<xm:sqref(?:\s[^<>]*)?>/);
+  return open ? element.slice(open[0].length, -"</xm:sqref>".length) : "";
+};
+
+// One extended rule, or `null` to drop it when the delete took its whole range.
+// `what` is the rule in the words a reader of the answer knows it by.
+function extendedRule(entry, what, kind, at, delta, sheet, note) {
+  const sqref = entry.match(XM_SQREF);
+  if (sqref) {
+    const range = sqrefElementText(sqref[0]);
+    const kept = movedRange(range, what, kind, at, delta, note);
+    if (kept === null) return null;
+    if (kept.length) entry = entry.replace(XM_SQREF, () => `<xm:sqref>${kept.join(" ")}</xm:sqref>`);
+  }
+  return entry.replace(EXTENDED_FORMULA, (whole, name, text) => {
+    const moved = shiftFormula(text, kind, at, delta, sheet);
+    return moved === text ? whole : `<${name}>${moved}</${name}>`;
+  });
+}
+
+// The names of the two containers an extended rule lives in: what says a wrapper
+// held a rule this pass moved, and so may have been emptied by it.
+const X14_RULE_CONTAINER = /<x14:(?:conditionalFormattings|dataValidations)\b/;
+
+// `xml` with the extended rules above moved. An extended conditional format
+// keeps its range beside its own `<x14:cfRule>` children, an extended data
+// validation holds its own: each goes whole when the range is gone, and a
+// container the delete emptied goes with it — both containers require a child, so
+// an emptied `<x14:conditionalFormattings>`/`<x14:dataValidations>` is not left
+// behind, and neither is the `null` a dropped rule would otherwise be written as.
+//
+// The containers are shifted inside the wrapper that holds them, so only a
+// wrapper that really held one of the two can have been emptied, and only such a
+// wrapper goes with its container: a payload of another kind — a plain-text
+// extension, one this pass never named — is left exactly as it stands.
+//
+// The wrappers are moved inside the `<extLst>` that holds them, so the list can
+// tell whether the pass emptied it: an `<extLst>` that held an `<ext>` and now
+// holds none goes with its last wrapper (the schema requires a child), while one
+// that held none to begin with — a self-closing `<extLst/>` or a paired empty
+// one — is not this pass's to remove. The open-tag alternation states a
+// self-closing list first, so it never pairs with a later `</extLst>`.
+// `elementPattern("ext")` cannot match `<extLst` (the name must be followed by a
+// space or `>`), and the ordered alternation keeps a self-closing `<ext .../>`
+// from being read as the open tag of a pair.
+function extendedRules(xml, kind, at, delta, sheet, note) {
+  const rule = (what) => (entry) => extendedRule(entry, what, kind, at, delta, sheet, note);
+  const shift = (block) => block
+    .replace(elementPattern("x14:conditionalFormattings"), (container) =>
+      countedContainer(container, X14_CONDITIONAL_FORMATTING, rule("extended conditional format's range")))
+    .replace(elementPattern("x14:dataValidations"), (container) =>
+      countedContainer(container, X14_DATA_VALIDATION, rule("extended data validation's range")));
+  const wrapper = (block) => {
+    const shifted = shift(block);
+    if (!X14_RULE_CONTAINER.test(block)) return shifted;
+    // The wrapper's own open tag is not payload: a wrapper whose shift left no
+    // element inside it held one of the two containers and nothing else, so it
+    // goes with them. The close tag reads `</…` to the test, never `<…`.
+    return /<[A-Za-z]/.test(shifted.slice(shifted.indexOf(">") + 1)) ? shifted : "";
+  };
+  return xml.replace(/<extLst\b[^<>]*\/>|<extLst\b[^<>]*>[\s\S]*?<\/extLst>/g, (block) => {
+    if (!/<ext\b/.test(block)) return block;
+    const shifted = block.replace(elementPattern("ext"), wrapper);
+    return /<ext\b/.test(shifted) ? shifted : "";
+  });
+}
+
+// A whole element that names a range in its own `ref` — the sheet's own
+// `<dimension>` extent, its `<autoFilter>` range — with the ref narrowed on the
+// deleted axis the way the merges are; a ref the delete covered whole takes the
+// element with it rather than keeping the removed line or leaving an empty `ref`.
+// Neither element is required by the format, so a dropped one is owed no note.
+const refElement = (kind, at, delta) => (element) => {
+  const ref = (element.match(/\bref="([^"]*)"/) || [])[1];
+  if (ref === undefined) return element;
+  const next = deleteRangeRef(ref, kind, at, delta, false);
+  return next === null ? "" : element.replace(/\bref="[^"]*"/, () => `ref="${next}"`);
+};
+
+// Move every address one row or column insert/delete moved, across a sheet part.
+// Formulas, defined names, charts and pivot caches keep their text on purpose:
+// rewriting a formula's references is a spreadsheet engine's job, and a wrong
+// rewrite is worse than a stale one — the notes this raises say so. The notes are
+// raised here rather than at each call site, so no row or column op can forget
+// them, and only when the shift really moved a row or cell address: an insert
+// past the used range moves nothing, and the formulas, comments, shapes and
+// drawing anchors the part holds still name the cells they did. `stale` is what
+// `staleRefs` collected for this part, and `sheet` the name the workbook spells
+// for the sheet being shifted, which is what tells a formula's reference to this
+// sheet from one to another.
+//
+// A shift that moved nothing returns the part it was handed: making the addresses
+// a writer left implicit explicit is the only thing it would have written, and a
+// part rewritten for nothing is a change the caller would see and a chart caveat
+// nobody is owed. `removed` is the caller's own delete having taken cells out
+// before this call: a delete of the sheet's last line moves no address, yet it
+// changed the sheet's content and leaves the same parts naming old cells.
+// `addressed` is for a caller whose own delete had to materialize the addresses
+// first: it hands the part over already addressed, so the walk is not made twice.
+function shiftSheet(editor, xml, kind, at, delta, { stale, sheet, removed, addressed }) {
+  const note = editor.note;
+  const materialized = addressed ? xml : materializeAddresses(xml);
+  const data = shiftSheetData(materialized, kind, at, delta);
+  const shifted = data
+    .replace(elementPattern("dimension"), refElement(kind, at, delta))
+    .replace(elementPattern("mergeCells"), (block) =>
+      countedContainer(block, MERGE_CELL, (cell) => {
+        const ref = (cell.match(/\bref="([^"]*)"/) || [])[1];
+        if (ref === undefined) return cell;
+        const next = deleteRangeRef(ref, kind, at, delta, true);
+        return next === null ? null : cell.replace(/\bref="[^"]*"/, () => `ref="${next}"`);
+      }))
+    // An `<autoFilter ref>` names the range the filter covers, so it narrows or
+    // goes with a delete exactly as the merges above do (see `refElement`).
+    .replace(elementPattern("autoFilter"), refElement(kind, at, delta))
+    // A pane's `topLeftCell` and a selection's `activeCell` name a cursor
+    // POSITION in the grid rather than a range of content: a position after the
+    // deleted line moves up, the deleted line's own number stays and now points at
+    // the line that shifted into it, and an insert pushes a position at or after
+    // the point down — what a spreadsheet does with a selected cell. The `sqref`
+    // sibling is a range the rule named, so it shrinks or goes with the delete
+    // (see `shiftSqrefs`), and the element goes with it when nothing of the range
+    // is left: that is why a `selection` can vanish while the pane beside it keeps
+    // its cursor. The match is anchored on the tag itself, so a cell whose own text
+    // reads `activeCell="B2"` is content.
+    .replace(/<(?:pane|selection)\b[^<>]*>/g, (tag) => tag
+      .replace(/(\btopLeftCell=")([^"]*)(")/, (whole, before, value, after) => before + shiftRef(value, kind, at, delta) + after)
+      .replace(/(\bactiveCell=")([^"]*)(")/, (whole, before, value, after) => before + shiftRef(value, kind, at, delta) + after))
+    .replace(elementPattern("hyperlinks"), (block) =>
+      countedContainer(block, HYPERLINK, (link) => {
+        const ref = (link.match(/\bref="([^"]*)"/) || [])[1];
+        if (ref === undefined) return link;
+        const next = deleteCellRef(ref, kind, at, delta);
+        return next === null ? null : link.replace(/\bref="[^"]*"/, () => `ref="${next}"`);
+      }));
+  // `conditionalFormatting`, `dataValidation` and `pane/selection` all carry a
+  // `sqref` of addresses; each token shrinks or drops the way the merges above
+  // do, and an element left with no token goes with them (see `shiftSqrefs`).
+  const sqrefs = shiftSqrefs(shifted, kind, at, delta, note)
+    .replace(elementPattern("cols"), (block) =>
+      kind === "column" ? countedContainer(block, COL_ENTRY, (entry) => columnEntry(entry, at, delta)) : block)
+    .replace(elementPattern("rowBreaks"), (block) => kind === "row" ? shiftBreaks(block, at, delta, RULES.sheet_row_max) : block)
+    .replace(elementPattern("colBreaks"), (block) => kind === "column" ? shiftBreaks(block, at, delta, RULES.sheet_column_max) : block)
+    // The ranges conditional formatting and data validation name are moved above
+    // with their `sqref`; the references their own formulas carry move with them —
+    // including the ranges of whole columns or rows and a reference the file
+    // qualified with this sheet's own name — so a rule keeps testing the cells it
+    // was written for. A cell's `<f>` is not touched — see `formulaNote`.
+    .replace(elementPattern("conditionalFormatting"), (block) =>
+      block.replace(/(<formula\b[^>]*>)([\s\S]*?)(<\/formula>)/g, (whole, open, text, close) => open + shiftFormula(text, kind, at, delta, sheet) + close))
+    .replace(DATA_VALIDATION, (entry) =>
+      entry.replace(/(<formula[12]\b[^>]*>)([\s\S]*?)(<\/formula[12]>)/g, (whole, open, text, close) => open + shiftFormula(text, kind, at, delta, sheet) + close));
+  // The extended forms of the same two rules live in an `<extLst>` beside them
+  // and move the same way.
+  const moved = extendedRules(sqrefs, kind, at, delta, sheet, note);
+  // What owes a content change and a note is the sheet having changed: a shift that
+  // moved a surviving address, or a delete that took cells without moving one (the
+  // last line of a sheet). An insert past the used range did neither — it has
+  // nothing to warn about and writes nothing.
+  const shiftedPart = moved !== materialized;
+  if (!shiftedPart && !removed) return xml;
+  editor.markContent();
+  formulaNote(editor, moved, kind, at, delta, sheet);
+  if (stale.size) note(`[the shift left ${[...stale].join(" and ")} pointing at the old cells — they were not rewritten]`);
+  return shiftedPart ? moved : xml;
+}
+
+// The sheet part with the addresses its writer left implicit made explicit: each
+// `<row>` gets the computed `r` it stands for, each addressless `<c>` its
+// computed `r`. The product's own reader already numbers them that way — an
+// addressless cell is its position in the row, an addressless row is the one
+// after its predecessor — so a shift that moved only written addresses would
+// move the wrong cells, or none. This rewrites the part the shift already
+// rewrites and no other.
+function materializeAddresses(xml) {
+  let number = 0;
+  return xml.replace(ROW_ELEMENT, (rowXml) => {
+    const attribute = (rowXml.match(/\br="(\d+)"/) || [])[1];
+    number = attribute ? Number(attribute) : number + 1;
+    const row = attribute ? rowXml : rowXml.replace(/^<row\b/, (open) => `${open} r="${number}"`);
+    const cells = rowCells(row);
+    let out = row;
+    for (let i = cells.length - 1; i >= 0; i -= 1) {
+      const cell = cells[i];
+      if (/\br="/.test(cell.xml)) continue;
+      const addressed = cell.xml.replace(/^<c\b/, (open) => `${open} r="${colName(cell.column)}${number}"`);
+      out = out.slice(0, cell.start) + addressed + out.slice(cell.end);
+    }
+    return out;
+  });
+}
+
+// The sheet's own rows and cells, with every address the shift moved. The caller
+// materializes the addresses first (see `materializeAddresses`), so a cell or row
+// with no `r` moves by the position that addresses it rather than staying put —
+// and so a shift can tell whether it really moved one.
+function shiftSheetData(xml, kind, at, delta) {
+  return xml.replace(ROW_ELEMENT, (rowXml) => {
+    const cells = rowXml.replace(CELL_ELEMENT, (cellXml) => cellXml.replace(/\br="([A-Za-z]+\d+)"/, (whole, reference) => `r="${shiftToken(reference, kind, at, delta)}"`));
+    if (kind !== "row") return cells;
+    return cells.replace(/(<row\b[^>]*\br=")(\d+)(")/, (whole, before, value, after) => `${before}${shiftNumber(Number(value), at, delta, RULES.sheet_row_max)}${after}`);
+  });
+}
+
+// Insert a new cell into its row at the address-ordered position.
+function insertCell(rowXml, cells, column, element) {
+  const after = cells.find((cell) => cell.column > column);
+  if (after) return rowXml.slice(0, after.start) + element + rowXml.slice(after.start);
+  const close = rowXml.lastIndexOf("</row>");
+  // A self-closing `<row r="1"/>` becomes a row that holds the new cell.
+  if (close < 0) return `${rowXml.slice(0, -2)}>${element}</row>`;
+  return rowXml.slice(0, close) + element + rowXml.slice(close);
+}
+
+// Insert a `<row>` into `<sheetData>` in row order.
+function insertSheetRow(xml, rows, number, element) {
+  const after = rows.find((row) => row.number > number);
+  if (after) return xml.slice(0, after.start) + element + xml.slice(after.start);
+  const close = xml.indexOf("</sheetData>");
+  if (close >= 0) return xml.slice(0, close) + element + xml.slice(close);
+  const empty = xml.match(/<sheetData\b[^>]*\/>/);
+  if (empty) return xml.replace(empty[0], `<sheetData>${element}</sheetData>`);
+  throw new UsageError("the sheet has no <sheetData> to add a row to");
+}
+
+// The cells a deleted column held, removed from their rows — the row itself
+// stays, so the sheet keeps a body to address. The caller materializes the
+// addresses first, so every cell here carries the `r` it sits at.
+function removeColumn(xml, column) {
+  return xml.replace(ROW_ELEMENT, (rowXml) => {
+    const cells = rowCells(rowXml).filter((cell) => cell.column + 1 === column);
+    let out = rowXml;
+    for (let i = cells.length - 1; i >= 0; i -= 1) out = out.slice(0, cells[i].start) + out.slice(cells[i].end);
+    return out;
+  });
+}
+
+// The `<f>` elements a part holds: a cell's formula, with the `ref` a shared
+// formula states and the formula's own text. A formula is the only place a
+// reference lives, so this is what a scan for one reads — a cell's own text is
+// content, and one that merely reads like a reference names nothing.
+const cellFormulas = (text) => [...text.matchAll(/<f\b([^<>]*)(?:\/>|>([\s\S]*?)<\/f>)/g)]
+  .map((match) => ({ range: (match[1].match(/\bref="([^"]*)"/) || [])[1], text: match[2] ?? "" }));
+
+// One note when a sheet a row or column shift touched holds cell formulas naming a
+// cell the shift moved: their own text is not rewritten — rewriting references is a
+// spreadsheet engine's job — so a reference may now mean a different cell. A
+// formula naming nothing the shift moved is left out rather than named: its text
+// means exactly what it did, and a note that stated a loss which did not happen
+// would be as wrong as a silent one. A cell's `<f>` is what counts — a
+// conditional-format or data-validation formula is not left behind (the shift
+// moves its references with the range it belongs to) — and a shared formula's own
+// covered range counts too, since the shift does not rewrite it either. `xml` is
+// the part as it stands AFTER the shift, so a formula the shift removed is not
+// counted as one left in place.
+function formulaNote(editor, xml, kind, at, delta, sheet) {
+  const movesReference = (text) => shiftFormula(text, kind, at, delta, sheet) !== text;
+  let count = 0;
+  for (const formula of cellFormulas(xml)) {
+    if (movesReference(formula.text) || (formula.range !== undefined && movesReference(formula.range))) count += 1;
+  }
+  if (!count) return;
+  const one = count === 1;
+  editor.note(`[the sheet's ${count} formula${one ? " was" : "s were"} left as ${one ? "it is" : "they are"} while ${one ? "a cell it names" : "cells they name"} moved — check the references]`);
+}
+
+// The addresses a cell- or range-anchored part names in its own text, which is
+// what a shift has to move for the part to be left behind: the `ref` of a comment,
+// of a table and of its autofilter, the range a `<definedName>` states, and the row
+// and column a floating drawing anchors its object at (0-based in the markup, so
+// one is added).
+const partRefs = (text) => [...text.matchAll(/\bref="([^"]*)"/g)].map((match) => match[1]);
+const definedNameTexts = (text) => [...text.matchAll(/<definedName\b[^>]*>([\s\S]*?)<\/definedName>/g)].map((match) => xmlUnescape(match[1]));
+const anchoredCells = (text) => [...text.matchAll(/<xdr:(?:from|to)\b[\s\S]*?<\/xdr:(?:from|to)>/g)].flatMap((anchor) => {
+  const column = (anchor[0].match(/<xdr:col>(\d+)<\/xdr:col>/) || [])[1];
+  const row = (anchor[0].match(/<xdr:row>(\d+)<\/xdr:row>/) || [])[1];
+  return column === undefined || row === undefined ? [] : [`${colName(Number(column))}${Number(row) + 1}`];
+});
+
+// The parts a row/column shift leaves naming the cells it moved, because their
+// own text is not rewritten: the workbook's defined names, the shifted sheet's
+// own table ranges (a table is declared either by the sheet's `<tableParts>` or
+// by a `<.../table>` relationship of its `.rels`) and the sheet's cell-anchored
+// parts — a comment's own `ref`, the VML shape a comment is drawn with, and a
+// floating drawing's cell anchor all name the cell they were written for while
+// the data under them moves. A part is collected only when the shift really moves
+// one of the addresses it names: one whose own cells the shift moved with is as
+// valid as it was, and naming it would state a loss that did not happen. A part
+// the sheet declares that the package cannot read keeps its caveat — one that
+// cannot be inspected is not one known to be fine. The formulas held by OTHER
+// sheets of the workbook belong here too: a reference such a formula qualifies
+// with this sheet's own name names cells this shift moved and its part is not the
+// one being edited. What is collected, the reply names, the way it names formulas,
+// charts and pivots.
+function staleRefs(editor, part, xml, stale, kind, at, delta, sheet) {
+  const zip = editor.zip;
+  const base = part.slice(0, part.lastIndexOf("/") + 1);
+  const rels = zip.file(relsPartFor(part));
+  const relations = rels ? relationships(rels.asText()) : [];
+  // Whether the shift changes what an address names. The test is the shift's own
+  // reference rule, so a part anchored on a line the delete took is stale like one
+  // below it.
+  const movesAddress = (address) => shiftFormula(address, kind, at, delta, sheet) !== address;
+  const anyMoves = (addresses) => addresses.some(movesAddress);
+  const declares = (what) => relations.some((rel) => rel.type.endsWith(`/${what}`));
+  // Whether a part of this type the sheet declares names an address the shift moves.
+  const movedPart = (what, addresses) => relations
+    .filter((rel) => rel.type.endsWith(`/${what}`))
+    .some((rel) => {
+      const file = zip.file(resolvePart(base, rel.target));
+      return !file || anyMoves(addresses(file.asText()));
+    });
+  const workbook = zip.file("xl/workbook.xml");
+  if (workbook && anyMoves(definedNameTexts(workbook.asText()))) stale.add("the workbook's defined names");
+  // A table declared by the sheet's `<tableParts>` but named by no relationship of
+  // its own can be neither read nor ruled out.
+  if (movedPart("table", partRefs) || (/<tableParts\b/.test(xml) && !declares("table"))) stale.add("the sheet's table ranges");
+  if (movedPart("comments", partRefs)) {
+    stale.add("the sheet's comments");
+    // The shape a comment is drawn with follows the comment's own cell.
+    if (declares("vmlDrawing")) stale.add("the sheet's comment shapes");
+  }
+  if (movedPart("drawing", anchoredCells)) stale.add("the sheet's drawing anchors");
+  // A formula held by ANOTHER sheet is not this shift's to rewrite — that part is
+  // not the one being edited — so a reference it qualifies with this sheet's name
+  // keeps naming cells that moved. A bare reference belongs to the sheet the
+  // formula sits on, which is what the qualifier tells apart. The scan reads the
+  // `<f>` elements the part holds rather than its whole text: a cell's own text
+  // can read like a reference and is content, not a formula, and naming it would
+  // state a loss that did not happen.
+  const others = workbookSheets(zip).map((entry) => entry.part).filter((name) => name !== part);
+  const staleElsewhere = others.some((name) => {
+    const file = zip.file(name);
+    if (!file) return false;
+    const text = file.asText();
+    editor.charge(text.length);
+    return cellFormulas(text).some((formula) => qualifiedRefs(formula.text, sheet).some(movesAddress));
+  });
+  if (staleElsewhere) stale.add("the other sheets' formulas naming this sheet");
+}
+
+// A worksheet's `<dimension ref>` widened so it covers a cell a `set_cell` wrote:
+// the cell may lie outside the sheet's declared reach, and a ref that does not
+// name it describes a part holding more than the ref says. The ref's own bounds
+// are the extent a write extends; one this reader cannot parse is left alone, as
+// a row or column shift updates the ref the ordinary way.
+function widenDimension(xml, row, column) {
+  return xml.replace(/(<dimension\b[^>]*\bref=")([^"]*)(")/, (whole, before, value, after) => {
+    const cells = value.split(":").map((part) => part.match(/^([A-Za-z]+)(\d+)$/));
+    if (cells.length > 2 || cells.some((cell) => cell === null)) return whole;
+    const columns = [column + 1, ...cells.map((cell) => columnOf(cell[1]) + 1)];
+    const rows = [row, ...cells.map((cell) => Number(cell[2]))];
+    const low = `${colName(Math.min(...columns) - 1)}${Math.min(...rows)}`;
+    const high = `${colName(Math.max(...columns) - 1)}${Math.max(...rows)}`;
+    return before + (low === high ? low : `${low}:${high}`) + after;
+  });
+}
+
+function setCell(editor, edit) {
+  const { part, name } = sheetPart(editor.zip, edit.sheet);
+  const address = cellAddress(edit.cell);
+  const reference = colName(address.column) + address.row;
+  let style = null;
+  if (edit.number_format !== undefined) {
+    const format = editText(edit.number_format, "number_format");
+    if (!editor.zip.file("xl/styles.xml")) throw new UsageError(`sheet ${JSON.stringify(name)}: the workbook has no xl/styles.xml to hold a number format`);
+    // The cell's own `s=`, read before the entry is built: the new format's entry
+    // is a clone of it, so setting a number format does not drop the cell's font,
+    // fill, border or alignment.
+    const sheet = editor.zip.file(part).asText();
+    const rows = sheetRows(sheet);
+    const row = rows.find((candidate) => candidate.number === address.row);
+    const cell = row ? rowCells(row.xml).find((candidate) => candidate.column === address.column) : undefined;
+    // The change is computed from the styles part the callback is handed — the
+    // part `part` is about to write — so the index the cell is given is the one
+    // the written part really holds. Through `part`, a styles change counts for
+    // `finish` (the signature note keys off it) and a no-op writes nothing.
+    editor.part("xl/styles.xml", (xml) => {
+      const applied = numberFormatStyle(xml, format, cell ? styleOf(cell.xml) : undefined);
+      style = String(applied.index);
+      return applied.styles;
+    });
+  }
+  editor.part(part, (xml) => {
+    const written = writeCell(xml, edit, address, reference, style);
+    // A write that landed on the value the cell already held changed no content,
+    // so the caveats keyed on content are not owed for it.
+    if (written !== xml) editor.markContent();
+    return written;
+  });
+}
+
+// `xml` with `edit`'s cell written: the row is added when the sheet has none, the
+// cell replaced or inserted inside its row, and the sheet's extent widened to
+// cover the address.
+function writeCell(xml, edit, address, reference, style) {
+  const rows = sheetRows(xml);
+  const row = rows.find((candidate) => candidate.number === address.row);
+  if (!row) {
+    const written = insertSheetRow(xml, rows, address.row, `<row r="${address.row}">${valueCell(reference, edit.value, style)}</row>`);
+    return widenDimension(written, address.row, address.column);
+  }
+  const cells = rowCells(row.xml);
+  const existing = cells.find((candidate) => candidate.column === address.column);
+  const cellStyle = style !== null ? style : existing ? styleOf(existing.xml) : null;
+  const element = valueCell(reference, edit.value, cellStyle);
+  const cellXml = existing ? row.xml.slice(0, existing.start) + element + row.xml.slice(existing.end) : insertCell(row.xml, cells, address.column, element);
+  return widenDimension(xml.slice(0, row.start) + cellXml + xml.slice(row.end), address.row, address.column);
+}
+
+function clearCell(editor, edit) {
+  const { part, name } = sheetPart(editor.zip, edit.sheet);
+  const address = cellAddress(edit.cell);
+  editor.part(part, (xml) => {
+    const rows = sheetRows(xml);
+    const row = rows.find((candidate) => candidate.number === address.row);
+    const existing = row ? rowCells(row.xml).find((candidate) => candidate.column === address.column) : null;
+    if (!existing) throw new UsageError(`the cell ${edit.cell} is not in sheet ${JSON.stringify(name)}`);
+    editor.markContent();
+    return xml.slice(0, row.start) + row.xml.slice(0, existing.start) + row.xml.slice(existing.end) + xml.slice(row.end);
+  });
+}
+
+function insertRow(editor, edit, stale) {
+  const { part, name } = sheetPart(editor.zip, edit.sheet);
+  const row = rowNumber(edit.row);
+  editor.part(part, (xml) => {
+    const { rowMax } = usedRange(xml);
+    if (rowMax === 0) throw new UsageError(`sheet ${JSON.stringify(name)} has no rows to insert into`);
+    if (row > rowMax + 1) throw new UsageError(`row ${row} is past the sheet's used range (1-${rowMax})`);
+    // An insert moves every line from `row` down by one, so a sheet already
+    // reaching the grid's last row cannot take one: the row pushed past the edge
+    // would have to keep the last row's own address. Refusing names a call the
+    // caller can fix rather than writing two lines the same address.
+    if (rowMax >= RULES.sheet_row_max) throw new UsageError(`sheet ${JSON.stringify(name)} reaches the last row (${RULES.sheet_row_max}), so an insert would push a row past the sheet's grid`);
+    staleRefs(editor, part, xml, stale, "row", row, 1, name);
+    const shifted = shiftSheet(editor, xml, "row", row, 1, { stale, sheet: name });
+    return insertSheetRow(shifted, sheetRows(shifted), row, `<row r="${row}"/>`);
+  });
+}
+
+function deleteRow(editor, edit, stale) {
+  const { part, name } = sheetPart(editor.zip, edit.sheet);
+  const row = rowNumber(edit.row);
+  editor.part(part, (xml) => {
+    const { rowMax } = usedRange(xml);
+    if (rowMax === 0) throw new UsageError(`sheet ${JSON.stringify(name)} has no rows`);
+    if (row > rowMax) throw new UsageError(`row ${row} is past the sheet's used range (1-${rowMax})`);
+    staleRefs(editor, part, xml, stale, "row", row, -1, name);
+    // A line inside the used range the writer left no `<row>` element for is
+    // still a line the delete takes: everything below it moves up by one, the
+    // same rule the column arm follows. Only a line past the used range is
+    // refused.
+    const target = sheetRows(xml).find((candidate) => candidate.number === row);
+    const without = target ? xml.slice(0, target.start) + xml.slice(target.end) : xml;
+    // The delete takes the content the line held, whether or not it moves a
+    // surviving address: deleting the last used line leaves nothing to shift, and
+    // the caveats about a workbook's charts and pivots are owed for a change of
+    // content — a line the writer left holding no cell changed none. The shift
+    // raises the notes that change owes (see `shiftSheet`).
+    const tookCells = Boolean(target && rowCells(target.xml).length);
+    return shiftSheet(editor, without, "row", row, -1, { stale, sheet: name, removed: tookCells });
+  });
+}
+
+function insertColumn(editor, edit, stale) {
+  const { part, name } = sheetPart(editor.zip, edit.sheet);
+  const column = columnNumber(edit.column);
+  editor.part(part, (xml) => {
+    const { columnMax } = usedRange(xml);
+    if (columnMax === 0) throw new UsageError(`sheet ${JSON.stringify(name)} has no columns to insert into`);
+    if (column > columnMax + 1) throw new UsageError(`column ${edit.column} is past the sheet's used range (A-${colName(columnMax - 1)})`);
+    // The column arm of the row guard above: a column pushed past the last one
+    // would have to keep the last column's own address.
+    if (columnMax >= RULES.sheet_column_max) throw new UsageError(`sheet ${JSON.stringify(name)} reaches the last column (${colName(RULES.sheet_column_max - 1)}), so an insert would push a column past the sheet's grid`);
+    staleRefs(editor, part, xml, stale, "column", column, 1, name);
+    return shiftSheet(editor, xml, "column", column, 1, { stale, sheet: name });
+  });
+}
+
+function deleteColumn(editor, edit, stale) {
+  const { part, name } = sheetPart(editor.zip, edit.sheet);
+  const column = columnNumber(edit.column);
+  editor.part(part, (xml) => {
+    const { columnMax } = usedRange(xml);
+    if (columnMax === 0) throw new UsageError(`sheet ${JSON.stringify(name)} has no columns`);
+    if (column > columnMax) throw new UsageError(`column ${edit.column} is past the sheet's used range (A-${colName(columnMax - 1)})`);
+    staleRefs(editor, part, xml, stale, "column", column, -1, name);
+    // The addresses a writer left implicit are materialized before the column is
+    // removed, so the cell that sits in the deleted column by position is found
+    // rather than left behind.
+    const materialized = materializeAddresses(xml);
+    const stripped = removeColumn(materialized, column);
+    // The row arm's rule: the delete takes the cells the column held, whether or
+    // not it moves a surviving address.
+    return shiftSheet(editor, stripped, "column", column, -1, { stale, sheet: name, removed: stripped !== materialized, addressed: true });
+  });
+}
+
+function xlsxEdit(req) {
+  const editor = openEdit(req, "xlsx");
+  const edits = editList(req);
+  const names = Object.keys(editor.zip.files);
+  // A chart or a pivot that reads the edited cells keeps the values it was
+  // written with: the parts are copied through and nothing recomputes them. The
+  // test is on the part names the format gives those objects — a chart's colour
+  // or style sidecar (`xl/charts/colors1.xml`) is not a chart and raises no
+  // caveat of its own.
+  const charts = names.some((name) => /^xl\/charts\/chart[^/]*\.xml$/.test(name));
+  const pivots = names.some((name) => /^xl\/pivotTables\/pivotTable[^/]*\.xml$/.test(name) || /^xl\/pivotCache\/pivotCache(?:Definition|Records)[^/]*\.xml$/.test(name));
+  // The stale references a shift cannot rewrite, collected while the edits run
+  // so the reply names them once.
+  const stale = new Set();
+  for (const edit of edits) {
+    const op = edit && edit.op;
+    if (op === "set_cell") setCell(editor, edit);
+    else if (op === "clear_cell") clearCell(editor, edit);
+    else if (op === "insert_row") insertRow(editor, edit, stale);
+    else if (op === "delete_row") deleteRow(editor, edit, stale);
+    else if (op === "insert_column") insertColumn(editor, edit, stale);
+    else if (op === "delete_column") deleteColumn(editor, edit, stale);
+    else throw new UsageError(`unknown xlsx edit: ${JSON.stringify(op)}`);
+  }
+  // The editor knows whether the call changed the sheet's content at all — a
+  // shift that moved nothing writes no part, a delete that took the last line of a
+  // sheet with no extent to shrink removes cells though it moves no address, and a
+  // repeated write states what the cell already held. A note about a chart or a
+  // pivot is owed on that: nothing recomputes their cached values when a value or
+  // an address really changed, and a call that changed neither leaves them as
+  // valid as they were.
+  const content = editor.content();
+  if (content && charts) editor.note("[the workbook's charts were copied unchanged — nothing recomputes them, so a chart that reads the changed cells keeps the values it had]");
+  if (content && pivots) editor.note("[the workbook's pivot tables were copied unchanged — nothing recomputes them, so a pivot that reads the changed cells keeps the values it had]");
+  return editor.finish();
+}
+
+// ── pptx_edit ──────────────────────────────────────────────────
+// A slide is addressed by its 1-based number as the reader shows it, which is
+// the order `src/ooxml.rs::resolve_slide_parts` resolves the slide list in:
+// `ppt/presentation.xml`'s `<p:sldIdLst>` relationship ids through
+// `ppt/_rels/presentation.xml.rels`, and, when neither resolves, the
+// conventionally numbered `ppt/slides/slideN.xml` parts. The model reads a deck
+// with that reader and edits it here, so the two must agree on what "slide N" is
+// — a change to either resolution belongs in both.
+const PPT_PRESENTATION = "ppt/presentation.xml";
+const PPT_RELS = "ppt/_rels/presentation.xml.rels";
+const PPT_BASE = "ppt/";
+const PPT_SLIDES = "ppt/slides/";
+const SLIDE_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
+// The run language of a slide this kit writes; a placeholder inherits its type,
+// size and bullets from the layout, so nothing else about it is stated here.
+const SLIDE_LANG = "en-US";
+
+// The value of the attribute `name` of an XML tag. A longer name never matches a
+// shorter one (`\bTarget=` is not `TargetMode=`, and the `Id` of a relationship
+// is not the `rId` a slide points with).
+const xmlAttribute = (tag, name) => (tag.match(new RegExp(`\\b${name}="([^"]*)"`)) || [])[1];
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// The relationship id of an element that refers to a part (`r:id="rId1"`): the
+// prefixed `id`, never the element's own unprefixed one, the way the reader's
+// `rel_id` picks it out.
+const relationshipId = (tag) => (tag.match(/\b[A-Za-z0-9_]+:id="([^"]*)"/) || [])[1];
+
+// One element of `name` whose attribute `attr` holds exactly `value`, in either
+// shape it can be written in — the self-closing one and the paired one — so an
+// element written the paired way goes with the self-closing one. Anchored on the
+// attribute's own value, so a longer value never matches a shorter one and the
+// element's own text is never rewritten. Built on the same two-shape rule as
+// `elementPattern` (see `elementForms`).
+const elementWithAttribute = (name, attr, value) => elementForms(name, `\\b[^<>]*\\b${attr}="${escapeRegExp(value)}"[^<>]*`);
+
+// One `<Relationship>` of a `.rels` part; an element without an id or a target
+// names no part and is dropped, the way the reader's own scan keeps only
+// complete ones.
+function relationships(xml) {
+  const list = [];
+  for (const match of xml.matchAll(/<Relationship\b[^>]*>/g)) {
+    const id = xmlAttribute(match[0], "Id");
+    const target = xmlAttribute(match[0], "Target");
+    if (id === undefined || target === undefined) continue;
+    list.push({ id, target, type: xmlAttribute(match[0], "Type") || "" });
+  }
+  return list;
+}
+const relationshipMap = (xml) => new Map(relationships(xml).map((rel) => [rel.id, rel.target]));
+
+// A relationship target resolved against the part that owns it, the way
+// `src/ooxml.rs::resolve_part` does: an absolute target drops its leading slash,
+// a relative one appends to `base`, and `..` segments are folded away.
+function resolvePart(base, target) {
+  const path = target.startsWith("/") ? target.slice(1) : base + target;
+  const parts = [];
+  for (const segment of path.split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") parts.pop();
+    else parts.push(segment);
+  }
+  return parts.join("/");
+}
+
+// The `.rels` part that belongs to `part`, by the OPC convention all three
+// families follow.
+function relsPartFor(part) {
+  const cut = part.lastIndexOf("/");
+  return `${part.slice(0, cut)}/_rels/${part.slice(cut + 1)}.rels`;
+}
+
+// The `ppt/slides/slideN.xml` numbers the package holds, whatever order the
+// presentation lists them in.
+const slideFileNumbers = (zip) => Object.keys(zip.files).flatMap((name) => {
+  const match = name.match(/^ppt\/slides\/slide(\d+)\.xml$/);
+  return match ? [Number(match[1])] : [];
+});
+
+// The slide parts in the order the presentation's own `<p:sldId>` list declares
+// them, or `null` when that list is not what the reader numbers by: a presentation
+// without a readable list, or one whose entries resolve to nothing, is read by the
+// conventional file naming instead. A slot is null when that slide's relationship
+// cannot be resolved, so the slides after it keep their own number; a `<p:sldId>`
+// without a relationship id is not a slide the reader numbers at all — its own
+// scan keeps only elements `rel_id` returns something for — and is dropped here
+// too rather than counted as an unreadable one.
+function listedSlideParts(zip) {
+  const presentation = zip.file(PPT_PRESENTATION);
+  const rels = zip.file(PPT_RELS);
+  if (!presentation || !rels) return null;
+  const map = relationshipMap(rels.asText());
+  const ids = [...presentation.asText().matchAll(/<p:sldId\b[^>]*>/g)].map((match) => relationshipId(match[0])).filter((id) => id !== undefined);
+  const parts = ids.map((id) => {
+    const target = map.get(id);
+    return target === undefined ? null : resolvePart(PPT_BASE, target);
+  });
+  // One resolvable slide is enough to trust the declared order.
+  return parts.some(Boolean) ? parts : null;
+}
+
+// The slide parts in presentation order, one slot per slide the reader would
+// number. Mirrors the reader (see above).
+function slideParts(zip) {
+  const listed = listedSlideParts(zip);
+  if (listed) return listed;
+  const numbered = slideFileNumbers(zip).map((number) => ({ number, name: `${PPT_SLIDES}slide${number}.xml` }));
+  numbered.sort((a, b) => a.number - b.number);
+  return numbered.map((slide) => slide.name);
+}
+
+// The part slide number `number` addresses, refused when the deck has no such
+// slide (named with the count the reader would number) or when the part it names
+// is not in the package.
+function addressedSlide(zip, number) {
+  const parts = slideParts(zip);
+  if (!Number.isInteger(number) || number < 1 || number > parts.length) {
+    throw new UsageError(`no slide ${number}: this presentation has ${parts.length} slide(s)`);
+  }
+  const part = parts[number - 1];
+  if (!part || !zip.file(part)) throw new UsageError(`slide ${number} could not be read`);
+  return part;
+}
+
+// The notes part a slide declares through its own relationships, the way
+// `src/ooxml.rs::slide_notes` resolves them, or null when it declares none.
+function slideNotesPart(zip, slidePart) {
+  const rels = zip.file(relsPartFor(slidePart));
+  if (!rels) return null;
+  const rel = relationships(rels.asText()).find((candidate) => candidate.type.endsWith("/notesSlide"));
+  return rel ? resolvePart(PPT_SLIDES, rel.target) : null;
+}
+
+// The layout part a slide's relationship names, or null when it has none.
+function slideLayoutPart(zip, slidePart) {
+  const rels = zip.file(relsPartFor(slidePart));
+  if (!rels) return null;
+  const rel = relationships(rels.asText()).find((candidate) => candidate.type.endsWith("/slideLayout"));
+  return rel ? resolvePart(PPT_SLIDES, rel.target) : null;
+}
+
+// The first `ppt/slideLayouts/slideLayoutN.xml` a package holds, the layout a
+// new slide falls back on.
+function firstLayoutPart(zip) {
+  const layouts = Object.keys(zip.files).flatMap((name) => {
+    const match = name.match(/^ppt\/slideLayouts\/slideLayout(\d+)\.xml$/);
+    return match ? [{ number: Number(match[1]), name }] : [];
+  });
+  layouts.sort((a, b) => a.number - b.number);
+  return layouts.length ? layouts[0].name : null;
+}
+
+// A target for `to` written relative to the directory `from`, e.g. the layout a
+// `ppt/slides/slideN.xml.rels` points at (`../slideLayouts/slideLayout1.xml`).
+function relativeTarget(from, to) {
+  const fromParts = from.split("/").filter(Boolean);
+  const toParts = to.split("/").filter(Boolean);
+  let common = 0;
+  while (common < fromParts.length && common < toParts.length - 1 && fromParts[common] === toParts[common]) common += 1;
+  return [...fromParts.slice(common).map(() => ".."), ...toParts.slice(common)].join("/");
+}
+
+// A `<a:p>` paragraph and an `<a:r>` run of a slide part. `<a:pPr>` and
+// `<a:rPr>` are not paragraph/run starts: the character after `a:p`/`a:r` is `P`,
+// which the optional whitespace-and-attributes group does not swallow.
+const SLIDE_PARAGRAPH = tagPattern("a:p");
+const SLIDE_RUN = tagPattern("a:r");
+const SLIDE_RUN_PROPERTIES = elementPattern("a:rPr");
+const SLIDE_PPR = elementPattern("a:pPr");
+// The text element of a drawing part, the same pattern the filler substitutes
+// through.
+const SLIDE_TEXT = runPattern("a:");
+
+// The `[start, end]` spans of a part's `<a:p>` paragraphs, at any nesting — a
+// table cell's `p:txBody`, a group shape — in part order. An empty paragraph
+// written self-closing still counts, so "the last paragraph" is the last one a
+// reader would see.
+function slideParagraphs(xml) {
+  return tagSpans(xml, SLIDE_PARAGRAPH).map(({ start, end }) => ({ start, end }));
+}
+
+// The slide's shape tree and the object shapes its own text never lives in: a
+// `<p:graphicFrame>` carries a table or a chart, a `<p:grpSp>` holds other
+// shapes. A top-level `<p:sp>` directly under the shape tree is a shape the
+// slide's text belongs to (a title or body placeholder).
+const SLIDE_SHAPE_TREE = tagPattern("p:spTree");
+const SLIDE_SHAPE = tagPattern("p:sp");
+const SLIDE_FRAME = tagPattern("p:graphicFrame");
+const SLIDE_GROUP = tagPattern("p:grpSp");
+const SLIDE_TX_BODY = /<p:txBody(?:\s[^>]*)?>[\s\S]*?<\/p:txBody>/;
+
+// The `<p:txBody>` span of a shape, or null when it holds none (a self-closing
+// `<p:txBody/>` has nowhere for a paragraph to go).
+function shapeTextBody(xml, shape) {
+  const body = xml.slice(shape.start, shape.end).match(SLIDE_TX_BODY);
+  if (!body) return null;
+  const start = shape.start + body.index;
+  return { start, end: start + body[0].length };
+}
+
+// The slide's OWN text: the `<p:txBody>` bodies of its top-level `<p:sp>` shapes
+// and the paragraphs inside them. A table's cells, a chart's frame and a group
+// shape's children are not the slide's text, so a paragraph added here never
+// lands in a frame the caller did not address. This is deliberately narrower than
+// `slideParagraphs`, which numbers every paragraph (tables included) for the
+// text ops that address the same text the reader shows.
+function slideTextBodies(xml) {
+  const tree = tagSpans(xml, SLIDE_SHAPE_TREE).find((span) => !span.selfClosing);
+  if (!tree) return { bodies: [], paragraphs: [] };
+  const excluded = [...tagSpans(xml, SLIDE_FRAME), ...tagSpans(xml, SLIDE_GROUP)];
+  const inside = (span) => excluded.some((other) => other.start < span.start && span.end < other.end);
+  const bodies = tagSpans(xml, SLIDE_SHAPE)
+    .filter((span) => !span.selfClosing && span.depth === 1 && tree.start < span.start && span.end < tree.end && !inside(span))
+    .map((shape) => shapeTextBody(xml, shape))
+    .filter(Boolean);
+  const paragraphs = slideParagraphs(xml).filter((span) => bodies.some((body) => body.start < span.start && span.end < body.end));
+  return { bodies, paragraphs };
+}
+
+// A paragraph's runs and text slots, shaped like `docxRuns` so the shared
+// `replaceOccurrences` rewrites one. A slot is an `<a:t>` inside a run; a
+// field's text (a slide number) is not addressed, the same text the reader
+// leaves out of what it shows.
+function slideRuns(fragment) {
+  const runs = [];
+  const slots = [];
+  for (const span of tagSpans(fragment, SLIDE_RUN)) {
+    if (span.selfClosing) continue;
+    const runXml = fragment.slice(span.start, span.end);
+    const index = runs.length;
+    runs.push({ start: span.start, end: span.end, rpr: (runXml.match(SLIDE_RUN_PROPERTIES) || [])[0] });
+    for (const text of runXml.matchAll(SLIDE_TEXT)) {
+      const at = span.start + text.index;
+      slots.push({ start: at, end: at + text[0].length, raw: text[1], unescaped: /&(#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/.test(text[1]), run: index });
+    }
+  }
+  return { runs, slots };
+}
+
+// A paragraph's joined, unescaped run text — the text an edit addresses.
+const slideParagraphText = (paragraph) => slideRuns(paragraph).slots.map((slot) => xmlUnescape(slot.raw)).join("");
+
+// `xml` with `change` applied to every paragraph in part order: `change` returns
+// the paragraph's replacement text, `null` to drop it, or `undefined` to leave
+// it alone. The paragraphs are written from the last to the first so an earlier
+// one's byte positions stay valid.
+function mapSlideParagraphs(xml, change) {
+  const spans = slideParagraphs(xml);
+  let out = xml;
+  for (let i = spans.length - 1; i >= 0; i -= 1) {
+    const span = spans[i];
+    const element = xml.slice(span.start, span.end);
+    const edited = change(element);
+    if (edited === undefined) continue;
+    out = out.slice(0, span.start) + (edited === null ? "" : edited) + out.slice(span.end);
+  }
+  return out;
+}
+
+// The refusal a slide edit that searched and found nothing states.
+const missingSlideFind = (find, slide) => `the text ${JSON.stringify(find)} is not on slide ${slide}`;
+
+// `pptx_edit`'s `replace_text`/`remove_text`: every occurrence of `find` in a
+// matching paragraph's joined text is rewritten, the replacement taking the
+// formatting of the run it starts in.
+function editSlideText(editor, edit, op) {
+  const part = addressedSlide(editor.zip, edit.slide);
+  const find = editText(edit && edit.find, "find");
+  if (!find) throw new UsageError("find must not be empty");
+  const replacement = op === "replace_text" ? editText(edit.replace, "replace") : "";
+  let found = false;
+  editor.part(part, (xml) => {
+    const out = mapSlideParagraphs(xml, (paragraph) => {
+      const { runs, slots } = slideRuns(paragraph);
+      const offsets = occurrences(slots.map((slot) => xmlUnescape(slot.raw)).join(""), find);
+      if (!offsets.length) return undefined;
+      found = true;
+      return replaceOccurrences(paragraph, runs, slots, offsets, replacement, editor.note, "a:");
+    });
+    if (!found) throw new UsageError(missingSlideFind(find, edit.slide));
+    return out;
+  });
+}
+
+// The run markup a new paragraph takes: the anchor's own first-run properties,
+// or a bare run when there is no anchor to copy.
+function slideRunXml(anchor, text) {
+  const rpr = anchor === undefined ? undefined : slideRuns(anchor).runs[0]?.rpr;
+  return `<a:r>${rpr || ""}${textElement("a:", xmlEscape(text))}</a:r>`;
+}
+
+// The `<a:pPr>` a new paragraph takes: the anchor's own with `level` merged in,
+// or a bare level when there is no anchor.
+function slideParagraphProperties(anchor, level) {
+  const ppr = anchor === undefined ? undefined : (anchor.match(SLIDE_PPR) || [])[0];
+  if (level === undefined) return ppr || "";
+  if (!ppr) return `<a:pPr lvl="${level}"/>`;
+  return /\blvl="[^"]*"/.test(ppr) ? ppr.replace(/\blvl="[^"]*"/, `lvl="${level}"`) : ppr.replace(/<a:pPr/, `<a:pPr lvl="${level}"`);
+}
+
+// `pptx_edit`'s `add_paragraph`: a new `<a:p>` after the first paragraph of the
+// slide's OWN text whose text holds `after`, or after its last one, carrying the
+// anchor's own paragraph and run properties so the new bullet keeps the deck's
+// style. "The slide's own text" is the `<p:txBody>` of its top-level `<p:sp>`
+// shapes — the title and body placeholders (see `slideTextBodies`) — because a
+// table's cells hold paragraphs too and a new one added there lands where the
+// caller did not ask. An `after` that names text only inside such a frame is
+// refused rather than placed silently, and a slide with no text body at all has
+// nowhere for one to go.
+function addSlideParagraph(editor, edit) {
+  const part = addressedSlide(editor.zip, edit.slide);
+  const text = editText(edit.text, "text");
+  let level;
+  if (edit.level !== undefined) {
+    if (!Number.isInteger(edit.level) || edit.level < 0 || edit.level > RULES.paragraph_level_max) throw new UsageError(`level must be a whole number from 0 to ${RULES.paragraph_level_max}, got: ${JSON.stringify(edit.level)}`);
+    level = edit.level;
+  }
+  editor.part(part, (xml) => {
+    const { bodies, paragraphs } = slideTextBodies(xml);
+    let anchor;
+    let at;
+    if (edit.after !== undefined) {
+      const after = editText(edit.after, "after");
+      if (!after) throw new UsageError("after must not be empty");
+      const span = paragraphs.find((candidate) => slideParagraphText(xml.slice(candidate.start, candidate.end)).includes(after));
+      if (!span) {
+        // The text may still be on the slide inside a table. Say where it is
+        // rather than writing into a shape the caller did not address.
+        const frames = tagSpans(xml, SLIDE_FRAME);
+        const buried = slideParagraphs(xml).find((candidate) => frames.some((frame) => frame.start < candidate.start && candidate.end < frame.end) && slideParagraphText(xml.slice(candidate.start, candidate.end)).includes(after));
+        if (buried) throw new UsageError(`the text ${JSON.stringify(after)} is inside a table on slide ${edit.slide}: add_paragraph writes into the slide's own text, not into a table`);
+        throw new UsageError(missingSlideFind(after, edit.slide));
+      }
+      anchor = xml.slice(span.start, span.end);
+      at = span.end;
+    } else if (paragraphs.length) {
+      const span = paragraphs[paragraphs.length - 1];
+      anchor = xml.slice(span.start, span.end);
+      at = span.end;
+    } else if (bodies.length) {
+      at = bodies[bodies.length - 1].end - "</p:txBody>".length;
+    } else {
+      throw new UsageError("the slide has no text body to add a paragraph to");
+    }
+    return xml.slice(0, at) + `<a:p>${slideParagraphProperties(anchor, level)}${slideRunXml(anchor, text)}</a:p>` + xml.slice(at);
+  });
+}
+
+// The text bodies of a slide part — a shape's `<p:txBody>` and a table cell's
+// `<a:txBody>` — each a `CT_TextBody`, which ECMA-376 requires to hold at least
+// one paragraph. A body never nests inside another, so one sweep over the bodies
+// and the paragraphs in order groups the paragraphs by the body holding them.
+const SLIDE_TEXT_BODIES = /<p:txBody(?:\s[^>]*)?>[\s\S]*?<\/p:txBody>|<a:txBody(?:\s[^>]*)?>[\s\S]*?<\/a:txBody>/g;
+
+// `pptx_edit`'s `remove_paragraph`: every paragraph whose joined text holds
+// `find` is dropped whole, so a fragment matching several paragraphs removes
+// each of them. A slide part has no paragraph nesting to pick an innermost one
+// from. A removal that would leave a text body with no paragraph is refused,
+// since that body would be one no reader may hold.
+function removeSlideParagraphs(editor, edit) {
+  const part = addressedSlide(editor.zip, edit.slide);
+  const find = editText(edit && edit.find, "find");
+  if (!find) throw new UsageError("find must not be empty");
+  editor.part(part, (xml) => {
+    const spans = slideParagraphs(xml);
+    const matched = new Set(spans.filter((span) => slideParagraphText(xml.slice(span.start, span.end)).includes(find)).map((span) => span.start));
+    if (!matched.size) throw new UsageError(missingSlideFind(find, edit.slide));
+    // The paragraphs of each text body, so a body whose every paragraph goes is
+    // caught before any of them is dropped. Both lists are in part order and
+    // neither kind nests, so the body holding a paragraph is the first one that
+    // has not ended before it — asking each paragraph on its own would walk the
+    // whole part once per paragraph.
+    const bodies = [...xml.matchAll(SLIDE_TEXT_BODIES)].map((match) => ({ start: match.index, end: match.index + match[0].length, cell: match[0].startsWith("<a:") }));
+    const groups = new Map();
+    let body = 0;
+    for (const span of spans) {
+      while (body < bodies.length && bodies[body].end <= span.start) body += 1;
+      const holder = body < bodies.length ? bodies[body] : null;
+      const key = holder ? `${holder.start}:${holder.end}` : `at:${span.start}`;
+      if (!groups.has(key)) groups.set(key, { body: holder, spans: [] });
+      groups.get(key).spans.push(span);
+    }
+    for (const { body: holder, spans: group } of groups.values()) {
+      if (holder && group.every((span) => matched.has(span.start))) {
+        throw new UsageError(`removing ${JSON.stringify(find)} would leave the ${holder.cell ? "table cell" : "shape"}'s text body with no paragraph — a text body must keep one`);
+      }
+    }
+    return mapSlideParagraphs(xml, (paragraph) => (slideParagraphText(paragraph).includes(find) ? null : undefined));
+  });
+}
+
+// The minimal slide part a new slide is built from: the group shape properties,
+// a title placeholder when a title was given and a body placeholder holding one
+// paragraph per bullet, then the colour-map override. The slide deliberately
+// carries no notes and no animation, and nothing layout-specific beyond its
+// placeholders — the layout supplies their geometry.
+function newSlideXml(title, bullets) {
+  const shapes = [];
+  if (title !== undefined) shapes.push(placeholderShape(2, "Title", `<p:ph type="title"/>`, [title]));
+  if (bullets.length) shapes.push(placeholderShape(3, "Body", `<p:ph type="body" idx="1"/>`, bullets));
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
+    `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">` +
+    `<p:cSld><p:spTree>` +
+    `<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>` +
+    `<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>` +
+    shapes.join("") +
+    `</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>`;
+}
+
+// A placeholder shape holding one paragraph per text, each run stating only the
+// run language.
+function placeholderShape(id, name, placeholder, texts) {
+  const paragraphs = texts.map((text) => `<a:p><a:r><a:rPr lang="${SLIDE_LANG}"/>${textElement("a:", xmlEscape(text))}</a:r></a:p>`).join("");
+  return `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="${name}"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr>${placeholder}</p:nvPr></p:nvSpPr>` +
+    `<p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/>${paragraphs}</p:txBody></p:sp>`;
+}
+
+// A new slide's relationships part: one relationship to the layout it is built
+// on.
+const newSlideRelsXml = (layout) => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+  `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="${relativeTarget(PPT_SLIDES, layout)}"/></Relationships>`;
+
+// The next free `<p:sldId id>`: one past the largest the presentation uses, and
+// never below 256, the value real decks start at.
+function nextSldId(xml) {
+  const ids = [...xml.matchAll(/<p:sldId\b[^>]*\bid="(\d+)"/g)].map((match) => Number(match[1]));
+  return Math.max(255, ...ids) + 1;
+}
+
+// The numeric relationship ids the presentation's relationships part already
+// uses.
+function presentationRelationshipIds(zip) {
+  const file = zip.file(PPT_RELS);
+  if (!file) return [];
+  return relationships(file.asText()).map((rel) => Number((rel.id.match(/^rId(\d+)$/) || [])[1])).filter(Number.isFinite);
+}
+
+// Add the presentation relationship naming slide `part` and return its fresh id;
+// the relationships part is created when the deck has none.
+function addSlideRelationship(editor, part) {
+  const id = `rId${Math.max(0, ...presentationRelationshipIds(editor.zip)) + 1}`;
+  const element = `<Relationship Id="${id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="${relativeTarget(PPT_BASE, part)}"/>`;
+  if (!editor.zip.file(PPT_RELS)) {
+    editor.add(PPT_RELS, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${element}</Relationships>`);
+    return id;
+  }
+  editor.part(PPT_RELS, (xml) => {
+    if (!xml.includes("</Relationships>")) throw new UsageError("the presentation's relationships part is not readable");
+    return xml.replace("</Relationships>", () => `${element}</Relationships>`);
+  });
+  return id;
+}
+
+// The presentation part with a `<p:sldId>` for `element` inserted into its
+// `<p:sldIdLst>` after the `after`-th slide, or at the end. A deck without a
+// slide list is refused rather than given one that would renumber its slides.
+// The entries counted are the ones `slideParts` numbers: a `<p:sldId>` with no
+// relationship id names no slide the reader shows, so it takes no slot and
+// `after` — a position the reader would number — must not count it. `listed` is
+// whether the presentation's own list is the numbering the reader used (see
+// `listedSlideParts`): when it is not, the deck was numbered by file naming and
+// no index here can be honoured, so an explicit `after` is refused instead of
+// appending at the end behind the caller's back. A count of entries equal to the
+// slide count is no proof of that — a file-named deck can carry the same number —
+// which is why this is asked of the list itself rather than of the counts.
+function withSldId(xml, element, after, listed) {
+  const list = xml.match(/<p:sldIdLst(?:\s[^>]*)?>[\s\S]*?<\/p:sldIdLst>/);
+  if (!list) throw new UsageError("the presentation has no slide list to add a slide to");
+  const ids = [...list[0].matchAll(/<p:sldId\b[^>]*>/g)].filter((match) => relationshipId(match[0]) !== undefined);
+  if (after !== undefined && !listed) {
+    throw new UsageError(`a slide cannot be placed after slide ${after}: the presentation's slide list does not number its slides the way the reader shows them`);
+  }
+  const at = after !== undefined && after >= 1 && after <= ids.length
+    ? list.index + ids[after - 1].index + ids[after - 1][0].length
+    : list.index + list[0].lastIndexOf("</p:sldIdLst>");
+  return xml.slice(0, at) + element + xml.slice(at);
+}
+
+// `[Content_Types].xml` with an `<Override>` for `part` added before the closing
+// `</Types>` — after every `<Default>`, the schema-correct place for one.
+function withOverride(xml, part) {
+  if (!xml.includes("</Types>")) throw new UsageError("[Content_Types].xml has no <Types> close to hold a slide's content type");
+  return xml.replace("</Types>", () => `<Override PartName="/${part}" ContentType="${SLIDE_CONTENT_TYPE}"/></Types>`);
+}
+
+// The layout the new slide is inserted after uses, the deck's last slide's, or
+// the first the package holds. A slide that names a layout the package does not
+// have falls through to one that is really there.
+function newSlideLayout(zip, slides, after) {
+  const source = after === undefined ? slides[slides.length - 1] : slides[after - 1];
+  const layout = source && slideLayoutPart(zip, source);
+  if (layout && zip.file(layout)) return layout;
+  const first = firstLayoutPart(zip);
+  if (!first) throw new UsageError("the presentation has no slide layout to build a new slide on");
+  return first;
+}
+
+// `pptx_edit`'s `add_slide`: a whole new slide part, wired into the presentation
+// and the content types.
+function addSlide(editor, edit) {
+  const zip = editor.zip;
+  const slides = slideParts(zip);
+  // Whether the presentation's own slide list is the numbering `slides` follows;
+  // read before any edit, since the list itself is about to gain an entry.
+  const listed = listedSlideParts(zip) !== null;
+  const title = edit.title === undefined ? undefined : editText(edit.title, "title");
+  let bullets = [];
+  if (edit.bullets !== undefined) {
+    if (!Array.isArray(edit.bullets)) throw new UsageError("bullets must be a list");
+    if (edit.bullets.length > RULES.bullets_max) throw new UsageError(`a slide may hold at most ${RULES.bullets_max} bullets, got: ${edit.bullets.length}`);
+    bullets = edit.bullets.map((bullet) => editText(bullet, "a bullet"));
+  }
+  let after;
+  if (edit.after !== undefined) {
+    after = edit.after;
+    if (!Number.isInteger(after) || after < 1 || after > slides.length) throw new UsageError(`no slide ${after}: this presentation has ${slides.length} slide(s)`);
+  }
+  const part = `${PPT_SLIDES}slide${Math.max(0, ...slideFileNumbers(zip)) + 1}.xml`;
+  editor.add(part, newSlideXml(title, bullets));
+  editor.add(relsPartFor(part), newSlideRelsXml(newSlideLayout(zip, slides, after)));
+  // `openEdit` already proved the presentation part is the family's own, so it
+  // is read here rather than re-checked.
+  const id = addSlideRelationship(editor, part);
+  const sldId = `<p:sldId id="${nextSldId(zip.file(PPT_PRESENTATION).asText())}" r:id="${id}"/>`;
+  editor.part(PPT_PRESENTATION, (xml) => withSldId(xml, sldId, after, listed));
+  editor.part("[Content_Types].xml", (xml) => withOverride(xml, part));
+}
+
+// `[Content_Types].xml` with the `<Override>` of `part` removed.
+function removeOverride(editor, part) {
+  editor.part("[Content_Types].xml", (xml) => xml.replace(elementWithAttribute("Override", "PartName", `/${part}`), ""));
+}
+
+// `pptx_edit`'s `delete_slide`: the slide part, its relationships, its notes
+// part and that part's relationships, its `<p:sldId>`, the matching presentation
+// relationship, and the content-type overrides of both parts. The addressed
+// POSITION is what goes — the reader numbers the resolved list, and two entries
+// may name the same part — so exactly that `<p:sldId>` and exactly that
+// relationship are removed, and a part another remaining slide still names is
+// kept (its `<Override>` with it). A deck the reader could only number by file
+// naming has no entry at that position: the entry whose target resolves to the
+// addressed part goes instead, and when none does the deletion is refused rather
+// than a `<p:sldId>` belonging to another slide going. The deck's only slide is
+// refused — a presentation with no slides is not one.
+function deleteSlide(editor, edit) {
+  const zip = editor.zip;
+  const parts = slideParts(zip);
+  const at = edit.slide - 1;
+  if (parts.length <= 1) throw new UsageError("the presentation's only slide cannot be deleted");
+  const part = addressedSlide(zip, edit.slide);
+  // The `<p:sldId>` the reader numbered as `at`. Only when the list is the one the
+  // reader numbered by is the entry at that position the reader's own; a deck
+  // numbered by file naming may hold an entry there that names another slide, so
+  // the entry whose relationship target resolves to the addressed part goes
+  // instead.
+  const presentation = zip.file(PPT_PRESENTATION);
+  const entries = presentation ? [...presentation.asText().matchAll(/<p:sldId\b[^>]*>/g)].filter((match) => relationshipId(match[0]) !== undefined) : [];
+  const rels = zip.file(PPT_RELS);
+  const targets = rels ? relationshipMap(rels.asText()) : new Map();
+  const sldId = listedSlideParts(zip)
+    ? entries[at]
+    : entries.find((match) => {
+      const target = targets.get(relationshipId(match[0]));
+      return target !== undefined && resolvePart(PPT_BASE, target) === part;
+    });
+  if (!sldId) throw new UsageError(`slide ${edit.slide} cannot be deleted: the presentation's slide list does not name it`);
+  const id = relationshipId(sldId[0]);
+  const notes = slideNotesPart(zip, part);
+  const others = parts.filter((_, index) => index !== at).filter(Boolean);
+  // A part another remaining slide still references is not this slide's alone:
+  // removing it would leave that slide dangling.
+  const partShared = others.includes(part);
+  const notesShared = notes !== null && others.some((other) => slideNotesPart(zip, other) === notes);
+  if (!partShared) {
+    editor.remove(part);
+    editor.remove(relsPartFor(part));
+    removeOverride(editor, part);
+  }
+  if (notes && !notesShared) {
+    editor.remove(notes);
+    editor.remove(relsPartFor(notes));
+    removeOverride(editor, notes);
+  }
+  editor.part(PPT_PRESENTATION, (xml) => xml.slice(0, sldId.index) + xml.slice(sldId.index + sldId[0].length));
+  if (id !== undefined) {
+    editor.part(PPT_RELS, (xml) => xml.replace(elementWithAttribute("Relationship", "Id", id), ""));
+  }
+}
+
+function pptxEdit(req) {
+  const editor = openEdit(req, "pptx");
+  // A package without content types is not a presentation this kit can edit: it
+  // could not name a new slide's type. The caller can supply one that has it,
+  // not the kit.
+  if (!editor.zip.file("[Content_Types].xml")) throw new UsageError(`cannot edit ${nodePath.basename(req.input)}: it has no [Content_Types].xml part`);
+  const edits = editList(req);
+  for (const edit of edits) {
+    const op = edit && edit.op;
+    if (op === "replace_text" || op === "remove_text") editSlideText(editor, edit, op);
+    else if (op === "add_paragraph") addSlideParagraph(editor, edit);
+    else if (op === "remove_paragraph") removeSlideParagraphs(editor, edit);
+    else if (op === "add_slide") addSlide(editor, edit);
+    else if (op === "delete_slide") deleteSlide(editor, edit);
+    else throw new UsageError(`unknown pptx edit: ${JSON.stringify(op)}`);
+  }
+  return editor.finish();
 }
 
 // ── pdf page operations ────────────────────────────────────────
@@ -1089,6 +3634,35 @@ const operations = {
       const filled = fillXlsx({ template: `${scratch}/probe.xlsx`, values: { name: "Проверка" } });
       writeOut(`${scratch}/probe_filled.xlsx`, filled.buffer);
     });
+    // The edit paths run over packages the create arms just wrote, so every op
+    // they advertise — a text replacement and a cell write with a row insert —
+    // really runs rather than being probed on a package that skips it.
+    await step("edit_docx", async () => {
+      writeOut(`${scratch}/probe_edit.docx`, await createDocx({ content: [{ type: "paragraph", text: "Проверка текста" }] }));
+      const edited = docxEdit({ input: `${scratch}/probe_edit.docx`, edits: [{ op: "replace_text", find: "текста", replace: "правки" }] });
+      writeOut(`${scratch}/probe_edited.docx`, edited.buffer);
+    });
+    await step("edit_xlsx", () => {
+      writeOut(`${scratch}/probe_edit.xlsx`, createXlsx({ sheets: [{ name: "Данные", rows: [["Проверка", 1]] }] }));
+      const edited = xlsxEdit({ input: `${scratch}/probe_edit.xlsx`, edits: [{ op: "set_cell", sheet: "Данные", cell: "C3", value: "правка" }, { op: "insert_row", sheet: "Данные", row: 1 }] });
+      writeOut(`${scratch}/probe_edited.xlsx`, edited.buffer);
+    });
+    // A deck with two slides and notes, edited through every presentation
+    // operation: a text replacement, an added paragraph and slide, and a deleted
+    // slide that carries notes.
+    await step("edit_pptx", async () => {
+      writeOut(`${scratch}/probe_edit.pptx`, await createPptx({ content: [
+        { type: "heading", level: 1, text: "Первый" }, { type: "paragraph", text: "Текст слайда" },
+        { type: "notes", text: "Заметка" }, { type: "heading", level: 1, text: "Второй" },
+      ] }));
+      const edited = pptxEdit({ input: `${scratch}/probe_edit.pptx`, edits: [
+        { op: "replace_text", slide: 1, find: "слайда", replace: "правки" },
+        { op: "add_paragraph", slide: 1, text: "Добавлено" },
+        { op: "add_slide", after: 2, title: "Новый", bullets: ["раз", "два"] },
+        { op: "delete_slide", slide: 1 },
+      ] });
+      writeOut(`${scratch}/probe_edited.pptx`, edited.buffer);
+    });
     return {};
   },
   create: async (req) => {
@@ -1107,6 +3681,21 @@ const operations = {
     const filled = req.format === "xlsx" ? fillXlsx(req) : fillDocxOrPptx(req);
     writeOut(req.output, filled.buffer);
     return { outputs: [req.output], missing: filled.missing, placeholders: filled.placeholders };
+  },
+  docx_edit: async (req) => {
+    const edited = docxEdit(req);
+    writeOut(req.output, edited.buffer);
+    return { outputs: [req.output], notes: edited.notes };
+  },
+  xlsx_edit: async (req) => {
+    const edited = xlsxEdit(req);
+    writeOut(req.output, edited.buffer);
+    return { outputs: [req.output], notes: edited.notes };
+  },
+  pptx_edit: async (req) => {
+    const edited = pptxEdit(req);
+    writeOut(req.output, edited.buffer);
+    return { outputs: [req.output], notes: edited.notes };
   },
   pdf_merge: async (req) => { writeOut(req.output, await pdfMerge(req)); return { outputs: [req.output] }; },
   pdf_split: async (req) => {

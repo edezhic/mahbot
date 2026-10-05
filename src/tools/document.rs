@@ -1,5 +1,5 @@
 //! The `document` tool: create `.docx`/`.xlsx`/`.pptx`/`.pdf` files, fill a
-//! user's own sample, and edit PDF pages.
+//! user's own sample, edit an existing Office file, and edit PDF pages.
 //!
 //! All work is data — never code or an expression — handed to the embedded
 //! document kit ([`crate::docgen`]) that runs on the managed bun runtime. The
@@ -21,14 +21,28 @@
 //! are stated once — in `assets/docgen/rules.json` ([`RULES_JSON`]), which both
 //! sides read — so a rule cannot drift between them.
 //!
+//! # Editing
+//!
+//! `docx_edit`, `xlsx_edit` and `pptx_edit` change an existing Office file. Three
+//! promises hold for every one: the input is never modified, the result is a
+//! new file under `<workspace>/generated/`, and every part an edit does not name
+//! is carried into it with the content it had — a chart, a comment, a header or
+//! a media file the caller never mentioned included. The raw archive is
+//! re-compressed, so byte-identical bytes are not promised; the content is. The
+//! honest limit is the other side of that: a package's aggregate formatting, a
+//! presentation's layouts and animations, and complex objects are not rebuilt,
+//! and the kit reports in its `notes` what it could not keep rather than passing
+//! a loss off as success.
+//!
 //! # Naming
 //!
 //! `file_name` is sanitized to a single path component and made unique against
 //! `generated/`, so a model-supplied name can neither escape the directory nor
 //! silently overwrite an earlier file. The tool appends the extension it
-//! produces — the action's own, or the sample's on a fill — after dropping a
-//! trailing OOXML or PDF extension (any of `.docx`, `.docm`, `.xlsx`, `.xlsm`,
-//! `.pptx`, `.pptm`, `.pdf`), so a name that already carries one is not doubled.
+//! produces — the action's own, or the sample's or input's on a fill or an edit
+//! — after dropping a trailing OOXML or PDF extension (any of `.docx`, `.docm`,
+//! `.xlsx`, `.xlsm`, `.pptx`, `.pptm`, `.pdf`), so a name that already carries
+//! one is not doubled.
 
 use crate::docgen;
 use crate::{Tool, Workspace};
@@ -74,15 +88,48 @@ const UNSUPPORTED_NOTE_MAX: usize = 10;
 /// The tool's fixed operation set, in the order the schema lists it. The schema's
 /// `enum` and the hint for an unknown action both come from here; only the
 /// dispatch `match` spells the names again.
-const ACTIONS: [&str; 8] = [
+const ACTIONS: [&str; 11] = [
     "create",
     "fill_template",
+    "docx_edit",
+    "xlsx_edit",
+    "pptx_edit",
     "pdf_merge",
     "pdf_split",
     "pdf_rotate",
     "pdf_text",
     "pdf_image",
     "pdf_form_fill",
+];
+
+/// The ops each family's edit action accepts, in the order the refusal names
+/// them. The kit owns the same vocabularies; these lists are what the boundary
+/// check answers an unknown `op` with, before a runtime is spawned.
+const DOCX_EDIT_OPS: [&str; 6] = [
+    "replace_text",
+    "insert_text",
+    "remove_text",
+    "format_text",
+    "add_paragraph",
+    "remove_paragraph",
+];
+
+const XLSX_EDIT_OPS: [&str; 6] = [
+    "set_cell",
+    "clear_cell",
+    "insert_row",
+    "delete_row",
+    "insert_column",
+    "delete_column",
+];
+
+const PPTX_EDIT_OPS: [&str; 6] = [
+    "replace_text",
+    "remove_text",
+    "add_paragraph",
+    "remove_paragraph",
+    "add_slide",
+    "delete_slide",
 ];
 
 /// The formats `create` understands: the three OOXML families (whose names the
@@ -141,11 +188,23 @@ struct Rules {
     image_extensions: Vec<String>,
     image_side_px: Span,
     pdf_size_points: Span,
+    /// A docx `format_text` size in points. Word's `<w:sz>` counts half-points
+    /// and caps the value at 1638 — 819 points — so the kit writes the doubled
+    /// number and both sides refuse past this bound rather than write a
+    /// `<w:sz>` a reader cannot hold.
+    text_size_points: Span,
     pdf_point_abs_max: f64,
     color_digits: usize,
     degrees_step: i64,
     sheet_name_max: usize,
     sheet_name_forbidden: String,
+    edit_text_max: usize,
+    edits_max: usize,
+    bullets_max: usize,
+    paragraph_level_max: u32,
+    sheet_row_max: u32,
+    sheet_column_max: u32,
+    number_format_max: usize,
 }
 
 /// [`RULES_JSON`] parsed once. A malformed file is a build fault, caught by the
@@ -195,6 +254,7 @@ impl Tool for DocumentTool {
         let heading_levels = listed(&RULES.heading_levels);
         let image_side_px = RULES.image_side_px.bounds();
         let pdf_size_points = RULES.pdf_size_points.bounds();
+        let text_size_points = RULES.text_size_points.bounds();
         let pdf_point_abs_max = RULES.pdf_point_abs_max.to_string();
         let color_digits = RULES.color_digits.to_string();
         let merge_inputs = MAX_MERGE_INPUTS.to_string();
@@ -202,6 +262,13 @@ impl Tool for DocumentTool {
         let split_parts = MAX_SPLIT_PARTS.to_string();
         let input_mb = megabytes(crate::util::FILE_MAX_BYTES).to_string();
         let sheet_name_max = RULES.sheet_name_max.to_string();
+        let edit_text_max = RULES.edit_text_max.to_string();
+        let edits_max = RULES.edits_max.to_string();
+        let bullets_max = RULES.bullets_max.to_string();
+        let paragraph_level_max = RULES.paragraph_level_max.to_string();
+        let sheet_row_max = RULES.sheet_row_max.to_string();
+        let sheet_column_max = RULES.sheet_column_max.to_string();
+        let number_format_max = RULES.number_format_max.to_string();
         // The set with its backslash escaped, as a quoted string spells one: a
         // bare `\` before the closing quote reads as an escaped quote.
         let sheet_name_forbidden = format!("{:?}", RULES.sheet_name_forbidden);
@@ -212,6 +279,7 @@ impl Tool for DocumentTool {
                 ("{{heading_levels}}", &heading_levels),
                 ("{{image_side_px}}", &image_side_px),
                 ("{{pdf_size_points}}", &pdf_size_points),
+                ("{{text_size_points}}", &text_size_points),
                 ("{{pdf_point_abs_max}}", &pdf_point_abs_max),
                 ("{{color_digits}}", &color_digits),
                 ("{{merge_inputs}}", &merge_inputs),
@@ -220,6 +288,13 @@ impl Tool for DocumentTool {
                 ("{{input_mb}}", &input_mb),
                 ("{{sheet_name_max}}", &sheet_name_max),
                 ("{{sheet_name_forbidden}}", &sheet_name_forbidden),
+                ("{{edit_text_max}}", &edit_text_max),
+                ("{{edits_max}}", &edits_max),
+                ("{{bullets_max}}", &bullets_max),
+                ("{{paragraph_level_max}}", &paragraph_level_max),
+                ("{{sheet_row_max}}", &sheet_row_max),
+                ("{{sheet_column_max}}", &sheet_column_max),
+                ("{{number_format_max}}", &number_format_max),
             ],
         )
     }
@@ -260,6 +335,16 @@ impl Tool for DocumentTool {
                     "type": "object",
                     "description": "fill_template / pdf_form_fill: values keyed by placeholder or form-field name; each value is text, a number or a boolean. pdf_form_fill needs at least one field."
                 },
+                "edits": {
+                    "type": "array",
+                    "items": { "type": "object" },
+                    "description": format!(
+                        "docx_edit/xlsx_edit/pptx_edit: the edits to apply in order, at most {}; \
+                         each is an object with an \"op\" and that op's fields — see the tool \
+                         description. Applied to a copy; the file passed is never changed.",
+                        RULES.edits_max
+                    )
+                },
                 "files": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -272,7 +357,7 @@ impl Tool for DocumentTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "PDF actions: workspace path of the PDF."
+                    "description": "PDF and edit actions: workspace path of the file."
                 },
                 "image": {
                     "type": "string",
@@ -346,6 +431,18 @@ impl Tool for DocumentTool {
         match super::get_str(&args, "action")? {
             "create" => self.create(ws, &args, &generated).await,
             "fill_template" => self.fill_template(ws, &args, &generated).await,
+            "docx_edit" => {
+                self.edit(ws, &args, &generated, crate::ooxml::Family::Docx)
+                    .await
+            }
+            "xlsx_edit" => {
+                self.edit(ws, &args, &generated, crate::ooxml::Family::Xlsx)
+                    .await
+            }
+            "pptx_edit" => {
+                self.edit(ws, &args, &generated, crate::ooxml::Family::Pptx)
+                    .await
+            }
             "pdf_merge" => self.pdf_merge(ws, &args, &generated).await,
             "pdf_split" => self.pdf_split(ws, &args, &generated).await,
             "pdf_rotate" => self.pdf_rotate(ws, &args, &generated).await,
@@ -412,15 +509,27 @@ impl DocumentTool {
         let values = super::get_object(args, "values")?;
         require_scalar_values(&values)?;
         let name = file_name_of(&template);
+        let head = head_of(&template).await?;
         // The kit's `format` is the sample's FAMILY: a workbook has its own
         // cell-wise filler, while a document and a presentation both go through
         // the template library (which reads the package's file type itself).
         let Some(family) = crate::ooxml::family_of(&template) else {
             // Only the three OOXML families carry `{name}` placeholders; naming
-            // the alternative beats the package reader's own parse error.
+            // the alternatives beats the package reader's own parse error.
+            let hint = old_format_hint(
+                &template,
+                &head,
+                "fill",
+                "an old .doc/.xls/.ppt file is read but never filled or edited, so save it as one \
+                 of the OOXML families first",
+            )
+            .unwrap_or_else(|| {
+                "a PDF is annotated with the pdf_text, pdf_image or pdf_form_fill actions"
+                    .to_string()
+            });
             anyhow::bail!(
                 "usage: a sample must be a .docx/.docm, .pptx/.pptm or .xlsx/.xlsm file, got {name} \
-                 — hint: annotate a PDF with the pdf_text, pdf_image or pdf_form_fill actions"
+                 — hint: {hint}"
             );
         };
         // The OUTPUT keeps the sample's own extension — an `.xlsm` copy stays an
@@ -429,7 +538,7 @@ impl DocumentTool {
             .extension()
             .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
             .expect("a matched family means the sample is named with its extension");
-        ensure_sample_readable(&template).await?;
+        ensure_input_readable(&template, &head)?;
         let base = sanitize_base(
             opt_string(args, "file_name")?,
             &input_base(&template, "filled"),
@@ -444,6 +553,45 @@ impl DocumentTool {
         });
         self.deliver(request, &outputs, "filled the sample into")
             .await
+    }
+
+    /// `docx_edit`/`xlsx_edit`/`pptx_edit` — a surgical edit of an existing
+    /// package of one family, into a new file.
+    async fn edit(
+        &self,
+        ws: &Workspace,
+        args: &Value,
+        generated: &Path,
+        family: crate::ooxml::Family,
+    ) -> Result<String> {
+        let (input, _) = resolve_input(ws, super::get_str(args, "path")?).await?;
+        // The file's head is read once and answers both questions: the family its
+        // name claims (its own family, never the name alone, is what this action
+        // edits — a package of another family or a PDF is refused by name and an
+        // old binary format with the hint that it is read but never edited) and
+        // whether it is an encrypted package this tool cannot open at all.
+        let head = head_of(&input).await?;
+        require_edit_family(&input, &head, family)?;
+        ensure_input_readable(&input, &head)?;
+        let edits = validate_edits(family, args)?;
+        // The OUTPUT keeps the input's own extension — a `.docm` copy stays a
+        // `.docm` one, macros and all — which a matched family guarantees it has.
+        let extension = input
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+            .expect("a matched family means the input is named with its extension");
+        let base = sanitize_base(
+            opt_string(args, "file_name")?,
+            &input_base(&input, "edited"),
+        );
+        let outputs = reserve(generated, std::slice::from_ref(&base), &extension).await?;
+        let request = json!({
+            "op": format!("{}_edit", family.name()),
+            "input": input.to_string_lossy(),
+            "edits": edits,
+            "output": outputs[0].to_string_lossy(),
+        });
+        self.deliver(request, &outputs, "edited").await
     }
 
     /// `pdf_merge` — every input's pages, in order, in one file.
@@ -647,6 +795,7 @@ impl DocumentTool {
     /// every reserved output exists, describe what was produced, and list the
     /// `[FILE:…]` markers. A failed run removes the reservations so no empty
     /// placeholder is left behind.
+    #[expect(clippy::too_many_lines)] // the one reply builder: verify, describe, and every note an operation can raise
     async fn deliver(&self, request: Value, outputs: &[PathBuf], prefix: &str) -> Result<String> {
         // The runtime's absence and a failing probe are mahbot-side faults the
         // model cannot fix; `probe` reports them with that token, so a broken
@@ -757,6 +906,13 @@ impl DocumentTool {
                  substituted; the copy is unchanged]",
             );
         }
+        // Each note is the kit's own caveat about what it could not keep — a chart
+        // or pivot keeping a cached value, a range the delete covered, a part left
+        // naming the old cells — already a bracketed, user-facing sentence, so it
+        // is appended verbatim.
+        for note in &outcome.notes {
+            text = super::with_note(&text, note);
+        }
         for path in outputs {
             text.push('\n');
             text.push_str(&self.format_media_result(path));
@@ -796,27 +952,587 @@ async fn resolve_input(ws: &Workspace, path: &str) -> Result<(PathBuf, u64)> {
     Ok((resolved, meta.len()))
 }
 
-/// Refuse an encrypted OOXML sample. Such a file is a CFB container that no
-/// package reader can open; the read path gives the same file the
-/// password-protected verdict, and the kit's own failure would be a zip-level
-/// message that says nothing about the password. Only a file whose name claims
-/// one of the OOXML families reaches this — a legacy `.doc`/`.xls`/`.ppt` is a
-/// CFB container too and is refused by the family check instead.
-async fn ensure_sample_readable(path: &Path) -> Result<()> {
+/// The leading bytes of `path` — the shape every container this module asks
+/// about is recognized by. A sample and an edit input are each read once and both
+/// their questions (password, family) asked of the same head.
+async fn head_of(path: &Path) -> Result<[u8; 8]> {
     use tokio::io::AsyncReadExt as _;
     let mut magic = [0u8; 8];
     let mut file = tokio::fs::File::open(path)
         .await
         .with_context(|| format!("cannot read {}", path.display()))?;
-    if file.read_exact(&mut magic).await.is_err() || magic.as_slice() != crate::document::CFB_MAGIC
-    {
+    // A file shorter than the magic reads what it has and is not a container; the
+    // bytes it could not read stay zero.
+    let _ = file.read(&mut magic).await;
+    Ok(magic)
+}
+
+/// Refuse an encrypted OOXML input — a `fill_template` sample or an edit's
+/// input. Such a file is a CFB container that no package reader can open; the
+/// read path gives the same file the password-protected verdict, and the kit's
+/// own failure would be a zip-level message that says nothing about the
+/// password. Only a file whose name claims one of the OOXML families reaches
+/// this — a legacy `.doc`/`.xls`/`.ppt` is a CFB container too, and the family
+/// check refuses it before this point because an old format is read but never
+/// filled or edited.
+fn ensure_input_readable(path: &Path, head: &[u8]) -> Result<()> {
+    if head != crate::document::CFB_MAGIC {
         return Ok(());
     }
     anyhow::bail!(
         "usage: {} is password-protected — hint: remove the protection, save an unprotected copy \
-         and fill that",
+         and fill or edit that",
         path.display()
     )
+}
+
+/// The answer a file NAMED as an old binary format but holding an OOXML package
+/// is owed. The legacy answer — the format is read but never written — would
+/// describe a file it is not, and the name is what this tool addresses a package
+/// by (it is what picks the family to fill or edit), so renaming it is the fix.
+/// `action` is what the caller can then do with it (`edit`, `fill`).
+fn misnamed_package(action: &str) -> String {
+    format!(
+        "the file's bytes are an OOXML package, so name it as the family it really is and {action} \
+         that"
+    )
+}
+
+/// The hint an input named in the old `.doc`/`.xls`/`.ppt` family is owed, or
+/// `None` when its name says nothing about old formats. The container, not the
+/// name alone, decides which of the two answers such a name gets: one whose bytes
+/// are an OOXML package is not an old format — the read path would not read it as
+/// one — and is owed the same "name it as the family it really is" hint a misnamed
+/// package gets anywhere else. `action` is what the caller can then do with it
+/// (`edit`, `fill`), and `old_format` the sentence an action that cannot write the
+/// format says instead.
+fn old_format_hint(path: &Path, head: &[u8], action: &str, old_format: &str) -> Option<String> {
+    crate::legacy::family_of(path).is_some().then(|| {
+        if crate::document::is_zip_container(head) {
+            misnamed_package(action)
+        } else {
+            old_format.to_string()
+        }
+    })
+}
+
+/// Require an edit input to be a package of the family its action edits: a file
+/// of another family (or a PDF) is refused by name, and an old binary
+/// `.doc`/`.xls`/`.ppt` gets the answer the old formats are owed — the format is
+/// read but never edited — instead of a file substituted for the one asked for.
+fn require_edit_family(path: &Path, head: &[u8], family: crate::ooxml::Family) -> Result<()> {
+    if crate::ooxml::family_of(path) == Some(family) {
+        return Ok(());
+    }
+    let accepted = match family {
+        crate::ooxml::Family::Docx => "a .docx/.docm file",
+        crate::ooxml::Family::Xlsx => "a .xlsx/.xlsm file",
+        crate::ooxml::Family::Pptx => "a .pptx/.pptm file",
+    };
+    let name = file_name_of(path);
+    if let Some(hint) = old_format_hint(
+        path,
+        head,
+        "edit",
+        "an old .doc/.xls/.ppt file is read but never edited; say so, or write a new file with \
+         create",
+    ) {
+        anyhow::bail!(
+            "usage: {}_edit edits only {accepted}, got {name} — hint: {hint}",
+            family.name()
+        );
+    }
+    anyhow::bail!(
+        "usage: {}_edit edits only {accepted}, got {name} — hint: pass the file's own family, or \
+         use the pdf_* actions for a PDF",
+        family.name()
+    )
+}
+
+/// The ops one family's edit action accepts.
+fn edit_ops(family: crate::ooxml::Family) -> &'static [&'static str] {
+    match family {
+        crate::ooxml::Family::Docx => &DOCX_EDIT_OPS,
+        crate::ooxml::Family::Xlsx => &XLSX_EDIT_OPS,
+        crate::ooxml::Family::Pptx => &PPTX_EDIT_OPS,
+    }
+}
+
+/// Validate and normalize the `edits` argument for one family's edit action,
+/// refusing every shape the kit would fail on before a runtime is spawned: the
+/// ops the family accepts, the fields each op needs, and the shared bounds in
+/// `assets/docgen/rules.json`. Returns the array the request carries.
+fn validate_edits(family: crate::ooxml::Family, args: &Value) -> Result<Value> {
+    let ops = edit_ops(family);
+    let edits = match args.get("edits") {
+        Some(Value::Array(edits)) if !edits.is_empty() => edits,
+        Some(Value::Array(_)) => {
+            anyhow::bail!("usage: \"edits\" is empty — hint: name at least one edit")
+        }
+        Some(v) => return Err(super::wrong_type("edits", "an array", v)),
+        None => anyhow::bail!(
+            "usage: missing required argument \"edits\" — hint: pass a JSON array of edit objects, \
+             e.g. [{{\"op\": \"replace_text\", \"find\": \"…\", \"replace\": \"…\"}}]"
+        ),
+    };
+    if edits.len() > RULES.edits_max {
+        anyhow::bail!(
+            "usage: {} edits is more than one call takes (limit {}) — hint: split them across \
+             calls",
+            edits.len(),
+            RULES.edits_max
+        );
+    }
+    let mut out = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        let at = format!("edits[{index}]");
+        let Some(object) = edit.as_object() else {
+            anyhow::bail!("usage: {at} must be an object — hint: give every edit an \"op\"");
+        };
+        let Some(op) = object.get("op").and_then(Value::as_str) else {
+            anyhow::bail!("usage: {at} has no \"op\" — hint: use {}", ops.join(", "));
+        };
+        if !ops.contains(&op) {
+            anyhow::bail!(
+                "usage: unknown {} edit \"{op}\" — hint: use {}",
+                family.name(),
+                ops.join(", ")
+            );
+        }
+        out.push(validate_edit(family, edit, object, op, &at)?);
+    }
+    Ok(Value::Array(out))
+}
+
+/// Validate one edit and return the object the request carries: an xlsx
+/// `set_cell`'s formula is normalized to its text, the way `create` normalizes a
+/// cell, every other family's edit is passed through unchanged, and a `null`
+/// field is dropped from all three.
+fn validate_edit(
+    family: crate::ooxml::Family,
+    edit: &Value,
+    object: &serde_json::Map<String, Value>,
+    op: &str,
+    at: &str,
+) -> Result<Value> {
+    let validated = match family {
+        crate::ooxml::Family::Docx => {
+            validate_docx_edit(object, op, at)?;
+            edit.clone()
+        }
+        crate::ooxml::Family::Xlsx => validate_xlsx_edit(edit, object, op, at)?,
+        crate::ooxml::Family::Pptx => {
+            validate_pptx_edit(object, op, at)?;
+            edit.clone()
+        }
+    };
+    Ok(without_nulls(validated))
+}
+
+/// `edit` with its null-valued keys dropped. The boundary reads a `null` as
+/// "absent" (every `edit_*`/`require_*` above matches `Some(Value::Null)`), but
+/// the kit tests only `!== undefined`: a null left in would reach it as a value
+/// — a `format_text`'s `bold: null` would strip the run's own bold where the
+/// model meant to leave it, and an `after: null` would be read as a text field.
+/// Validation runs before the keys are dropped, so a `null` where a value is
+/// required is still refused as a missing one.
+fn without_nulls(edit: Value) -> Value {
+    match edit {
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .filter(|(_, value)| !value.is_null())
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// One string field of an edit, bounded by the shared `edit_text_max`.
+fn edit_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+    at: &str,
+) -> Result<Option<&'a str>> {
+    match optional_string(object.get(key), at, key)? {
+        Some(text) => {
+            let length = text.chars().count();
+            if length > RULES.edit_text_max {
+                anyhow::bail!(
+                    "usage: {at}.{key} must be at most {} characters, got {length} — hint: shorten \
+                     the text",
+                    RULES.edit_text_max
+                );
+            }
+            Ok(Some(text))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Require an edit's string field to be present; an empty value is still a
+/// value, which is what several ops accept.
+fn edit_string_present<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+    at: &str,
+) -> Result<&'a str> {
+    match edit_string(object, key, at)? {
+        Some(text) => Ok(text),
+        None => {
+            anyhow::bail!("usage: {at} has no \"{key}\" — hint: give the edit its \"{key}\" text")
+        }
+    }
+}
+
+/// Require an edit's string field to be a non-empty value.
+fn edit_string_non_empty<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+    at: &str,
+) -> Result<&'a str> {
+    match edit_string(object, key, at)? {
+        Some(text) if !text.is_empty() => Ok(text),
+        _ => anyhow::bail!("usage: {at}.{key} must not be empty"),
+    }
+}
+
+/// Require an optional string field, when present, to be a non-empty value.
+fn require_optional_text(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    at: &str,
+) -> Result<()> {
+    match edit_string(object, key, at)? {
+        Some("") => anyhow::bail!("usage: {at}.{key} must not be empty"),
+        _ => Ok(()),
+    }
+}
+
+/// One optional whole-number field of an edit; a negative, fractional or
+/// non-numeric value is refused here rather than by the kit later.
+fn edit_integer(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    at: &str,
+) -> Result<Option<u64>> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            super::wrong_type(&format!("{at}.{key}"), "a non-negative integer", value)
+        }),
+    }
+}
+
+/// The docx edit vocabulary: text ops address the joined text of a paragraph's
+/// runs in the body, so the field each op needs and the shapes it accepts are
+/// stated here once.
+fn validate_docx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &str) -> Result<()> {
+    match op {
+        "replace_text" => {
+            edit_string_non_empty(object, "find", at)?;
+            edit_string_present(object, "replace", at)?;
+        }
+        "insert_text" => {
+            edit_string_non_empty(object, "find", at)?;
+            edit_string_non_empty(object, "insert", at)?;
+            require_position(object, at)?;
+        }
+        "remove_text" | "remove_paragraph" => {
+            edit_string_non_empty(object, "find", at)?;
+        }
+        "format_text" => {
+            edit_string_non_empty(object, "find", at)?;
+            require_format(object, at)?;
+        }
+        "add_paragraph" => {
+            edit_string_present(object, "text", at)?;
+            require_optional_text(object, "after", at)?;
+        }
+        _ => unreachable!("the op was checked against the family's vocabulary"),
+    }
+    Ok(())
+}
+
+/// Require an `insert_text`'s optional `position` to be `after` or `before`.
+fn require_position(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    match object.get("position") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(position)) if position == "after" || position == "before" => Ok(()),
+        Some(Value::String(position)) => anyhow::bail!(
+            "usage: {at}.position must be \"after\" or \"before\", got \"{position}\""
+        ),
+        Some(v) => Err(super::wrong_type(&format!("{at}.position"), "a string", v)),
+    }
+}
+
+/// Require a `format_text` to name at least one property, and each property to
+/// be the shape the kit writes: a boolean toggle, or a point size inside the
+/// shared bound (`<w:sz>` counts half-points and tops out at 1638 of them).
+fn require_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let mut any = false;
+    for key in ["bold", "italic"] {
+        match object.get(key) {
+            None | Some(Value::Null) => {}
+            Some(Value::Bool(_)) => any = true,
+            Some(v) => return Err(super::wrong_type(&format!("{at}.{key}"), "a boolean", v)),
+        }
+    }
+    match object.get("size") {
+        None | Some(Value::Null) => {}
+        Some(value) => {
+            let size = value
+                .as_f64()
+                .filter(|size| size.is_finite())
+                .ok_or_else(|| super::wrong_type(&format!("{at}.size"), "a number", value))?;
+            if !RULES.text_size_points.contains(size) {
+                anyhow::bail!(
+                    "usage: {at}.size must be {}, got {size} — hint: give a size in points",
+                    RULES.text_size_points.bounds()
+                );
+            }
+            any = true;
+        }
+    }
+    if !any {
+        anyhow::bail!(
+            "usage: {at} (format_text) needs at least one of bold, italic or size — hint: a \
+             boolean toggles bold or italic, size is in points"
+        );
+    }
+    Ok(())
+}
+
+/// The xlsx edit vocabulary and the cell, row and column shapes its writer
+/// knows: a sheet is named, a cell is an A1 address, a row and a column are the
+/// 1-based units the reader shows.
+fn validate_xlsx_edit(
+    edit: &Value,
+    object: &serde_json::Map<String, Value>,
+    op: &str,
+    at: &str,
+) -> Result<Value> {
+    let sheet = edit_string_non_empty(object, "sheet", at)?;
+    require_sheet_name_length(sheet, &format!("{at}.sheet"))?;
+    match op {
+        "set_cell" => {
+            require_cell(object, at)?;
+            let value = require_cell_value(object, at)?;
+            require_number_format(object, at)?;
+            let mut normalized = edit.clone();
+            normalized["value"] = value;
+            return Ok(normalized);
+        }
+        "clear_cell" => require_cell(object, at)?,
+        "insert_row" | "delete_row" => require_row(object, at)?,
+        "insert_column" | "delete_column" => require_column(object, at)?,
+        _ => unreachable!("the op was checked against the family's vocabulary"),
+    }
+    Ok(edit.clone())
+}
+
+/// The 1-based column number A1-style letters name (`"A"` -> 1, `"XFD"` ->
+/// 16384), or `None` when they are not one to three ASCII uppercase letters.
+/// The letters' shape is checked here and nowhere else, so the `cell` and the
+/// `column` fields cannot disagree about what a column address is, and the
+/// number is the shared reader's own (`ooxml::column_index`).
+fn column_number(letters: &str) -> Option<u32> {
+    if !((1..=3).contains(&letters.len()) && letters.bytes().all(|byte| byte.is_ascii_uppercase()))
+    {
+        return None;
+    }
+    crate::ooxml::column_index(letters).map(|index| index + 1)
+}
+
+/// The row and column an A1 address (`"B7"`) names, or `None` when the text is
+/// not one: one to three uppercase letters (the column) and a 1-based row of at
+/// most seven digits, which is why the row cannot overflow a `u32`.
+fn cell_address(cell: &str) -> Option<(u32, u32)> {
+    let split = cell.find(|c: char| c.is_ascii_digit())?;
+    let (letters, digits) = cell.split_at(split);
+    let column = column_number(letters)?;
+    let digits_ok = digits.len() <= 7
+        && digits
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| (b'1'..=b'9').contains(byte))
+        && digits.bytes().all(|byte| byte.is_ascii_digit());
+    if !digits_ok {
+        return None;
+    }
+    Some((digits.parse().ok()?, column))
+}
+
+/// Require an edit's `cell` to be an A1 address inside the sheet's grid, with
+/// its row and column within the shared limits.
+fn require_cell(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let cell = edit_string_non_empty(object, "cell", at)?;
+    let Some((row, column)) = cell_address(cell) else {
+        anyhow::bail!("usage: {at}.cell must be an A1 address like B7, got \"{cell}\"");
+    };
+    if row > RULES.sheet_row_max {
+        anyhow::bail!(
+            "usage: {at}.cell \"{cell}\": the row must be between 1 and {}",
+            RULES.sheet_row_max
+        );
+    }
+    if column > RULES.sheet_column_max {
+        anyhow::bail!(
+            "usage: {at}.cell \"{cell}\": the column must be between A and {}",
+            crate::ooxml::column_letters(RULES.sheet_column_max - 1)
+        );
+    }
+    Ok(())
+}
+
+/// The `value` a `set_cell` writes: a scalar the writer stringifies, or a
+/// `{"formula": "…"}` object normalized to its text — the same rule `create`'s
+/// cells follow.
+fn require_cell_value(object: &serde_json::Map<String, Value>, at: &str) -> Result<Value> {
+    let Some(value) = object.get("value") else {
+        anyhow::bail!(
+            "usage: {at} has no \"value\" — hint: pass a string, a number, a boolean or \
+             {{\"formula\": \"SUM(A1:A2)\"}}"
+        );
+    };
+    if is_scalar(value) {
+        return Ok(value.clone());
+    }
+    match value {
+        Value::Object(formula) => normalized_formula(&format!("{at}.value"), formula),
+        other => Err(super::wrong_type(
+            &format!("{at}.value"),
+            SCALAR_TYPE,
+            other,
+        )),
+    }
+}
+
+/// Require an edit's `row` to be a sheet row the workbook's grid holds.
+fn require_row(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    match edit_integer(object, "row", at)? {
+        Some(row) if (1..=u64::from(RULES.sheet_row_max)).contains(&row) => Ok(()),
+        _ => anyhow::bail!(
+            "usage: {at}.row must be a whole number between 1 and {} — hint: a 1-based sheet row",
+            RULES.sheet_row_max
+        ),
+    }
+}
+
+/// Require an edit's `column` to be column letters the workbook's grid holds.
+fn require_column(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let column = edit_string_non_empty(object, "column", at)?;
+    match column_number(column) {
+        Some(number) if number <= RULES.sheet_column_max => Ok(()),
+        _ => anyhow::bail!(
+            "usage: {at}.column must be column letters between A and {}, got \"{column}\"",
+            crate::ooxml::column_letters(RULES.sheet_column_max - 1)
+        ),
+    }
+}
+
+/// Require an optional `set_cell` `number_format` to be text inside the shared
+/// cap; an empty format is not one.
+fn require_number_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    match edit_string(object, "number_format", at)? {
+        None => Ok(()),
+        Some("") => anyhow::bail!("usage: {at}.number_format must not be empty"),
+        Some(format) if format.chars().count() <= RULES.number_format_max => Ok(()),
+        Some(format) => anyhow::bail!(
+            "usage: {at}.number_format must be at most {} characters, got {}",
+            RULES.number_format_max,
+            format.chars().count()
+        ),
+    }
+}
+
+/// The pptx edit vocabulary: a slide is its 1-based number as the reader shows
+/// it, and a text op names a fragment that must be on that slide.
+fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &str) -> Result<()> {
+    match op {
+        "add_slide" => {
+            if edit_integer(object, "after", at)? == Some(0) {
+                anyhow::bail!("usage: {at}.after must be a whole number of at least 1");
+            }
+            require_optional_text(object, "title", at)?;
+            require_bullets(object, at)?;
+        }
+        "replace_text" => {
+            require_slide(object, at)?;
+            edit_string_non_empty(object, "find", at)?;
+            edit_string_present(object, "replace", at)?;
+        }
+        "remove_text" | "remove_paragraph" => {
+            require_slide(object, at)?;
+            edit_string_non_empty(object, "find", at)?;
+        }
+        "add_paragraph" => {
+            require_slide(object, at)?;
+            edit_string_present(object, "text", at)?;
+            require_optional_text(object, "after", at)?;
+            require_optional_level(object, at)?;
+        }
+        "delete_slide" => require_slide(object, at)?,
+        _ => unreachable!("the op was checked against the family's vocabulary"),
+    }
+    Ok(())
+}
+
+/// Require an edit's `slide` to be a 1-based slide number; a deck's length is
+/// the kit's to know, so only the lower bound is enforced here.
+fn require_slide(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    match edit_integer(object, "slide", at)? {
+        Some(slide) if slide >= 1 => Ok(()),
+        _ => anyhow::bail!("usage: {at}.slide must be a whole number of at least 1"),
+    }
+}
+
+/// Require an `add_paragraph`'s optional outline `level` to be one the slide
+/// writer has (0 is the slide's own level, `paragraph_level_max` the deepest).
+fn require_optional_level(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    match edit_integer(object, "level", at)? {
+        None => Ok(()),
+        Some(level) if level <= u64::from(RULES.paragraph_level_max) => Ok(()),
+        Some(level) => {
+            anyhow::bail!(
+                "usage: {at}.level must be a whole number from 0 to {}, got {level}",
+                RULES.paragraph_level_max
+            )
+        }
+    }
+}
+
+/// Require an `add_slide`'s optional `bullets` to be a list of bounded strings.
+fn require_bullets(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let bullets = match object.get("bullets") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Array(bullets)) => bullets,
+        Some(v) => return Err(super::wrong_type(&format!("{at}.bullets"), "an array", v)),
+    };
+    if bullets.len() > RULES.bullets_max {
+        anyhow::bail!(
+            "usage: {at}.bullets must hold at most {} bullets, got {} — hint: split the slide",
+            RULES.bullets_max,
+            bullets.len()
+        );
+    }
+    for (index, bullet) in bullets.iter().enumerate() {
+        let Some(text) = bullet.as_str() else {
+            return Err(super::wrong_type(
+                &format!("{at}.bullets[{index}]"),
+                "a string",
+                bullet,
+            ));
+        };
+        let length = text.chars().count();
+        if length > RULES.edit_text_max {
+            anyhow::bail!(
+                "usage: {at}.bullets[{index}] must be at most {} characters, got {length}",
+                RULES.edit_text_max
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Resolve and validate the `content` blocks, confining every embedded image
@@ -980,6 +1696,19 @@ fn resolve_sheets(args: &Value) -> Result<Value> {
     Ok(Value::Array(normalized))
 }
 
+/// Refuse a sheet name longer than the shared cap, naming `at` in the message.
+/// The length rule is the same one `create`'s `sheets[{index}].name` enforces.
+fn require_sheet_name_length(name: &str, at: &str) -> Result<()> {
+    if name.chars().count() > RULES.sheet_name_max {
+        anyhow::bail!(
+            "usage: {at} must be at most {} characters, got \"{name}\" — hint: shorten the sheet \
+             name",
+            RULES.sheet_name_max
+        );
+    }
+    Ok(())
+}
+
 /// Require a sheet name to satisfy the shared rules: at most `sheet_name_max`
 /// characters, none of `sheet_name_forbidden`, and no earlier sheet sharing it
 /// ignoring case. The caller has already resolved an absent name to `Sheet<n>`,
@@ -987,14 +1716,7 @@ fn resolve_sheets(args: &Value) -> Result<Value> {
 /// rule as its last line, over the names it actually writes.
 fn require_sheet_name(name: &str, index: usize, seen: &mut HashSet<String>) -> Result<()> {
     let at = format!("sheets[{index}].name");
-    let length = name.chars().count();
-    if length > RULES.sheet_name_max {
-        anyhow::bail!(
-            "usage: {at} must be at most {} characters, got \"{name}\" — hint: shorten the sheet \
-             name",
-            RULES.sheet_name_max
-        );
-    }
+    require_sheet_name_length(name, &at)?;
     if let Some(forbidden) = RULES
         .sheet_name_forbidden
         .chars()
@@ -1286,15 +2008,30 @@ fn require_optional_bool(
     }
 }
 
-/// A present optional string: a wrong type is refused rather than read as an
-/// absent argument (the shared [`super::get_opt_str`] is deliberately silent,
-/// which would drop the caller's value instead of telling them about it).
-fn opt_string<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
-    match args.get(key) {
+/// A present optional string, `at` naming where it sits for the refusal (`""`
+/// for a top-level field): an absent or null value is `None`, a string is read,
+/// and a value of another type is refused rather than read as absent (the shared
+/// [`super::get_opt_str`] is deliberately silent, which would drop the caller's
+/// value instead of telling them about it). The displayed path is built only on
+/// the error path, so reading a value allocates nothing.
+fn optional_string<'a>(value: Option<&'a Value>, at: &str, key: &str) -> Result<Option<&'a str>> {
+    match value {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => Ok(Some(value)),
-        Some(value) => Err(super::wrong_type(key, "a string", value)),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(other) => {
+            let named = if at.is_empty() {
+                key.to_string()
+            } else {
+                format!("{at}.{key}")
+            };
+            Err(super::wrong_type(&named, "a string", other))
+        }
     }
+}
+
+/// A present optional string of a top-level argument.
+fn opt_string<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    optional_string(args.get(key), "", key)
 }
 
 /// Require every value of a name-keyed map — a sample's placeholders, a form's
@@ -1697,6 +2434,11 @@ mod tests {
     /// font (and a correct encoding round-trip) can carry.
     const CYRILLIC: &str = "Кириллический текст";
 
+    /// A character outside the Basic Multilingual Plane: one code point, two
+    /// UTF-16 code units. An edit that measured a match's offset in code units
+    /// would land before it, rewriting the wrong part of the text.
+    const ASTRAL: &str = "\u{1F600}";
+
     /// End-to-end coverage needs the managed bun runtime, which the product
     /// installs on its first start. A check that needs it is `#[ignore]`d, so a
     /// standard test run stays green on a host that lacks the runtime; an
@@ -1798,13 +2540,20 @@ mod tests {
         }
     }
 
-    /// One ZIP entry as text, for asserting a package's internal shape.
-    fn part_text(path: &Path, name: &str) -> String {
-        let mut archive = open_zip(path);
+    /// One ZIP entry as text, from the package's own bytes — the primitive
+    /// [`part_text`] and a fixture that must be modified before it is written
+    /// out both read through.
+    fn part_text_bytes(package: &[u8], name: &str) -> String {
+        let mut archive = zip::ZipArchive::new(Cursor::new(package)).expect("open package");
         let mut entry = archive.by_name(name).expect("part");
         let mut text = String::new();
         entry.read_to_string(&mut text).expect("read part");
         text
+    }
+
+    /// One ZIP entry as text, read from the package at `path`.
+    fn part_text(path: &Path, name: &str) -> String {
+        part_text_bytes(&std::fs::read(path).expect("read package"), name)
     }
 
     /// One ZIP entry's decompressed bytes, so a part can be compared byte for
@@ -1817,11 +2566,78 @@ mod tests {
         bytes
     }
 
+    /// Whether `needle` sits between an `open` tag and its `close` tag in `xml`:
+    /// the opens before it outnumber the closes, so the caller states the exact
+    /// tags a nesting is measured with.
+    fn inside_element(xml: &str, needle: &str, open: &str, close: &str) -> bool {
+        let at = xml.find(needle).expect("the text to place");
+        let before = &xml[..at];
+        before.matches(open).count() > before.matches(close).count()
+    }
+
+    /// `xml`'s `<p:sldIdLst>` with every `<p:sldId>`'s relationship id dropped:
+    /// the deck the reader can only number by file name.
+    fn without_sld_id_rel_ids(xml: &str) -> String {
+        let open = xml.find("<p:sldIdLst>").expect("a slide list");
+        let close = xml[open..]
+            .find("</p:sldIdLst>")
+            .expect("a slide list close")
+            + open;
+        let mut list = String::new();
+        let mut rest = &xml[open..close];
+        while let Some(at) = rest.find(" r:id=\"") {
+            list.push_str(&rest[..at]);
+            let after = &rest[at + " r:id=\"".len()..];
+            rest = &after[after.find('"').expect("a closing quote") + 1..];
+        }
+        list.push_str(rest);
+        format!("{}{}{}", &xml[..open], list, &xml[close..])
+    }
+
     /// Add one part to an in-progress package.
     fn add_part(zip: &mut zip::ZipWriter<Cursor<Vec<u8>>>, name: &str, body: &str) {
+        add_bytes(zip, name, body.as_bytes());
+    }
+
+    /// Add one part with raw bytes to an in-progress package.
+    fn add_bytes(zip: &mut zip::ZipWriter<Cursor<Vec<u8>>>, name: &str, body: &[u8]) {
         zip.start_file(name, zip::write::SimpleFileOptions::default())
             .expect("start part");
-        zip.write_all(body.as_bytes()).expect("write part");
+        zip.write_all(body).expect("write part");
+    }
+
+    /// `package` with `parts` added, a name it already holds replaced. Used to
+    /// give a fixture the parts an edit must carry through untouched — a header,
+    /// a footer, a chart, a media file — whose bodies may be minimal XML.
+    fn with_parts(package: &[u8], parts: &[(&str, &[u8])]) -> Vec<u8> {
+        let replaced: std::collections::HashSet<&str> =
+            parts.iter().map(|(name, _)| *name).collect();
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        {
+            let mut archive =
+                zip::ZipArchive::new(Cursor::new(package.to_vec())).expect("open package");
+            for index in 0..archive.len() {
+                let mut entry = archive.by_index(index).expect("entry");
+                let name = entry.name().to_string();
+                if name.ends_with('/') || replaced.contains(name.as_str()) {
+                    continue;
+                }
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).expect("read part");
+                add_bytes(&mut zip, &name, &bytes);
+            }
+        }
+        for (name, body) in parts {
+            add_bytes(&mut zip, name, body);
+        }
+        zip.finish().expect("finish package").into_inner()
+    }
+
+    /// Write a fixture package into the workspace and return its path.
+    fn write_fixture(ws: &Workspace, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = ws.as_path().join(name);
+        std::fs::write(&path, bytes).expect("write fixture");
+        path
     }
 
     /// A real-Excel-shaped workbook: its string lives in `xl/sharedStrings.xml`
@@ -2736,11 +3552,51 @@ mod tests {
         );
     }
 
+    /// A sample's family comes from its NAME, and the name is judged by the
+    /// container: a sample NAMED as an old binary format whose bytes are an OOXML
+    /// package is told to be renamed, while a real `.doc`/`.xls`/`.ppt` gets the old
+    /// formats' answer — read, but never filled or edited.
+    #[tokio::test]
+    async fn a_sample_is_answered_by_what_it_really_holds() {
+        let (_dir, ws) = workspace();
+        let cases = [
+            (
+                "report.doc",
+                [crate::document::CFB_MAGIC, b"the rest of a container"].concat(),
+                "an old .doc/.xls/.ppt file is read but never filled or edited",
+            ),
+            (
+                "sheet.xls",
+                b"PK\x03\x04the rest of a package".to_vec(),
+                "the file's bytes are an OOXML package",
+            ),
+        ];
+        for (name, bytes, expected) in cases {
+            std::fs::write(ws.as_path().join(name), &bytes).expect("write sample");
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "fill_template", "file_name": "copy",
+                        "template": name, "values": { "name": "Имя" },
+                    }),
+                )
+                .await
+                .expect_err("a sample of another format must be refused");
+            assert!(
+                err.to_string().contains(expected),
+                "{name}: expected {expected:?}, got {err}"
+            );
+        }
+        assert_eq!(generated_count(&ws), 0, "a refused call left an output");
+    }
+
     /// A sample the template library cannot compile — an unbalanced `{`, which
     /// is what a document a user edited by hand can end up with — is the
     /// request's own input too, and the refusal carries what makes it fixable.
     #[tokio::test]
     #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    #[expect(clippy::too_many_lines)] // reason: the sample, the fill and the edit voice, one case each
     async fn a_sample_that_cannot_be_compiled_is_a_usage_error() {
         if runtime_missing() {
             return;
@@ -2798,8 +3654,8 @@ mod tests {
             .await,
         );
         let cases = [
-            (&sheet, "sheet.docx", "really a xlsx package"),
-            (&word, "word.xlsx", "really a docx package"),
+            (&sheet, "sheet.docx", "really a .xlsx package"),
+            (&word, "word.xlsx", "really a .docx package"),
         ];
         for (source, misnamed, expected) in cases {
             let misnamed = ws.as_path().join(misnamed);
@@ -2817,8 +3673,52 @@ mod tests {
             let message = err.to_string();
             assert!(message.starts_with("usage:"), "got: {message}");
             assert!(
+                message.contains("the sample is really a"),
+                "a fill's sample keeps the sample wording: {message}"
+            );
+            assert!(
                 message.contains(expected),
                 "the refusal must describe the file, not the library's modules: {message}"
+            );
+        }
+
+        // An edit input of another family gets that action's own voice: it is
+        // told which action edits the family the package really is, rather than
+        // handed the sample's rename advice, which would leave docx_edit pointed
+        // at a workbook no rename makes editable.
+        for (source, misnamed, action, edit, expected) in [
+            (
+                &sheet,
+                "sheet.docx",
+                "docx_edit",
+                json!({ "op": "replace_text", "find": "x", "replace": "y" }),
+                "use xlsx_edit",
+            ),
+            (
+                &word,
+                "word.xlsx",
+                "xlsx_edit",
+                json!({ "op": "clear_cell", "sheet": "S", "cell": "A1" }),
+                "use docx_edit",
+            ),
+        ] {
+            let misnamed = ws.as_path().join(misnamed);
+            std::fs::copy(source, &misnamed).expect("copy the package under the other name");
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": action, "path": misnamed.to_string_lossy(),
+                        "edits": [edit],
+                    }),
+                )
+                .await
+                .expect_err("an edit input of another family must be refused");
+            let message = err.to_string();
+            assert!(message.starts_with("usage:"), "got: {message}");
+            assert!(
+                message.contains("the input is really a") && message.contains(expected),
+                "the refusal must point the edit at the action that fits it: {message}"
             );
         }
     }
@@ -3603,6 +4503,4039 @@ mod tests {
         );
     }
 
+    /// The body of the docx editing fixture: an untouched run whose own
+    /// formatting must survive, an insert anchor, an editable paragraph, a
+    /// `w:fldChar`-based field, a `w:fldSimple`-based field, a paragraph to
+    /// remove or to remove whole, and a drawing that names the embedded image.
+    const DOCX_EDIT_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:r><w:rPr><w:u w:val="single"/></w:rPr><w:t>UNTOUCHED-FORMAT</w:t></w:r></w:p>
+<w:p><w:r><w:t>KEEP-FORMAT</w:t></w:r></w:p>
+<w:p><w:r><w:t>Replace me now</w:t></w:r></w:p>
+<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> DATE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>CACHED-DATE</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>
+<w:p><w:fldSimple w:instr=" PAGE "><w:r><w:t>CACHED-PAGE</w:t></w:r></w:fldSimple></w:p>
+<w:p><w:r><w:t>Remove me too</w:t></w:r></w:p>
+<w:p><w:r><w:t>PARA-TO-REMOVE</w:t></w:r></w:p>
+<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"/></a:graphic></wp:inline></w:drawing></w:r></w:p>
+<w:sectPr/>
+</w:body></w:document>"#;
+
+    const DOCX_EDIT_HEADER: &str = r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>HEADER-TEXT</w:t></w:r></w:p></w:hdr>"#;
+    const DOCX_EDIT_FOOTER: &str = r#"<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>FOOTER-TEXT</w:t></w:r></w:p></w:ftr>"#;
+
+    /// Minimal extra parts for the editing fixtures: a chart, a pivot cache, a
+    /// table, a comment + its VML drawing, a macro and a timing part — every one
+    /// an edit must carry through untouched.
+    const EDIT_CHART: &str = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart/></c:chartSpace>"#;
+    const EDIT_PIVOT: &str = r#"<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#;
+    const EDIT_TABLE: &str = r#"<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><name>Table1</name></table>"#;
+    const EDIT_COMMENTS: &str = r#"<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>A</author></authors></comments>"#;
+    const EDIT_VML: &str =
+        r#"<xml xmlns:v="urn:schemas-microsoft-com:vml"><v:shape id="s"/></xml>"#;
+    const EDIT_TIMING: &str =
+        r#"<timing xmlns="http://schemas.openxmlformats.org/presentationml/2006/main"/>"#;
+
+    /// The generated directory's entry count: how a test proves a refused call
+    /// left no output behind.
+    fn generated_count(ws: &Workspace) -> usize {
+        std::fs::read_dir(ws.as_path().join(GENERATED_DIR)).map_or(0, std::iter::Iterator::count)
+    }
+
+    /// The three edit actions address a file's own family: a package of another
+    /// family, a PDF, and an old `.doc`/`.xls`/`.ppt` are refused by name, the
+    /// legacy one with the hint that it is read but never edited — all before a
+    /// runtime is spawned.
+    #[tokio::test]
+    async fn editing_refuses_an_input_of_another_family() {
+        let (_dir, ws) = workspace();
+        let legacy = "an old .doc/.xls/.ppt file is read but never edited";
+        let cases = [
+            ("report.doc", "docx_edit", legacy),
+            ("sheet.xls", "xlsx_edit", legacy),
+            ("deck.ppt", "pptx_edit", legacy),
+            ("paper.pdf", "docx_edit", "edits only a .docx/.docm file"),
+            ("paper.pdf", "xlsx_edit", "edits only a .xlsx/.xlsm file"),
+            ("paper.pdf", "pptx_edit", "edits only a .pptx/.pptm file"),
+            ("report.docx", "xlsx_edit", "edits only a .xlsx/.xlsm file"),
+            ("sheet.xlsx", "pptx_edit", "edits only a .pptx/.pptm file"),
+        ];
+        for (name, action, expected) in cases {
+            std::fs::write(ws.as_path().join(name), b"fixture").expect("write input");
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": action, "path": name,
+                        "edits": [{ "op": "replace_text", "find": "x", "replace": "y" }],
+                    }),
+                )
+                .await
+                .expect_err("a wrong-family input must be refused");
+            assert!(
+                err.to_string().contains(expected),
+                "{action} on {name}: expected {expected:?}, got {err}"
+            );
+        }
+        assert_eq!(generated_count(&ws), 0, "a refused call left an output");
+
+        // The container decides which answer a `.doc`-shaped name gets: a file
+        // whose bytes are an OOXML package is not an old format — the read path
+        // reads it as the package it holds — while a real CFB container is.
+        std::fs::write(
+            ws.as_path().join("package.doc"),
+            b"PK\x03\x04the-rest-of-a-package",
+        )
+        .expect("write input");
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": "package.doc",
+                    "edits": [{ "op": "replace_text", "find": "x", "replace": "y" }],
+                }),
+            )
+            .await
+            .expect_err("a package under an old-format name is not an old format");
+        assert!(
+            err.to_string()
+                .contains("the file's bytes are an OOXML package"),
+            "got: {err}"
+        );
+
+        std::fs::write(
+            ws.as_path().join("container.doc"),
+            [crate::document::CFB_MAGIC, b"the rest of a container"].concat(),
+        )
+        .expect("write input");
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": "container.doc",
+                    "edits": [{ "op": "replace_text", "find": "x", "replace": "y" }],
+                }),
+            )
+            .await
+            .expect_err("a legacy container under an old-format name is an old format");
+        assert!(err.to_string().contains(legacy), "got: {err}");
+        assert_eq!(generated_count(&ws), 0, "a refused call left an output");
+    }
+
+    /// Every edit shape the kit would fail on is refused at the boundary,
+    /// naming the offending edit and field, and before an output is reserved.
+    #[tokio::test]
+    #[expect(clippy::too_many_lines)] // reason: one refused edit shape per op and field
+    async fn edit_shapes_are_checked_before_an_output_is_reserved() {
+        let (_dir, ws) = workspace();
+        for name in ["doc.docx", "book.xlsx", "deck.pptx"] {
+            std::fs::write(ws.as_path().join(name), b"fixture").expect("write input");
+        }
+        let too_many: Vec<Value> = (0..=RULES.edits_max)
+            .map(|_| json!({ "op": "replace_text", "find": "x", "replace": "y" }))
+            .collect();
+        let calls = [
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "nope", "find": "x" }] }),
+                "unknown docx edit",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "nope", "sheet": "Values", "cell": "A1" }] }),
+                "unknown xlsx edit",
+            ),
+            (
+                json!({ "action": "pptx_edit", "path": "deck.pptx",
+                        "edits": [{ "op": "nope", "slide": 1 }] }),
+                "unknown pptx edit",
+            ),
+            // A `find` an op needs, a `format_text` with nothing to set, and an
+            // `insert_text` in the wrong position.
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "replace_text", "replace": "y" }] }),
+                "must not be empty",
+            ),
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_text", "find": "x" }] }),
+                "at least one of bold",
+            ),
+            // A `format_text` whose only property is a null has nothing to set
+            // either: the null is "absent" at the boundary, so it is refused here
+            // rather than forwarded and read by the kit as a value.
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_text", "find": "x", "bold": null }] }),
+                "at least one of bold",
+            ),
+            // A `format_text` size outside the shared bound, and one JSON cannot
+            // carry as a finite number: the kit writes half-points, so either
+            // would otherwise be rounded into a `<w:sz>` a reader cannot hold. A
+            // non-finite float is JSON null — the shape JSON has for it — which
+            // is an absent property, so the edit with nothing else to set is
+            // refused rather than succeeding with no formatting.
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_text", "find": "x", "size": 1e300 }] }),
+                "size must be",
+            ),
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_text", "find": "x", "size": f64::INFINITY }] }),
+                "at least one of bold",
+            ),
+            // A null cannot stand in for a `set_cell`'s required `value`.
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "set_cell", "sheet": "Values", "cell": "A1",
+                                    "value": null }] }),
+                "must be text, a number or a boolean",
+            ),
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "insert_text", "find": "x", "insert": "y",
+                                    "position": "middle" }] }),
+                "position",
+            ),
+            // A cell, a row and a column outside the workbook's grid.
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "set_cell", "sheet": "Values", "cell": "A9999999",
+                                    "value": 1 }] }),
+                "the row must be between",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "set_cell", "sheet": "Values", "cell": "ZZZ1",
+                                    "value": 1 }] }),
+                "the column must be between",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "set_cell", "sheet": "Values", "cell": "A0",
+                                    "value": 1 }] }),
+                "must be an A1 address",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "insert_row", "sheet": "Values", "row": 0 }] }),
+                "row must be a whole number",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "insert_column", "sheet": "Values", "column": "A1" }] }),
+                "column must be column letters",
+            ),
+            // A slide number below one.
+            (
+                json!({ "action": "pptx_edit", "path": "deck.pptx",
+                        "edits": [{ "op": "delete_slide", "slide": 0 }] }),
+                "slide must be a whole number",
+            ),
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx", "edits": too_many }),
+                "more than one call takes",
+            ),
+        ];
+        for (args, expected) in calls {
+            let err = DocumentTool
+                .execute(&ws, args)
+                .await
+                .expect_err("a call the tool cannot carry out");
+            assert!(
+                err.to_string().contains(expected),
+                "expected the refusal to name {expected}: {err}"
+            );
+        }
+        assert_eq!(generated_count(&ws), 0, "a refused call left an output");
+    }
+
+    /// A `null` for an optional edit field is the boundary's "absent", and the
+    /// request spells it that way: the kit tests only `!== undefined`, so a null
+    /// left in would reach it as a value — a `format_text`'s `bold: null` would
+    /// strip a run's own bold, and a text field's null would be read as text.
+    #[test]
+    fn edit_nulls_are_dropped_before_the_request_is_forwarded() {
+        use crate::ooxml::Family;
+        let docx = validate_edits(
+            Family::Docx,
+            &json!({ "edits": [
+                { "op": "format_text", "find": "x", "bold": null, "size": 24 },
+                { "op": "insert_text", "find": "x", "insert": "y", "position": null },
+                { "op": "add_paragraph", "text": "z", "after": null },
+            ]}),
+        )
+        .expect("valid docx edits");
+        assert_eq!(
+            docx,
+            json!([
+                { "op": "format_text", "find": "x", "size": 24 },
+                { "op": "insert_text", "find": "x", "insert": "y" },
+                { "op": "add_paragraph", "text": "z" },
+            ])
+        );
+
+        // The set_cell object's normalized `value` survives beside the dropped
+        // `number_format`.
+        let xlsx = validate_edits(
+            Family::Xlsx,
+            &json!({ "edits": [
+                { "op": "set_cell", "sheet": "S", "cell": "A1", "value": 1,
+                  "number_format": null },
+            ]}),
+        )
+        .expect("valid xlsx edits");
+        assert_eq!(
+            xlsx,
+            json!([{ "op": "set_cell", "sheet": "S", "cell": "A1", "value": 1 }])
+        );
+
+        let pptx = validate_edits(
+            Family::Pptx,
+            &json!({ "edits": [
+                { "op": "add_paragraph", "slide": 1, "text": "z", "after": null,
+                  "level": null },
+                { "op": "add_slide", "after": null, "title": null, "bullets": null },
+            ]}),
+        )
+        .expect("valid pptx edits");
+        assert_eq!(
+            pptx,
+            json!([
+                { "op": "add_paragraph", "slide": 1, "text": "z" },
+                { "op": "add_slide" },
+            ])
+        );
+    }
+
+    /// A docx edit changes only the body part: every other part keeps its exact
+    /// bytes, a field's cached value and an untouched run's formatting survive,
+    /// the new text reads back, and one file is delivered.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_keeps_every_part_it_does_not_touch() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "docx", "file_name": "base",
+                    "content": [{ "type": "paragraph", "text": "base" }],
+                }),
+            )
+            .await,
+        );
+        let png = noisy_png(4, 4);
+        let package = with_parts(
+            &std::fs::read(&created).expect("read base package"),
+            &[
+                ("word/document.xml", DOCX_EDIT_BODY.as_bytes()),
+                ("word/header1.xml", DOCX_EDIT_HEADER.as_bytes()),
+                ("word/footer1.xml", DOCX_EDIT_FOOTER.as_bytes()),
+                ("word/charts/chart1.xml", EDIT_CHART.as_bytes()),
+                ("word/media/image1.png", png.as_slice()),
+            ],
+        );
+        let source = write_fixture(&ws, "source.docx", &package);
+
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "replace_text", "find": "Replace me now", "replace": "REPLACED-TEXT" },
+                    { "op": "insert_text", "find": "KEEP-FORMAT", "insert": " INSERTED",
+                      "position": "after" },
+                    { "op": "remove_text", "find": "Remove me too" },
+                    { "op": "format_text", "find": "REPLACED-TEXT", "bold": true, "size": 24 },
+                    { "op": "add_paragraph", "text": "ADDED PARAGRAPH", "after": "REPLACED-TEXT" },
+                    { "op": "remove_paragraph", "find": "PARA-TO-REMOVE" },
+                ],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        assert_eq!(file_paths(&reply).len(), 1, "one file marker: {reply}");
+
+        assert_eq!(
+            zip_names(&source),
+            zip_names(&output),
+            "a part was added or dropped"
+        );
+        for name in zip_names(&source) {
+            if name == "word/document.xml" {
+                continue;
+            }
+            assert_eq!(
+                part_bytes(&source, &name),
+                part_bytes(&output, &name),
+                "{name} changed"
+            );
+        }
+
+        let text = converted_text(&ws, &output).await;
+        for expected in ["REPLACED-TEXT", "ADDED PARAGRAPH", "KEEP-FORMAT INSERTED"] {
+            assert!(text.contains(expected), "{expected} missing from: {text}");
+        }
+        let body = part_text(&output, "word/document.xml");
+        assert!(
+            body.contains("CACHED-DATE") && body.contains("CACHED-PAGE"),
+            "a field's cached value changed: {body}"
+        );
+        assert!(
+            body.contains(r#"<w:u w:val="single"/>"#),
+            "an untouched run lost its formatting: {body}"
+        );
+        assert!(
+            body.contains("<w:b/>") && body.contains(r#"<w:sz w:val="48"/>"#),
+            "format_text wrote no properties: {body}"
+        );
+    }
+
+    /// Fixture bodies for the docx edge cases below: a body whose paragraph-level
+    /// section break must not be mistaken for the body's own, a field whose begin
+    /// and end sit in different paragraphs, a run whose own `<w:rPr>` carries a
+    /// nested `<w:rPrChange>`, and a table cell holding one paragraph.
+    const MULTISECTION_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>First section text</w:t></w:r></w:p><w:p><w:pPr><w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr></w:pPr><w:r><w:t>Second section text</w:t></w:r></w:p><w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr></w:body></w:document>"#;
+    const SPANNING_FIELD_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>before</w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r></w:p><w:p><w:r><w:t>SPANNED-CACHE</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p><w:p><w:r><w:t>after</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+    /// A field spanning two paragraphs with real body text on BOTH sides of it:
+    /// one `target` before the field's `begin` and one after its `end`, with the
+    /// field's cached value between them. An edit that re-located runs without
+    /// the field regions would read the cached value as body text and apply the
+    /// offsets found over the shorter text to the longer one.
+    const SPANNING_FIELD_TWO_TARGETS_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>head target</w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r></w:p><w:p><w:r><w:t>SPANNED-CACHE</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:t>tail target</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+    const NESTED_RPR_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr><w:b/><w:rPrChange w:id="1" w:author="A"><w:rPr><w:b/></w:rPr></w:rPrChange></w:rPr><w:t>TARGET</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+    /// A run whose own `<w:rPr>` holds nothing and whose tracked revision holds
+    /// the property: reading the revision's contents as the run's own would make
+    /// a request that asked for bold change nothing at all.
+    const REVISION_ONLY_RPR_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr><w:rPrChange w:id="1" w:author="A"><w:rPr><w:b/><w:sz w:val="20"/></w:rPr></w:rPrChange></w:rPr><w:t>TARGET</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+    const TABLE_CELL_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>CELL-ONLY</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>outside</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+
+    /// A table cell whose one paragraph draws a VML text box; the box holds a
+    /// single paragraph, so removing it would empty the box. The cell keeps its
+    /// own paragraph, the one that draws the box.
+    const TEXT_BOX_ONLY_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tr><w:tc><w:tcPr/><w:p><w:r><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml"><v:textbox><w:txbxContent><w:p><w:r><w:t>TXBX-ONLY</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>outside</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+
+    /// The same cell with a text box holding two paragraphs: removing one leaves
+    /// the box with the other.
+    const TEXT_BOX_TWO_PARAGRAPHS_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tr><w:tc><w:tcPr/><w:p><w:r><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml"><v:textbox><w:txbxContent><w:p><w:r><w:t>TXBX-KEEP</w:t></w:r></w:p><w:p><w:r><w:t>TXBX-GO</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>outside</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+
+    /// A table cell holding two paragraphs of its own with a table nested between
+    /// them: the nested table's own cells' paragraphs are that table's, not this
+    /// cell's, so a cell keeps a paragraph even when every paragraph of it that
+    /// holds the token goes — counting the nested ones would let the removal empty
+    /// the cell and write a part Word calls damaged.
+    const NESTED_TABLE_CELL_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>CELL-GO</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>INNER</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>CELL-KEEP</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>outside</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+
+    /// A created document with one body part swapped for `body`.
+    async fn docx_body_fixture(ws: &Workspace, name: &str, body: &str) -> PathBuf {
+        let created = single(
+            &run(
+                ws,
+                json!({
+                    "action": "create", "format": "docx", "file_name": name,
+                    "content": [{ "type": "paragraph", "text": "seed" }],
+                }),
+            )
+            .await,
+        );
+        let package = with_parts(
+            &std::fs::read(&created).expect("read base package"),
+            &[("word/document.xml", body.as_bytes())],
+        );
+        write_fixture(ws, &format!("{name}.docx"), &package)
+    }
+
+    /// `add_paragraph` with no anchor appends before the body's OWN `<w:sectPr>`,
+    /// not before the first `<w:sectPr>` anywhere in the body — a paragraph-level
+    /// section break sits inside `<w:pPr>`, and appending there would nest a
+    /// `<w:p>` inside it, which ECMA-376 refuses.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_add_paragraph_appends_before_the_body_section() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(&ws, "sections", MULTISECTION_BODY).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "add_paragraph", "text": "APPENDED" }],
+            }),
+        )
+        .await;
+        let body = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            !body.contains("<w:pPr><w:p"),
+            "a paragraph was nested inside <w:pPr>: {body}"
+        );
+        assert!(
+            body.contains(
+                r#"APPENDED</w:t></w:r></w:p><w:sectPr><w:pgSz w:w="11906" w:h="16838"/>"#
+            ),
+            "the paragraph must land before the body-level sectPr: {body}"
+        );
+        assert!(
+            body.contains("Second section text"),
+            "the second section's text was lost: {body}"
+        );
+    }
+
+    /// An `add_paragraph` `after` anchors after the FIRST paragraph whose text
+    /// holds it — the rule the presentation's `add_paragraph` follows too — so a
+    /// fragment that matches several paragraphs always lands the new one in the
+    /// same place rather than after the last match.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_add_paragraph_anchors_after_the_first_match() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let body = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>first DUP-ANCHOR one</w:t></w:r></w:p><w:p><w:r><w:t>second DUP-ANCHOR two</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let source = docx_body_fixture(&ws, "anchors", body).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "add_paragraph", "text": "INSERTED", "after": "DUP-ANCHOR" }],
+            }),
+        )
+        .await;
+        let text = converted_text(&ws, &single(&reply)).await;
+        let first = text
+            .find("first DUP-ANCHOR one")
+            .expect("the first paragraph");
+        let inserted = text.find("INSERTED").expect("the new paragraph");
+        let second = text
+            .find("second DUP-ANCHOR two")
+            .expect("the second paragraph");
+        assert!(
+            first < inserted && inserted < second,
+            "the anchor must be the first match: {text}"
+        );
+    }
+
+    /// A field whose begin and end sit in different paragraphs is still a field:
+    /// its cached result is not body text, and a find on it is refused.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_refuses_a_find_inside_a_field_spanning_paragraphs() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(&ws, "spanning-field", SPANNING_FIELD_BODY).await;
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "find": "SPANNED-CACHE", "replace": "X" }],
+                }),
+            )
+            .await
+            .expect_err("a field's cached result must not be searched");
+        assert!(
+            err.to_string().contains("not in the document's body"),
+            "got: {err}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// Two occurrences around a field whose `begin` and `end` sit in different
+    /// paragraphs are both rewritten, and the field's cached value between them
+    /// is not: the offsets come from the same field-region-excluded text the
+    /// occurrence was found in, so neither the replacement nor the cached result
+    /// is corrupted.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_replaces_around_a_field_spanning_paragraphs() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source =
+            docx_body_fixture(&ws, "spanning-targets", SPANNING_FIELD_TWO_TARGETS_BODY).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "replace_text", "find": "target", "replace": "XYZ" }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let body = part_text(&output, "word/document.xml");
+        assert!(
+            body.contains("SPANNED-CACHE"),
+            "the field's cached value was rewritten: {body}"
+        );
+        assert!(
+            !body.contains("SPANNXYZHE"),
+            "the edit addressed the field region: {body}"
+        );
+        let text = converted_text(&ws, &output).await;
+        assert!(
+            text.contains("head XYZ") && text.contains("tail XYZ"),
+            "an occurrence outside the field was lost: {text}"
+        );
+    }
+
+    /// A match that follows a supplementary character is addressed by code
+    /// point, not by UTF-16 code unit: the astral character is two code units but
+    /// one character, and a code-unit offset would rewrite the character before
+    /// the match.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_replaces_text_after_an_astral_character() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "docx", "file_name": "astral",
+                    "content": [{ "type": "paragraph", "text": format!("{ASTRAL}abc") }],
+                }),
+            )
+            .await,
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": created.to_string_lossy(),
+                "edits": [{ "op": "replace_text", "find": "abc", "replace": "XYZ" }],
+            }),
+        )
+        .await;
+        let text = converted_text(&ws, &single(&reply)).await;
+        assert!(
+            text.contains(&format!("{ASTRAL}XYZ")),
+            "the character before the match was rewritten: {text}"
+        );
+    }
+
+    /// `format_text` reaches the run's OWN `<w:rPr>` and never a nested
+    /// `<w:rPrChange>`: a toggle the run does not have is written to it even when
+    /// the tracked revision holds one (a request that changed nothing and said
+    /// nothing is what this rules out), the revision keeps its own bytes, and the
+    /// new properties land in front of it, the one place `<w:rPr>` accepts them.
+    #[expect(clippy::too_many_lines)] // reason: set, clear and size, one case each
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_format_text_targets_the_runs_own_properties() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(&ws, "nested-rpr", NESTED_RPR_BODY).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_text", "find": "TARGET", "italic": true }],
+            }),
+        )
+        .await;
+        let body = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            body.contains("<w:rPr><w:b/><w:i/><w:rPrChange"),
+            "the toggle did not land before the recorded revision: {body}"
+        );
+        assert!(
+            body.contains(
+                r#"<w:rPrChange w:id="1" w:author="A"><w:rPr><w:b/></w:rPr></w:rPrChange>"#
+            ),
+            "the tracked revision was rewritten: {body}"
+        );
+
+        let revision_only = docx_body_fixture(&ws, "revision-only", REVISION_ONLY_RPR_BODY).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": revision_only.to_string_lossy(),
+                "edits": [{ "op": "format_text", "find": "TARGET", "bold": true, "size": 12 }],
+            }),
+        )
+        .await;
+        let body = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            body.contains(r#"<w:rPr><w:b/><w:sz w:val="24"/><w:szCs w:val="24"/><w:rPrChange"#),
+            "the run did not take the properties only its revision held: {body}"
+        );
+        assert!(
+            body.contains(r#"<w:rPr><w:b/><w:sz w:val="20"/></w:rPr>"#),
+            "the revision's own properties were rewritten: {body}"
+        );
+
+        // The other direction: clearing a toggle removes the run's own property and
+        // must leave the recorded revision exactly as it was — dropping the whole
+        // `<w:rPr>` would delete the revision with it.
+        let nested_off = docx_body_fixture(&ws, "nested-rpr-off", NESTED_RPR_BODY).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": nested_off.to_string_lossy(),
+                "edits": [{ "op": "format_text", "find": "TARGET", "bold": false }],
+            }),
+        )
+        .await;
+        let body = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            body.contains(r#"<w:rPr><w:rPrChange w:id="1" w:author="A"><w:rPr><w:b/></w:rPr></w:rPrChange></w:rPr><w:t>TARGET"#),
+            "the recorded revision did not survive the toggle being cleared: {body}"
+        );
+
+        // A run whose only property the revision holds: the request empties the
+        // run's own body, and the revision is all that is left of its `<w:rPr>`.
+        let revision_off =
+            docx_body_fixture(&ws, "revision-only-off", REVISION_ONLY_RPR_BODY).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": revision_off.to_string_lossy(),
+                "edits": [{ "op": "format_text", "find": "TARGET", "bold": false }],
+            }),
+        )
+        .await;
+        let body = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            body.contains(r#"<w:rPr><w:rPrChange w:id="1" w:author="A"><w:rPr><w:b/><w:sz w:val="20"/></w:rPr></w:rPrChange></w:rPr><w:t>TARGET"#),
+            "a request that changed nothing removed the recorded revision: {body}"
+        );
+
+        // `<w:sz>` counts half-points, so the shared bound's low end is the smallest
+        // size a document holds: a request below it is refused rather than rounded up
+        // to a size the caller did not ask for.
+        let below = docx_body_fixture(&ws, "size-below", NESTED_RPR_BODY).await;
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": below.to_string_lossy(),
+                    "edits": [{ "op": "format_text", "find": "TARGET", "size": 0.05 }],
+                }),
+            )
+            .await
+            .expect_err("a size below half a point cannot be written");
+        assert!(
+            err.to_string().contains("between 0.5 and 819"),
+            "got: {err}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        let half = docx_body_fixture(&ws, "size-half", NESTED_RPR_BODY).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": half.to_string_lossy(),
+                "edits": [{ "op": "format_text", "find": "TARGET", "size": 0.5 }],
+            }),
+        )
+        .await;
+        let body = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            body.contains(r#"<w:sz w:val="1"/>"#),
+            "half a point did not write one half-point: {body}"
+        );
+    }
+
+    /// A replacement takes the formatting of the run its span starts in, and the
+    /// answer says so whenever ANY run the span covers is formatted differently — a
+    /// differently formatted run in the middle loses exactly as much as one at the
+    /// end. A removal substitutes nothing, so it takes no formatting with it and
+    /// raises no such note.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_notes_formatting_loss_only_where_it_substitutes() {
+        const THREE_RUNS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">aa</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>BOLD</w:t></w:r><w:r><w:t>zz</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        const ACROSS: &str = "aaBOLDzz";
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(&ws, "three-runs", THREE_RUNS).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "replace_text", "find": ACROSS, "replace": "X" }],
+            }),
+        )
+        .await;
+        assert!(
+            reply.contains("differently formatted runs"),
+            "the formatting a replacement dropped is not named: {reply}"
+        );
+
+        let removed = docx_body_fixture(&ws, "three-runs-removed", THREE_RUNS).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": removed.to_string_lossy(),
+                "edits": [{ "op": "remove_text", "find": ACROSS }],
+            }),
+        )
+        .await;
+        assert!(
+            !reply.contains("differently formatted runs"),
+            "a removal substituted nothing, so no formatting was lost: {reply}"
+        );
+    }
+
+    /// An `add_paragraph` `after` anchors in the document's OWN paragraphs: a
+    /// table cell's is one of them, a text box's is a nested one, and an `after`
+    /// naming text only a text box holds is refused with a message saying where
+    /// the text lies. The presentation's arm anchors only in the slide's own text
+    /// and refuses a table, which the model-facing hint states.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_add_paragraph_after_says_where_the_text_lies() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(&ws, "cell-only", TABLE_CELL_BODY).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "add_paragraph", "text": "AFTER-CELL", "after": "CELL-ONLY" }],
+            }),
+        )
+        .await;
+        let body = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            body.contains(
+                r#"CELL-ONLY</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">AFTER-CELL</w:t></w:r></w:p></w:tc>"#
+            ),
+            "a table cell's own paragraph must anchor the new one: {body}"
+        );
+
+        let text_box = docx_body_fixture(&ws, "text-box-only", TEXT_BOX_ONLY_BODY).await;
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": text_box.to_string_lossy(),
+                    "edits": [{ "op": "add_paragraph", "text": "AFTER-BOX", "after": "TXBX-ONLY" }],
+                }),
+            )
+            .await
+            .expect_err("a text box is not one of the document's own paragraphs");
+        assert!(err.to_string().contains("text box"), "got: {err}");
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": text_box.to_string_lossy(),
+                    "edits": [{ "op": "add_paragraph", "text": "AFTER-NOWHERE", "after": "NOWHERE" }],
+                }),
+            )
+            .await
+            .expect_err("text the body does not hold");
+        assert!(
+            err.to_string().contains("not in the document's body"),
+            "got: {err}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// Removing a table cell's or a text box's only paragraph is refused: the
+    /// container would be left with none, which ECMA-376 calls corrupt. A text
+    /// box that keeps another paragraph can lose one.
+    #[expect(clippy::too_many_lines)] // reason: a cell, a text box and a nested table, one case each
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_refuses_removing_a_containers_only_paragraph() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(&ws, "cell-only", TABLE_CELL_BODY).await;
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "remove_paragraph", "find": "CELL-ONLY" }],
+                }),
+            )
+            .await
+            .expect_err("a cell must keep a paragraph");
+        assert!(err.to_string().contains("table cell"), "got: {err}");
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        let text_box = docx_body_fixture(&ws, "text-box-only", TEXT_BOX_ONLY_BODY).await;
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": text_box.to_string_lossy(),
+                    "edits": [{ "op": "remove_paragraph", "find": "TXBX-ONLY" }],
+                }),
+            )
+            .await
+            .expect_err("a text box must keep a paragraph");
+        assert!(err.to_string().contains("text box"), "got: {err}");
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        let two = docx_body_fixture(&ws, "text-box-two", TEXT_BOX_TWO_PARAGRAPHS_BODY).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": two.to_string_lossy(),
+                "edits": [{ "op": "remove_paragraph", "find": "TXBX-GO" }],
+            }),
+        )
+        .await;
+        let body = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            body.contains("TXBX-KEEP"),
+            "the surviving paragraph was lost: {body}"
+        );
+        assert!(
+            !body.contains("TXBX-GO"),
+            "the removed paragraph survived: {body}"
+        );
+
+        // A cell whose paragraphs sit beside a nested table: the nested cells'
+        // paragraphs are not this cell's own, so the token that matches both of the
+        // cell's own ones empties it and is refused, while the nested cell's own only
+        // paragraph is its container's when the token names it.
+        let nested = docx_body_fixture(&ws, "nested-table", NESTED_TABLE_CELL_BODY).await;
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": nested.to_string_lossy(),
+                    "edits": [{ "op": "remove_paragraph", "find": "CELL-GO" }, { "op": "remove_paragraph", "find": "CELL-KEEP" }],
+                }),
+            )
+            .await
+            .expect_err("the cell would be left with no paragraph of its own");
+        assert!(err.to_string().contains("table cell"), "got: {err}");
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": nested.to_string_lossy(),
+                    "edits": [{ "op": "remove_paragraph", "find": "INNER" }],
+                }),
+            )
+            .await
+            .expect_err("the nested cell would be left with no paragraph");
+        assert!(err.to_string().contains("table cell"), "got: {err}");
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        // One of the cell's own paragraphs, with the nested table left standing.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": nested.to_string_lossy(),
+                "edits": [{ "op": "remove_paragraph", "find": "CELL-GO" }],
+            }),
+        )
+        .await;
+        let body = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            body.contains("CELL-KEEP") && body.contains("INNER"),
+            "the removal took the cell's own paragraph or the nested table with it: {body}"
+        );
+        assert!(
+            !body.contains("CELL-GO"),
+            "the removed paragraph survived: {body}"
+        );
+    }
+
+    /// An xlsx edit rewrites only the sheets it names: the workbook's chart,
+    /// pivot, table, comment and macro parts stay byte-identical, the cells read
+    /// back at their new addresses, and the reply names the stale caches.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    #[expect(clippy::too_many_lines)] // reason: one workbook exercising every cell and shift op
+    async fn xlsx_edit_writes_cells_and_reports_stale_charts() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [
+                        { "name": "Values", "rows": [["Name", 1], ["Alpha", 7]] },
+                        { "name": "Rows", "rows": [["one"], ["two"], ["three"]] },
+                        { "name": "Columns", "rows": [["one", "two", "three"]] },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let package = with_parts(
+            &std::fs::read(&created).expect("read base package"),
+            &[
+                ("xl/charts/chart1.xml", EDIT_CHART.as_bytes()),
+                (
+                    "xl/pivotCache/pivotCacheDefinition1.xml",
+                    EDIT_PIVOT.as_bytes(),
+                ),
+                ("xl/tables/table1.xml", EDIT_TABLE.as_bytes()),
+                ("xl/comments1.xml", EDIT_COMMENTS.as_bytes()),
+                ("xl/drawings/vmlDrawing1.vml", EDIT_VML.as_bytes()),
+                ("xl/vbaProject.bin", b"macro-bytes"),
+            ],
+        );
+        let source = write_fixture(&ws, "book.xlsx", &package);
+        // The same bytes under a macro-enabled name: an edit keeps that name.
+        let macro_source = write_fixture(&ws, "book.xlsm", &package);
+
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "set_cell", "sheet": "Values", "cell": "B2", "value": 42 },
+                    { "op": "set_cell", "sheet": "Values", "cell": "C2", "value": "added" },
+                    { "op": "set_cell", "sheet": "Values", "cell": "D2", "value": true },
+                    { "op": "set_cell", "sheet": "Values", "cell": "E2",
+                      "value": { "formula": "=SUM(B2:B3)" } },
+                    { "op": "set_cell", "sheet": "Values", "cell": "F2", "value": 1.5,
+                      "number_format": "#,##0.00" },
+                    { "op": "clear_cell", "sheet": "Values", "cell": "A1" },
+                    { "op": "insert_row", "sheet": "Rows", "row": 2 },
+                    { "op": "delete_row", "sheet": "Rows", "row": 4 },
+                    { "op": "insert_column", "sheet": "Columns", "column": "B" },
+                    { "op": "delete_column", "sheet": "Columns", "column": "C" },
+                ],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+
+        let touched = [
+            "xl/worksheets/sheet1.xml",
+            "xl/worksheets/sheet2.xml",
+            "xl/worksheets/sheet3.xml",
+            "xl/styles.xml",
+        ];
+        let names = zip_names(&source);
+        for name in &names {
+            assert!(
+                zip_names(&output).contains(name),
+                "{name} vanished from the edited workbook"
+            );
+            if touched.contains(&name.as_str()) {
+                continue;
+            }
+            assert_eq!(
+                part_bytes(&source, name),
+                part_bytes(&output, name),
+                "{name} changed"
+            );
+        }
+        assert_eq!(
+            names.len(),
+            zip_names(&output).len(),
+            "a part was added to the edited workbook"
+        );
+
+        let text = converted_text(&ws, &output).await;
+        for expected in [
+            "B2: 42",
+            "C2: added",
+            "D2: TRUE",
+            "E2: =SUM(B2:B3)",
+            "F2: 1.5",
+            "A3: two",
+            "C1: three",
+        ] {
+            assert!(text.contains(expected), "{expected} missing from: {text}");
+        }
+        assert!(
+            !text.contains("Name"),
+            "the cleared cell still reads: {text}"
+        );
+        assert!(
+            part_text(&output, "xl/styles.xml").contains("formatCode=\"#,##0.00\""),
+            "the number format was not written"
+        );
+
+        assert!(
+            reply.contains("charts were copied unchanged"),
+            "the stale-chart caveat is missing: {reply}"
+        );
+        assert!(
+            reply.contains("pivot tables were copied unchanged"),
+            "the stale-pivot caveat is missing: {reply}"
+        );
+
+        let macro_reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "macro-edited",
+                "path": macro_source.to_string_lossy(),
+                "edits": [{ "op": "set_cell", "sheet": "Values", "cell": "B2", "value": 7 }],
+            }),
+        )
+        .await;
+        assert_eq!(
+            single(&macro_reply)
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some("xlsm"),
+            "a macro-enabled input must keep its extension: {macro_reply}"
+        );
+    }
+
+    /// An Excel-shaped `xl/styles.xml`: `<cellXfs>` entries carrying an
+    /// `<alignment>` and a `<protection>` child (legal `CT_Xf`, and what Excel
+    /// writes), a `<numFmt>` whose code holds a dollar sign, and a `<cellStyles>`
+    /// block after `<cellXfs>`. A `<cellXfs>` rebuilt from self-closing `<xf/>`
+    /// alone would drop the child-bearing entries and shift every `s=`.
+    const EXCEL_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="&quot;$&quot;#,##0.00"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFF0000"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1" applyNumberFormat="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment horizontal="center" wrapText="1"/></xf><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"><protection locked="0"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#;
+    /// A sheet whose A1 uses `s="0"` (the bold-font entry, which states
+    /// `applyNumberFormat="0"`): setting a number format must keep that font, not
+    /// replace the entry with a bare one.
+    const EXCEL_SHEET: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B1"/><sheetData><row r="1"><c r="A1" s="0"><v>1</v></c><c r="B1" s="1" t="inlineStr"><is><t>x</t></is></c></row></sheetData></worksheet>"#;
+
+    /// Setting a number format on an Excel-shaped workbook keeps every `<xf>`
+    /// entry (children included), keeps the edited cell's own font, states
+    /// `applyNumberFormat` even when the cell's own entry left it at `0` (a format
+    /// written but never applied), adds the new `<numFmt>` without a dollar sign in
+    /// a code corrupting the part (a replacement string reads `$&`), and points the
+    /// cell at a clone of its own entry.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_set_cell_keeps_each_cell_format_and_a_dollar_code() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
+        let package = with_parts(
+            &std::fs::read(&created).expect("read base package"),
+            &[
+                ("xl/styles.xml", EXCEL_STYLES.as_bytes()),
+                ("xl/worksheets/sheet1.xml", EXCEL_SHEET.as_bytes()),
+            ],
+        );
+        let source = write_fixture(&ws, "styled.xlsx", &package);
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "set_cell", "sheet": "S", "cell": "A1", "value": 1234.5,
+                            "number_format": "\"$\"#,##0.000" }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let styles = part_text(&output, "xl/styles.xml");
+        assert_eq!(
+            styles.matches("<styleSheet").count(),
+            1,
+            "the part was corrupted by a dollar sign: {styles}"
+        );
+        assert_eq!(styles.matches("<cellXfs").count(), 1, "{styles}");
+        assert!(
+            styles.contains(r#"<alignment horizontal="center" wrapText="1"/>"#),
+            "a child-bearing <xf> was dropped: {styles}"
+        );
+        assert!(
+            styles.contains(r#"<protection locked="0"/>"#),
+            "a child-bearing <xf> was dropped: {styles}"
+        );
+        assert!(
+            styles.contains(r#"<numFmt numFmtId="164" formatCode="&quot;$&quot;#,##0.00"/>"#),
+            "an existing dollar code was rewritten: {styles}"
+        );
+        assert!(
+            styles.contains(r#"<numFmt numFmtId="165" formatCode="&quot;$&quot;#,##0.000"/>"#),
+            "the new format was not written: {styles}"
+        );
+        assert_eq!(
+            styles.matches("<numFmt ").count(),
+            2,
+            "the format table gained or lost an entry: {styles}"
+        );
+        assert!(
+            styles.contains(r#"numFmtId="165" fontId="1""#),
+            "the edited cell lost its own font: {styles}"
+        );
+        assert!(
+            styles.contains(
+                r#"<xf numFmtId="165" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1" applyNumberFormat="1"/>"#
+            ),
+            "the cloned entry kept the cell's own applyNumberFormat=0, so the format would not be applied: {styles}"
+        );
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+        assert!(
+            sheet.contains(r#"<c r="A1" s="3"><v>1234.5</v></c>"#),
+            "the cell does not point at its own cloned entry: {sheet}"
+        );
+    }
+
+    /// A worksheet whose rows and cells carry no `r`: the shift must address them
+    /// by the position that addresses them (the rule the reader and the filler
+    /// use), or the row lands in the wrong place and a deleted column's cell
+    /// stays behind.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_shifts_addressless_rows_and_cells() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+
+        let addressless_rows = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row></sheetData></worksheet>"#;
+        let rows_source = write_fixture(
+            &ws,
+            "no-row.xlsx",
+            &with_parts(
+                &base,
+                &[("xl/worksheets/sheet1.xml", addressless_rows.as_bytes())],
+            ),
+        );
+        let rows_reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "rows-edited",
+                "path": rows_source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        let rows_sheet = part_text(&single(&rows_reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            rows_sheet.contains(
+                r#"<sheetData><row r="1"/><row r="2"><c r="A2"><v>1</v></c><c r="B2"><v>2</v></c></row>"#
+            ),
+            "the inserted row did not land in position: {rows_sheet}"
+        );
+
+        let addressless_cells = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c><c><v>2</v></c><c r="C1"><v>3</v></c></row></sheetData></worksheet>"#;
+        let cells_source = write_fixture(
+            &ws,
+            "no-cell.xlsx",
+            &with_parts(
+                &base,
+                &[("xl/worksheets/sheet1.xml", addressless_cells.as_bytes())],
+            ),
+        );
+        let deleted = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "cells-deleted",
+                "path": cells_source.to_string_lossy(),
+                "edits": [{ "op": "delete_column", "sheet": "S", "column": "B" }],
+            }),
+        )
+        .await;
+        let deleted_path = single(&deleted);
+        let deleted_sheet = part_text(&deleted_path, "xl/worksheets/sheet1.xml");
+        assert!(
+            deleted_sheet.contains(r#"<c r="A1"><v>1</v></c><c r="B1"><v>3</v></c>"#),
+            "the addressless cell in the deleted column stayed: {deleted_sheet}"
+        );
+        assert!(
+            !deleted_sheet.contains("<c><v>2</v></c>"),
+            "the deleted column's cell survived: {deleted_sheet}"
+        );
+        let read_back = converted_text(&ws, &deleted_path).await;
+        assert!(
+            read_back.contains("A1: 1") && read_back.contains("B1: 3"),
+            "the reader does not show the shifted cells: {read_back}"
+        );
+
+        let inserted = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "cells-inserted",
+                "path": cells_source.to_string_lossy(),
+                "edits": [{ "op": "insert_column", "sheet": "S", "column": "B" }],
+            }),
+        )
+        .await;
+        let inserted_sheet = part_text(&single(&inserted), "xl/worksheets/sheet1.xml");
+        assert!(
+            inserted_sheet
+                .contains(r#"<c r="A1"><v>1</v></c><c r="C1"><v>2</v></c><c r="D1"><v>3</v></c>"#),
+            "an addressless cell did not move for the insert: {inserted_sheet}"
+        );
+    }
+
+    /// A line inside the used range the writer left NO `<row>` element for is
+    /// still a line a delete takes: everything below it moves up by one, the
+    /// same rule the column arm follows. Only a line past the used range is
+    /// refused.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_deletes_a_line_the_writer_left_no_row_element_for() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B5"/><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row r="3"><c r="A3"><v>3</v></c></row><row r="5"><c r="A5"><v>5</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "gap.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "gap-deleted",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "delete_row", "sheet": "S", "row": 4 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r#"<row r="4"><c r="A4"><v>5</v></c></row></sheetData>"#),
+            "the row below the deleted line did not move up: {output}"
+        );
+        let past = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "delete_row", "sheet": "S", "row": 6 }],
+                }),
+            )
+            .await
+            .expect_err("a row past the used range cannot be deleted");
+        assert!(
+            past.to_string()
+                .contains("past the sheet's used range (1-5)"),
+            "a row past the used range was not refused by that rule: {past}"
+        );
+    }
+
+    /// The `(min, max)` of every `<col min max>` in a worksheet part.
+    fn col_ranges(xml: &str) -> Vec<(u32, u32)> {
+        xml.split("<col ")
+            .skip(1)
+            .map(|rest| {
+                let min = rest
+                    .split("min=\"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                    .and_then(|s| s.parse().ok())
+                    .expect("a col min");
+                let max = rest
+                    .split("max=\"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                    .and_then(|s| s.parse().ok())
+                    .expect("a col max");
+                (min, max)
+            })
+            .collect()
+    }
+
+    /// A merge and a `<col min max>` range the deleted column falls in: the range
+    /// shrinks or is dropped rather than left as a one-cell merge or a duplicate
+    /// `<col>` range.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_drops_or_shrinks_merges_and_column_entries_a_delete_covers() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols><col min="1" max="1" width="10" customWidth="1"/><col min="2" max="2" width="20" customWidth="1"/><col min="3" max="3" width="30" customWidth="1"/></cols><dimension ref="A1:D2"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c><c r="C1"><v>3</v></c><c r="D1"><v>4</v></c></row><row r="2"><c r="A2"><v>5</v></c><c r="B2"><v>6</v></c><c r="C2"><v>7</v></c><c r="D2"><v>8</v></c></row></sheetData><mergeCells count="3"><mergeCell ref="B1:C1"/><mergeCell ref="C1:D1"/><mergeCell ref="C2:D2"/></mergeCells></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "merge.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "delete_column", "sheet": "S", "column": "B" }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(
+                r#"<mergeCells count="2"><mergeCell ref="B1:C1"/><mergeCell ref="B2:C2"/></mergeCells>"#
+            ),
+            "a one-cell merge was kept or a range was not shrunk: {output}"
+        );
+        assert!(
+            output.contains(
+                r#"<cols><col min="1" max="1" width="10" customWidth="1"/><col min="2" max="2" width="30" customWidth="1"/></cols>"#
+            ),
+            "the <cols> container lost a surviving entry, reordered them or had a count invented for it (`CT_Cols` declares no attributes): {output}"
+        );
+        let ranges = col_ranges(&output);
+        assert_eq!(ranges, vec![(1, 1), (2, 2)], "col ranges: {ranges:?}");
+        for (index, (low, high)) in ranges.iter().enumerate() {
+            for (other, (other_low, other_high)) in ranges.iter().enumerate() {
+                if index != other {
+                    assert!(
+                        high < other_low || other_high < low,
+                        "two <col> entries overlap: {ranges:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A delete that covers the last entry of a container the shift rewrites drops
+    /// the container with it — ECMA-376 requires a child, so an emptied
+    /// `<mergeCells>`/`<cols>`/`<hyperlinks>` is schema-invalid — and a hyperlink
+    /// on a deleted cell goes with it rather than re-attaching to whatever cell
+    /// shifts into its address.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_drops_a_container_a_delete_empties() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols><col min="1" max="1" width="10" customWidth="1"/></cols><dimension ref="A1:B2"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells><hyperlinks><hyperlink ref="A2" r:id="rId1"/></hyperlinks></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "empties.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+
+        // The header merge is the only one and the row delete covers it: the
+        // emptied container goes, and the link below the header moves up with its
+        // cell instead of staying behind.
+        let dropped = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "row-deleted",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "delete_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        let rows = part_text(&single(&dropped), "xl/worksheets/sheet1.xml");
+        assert!(
+            !rows.contains("<mergeCells"),
+            "an emptied <mergeCells> was left behind: {rows}"
+        );
+        assert!(
+            rows.contains(r#"<hyperlinks><hyperlink ref="A1" r:id="rId1"/></hyperlinks>"#),
+            "the link did not move with its cell, or a count `CT_Hyperlinks` does not declare was invented for it: {rows}"
+        );
+
+        // The column delete removes the only `<col>` entry, shrinks the header
+        // merge to a non-merge, and covers the link's own cell: all three
+        // containers are emptied and dropped.
+        let deleted = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "column-deleted",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "delete_column", "sheet": "S", "column": "A" }],
+            }),
+        )
+        .await;
+        let columns = part_text(&single(&deleted), "xl/worksheets/sheet1.xml");
+        for container in ["<cols", "<mergeCells", "<hyperlinks"] {
+            assert!(
+                !columns.contains(container),
+                "an emptied {container}> was left behind: {columns}"
+            );
+        }
+    }
+
+    /// A counted container one of whose children the shift rewrites may be left
+    /// with its LAST child gone: `<dataValidations>`, `<protectedRanges>` and
+    /// `<ignoredErrors>` require a child (ECMA-376), so an emptied one goes the
+    /// way the emptied `<mergeCells>`/`<cols>`/`<hyperlinks>` do, and a count the
+    /// file stated follows the children that survive rather than naming one that
+    /// does not. The entries are moved inside the container's own pass — the
+    /// failure this covers is an entry removed before its container was walked,
+    /// which left the container empty with its old count and a reply that called
+    /// the corrupt result a success.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_drops_a_counted_container_a_delete_empties() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["one", "two"], ["three", "four"]] }],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+
+        // Every container's only entry names the column the delete covers: all
+        // three are emptied and must go, each with a note naming the drop.
+        let emptied = write_fixture(
+            &ws,
+            "emptied-counted.xlsx",
+            &with_parts(
+                &base,
+                &[(
+                    "xl/worksheets/sheet1.xml",
+                    br#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B2"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row></sheetData><dataValidations count="1"><dataValidation type="list" sqref="B2"/></dataValidations><protectedRanges><protectedRange sqref="B1:B2"/></protectedRanges><ignoredErrors><ignoredError sqref="B1:B2" numberStoredAsText="1"/></ignoredErrors></worksheet>"#,
+                )],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "emptied",
+                "path": emptied.to_string_lossy(),
+                "edits": [{ "op": "delete_column", "sheet": "S", "column": "B" }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        for container in ["<dataValidations", "<protectedRanges", "<ignoredErrors"] {
+            assert!(
+                !output.contains(container),
+                "an emptied {container}> with a stale count was left behind: {output}"
+            );
+        }
+        for named in ["data validation", "protected range", "ignored error"] {
+            assert!(
+                reply.contains(named),
+                "the dropped {named} is not named in the answer: {reply}"
+            );
+        }
+        assert!(
+            output.contains(r#"<dimension ref="A1:A2"/>"#),
+            "the shift did not run, so the test proves nothing: {output}"
+        );
+
+        // The partial case: two validations, the delete covers one, so the
+        // container stays and its stated count follows the survivor; a
+        // `<protectedRanges>` with no count at all keeps its open tag as written.
+        let partial = write_fixture(
+            &ws,
+            "partial-counted.xlsx",
+            &with_parts(
+                &base,
+                &[(
+                    "xl/worksheets/sheet1.xml",
+                    br#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B2"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row></sheetData><dataValidations count="2"><dataValidation type="list" sqref="B2"/><dataValidation type="list" sqref="A1"/></dataValidations><protectedRanges><protectedRange sqref="B1:B2"/><protectedRange sqref="A1"/></protectedRanges></worksheet>"#,
+                )],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "partial",
+                "path": partial.to_string_lossy(),
+                "edits": [{ "op": "delete_column", "sheet": "S", "column": "B" }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r#"<dataValidations count="1"><dataValidation type="list" sqref="A1"/></dataValidations>"#),
+            "the count did not follow the surviving validation: {output}"
+        );
+        assert!(
+            output.contains(r#"<protectedRanges><protectedRange sqref="A1"/></protectedRanges>"#),
+            "a count `CT_ProtectedRanges` does not declare was invented, or the survivor was lost: {output}"
+        );
+    }
+
+    /// A `sqref` rewrite stays inside the tag that carries the attribute: a cell
+    /// whose own TEXT reads `sqref="B2"` is content, not an attribute, and an
+    /// unrelated row shift must leave it byte-identical while moving the real
+    /// `sqref` with its cell.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_keeps_sqref_looking_cell_text_through_a_shift() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B2"/><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t xml:space="preserve">sqref="B2"</t></is></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row></sheetData><dataValidations count="1"><dataValidation type="list" sqref="B2"/></dataValidations></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "sqref.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r#"<t xml:space="preserve">sqref="B2"</t>"#),
+            "the cell's own text was rewritten as if it were an attribute: {output}"
+        );
+        assert!(
+            output.contains(r#"sqref="B3"/>"#),
+            "the real sqref attribute did not move with its cell: {output}"
+        );
+    }
+
+    /// A delete shrinks the `<dimension ref>`, every `sqref` token and a
+    /// `<mergeCell>` the same way it shrinks a merge: a range an end of which is
+    /// the deleted line no longer names it, a range the delete covered whole is
+    /// dropped (with a note when it carried an `sqref`), and a one-cell
+    /// `<mergeCell>` the delete does not reach survives byte for byte.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_shrinks_the_dimension_and_sqref_and_keeps_an_untouched_one_cell_merge() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B2"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row></sheetData><dataValidations count="2"><dataValidation type="list" sqref="A1:B2 C2"/><dataValidation type="list" sqref="B2"/></dataValidations><mergeCells count="2"><mergeCell ref="A1:A1"/><mergeCell ref="A2:B2"/></mergeCells></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "shrink.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "delete_column", "sheet": "S", "column": "B" }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r#"<dimension ref="A1:A2"/>"#),
+            "the dimension still names the deleted column: {output}"
+        );
+        assert!(
+            output.contains(r#"<dataValidation type="list" sqref="A1:A2 B2"/>"#),
+            "the sqref range did not shrink: {output}"
+        );
+        assert!(
+            !output.contains(r#"sqref="B2""#),
+            "an sqref the delete covered whole survived: {output}"
+        );
+        assert!(
+            output.contains(r#"<dataValidations count="1">"#),
+            "the data validations count did not follow the dropped entry: {output}"
+        );
+        assert!(
+            reply.contains("data validation's range")
+                && reply.contains("B2")
+                && reply.contains("gone with it"),
+            "the dropped sqref was not named in a note: {reply}"
+        );
+        assert!(
+            output.contains(r#"<mergeCells count="1"><mergeCell ref="A1:A1"/></mergeCells>"#),
+            "the untouched one-cell merge was dropped or the covered one kept: {output}"
+        );
+    }
+
+    /// A row or column shift moves what a sheet's rules and validations carry:
+    /// the range they name AND the references their own formulas hold, so a rule
+    /// keeps testing the cells it was written for. A cell's `<f>` is not rewritten
+    /// (the reply names it instead), a value list is text rather than addresses,
+    /// and a reference qualified with another sheet's name is left alone.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_moves_rule_and_validation_formulas_with_their_ranges() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed", "x"], ["y", "z"]] }],
+                }),
+            )
+            .await,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B2"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row></sheetData><conditionalFormatting sqref="A1:B2"><cfRule type="expression" dxfId="0" priority="1"><formula>$A$1&gt;5</formula></cfRule></conditionalFormatting><dataValidations count="2"><dataValidation type="list" sqref="B2"><formula1>"yes,no"</formula1></dataValidation><dataValidation type="list" sqref="A1:A2"><formula1>$A$1:$A$2</formula1></dataValidation></dataValidations></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "rules.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r"<formula>$A$2&gt;5</formula>"),
+            "the conditional format's formula did not move with its range: {output}"
+        );
+        assert!(
+            output.contains(r"<formula1>$A$2:$A$3</formula1>"),
+            "the validation's formula did not move with its range: {output}"
+        );
+        assert!(
+            output.contains(r#"<formula1>"yes,no"</formula1>"#),
+            "a value list is text, not addresses: {output}"
+        );
+
+        let referencing = sheet.replace(
+            "<formula1>$A$1:$A$2</formula1>",
+            "<formula1>Other!$A$1</formula1><formula2>$A$2&gt;5</formula2>",
+        );
+        let other = write_fixture(
+            &ws,
+            "other.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", referencing.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": other.to_string_lossy(),
+                "edits": [{ "op": "delete_row", "sheet": "S", "row": 2 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r"<formula1>Other!$A$1</formula1>"),
+            "a reference qualified with another sheet's name is not this sheet's: {output}"
+        );
+        assert!(
+            output.contains(r"<formula2>#REF!&gt;5</formula2>"),
+            "a reference the delete took must not name the cell that shifted in: {output}"
+        );
+    }
+
+    /// The extended rule Excel writes in an `<extLst>` beside a base conditional
+    /// format or data validation — the same range in an `<xm:sqref>` child and the
+    /// formula in an `<xm:f>` child — moves with the base rule, and so do a
+    /// whole-column range and a reference the file qualified with this sheet's own
+    /// name. An extended rule whose range the delete took goes with it, and its
+    /// container's `count` follows.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_moves_whole_line_and_qualified_rule_ranges_with_their_extended_twins() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [[1, 2, 3, 4], [5, 6, 7, 8]] }],
+                }),
+            )
+            .await,
+        );
+        // The base rules name whole columns and a range the file qualified with the
+        // sheet's own name; the extended twins hold the same in `xm:` children, and
+        // the second validation's range is the column the edit deletes.
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:D2"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c><c r="C1"><v>3</v></c><c r="D1"><v>4</v></c></row><row r="2"><c r="A2"><v>5</v></c><c r="B2"><v>6</v></c><c r="C2"><v>7</v></c><c r="D2"><v>8</v></c></row></sheetData><conditionalFormatting sqref="B:D"><cfRule type="expression" dxfId="0" priority="1"><formula>SUM($B:$D)&gt;0</formula></cfRule></conditionalFormatting><dataValidations count="1"><dataValidation type="list" sqref="C:C"><formula1>S!$B$1:$B$5</formula1></dataValidation></dataValidations><extLst><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}"><x14:conditionalFormattings xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:conditionalFormatting xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:cfRule type="expression" priority="1" id="{AAAA}"><xm:f>SUM($B:$D)&gt;0</xm:f></x14:cfRule><xm:sqref>B:D</xm:sqref></x14:conditionalFormatting><x14:conditionalFormatting xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:cfRule type="expression" priority="2" id="{EEEE}"><xm:f>$A$1&gt;0</xm:f></x14:cfRule><xm:sqref>A:A</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext><ext uri="{11111111-2222-3333-4444-555555555555}"><x14:conditionalFormattings xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:conditionalFormatting xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:cfRule type="expression" priority="3" id="{FFFF}"><xm:f>$A$2&gt;0</xm:f></x14:cfRule><xm:sqref>A1:A2</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext><ext uri="{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}"><x14:dataValidations count="2" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:dataValidation type="list" allowBlank="1"><x14:formula1><xm:f>S!$B$1:$B$5</xm:f></x14:formula1><xm:sqref>C:C</xm:sqref></x14:dataValidation><x14:dataValidation type="list" allowBlank="1"><x14:formula1><xm:f>A1</xm:f></x14:formula1><xm:sqref>A:A</xm:sqref></x14:dataValidation></x14:dataValidations></ext></extLst></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "extended.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "delete_column", "sheet": "S", "column": "A" }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r#"sqref="A:C""#),
+            "the whole-column rule range did not move with the delete: {output}"
+        );
+        assert!(
+            output.contains(r"<formula>SUM($A:$C)&gt;0</formula>"),
+            "a whole-column range in the rule's formula did not move: {output}"
+        );
+        assert!(
+            output.contains(r#"<dataValidation type="list" sqref="B:B">"#),
+            "the validation's whole-column range did not move: {output}"
+        );
+        assert!(
+            output.contains(r"<formula1>S!$A$1:$A$5</formula1>"),
+            "a reference the file qualified with this sheet's own name did not move: {output}"
+        );
+        assert!(
+            output.contains(r"<xm:sqref>A:C</xm:sqref>")
+                && output.contains(r"<xm:f>SUM($A:$C)&gt;0</xm:f>"),
+            "the extended conditional format did not move with its base rule: {output}"
+        );
+        assert!(
+            output.contains(r"<xm:sqref>B:B</xm:sqref>")
+                && output.contains(r"<xm:f>S!$A$1:$A$5</xm:f>"),
+            "the extended validation did not move with its base rule: {output}"
+        );
+        assert!(
+            !output.contains("<xm:sqref>A:A</xm:sqref>") && output.contains(r#"count="1""#),
+            "an extended rule the delete emptied was kept: {output}"
+        );
+        assert!(
+            !output.contains("null") && output.matches("<x14:conditionalFormattings").count() == 1,
+            "a dropped extended conditional format left its container (or a literal null): {output}"
+        );
+        assert!(
+            reply.contains("extended data validation")
+                && reply.contains("extended conditional format"),
+            "a dropped extended range is not named: {reply}"
+        );
+    }
+
+    /// A workbook whose relationships cannot name its sheets is edited where it is
+    /// read: the reader falls back to the conventionally numbered worksheet part,
+    /// and the edit does the same instead of refusing a file it can read.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_falls_back_to_the_conventional_sheet_part() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["before"]] }],
+                }),
+            )
+            .await,
+        );
+        let source = write_fixture(
+            &ws,
+            "no-rels.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[(
+                    "xl/_rels/workbook.xml.rels",
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
+                )],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "set_cell", "sheet": "S", "cell": "A1", "value": "after" }],
+            }),
+        )
+        .await;
+        let text = converted_text(&ws, &single(&reply)).await;
+        assert!(
+            text.contains("after"),
+            "the edit did not reach the sheet the reader reads: {text}"
+        );
+    }
+
+    /// An insert past the used range writes the empty line it was asked for and
+    /// moves no address: the addresses a writer left implicit are not materialized,
+    /// and the caveats about a workbook's charts are owed only for a change of the
+    /// sheet's content, which this is not.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_insert_past_the_used_range_moves_no_address() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["one"], ["two"]] }],
+                }),
+            )
+            .await,
+        );
+        // The rows carry no `r` of their own — the case a materializing shift would
+        // rewrite — and the workbook holds a chart, whose caveat is keyed on a real
+        // change.
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row><c r="A1" t="inlineStr"><is><t>one</t></is></c></row><row><c r="A2" t="inlineStr"><is><t>two</t></is></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "addressless.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[
+                    ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+                    (
+                        "xl/charts/chart1.xml",
+                        br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"/>"#,
+                    ),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "S", "row": 3 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            !output.contains(r#"<row r="1">"#) && !output.contains(r#"<row r="2">"#),
+            "an insert that moved nothing materialized the sheet's addresses: {output}"
+        );
+        assert!(
+            output.contains(r#"<row r="3"/>"#),
+            "the inserted line is not in the sheet: {output}"
+        );
+        assert!(
+            !reply.contains("charts"),
+            "a chart caveat is raised for a shift that moved nothing: {reply}"
+        );
+    }
+
+    /// A delete removes content even when it moves no surviving address: deleting
+    /// the sheet's last used line leaves nothing to shift, and both the caveat about
+    /// a workbook's charts and the parts anchored on the line it took are owed for
+    /// the content it removed — the anchored part names a cell that is gone, and the
+    /// shift that moved nothing must not keep that quiet.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_names_a_delete_without_a_shift_and_the_parts_anchored_on_it() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["one"], ["two"], ["three"], ["four"], ["five"]] }],
+                }),
+            )
+            .await,
+        );
+        // A product-created sheet carries no `<dimension>`, so deleting its last
+        // line is a removal that shifts nothing at all, and the comment is anchored
+        // on that line.
+        let base = std::fs::read(&created).expect("read base package");
+        let anchored = |reference: &str| {
+            let comments = format!(
+                r#"<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>a</author></authors><commentList><comment ref="{reference}" authorId="0"><text><t>note</t></text></comment></commentList></comments>"#
+            );
+            with_parts(
+                &base,
+                &[
+                    (
+                        "xl/charts/chart1.xml",
+                        br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"/>"#,
+                    ),
+                    (
+                        "xl/worksheets/_rels/sheet1.xml.rels",
+                        br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/></Relationships>"#,
+                    ),
+                    ("xl/comments1.xml", comments.as_bytes()),
+                ],
+            )
+        };
+        let source = write_fixture(&ws, "chart.xlsx", &anchored("A5"));
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "delete_row", "sheet": "S", "row": 5 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            !output.contains("A5"),
+            "the deleted line is still in the sheet: {output}"
+        );
+        assert!(
+            reply.contains("charts"),
+            "a delete that took the sheet's last line says nothing about its chart: {reply}"
+        );
+        assert!(
+            reply.contains("comments"),
+            "a delete that took the sheet's last line says nothing about the comment on it: {reply}"
+        );
+
+        // The same delete with the comment on a line it does not touch: the chart
+        // caveat is still owed, and no part is claimed for a cell that stayed.
+        let elsewhere = write_fixture(&ws, "chart-anchored.xlsx", &anchored("A3"));
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": elsewhere.to_string_lossy(),
+                "edits": [{ "op": "delete_row", "sheet": "S", "row": 5 }],
+            }),
+        )
+        .await;
+        assert!(
+            reply.contains("charts"),
+            "a delete that took content says nothing about its chart: {reply}"
+        );
+        assert!(
+            !reply.contains("comments"),
+            "a delete below the comment named a part the shift did not move: {reply}"
+        );
+    }
+
+    /// A `<brk id>` names the BOUNDARY a manual page break sits at — the number of
+    /// lines above it — not the line it is written for: a break at or below the line
+    /// that went moves up with it, one above it stays, an insert pushes one at or
+    /// beyond the point down, and a break at the sheet's own top cannot move past it.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_moves_a_page_break_by_its_boundary() {
+        use std::fmt::Write as _;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["one"], ["two"], ["three"], ["four"]] }],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        let rows = |last: u32| -> String {
+            (1..=last).fold(String::new(), |mut acc, n| {
+                write!(
+                    acc,
+                    r#"<row r="{n}"><c r="A{n}" t="inlineStr"><is><t>v{n}</t></is></c></row>"#
+                )
+                .expect("write");
+                acc
+            })
+        };
+        let breaks = |id: u32| {
+            format!(
+                r#"<rowBreaks count="1" manualBreakCount="1"><brk id="{id}" max="16383" man="1"/></rowBreaks>"#
+            )
+        };
+        let sheet = |body: String| {
+            format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{body}</sheetData></worksheet>"#
+            )
+        };
+        let with_sheet =
+            |body: String| with_parts(&base, &[("xl/worksheets/sheet1.xml", body.as_bytes())]);
+        // Rows 1-4 with a break between rows 3 and 4: three rows above it.
+        let source = write_fixture(
+            &ws,
+            "breaks.xlsx",
+            &with_sheet(sheet(format!("{}{}", rows(4), breaks(3)))),
+        );
+        let top = write_fixture(
+            &ws,
+            "breaks-top.xlsx",
+            &with_sheet(sheet(format!("{}{}", rows(1), breaks(1)))),
+        );
+
+        for (row, op, want, what) in [
+            (
+                3,
+                "delete_row",
+                r#"id="2""#,
+                "a break below the deleted line moves up",
+            ),
+            (
+                3,
+                "insert_row",
+                r#"id="4""#,
+                "a break at the insert point moves down",
+            ),
+            (
+                4,
+                "delete_row",
+                r#"id="3""#,
+                "a break above the deleted line stays",
+            ),
+        ] {
+            let reply = run(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "file_name": "edited",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": op, "sheet": "S", "row": row }],
+                }),
+            )
+            .await;
+            let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+            assert!(output.contains(want), "{what}: the break reads {output}");
+            assert_eq!(
+                output.matches("<brk ").count(),
+                1,
+                "the break was lost by {op} {row}: {output}"
+            );
+        }
+
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": top.to_string_lossy(),
+                "edits": [{ "op": "delete_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r#"id="1""#),
+            "a break at the sheet's top left the grid: {output}"
+        );
+    }
+
+    /// A rule element that names no range is content the edit never named, so a
+    /// shift leaves it as it is; a rule whose range the delete took goes whole, and
+    /// so do the container that held it and the `<ext>`/`<extLst>` wrappers around
+    /// that — an emptied wrapper carries nothing.
+    #[expect(clippy::too_many_lines)] // reason: a nameless rule, a dropped one and one dropped beside a surviving wrapper
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_keeps_a_rule_that_named_no_range_and_drops_the_emptied_wrappers() {
+        use std::fmt::Write as _;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["one"], ["two"], ["three"]] }],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        let rows: String = (1..=3).fold(String::new(), |mut acc, n| {
+            write!(
+                acc,
+                r#"<row r="{n}"><c r="A{n}" t="inlineStr"><is><t>v{n}</t></is></c><c r="C{n}" t="inlineStr"><is><t>w{n}</t></is></c></row>"#
+            )
+            .expect("write");
+            acc
+        });
+        let rule = |sqref: &str| {
+            format!(
+                r#"<extLst><ext uri="{{78C0D931-6437-407d-A8EE-F0AAD7539E65}}"><x14:conditionalFormattings xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:conditionalFormatting><x14:cfRule type="expression" priority="1" id="{{AAAA}}"><xm:f>TRUE</xm:f></x14:cfRule>{sqref}</x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#
+            )
+        };
+        let sheet = |body: String| {
+            format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{rows}</sheetData>{body}</worksheet>"#
+            )
+        };
+
+        // A rule naming no range at all: nothing to move and nothing the edit
+        // covered, so the element stays.
+        let nameless = write_fixture(
+            &ws,
+            "nameless.xlsx",
+            &with_parts(
+                &base,
+                &[(
+                    "xl/worksheets/sheet1.xml",
+                    sheet(rule("<xm:sqref/>")).as_bytes(),
+                )],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": nameless.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains("<x14:conditionalFormatting>"),
+            "a rule naming no range was dropped by the shift: {output}"
+        );
+        assert!(
+            !reply.contains("gone with it"),
+            "a rule naming no range was reported as a loss: {reply}"
+        );
+
+        // A rule over the column the delete takes: the rule, its container and both
+        // wrappers go, and the answer names the drop.
+        let dropped = write_fixture(
+            &ws,
+            "dropped-rule.xlsx",
+            &with_parts(
+                &base,
+                &[(
+                    "xl/worksheets/sheet1.xml",
+                    sheet(rule("<xm:sqref>C1:C2</xm:sqref>")).as_bytes(),
+                )],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": dropped.to_string_lossy(),
+                "edits": [{ "op": "delete_column", "sheet": "S", "column": "C" }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        for gone in ["x14:conditionalFormatting", "<ext ", "<extLst>"] {
+            assert!(
+                !output.contains(gone),
+                "the emptied wrapper {gone} was left behind: {output}"
+            );
+        }
+        assert!(
+            reply.contains("gone with it"),
+            "the dropped rule is not named: {reply}"
+        );
+
+        // A wrapper the delete empties goes while one beside it stays: a
+        // self-closing `<ext/>` the edit never named survives, so the `<extLst>`
+        // still holds a wrapper and stays. A wrapper written without a `uri`
+        // attribute is no different from one with it: it goes with its emptied
+        // container rather than being left as an empty `<ext></ext>`.
+        let beside = write_fixture(
+            &ws,
+            "beside-emptied.xlsx",
+            &with_parts(
+                &base,
+                &[(
+                    "xl/worksheets/sheet1.xml",
+                    sheet(
+                        r#"<extLst><ext uri="{AAA}"/><ext><x14:conditionalFormattings xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:conditionalFormatting><x14:cfRule type="expression" priority="1" id="{AAAA}"><xm:f>TRUE</xm:f></x14:cfRule><xm:sqref>C1:C2</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#
+                            .to_string(),
+                    )
+                    .as_bytes(),
+                )],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": beside.to_string_lossy(),
+                "edits": [{ "op": "delete_column", "sheet": "S", "column": "C" }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r#"<ext uri="{AAA}"/>"#),
+            "a self-closing wrapper the edit never named was dropped: {output}"
+        );
+        assert!(
+            output.contains("<extLst>") && output.contains("</extLst>"),
+            "the wrapper still holding an extension was dropped with its emptied twin: {output}"
+        );
+        assert!(
+            !output.contains("<ext></ext>") && !output.contains("x14:conditionalFormatting"),
+            "an emptied wrapper written without a uri was left behind: {output}"
+        );
+    }
+
+    /// An extension payload the edit never named — a plain-text `<ext>` beside a
+    /// real extended conditional format — is content, not something a shift may
+    /// touch: the payload and its `<ext>` stay byte-identical, the `<extLst>` that
+    /// still holds both stays, and only the rule's own `<xm:sqref>` moves.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_keeps_an_extension_payload_the_edit_never_named() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["one"], ["two"], ["three"]] }],
+                }),
+            )
+            .await,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>v1</t></is></c><c r="B1" t="inlineStr"><is><t>w1</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>v2</t></is></c><c r="B2" t="inlineStr"><is><t>w2</t></is></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>v3</t></is></c><c r="B3" t="inlineStr"><is><t>w3</t></is></c></row></sheetData><extLst><ext uri="{AAA}">plain text payload</ext><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}"><x14:conditionalFormattings xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:conditionalFormatting><x14:cfRule type="expression" priority="1" id="{AAAA}"><xm:f>TRUE</xm:f></x14:cfRule><xm:sqref>B1:B2</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "plain-ext.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r#"<ext uri="{AAA}">plain text payload</ext>"#),
+            "the extension payload the edit never named was rewritten: {output}"
+        );
+        assert!(
+            output.contains("<xm:sqref>B2:B3</xm:sqref>"),
+            "the extended rule's range did not move with the shift: {output}"
+        );
+        assert!(
+            output.contains("<extLst>") && output.contains("</extLst>"),
+            "the extension list holding an untouched payload was dropped: {output}"
+        );
+    }
+
+    /// A sheet that holds an empty `<extLst>` keeps it through a shift that changes
+    /// the sheet — in either spelling, because the pair `<extLst></extLst>` holds
+    /// nothing just as a `<extLst/>` does, and an element that held nothing is not
+    /// this pass's to remove. Only a list the pass EMPTIED goes with its last
+    /// wrapper (the schema requires a child), which the emptied-wrapper test covers.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_leaves_an_empty_ext_lst_alone() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["one"], ["two"]] }],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        for (name, spelling) in [
+            ("empty-ext-lst.xlsx", "<extLst/>"),
+            ("empty-ext-lst-paired.xlsx", "<extLst></extLst>"),
+        ] {
+            let sheet = format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row></sheetData>{spelling}</worksheet>"#
+            );
+            let source = write_fixture(
+                &ws,
+                name,
+                &with_parts(&base, &[("xl/worksheets/sheet1.xml", sheet.as_bytes())]),
+            );
+            let reply = run(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "file_name": "edited",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "insert_row", "sheet": "S", "row": 1 }],
+                }),
+            )
+            .await;
+            let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+            assert!(
+                output.contains(spelling),
+                "an empty extension list ({spelling}) was rewritten by a shift that changed the sheet: {output}"
+            );
+            assert!(
+                output.contains(r#"<row r="1"/>"#),
+                "the shift did not change the sheet, so the test proves nothing: {output}"
+            );
+        }
+    }
+
+    /// A counted container may hold a member this pass never names — the `extLst`
+    /// the schema allows inside `<ignoredErrors>`: a shift moves the entry's range
+    /// where it stands and leaves that member, and no `count` is invented for a
+    /// container whose schema declares none.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_keeps_a_member_of_a_container_it_does_not_name() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["one", "two"], ["three", "four"]] }],
+                }),
+            )
+            .await,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row></sheetData><ignoredErrors><ignoredError sqref="B1:B2" numberStoredAsText="1"/><extLst><ext uri="{AAA}">keep me</ext></extLst></ignoredErrors></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "ignored-errors.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r#"<ignoredError sqref="B2:B3""#),
+            "the ignored error's range did not move with the shift: {output}"
+        );
+        assert!(
+            output.contains(r#"<extLst><ext uri="{AAA}">keep me</ext></extLst>"#),
+            "a member of the container the edit never named was rewritten: {output}"
+        );
+        assert!(
+            output.contains("<ignoredErrors>") && !output.contains("ignoredErrors count="),
+            "a count was invented for a container whose schema declares none: {output}"
+        );
+    }
+
+    /// A formula that a shift cannot rewrite because it sits in ANOTHER sheet is
+    /// named: the reference it qualifies with this sheet's name keeps naming cells
+    /// that moved, and the other part is left byte-identical. A formula naming only
+    /// the sheet it sits on is not this shift's business.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_names_a_formula_another_sheet_writes_about_this_one() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "Data", "rows": [[1], [2], [3]] }],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        let workbook = part_text_bytes(&base, "xl/workbook.xml").replace(
+            "</sheets>",
+            r#"<sheet name="Totals" sheetId="2" r:id="rId9"/></sheets>"#,
+        );
+        let rels = part_text_bytes(&base, "xl/_rels/workbook.xml.rels").replace(
+            "</Relationships>",
+            r#"<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#,
+        );
+        // One cell names the shifted sheet's range, another only its own.
+        let totals = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B1"/><sheetData><row r="1"><c r="A1"><f>SUM(Data!A1:A3)</f><v>6</v></c><c r="B1"><f>SUM(A1:A1)</f><v>1</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "cross-sheet.xlsx",
+            &with_parts(
+                &base,
+                &[
+                    ("xl/workbook.xml", workbook.as_bytes()),
+                    ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+                    ("xl/worksheets/sheet2.xml", totals.as_bytes()),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "Data", "row": 1 }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        assert!(
+            reply.contains("other sheets' formulas"),
+            "a formula another sheet writes about this one is not named: {reply}"
+        );
+        assert_eq!(
+            part_text(&output, "xl/worksheets/sheet2.xml"),
+            totals,
+            "the other sheet's part was rewritten"
+        );
+
+        // Shifting the other sheet: its own formula's reference to this one is not
+        // this shift's business, and its bare reference is not reported either.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "Totals", "row": 1 }],
+            }),
+        )
+        .await;
+        assert!(
+            !reply.contains("other sheets' formulas"),
+            "a formula naming another sheet is claimed by the wrong shift: {reply}"
+        );
+    }
+
+    /// A reference the file qualified with a sheet name carrying punctuation is
+    /// spelled escaped in the part (`'R&amp;D'!…`) while the workbook's own name is
+    /// not: the qualifier is unescaped before it is compared, so the rule moves
+    /// with the shift and another sheet's formula naming the sheet is named, its
+    /// part left byte-identical.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_moves_a_reference_qualified_with_an_escaped_sheet_name() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "R&D", "rows": [["a"], ["b"]] }],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        let workbook = part_text_bytes(&base, "xl/workbook.xml").replace(
+            "</sheets>",
+            r#"<sheet name="Totals" sheetId="2" r:id="rId9"/></sheets>"#,
+        );
+        let rels = part_text_bytes(&base, "xl/_rels/workbook.xml.rels").replace(
+            "</Relationships>",
+            r#"<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B2"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row></sheetData><conditionalFormatting sqref="B1:B2"><cfRule type="expression" dxfId="0" priority="1"><formula>COUNTIF('R&amp;D'!$A$1:$A$2,1)</formula></cfRule></conditionalFormatting></worksheet>"#;
+        let totals = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1"/><sheetData><row r="1"><c r="A1"><f>SUM('R&amp;D'!A1:A2)</f><v>3</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "escaped-sheet.xlsx",
+            &with_parts(
+                &base,
+                &[
+                    ("xl/workbook.xml", workbook.as_bytes()),
+                    ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+                    ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+                    ("xl/worksheets/sheet2.xml", totals.as_bytes()),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "R&D", "row": 1 }],
+            }),
+        )
+        .await;
+        let out = single(&reply);
+        let output = part_text(&out, "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r"<formula>COUNTIF('R&amp;D'!$A$2:$A$3,1)</formula>"),
+            "a reference qualified with an escaped sheet name did not move: {output}"
+        );
+        assert!(
+            output.contains(r#"sqref="B2:B3""#),
+            "the rule's range did not move: {output}"
+        );
+        assert!(
+            reply.contains("other sheets' formulas"),
+            "another sheet's formula naming this one is not named: {reply}"
+        );
+        assert_eq!(
+            part_text(&out, "xl/worksheets/sheet2.xml"),
+            totals,
+            "the other sheet's part was rewritten"
+        );
+    }
+
+    /// A sheet name needs no quoting when it carries no space or punctuation, so
+    /// Excel writes a same-sheet validation list as `Данные!$B$2:$B$4`: the bare
+    /// qualifier takes letters of any script, so the reference moves with the shift
+    /// and another sheet's formula naming the sheet is named, its part untouched.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_moves_a_reference_qualified_with_a_non_ascii_sheet_name() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "Данные", "rows": [["a"], ["b"], ["c"], ["d"]] }],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        let workbook = part_text_bytes(&base, "xl/workbook.xml").replace(
+            "</sheets>",
+            r#"<sheet name="Totals" sheetId="2" r:id="rId9"/></sheets>"#,
+        );
+        let rels = part_text_bytes(&base, "xl/_rels/workbook.xml.rels").replace(
+            "</Relationships>",
+            r#"<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:C4"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row><row r="3"><c r="A3"><v>5</v></c></row><row r="4"><c r="A4"><v>6</v></c></row></sheetData><dataValidations count="1"><dataValidation type="list" sqref="C1:C4"><formula1>Данные!$B$2:$B$4</formula1></dataValidation></dataValidations></worksheet>"#;
+        let totals = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1"/><sheetData><row r="1"><c r="A1"><f>SUM(Данные!A1:A2)</f><v>3</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "non-ascii-sheet.xlsx",
+            &with_parts(
+                &base,
+                &[
+                    ("xl/workbook.xml", workbook.as_bytes()),
+                    ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+                    ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+                    ("xl/worksheets/sheet2.xml", totals.as_bytes()),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "Данные", "row": 1 }],
+            }),
+        )
+        .await;
+        let out = single(&reply);
+        let output = part_text(&out, "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r"<formula1>Данные!$B$3:$B$5</formula1>"),
+            "a reference qualified with a non-ascii sheet name did not move: {output}"
+        );
+        assert!(
+            output.contains(r#"<dataValidation type="list" sqref="C2:C5">"#),
+            "the validation's range did not move: {output}"
+        );
+        assert!(
+            reply.contains("other sheets' formulas"),
+            "another sheet's formula naming this one is not named: {reply}"
+        );
+        assert_eq!(
+            part_text(&out, "xl/worksheets/sheet2.xml"),
+            totals,
+            "the other sheet's part was rewritten"
+        );
+    }
+
+    /// A cell's own TEXT is content, not a formula: a string that reads like a
+    /// qualified reference raises no note about another sheet's formulas.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_does_not_read_a_cell_text_as_another_sheet_formula() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"], ["two"]] }],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        let workbook = part_text_bytes(&base, "xl/workbook.xml").replace(
+            "</sheets>",
+            r#"<sheet name="Totals" sheetId="2" r:id="rId9"/></sheets>"#,
+        );
+        let rels = part_text_bytes(&base, "xl/_rels/workbook.xml.rels").replace(
+            "</Relationships>",
+            r#"<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#,
+        );
+        // The cell's text reads like a qualified reference, but it is a string
+        // rather than a `<f>`: the scan for another sheet's formulas must not see it.
+        let totals = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1"/><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t xml:space="preserve">see S!A1:A2 for the numbers</t></is></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "text-not-formula.xlsx",
+            &with_parts(
+                &base,
+                &[
+                    ("xl/workbook.xml", workbook.as_bytes()),
+                    ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+                    ("xl/worksheets/sheet2.xml", totals.as_bytes()),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        let out = single(&reply);
+        assert!(
+            !reply.contains("other sheets' formulas"),
+            "a cell's own text was read as another sheet's formula: {reply}"
+        );
+        assert_eq!(
+            part_text(&out, "xl/worksheets/sheet2.xml"),
+            totals,
+            "the other sheet's part was rewritten"
+        );
+    }
+
+    /// A cell's own formula keeps its text — rewriting its references is a
+    /// spreadsheet engine's job — and the reply names it rather than passing the
+    /// stale reference off as preserved. A formula naming nothing the shift moved
+    /// is left out of that count: its text means exactly what it did.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_leaves_a_cell_formula_and_names_it() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed", "x"], ["y", "z"]] }],
+                }),
+            )
+            .await,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B2"/><sheetData><row r="1"><c r="A1"><f>A2+A3</f><v>7</v></c><c r="B1"><f>A1*2</f><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "cell-formula.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "delete_row", "sheet": "S", "row": 2 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains("<f>A2+A3</f>"),
+            "a cell's own formula is not rewritten: {output}"
+        );
+        assert!(
+            reply.contains("1 formula was left as it is"),
+            "the cell formula was not named in the reply: {reply}"
+        );
+        assert!(
+            !reply.contains("2 formulas"),
+            "a formula naming nothing the shift moved is counted: {reply}"
+        );
+    }
+
+    /// A shifted address stays inside the sheet's grid: a `<col>` covering the
+    /// whole grid keeps its last column, and a page break on the grid's last line
+    /// stays there instead of naming a line the grid does not have.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_keeps_a_shifted_address_inside_the_grid() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B2"/><cols><col min="1" max="16384" width="9"/></cols><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c></row></sheetData><rowBreaks count="1" manualBreakCount="1"><brk id="1048576" max="16383" man="1"/></rowBreaks><colBreaks count="1" manualBreakCount="1"><brk id="16384" max="1048575" man="1"/></colBreaks></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "grid.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_column", "sheet": "S", "column": "A" }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains(r#"<col min="2" max="16384" width="9"/>"#),
+            "the column range was pushed past the grid: {output}"
+        );
+        assert!(
+            !output.contains("XFE"),
+            "a cell named a column the grid does not have: {output}"
+        );
+        assert!(
+            output.contains(r#"<brk id="16384" max="1048575" man="1"/>"#),
+            "a column break was pushed past the grid: {output}"
+        );
+
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            !output.contains(r#"r="1048577""#) && !output.contains(r#"<brk id="1048577""#),
+            "a row was pushed past the grid: {output}"
+        );
+        assert!(
+            output.contains(r#"<brk id="1048576" max="16383" man="1"/>"#),
+            "the row break of the last row must stay inside the grid: {output}"
+        );
+    }
+
+    /// An insert that would push a line past the sheet's grid is refused: the
+    /// pushed line would have to keep the last line's own address, so the caller
+    /// is told to insert where there is room instead of being handed an ambiguous
+    /// sheet.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_refuses_an_insert_that_would_pass_the_grid() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
+        for (name, sheet, edit) in [
+            (
+                "last-row.xlsx",
+                r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1048576"><c r="A1048576"><v>1</v></c></row></sheetData></worksheet>"#,
+                json!({ "op": "insert_row", "sheet": "S", "row": 1_048_576 }),
+            ),
+            (
+                "last-column.xlsx",
+                r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="XFD1"><v>1</v></c></row></sheetData></worksheet>"#,
+                json!({ "op": "insert_column", "sheet": "S", "column": "XFD" }),
+            ),
+        ] {
+            let source = write_fixture(
+                &ws,
+                name,
+                &with_parts(
+                    &std::fs::read(&created).expect("read base package"),
+                    &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+                ),
+            );
+            let error = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "xlsx_edit", "file_name": "edited",
+                        "path": source.to_string_lossy(),
+                        "edits": [edit],
+                    }),
+                )
+                .await
+                .expect_err("an insert the grid cannot hold must be refused");
+            assert!(
+                error.to_string().contains("past the sheet's grid"),
+                "{name}: the refusal does not name the grid: {error}"
+            );
+        }
+    }
+
+    /// A `set_cell` widens `<dimension ref>` so it covers the written cell, the
+    /// way a row or column shift keeps the ref level with the cells, while a write
+    /// inside the declared reach leaves the ref alone.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_set_cell_widens_the_dimension_it_writes_outside() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B2"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "dimension.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+
+        let outside = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "outside",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "set_cell", "sheet": "S", "cell": "D5", "value": 9 }],
+            }),
+        )
+        .await;
+        let widened = part_text(&single(&outside), "xl/worksheets/sheet1.xml");
+        assert!(
+            widened.contains(r#"<dimension ref="A1:D5"/>"#),
+            "the dimension does not cover the written cell: {widened}"
+        );
+
+        let inside = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "inside",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "set_cell", "sheet": "S", "cell": "A1", "value": 5 }],
+            }),
+        )
+        .await;
+        let kept = part_text(&single(&inside), "xl/worksheets/sheet1.xml");
+        assert!(
+            kept.contains(r#"<dimension ref="A1:B2"/>"#),
+            "a write inside the reach changed the dimension: {kept}"
+        );
+    }
+
+    /// A shift leaves the workbook's defined names and the sheet's table ranges
+    /// pointing at the old cells, and a signed package's signature no longer
+    /// matches: the reply names each rather than staying silent.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_names_the_stale_references_and_signature_it_cannot_rewrite() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        let workbook = part_text_bytes(&base, "xl/workbook.xml").replace(
+            "</workbook>",
+            "<definedNames><definedName name=\"Total\">S!$B$2</definedName></definedNames></workbook>",
+        );
+        let sheet = part_text_bytes(&base, "xl/worksheets/sheet1.xml").replace(
+            "</worksheet>",
+            "<tableParts count=\"1\"><tablePart r:id=\"rId9\"/></tableParts>\
+             <legacyDrawing r:id=\"rId3\"/><drawing r:id=\"rId4\"/></worksheet>",
+        );
+        let package = with_parts(
+            &base,
+            &[
+                ("xl/workbook.xml", workbook.as_bytes()),
+                ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+                (
+                    "xl/tables/table1.xml",
+                    br#"<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="T" displayName="T" ref="A1:B2"/>"#,
+                ),
+                // The sheet's cell-anchored parts: a comment's own `ref`, the VML
+                // shape it is drawn with and a floating drawing's anchor all name
+                // a cell a row or column shift moves, and none is rewritten.
+                (
+                    "xl/worksheets/_rels/sheet1.xml.rels",
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing" Target="../drawings/vmlDrawing1.vml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#,
+                ),
+                (
+                    "xl/comments1.xml",
+                    br#"<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>a</author></authors><commentList><comment ref="B2" authorId="0"><text><t>note</t></text></comment></commentList></comments>"#,
+                ),
+                (
+                    "xl/drawings/drawing1.xml",
+                    br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"><xdr:twoCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:row>1</xdr:row></xdr:from><xdr:to><xdr:col>3</xdr:col><xdr:row>3</xdr:row></xdr:to></xdr:twoCellAnchor></xdr:wsDr>"#,
+                ),
+                (
+                    "_xmlsignatures/sig1.xml",
+                    br#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo/></Signature>"#,
+                ),
+                (
+                    "_xmlsignatures/_rels/origin.sigs.rels",
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
+                ),
+            ],
+        );
+        let source = write_fixture(&ws, "signed.xlsx", &package);
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        assert!(
+            reply.contains("defined names"),
+            "the stale defined names are not named: {reply}"
+        );
+        assert!(
+            reply.contains("table ranges"),
+            "the stale table ranges are not named: {reply}"
+        );
+        for anchored in ["comments", "comment shapes", "drawing anchors"] {
+            assert!(
+                reply.contains(anchored),
+                "the cell-anchored {anchored} a shift left in place are not named: {reply}"
+            );
+        }
+        assert!(
+            reply.contains("digital signature"),
+            "the broken signature is not named: {reply}"
+        );
+    }
+
+    /// A part whose own addresses the shift moved with the cells is as valid as it
+    /// was: a comment, a table range, a defined name and a drawing anchor all above
+    /// the deleted line are not named, because nothing about them went stale.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_names_no_part_the_shift_did_not_move() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["a"], ["b"], ["c"], ["d"], ["e"]] }],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        let workbook = part_text_bytes(&base, "xl/workbook.xml").replace(
+            "</workbook>",
+            "<definedNames><definedName name=\"Total\">S!$A$1</definedName></definedNames></workbook>",
+        );
+        let sheet = part_text_bytes(&base, "xl/worksheets/sheet1.xml").replace(
+            "</worksheet>",
+            "<tableParts count=\"1\"><tablePart r:id=\"rId9\"/></tableParts>\
+             <legacyDrawing r:id=\"rId3\"/><drawing r:id=\"rId4\"/></worksheet>",
+        );
+        let package = with_parts(
+            &base,
+            &[
+                ("xl/workbook.xml", workbook.as_bytes()),
+                ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+                (
+                    "xl/worksheets/_rels/sheet1.xml.rels",
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing" Target="../drawings/vmlDrawing1.vml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>"#,
+                ),
+                (
+                    "xl/comments1.xml",
+                    br#"<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>a</author></authors><commentList><comment ref="B1" authorId="0"><text><t>note</t></text></comment></commentList></comments>"#,
+                ),
+                (
+                    "xl/drawings/vmlDrawing1.vml",
+                    br#"<xml xmlns:v="urn:schemas-microsoft-com:vml"><v:shape id="s"/></xml>"#,
+                ),
+                (
+                    "xl/drawings/drawing1.xml",
+                    br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"><xdr:twoCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:row>0</xdr:row></xdr:from><xdr:to><xdr:col>3</xdr:col><xdr:row>1</xdr:row></xdr:to></xdr:twoCellAnchor></xdr:wsDr>"#,
+                ),
+                (
+                    "xl/tables/table1.xml",
+                    br#"<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="T" displayName="T" ref="A1:B2"/>"#,
+                ),
+            ],
+        );
+        let source = write_fixture(&ws, "anchored-above.xlsx", &package);
+        // The delete takes row 3 and moves rows 4-5 up, so the shift really changed
+        // the sheet — every part above it names a cell it did not touch.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "delete_row", "sheet": "S", "row": 3 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            !output.contains(">c<") && output.contains(">e<"),
+            "the delete did not take the line it named: {output}"
+        );
+        assert!(
+            !reply.contains("pointing at the old cells"),
+            "a part the shift moved with its cells is named as stale: {reply}"
+        );
+    }
+
+    /// A pptx edit adds and deletes slides without touching the deck's chart or
+    /// timing parts, keeps the surviving slides' text and notes, and refuses to
+    /// delete a deck's only slide.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    #[expect(clippy::too_many_lines)] // reason: one deck exercising every slide and text op
+    async fn pptx_edit_adds_and_deletes_slides_and_keeps_the_survivors() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "Первый слайд" },
+                        { "type": "paragraph", "text": "Первый текст" },
+                        { "type": "paragraph", "text": "Удаляемый текст" },
+                        { "type": "notes", "text": "Заметка один" },
+                        { "type": "heading", "level": 1, "text": "Второй слайд" },
+                        { "type": "paragraph", "text": "Второй текст" },
+                        { "type": "notes", "text": "Заметка два" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let package = with_parts(
+            &std::fs::read(&created).expect("read base package"),
+            &[
+                ("ppt/charts/chart1.xml", EDIT_CHART.as_bytes()),
+                ("ppt/animations/timing1.xml", EDIT_TIMING.as_bytes()),
+            ],
+        );
+        let source = write_fixture(&ws, "deck.pptx", &package);
+
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "replace_text", "slide": 1, "find": "Первый", "replace": "Изменён" },
+                    { "op": "add_paragraph", "slide": 1, "text": "Добавлено" },
+                    { "op": "remove_paragraph", "slide": 1, "find": "Удаляемый" },
+                    { "op": "add_slide", "after": 1, "title": "Вставленный",
+                      "bullets": ["раз", "два"] },
+                    { "op": "add_slide", "title": "В конце" },
+                    { "op": "delete_slide", "slide": 3 },
+                ],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+
+        for name in ["ppt/charts/chart1.xml", "ppt/animations/timing1.xml"] {
+            assert_eq!(
+                part_bytes(&source, name),
+                part_bytes(&output, name),
+                "{name} changed"
+            );
+        }
+        let surviving_notes: Vec<String> = zip_names(&output)
+            .into_iter()
+            .filter(|name| name.starts_with("ppt/notesSlides/notesSlide"))
+            .collect();
+        assert!(
+            !surviving_notes.is_empty(),
+            "the surviving slide's notes part was dropped"
+        );
+        for name in &surviving_notes {
+            assert_eq!(
+                part_bytes(&source, name),
+                part_bytes(&output, name),
+                "{name} changed"
+            );
+        }
+
+        let slides = converted_text(&ws, &output).await;
+        assert!(
+            slides.contains("Изменён текст"),
+            "the surviving slide's text was lost: {slides}"
+        );
+        assert!(slides.contains("Добавлено"), "add_paragraph lost: {slides}");
+        assert!(
+            !slides.contains("Удаляемый"),
+            "remove_paragraph lost: {slides}"
+        );
+        assert!(
+            !slides.contains("Второй текст"),
+            "the deleted slide's text survived: {slides}"
+        );
+        assert!(
+            slides.contains("Заметка один"),
+            "the surviving slide's notes were lost: {slides}"
+        );
+        assert!(
+            !slides.contains("Заметка два"),
+            "the deleted slide's notes survived: {slides}"
+        );
+        let inserted = slides.find("Вставленный").expect("the inserted slide");
+        let appended = slides.find("В конце").expect("the appended slide");
+        assert!(inserted < appended, "the slides are out of order: {slides}");
+        assert!(
+            slides.contains("Slide 2:") && slides.contains("Slide 3:"),
+            "the added slides are not in the deck: {slides}"
+        );
+        assert!(
+            !reply.to_lowercase().contains("reorder"),
+            "the reply says something about reordering: {reply}"
+        );
+
+        let one = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "one",
+                    "content": [{ "type": "paragraph", "text": "Только слайд" }],
+                }),
+            )
+            .await,
+        );
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "path": one.to_string_lossy(),
+                    "edits": [{ "op": "delete_slide", "slide": 1 }],
+                }),
+            )
+            .await
+            .expect_err("a deck's only slide cannot be deleted");
+        assert!(err.to_string().contains("only slide"), "got: {err}");
+    }
+
+    /// A new pptx paragraph goes into the slide's OWN text — the `<p:txBody>` of
+    /// its top-level `<p:sp>` shapes — never into a table's cell, whose
+    /// paragraphs a plain "last paragraph" scan would pick up. An `after` that
+    /// names text only inside a table is refused rather than placed silently.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_add_paragraph_writes_into_the_slide_text_not_a_table() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "Title" },
+                        { "type": "paragraph", "text": "Body" },
+                        { "type": "table", "headers": ["H1", "H2"],
+                          "rows": [["r1c1", "r1c2"], ["r2c1", "r2c2"]] },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "add_paragraph", "slide": 1, "text": "ADDED-PARA" }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let slide = part_text(&output, "ppt/slides/slide1.xml");
+        assert!(
+            !inside_element(&slide, "ADDED-PARA", "<a:tbl>", "</a:tbl>"),
+            "the new paragraph landed inside the table: {slide}"
+        );
+        let text = converted_text(&ws, &output).await;
+        assert!(
+            text.contains("ADDED-PARA"),
+            "the paragraph was lost: {text}"
+        );
+        assert!(text.contains("r2c2"), "the table was damaged: {text}");
+
+        // Text that lives only inside the table cannot anchor a new paragraph.
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "file_name": "refused",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "add_paragraph", "slide": 1, "text": "X", "after": "r1c1" }],
+                }),
+            )
+            .await
+            .expect_err("an anchor inside a table must be refused");
+        assert!(err.to_string().contains("inside a table"), "got: {err}");
+    }
+
+    /// A presentation's text is written WITHOUT `xml:space`: DrawingML declares no
+    /// attributes on `<a:t>`, so the attribute belongs to WordprocessingML's `w:t`
+    /// (and is ordinary on SpreadsheetML's `<t>`) but not here, and a presentation
+    /// that carries it offers to repair itself. A significant space needs no
+    /// attribute to survive — element text reaches a reader whole — so the spaces
+    /// an edit writes are in the part verbatim.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_writes_no_space_attribute_and_keeps_significant_spaces() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [{ "type": "paragraph", "text": "Seed" }],
+                }),
+            )
+            .await,
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "replace_text", "slide": 1, "find": "Seed", "replace": "  kept  " },
+                    { "op": "add_paragraph", "slide": 1, "text": "  added  " },
+                ],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let slide = part_text(&output, "ppt/slides/slide1.xml");
+        assert!(
+            !slide.contains("xml:space"),
+            "a presentation's text carries the attribute DrawingML does not declare on it: {slide}"
+        );
+        assert!(
+            slide.contains("<a:t>  kept  </a:t>"),
+            "the replacement's significant spaces were lost: {slide}"
+        );
+        assert!(
+            slide.contains("<a:t>  added  </a:t>"),
+            "the new paragraph's significant spaces were lost: {slide}"
+        );
+        let text = converted_text(&ws, &output).await;
+        assert!(
+            text.contains("kept") && text.contains("added"),
+            "the edited text was lost: {text}"
+        );
+    }
+
+    /// A `remove_paragraph` that would leave a slide shape's text body or a
+    /// table cell's text body with no paragraph is refused: the body would be
+    /// one ECMA-376 calls corrupt. A body that keeps another paragraph can lose
+    /// one.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_refuses_removing_a_text_bodys_only_paragraph() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "TITLE" },
+                        { "type": "table", "headers": ["H1"], "rows": [["r1c1"]] },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let before = generated_count(&ws);
+        let shape = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "remove_paragraph", "slide": 1, "find": "TITLE" }],
+                }),
+            )
+            .await
+            .expect_err("a shape's only paragraph cannot be removed");
+        assert!(
+            shape.to_string().contains("shape's text body"),
+            "got: {shape}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        let cell = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "remove_paragraph", "slide": 1, "find": "r1c1" }],
+                }),
+            )
+            .await
+            .expect_err("a table cell's only paragraph cannot be removed");
+        assert!(
+            cell.to_string().contains("table cell's text body"),
+            "got: {cell}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        // With another paragraph in the shape's own text, the original can go.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "add_paragraph", "slide": 1, "text": "SECOND" },
+                    { "op": "remove_paragraph", "slide": 1, "find": "TITLE" },
+                ],
+            }),
+        )
+        .await;
+        let text = converted_text(&ws, &single(&reply)).await;
+        assert!(
+            !text.contains("TITLE"),
+            "the removed paragraph survived: {text}"
+        );
+        assert!(
+            text.contains("SECOND"),
+            "the added paragraph was lost: {text}"
+        );
+    }
+
+    /// `add_slide`'s `after` is a position in the numbering the reader shows: a
+    /// `<p:sldId>` without a relationship id names no slide and takes no slot, so
+    /// it must not shift the insertion point. A deck that can only be numbered by
+    /// file name has no index to honour, and an explicit `after` is refused
+    /// rather than appended at the end behind the caller's back.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_add_slide_after_uses_the_readers_numbering() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "FIRST" },
+                        { "type": "heading", "level": 1, "text": "SECOND" },
+                        { "type": "heading", "level": 1, "text": "THIRD" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        let presentation = part_text_bytes(&base, "ppt/presentation.xml")
+            .replace("<p:sldIdLst>", "<p:sldIdLst><p:sldId id=\"999\"/>");
+        let source = write_fixture(
+            &ws,
+            "extra-sld-id.pptx",
+            &with_parts(&base, &[("ppt/presentation.xml", presentation.as_bytes())]),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "add_slide", "after": 2, "title": "NEW" }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let text = converted_text(&ws, &output).await;
+        let second = text.find("SECOND").expect("the second slide");
+        let inserted = text.find("NEW").expect("the added slide");
+        let third = text.find("THIRD").expect("the third slide");
+        assert!(
+            second < inserted && inserted < third,
+            "the slide did not land at the reader's slide 2: {text}"
+        );
+        assert!(
+            part_text(&output, "ppt/presentation.xml").contains(r#"<p:sldId id="999"/>"#),
+            "the entry with no relationship id was rewritten"
+        );
+
+        // A deck whose slide list numbers nothing can only be read by file name.
+        let unnumbered = write_fixture(
+            &ws,
+            "unnumbered.pptx",
+            &with_parts(
+                &base,
+                &[(
+                    "ppt/presentation.xml",
+                    without_sld_id_rel_ids(&part_text_bytes(&base, "ppt/presentation.xml"))
+                        .as_bytes(),
+                )],
+            ),
+        );
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "file_name": "refused",
+                    "path": unnumbered.to_string_lossy(),
+                    "edits": [{ "op": "add_slide", "after": 1, "title": "NEW" }],
+                }),
+            )
+            .await
+            .expect_err("a deck with no numbered slide entry cannot honour an index");
+        assert!(err.to_string().contains("does not number"), "got: {err}");
+    }
+
+    /// A slide paragraph's text is addressed by code point, as a docx
+    /// paragraph's is: an astral character before the match is one character
+    /// even though it is two UTF-16 code units, and a code-unit offset would
+    /// rewrite it together with the match.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_replaces_text_after_an_astral_character() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "astral",
+                    "content": [{ "type": "paragraph", "text": format!("{ASTRAL}abc") }],
+                }),
+            )
+            .await,
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "edited",
+                "path": created.to_string_lossy(),
+                "edits": [{ "op": "replace_text", "slide": 1, "find": "abc", "replace": "XYZ" }],
+            }),
+        )
+        .await;
+        let text = converted_text(&ws, &single(&reply)).await;
+        assert!(
+            text.contains(&format!("{ASTRAL}XYZ")),
+            "the character before the match was rewritten: {text}"
+        );
+    }
+
+    /// `delete_slide` removes the addressed POSITION of the resolved slide list,
+    /// not the `<p:sldId>` whose target matches the addressed part: two entries
+    /// may name the same part, and deleting the other one would leave a dangling
+    /// `<p:sldId>` and drop a part a remaining slide still reads.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_deletes_the_addressed_slide_position_and_keeps_a_shared_part() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "One" },
+                        { "type": "paragraph", "text": "Body one" },
+                        { "type": "heading", "level": 1, "text": "Two" },
+                        { "type": "paragraph", "text": "Body two" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        // Make both slide relationships point at the first slide: the deck now
+        // declares two `<p:sldId>`s naming the same part.
+        let rels = part_text_bytes(&base, "ppt/_rels/presentation.xml.rels").replace(
+            "Target=\"slides/slide2.xml\"",
+            "Target=\"slides/slide1.xml\"",
+        );
+        let source = write_fixture(
+            &ws,
+            "dup.pptx",
+            &with_parts(
+                &base,
+                &[("ppt/_rels/presentation.xml.rels", rels.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "delete_slide", "slide": 2 }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let presentation = part_text(&output, "ppt/presentation.xml");
+        assert_eq!(
+            presentation.matches("<p:sldId ").count(),
+            1,
+            "a <p:sldId> was left dangling or the wrong one was removed: {presentation}"
+        );
+        assert!(
+            presentation.contains(r#"r:id="rId2""#),
+            "the first slide's entry was removed: {presentation}"
+        );
+        assert!(
+            zip_names(&output)
+                .iter()
+                .any(|name| name == "ppt/slides/slide1.xml"),
+            "the still-referenced slide part was removed"
+        );
+        // Every remaining `<p:sldId>` still resolves through the relationships.
+        let presentation_rels = part_text(&output, "ppt/_rels/presentation.xml.rels");
+        assert!(
+            presentation_rels.contains(r#"Id="rId2""#),
+            "the relationship the remaining slide names was removed: {presentation_rels}"
+        );
+    }
+
+    /// A deck whose slide list names no slide cannot be addressed by the reader's
+    /// numbering, so `delete_slide` is refused rather than deleting a part and
+    /// leaving a `<p:sldId>` dangling.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_delete_slide_refuses_a_deck_whose_slide_list_names_nothing() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "One" },
+                        { "type": "paragraph", "text": "Body one" },
+                        { "type": "heading", "level": 1, "text": "Two" },
+                        { "type": "paragraph", "text": "Body two" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        let source = write_fixture(
+            &ws,
+            "unnumbered.pptx",
+            &with_parts(
+                &base,
+                &[(
+                    "ppt/presentation.xml",
+                    without_sld_id_rel_ids(&part_text_bytes(&base, "ppt/presentation.xml"))
+                        .as_bytes(),
+                )],
+            ),
+        );
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "delete_slide", "slide": 1 }],
+                }),
+            )
+            .await
+            .expect_err("a deck whose slide list names nothing cannot delete a slide");
+        assert!(err.to_string().contains("slide list"), "got: {err}");
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        // A deck whose slide list names relationship ids nothing resolves: the
+        // reader numbers it by file naming, so the entry at the addressed position
+        // is not the reader's own and removing it would take a `<p:sldId>`
+        // belonging to another slide. The rels keep naming the real parts, so only
+        // the list is the broken half.
+        let presentation = part_text_bytes(&base, "ppt/presentation.xml");
+        let list = presentation.find("<p:sldIdLst>").expect("a slide list");
+        let end = presentation.find("</p:sldIdLst>").expect("a slide list");
+        let mismatched_deck = format!(
+            "{}{}{}",
+            &presentation[..list],
+            r#"<p:sldIdLst><p:sldId id="256" r:id="rId77"/><p:sldId id="257" r:id="rId88"/></p:sldIdLst>"#,
+            &presentation[end + "</p:sldIdLst>".len()..]
+        );
+        let mismatched = write_fixture(
+            &ws,
+            "mismatched.pptx",
+            &with_parts(
+                &base,
+                &[("ppt/presentation.xml", mismatched_deck.as_bytes())],
+            ),
+        );
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "path": mismatched.to_string_lossy(),
+                    "edits": [{ "op": "delete_slide", "slide": 2 }],
+                }),
+            )
+            .await
+            .expect_err("a deck numbered by file naming cannot delete by list position");
+        assert!(err.to_string().contains("slide list"), "got: {err}");
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A deck whose slide list carries as many entries as there are slide files,
+    /// but whose relationship ids resolve to nothing, is numbered by file naming:
+    /// a count coincidence is no proof that the list is the reader's numbering, so
+    /// an explicit `after` is refused and the package untouched. Without `after`
+    /// there is no position to honour and the slide still appends at the end.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_add_slide_refuses_an_after_the_slide_list_cannot_number() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "One" },
+                        { "type": "paragraph", "text": "Body one" },
+                        { "type": "heading", "level": 1, "text": "Two" },
+                        { "type": "paragraph", "text": "Body two" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        // One entry per slide file, yet neither id resolves: the list is not what
+        // the reader numbers by, so no position in it can be honoured.
+        let presentation = part_text_bytes(&base, "ppt/presentation.xml");
+        let list = presentation.find("<p:sldIdLst>").expect("a slide list");
+        let end = presentation.find("</p:sldIdLst>").expect("a slide list");
+        let unnumbered = format!(
+            "{}{}{}",
+            &presentation[..list],
+            r#"<p:sldIdLst><p:sldId id="256" r:id="rId77"/><p:sldId id="257" r:id="rId88"/></p:sldIdLst>"#,
+            &presentation[end + "</p:sldIdLst>".len()..]
+        );
+        let source = write_fixture(
+            &ws,
+            "unnumbered.pptx",
+            &with_parts(&base, &[("ppt/presentation.xml", unnumbered.as_bytes())]),
+        );
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "add_slide", "after": 1, "title": "Three" }],
+                }),
+            )
+            .await
+            .expect_err("a deck numbered by file naming cannot place a slide after one");
+        assert!(err.to_string().contains("slide list"), "got: {err}");
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "add_slide", "title": "Three" }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let slides = zip_names(&output)
+            .into_iter()
+            .filter(|name| {
+                name.starts_with("ppt/slides/slide")
+                    && Path::new(name).extension().is_some_and(|ext| ext == "xml")
+            })
+            .count();
+        assert_eq!(slides, 3, "the appended slide is not in the package");
+        let presentation = part_text(&output, "ppt/presentation.xml");
+        assert_eq!(
+            presentation.matches("<p:sldId ").count(),
+            3,
+            "the appended slide is not in the slide list: {presentation}"
+        );
+    }
+
     /// The naming helpers drop a directory part, neutralize marker punctuation,
     /// ignore a trailing extension the tool appends itself, and fall back when
     /// nothing usable is left.
@@ -3661,6 +8594,10 @@ mod tests {
             "an empty PDF-size range"
         );
         assert!(
+            rules.text_size_points.min < rules.text_size_points.max,
+            "an empty text-size range"
+        );
+        assert!(
             rules.color_digits > 0 && rules.color_digits.is_multiple_of(3),
             "a colour whose digits do not split into three channels"
         );
@@ -3676,6 +8613,44 @@ mod tests {
             !rules.sheet_name_forbidden.is_empty(),
             "an empty forbidden set admits every character"
         );
+        // Each cap is a bound the tool refuses past, so a zero would refuse every
+        // value a caller could pass.
+        for (name, cap) in [
+            ("edit_text_max", rules.edit_text_max),
+            ("edits_max", rules.edits_max),
+            ("bullets_max", rules.bullets_max),
+            ("paragraph_level_max", rules.paragraph_level_max as usize),
+            ("sheet_row_max", rules.sheet_row_max as usize),
+            ("sheet_column_max", rules.sheet_column_max as usize),
+            ("number_format_max", rules.number_format_max),
+        ] {
+            assert!(cap > 0, "{name} refuses every value");
+        }
+    }
+
+    /// Whether `text` states `value` as a whole token rather than as a slice of
+    /// a longer number: a bare `contains` would let the paragraph-level cap `8`
+    /// be satisfied by the `1048576` of the row cap, so a placeholder that
+    /// moved or went stale would still pass.
+    fn states_whole_token(text: &str, value: &str) -> bool {
+        let mut from = 0;
+        while let Some(at) = text[from..].find(value) {
+            let start = from + at;
+            let end = start + value.len();
+            let digit_before = text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_digit());
+            let digit_after = text[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit());
+            if !digit_before && !digit_after {
+                return true;
+            }
+            from = start + 1;
+        }
+        false
     }
 
     /// Every rule the description states is the one the tool enforces: the
@@ -3694,15 +8669,23 @@ mod tests {
             listed(&RULES.heading_levels),
             RULES.image_side_px.bounds(),
             RULES.pdf_size_points.bounds(),
+            RULES.text_size_points.bounds(),
             RULES.color_digits.to_string(),
             RULES.degrees_step.to_string(),
             RULES.sheet_name_max.to_string(),
             format!("{:?}", RULES.sheet_name_forbidden),
+            RULES.edit_text_max.to_string(),
+            RULES.edits_max.to_string(),
+            RULES.bullets_max.to_string(),
+            RULES.paragraph_level_max.to_string(),
+            RULES.sheet_row_max.to_string(),
+            RULES.sheet_column_max.to_string(),
+            RULES.number_format_max.to_string(),
             megabytes(crate::util::FILE_MAX_BYTES).to_string(),
         ] {
             assert!(
-                description.contains(&value),
-                "the description does not state the rule it names — {value:?} is missing from:\n{description}"
+                states_whole_token(&description, &value),
+                "the description does not state the rule it names — {value:?} is missing as a whole number from:\n{description}"
             );
         }
     }

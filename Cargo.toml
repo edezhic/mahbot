@@ -207,9 +207,18 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 #                 embedded images of text pages.
 #   quick-xml   — XML reader for every OOXML package part: the .docx body,
 #                 .xlsx sheets/shared strings and .pptx slides/notes (MIT).
+#   office_oxide — readers for the legacy binary Word/Excel/PowerPoint formats
+#                 (.doc/.xls/.ppt) this converter also accepts (MIT OR
+#                 Apache-2.0). Pinned exactly like turso and tree-sitter: its
+#                 parse result *is* the delivered text, so a new release's
+#                 behaviour change must be taken deliberately, not at the next
+#                 `cargo update`. Brings its own quick-xml 0.42 next to the
+#                 OOXML reader's 0.39 — the accepted price of reading the old
+#                 formats.
 pdf-extract = { version = "0.12", default-features = false }
 hayro = "0.7"
 quick-xml = { version = "0.39", default-features = false }
+office_oxide = { version = "=0.1.13" }
 
 [build-dependencies]
 # The product's icon inside the Windows executable (build.rs). Requested without
