@@ -608,7 +608,7 @@ async fn run_trigger(ws: &Workspace, user: &str, trigger: &Trigger) -> TriggerOu
     };
     TriggerOutcome::from_run(
         crate::tools::shell::run_program_outcome(
-            ws,
+            ws.as_path(),
             &bun,
             &[call.path.display().to_string(), call.payload()],
         )

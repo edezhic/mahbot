@@ -31,6 +31,9 @@ pub mod config;
 pub mod config_db;
 pub(crate) mod consensus;
 pub mod db;
+/// The document kit runner: the embedded script and PDF text font the
+/// `document` tool runs on the managed bun runtime ([`crate::tools::document`]).
+pub(crate) mod docgen;
 pub(crate) mod document;
 pub(crate) mod embedder;
 pub(crate) mod git;
@@ -42,6 +45,9 @@ pub(crate) mod onboarding;
 /// ([`crate::audio::tts`]), so it is built only where that exists.
 #[cfg(target_os = "macos")]
 pub(crate) mod onnx;
+/// OOXML package reading (Word/Excel/PowerPoint): the ZIP-container arm of the
+/// shared document converter ([`crate::document`]).
+pub(crate) mod ooxml;
 pub mod pipeline;
 pub(crate) mod prompt;
 pub mod providers;

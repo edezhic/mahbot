@@ -1290,6 +1290,33 @@ pub(crate) fn suffixed_name(name: &str, n: u32) -> String {
     }
 }
 
+/// Create a NEW empty file `dir`/`name`, disambiguating with a `_<n>` counting
+/// suffix (see [`suffixed_name`]) when a file of that name is already there, and
+/// return the open handle with its path.
+///
+/// The `create_new` open *is* the collision check: two concurrent callers must
+/// not pick the same free name, so a check-then-act probe would let them
+/// overwrite each other.
+pub(crate) async fn create_unique_file(
+    dir: &Path,
+    name: &str,
+) -> std::io::Result<(tokio::fs::File, PathBuf)> {
+    let mut counter = 1u32;
+    loop {
+        let candidate = dir.join(suffixed_name(name, counter));
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await
+        {
+            Ok(file) => return Ok((file, candidate)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => counter += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Strip ANSI escape sequences from a string.
 ///
 /// Removes common ANSI escape codes used for terminal text formatting (colors,

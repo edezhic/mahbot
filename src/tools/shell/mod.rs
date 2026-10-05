@@ -26,8 +26,8 @@
 //! what the product provides while it RETAINS the channel; releasing it (past the
 //! retained-channel cap) ends the guarantee
 //! ([`crate::util::leftover_channels`]). A program this product
-//! runs for itself (a user's alarm, a custom tool's script) uses `End`: the run's
-//! tree is ended and the run is reported as a failure
+//! runs for itself (a user's alarm, a custom tool's script, the document kit)
+//! uses `End`: the run's tree is ended and the run is reported as a failure
 //! ([`ShellRunResult::EndedWithLeftovers`]).
 //!
 //! # The runner's own steps
@@ -262,11 +262,12 @@ const FALLBACK_ENV_VARS: &[&str] = &[
     "USERNAME",
 ];
 
-/// The environment the product's own work runs in — today that is git (see
-/// [`crate::git::commands::git_command`]) — and the one an agent's command falls
-/// back to until the owner's environment has been read ([`agent_env_pairs`]):
-/// every name in [`FALLBACK_ENV_VARS`] with its baseline value, then the
-/// platform's temp variables bound to the daemon's private temp root.
+/// The environment the product's own work runs in — git (see
+/// [`crate::git::commands::git_command`]) and the document kit — and the one an
+/// agent's command falls back to until the owner's environment has been read
+/// ([`agent_env_pairs`]): every name in [`FALLBACK_ENV_VARS`] with its baseline
+/// value, then the platform's temp variables bound to the daemon's private temp
+/// root.
 ///
 /// The temp names and value come from [`crate::temp::shell_temp_vars`] — the same
 /// pair the read-only guard's temp model reads — so the scratch location a child
@@ -345,7 +346,7 @@ pub(crate) fn agent_env_pairs_from(
 
 /// Apply `pairs` to a child's environment, from nothing: the one definition of
 /// a clear-and-fill spawn environment, used by [`program_command`] and by the
-/// async builder [`apply_agent_env`].
+/// async builders [`apply_agent_env`] and [`program_command_with`].
 fn apply_env_pairs(cmd: &mut std::process::Command, pairs: &[(OsString, OsString)]) {
     cmd.env_clear();
     cmd.envs(pairs.iter().map(|(name, value)| (name, value)));
@@ -625,21 +626,22 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
     process
 }
 
-/// Build a [`tokio::process::Command`] that runs `program` with `args` as
-/// argv — no shell in between, so no argument can ever be reinterpreted as
-/// shell syntax (unlike [`build_shell_command`], whose string is parsed by
-/// `sh -c`). Containment is otherwise identical: the workspace root as cwd,
-/// [`agent_env_pairs`] as the environment (the owner's own once a read has
-/// succeeded, the reduced fallback until then), and (Unix) the child leading
-/// its own process group; on Windows the runner's job is the platform's side of
-/// that containment ([`tree`]).
+/// The shared setup of a direct program run: argv, the working directory, the
+/// child leading its own process group (Unix) or running under the runner's job
+/// (Windows), and `apply_env` as the last word on the child's environment — the
+/// clear-and-fill spawn environment belongs to whoever the run is for. Nothing
+/// here resolves a name: `program` is already an absolute path by the time it
+/// arrives (the managed bun runtime, this service's own image).
 ///
-/// `program` is already an absolute path by the time it arrives — the managed bun
-/// runtime, this service's own image — so nothing here resolves a name.
-fn build_program_command(
+/// `cwd` is the caller's choice, not necessarily a workspace: the program paths
+/// take a workspace root, while the document kit runs inside its own materialized
+/// directory so bun cannot load a config from a workspace (see
+/// [`crate::docgen`]).
+fn program_command_with(
     program: &Path,
     args: &[String],
-    workspace_root: &Path,
+    cwd: &Path,
+    apply_env: impl FnOnce(&mut tokio::process::Command),
 ) -> tokio::process::Command {
     let mut process = tokio::process::Command::new(program);
     process.args(args);
@@ -649,9 +651,39 @@ fn build_program_command(
     }
     #[cfg(target_os = "windows")]
     process.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    process.current_dir(workspace_root);
-    apply_agent_env(&mut process);
+    process.current_dir(cwd);
+    apply_env(&mut process);
     process
+}
+
+/// Build a [`tokio::process::Command`] that runs `program` with `args` as
+/// argv — no shell in between, so no argument can ever be reinterpreted as
+/// shell syntax (unlike [`build_shell_command`], whose string is parsed by
+/// `sh -c`). Containment is otherwise identical: `cwd` as the working
+/// directory, the OWNER's environment — his own once a read has succeeded (the
+/// reduced fallback until then, see [`agent_env_pairs`]) — and (Unix) the child
+/// leading its own process group; on Windows the runner's job is the platform's
+/// side of that containment ([`tree`]).
+///
+/// These are the owner's own commands doing his own work — an alarm's program, a
+/// custom tool, a plan step — so his environment is handed over whole. The
+/// product's own work goes through [`build_internal_program_command`] instead.
+fn build_program_command(program: &Path, args: &[String], cwd: &Path) -> tokio::process::Command {
+    program_command_with(program, args, cwd, apply_agent_env)
+}
+
+/// [`build_program_command`] for the product's OWN work — the document kit: the
+/// reduced [`internal_env_pairs`] environment, which holds none of the owner's
+/// secrets. The separate entry point means no caller has to name an environment,
+/// so a product run can never inherit the owner's by mistake.
+fn build_internal_program_command(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+) -> tokio::process::Command {
+    program_command_with(program, args, cwd, |process| {
+        apply_env_pairs(process.as_std_mut(), &internal_env_pairs());
+    })
 }
 
 /// Outcome of a timed shell subprocess run.
@@ -725,9 +757,10 @@ enum ShellRunResult {
 /// and the rewritten-line plan runner): the command's own exit status and output are
 /// the result, and the leftover is left running because it was started on purpose
 /// ([`ShellRunResult::ExitedWithLeftovers`]). `End` is the program paths' behaviour
-/// (`run_program_outcome` — a user's alarm — and `run_program_with_timeout` — a
-/// custom tool's script): the run's tree is ended and the run is reported as a
-/// failure ([`ShellRunResult::EndedWithLeftovers`]).
+/// (`run_program_outcome` — a user's alarm — and the `run_program_with_timeout` /
+/// `run_internal_program_with_timeout` pair — a custom tool's script, the document
+/// kit): the run's tree is ended and the run is reported as a failure
+/// ([`ShellRunResult::EndedWithLeftovers`]).
 #[derive(Clone, Copy)]
 pub(super) enum LeftoverPolicy {
     /// Keep the leftover: the run's own status is the answer.
@@ -1635,27 +1668,29 @@ fn program_outcome(success: bool, detail: String, stdout: &[u8], stderr: &[u8]) 
     }
 }
 
-/// Run `program` with `args` (argv — never a shell command string) in `ws` and
-/// return the raw run result. The single place that decides how a direct run is
-/// bounded: the agent's environment ([`apply_agent_env`]),
-/// [`DEFAULT_SHELL_TIMEOUT_SECS`], the per-pipe output cap and the post-exit
-/// drain bound. `owner` travels to [`run_command_with_timeout`] and decides the
-/// run's containment.
+/// Run `program` with `args` (argv — never a shell command string) in `cwd` and
+/// return the raw run result, under the OWNER's environment: his own commands
+/// doing his own work. The bounds a direct run is held to live in [`run_bounded`].
 ///
 /// A direct run is never an agent's own command, so a leftover it leaves behind is
 /// ended rather than kept ([`LeftoverPolicy::End`]): an alarm or a custom tool must
 /// not be able to leave a process holding its output open.
 async fn run_program(
-    ws: &Workspace,
+    cwd: &Path,
     program: &Path,
     args: &[String],
     owner: RunOwner,
 ) -> ShellRunResult {
-    let timeout = Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS);
-    let mut cmd = build_program_command(program, args, ws.as_path());
+    run_bounded(build_program_command(program, args, cwd), owner).await
+}
+
+/// Perform one [`run_command_with_timeout`] call with the bounds every direct
+/// run is held to: [`DEFAULT_SHELL_TIMEOUT_SECS`], the per-pipe output cap and
+/// the post-exit drain bound. `owner` decides the run's containment.
+async fn run_bounded(mut cmd: tokio::process::Command, owner: RunOwner) -> ShellRunResult {
     run_command_with_timeout(
         &mut cmd,
-        timeout,
+        Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
         output_drain_timeout(),
         mem::default_limit(),
         owner,
@@ -1664,7 +1699,7 @@ async fn run_program(
     .await
 }
 
-/// Run `program` with `args` in `ws` and report the run as an outcome instead
+/// Run `program` with `args` in `cwd` and report the run as an outcome instead
 /// of folding a non-zero exit into an error: a run that did not complete is a
 /// failed outcome, never an `Err`, because the caller's rule is about what the
 /// run reported rather than about this layer's error type.
@@ -1672,11 +1707,11 @@ async fn run_program(
 /// The run is a service launch rather than an agent's work, so Windows gives it
 /// no job ([`RunOwner::Service`] — see [`tree`]).
 pub(crate) async fn run_program_outcome(
-    ws: &Workspace,
+    cwd: &Path,
     program: &Path,
     args: &[String],
 ) -> ProgramOutcome {
-    match run_program(ws, program, args, RunOwner::Service).await {
+    match run_program(cwd, program, args, RunOwner::Service).await {
         ShellRunResult::Completed {
             stdout,
             stderr,
@@ -1724,9 +1759,10 @@ pub(crate) async fn run_program_outcome(
     }
 }
 
-/// Run `program` with `args` (argv — never a shell command string) in `ws`,
-/// under the bounds [`run_program`] applies to a direct run, contained as an
-/// agent's command (see [`RunOwner::Agent`]).
+/// Run `program` with `args` (argv — never a shell command string) in `cwd`,
+/// under the bounds a direct run is held to (see [`run_bounded`]), contained as
+/// an agent's command (see [`RunOwner::Agent`]), with the OWNER's environment:
+/// his own command doing his own work.
 ///
 /// `label` names what the caller asked to run and is what the failure prose
 /// talks about, so the model reads back the thing it called rather than the
@@ -1741,12 +1777,41 @@ pub(crate) async fn run_program_outcome(
 /// failure, timeout, drain overrun or the memory ceiling — never a non-zero
 /// exit, so a script's own failure stays the script's output.
 pub(crate) async fn run_program_with_timeout(
-    ws: &Workspace,
+    cwd: &Path,
     program: &Path,
     args: &[String],
     label: &str,
 ) -> anyhow::Result<String> {
-    match run_program(ws, program, args, RunOwner::Agent).await {
+    annotate_run(
+        run_program(cwd, program, args, RunOwner::Agent).await,
+        label,
+    )
+}
+
+/// [`run_program_with_timeout`] for the product's OWN work rather than the
+/// owner's: the run gets the reduced [`internal_env_pairs`] environment, which
+/// holds none of his secrets. The entry point is separate so that no caller has
+/// to name an environment to say whose work a run is.
+pub(crate) async fn run_internal_program_with_timeout(
+    cwd: &Path,
+    program: &Path,
+    args: &[String],
+    label: &str,
+) -> anyhow::Result<String> {
+    annotate_run(
+        run_bounded(
+            build_internal_program_command(program, args, cwd),
+            RunOwner::Agent,
+        )
+        .await,
+        label,
+    )
+}
+
+/// The one mapping behind both entry points above: a finished run turned into
+/// the caller's answer.
+fn annotate_run(run: ShellRunResult, label: &str) -> anyhow::Result<String> {
+    match run {
         ShellRunResult::Completed {
             stdout,
             stderr,
@@ -5378,7 +5443,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let ws = crate::workspace::test_ws(tmp.path());
         let output = run_program_with_timeout(
-            &ws,
+            ws.as_path(),
             Path::new("/bin/sh"),
             &[
                 "-c".to_string(),
@@ -5411,8 +5476,12 @@ mod tests {
         let ws = crate::workspace::test_ws(tmp.path());
 
         // Success with stdout — raw, un-annotated output.
-        let out =
-            run_program_outcome(&ws, Path::new("/bin/sh"), &sh_args("echo hello-prog-out")).await;
+        let out = run_program_outcome(
+            ws.as_path(),
+            Path::new("/bin/sh"),
+            &sh_args("echo hello-prog-out"),
+        )
+        .await;
         assert!(out.success);
         assert!(out.has_output);
         assert!(out.output.contains("hello-prog-out"), "got: {}", out.output);
@@ -5421,8 +5490,12 @@ mod tests {
 
         // Non-zero exit is a failed outcome whose output is still just the
         // program's own text.
-        let out =
-            run_program_outcome(&ws, Path::new("/bin/sh"), &sh_args("echo bad; exit 3")).await;
+        let out = run_program_outcome(
+            ws.as_path(),
+            Path::new("/bin/sh"),
+            &sh_args("echo bad; exit 3"),
+        )
+        .await;
         assert!(!out.success);
         assert!(out.has_output);
         assert!(out.output.contains("bad"), "got: {}", out.output);
@@ -5430,20 +5503,22 @@ mod tests {
         assert_eq!(out.detail, "exit status 3");
 
         // No output at all: nothing was reported.
-        let out = run_program_outcome(&ws, Path::new("/bin/sh"), &sh_args("printf ''")).await;
+        let out =
+            run_program_outcome(ws.as_path(), Path::new("/bin/sh"), &sh_args("printf ''")).await;
         assert!(out.success);
         assert!(!out.has_output);
         assert!(out.output.is_empty());
 
         // Whitespace-only output still counts as reported — the raw streams
         // decide, not the trimmed text.
-        let out = run_program_outcome(&ws, Path::new("/bin/sh"), &sh_args("printf '\\n'")).await;
+        let out =
+            run_program_outcome(ws.as_path(), Path::new("/bin/sh"), &sh_args("printf '\\n'")).await;
         assert!(out.has_output);
 
         // ... and so does escape-sequence-only output — reported, even though
         // the ANSI strip leaves nothing readable behind.
         let out = run_program_outcome(
-            &ws,
+            ws.as_path(),
             Path::new("/bin/sh"),
             &sh_args("printf '\\033[32m\\033[0m'"),
         )
@@ -5452,7 +5527,8 @@ mod tests {
         assert!(out.output.is_empty(), "got: {}", out.output);
 
         // stderr alone counts as output.
-        let out = run_program_outcome(&ws, Path::new("/bin/sh"), &sh_args("echo hi >&2")).await;
+        let out =
+            run_program_outcome(ws.as_path(), Path::new("/bin/sh"), &sh_args("echo hi >&2")).await;
         assert!(out.has_output);
         assert!(out.output.contains("hi"), "got: {}", out.output);
 
@@ -5464,8 +5540,12 @@ mod tests {
             scrub_credentials(raw).contains("*[REDACTED]"),
             "the scrubber must rewrite this value, or the pin below is vacuous"
         );
-        let out =
-            run_program_outcome(&ws, Path::new("/bin/sh"), &sh_args(&format!("echo {raw}"))).await;
+        let out = run_program_outcome(
+            ws.as_path(),
+            Path::new("/bin/sh"),
+            &sh_args(&format!("echo {raw}")),
+        )
+        .await;
         assert!(out.has_output);
         assert_eq!(
             out.output.trim(),

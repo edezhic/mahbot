@@ -253,11 +253,11 @@ use crate::config::CONFIG;
 use crate::tools::ComputerTool;
 use crate::tools::{
     AddAlarmTool, AddCommentTool, AnalyzeTool, ChromeTool, CreateTicketTool, CustomTool,
-    DispatchMode, EditTool, GetTicketTool, ImageGenTool, ImplementTool, ListAlarmsTool,
-    ListTicketsTool, MahbotConfigTool, MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool,
-    SearchArchivedTicketsTool, SearchTool, SendMessageToManagerTool, ShellMode, ShellTool,
-    SleepTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
-    WorkspaceControlTool,
+    DispatchMode, DocumentTool, EditTool, GetTicketTool, ImageGenTool, ImplementTool,
+    ListAlarmsTool, ListTicketsTool, MahbotConfigTool, MahbotDebugTool, ReadTool, RemoveAlarmTool,
+    ResearchTool, SearchArchivedTicketsTool, SearchTool, SendMessageToManagerTool, ShellMode,
+    ShellTool, SleepTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend,
+    WebSearchTool, WorkspaceControlTool,
 };
 
 impl Role {
@@ -417,6 +417,10 @@ impl Role {
                     Box::new(ImageGenTool),
                     Box::new(VideoGenTool),
                     Box::new(VideoEditTool),
+                    // Likewise, the document tool serves every account: its
+                    // outputs stay inside the caller's own workspace, and every
+                    // input path it accepts is confined to that workspace.
+                    Box::new(DocumentTool),
                 ];
                 // The grant-gated forwarding tool: every Assistant can call
                 // admin-authored scripts; the grant (or admin rights) decides
@@ -813,6 +817,31 @@ mod tests {
                     has,
                     role == crate::Role::Assistant,
                     "{}{} custom-tool availability",
+                    role.as_str(),
+                    if is_admin { " (admin)" } else { "" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn document_tool_is_advertised_by_every_assistant_only() {
+        // Acceptance pin: document work is built into EVERY Assistant — the
+        // owner's and a guest's alike, with no grant or permission in between —
+        // and into no other role. (The managed runtime's absence hides it at
+        // advertisement time, which is a separate per-agent decision; this pins
+        // the toolset itself.)
+        let ws = crate::workspace::test_ws("test");
+        for role in Role::iter() {
+            for is_admin in [false, true] {
+                let has = role
+                    .tools(&ws, is_admin, test_sessions())
+                    .iter()
+                    .any(|t| t.name() == "document");
+                assert_eq!(
+                    has,
+                    role == crate::Role::Assistant,
+                    "{}{} document-tool availability",
                     role.as_str(),
                     if is_admin { " (admin)" } else { "" }
                 );

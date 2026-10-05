@@ -51,14 +51,16 @@
 //!
 //! [`RunOwner`] draws the boundary and it is the *only* thing the two owners
 //! differ in. [`RunOwner::Agent`] — the shell tool in both modes, which is also
-//! the path the pipeline's diagnostics stage takes, and the `custom` tool's script
-//! run — gets the job. [`RunOwner::Service`] — a user's alarm program — does
-//! not: it is not an agent's work and keeps exactly the treatment it had before
-//! job containment existed. Everything the service launches for its own
-//! operation — the browser, the replacement instance a self-update starts, the
-//! browser-automation command-line tool and the helper process it forks, the
-//! bun runtime's own install/update/probe runs, git — never comes through this
-//! module.
+//! the path the pipeline's diagnostics stage takes, the `custom` tool's script
+//! run, and the document kit (the product's own work, through
+//! [`super::run_internal_program_with_timeout`], which gives it the reduced
+//! internal environment) — gets the job. [`RunOwner::Service`] — a
+//! user's alarm program — does not: it is not an agent's work and keeps exactly
+//! the treatment it had before job containment existed. Everything *else* the
+//! service launches for its own operation — the browser, the replacement
+//! instance a self-update starts, the browser-automation command-line tool and
+//! the helper process it forks, the bun runtime's own install/update/probe runs,
+//! git — never comes through this module.
 //!
 //! # No console window (windows)
 //!
@@ -108,7 +110,9 @@
 //! `tasklist_has`, `register_native_host`, `run_cli`) with the shared
 //! `chrome::spawn::spawn_cli` and the browser itself
 //! (`tools::chrome_daemon::spawn_chrome_detached`); every agent command through the
-//! shell builders (`tools::shell::build_program_command` itself, and
+//! shell builders (`tools::shell::program_command_with`, the shared start of the
+//! direct-program builders `tools::shell::build_program_command` and
+//! `tools::shell::build_internal_program_command`, and
 //! `tools::shell::build_shell_command` through the shared start above — the shell
 //! tool, the diagnostics runner, the `custom` tool's script, a user's alarm program,
 //! and every step of a rewritten line's plan, [`super::plan`] included) with the grep

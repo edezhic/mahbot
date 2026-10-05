@@ -205,7 +205,8 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 #                 (Apache-2.0 OR MIT); supplies the page list, reports an
 #                 encrypted document and decodes both rasterized pages and the
 #                 embedded images of text pages.
-#   quick-xml   — XML reader for the .docx body part (MIT).
+#   quick-xml   — XML reader for every OOXML package part: the .docx body,
+#                 .xlsx sheets/shared strings and .pptx slides/notes (MIT).
 pdf-extract = { version = "0.12", default-features = false }
 hayro = "0.7"
 quick-xml = { version = "0.39", default-features = false }

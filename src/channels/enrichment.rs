@@ -173,7 +173,7 @@ async fn copy_to_uploads(
     // The created file *is* the collision check, so a failure after this point
     // would leave an empty or truncated file in the uploads dir with nothing
     // referencing it.
-    let (mut dest, path) = match create_unique_upload(dir, name).await {
+    let (mut dest, path) = match crate::util::create_unique_file(dir, name).await {
         Ok(handle) => handle,
         Err(e) => {
             tracing::warn!(
@@ -635,33 +635,6 @@ async fn handle_file(
     Some(replacement)
 }
 
-/// Create a NEW empty file `dir`/`file_name`, disambiguating with a `_<n>`
-/// counting suffix (see [`crate::util::suffixed_name`]) when a file of that name
-/// is already there, and return the open handle with its path.
-///
-/// The `create_new` open *is* the collision check: two chats frequently send a
-/// file under the same name, and a check-then-act probe would let two concurrent
-/// enrichments pick the same free name and overwrite each other.
-async fn create_unique_upload(
-    dir: &std::path::Path,
-    file_name: &str,
-) -> std::io::Result<(tokio::fs::File, std::path::PathBuf)> {
-    let mut counter = 1u32;
-    loop {
-        let candidate = dir.join(crate::util::suffixed_name(file_name, counter));
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-            .await
-        {
-            Ok(file) => return Ok((file, candidate)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => counter += 1,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 /// Annotation block for a document's extracted text.
 ///
 /// Short text is inlined; longer text is spilled to
@@ -688,7 +661,7 @@ async fn extracted_text_annotation(
     }
     let spilled = async {
         let spill_name = format!("{}.extracted.txt", crate::util::name_stem(name));
-        let (mut file, path) = create_unique_upload(uploads_dir, &spill_name).await?;
+        let (mut file, path) = crate::util::create_unique_file(uploads_dir, &spill_name).await?;
         match tokio::io::AsyncWriteExt::write_all(&mut file, text.as_bytes()).await {
             Ok(()) => Ok::<_, std::io::Error>(path),
             Err(e) => {

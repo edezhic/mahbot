@@ -321,7 +321,8 @@ async fn spill_text(dir: &Path, display: &str, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::test_fixtures::{DOCX_BODY, multi_page_pdf, zip_fixture};
+    use crate::document::test_fixtures::multi_page_pdf;
+    use crate::ooxml::test_fixtures::{DOCX_BODY, zip_fixture};
     use tempfile::TempDir;
 
     /// A temp workspace holding `files` (name, bytes) — hold the `TempDir` to

@@ -3,6 +3,19 @@
 # on a `---` line so each parallel agent gets its own variant. A checkout that
 # rewrites line endings — Windows, where `core.autocrlf` is on by default — would
 # ship bytes the repository does not hold and collapse those variants into one.
-# LF is therefore pinned for this folder alone, in the store and on checkout; no
-# other file in the repository is affected, raw-byte files included.
+# LF is therefore pinned for the files below; the rest of the repository is
+# unaffected, raw-byte files included.
 /src/prompt/** text eol=lf
+
+# The document kit's sources and the bundle built from them follow the same rule,
+# for the same reason: the bundle is embedded with `include_bytes!`, and its
+# header records a hash of the four sources (assets/docgen/kit.js, rules.json,
+# package.json, bun.lock) that a test recomputes from the checkout — a rewrite
+# of any of those line endings would change the embedded bytes and break the
+# guard. The bundle itself is a generated artifact, so git must not touch it at
+# all, on either side of a checkout.
+/assets/docgen/kit.js text eol=lf
+/assets/docgen/rules.json text eol=lf
+/assets/docgen/package.json text eol=lf
+/assets/docgen/bun.lock text eol=lf
+/assets/docgen/document-kit.js -text

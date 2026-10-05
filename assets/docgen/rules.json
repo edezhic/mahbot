@@ -1,0 +1,12 @@
+{
+  "heading_levels": [1, 2, 3],
+  "scalar_kinds": ["string", "number", "boolean"],
+  "image_extensions": ["png", "jpg", "jpeg"],
+  "image_side_px": { "min": 1, "max": 20000, "min_exclusive": false },
+  "pdf_size_points": { "min": 0, "max": 20000, "min_exclusive": true },
+  "pdf_point_abs_max": 20000,
+  "color_digits": 6,
+  "degrees_step": 90,
+  "sheet_name_max": 31,
+  "sheet_name_forbidden": "[]:*?/\\"
+}

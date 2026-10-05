@@ -839,7 +839,7 @@ impl Tool for CustomTool {
             ));
         };
         let run = crate::tools::shell::run_program_with_timeout(
-            ws,
+            ws.as_path(),
             &bun,
             &[call.path.display().to_string(), call.payload()],
             &format!("custom tool \"{name}\""),

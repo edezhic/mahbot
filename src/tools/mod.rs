@@ -19,6 +19,7 @@ mod computer;
 pub mod computer;
 pub(crate) mod custom;
 pub(crate) mod delegation;
+pub(crate) mod document;
 pub(crate) mod edit;
 pub(crate) mod image_gen;
 pub(crate) mod implement;
@@ -178,6 +179,7 @@ pub(crate) use chrome::ChromeTool;
 #[cfg(not(target_os = "macos"))]
 pub(crate) use computer::ComputerTool;
 pub(crate) use custom::CustomTool;
+pub(crate) use document::DocumentTool;
 pub(crate) use edit::EditTool;
 pub(crate) use image_gen::ImageGenTool;
 pub(crate) use implement::ImplementTool;
@@ -1724,10 +1726,11 @@ mod tests {
     // ── media_marker coverage ────────────────────────────────────────
     fn all_media_tools_implement_media_marker() {
         // Each media-generation tool must return Some from media_marker()
-        let tools: [(&str, Box<dyn Tool>); 3] = [
+        let tools: [(&str, Box<dyn Tool>); 4] = [
             ("ImageGenTool", Box::new(ImageGenTool)),
             ("VideoGenTool", Box::new(VideoGenTool)),
             ("VideoEditTool", Box::new(VideoEditTool)),
+            ("DocumentTool", Box::new(DocumentTool)),
         ];
         for (name, tool) in &tools {
             let marker = tool.media_marker();

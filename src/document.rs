@@ -7,6 +7,9 @@
 //! entry point both go through, and [`needs_extraction`] tells the read tool
 //! whether a file is one of the containers this module extracts from.
 //!
+//! Format detection and the PDF arm live here; the ZIP-container OOXML formats
+//! (Word, Excel, PowerPoint) live in [`crate::ooxml`].
+//!
 //! # Invariants
 //!
 //! - **Pure and CPU-bound.** No state but the shared conversion semaphore; the
@@ -32,8 +35,9 @@
 //!   delivered, and named in a note, because a page whose text could not be read
 //!   is not a page that has none.
 //! - **Content-first detection.** Magic bytes decide the format; the extension
-//!   only disambiguates formats that share a container (a ZIP is a `.docx` only
-//!   when the name says so) or that have no magic (plain text).
+//!   only disambiguates formats that share a container (a ZIP is a
+//!   `.docx`/`.xlsx`/`.pptx` only when the name says so) or that have no magic
+//!   (plain text).
 //! - **`out_dir` is created on demand** and is the only place artifacts are
 //!   written, with names taken from the source/entry file name — never from a
 //!   full ZIP entry path, so a crafted archive cannot write outside it.
@@ -53,12 +57,8 @@ use hayro::{RenderCache, RenderSettings};
 use image::codecs::jpeg::JpegEncoder;
 use image::{RgbImage, RgbaImage};
 use pdf_extract::{Document, PlainTextOutput, output_doc_page};
-use quick_xml::Reader;
-use quick_xml::events::{BytesRef, Event};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Cursor, Read, Seek};
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use zip::ZipArchive;
 
 /// Maximum extracted-text length (Unicode chars) inlined into the message.
 pub(crate) const INLINE_TEXT_MAX_CHARS: usize = 5000;
@@ -80,23 +80,13 @@ const RASTER_JPEG_QUALITY: u8 = 90;
 
 /// Magic bytes at the start of every PDF.
 const PDF_MAGIC: &[u8] = b"%PDF-";
-/// Magic bytes at the start of a ZIP local file header (`.docx`/`.docm` here).
+/// Magic bytes at the start of a ZIP local file header — the OOXML packages
+/// (Word/Excel/PowerPoint) and plain archives alike.
 const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
-/// CFB/OLE container magic — what an *encrypted* OOXML package is wrapped in.
-const CFB_MAGIC: &[u8] = &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
-/// Extensions accepted as OOXML Word packages (`docm` is a macro-enabled docx).
-const DOCX_EXTENSIONS: &[&str] = &["docx", "docm"];
-/// Maximum bytes decompressed from a single ZIP entry, so a lying size header
-/// cannot inflate the temp dir. Deliberately not an aggregate bound: the entry
-/// count is unbounded.
-const MAX_ZIP_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
-/// Part holding the WordprocessingML body.
-const DOCX_BODY_PART: &str = "word/document.xml";
-/// Prefix of the embedded-media parts in a Word package.
-const DOCX_MEDIA_PREFIX: &str = "word/media/";
-/// Media extensions written through to `out_dir` verbatim. Everything else
-/// (emf/wmf/tiff/bmp/gif/svg/...) would need transcoding this module avoids.
-const EMBEDDED_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+/// CFB/OLE container magic — what an *encrypted* OOXML package is wrapped in,
+/// and also what a legacy `.doc`/`.xls`/`.ppt` is. Shared with the `document`
+/// tool, which gives an OOXML-named one the same password-protected verdict.
+pub(crate) const CFB_MAGIC: &[u8] = &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 /// Extensions treated as plain text regardless of content.
 const PLAIN_TEXT_EXTENSIONS: &[&str] = &[
     "md", "markdown", "txt", "text", "rst", "adoc", "org", "csv", "json", "yaml", "yml", "toml",
@@ -165,6 +155,8 @@ pub(crate) enum DocOutcome {
 enum DocumentKind {
     Pdf,
     Docx,
+    Xlsx,
+    Pptx,
     /// An encrypted OOXML package: a CFB container, which needs a password
     /// rather than a conversion.
     EncryptedOoxml,
@@ -173,31 +165,33 @@ enum DocumentKind {
 }
 
 /// Classify `bytes` named `path`: magic bytes first, the extension only where
-/// the container is shared (a ZIP is a `.docx` only when the name says so) or
-/// absent (plain text). The single dispatch behind [`convert_document`] and
-/// [`needs_extraction`], so detection cannot drift between them.
+/// the container is shared (a ZIP is a `.docx`/`.xlsx`/`.pptx` only when the
+/// name says so) or absent (plain text). The single dispatch behind
+/// [`convert_document`] and [`needs_extraction`], so detection cannot drift
+/// between them.
 fn classify(bytes: &[u8], path: &Path) -> DocumentKind {
     if bytes.starts_with(PDF_MAGIC) {
         return DocumentKind::Pdf;
     }
     // Checked before the ZIP attempt: an encrypted OOXML package is a CFB
-    // container, and its bytes would otherwise look like corruption. Only a
-    // Word-named one gets the password-protected verdict — CFB is also what a
+    // container, and its bytes would otherwise look like corruption. Only an
+    // OOXML-named one gets the password-protected verdict — CFB is also what a
     // legacy .doc/.xls/.ppt is, and those are not a format this converts.
     if bytes.starts_with(CFB_MAGIC) {
-        return if crate::util::has_extension(path, DOCX_EXTENSIONS) {
+        return if crate::ooxml::family_of(path).is_some() {
             DocumentKind::EncryptedOoxml
         } else {
             DocumentKind::Unsupported
         };
     }
     if bytes.starts_with(ZIP_MAGIC) {
-        // ZIP magic alone is shared by xlsx/pptx/plain archives; only the name
-        // can tell a Word package apart.
-        return if crate::util::has_extension(path, DOCX_EXTENSIONS) {
-            DocumentKind::Docx
-        } else {
-            DocumentKind::Unsupported
+        // ZIP magic alone is shared by every OOXML package and plain archives;
+        // only the name can tell which kind, if any, this is.
+        return match crate::ooxml::family_of(path) {
+            Some(crate::ooxml::Family::Docx) => DocumentKind::Docx,
+            Some(crate::ooxml::Family::Xlsx) => DocumentKind::Xlsx,
+            Some(crate::ooxml::Family::Pptx) => DocumentKind::Pptx,
+            None => DocumentKind::Unsupported,
         };
     }
     // A known text extension is decoded lossily; anything else must look like
@@ -217,7 +211,11 @@ fn classify(bytes: &[u8], path: &Path) -> DocumentKind {
 pub(crate) fn needs_extraction(head: &[u8], file_name: &str) -> bool {
     matches!(
         classify(head, Path::new(file_name)),
-        DocumentKind::Pdf | DocumentKind::Docx | DocumentKind::EncryptedOoxml
+        DocumentKind::Pdf
+            | DocumentKind::Docx
+            | DocumentKind::Xlsx
+            | DocumentKind::Pptx
+            | DocumentKind::EncryptedOoxml
     )
 }
 
@@ -232,7 +230,9 @@ fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome
         DocumentKind::EncryptedOoxml => DocOutcome::Unreadable {
             reason: "password-protected".to_string(),
         },
-        DocumentKind::Docx => convert_docx(bytes, out_dir),
+        DocumentKind::Docx => crate::ooxml::convert_docx(bytes, out_dir),
+        DocumentKind::Xlsx => crate::ooxml::convert_xlsx(bytes, out_dir),
+        DocumentKind::Pptx => crate::ooxml::convert_pptx(bytes, out_dir),
         DocumentKind::PlainText => DocOutcome::Text {
             text: String::from_utf8_lossy(bytes).into_owned(),
             images: Vec::new(),
@@ -611,103 +611,9 @@ fn page_ranges(pages: &[usize]) -> String {
     ranges.join(", ")
 }
 
-/// Extract body text and embedded images from a `.docx`/`.docm` ZIP package.
-fn convert_docx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
-    let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
-        return unreadable_docx();
-    };
-    let Some(body_xml) = read_zip_entry(&mut archive, DOCX_BODY_PART) else {
-        return unreadable_docx();
-    };
-    let Some(text) = docx_body_text(&body_xml) else {
-        return unreadable_docx();
-    };
-
-    ensure_out_dir(out_dir);
-
-    let entries: Vec<String> = archive
-        .file_names()
-        // A document's media parts are the entries under `word/media/` that name
-        // a file, i.e. carry an extension. Directory entries (`word/media/`,
-        // `word/media\`) and extension-less names are not media: their base name
-        // would otherwise be ingested as a nonexistent image and counted as
-        // skipped.
-        .filter(|name| name.starts_with(DOCX_MEDIA_PREFIX) && Path::new(name).extension().is_some())
-        .map(str::to_owned)
-        .collect();
-    let mut images = Vec::new();
-    let mut next_suffix = HashMap::new();
-    // A media entry the existing image pipeline cannot take is skipped with the
-    // same aggregated note the PDF path emits: an honest count, not one line per
-    // figure of a document full of them.
-    let mut skipped = SkippedImages::default();
-    for entry in entries {
-        // Only the entry's file name is used: a crafted `word/media/../..`
-        // entry must never escape `out_dir`.
-        let file_name = crate::util::neutralized_name(crate::util::file_name_or_path(&entry));
-        if !crate::util::has_extension(Path::new(&file_name), EMBEDDED_IMAGE_EXTENSIONS) {
-            skipped.add(SkipReason::Unsupported);
-            continue;
-        }
-        let Some(content) = read_zip_entry(&mut archive, &entry) else {
-            tracing::warn!(%file_name, "document: failed to read embedded .docx image");
-            skipped.add(SkipReason::Failed);
-            continue;
-        };
-        let path = unique_out_path(out_dir, &file_name, &mut next_suffix);
-        match std::fs::write(&path, &content) {
-            Ok(()) => images.push(path),
-            Err(e) => {
-                tracing::warn!(%file_name, error = %e, "document: failed to write embedded .docx image");
-                skipped.add(SkipReason::Failed);
-            }
-        }
-    }
-    DocOutcome::Text {
-        text,
-        images,
-        notes: skipped.notes(),
-        all_page_text_lost: false,
-    }
-}
-
-/// The shared "recognized `.docx`-shaped package that cannot be read" outcome.
-fn unreadable_docx() -> DocOutcome {
-    DocOutcome::Unreadable {
-        reason: "corrupt or unsupported .docx".to_string(),
-    }
-}
-
-/// `out_dir/<file_name>`, suffixed `_2`, `_3`, … when that name is taken (see
-/// [`crate::util::suffixed_name`]).
-///
-/// A package can hold the same base name under different directories
-/// (`word/media/a.png` and `word/media/sub/a.png`), and only the base name is
-/// used here: without a suffix the first entry would be overwritten and the
-/// survivor ingested twice. The check is against the directory, not a counter,
-/// because `out_dir` also holds the attachment itself. `next_suffix` memoizes
-/// the first suffix still worth trying per name, so a package of many entries
-/// sharing one base name does not rescan the names already taken.
-/// Only the `.docx` path needs this: PDF artifacts are named from page index and
-/// image slot, and a document's images are consumed before the next one converts.
-fn unique_out_path(
-    out_dir: &Path,
-    file_name: &str,
-    next_suffix: &mut HashMap<String, u32>,
-) -> PathBuf {
-    let n = next_suffix.entry(file_name.to_owned()).or_insert(1);
-    while out_dir
-        .join(crate::util::suffixed_name(file_name, *n))
-        .exists()
-    {
-        *n += 1;
-    }
-    out_dir.join(crate::util::suffixed_name(file_name, *n))
-}
-
 /// Embedded images left out of the conversion, by cause.
 #[derive(Default, Clone, Copy)]
-struct SkippedImages {
+pub(crate) struct SkippedImages {
     /// Format, colour space or bit depth this module does not convert.
     unsupported: usize,
     /// Decoding, reading or writing the image failed.
@@ -717,7 +623,7 @@ struct SkippedImages {
 }
 
 impl SkippedImages {
-    fn add(&mut self, reason: SkipReason) {
+    pub(crate) fn add(&mut self, reason: SkipReason) {
         match reason {
             SkipReason::Unsupported => self.unsupported += 1,
             SkipReason::Failed => self.failed += 1,
@@ -727,7 +633,7 @@ impl SkippedImages {
 
     /// One note per cause that happened, so a note never claims a decode
     /// failure for an image this module simply does not convert.
-    fn notes(&self) -> Vec<String> {
+    pub(crate) fn notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
         for (count, text) in [
             (self.unsupported, "in a format this pipeline cannot convert"),
@@ -744,7 +650,7 @@ impl SkippedImages {
 
 /// Why one embedded image is not in the conversion.
 #[derive(Clone, Copy)]
-enum SkipReason {
+pub(crate) enum SkipReason {
     Unsupported,
     Failed,
     Oversized,
@@ -1451,103 +1357,9 @@ fn rasterize_page(
     }
 }
 
-/// Extract the readable body of a `word/document.xml` part: the content of
-/// every `w:t` run-text element, a tab at `w:tab`, a newline at `w:br`, and a
-/// newline at each `w:p` paragraph end.
-///
-/// Elements are matched on their local name (after any namespace prefix) so a
-/// producer using a prefix other than `w:` still parses. `None` on any XML
-/// error — a body that cannot be read as XML is reported as corrupt.
-fn docx_body_text(xml: &[u8]) -> Option<String> {
-    let mut reader = Reader::from_reader(xml);
-    let mut buffer = Vec::new();
-    let mut text = String::new();
-    let mut in_run_text = false;
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(event)) => match event.local_name().as_ref() {
-                b"t" => in_run_text = true,
-                b"tab" => text.push('\t'),
-                b"br" => text.push('\n'),
-                _ => {}
-            },
-            Ok(Event::Empty(event)) => match event.local_name().as_ref() {
-                b"tab" => text.push('\t'),
-                b"br" => text.push('\n'),
-                _ => {}
-            },
-            Ok(Event::Text(event)) if in_run_text => {
-                if let Ok(chunk) = event.xml10_content() {
-                    text.push_str(&chunk);
-                }
-            }
-            Ok(Event::GeneralRef(event)) if in_run_text => append_entity(&mut text, &event),
-            Ok(Event::End(event)) => match event.local_name().as_ref() {
-                b"t" => in_run_text = false,
-                b"p" => text.push('\n'),
-                _ => {}
-            },
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return None,
-        }
-        buffer.clear();
-    }
-    // Every `w:p` leaves a trailing break; drop the document's final one so the
-    // inlined text does not end with a blank line.
-    Some(text.trim_end().to_string())
-}
-
-/// Resolve one XML entity reference (`&amp;`, `&#x41;`) in run text. An
-/// unresolvable reference is dropped rather than aborting the whole body.
-fn append_entity(text: &mut String, reference: &BytesRef<'_>) {
-    if let Ok(name) = reference.decode()
-        && let Some(resolved) = quick_xml::escape::resolve_predefined_entity(&name)
-    {
-        text.push_str(resolved);
-        return;
-    }
-    if let Ok(Some(character)) = reference.resolve_char_ref() {
-        text.push(character);
-    }
-}
-
-/// Read a named ZIP entry into memory, bounded by [`MAX_ZIP_ENTRY_BYTES`].
-/// `None` when it is absent, unreadable, or over the bound; none of those is
-/// fatal — the caller skips the entry (noting why) or reports the package
-/// unreadable.
-fn read_zip_entry<R: Read + Seek>(archive: &mut ZipArchive<R>, name: &str) -> Option<Vec<u8>> {
-    let mut entry = archive.by_name(name).ok()?;
-    // The declared size is checked first, so a bomb that admits its size is
-    // rejected before any inflation; the read then goes through the same cap so
-    // a lying header cannot exceed it either.
-    if entry.size() > MAX_ZIP_ENTRY_BYTES {
-        tracing::warn!(
-            %name,
-            declared_bytes = entry.size(),
-            "document: ZIP entry exceeds the decompression bound"
-        );
-        return None;
-    }
-    let mut bytes = Vec::new();
-    // Read one byte past the bound so an entry that is exactly at the limit is
-    // still accepted whole while a larger one is detected instead of silently
-    // truncated.
-    entry
-        .by_ref()
-        .take(MAX_ZIP_ENTRY_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_ZIP_ENTRY_BYTES {
-        tracing::warn!(%name, "document: ZIP entry exceeds the decompression bound");
-        return None;
-    }
-    Some(bytes)
-}
-
 /// Create `out_dir` when missing. A failure is logged here and surfaces again
 /// as an individual artifact-write failure, which is already handled.
-fn ensure_out_dir(out_dir: &Path) {
+pub(crate) fn ensure_out_dir(out_dir: &Path) {
     if let Err(e) = std::fs::create_dir_all(out_dir) {
         tracing::warn!(path = %out_dir.display(), error = %e, "document: failed to create extraction output dir");
     }
@@ -1572,24 +1384,6 @@ fn is_plain_utf8(bytes: &[u8]) -> bool {
 /// fixtures.
 #[cfg(test)]
 pub(crate) mod test_fixtures {
-    use super::*;
-    use std::io::Write;
-
-    pub(crate) const DOCX_BODY: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>First paragraph</w:t></w:r></w:p><w:p><w:r><w:t>Second paragraph</w:t></w:r></w:p></w:body></w:document>"#;
-
-    /// Build a ZIP archive in memory from `(entry path, contents)` pairs.
-    pub(crate) fn zip_fixture(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        for (path, contents) in entries {
-            writer.start_file(*path, options).expect("start zip entry");
-            writer.write_all(contents).expect("write zip entry");
-        }
-        writer.finish().expect("finish zip").into_inner()
-    }
-
     /// Assemble numbered objects into a PDF with a valid xref table, computing
     /// offsets as it writes.
     pub(crate) fn assemble_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
@@ -1671,6 +1465,8 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::test_fixtures::*;
     use super::*;
+    // The ZIP/OOXML fixtures live with the arm that reads them.
+    use crate::ooxml::test_fixtures::zip_fixture;
     use std::io::Write;
 
     /// One embedded image XObject for [`pdf_fixture`]: dictionary entries are
@@ -1805,112 +1601,24 @@ mod tests {
     }
 
     #[test]
-    fn docx_extracts_paragraphs_and_media() {
-        let bytes = zip_fixture(&[
-            ("word/document.xml", DOCX_BODY),
-            ("word/media/pic.png", b"\x89PNG\r\n\x1a\nfake image bytes"),
-            // A directory entry is not media: skipping it must not produce a
-            // "skipped embedded image media" note (asserted by `notes.is_empty`).
-            ("word/media/", b""),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = convert_document(&bytes, "report.docx", dir.path());
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            ..
-        } = outcome
-        else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(text, "First paragraph\nSecond paragraph");
-        assert_eq!(images, vec![dir.path().join("pic.png")]);
-        assert!(notes.is_empty());
-        assert_eq!(
-            std::fs::read(&images[0]).expect("read written image"),
-            b"\x89PNG\r\n\x1a\nfake image bytes"
-        );
-    }
-
-    #[test]
-    fn docx_notes_media_entries_it_cannot_convert() {
-        let bytes = zip_fixture(&[
-            ("word/document.xml", DOCX_BODY),
-            (
-                "word/media/diagram.emf",
-                b"EMF bytes this stack cannot decode",
-            ),
-            (
-                "word/media/vector.wmf",
-                b"WMF bytes this stack cannot decode",
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { images, notes, .. } =
-            convert_document(&bytes, "report.docx", dir.path())
-        else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert!(images.is_empty(), "an undecodable entry yields no image");
-        assert_eq!(
-            notes,
-            ["skipped 2 embedded image(s) in a format this pipeline cannot convert"]
-        );
-    }
-
-    /// A media entry name carrying a bracket would close the `[File ...]` note
-    /// (and the `[IMAGE:...]` marker built from it) early.
-    #[test]
-    fn docx_media_entry_names_are_marker_safe() {
-        let bytes = zip_fixture(&[
-            ("word/document.xml", DOCX_BODY),
-            ("word/media/a]b.png", b"\x89PNG\r\n\x1a\nfake image bytes"),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { images, .. } = convert_document(&bytes, "report.docx", dir.path())
-        else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(images, vec![dir.path().join("a_b.png")]);
-    }
-
-    /// Two entries can share a base name under different directories, and only
-    /// the base name survives into `out_dir`: each must get its own file, or one
-    /// is silently overwritten and the survivor ingested twice.
-    #[test]
-    fn docx_duplicate_media_base_names_get_distinct_files() {
-        let bytes = zip_fixture(&[
-            ("word/document.xml", DOCX_BODY),
-            ("word/media/pic.png", b"\x89PNG\r\n\x1a\nfirst"),
-            ("word/media/sub/pic.png", b"\x89PNG\r\n\x1a\nsecond"),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { images, .. } = convert_document(&bytes, "report.docx", dir.path())
-        else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(
-            images,
-            vec![dir.path().join("pic.png"), dir.path().join("pic_2.png")]
-        );
-    }
-
-    #[test]
-    fn encrypted_docx_reports_password_protected() {
+    fn encrypted_ooxml_reports_password_protected() {
         let mut bytes = CFB_MAGIC.to_vec();
         bytes.extend_from_slice(b"OLE container body that is not a zip");
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(matches!(
-            convert_document(&bytes, "secret.docx", dir.path()),
-            DocOutcome::Unreadable { reason } if reason == "password-protected"
-        ));
-        // The same container under a legacy Word name is just a format we do not
-        // convert — CFB is not by itself evidence of encryption.
-        assert!(matches!(
-            convert_document(&bytes, "old.doc", dir.path()),
-            DocOutcome::Unsupported
-        ));
+        for name in ["secret.docx", "book.xlsx", "deck.pptx"] {
+            assert!(matches!(
+                convert_document(&bytes, name, dir.path()),
+                DocOutcome::Unreadable { reason } if reason == "password-protected"
+            ));
+        }
+        // The same container under a legacy Office name is just a format we do
+        // not convert — CFB is not by itself evidence of encryption.
+        for name in ["old.doc", "old.xls", "old.ppt"] {
+            assert!(matches!(
+                convert_document(&bytes, name, dir.path()),
+                DocOutcome::Unsupported
+            ));
+        }
     }
 
     #[test]
@@ -1940,12 +1648,58 @@ mod tests {
     }
 
     #[test]
-    fn zip_with_non_docx_extension_is_unsupported() {
+    fn zip_with_non_ooxml_extension_is_unsupported() {
         let bytes = zip_fixture(&[("xl/workbook.xml", b"<workbook/>")]);
         let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["book.zip", "book.bin"] {
+            assert!(matches!(
+                convert_document(&bytes, name, dir.path()),
+                DocOutcome::Unsupported
+            ));
+        }
+    }
+
+    /// A ZIP named as one of the new OOXML formats reaches that format's reader
+    /// rather than the single Word arm.
+    #[test]
+    fn ooxml_zip_packages_dispatch_to_their_arm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xlsx = zip_fixture(&[
+            (
+                "xl/workbook.xml",
+                br#"<workbook xmlns:r="r"><sheets><sheet name="S" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                br#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>cell</t></is></c></row></sheetData></worksheet>"#,
+            ),
+        ]);
         assert!(matches!(
-            convert_document(&bytes, "book.xlsx", dir.path()),
-            DocOutcome::Unsupported
+            convert_document(&xlsx, "book.xlsx", dir.path()),
+            DocOutcome::Text { text, .. } if text == "Sheet \"S\":\n  A1: cell"
+        ));
+
+        let pptx = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation xmlns:p="p" xmlns:r="r"><p:sldIdLst><p:sldId r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                br"<p:sld><a:p><a:r><a:t>hello</a:t></a:r></a:p></p:sld>",
+            ),
+        ]);
+        assert!(matches!(
+            convert_document(&pptx, "deck.pptx", dir.path()),
+            DocOutcome::Text { text, .. } if text == "Slide 1:\n  hello"
         ));
     }
 
