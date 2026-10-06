@@ -252,7 +252,9 @@ pub struct Workspace {
     ///
     /// Automatically set to `true` on technical/agent failures (dispatch panic,
     /// agent run failure, all verifiers failing, user cancelling an in-flight
-    /// run) so queued development tickets aren't claimed and don't cascade.
+    /// run) so queued development tickets aren't claimed and don't cascade, and
+    /// by a `mahbot paused` launch, which pauses every registered workspace
+    /// before the poll loop starts.
     /// Lifted via the normal unpause path (GUI toggle, the admin's
     /// `workspace_control` chat tool, or rediscovery; the nightly loop skips
     /// paused workspaces). A discovery already in flight when the pause lands

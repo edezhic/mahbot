@@ -1218,10 +1218,11 @@ impl WorkspaceStore {
             //
             // The store→registry call mirrors `set_maintenance_enabled` above (which
             // cancels Maintainer agents): this method is the choke point for every
-            // pause entry point (GUI, Telegram, and the failure freeze), so the
-            // cancel is guaranteed rather than left to each caller. The one caller
-            // that signals the registry itself is `pause_workspace_on_failure`
-            // finding the flag already set — it has no write to piggyback on.
+            // pause entry point (GUI, Telegram, the `mahbot paused` startup mode,
+            // and the failure freeze), so the cancel is guaranteed rather than left
+            // to each caller. The one caller that signals the registry itself is
+            // `pause_workspace_on_failure` finding the flag already set — it has no
+            // write to piggyback on.
             crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(name);
             tracing::info!(workspace = name, "Workspace pipeline paused");
         } else {
@@ -1232,6 +1233,23 @@ impl WorkspaceStore {
             tracing::info!(workspace = name, "Workspace pipeline resumed");
         }
         Ok(())
+    }
+
+    /// Pause every registered workspace — the `mahbot paused` startup mode,
+    /// which must leave no workspace able to pick work up. Each row goes through
+    /// [`Self::set_paused`], so the pause is the ordinary one. Rows already
+    /// paused (a `pending`/`analyzing` one already carries the discovery
+    /// analysis-pause) are left untouched rather than rewritten. Returns the
+    /// number of registered workspaces, all of them now paused. Personal
+    /// workspaces have no row here.
+    pub async fn pause_all(&self) -> Result<usize> {
+        let workspaces = self.list().await?;
+        for ws in &workspaces {
+            if !ws.paused {
+                self.set_paused(&ws.name, true).await?;
+            }
+        }
+        Ok(workspaces.len())
     }
 
     /// Record a completed maintainer run by writing `maintainer_last_run_at`
@@ -2000,6 +2018,19 @@ mod tests {
             err.to_string().contains("No workspace is registered"),
             "got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn pause_all_pauses_every_registered_workspace() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "all_ready", "/tmp/all_ready", false, false, 0, 0).await;
+        insert_direct(&store, "all_paused", "/tmp/all_paused", true, false, 0, 0).await;
+
+        assert_eq!(store.pause_all().await.unwrap(), 2);
+        for name in ["all_ready", "all_paused"] {
+            let ws = store.get_by_name(name).await.unwrap().expect("exists");
+            assert!(ws.paused, "{name} must be paused");
+        }
     }
 
     #[tokio::test]

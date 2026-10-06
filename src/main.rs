@@ -37,7 +37,7 @@ const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-
 /// JetBrainsMono-Italic.ttf embedded for italic narration text in the Iced dashboard.
 const JETBRAINS_MONO_ITALIC_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Italic.ttf");
 
-/// Top-level `--help` text. Lists only the public subcommands (hidden
+/// Top-level `--help` text. Lists only the public entry points (hidden
 /// internals like `__grep-engine` are excluded). Printed through
 /// `util::print_stdout`, which adds the terminating newline.
 const TOP_LEVEL_USAGE: &str = "\
@@ -45,6 +45,8 @@ mahbot — autonomous agentic engineering system with a GUI dashboard daemon
 
 Usage:
   mahbot                 Launch the GUI dashboard daemon
+  mahbot paused          Launch the daemon with every registered workspace
+                         paused (no ticket is claimed or advanced)
   mahbot chrome <args>   Browser automation CLI over the shared chrome core
   mahbot debug           Read-only SQL query tool against the live stores
   mahbot bench-openrouter <args>
@@ -62,8 +64,11 @@ const LOG_RETENTION_HOURS: i64 = 8;
 /// a boot error instead of hanging on "Starting…" forever. A panic is recorded
 /// as a start-up failure like any other; the `Ok(Err(_))` arm is not recorded
 /// again, since the failing step already recorded it.
-async fn bootstrap_mahbot_safe() -> Result<(), String> {
-    match AssertUnwindSafe(bootstrap_mahbot()).catch_unwind().await {
+async fn bootstrap_mahbot_safe(start_paused: bool) -> Result<(), String> {
+    match AssertUnwindSafe(bootstrap_mahbot(start_paused))
+        .catch_unwind()
+        .await
+    {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(format!("{e:#}")),
         Err(payload) => {
@@ -80,7 +85,10 @@ async fn bootstrap_mahbot_safe() -> Result<(), String> {
 }
 
 /// Async startup for `MahBot` — runs on Iced's Tokio runtime via a boot [`Task`].
-async fn bootstrap_mahbot() -> Result<()> {
+///
+/// `start_paused` is the `mahbot paused` startup mode: every registered
+/// workspace is put on pause before the poll loop that claims work starts.
+async fn bootstrap_mahbot(start_paused: bool) -> Result<()> {
     mahbot::config::load_or_init()
         .await
         .map_err(|e| mahbot::boot::record_startup_failure("config::load_or_init", e))?;
@@ -133,6 +141,25 @@ async fn bootstrap_mahbot() -> Result<()> {
             )
         })?;
 
+    // `mahbot paused`: put every registered workspace on pause here. The stores
+    // are up and the poll loop that claims work is not spawned yet, so its first
+    // round already finds them paused and nothing gets claimed. This is the
+    // ordinary workspace pause — the same persisted flag and the same `set_paused`
+    // path as the dashboard toggle — so it survives restarts, and beyond the
+    // ordinary pause's effect (the ticket pipeline stands still) nothing else is
+    // stopped. A pause that cannot be written fails the launch: the daemon must
+    // never come up unpaused on a swallowed error.
+    if start_paused {
+        let workspaces = mahbot::workspace::store()
+            .pause_all()
+            .await
+            .map_err(|e| mahbot::boot::record_startup_failure("workspace::pause_all", e))?;
+        info!(
+            workspaces,
+            "Started with the paused argument: all registered workspaces are on pause"
+        );
+    }
+
     spawn_background_tasks(log_store.clone());
 
     info!(
@@ -143,7 +170,7 @@ async fn bootstrap_mahbot() -> Result<()> {
     let admin_target = mahbot::self_update::resolve_admin_telegram_target().await;
     tokio::spawn(async move {
         mahbot::self_update::notify_admin(
-            &mahbot::self_update::back_online_message(),
+            &mahbot::self_update::back_online_message(start_paused),
             admin_target.as_deref(),
         )
         .await;
@@ -736,6 +763,13 @@ fn main() -> Result<()> {
         _ => {}
     }
 
+    // `mahbot paused` is a startup mode, not a subcommand: the launch continues
+    // into the normal GUI startup, with a flag that pauses every registered
+    // workspace before any background task starts (see `bootstrap_mahbot`). Only
+    // this exact argv[1] token is matched — no argument, or anything else,
+    // behaves exactly as before.
+    let start_paused = std::env::args().nth(1).as_deref() == Some("paused");
+
     // Subscribe to the platform's stop requests before boot and before the interface
     // exists; `shutdown` names the three sources.
     mahbot::shutdown::install_stop_request_sources();
@@ -804,7 +838,7 @@ fn main() -> Result<()> {
         move || {
             (
                 Dashboard::loading(),
-                iced::Task::perform(bootstrap_mahbot_safe(), DashboardMessage::Boot),
+                iced::Task::perform(bootstrap_mahbot_safe(start_paused), DashboardMessage::Boot),
             )
         },
         Dashboard::update,

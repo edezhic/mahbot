@@ -1948,9 +1948,16 @@ pub(crate) async fn report_update_failure(err: &anyhow::Error) {
 /// "back online" line, which now names the running version's build. An unattended
 /// update reports itself through the same lines a manual one does; this is what
 /// says the version that came up is the new one, with no additional surface.
+/// `started_paused` (`mahbot paused`) adds that mode's state, so the owner is told
+/// that the workspaces standing still are the mode's doing and not a fault.
 #[must_use]
-pub fn back_online_message() -> String {
-    format!("✅ MahBot is back online — running v{VERSION}")
+pub fn back_online_message(started_paused: bool) -> String {
+    let message = format!("✅ MahBot is back online — running v{VERSION}");
+    if started_paused {
+        format!("{message}\nStarted paused — every registered workspace is on pause.")
+    } else {
+        message
+    }
 }
 
 /// Reply used when a command requires the admin. Used by both

@@ -3197,7 +3197,8 @@ fn test_update_notification_texts_render_as_plain_single_messages() {
         crate::self_update::UPDATE_BUILD_COMPLETE_MSG,
         crate::self_update::UPDATE_DOWNLOAD_COMPLETE_MSG,
         crate::self_update::UPDATE_RESTART_MSG,
-        &crate::self_update::back_online_message(),
+        &crate::self_update::back_online_message(false),
+        &crate::self_update::back_online_message(true),
     ] {
         assert_eq!(to_telegram_html(text), text, "not plain text: {text}");
         assert_eq!(
