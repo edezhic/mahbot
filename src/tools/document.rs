@@ -123,13 +123,20 @@ const XLSX_EDIT_OPS: [&str; 6] = [
     "delete_column",
 ];
 
-const PPTX_EDIT_OPS: [&str; 6] = [
+const PPTX_EDIT_OPS: [&str; 13] = [
     "replace_text",
     "remove_text",
+    "format_text",
     "add_paragraph",
     "remove_paragraph",
+    "add_image",
     "add_slide",
     "delete_slide",
+    "move_slide",
+    "duplicate_slide",
+    "replace_notes",
+    "remove_notes",
+    "add_notes",
 ];
 
 /// The formats `create` understands: the three OOXML families (whose names the
@@ -187,14 +194,28 @@ struct Rules {
     scalar_kinds: Vec<String>,
     image_extensions: Vec<String>,
     image_side_px: Span,
+    /// A pptx `add_image` placement: the fraction of the slide's width or
+    /// height the image is placed at.
+    slide_position_fraction: Span,
+    /// A pptx `add_image` size: the fraction of the slide's width or height the
+    /// image is scaled to, where zero is not a size.
+    slide_size_fraction: Span,
     pdf_size_points: Span,
     /// A docx `format_text` size in points. Word's `<w:sz>` counts half-points
     /// and caps the value at 1638 — 819 points — so the kit writes the doubled
     /// number and both sides refuse past this bound rather than write a
     /// `<w:sz>` a reader cannot hold.
     text_size_points: Span,
+    /// A pptx `format_text` size in points. DrawingML's `<a:rPr sz>` counts
+    /// hundredths of a point, so the ruler is its own — unlike
+    /// [`Rules::text_size_points`], which is Word's half-point cap.
+    slide_text_size_points: Span,
     pdf_point_abs_max: f64,
     color_digits: usize,
+    /// A pptx `format_text` alignment: the word a caller names, and the `algn`
+    /// value ECMA-376 writes for it. The kit's writer reads the same pairs, so
+    /// the word a call may name and the value written for it cannot drift.
+    slide_alignments: Vec<(String, String)>,
     degrees_step: i64,
     sheet_name_max: usize,
     sheet_name_forbidden: String,
@@ -253,8 +274,18 @@ impl Tool for DocumentTool {
         let degrees_step = RULES.degrees_step.to_string();
         let heading_levels = listed(&RULES.heading_levels);
         let image_side_px = RULES.image_side_px.bounds();
+        let slide_position_fraction = RULES.slide_position_fraction.bounds();
+        let slide_size_fraction = RULES.slide_size_fraction.bounds();
         let pdf_size_points = RULES.pdf_size_points.bounds();
         let text_size_points = RULES.text_size_points.bounds();
+        let slide_text_size_points = RULES.slide_text_size_points.bounds();
+        // The alignments as the prompt spells one in a JSON edit: quoted and
+        // pipe-separated, in the order the rules state them.
+        let slide_alignments = align_words()
+            .iter()
+            .map(|word| format!("\"{word}\""))
+            .collect::<Vec<_>>()
+            .join("|");
         let pdf_point_abs_max = RULES.pdf_point_abs_max.to_string();
         let color_digits = RULES.color_digits.to_string();
         let merge_inputs = MAX_MERGE_INPUTS.to_string();
@@ -278,8 +309,12 @@ impl Tool for DocumentTool {
                 ("{{degrees_step}}", &degrees_step),
                 ("{{heading_levels}}", &heading_levels),
                 ("{{image_side_px}}", &image_side_px),
+                ("{{slide_position_fraction}}", &slide_position_fraction),
+                ("{{slide_size_fraction}}", &slide_size_fraction),
                 ("{{pdf_size_points}}", &pdf_size_points),
                 ("{{text_size_points}}", &text_size_points),
+                ("{{slide_text_size_points}}", &slide_text_size_points),
+                ("{{slide_alignments}}", &slide_alignments),
                 ("{{pdf_point_abs_max}}", &pdf_point_abs_max),
                 ("{{color_digits}}", &color_digits),
                 ("{{merge_inputs}}", &merge_inputs),
@@ -573,7 +608,12 @@ impl DocumentTool {
         let head = head_of(&input).await?;
         require_edit_family(&input, &head, family)?;
         ensure_input_readable(&input, &head)?;
-        let edits = validate_edits(family, args)?;
+        let mut edits = validate_edits(family, args)?;
+        // Only a presentation places an image the kit must be handed a resolved
+        // path for; the other families' edits carry no path to resolve.
+        if family == crate::ooxml::Family::Pptx {
+            resolve_edit_images(ws, &mut edits).await?;
+        }
         // The OUTPUT keeps the input's own extension — a `.docm` copy stays a
         // `.docm` one, macros and all — which a matched family guarantees it has.
         let extension = input
@@ -720,7 +760,8 @@ impl DocumentTool {
         set_positive_number(&mut request, args, "size")?;
         set_number(&mut request, args, "rotate")?;
         if let Some(color) = opt_string(args, "color")? {
-            require_hex_color(color)?;
+            // A pdf argument is named quoted, as the neighbouring refusals do.
+            require_hex_color("\"color\"", color)?;
             request["color"] = json!(color);
         }
         if let Some(stamp) = super::get_opt_bool(args, "stamp")? {
@@ -1224,6 +1265,23 @@ fn edit_integer(
     }
 }
 
+/// One optional number field of an edit; a non-numeric or non-finite value is
+/// refused here rather than by the kit later.
+fn edit_number(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    at: &str,
+) -> Result<Option<f64>> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|number| number.is_finite())
+            .map(Some)
+            .ok_or_else(|| super::wrong_type(&format!("{at}.{key}"), "a number", value)),
+    }
+}
+
 /// The docx edit vocabulary: text ops address the joined text of a paragraph's
 /// runs in the body, so the field each op needs and the shapes it accepts are
 /// stated here once.
@@ -1266,34 +1324,62 @@ fn require_position(object: &serde_json::Map<String, Value>, at: &str) -> Result
     }
 }
 
-/// Require a `format_text` to name at least one property, and each property to
-/// be the shape the kit writes: a boolean toggle, or a point size inside the
-/// shared bound (`<w:sz>` counts half-points and tops out at 1638 of them).
-fn require_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+/// Require each named toggle, when present and not null, to be a boolean;
+/// returns whether any was stated, which is what a `format_text`'s "at least
+/// one property" test counts.
+fn require_toggles(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+    at: &str,
+) -> Result<bool> {
     let mut any = false;
-    for key in ["bold", "italic"] {
-        match object.get(key) {
+    for key in keys {
+        match object.get(*key) {
             None | Some(Value::Null) => {}
             Some(Value::Bool(_)) => any = true,
             Some(v) => return Err(super::wrong_type(&format!("{at}.{key}"), "a boolean", v)),
         }
     }
-    match object.get("size") {
-        None | Some(Value::Null) => {}
-        Some(value) => {
-            let size = value
-                .as_f64()
-                .filter(|size| size.is_finite())
-                .ok_or_else(|| super::wrong_type(&format!("{at}.size"), "a number", value))?;
-            if !RULES.text_size_points.contains(size) {
-                anyhow::bail!(
-                    "usage: {at}.size must be {}, got {size} — hint: give a size in points",
-                    RULES.text_size_points.bounds()
-                );
-            }
-            any = true;
-        }
+    Ok(any)
+}
+
+/// Require an optional numeric field, when present and not null, to sit inside
+/// `span`; the refusal names `what` the number is for.
+fn require_span_number(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    span: &Span,
+    what: &str,
+    at: &str,
+) -> Result<()> {
+    match edit_number(object, key, at)? {
+        Some(number) if span.contains(number) => Ok(()),
+        Some(number) => anyhow::bail!(
+            "usage: {at}.{key} must be {}, got {number} — hint: {what}",
+            span.bounds()
+        ),
+        None => Ok(()),
     }
+}
+
+/// Require an optional `format_text` `size` to sit inside `span`, and report
+/// whether it was stated — the presence a `format_text`'s "at least one
+/// property" test counts, read the way [`edit_number`] reads one.
+fn require_text_size(
+    object: &serde_json::Map<String, Value>,
+    span: &Span,
+    at: &str,
+) -> Result<bool> {
+    require_span_number(object, "size", span, "give a size in points", at)?;
+    Ok(!matches!(object.get("size"), None | Some(Value::Null)))
+}
+
+/// Require a `format_text` to name at least one property, and each property to
+/// be the shape the kit writes: a boolean toggle, or a point size inside the
+/// shared bound (`<w:sz>` counts half-points and tops out at 1638 of them).
+fn require_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let mut any = require_toggles(object, &["bold", "italic"], at)?;
+    any |= require_text_size(object, &RULES.text_size_points, at)?;
     if !any {
         anyhow::bail!(
             "usage: {at} (format_text) needs at least one of bold, italic or size — hint: a \
@@ -1449,31 +1535,102 @@ fn require_number_format(object: &serde_json::Map<String, Value>, at: &str) -> R
 /// The pptx edit vocabulary: a slide is its 1-based number as the reader shows
 /// it, and a text op names a fragment that must be on that slide.
 fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &str) -> Result<()> {
+    // Refuse a key the op does not take before any field is read: the kit reads
+    // only the fields its op knows, so a mistyped or extra parameter would be
+    // dropped in silence and the model would believe it asked for something it
+    // did not.
     match op {
+        "replace_text" | "replace_notes" => {
+            require_pptx_keys(object, op, &["slide", "find", "replace"], at)?;
+            require_slide(object, at)?;
+            edit_string_non_empty(object, "find", at)?;
+            edit_string_present(object, "replace", at)?;
+        }
+        "remove_text" | "remove_paragraph" | "remove_notes" => {
+            require_pptx_keys(object, op, &["slide", "find"], at)?;
+            require_slide(object, at)?;
+            edit_string_non_empty(object, "find", at)?;
+        }
+        "format_text" => {
+            require_pptx_keys(
+                object,
+                op,
+                &[
+                    "slide",
+                    "find",
+                    "bold",
+                    "italic",
+                    "underline",
+                    "size",
+                    "color",
+                    "align",
+                ],
+                at,
+            )?;
+            require_slide(object, at)?;
+            edit_string_non_empty(object, "find", at)?;
+            require_pptx_format(object, at)?;
+        }
+        "add_paragraph" => {
+            require_pptx_keys(object, op, &["slide", "text", "after", "level"], at)?;
+            require_slide(object, at)?;
+            edit_string_present(object, "text", at)?;
+            require_optional_text(object, "after", at)?;
+            require_optional_level(object, at)?;
+        }
+        "add_image" => {
+            require_pptx_keys(
+                object,
+                op,
+                &["slide", "path", "x", "y", "width", "height"],
+                at,
+            )?;
+            require_slide(object, at)?;
+            edit_string_non_empty(object, "path", at)?;
+            require_image_geometry(object, at)?;
+        }
         "add_slide" => {
+            require_pptx_keys(object, op, &["after", "title", "bullets"], at)?;
             if edit_integer(object, "after", at)? == Some(0) {
                 anyhow::bail!("usage: {at}.after must be a whole number of at least 1");
             }
             require_optional_text(object, "title", at)?;
             require_bullets(object, at)?;
         }
-        "replace_text" => {
+        "delete_slide" | "duplicate_slide" => {
+            require_pptx_keys(object, op, &["slide"], at)?;
             require_slide(object, at)?;
-            edit_string_non_empty(object, "find", at)?;
-            edit_string_present(object, "replace", at)?;
         }
-        "remove_text" | "remove_paragraph" => {
+        "move_slide" => {
+            require_pptx_keys(object, op, &["slide", "to"], at)?;
             require_slide(object, at)?;
-            edit_string_non_empty(object, "find", at)?;
+            require_slide_number(object, "to", at)?;
         }
-        "add_paragraph" => {
+        "add_notes" => {
+            require_pptx_keys(object, op, &["slide", "text"], at)?;
             require_slide(object, at)?;
             edit_string_present(object, "text", at)?;
-            require_optional_text(object, "after", at)?;
-            require_optional_level(object, at)?;
         }
-        "delete_slide" => require_slide(object, at)?,
         _ => unreachable!("the op was checked against the family's vocabulary"),
+    }
+    Ok(())
+}
+
+/// Refuse a pptx edit's key that its op does not take, naming the fields the op
+/// does: the kit reads only those, so an extra one would be dropped in silence.
+fn require_pptx_keys(
+    object: &serde_json::Map<String, Value>,
+    op: &str,
+    allowed: &[&str],
+    at: &str,
+) -> Result<()> {
+    for key in object.keys() {
+        if key != "op" && !allowed.contains(&key.as_str()) {
+            anyhow::bail!(
+                "usage: {at}.{key} is not a field of pptx \"{op}\" — hint: it takes {}",
+                allowed.join(", ")
+            );
+        }
     }
     Ok(())
 }
@@ -1481,9 +1638,19 @@ fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &st
 /// Require an edit's `slide` to be a 1-based slide number; a deck's length is
 /// the kit's to know, so only the lower bound is enforced here.
 fn require_slide(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
-    match edit_integer(object, "slide", at)? {
-        Some(slide) if slide >= 1 => Ok(()),
-        _ => anyhow::bail!("usage: {at}.slide must be a whole number of at least 1"),
+    require_slide_number(object, "slide", at)
+}
+
+/// Require a 1-based slide number under `key` — an edit's `slide` or a
+/// `move_slide`'s `to`.
+fn require_slide_number(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    at: &str,
+) -> Result<()> {
+    match edit_integer(object, key, at)? {
+        Some(number) if number >= 1 => Ok(()),
+        _ => anyhow::bail!("usage: {at}.{key} must be a whole number of at least 1"),
     }
 }
 
@@ -1531,6 +1698,85 @@ fn require_bullets(object: &serde_json::Map<String, Value>, at: &str) -> Result<
                 RULES.edit_text_max
             );
         }
+    }
+    Ok(())
+}
+
+/// Require an optional `format_text` `color` to be the shape the kit parses (see
+/// [`require_hex_color`]); returns whether it was stated.
+fn require_color(object: &serde_json::Map<String, Value>, at: &str) -> Result<bool> {
+    match object.get("color") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(color)) => {
+            require_hex_color(&format!("{at}.color"), color)?;
+            Ok(true)
+        }
+        Some(v) => Err(super::wrong_type(&format!("{at}.color"), "a string", v)),
+    }
+}
+
+/// Require an optional `format_text` `align` to be one the paragraph writer has —
+/// a word the shared rules state, and the `algn` value its own pair writes;
+/// returns whether it was stated.
+fn require_align(object: &serde_json::Map<String, Value>, at: &str) -> Result<bool> {
+    match object.get("align") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(align)) => {
+            if !RULES.slide_alignments.iter().any(|(word, _)| word == align) {
+                anyhow::bail!(
+                    "usage: {at}.align must be {}, got \"{align}\"",
+                    listed(&align_words())
+                );
+            }
+            Ok(true)
+        }
+        Some(v) => Err(super::wrong_type(&format!("{at}.align"), "a string", v)),
+    }
+}
+
+/// The `align` words the shared rules state, in their own order: the one list the
+/// refusal and the model-facing hint read, so a word added to the rules cannot
+/// leave either of them stale.
+fn align_words() -> Vec<&'static str> {
+    RULES
+        .slide_alignments
+        .iter()
+        .map(|(word, _)| word.as_str())
+        .collect()
+}
+
+/// Require a pptx `format_text` to name at least one property, and each to be
+/// the shape the kit writes: a boolean run toggle, a point size inside the
+/// presentation's own bound, a hex colour, or a paragraph alignment.
+fn require_pptx_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let mut any = require_toggles(object, &["bold", "italic", "underline"], at)?;
+    any |= require_text_size(object, &RULES.slide_text_size_points, at)?;
+    any |= require_color(object, at)?;
+    any |= require_align(object, at)?;
+    if !any {
+        anyhow::bail!(
+            "usage: {at} (format_text) needs at least one of bold, italic, underline, size, color \
+             or align — hint: a boolean toggles bold, italic or underline, size is in points, \
+             color is hex digits and align is {}",
+            listed(&align_words())
+        );
+    }
+    Ok(())
+}
+
+/// Require an `add_image`'s optional placement and size: `x` and `y` are fractions
+/// of the slide's own width and height and may sit on its edge, while `width` and
+/// `height` are fractions of that size and may not be zero.
+fn require_image_geometry(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let place = "give the fraction of the slide the image is placed at";
+    let size = "give the fraction of the slide the image is scaled to";
+    for (key, span, what) in [
+        ("x", &RULES.slide_position_fraction, place),
+        ("y", &RULES.slide_position_fraction, place),
+        ("width", &RULES.slide_size_fraction, size),
+        ("height", &RULES.slide_size_fraction, size),
+    ] {
+        require_span_number(object, key, span, what, at)?;
     }
     Ok(())
 }
@@ -1631,6 +1877,35 @@ async fn resolve_content(ws: &Workspace, args: &Value, format: &str) -> Result<V
         out.push(resolved);
     }
     Ok(Value::Array(out))
+}
+
+/// Resolve every `add_image` path in a validated pptx edit list against the
+/// workspace, the way `create`'s image block is: the kit is handed a path it can
+/// open, and the same strict read rule keeps an edit from embedding a file the
+/// caller did not name inside the workspace. The list's shape — an array of
+/// objects, each naming an `op`, an `add_image` also carrying a non-empty
+/// `path` — is the pptx validator's own contract.
+async fn resolve_edit_images(ws: &Workspace, edits: &mut Value) -> Result<()> {
+    let list = edits
+        .as_array_mut()
+        .expect("validate_edits hands a pptx edit list back as an array");
+    for edit in list {
+        let object = edit
+            .as_object_mut()
+            .expect("validate_edits hands every pptx edit back as an object");
+        if object.get("op").and_then(Value::as_str) != Some("add_image") {
+            continue;
+        }
+        let raw = object
+            .get("path")
+            .and_then(Value::as_str)
+            .expect("the pptx validator requires an add_image path")
+            .to_owned();
+        let (image, _) = resolve_input(ws, &raw).await?;
+        ensure_image(&image)?;
+        object.insert("path".to_owned(), json!(image.to_string_lossy()));
+    }
+    Ok(())
 }
 
 /// Resolve and validate the `sheets` argument: every sheet is an object with a
@@ -1924,7 +2199,7 @@ fn require_table_body(object: &serde_json::Map<String, Value>, index: usize) -> 
 
 /// `1, 2 or 3` — how a refusal hint and the description name the values a rule
 /// allows.
-fn listed(values: &[f64]) -> String {
+fn listed<T: std::fmt::Display>(values: &[T]) -> String {
     match values {
         [] => String::new(),
         [only] => only.to_string(),
@@ -2050,20 +2325,20 @@ fn require_scalar_values(values: &serde_json::Map<String, Value>) -> Result<()> 
     Ok(())
 }
 
-/// Check that a `pdf_text` colour is the shape the kit parses: the shared rules'
-/// `color_digits` hex digits, with an optional leading `#`.
-fn require_hex_color(color: &str) -> Result<()> {
+/// Check that a colour is the shape the kit parses: the shared rules'
+/// `color_digits` hex digits, with an optional leading `#`. `at` is the path the
+/// refusal names, spelled the way the caller's other messages spell it.
+fn require_hex_color(at: &str, color: &str) -> Result<()> {
     let digits = color.strip_prefix('#').unwrap_or(color);
     if digits.len() == RULES.color_digits && digits.chars().all(|digit| digit.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "usage: \"color\" must be {} hex digits, with an optional leading \"#\", got \
-             \"{color}\" — hint: like \"#{}\"",
-            RULES.color_digits,
-            "f".repeat(RULES.color_digits)
-        )
+        return Ok(());
     }
+    anyhow::bail!(
+        "usage: {at} must be {} hex digits, with an optional leading \"#\", got \"{color}\" — \
+         hint: like \"#{}\"",
+        RULES.color_digits,
+        "f".repeat(RULES.color_digits)
+    )
 }
 
 /// Require `object[key]` to be a string, naming the block position in the error.
@@ -2426,7 +2701,7 @@ fn path_strings(paths: &[PathBuf]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::document::{DocOutcome, convert_document_file};
-    use crate::util::test::noisy_png;
+    use crate::util::test::{noisy_jpeg, noisy_png};
     use crate::workspace::test_ws_named;
     use std::io::{Cursor, Read as _, Write as _};
 
@@ -2594,6 +2869,45 @@ mod tests {
         format!("{}{}{}", &xml[..open], list, &xml[close..])
     }
 
+    /// The `<a:p>…</a:p>` whose run text is exactly `text`: the paragraph a
+    /// slide's text sits in, so a caller can assert what the paragraph itself
+    /// carries — an alignment, say — rather than the run.
+    fn paragraph_element<'a>(xml: &'a str, text: &str) -> &'a str {
+        let at = xml
+            .find(&format!("<a:t>{text}</a:t>"))
+            .expect("the paragraph's run text");
+        let start = xml[..at].rfind("<a:p>").expect("the paragraph's open");
+        let end = xml[at..].find("</a:p>").expect("the paragraph's close") + at;
+        &xml[start..end]
+    }
+
+    /// The relationship id a picture names in its `r:embed`.
+    fn embedding_id(picture: &str) -> &str {
+        let attribute = "r:embed=\"";
+        let after = &picture
+            [picture.find(attribute).expect("a picture names an image") + attribute.len()..];
+        &after[..after.find('"').expect("a closing quote")]
+    }
+
+    /// `xml` with every `<Relationship …/>` whose element text names `needle`
+    /// dropped: a part a caller needs to lack a relationship it would otherwise
+    /// declare.
+    fn without_relationship(xml: &str, needle: &str) -> String {
+        let mut out = String::new();
+        let mut rest = xml;
+        while let Some(at) = rest.find("<Relationship") {
+            out.push_str(&rest[..at]);
+            let element = &rest[at..];
+            let end = element.find("/>").expect("a self-closing relationship") + "/>".len();
+            if !element[..end].contains(needle) {
+                out.push_str(&element[..end]);
+            }
+            rest = &element[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+
     /// Add one part to an in-progress package.
     fn add_part(zip: &mut zip::ZipWriter<Cursor<Vec<u8>>>, name: &str, body: &str) {
         add_bytes(zip, name, body.as_bytes());
@@ -2606,12 +2920,10 @@ mod tests {
         zip.write_all(body).expect("write part");
     }
 
-    /// `package` with `parts` added, a name it already holds replaced. Used to
-    /// give a fixture the parts an edit must carry through untouched — a header,
-    /// a footer, a chart, a media file — whose bodies may be minimal XML.
-    fn with_parts(package: &[u8], parts: &[(&str, &[u8])]) -> Vec<u8> {
-        let replaced: std::collections::HashSet<&str> =
-            parts.iter().map(|(name, _)| *name).collect();
+    /// A package holding the parts of `package` — the names in `dropped` left out —
+    /// with `parts` written beside them, a name already there replaced. Folder
+    /// entries are not parts.
+    fn repacked(package: &[u8], dropped: &[&str], parts: &[(&str, &[u8])]) -> Vec<u8> {
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         {
             let mut archive =
@@ -2619,7 +2931,10 @@ mod tests {
             for index in 0..archive.len() {
                 let mut entry = archive.by_index(index).expect("entry");
                 let name = entry.name().to_string();
-                if name.ends_with('/') || replaced.contains(name.as_str()) {
+                if name.ends_with('/')
+                    || dropped.contains(&name.as_str())
+                    || parts.iter().any(|(part, _)| *part == name)
+                {
                     continue;
                 }
                 let mut bytes = Vec::new();
@@ -2633,11 +2948,127 @@ mod tests {
         zip.finish().expect("finish package").into_inner()
     }
 
+    /// `package` with `parts` added, a name it already holds replaced. Used to
+    /// give a fixture the parts an edit must carry through untouched — a header,
+    /// a footer, a chart, a media file — whose bodies may be minimal XML.
+    fn with_parts(package: &[u8], parts: &[(&str, &[u8])]) -> Vec<u8> {
+        repacked(package, &[], parts)
+    }
+
+    /// A `pptx` package whose parts are not the ones a number spells: its layout is
+    /// numbered with a leading zero (`slideLayout01.xml`, and no `slideLayout1.xml`),
+    /// and of the two notes masters it holds it declares and uses the second, the
+    /// first being a part nothing points at. The other families' writers only ever
+    /// number their parts plainly and keep one master, so this is written by hand
+    /// rather than produced by one.
+    fn leading_zero_deck() -> Vec<u8> {
+        const LAYOUT: &str = r#"<?xml version="1.0"?><p:sldLayout xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>"#;
+        const MASTER: &str = r#"<?xml version="1.0"?><p:notesMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>"#;
+        const SLIDE: &str = r#"<?xml version="1.0"?><p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Первый</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#;
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        add_part(
+            &mut zip,
+            "[Content_Types].xml",
+            concat!(
+                r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">"#,
+                r#"<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>"#,
+                r#"<Default Extension="xml" ContentType="application/xml"/>"#,
+                r#"<Override PartName="/ppt/slideLayouts/slideLayout01.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>"#,
+                r#"<Override PartName="/ppt/notesMasters/notesMaster01.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml"/>"#,
+                r#"<Override PartName="/ppt/notesMasters/notesMaster02.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml"/>"#,
+                r#"<Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>"#,
+                "</Types>",
+            ),
+        );
+        add_part(
+            &mut zip,
+            "ppt/presentation.xml",
+            concat!(
+                r#"<?xml version="1.0"?><p:presentation xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#,
+                r#"<p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst>"#,
+                r#"<p:notesMasterIdLst><p:notesMasterId r:id="rId3"/></p:notesMasterIdLst>"#,
+                r#"<p:sldSz cx="12192000" cy="6858000"/></p:presentation>"#,
+            ),
+        );
+        add_part(
+            &mut zip,
+            "ppt/_rels/presentation.xml.rels",
+            concat!(
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+                r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>"#,
+                r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="slideLayouts/slideLayout01.xml"/>"#,
+                r#"<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesMaster" Target="notesMasters/notesMaster02.xml"/>"#,
+                "</Relationships>",
+            ),
+        );
+        add_part(&mut zip, "ppt/slides/slide1.xml", SLIDE);
+        add_part(&mut zip, "ppt/slideLayouts/slideLayout01.xml", LAYOUT);
+        add_part(&mut zip, "ppt/notesMasters/notesMaster01.xml", MASTER);
+        add_part(&mut zip, "ppt/notesMasters/notesMaster02.xml", MASTER);
+        zip.finish().expect("finish package").into_inner()
+    }
+
     /// Write a fixture package into the workspace and return its path.
     fn write_fixture(ws: &Workspace, name: &str, bytes: &[u8]) -> PathBuf {
         let path = ws.as_path().join(name);
         std::fs::write(&path, bytes).expect("write fixture");
         path
+    }
+
+    /// The same package with one part dropped — the shape a deck has when it
+    /// declares a part it no longer holds.
+    fn without_part(package: &[u8], name: &str) -> Vec<u8> {
+        repacked(package, &[name], &[])
+    }
+
+    /// A deck whose presentation numbers a `<p:sldId>` its list does not hold: a
+    /// slide of its own the reader shows BEFORE the list's three, so the entry at a
+    /// position in the list is the slide after the one the reader shows there. The
+    /// stray slide shows `STRAY` where the list's show `FIRST`, `SECOND` and `THIRD`,
+    /// and its part is a copy of the first slide's, so which part an edit removes is
+    /// visible in the result. Built from the writer's own deck because no writer
+    /// emits a `<p:sldId>` outside the list.
+    async fn stray_sld_id_deck(ws: &Workspace, name: &str) -> PathBuf {
+        let created = single(
+            &run(
+                ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "FIRST" },
+                        { "type": "heading", "level": 1, "text": "SECOND" },
+                        { "type": "heading", "level": 1, "text": "THIRD" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        let stray = part_text_bytes(&base, "ppt/slides/slide1.xml").replace("FIRST", "STRAY");
+        let presentation = part_text_bytes(&base, "ppt/presentation.xml").replacen(
+            "<p:sldIdLst>",
+            r#"<p:sldId id="999" r:id="rId99"/><p:sldIdLst>"#,
+            1,
+        );
+        let rels = part_text_bytes(&base, "ppt/_rels/presentation.xml.rels").replace(
+            "</Relationships>",
+            concat!(
+                r#"<Relationship Id="rId99" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide4.xml"/>"#,
+                "</Relationships>",
+            ),
+        );
+        write_fixture(
+            ws,
+            name,
+            &with_parts(
+                &base,
+                &[
+                    ("ppt/presentation.xml", presentation.as_bytes()),
+                    ("ppt/_rels/presentation.xml.rels", rels.as_bytes()),
+                    ("ppt/slides/slide4.xml", stray.as_bytes()),
+                ],
+            ),
+        )
     }
 
     /// A real-Excel-shaped workbook: its string lives in `xl/sharedStrings.xml`
@@ -4421,8 +4852,9 @@ mod tests {
                 .await
                 .expect_err("an image the writer cannot embed whole");
             assert!(
-                err.to_string().contains("the file is not a whole one"),
-                "expected the refusal to name the file's own bytes: {err}"
+                err.to_string().contains("are not a whole PNG image")
+                    || err.to_string().contains("are not a whole JPEG image"),
+                "expected the refusal to name the bytes rather than the file: {err}"
             );
         }
         assert_eq!(
@@ -4807,6 +5239,75 @@ mod tests {
                 { "op": "add_slide" },
             ])
         );
+    }
+
+    /// A pptx edit that names a key its op does not take is refused at the
+    /// boundary: the kit reads only the fields the op knows, so a mistyped or
+    /// extra parameter would be dropped in silence and the model would believe
+    /// it asked for something it did not.
+    #[test]
+    fn pptx_edit_refuses_a_key_its_op_does_not_take() {
+        let cases = [
+            (
+                json!([{ "op": "delete_slide", "slide": 1, "title": "x" }]),
+                "edits[0].title is not a field of pptx \"delete_slide\"",
+            ),
+            (
+                json!([{ "op": "format_text", "slide": 1, "find": "a", "shadow": true }]),
+                "edits[0].shadow is not a field of pptx \"format_text\"",
+            ),
+        ];
+        for (edits, expected) in cases {
+            let err = validate_edits(crate::ooxml::Family::Pptx, &json!({ "edits": edits }))
+                .expect_err("a key the op does not take must be refused");
+            let message = err.to_string();
+            assert!(
+                message.contains("usage:") && message.contains(expected),
+                "expected {expected:?}, got: {message}"
+            );
+        }
+    }
+
+    /// Every shape a pptx `format_text` could be given that the kit cannot write
+    /// is refused at the boundary: no property at all, a size outside the run's
+    /// own bound, a colour that is not hex digits, an alignment the writer has
+    /// not, and a toggle that is not a boolean.
+    #[test]
+    fn pptx_edit_format_text_refuses_every_unwritable_property() {
+        let cases = [
+            (
+                json!({ "op": "format_text", "slide": 1, "find": "a" }),
+                "needs at least one of bold",
+            ),
+            (
+                json!({ "op": "format_text", "slide": 1, "find": "a", "size": 1e300 }),
+                "size must be",
+            ),
+            (
+                json!({ "op": "format_text", "slide": 1, "find": "a", "size": 0.5 }),
+                "size must be",
+            ),
+            (
+                json!({ "op": "format_text", "slide": 1, "find": "a", "color": "zzz" }),
+                "color must be",
+            ),
+            (
+                json!({ "op": "format_text", "slide": 1, "find": "a", "align": "middle" }),
+                "align must be",
+            ),
+            (
+                json!({ "op": "format_text", "slide": 1, "find": "a", "bold": "yes" }),
+                "must be a boolean",
+            ),
+        ];
+        for (edit, expected) in cases {
+            let err = validate_edits(crate::ooxml::Family::Pptx, &json!({ "edits": [edit] }))
+                .expect_err("an unwritable format_text must be refused");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got: {err}"
+            );
+        }
     }
 
     /// A docx edit changes only the body part: every other part keeps its exact
@@ -7947,6 +8448,126 @@ mod tests {
         assert!(err.to_string().contains("only slide"), "got: {err}");
     }
 
+    /// A deck's slides are reordered, duplicated and re-noted: `move_slide` puts
+    /// the addressed slide first, `duplicate_slide` copies it in place with its
+    /// notes, and `replace_notes` rewrites only the slide it names — the reader's
+    /// own `Slide N:`/`Slide N notes:` labels say so. A notes shape whose `<p:ph>`
+    /// names no type is not the body a reader draws notes from, so the notes'
+    /// text is still rewritten there while a paragraph is not added to it.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_moves_duplicates_and_replaces_notes() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "Первый" },
+                        { "type": "paragraph", "text": "Тело один" },
+                        { "type": "notes", "text": "Заметка один" },
+                        { "type": "heading", "level": 1, "text": "Второй" },
+                        { "type": "paragraph", "text": "Тело два" },
+                        { "type": "notes", "text": "Заметка два" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "move_slide", "slide": 2, "to": 1 },
+                    { "op": "duplicate_slide", "slide": 1 },
+                    { "op": "replace_notes", "slide": 1, "find": "Заметка два",
+                      "replace": "Заметка изменена" },
+                ],
+            }),
+        )
+        .await;
+        let text = converted_text(&ws, &single(&reply)).await;
+
+        // The reader numbers the three slides it now holds, and the second
+        // slide the deck was written with is the first of them.
+        let first = text.find("Slide 1:").expect("the first slide");
+        let second = text.find("Slide 2:").expect("the second slide");
+        let third = text.find("Slide 3:").expect("the third slide");
+        assert!(
+            first < second && second < third,
+            "the reader did not number three slides: {text}"
+        );
+        let (s1, s2, s3) = (&text[first..second], &text[second..third], &text[third..]);
+        assert!(
+            s1.contains("Второй") && s2.contains("Второй") && s3.contains("Первый"),
+            "move_slide did not put the second slide first: {text}"
+        );
+        // replace_notes rewrote the first slide's notes …
+        assert!(
+            s1.contains("Slide 1 notes:") && s1.contains("Заметка изменена"),
+            "replace_notes did not rewrite the addressed slide's notes: {s1}"
+        );
+        // … while the duplicate still carries the notes it copied.
+        assert!(
+            s2.contains("Slide 2 notes:") && s2.contains("Заметка два"),
+            "the duplicate did not carry the notes of what it copied: {s2}"
+        );
+        assert!(
+            s3.contains("Slide 3 notes:") && s3.contains("Заметка один"),
+            "the untouched slide's notes changed: {s3}"
+        );
+
+        // A notes slide whose `<p:ph>` names no type holds the `obj` placeholder
+        // the schema defaults to, not the body a reader draws notes from: its
+        // paragraphs are still matched by text, but a paragraph added to it would
+        // land where no reader shows notes, so adding one is refused.
+        let notes = part_text(&source, "ppt/notesSlides/notesSlide1.xml");
+        let without_type = notes.replace(r#"type="body" "#, "");
+        let bodyless = write_fixture(
+            &ws,
+            "bodyless.pptx",
+            &with_parts(
+                &std::fs::read(&source).expect("read created deck"),
+                &[("ppt/notesSlides/notesSlide1.xml", without_type.as_bytes())],
+            ),
+        );
+        let noted_reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "noted",
+                "path": bodyless.to_string_lossy(),
+                "edits": [{ "op": "replace_notes", "slide": 1, "find": "Заметка один",
+                            "replace": "Заметка без типа" }],
+            }),
+        )
+        .await;
+        let noted_text = converted_text(&ws, &single(&noted_reply)).await;
+        assert!(
+            noted_text.contains("Slide 1 notes:") && noted_text.contains("Заметка без типа"),
+            "the notes text of a placeholder that names no type was not rewritten: {noted_text}"
+        );
+        let added = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "file_name": "typed",
+                    "path": bodyless.to_string_lossy(),
+                    "edits": [{ "op": "add_notes", "slide": 1, "text": "Ещё заметка" }],
+                }),
+            )
+            .await
+            .expect_err("a notes shape no reader draws notes from must not take a paragraph");
+        let refusal = added.to_string();
+        let no_body = "usage: the notes of slide 1 have no body";
+        assert!(refusal.starts_with(no_body), "got: {refusal}");
+    }
+
     /// A new pptx paragraph goes into the slide's OWN text — the `<p:txBody>` of
     /// its top-level `<p:sp>` shapes — never into a table's cell, whose
     /// paragraphs a plain "last paragraph" scan would pick up. An `after` that
@@ -8008,6 +8629,640 @@ mod tests {
             .await
             .expect_err("an anchor inside a table must be refused");
         assert!(err.to_string().contains("inside a table"), "got: {err}");
+    }
+
+    /// A package whose parts are not the ones a plain number spells — the layout it
+    /// holds is `slideLayout01.xml`, and the notes master it declares is the second
+    /// of the two it holds — is named by the parts it really has: a relationship
+    /// built from a number resolves to nothing. The model-facing description of
+    /// `add_notes` promises a notes slide is written for a slide that has none, so
+    /// this is also where the master it is wired to is checked: the one the deck
+    /// declares, not the first the package happens to hold.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_names_the_parts_a_leading_zero_deck_really_has() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(&ws, "zero.pptx", &leading_zero_deck());
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "add_slide", "after": 1, "title": "NEW" },
+                    { "op": "add_notes", "slide": 1, "text": "заметка" },
+                ],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let layout = part_text(&output, "ppt/slides/_rels/slide2.xml.rels");
+        assert!(
+            layout.contains(r#"Target="../slideLayouts/slideLayout01.xml""#),
+            "the new slide names a layout the package does not have: {layout}"
+        );
+        let notes = part_text(&output, "ppt/notesSlides/_rels/notesSlide1.xml.rels");
+        assert!(
+            notes.contains(r#"Target="../notesMasters/notesMaster02.xml""#),
+            "the created notes slide is not wired to the master the deck declares: {notes}"
+        );
+    }
+
+    /// A deck whose slide list holds fewer entries than the reader numbers — an
+    /// entry outside the list — refuses a `duplicate_slide` of the last slide with
+    /// its own cause: a copy is placed where the reader shows it, and the list is
+    /// what cannot take it, never a placement nobody asked for.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_duplicate_slide_refuses_a_list_that_numbers_fewer_slides() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "One" },
+                        { "type": "heading", "level": 1, "text": "Two" },
+                        { "type": "heading", "level": 1, "text": "Three" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let base = std::fs::read(&created).expect("read base package");
+        // A third slide the reader numbers — the `<p:sldId>` the list itself does
+        // not hold, reusing the third slide's own relationship.
+        let rels = part_text_bytes(&base, "ppt/_rels/presentation.xml.rels");
+        let target = rels
+            .find(r#"Target="slides/slide3.xml""#)
+            .expect("the third slide's relationship");
+        let open = rels[..target].rfind(r#"Id=""#).expect("an id") + r#"Id=""#.len();
+        let id = &rels[open..][..rels[open..].find('"').expect("the id's end")];
+        let presentation = part_text_bytes(&base, "ppt/presentation.xml").replace(
+            "</p:sldIdLst>",
+            &format!(r#"</p:sldIdLst><p:foo><p:sldId id="900" r:id="{id}"/></p:foo>"#),
+        );
+        let source = write_fixture(
+            &ws,
+            "stray.pptx",
+            &with_parts(&base, &[("ppt/presentation.xml", presentation.as_bytes())]),
+        );
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "duplicate_slide", "slide": 4 }],
+                }),
+            )
+            .await
+            .expect_err("a slide the list does not hold cannot be duplicated");
+        let text = err.to_string();
+        assert!(
+            text.contains("does not number its slides the way the reader shows them"),
+            "the refusal does not name its cause: {text}"
+        );
+        assert!(
+            !text.contains("placed after"),
+            "the refusal words a duplicate as a placement: {text}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A `<p:sldId>` sitting outside the presentation's list is numbered by the
+    /// reader and not by the list, so the entry at a position in the list is the
+    /// slide after the one the reader shows there: a move and a copy of the reader's
+    /// slide are refused rather than performed on the wrong one, and a delete takes
+    /// the entry the reader numbered — never one belonging to another slide, which
+    /// would leave both a dangling `<p:sldId>` and an orphaned part.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_a_sld_id_outside_the_slide_list_is_not_addressable_by_position() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = stray_sld_id_deck(&ws, "stray.pptx").await;
+        let before = generated_count(&ws);
+        for edit in [
+            json!({ "op": "move_slide", "slide": 1, "to": 3 }),
+            json!({ "op": "duplicate_slide", "slide": 2 }),
+        ] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "pptx_edit", "path": source.to_string_lossy(),
+                        "edits": [edit],
+                    }),
+                )
+                .await
+                .expect_err("a position the list does not number is not one to act on");
+            assert!(
+                err.to_string()
+                    .contains("does not number its slides the way the reader shows them"),
+                "the refusal does not name its cause: {err}"
+            );
+        }
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        let output = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "file_name": "edited",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "delete_slide", "slide": 2 }],
+                }),
+            )
+            .await,
+        );
+        let names = zip_names(&output);
+        assert!(
+            !names.iter().any(|name| name == "ppt/slides/slide1.xml"),
+            "the addressed slide's part was left behind: {names:?}"
+        );
+        assert!(
+            ["ppt/slides/slide2.xml", "ppt/slides/slide4.xml"]
+                .iter()
+                .all(|kept| names.iter().any(|name| name == kept)),
+            "a slide another entry numbers was removed: {names:?}"
+        );
+        assert_eq!(
+            part_text(&output, "ppt/presentation.xml")
+                .matches("<p:sldId ")
+                .count(),
+            3,
+            "a <p:sldId> was left dangling or an extra one was removed"
+        );
+        let text = converted_text(&ws, &output).await;
+        assert!(
+            !text.contains("FIRST"),
+            "the deleted slide's own text is still shown: {text}"
+        );
+        let (stray, second, third) = (
+            text.find("STRAY").expect("the stray slide"),
+            text.find("SECOND").expect("the second slide"),
+            text.find("THIRD").expect("the third slide"),
+        );
+        assert!(
+            stray < second && second < third,
+            "the reader's order changed: {text}"
+        );
+    }
+
+    /// A deck whose slide declares speaker notes the package does not hold cannot
+    /// be duplicated: a copy repeats the source's notes, and a copy left naming the
+    /// declaration the source keeps would put one notes part behind two slides, so
+    /// a later edit of either would change both. The refusal names the declaration,
+    /// and nothing is written.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_duplicate_slide_refuses_a_declared_notes_part_the_deck_lacks() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "Один" },
+                        { "type": "notes", "text": "Заметка" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let notes = zip_names(&created)
+            .into_iter()
+            .find(|name| name.starts_with("ppt/notesSlides/notesSlide"))
+            .expect("the slide's notes part");
+        let source = write_fixture(
+            &ws,
+            "dangling.pptx",
+            &without_part(&std::fs::read(&created).expect("read base package"), &notes),
+        );
+        // The slide still declares those notes; the part they name is gone.
+        assert!(
+            part_text(&source, "ppt/slides/_rels/slide1.xml.rels").contains("notesSlide"),
+            "the fixture lost the notes declaration it is about"
+        );
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "duplicate_slide", "slide": 1 }],
+                }),
+            )
+            .await
+            .expect_err("a slide whose notes are declared but missing cannot be copied");
+        let text = err.to_string();
+        assert!(
+            text.contains("declares speaker notes") && text.contains(&notes),
+            "the refusal does not name the notes declaration it is about: {text}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A media part `add_image` writes is declared with the content type the kit
+    /// read the image as. A deck the tool created declares its `.jpg` parts
+    /// through the writer's own `<Default Extension="jpg" …>`, which is not the
+    /// type of the part that was added, so the part's own declaration is what the
+    /// bytes of a JPEG added to such a deck are checked against.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_declares_an_added_images_own_content_type() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [{ "type": "paragraph", "text": "Слайд" }],
+                }),
+            )
+            .await,
+        );
+        let photo = write_fixture(&ws, "photo.jpg", &noisy_jpeg(60, 30));
+
+        // The image is added to the deck the tool created, and to a copy of it whose
+        // content types already declare the media part the image will take — a
+        // declaration of a part that is not there, which the edit has to correct
+        // rather than leave standing.
+        let bytes = std::fs::read(&source).expect("read the created deck");
+        let declaring = part_text_bytes(&bytes, "[Content_Types].xml").replace(
+            "</Types>",
+            r#"<Override PartName="/ppt/media/image1.jpg" ContentType="image/jpg"/></Types>"#,
+        );
+        for (name, deck) in [
+            ("created.pptx", bytes.clone()),
+            (
+                "declaring.pptx",
+                with_parts(&bytes, &[("[Content_Types].xml", declaring.as_bytes())]),
+            ),
+        ] {
+            let deck = write_fixture(&ws, name, &deck);
+            let output = single(
+                &run(
+                    &ws,
+                    json!({
+                        "action": "pptx_edit", "file_name": "edited",
+                        "path": deck.to_string_lossy(),
+                        "edits": [{ "op": "add_image", "slide": 1, "path": photo.to_string_lossy() }],
+                    }),
+                )
+                .await,
+            );
+            let types = part_text(&output, "[Content_Types].xml");
+            let media: Vec<&str> = types
+                .match_indices("<Override ")
+                .map(|(at, _)| types[at..].split('>').next().expect("a tag"))
+                .filter(|tag| tag.contains(r#"PartName="/ppt/media/"#))
+                .collect();
+            let [declared] = media.as_slice() else {
+                panic!("the added image is not one declared media part of {name}: {media:?}");
+            };
+            assert!(
+                declared.contains(r#"ContentType="image/jpeg""#),
+                "the added JPEG is not declared as image/jpeg in {name}: {types}"
+            );
+        }
+    }
+
+    /// A pptx format fragment that is exactly its paragraph widens to nothing,
+    /// while a partial one raises both of the kit's caveats — the formatting took
+    /// the rest of the run and the alignment the rest of the paragraph — and two
+    /// added images land as the slide's last shapes: one where the request placed
+    /// it, one centred and scaled to fit.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    #[expect(clippy::too_many_lines)] // reason: one deck carrying every formatting and image assertion
+    async fn pptx_edit_formats_text_places_images_and_reports_a_partial_fragment() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "Заголовок" },
+                        { "type": "paragraph", "text": "Целый абзац" },
+                        { "type": "paragraph", "text": "Второй абзац тут" },
+                        { "type": "heading", "level": 1, "text": "Второй слайд" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let image = noisy_png(200, 100);
+        let picture = write_fixture(&ws, "pic.png", &image);
+        let path = source.to_string_lossy();
+
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "edited",
+                "path": path,
+                "edits": [
+                    { "op": "format_text", "slide": 1, "find": "Целый абзац",
+                      "bold": true, "italic": true, "underline": true, "size": 20,
+                      "color": "#FF0000", "align": "center" },
+                    { "op": "format_text", "slide": 1, "find": "Второй абзац",
+                      "color": "00FF00", "align": "left" },
+                    { "op": "add_image", "slide": 1, "path": picture.to_string_lossy(),
+                      "x": 0.1, "y": 0.2, "width": 0.4 },
+                    { "op": "add_image", "slide": 1, "path": picture.to_string_lossy() },
+                ],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        // "Второй абзац" is only part of its paragraph's text, so the kit says
+        // the formatting widened to the rest of the run and that aligning it
+        // aligned the whole paragraph.
+        for note in ["part of a longer run", "alignment is the whole paragraph's"] {
+            assert!(reply.contains(note), "{note} was not raised: {reply}");
+        }
+
+        // Both additions are the package's media parts, byte for byte the file
+        // the request named.
+        let media: Vec<String> = zip_names(&output)
+            .into_iter()
+            .filter(|name| name.starts_with("ppt/media/image"))
+            .collect();
+        assert_eq!(
+            media,
+            ["ppt/media/image1.png", "ppt/media/image2.png"],
+            "the added images are not the deck's two media parts"
+        );
+        for name in &media {
+            assert_eq!(
+                part_bytes(&output, name),
+                image,
+                "{name} is not the fixture image"
+            );
+        }
+
+        let slide = part_text(&output, "ppt/slides/slide1.xml");
+        let pictures: Vec<&str> = slide
+            .split("<p:pic>")
+            .skip(1)
+            .map(|rest| rest.split("</p:pic>").next().expect("a picture close"))
+            .collect();
+        assert_eq!(
+            pictures.len(),
+            2,
+            "the slide does not hold exactly two pictures: {slide}"
+        );
+        let rels = part_text(&output, "ppt/slides/_rels/slide1.xml.rels");
+        // The picture the request placed: 0.1 × 0.2 of the slide, 0.4 of its
+        // width and — the image being twice as wide as it is tall — half of that
+        // again as its height.
+        let placed = pictures[0];
+        let embed = embedding_id(placed);
+        let relationship = rels
+            .split("<Relationship")
+            .find(|rel| rel.contains(&format!("Id=\"{embed}\"")))
+            .expect("the placed picture's relationship");
+        assert!(
+            relationship.contains(r#"Target="../media/image1.png""#),
+            "the placed picture does not draw image1.png: {relationship}"
+        );
+        assert!(
+            placed.contains(r#"x="914400" y="1028700""#)
+                && placed.contains(r#"cx="3657600" cy="1828800""#),
+            "the placed picture's geometry is not the requested fraction: {placed}"
+        );
+        // The picture with neither a place nor a size: centred and the largest
+        // that fits the slide with the image's proportions.
+        let centred = pictures[1];
+        let embed = embedding_id(centred);
+        let relationship = rels
+            .split("<Relationship")
+            .find(|rel| rel.contains(&format!("Id=\"{embed}\"")))
+            .expect("the centred picture's relationship");
+        assert!(
+            relationship.contains(r#"Target="../media/image2.png""#),
+            "the centred picture does not draw image2.png: {relationship}"
+        );
+        assert!(
+            centred.contains(r#"x="0" y="285750""#)
+                && centred.contains(r#"cx="9144000" cy="4572000""#),
+            "the picture with no place or size is not centred and fitted: {centred}"
+        );
+
+        let formatting = paragraph_element(&slide, "Целый абзац");
+        assert!(
+            formatting.contains(r#"algn="ctr""#),
+            "the whole-paragraph fragment did not align its paragraph: {formatting}"
+        );
+        let formatted_run = &formatting[formatting
+            .find("<a:rPr")
+            .expect("the formatted run's properties")..];
+        for attribute in [r#"b="1""#, r#"i="1""#, r#"u="sng""#, r#"sz="2000""#] {
+            assert!(
+                formatted_run.contains(attribute),
+                "the formatted run lost {attribute}: {formatted_run}"
+            );
+        }
+        assert!(
+            formatted_run.contains(r#"<a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>"#),
+            "the formatted run did not take the requested colour: {formatted_run}"
+        );
+
+        let partial = paragraph_element(&slide, "Второй абзац тут");
+        assert!(
+            partial.contains(r#"algn="l""#),
+            "the partial fragment did not align its paragraph: {partial}"
+        );
+        assert!(
+            partial.contains(r#"<a:srgbClr val="00FF00"/>"#),
+            "the partial fragment did not colour its run: {partial}"
+        );
+
+        let text = converted_text(&ws, &output).await;
+        for expected in ["Целый абзац", "Второй абзац тут", "Второй слайд"]
+        {
+            assert!(
+                text.contains(expected),
+                "{expected} was lost from the deck: {text}"
+            );
+        }
+
+        // The same formatting alone, on a fragment that IS the whole paragraph:
+        // it covers every point of its run, so it raises neither caveat.
+        let alone = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "formatted",
+                "path": path,
+                "edits": [
+                    { "op": "format_text", "slide": 1, "find": "Целый абзац",
+                      "bold": true, "italic": false, "underline": true, "size": 20,
+                      "color": "#FF0000", "align": "center" },
+                ],
+            }),
+        )
+        .await;
+        for note in ["part of a longer run", "alignment is the whole paragraph's"] {
+            assert!(
+                !alone.contains(note),
+                "a whole-paragraph fragment raised {note}: {alone}"
+            );
+        }
+        // An explicit `false` is a written value, not an absence: the run carries
+        // italic off so a placeholder, layout or theme cannot give it back.
+        let formatted = single(&alone);
+        let slide = part_text(&formatted, "ppt/slides/slide1.xml");
+        let formatting = paragraph_element(&slide, "Целый абзац");
+        assert!(
+            formatting.contains(r#"i="0""#),
+            "the explicit italic false was not written onto the run: {formatting}"
+        );
+    }
+
+    /// A slide whose package holds no notes part is given one: `add_notes` writes
+    /// a fresh notes slide whose body placeholder carries the text, wires a
+    /// notes-master relationship into it, declares it in the content types and
+    /// gives the slide a relationship to it — which is what the reader shows.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_add_notes_creates_the_notes_part_a_slide_lacks() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "Первый" },
+                        { "type": "paragraph", "text": "Тело" },
+                        { "type": "heading", "level": 1, "text": "Второй" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        // pptxgenjs writes an empty notes slide for every slide it makes, so the
+        // second slide is cooked into one whose package holds no notes at all:
+        // its only relationship to them is what a reader goes by.
+        let bytes = std::fs::read(&created).expect("read base package");
+        let rels = part_text(&created, "ppt/slides/_rels/slide2.xml.rels");
+        let without_notes = without_relationship(&rels, "notesSlide");
+        let source = write_fixture(
+            &ws,
+            "deck.pptx",
+            &with_parts(
+                &bytes,
+                &[("ppt/slides/_rels/slide2.xml.rels", without_notes.as_bytes())],
+            ),
+        );
+
+        let output = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "file_name": "noted",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "add_notes", "slide": 2, "text": "Заметка добавлена" }],
+                }),
+            )
+            .await,
+        );
+
+        let notes: Vec<String> = zip_names(&output)
+            .into_iter()
+            .filter(|name| name.starts_with("ppt/notesSlides/notesSlide"))
+            .filter(|name| part_text(&output, name).contains("Заметка добавлена"))
+            .collect();
+        assert_eq!(
+            notes.len(),
+            1,
+            "the created notes part is not the only one holding the text: {notes:?}"
+        );
+        let notes_part = &notes[0];
+        let xml = part_text(&output, notes_part);
+        assert!(
+            xml.contains(r#"<p:ph type="body""#),
+            "{notes_part} has no notes body placeholder: {xml}"
+        );
+        assert!(
+            inside_element(&xml, "Заметка добавлена", "<p:txBody>", "</p:txBody>"),
+            "the added notes are not in a text body: {xml}"
+        );
+
+        let slide_rels = part_text(&output, "ppt/slides/_rels/slide2.xml.rels");
+        let relationship = slide_rels
+            .split("<Relationship")
+            .find(|rel| rel.contains("notesSlide"))
+            .expect("the slide's notes relationship");
+        let target = format!(
+            "../{}",
+            notes_part
+                .strip_prefix("ppt/")
+                .expect("a package-relative part")
+        );
+        assert!(
+            relationship.contains(&format!("Target=\"{target}\"")),
+            "the slide's notes relationship does not name {notes_part}: {relationship}"
+        );
+
+        let file_name = notes_part.rsplit('/').next().expect("a notes file name");
+        let notes_rels = part_text(&output, &format!("ppt/notesSlides/_rels/{file_name}.rels"));
+        assert!(
+            notes_rels.contains("notesMaster"),
+            "{notes_part} has no notes master relationship: {notes_rels}"
+        );
+
+        let types = part_text(&output, "[Content_Types].xml");
+        assert!(
+            types.contains(&format!(r#"<Override PartName="/{notes_part}""#)),
+            "[Content_Types].xml declares no override for {notes_part}: {types}"
+        );
+
+        let text = converted_text(&ws, &output).await;
+        assert!(
+            text.contains("Slide 2 notes:"),
+            "the reader shows no notes for the second slide: {text}"
+        );
+        assert!(
+            text.contains("Заметка добавлена"),
+            "the created notes were lost: {text}"
+        );
     }
 
     /// A presentation's text is written WITHOUT `xml:space`: DrawingML declares no
@@ -8590,12 +9845,24 @@ mod tests {
             "an empty image-side range"
         );
         assert!(
+            rules.slide_position_fraction.min < rules.slide_position_fraction.max,
+            "an empty slide-position range"
+        );
+        assert!(
+            rules.slide_size_fraction.min < rules.slide_size_fraction.max,
+            "an empty slide-size range"
+        );
+        assert!(
             rules.pdf_size_points.min < rules.pdf_size_points.max,
             "an empty PDF-size range"
         );
         assert!(
             rules.text_size_points.min < rules.text_size_points.max,
             "an empty text-size range"
+        );
+        assert!(
+            rules.slide_text_size_points.min < rules.slide_text_size_points.max,
+            "an empty slide-text-size range"
         );
         assert!(
             rules.color_digits > 0 && rules.color_digits.is_multiple_of(3),
@@ -8668,8 +9935,17 @@ mod tests {
         for value in [
             listed(&RULES.heading_levels),
             RULES.image_side_px.bounds(),
+            RULES.slide_position_fraction.bounds(),
+            RULES.slide_size_fraction.bounds(),
             RULES.pdf_size_points.bounds(),
             RULES.text_size_points.bounds(),
+            RULES.slide_text_size_points.bounds(),
+            RULES
+                .slide_alignments
+                .iter()
+                .map(|(word, _)| format!("\"{word}\""))
+                .collect::<Vec<_>>()
+                .join("|"),
             RULES.color_digits.to_string(),
             RULES.degrees_step.to_string(),
             RULES.sheet_name_max.to_string(),

@@ -63,11 +63,13 @@ class UsageError extends Error {}
 // Only the extensions the shared rules name are accepted: all three writers
 // embed PNG and JPEG and nothing else, and one rule is what the tool's prompt
 // can state honestly.
-function imageKind(file) {
+function imageType(file) {
   const lower = file.toLowerCase();
   const extension = RULES.image_extensions.find((candidate) => lower.endsWith(`.${candidate}`));
   if (!extension) throw new UsageError(`only PNG and JPEG images can be embedded, got: ${nodePath.basename(file)}`);
-  return extension === "png" ? "png" : "jpg";
+  return extension === "png"
+    ? { kind: "png", contentType: "image/png" }
+    : { kind: "jpg", contentType: "image/jpeg" };
 }
 // The shapes the tool's own boundary guarantees, as the kit's last line: a text
 // field is a string and a bullet or a cell is a scalar. A structure reaching a
@@ -106,17 +108,22 @@ function headingLevel(level) {
 // in a document the caller receives as a success. The check walks the format's
 // own structure and yields the image's own pixel size with it; a whole image of
 // a flavour pdf-lib's decoder rejects is still that arm's to refuse, one step
-// later.
+// later. The media part the image becomes is named with the kind and declared
+// with the content type. The size is the frame's own, with no EXIF orientation
+// applied: a viewer that honours an orientation tag draws such a JPEG turned.
 function readImage(file) {
-  const kind = imageKind(file);
+  const { kind, contentType } = imageType(file);
   const bytes = readInput(file);
   const size = kind === "png" ? pngSize(bytes) : jpegSize(bytes);
-  // A declared size of nothing is a degenerate image, not a small one: the
-  // proportions every other size is scaled from would not exist.
+  // A declared size of nothing means the bytes are not a whole image of the kind
+  // the name claims — truncated, or another format under that extension — not
+  // that the image is small: the proportions every other size is scaled from
+  // would not exist.
   if (!size || size.width < 1 || size.height < 1) {
-    throw new UsageError(`cannot embed ${nodePath.basename(file)} as a ${kind === "png" ? "PNG" : "JPEG"} image: the file is not a whole one`);
+    const label = kind === "png" ? "PNG" : "JPEG";
+    throw new UsageError(`cannot embed ${nodePath.basename(file)} as a ${label} image: the file's bytes are not a whole ${label} image`);
   }
-  return { kind, bytes, width: size.width, height: size.height };
+  return { kind, contentType, bytes, width: size.width, height: size.height };
 }
 // A PNG: the signature, then chunks of declared length whose first is a 13-byte
 // IHDR, at least one of which is image data, closed by an IEND. Bytes after the
@@ -447,7 +454,7 @@ function createPptx(req) {
       const w = size.width / 96;
       const h = size.height / 96;
       room(h + 0.2);
-      slide.addImage({ data: `data:image/${image.kind === "png" ? "png" : "jpeg"};base64,${image.bytes.toString("base64")}`, x: 0.4, y, w, h });
+      slide.addImage({ data: `data:${image.contentType};base64,${image.bytes.toString("base64")}`, x: 0.4, y, w, h });
       y += h + 0.2;
     } else if (block.type === "notes") {
       if (!slide) fresh();
@@ -2820,10 +2827,34 @@ const PPT_PRESENTATION = "ppt/presentation.xml";
 const PPT_RELS = "ppt/_rels/presentation.xml.rels";
 const PPT_BASE = "ppt/";
 const PPT_SLIDES = "ppt/slides/";
+const PPT_LAYOUTS = "ppt/slideLayouts/";
+const PPT_NOTES_SLIDES = "ppt/notesSlides/";
+const PPT_NOTES_MASTERS = "ppt/notesMasters/";
+const PPT_MEDIA = "ppt/media/";
 const SLIDE_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
+const NOTES_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml";
+// The relationships namespace the parts this kit writes declare as `r`, and the
+// base its relationship types are built from.
+const REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const REL_BASE = `${REL_NS}/`;
+const SLIDE_REL = `${REL_BASE}slide`;
+const SLIDE_LAYOUT_REL = `${REL_BASE}slideLayout`;
+const NOTES_REL = `${REL_BASE}notesSlide`;
+const NOTES_MASTER_REL = `${REL_BASE}notesMaster`;
+const IMAGE_REL = `${REL_BASE}image`;
 // The run language of a slide this kit writes; a placeholder inherits its type,
 // size and bullets from the layout, so nothing else about it is stated here.
 const SLIDE_LANG = "en-US";
+// The alignments a `format_text` may name, in the order the shared rules state
+// them: each word a caller may name and the `algn` value ECMA-376 writes for it.
+const SLIDE_ALIGNMENTS = new Map(RULES.slide_alignments);
+// The slide size a presentation stating none is read at, in EMU: the
+// 10in × 7½in one MS-OI29500 Part 1 §19.2.1.39 states PowerPoint assumes — a
+// `<p:sldSz cx="9144000" cy="6858000"/>` — when the element is absent. An image
+// on such a slide is placed by fraction of this.
+const SLIDE_SIZE_DEFAULT = { width: 9144000, height: 6858000 };
+// One CSS pixel — the unit an image's own pixel size is stated in — in EMU.
+const PX_TO_EMU = 9525;
 
 // The value of the attribute `name` of an XML tag. A longer name never matches a
 // shorter one (`\bTarget=` is not `TargetMode=`, and the `Id` of a relationship
@@ -2879,12 +2910,63 @@ function relsPartFor(part) {
   return `${part.slice(0, cut)}/_rels/${part.slice(cut + 1)}.rels`;
 }
 
-// The `ppt/slides/slideN.xml` numbers the package holds, whatever order the
-// presentation lists them in.
-const slideFileNumbers = (zip) => Object.keys(zip.files).flatMap((name) => {
-  const match = name.match(/^ppt\/slides\/slide(\d+)\.xml$/);
-  return match ? [Number(match[1])] : [];
+// The directory a part's own relationships resolve their targets against.
+const partDirectory = (part) => part.slice(0, part.lastIndexOf("/") + 1);
+
+// A tag's own XML with attribute `name` set to `value`, or removed when the
+// value is null. The attribute is written just before the tag's own close, so a
+// self-closing tag stays self-closing.
+function setXmlAttribute(tag, name, value) {
+  const pattern = new RegExp(`\\s${name}="[^"]*"`);
+  if (value === null) return tag.replace(pattern, "");
+  if (pattern.test(tag)) return tag.replace(pattern, ` ${name}="${value}"`);
+  return tag.replace(/(\s*\/?>)$/, ` ${name}="${value}"$1`);
+}
+
+// Add a relationship of `type` to `part`'s own relationships, naming the
+// absolute package path `target`, and return the fresh id it took. The
+// relationship part is created when the package has none.
+function addRelationship(editor, part, type, target) {
+  const rels = relsPartFor(part);
+  const file = editor.zip.file(rels);
+  // Every id the part already holds is stepped over, whether or not its element
+  // is one this kit would read: two relationships sharing an id name each other.
+  const used = file ? [...file.asText().matchAll(/\bId="rId(\d+)"/g)].map((match) => Number(match[1])) : [];
+  const id = `rId${Math.max(0, ...used) + 1}`;
+  const element = `<Relationship Id="${id}" Type="${type}" Target="${relativeTarget(partDirectory(part), target)}"/>`;
+  if (!file) {
+    editor.add(rels, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${element}</Relationships>`);
+    return id;
+  }
+  editor.part(rels, (xml) => {
+    if (!xml.includes("</Relationships>")) throw new UsageError(`the relationships of ${part} are not readable`);
+    return xml.replace("</Relationships>", () => `${element}</Relationships>`);
+  });
+  return id;
+}
+
+// The package's `<base>N.xml` parts: the number each carries and the name it
+// really has. A package that numbers with a leading zero (`slideLayout01.xml`)
+// holds no `slideLayout1.xml`, so a reference to a part that is already there
+// must use the matched name; only a name for a part about to be written may be
+// built from the number.
+const numberedParts = (zip, base) => Object.keys(zip.files).flatMap((name) => {
+  const match = name.match(new RegExp(`^${escapeRegExp(base)}(\\d+)\\.xml$`));
+  return match ? [{ number: Number(match[1]), name }] : [];
 });
+// Those parts in the order the reader numbers them: by number, then by name.
+const byPartNumber = (a, b) => a.number - b.number || (a.name < b.name ? -1 : 1);
+// The `ppt/slides/slideN.xml` numbers the package holds, whatever order the
+// presentation lists them in, and the notes-slide ones — the numbers a fresh
+// part of that kind takes the next of.
+const slideFileNumbers = (zip) => numberedParts(zip, `${PPT_SLIDES}slide`).map((part) => part.number);
+const notesSlideNumbers = (zip) => numberedParts(zip, `${PPT_NOTES_SLIDES}notesSlide`).map((part) => part.number);
+// The name of the numerically first `<base>N.xml` part a package holds, or null
+// when it holds none.
+function firstPartName(zip, base) {
+  const parts = numberedParts(zip, base).sort(byPartNumber);
+  return parts.length ? parts[0].name : null;
+}
 
 // The slide parts in the order the presentation's own `<p:sldId>` list declares
 // them, or `null` when that list is not what the reader numbers by: a presentation
@@ -2913,9 +2995,9 @@ function listedSlideParts(zip) {
 function slideParts(zip) {
   const listed = listedSlideParts(zip);
   if (listed) return listed;
-  const numbered = slideFileNumbers(zip).map((number) => ({ number, name: `${PPT_SLIDES}slide${number}.xml` }));
-  numbered.sort((a, b) => a.number - b.number);
-  return numbered.map((slide) => slide.name);
+  const named = numberedParts(zip, `${PPT_SLIDES}slide`);
+  named.sort(byPartNumber);
+  return named.map((slide) => slide.name);
 }
 
 // The part slide number `number` addresses, refused when the deck has no such
@@ -2948,15 +3030,16 @@ function slideLayoutPart(zip, slidePart) {
   return rel ? resolvePart(PPT_SLIDES, rel.target) : null;
 }
 
-// The first `ppt/slideLayouts/slideLayoutN.xml` a package holds, the layout a
-// new slide falls back on.
-function firstLayoutPart(zip) {
-  const layouts = Object.keys(zip.files).flatMap((name) => {
-    const match = name.match(/^ppt\/slideLayouts\/slideLayout(\d+)\.xml$/);
-    return match ? [{ number: Number(match[1]), name }] : [];
-  });
-  layouts.sort((a, b) => a.number - b.number);
-  return layouts.length ? layouts[0].name : null;
+// The layout the new slide is inserted after uses, the deck's last slide's, or
+// the first the package holds. A slide that names a layout the package does not
+// have falls through to one that is really there.
+function newSlideLayout(zip, slides, after) {
+  const source = after === undefined ? slides[slides.length - 1] : slides[after - 1];
+  const layout = source && slideLayoutPart(zip, source);
+  if (layout && zip.file(layout)) return layout;
+  const first = firstPartName(zip, `${PPT_LAYOUTS}slideLayout`);
+  if (!first) throw new UsageError("the presentation has no slide layout to build a new slide on");
+  return first;
 }
 
 // A target for `to` written relative to the directory `from`, e.g. the layout a
@@ -3037,7 +3120,7 @@ function slideRuns(fragment) {
     if (span.selfClosing) continue;
     const runXml = fragment.slice(span.start, span.end);
     const index = runs.length;
-    runs.push({ start: span.start, end: span.end, rpr: (runXml.match(SLIDE_RUN_PROPERTIES) || [])[0] });
+    runs.push({ start: span.start, end: span.end, rpr: runPropertiesOf(runXml) });
     for (const text of runXml.matchAll(SLIDE_TEXT)) {
       const at = span.start + text.index;
       slots.push({ start: at, end: at + text[0].length, raw: text[1], unescaped: /&(#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/.test(text[1]), run: index });
@@ -3069,14 +3152,14 @@ function mapSlideParagraphs(xml, change) {
 // The refusal a slide edit that searched and found nothing states.
 const missingSlideFind = (find, slide) => `the text ${JSON.stringify(find)} is not on slide ${slide}`;
 
-// `pptx_edit`'s `replace_text`/`remove_text`: every occurrence of `find` in a
-// matching paragraph's joined text is rewritten, the replacement taking the
-// formatting of the run it starts in.
-function editSlideText(editor, edit, op) {
-  const part = addressedSlide(editor.zip, edit.slide);
+// The pptx text ops over one part: every occurrence of `find` in a matching
+// paragraph's joined text is rewritten, the replacement taking the formatting of
+// the run it starts in. `replacing` is what tells a replace op from a remove one,
+// and `missing` words the refusal a search that found nothing states.
+function editPartText(editor, part, edit, replacing, missing) {
   const find = editText(edit && edit.find, "find");
   if (!find) throw new UsageError("find must not be empty");
-  const replacement = op === "replace_text" ? editText(edit.replace, "replace") : "";
+  const replacement = replacing ? editText(edit.replace, "replace") : "";
   let found = false;
   editor.part(part, (xml) => {
     const out = mapSlideParagraphs(xml, (paragraph) => {
@@ -3086,10 +3169,13 @@ function editSlideText(editor, edit, op) {
       found = true;
       return replaceOccurrences(paragraph, runs, slots, offsets, replacement, editor.note, "a:");
     });
-    if (!found) throw new UsageError(missingSlideFind(find, edit.slide));
+    if (!found) throw new UsageError(missing(find));
     return out;
   });
 }
+
+// `pptx_edit`'s `replace_text`/`remove_text` on a slide's own text.
+const editSlideText = (editor, edit, op) => editPartText(editor, addressedSlide(editor.zip, edit.slide), edit, op === "replace_text", (find) => missingSlideFind(find, edit.slide));
 
 // The run markup a new paragraph takes: the anchor's own first-run properties,
 // or a bare run when there is no anchor to copy.
@@ -3208,7 +3294,7 @@ function newSlideXml(title, bullets) {
   if (title !== undefined) shapes.push(placeholderShape(2, "Title", `<p:ph type="title"/>`, [title]));
   if (bullets.length) shapes.push(placeholderShape(3, "Body", `<p:ph type="body" idx="1"/>`, bullets));
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
-    `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">` +
+    `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="${REL_NS}" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">` +
     `<p:cSld><p:spTree>` +
     `<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>` +
     `<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>` +
@@ -3227,7 +3313,7 @@ function placeholderShape(id, name, placeholder, texts) {
 // A new slide's relationships part: one relationship to the layout it is built
 // on.
 const newSlideRelsXml = (layout) => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-  `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="${relativeTarget(PPT_SLIDES, layout)}"/></Relationships>`;
+  `<Relationship Id="rId1" Type="${SLIDE_LAYOUT_REL}" Target="${relativeTarget(PPT_SLIDES, layout)}"/></Relationships>`;
 
 // The next free `<p:sldId id>`: one past the largest the presentation uses, and
 // never below 256, the value real decks start at.
@@ -3236,72 +3322,79 @@ function nextSldId(xml) {
   return Math.max(255, ...ids) + 1;
 }
 
-// The numeric relationship ids the presentation's relationships part already
-// uses.
-function presentationRelationshipIds(zip) {
-  const file = zip.file(PPT_RELS);
-  if (!file) return [];
-  return relationships(file.asText()).map((rel) => Number((rel.id.match(/^rId(\d+)$/) || [])[1])).filter(Number.isFinite);
-}
-
 // Add the presentation relationship naming slide `part` and return its fresh id;
 // the relationships part is created when the deck has none.
-function addSlideRelationship(editor, part) {
-  const id = `rId${Math.max(0, ...presentationRelationshipIds(editor.zip)) + 1}`;
-  const element = `<Relationship Id="${id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="${relativeTarget(PPT_BASE, part)}"/>`;
-  if (!editor.zip.file(PPT_RELS)) {
-    editor.add(PPT_RELS, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${element}</Relationships>`);
-    return id;
-  }
-  editor.part(PPT_RELS, (xml) => {
-    if (!xml.includes("</Relationships>")) throw new UsageError("the presentation's relationships part is not readable");
-    return xml.replace("</Relationships>", () => `${element}</Relationships>`);
+const addSlideRelationship = (editor, part) => addRelationship(editor, PPT_PRESENTATION, SLIDE_REL, part);
+
+// The presentation's `<p:sldIdLst>` and the `<p:sldId>` entries that name a
+// slide, or `null` when the presentation has no such list. An entry with no
+// relationship id names no slide the reader shows, so it takes no slot and no
+// position counts it; the entries are matched against the list's own text, so
+// each `entry.index` is relative to `text`.
+function slideListEntries(xml) {
+  const match = xml.match(/<p:sldIdLst(?:\s[^>]*)?>[\s\S]*?<\/p:sldIdLst>/);
+  if (!match) return null;
+  const entries = [...match[0].matchAll(/<p:sldId\b[^>]*>/g)].filter((entry) => relationshipId(entry[0]) !== undefined);
+  return { index: match.index, text: match[0], entries };
+}
+
+// That list, when its entries are exactly the slides the reader numbers — one per
+// slide, in that same order — or `null` when they are not. The reader numbers every
+// `<p:sldId>` the presentation holds while the list holds only its own, so a
+// `<p:sldId>` outside it is numbered by the reader and not by the list, and the
+// entry at a position is then another slide than the reader shows there; a deck the
+// reader numbers by file naming differs the same way. A slide's number is a
+// position in the list only while the two agree, which is what every operation that
+// reorders, copies or deletes a slide by its number asks here first. The entries
+// and their positions are relative to the presentation part's text as it stands,
+// which is the text an edit rewrites.
+function numberedSlideList(zip) {
+  const presentation = zip.file(PPT_PRESENTATION);
+  const rels = zip.file(PPT_RELS);
+  const list = presentation && rels ? slideListEntries(presentation.asText()) : null;
+  const parts = slideParts(zip);
+  if (!list || list.entries.length !== parts.length) return null;
+  const map = relationshipMap(rels.asText());
+  const agrees = list.entries.every((entry, index) => {
+    const target = map.get(relationshipId(entry[0]));
+    return (target === undefined ? null : resolvePart(PPT_BASE, target)) === parts[index];
   });
-  return id;
+  return agrees ? list : null;
 }
 
 // The presentation part with a `<p:sldId>` for `element` inserted into its
-// `<p:sldIdLst>` after the `after`-th slide, or at the end. A deck without a
-// slide list is refused rather than given one that would renumber its slides.
-// The entries counted are the ones `slideParts` numbers: a `<p:sldId>` with no
-// relationship id names no slide the reader shows, so it takes no slot and
-// `after` — a position the reader would number — must not count it. `listed` is
-// whether the presentation's own list is the numbering the reader used (see
-// `listedSlideParts`): when it is not, the deck was numbered by file naming and
-// no index here can be honoured, so an explicit `after` is refused instead of
-// appending at the end behind the caller's back. A count of entries equal to the
-// slide count is no proof of that — a file-named deck can carry the same number —
-// which is why this is asked of the list itself rather than of the counts.
-function withSldId(xml, element, after, listed) {
-  const list = xml.match(/<p:sldIdLst(?:\s[^>]*)?>[\s\S]*?<\/p:sldIdLst>/);
+// `<p:sldIdLst>` as its entry `before` — before the slide the reader numbers
+// `before + 1`, or at the end of the list for `before` past its last entry or
+// absent. A deck without a slide list is refused rather than given one that would
+// renumber its slides. An entry position is a slide's number only while the list is
+// the numbering the reader shows (see `numberedSlideList`), so a caller handing one
+// over has asked that first; appending needs no such proof, since it makes the new
+// slide the deck's last one whichever numbering it is.
+function withSldId(xml, element, before) {
+  const list = slideListEntries(xml);
   if (!list) throw new UsageError("the presentation has no slide list to add a slide to");
-  const ids = [...list[0].matchAll(/<p:sldId\b[^>]*>/g)].filter((match) => relationshipId(match[0]) !== undefined);
-  if (after !== undefined && !listed) {
-    throw new UsageError(`a slide cannot be placed after slide ${after}: the presentation's slide list does not number its slides the way the reader shows them`);
-  }
-  const at = after !== undefined && after >= 1 && after <= ids.length
-    ? list.index + ids[after - 1].index + ids[after - 1][0].length
-    : list.index + list[0].lastIndexOf("</p:sldIdLst>");
+  const at = before === undefined || before >= list.entries.length
+    ? list.index + list.text.lastIndexOf("</p:sldIdLst>")
+    : list.index + list.entries[before].index;
   return xml.slice(0, at) + element + xml.slice(at);
 }
 
-// `[Content_Types].xml` with an `<Override>` for `part` added before the closing
-// `</Types>` — after every `<Default>`, the schema-correct place for one.
-function withOverride(xml, part) {
-  if (!xml.includes("</Types>")) throw new UsageError("[Content_Types].xml has no <Types> close to hold a slide's content type");
-  return xml.replace("</Types>", () => `<Override PartName="/${part}" ContentType="${SLIDE_CONTENT_TYPE}"/></Types>`);
-}
+// The `<Override>` a package already declares for `part`, or `undefined` when it
+// declares none. OPC gives a part one content type, so this is the declaration no
+// caller may add a second of.
+const overrideFor = (xml, part) => [...xml.matchAll(/<Override\b[^>]*>/g)].find((match) => (xmlAttribute(match[0], "PartName") || "").toLowerCase() === `/${part}`.toLowerCase());
 
-// The layout the new slide is inserted after uses, the deck's last slide's, or
-// the first the package holds. A slide that names a layout the package does not
-// have falls through to one that is really there.
-function newSlideLayout(zip, slides, after) {
-  const source = after === undefined ? slides[slides.length - 1] : slides[after - 1];
-  const layout = source && slideLayoutPart(zip, source);
-  if (layout && zip.file(layout)) return layout;
-  const first = firstLayoutPart(zip);
-  if (!first) throw new UsageError("the presentation has no slide layout to build a new slide on");
-  return first;
+// `[Content_Types].xml` declaring `part`'s `contentType`, through the `<Override>`
+// written before the closing `</Types>` — after every `<Default>`, the
+// schema-correct place for one. A package that already declares the part has that
+// declaration given the type instead of a second one added beside it, which is also
+// what leaves a stale declaration saying what the part really is.
+function withOverride(xml, part, contentType) {
+  if (!xml.includes("</Types>")) throw new UsageError("[Content_Types].xml has no <Types> close to hold a part's content type");
+  const declaration = `<Override PartName="/${part}" ContentType="${contentType}"/>`;
+  const declared = overrideFor(xml, part);
+  if (declared === undefined) return xml.replace("</Types>", () => `${declaration}</Types>`);
+  return xml.slice(0, declared.index) + declaration + xml.slice(declared.index + declared[0].length);
 }
 
 // `pptx_edit`'s `add_slide`: a whole new slide part, wired into the presentation
@@ -3309,9 +3402,6 @@ function newSlideLayout(zip, slides, after) {
 function addSlide(editor, edit) {
   const zip = editor.zip;
   const slides = slideParts(zip);
-  // Whether the presentation's own slide list is the numbering `slides` follows;
-  // read before any edit, since the list itself is about to gain an entry.
-  const listed = listedSlideParts(zip) !== null;
   const title = edit.title === undefined ? undefined : editText(edit.title, "title");
   let bullets = [];
   if (edit.bullets !== undefined) {
@@ -3323,6 +3413,9 @@ function addSlide(editor, edit) {
   if (edit.after !== undefined) {
     after = edit.after;
     if (!Number.isInteger(after) || after < 1 || after > slides.length) throw new UsageError(`no slide ${after}: this presentation has ${slides.length} slide(s)`);
+    // Asked before any edit, since the list is about to gain the new entry: the
+    // named position is a slide's number only while the list is that numbering.
+    if (!numberedSlideList(zip)) throw new UsageError(`a slide cannot be placed after slide ${after}: the presentation's slide list does not number its slides the way the reader shows them`);
   }
   const part = `${PPT_SLIDES}slide${Math.max(0, ...slideFileNumbers(zip)) + 1}.xml`;
   editor.add(part, newSlideXml(title, bullets));
@@ -3331,13 +3424,17 @@ function addSlide(editor, edit) {
   // is read here rather than re-checked.
   const id = addSlideRelationship(editor, part);
   const sldId = `<p:sldId id="${nextSldId(zip.file(PPT_PRESENTATION).asText())}" r:id="${id}"/>`;
-  editor.part(PPT_PRESENTATION, (xml) => withSldId(xml, sldId, after, listed));
-  editor.part("[Content_Types].xml", (xml) => withOverride(xml, part));
+  editor.part(PPT_PRESENTATION, (xml) => withSldId(xml, sldId, after));
+  editor.part("[Content_Types].xml", (xml) => withOverride(xml, part, SLIDE_CONTENT_TYPE));
 }
 
-// `[Content_Types].xml` with the `<Override>` of `part` removed.
+// `[Content_Types].xml` with the `<Override>` of `part` removed — the same
+// declaration `overrideFor` finds, by the same rule.
 function removeOverride(editor, part) {
-  editor.part("[Content_Types].xml", (xml) => xml.replace(elementWithAttribute("Override", "PartName", `/${part}`), ""));
+  editor.part("[Content_Types].xml", (xml) => {
+    const declared = overrideFor(xml, part);
+    return declared === undefined ? xml : xml.slice(0, declared.index) + xml.slice(declared.index + declared[0].length);
+  });
 }
 
 // `pptx_edit`'s `delete_slide`: the slide part, its relationships, its notes
@@ -3357,16 +3454,18 @@ function deleteSlide(editor, edit) {
   const at = edit.slide - 1;
   if (parts.length <= 1) throw new UsageError("the presentation's only slide cannot be deleted");
   const part = addressedSlide(zip, edit.slide);
-  // The `<p:sldId>` the reader numbered as `at`. Only when the list is the one the
-  // reader numbered by is the entry at that position the reader's own; a deck
-  // numbered by file naming may hold an entry there that names another slide, so
-  // the entry whose relationship target resolves to the addressed part goes
-  // instead.
+  // The `<p:sldId>` the reader numbered as `at`. Only while the list is that
+  // numbering is the entry at that position the reader's own (see
+  // `numberedSlideList`): a deck whose list holds another slide there — or numbers a
+  // `<p:sldId>` its list does not — has the entry whose relationship target
+  // resolves to the addressed part taken instead, so the removed `<p:sldId>` is
+  // always the addressed slide's own.
   const presentation = zip.file(PPT_PRESENTATION);
-  const entries = presentation ? [...presentation.asText().matchAll(/<p:sldId\b[^>]*>/g)].filter((match) => relationshipId(match[0]) !== undefined) : [];
+  const list = presentation ? slideListEntries(presentation.asText()) : null;
+  const entries = list ? list.entries : [];
   const rels = zip.file(PPT_RELS);
   const targets = rels ? relationshipMap(rels.asText()) : new Map();
-  const sldId = listedSlideParts(zip)
+  const sldId = numberedSlideList(zip)
     ? entries[at]
     : entries.find((match) => {
       const target = targets.get(relationshipId(match[0]));
@@ -3374,6 +3473,7 @@ function deleteSlide(editor, edit) {
     });
   if (!sldId) throw new UsageError(`slide ${edit.slide} cannot be deleted: the presentation's slide list does not name it`);
   const id = relationshipId(sldId[0]);
+  const cut = list.index + sldId.index;
   const notes = slideNotesPart(zip, part);
   const others = parts.filter((_, index) => index !== at).filter(Boolean);
   // A part another remaining slide still references is not this slide's alone:
@@ -3390,10 +3490,558 @@ function deleteSlide(editor, edit) {
     editor.remove(relsPartFor(notes));
     removeOverride(editor, notes);
   }
-  editor.part(PPT_PRESENTATION, (xml) => xml.slice(0, sldId.index) + xml.slice(sldId.index + sldId[0].length));
+  editor.part(PPT_PRESENTATION, (xml) => xml.slice(0, cut) + xml.slice(cut + sldId[0].length));
   if (id !== undefined) {
     editor.part(PPT_RELS, (xml) => xml.replace(elementWithAttribute("Relationship", "Id", id), ""));
   }
+}
+
+// The relationships `xml` with the `Target` of every relationship whose type
+// `match` accepts replaced by `target`; every other relationship keeps its own
+// bytes. A `match` compares the LAST segment of a type because a strict package
+// spells the same relationship under another namespace — and the segments are
+// distinct enough that `/slide` cannot match `/slideLayout`.
+function withRelationshipTarget(xml, match, target) {
+  return xml.replace(/<Relationship\b[^>]*>/g, (element) => (match(xmlAttribute(element, "Type") || "")
+    ? element.replace(/\bTarget="[^"]*"/, () => `Target="${target}"`)
+    : element));
+}
+
+// `pptx_edit`'s `move_slide`: the addressed slide's `<p:sldId>` is taken out of
+// the presentation's own slide list and put back at another position of it, so
+// the deck's order — the one the reader numbers and `slideParts` resolves — is
+// the only thing that changes. Only a list that IS that order has the position the
+// caller named (see `numberedSlideList`), and a slide already at the named position
+// is refused because the move would change nothing.
+function moveSlide(editor, edit) {
+  const zip = editor.zip;
+  addressedSlide(zip, edit.slide);
+  const slides = slideParts(zip);
+  if (!Number.isInteger(edit.to) || edit.to < 1 || edit.to > slides.length) throw new UsageError(`no position ${edit.to}: this presentation has ${slides.length} slide(s)`);
+  if (edit.to === edit.slide) throw new UsageError(`slide ${edit.slide} is already at position ${edit.to} — moving it there would change nothing`);
+  const list = numberedSlideList(zip);
+  if (!list) throw new UsageError("the presentation's slide list does not number its slides the way the reader shows them, so a slide cannot be moved");
+  const from = edit.slide - 1;
+  const entry = list.entries[from];
+  const rest = list.entries.filter((_, index) => index !== from);
+  const cut = list.index + entry.index;
+  // The slide takes the position the `to`-th slide of the RESULT holds: in front
+  // of the entry that follows it there, or after the last one when it is that
+  // deck's last slide.
+  const before = edit.to - 1 < rest.length ? list.index + rest[edit.to - 1].index : list.index + list.text.lastIndexOf("</p:sldIdLst>");
+  editor.part(PPT_PRESENTATION, (xml) => {
+    const out = xml.slice(0, cut) + xml.slice(cut + entry[0].length);
+    const at = before > cut ? before - entry[0].length : before;
+    return out.slice(0, at) + entry[0] + out.slice(at);
+  });
+}
+
+// The notes part of a duplicated slide: a copy of `notes` — a part the package
+// holds, which is what the caller has checked — under a fresh name, with its own
+// relationships (the notes master stays the shared part it was) and its slide
+// back-reference pointed at the copy. The notes themselves are the copy's own, so
+// editing one slide's notes leaves the other's alone.
+function duplicateNotes(editor, notes, slidePart) {
+  const zip = editor.zip;
+  const part = `${PPT_NOTES_SLIDES}notesSlide${Math.max(0, ...notesSlideNumbers(zip)) + 1}.xml`;
+  editor.add(part, zip.file(notes).asText());
+  const rels = zip.file(relsPartFor(notes));
+  if (rels) editor.add(relsPartFor(part), withRelationshipTarget(rels.asText(), (type) => type.endsWith("/slide"), relativeTarget(partDirectory(part), slidePart)));
+  editor.part("[Content_Types].xml", (xml) => withOverride(xml, part, NOTES_CONTENT_TYPE));
+  return part;
+}
+
+// `pptx_edit`'s `duplicate_slide`: a fresh slide part holding exactly what the
+// addressed slide held, with a notes copy and its own relationships, inserted
+// right after the source — where the reader that numbered it shows it next. The
+// layout, the masters and the media the copy names stay shared parts, because no
+// edit this kit makes writes to them. Only a deck whose slide list numbers its
+// slides the way the reader shows them can place a copy (see `numberedSlideList`).
+function duplicateSlide(editor, edit) {
+  const zip = editor.zip;
+  const source = addressedSlide(zip, edit.slide);
+  // A copy is written among the presentation's own slides, while the source's
+  // relationships are written for the folder it sits in: a slide stored elsewhere
+  // is one whose links a copy in this folder would not resolve.
+  if (partDirectory(source) !== PPT_SLIDES) {
+    throw new UsageError(`slide ${edit.slide} is stored outside ${PPT_SLIDES}, so a copy of it cannot be placed among the presentation's other slides`);
+  }
+  if (!numberedSlideList(zip)) throw new UsageError("the presentation's slide list does not number its slides the way the reader shows them, so a slide cannot be duplicated");
+  const notes = slideNotesPart(zip, source);
+  // A copy carries the source's notes as its own, so a source declaring notes the
+  // package does not hold has none to carry: a copy left naming that declaration
+  // would put the two slides' notes in the one part a later edit rewrites. Both
+  // checks are made before the copy is written.
+  if (notes !== null && !zip.file(notes)) {
+    throw new UsageError(`slide ${edit.slide} declares speaker notes (${notes}) the presentation does not hold, so a copy of it cannot have notes of its own`);
+  }
+  const part = `${PPT_SLIDES}slide${Math.max(0, ...slideFileNumbers(zip)) + 1}.xml`;
+  editor.add(part, zip.file(source).asText());
+  const notesCopy = notes === null ? null : duplicateNotes(editor, notes, part);
+  const rels = zip.file(relsPartFor(source));
+  if (rels) {
+    // The source's own relationships with the notes relationship pointed at the
+    // copy: the source's notes belong to the source.
+    editor.add(relsPartFor(part), notesCopy === null ? rels.asText() : withRelationshipTarget(rels.asText(), (type) => type.endsWith("/notesSlide"), relativeTarget(partDirectory(part), notesCopy)));
+  }
+  editor.part("[Content_Types].xml", (xml) => withOverride(xml, part, SLIDE_CONTENT_TYPE));
+  const id = addSlideRelationship(editor, part);
+  const sldId = `<p:sldId id="${nextSldId(zip.file(PPT_PRESENTATION).asText())}" r:id="${id}"/>`;
+  editor.part(PPT_PRESENTATION, (xml) => withSldId(xml, sldId, edit.slide));
+}
+
+// A run of speaker notes carrying `text`; notes are plain text, so the run
+// states nothing but the language a reader draws it in.
+const notesParagraph = (text) => `<a:p><a:r><a:rPr lang="${SLIDE_LANG}" dirty="0"/>${textElement("a:", xmlEscape(text))}</a:r></a:p>`;
+
+// The `<p:notes>` part a slide with no notes is given: the slide image and notes
+// body placeholders every notes slide holds, the body carrying `text`. Its
+// relationships and content type are written by `addSlideNotes`, which is the
+// only caller.
+function newNotesXml(text) {
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
+    `<p:notes xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="${REL_NS}" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">` +
+    `<p:cSld><p:spTree>` +
+    `<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>` +
+    `<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>` +
+    `<p:sp><p:nvSpPr><p:cNvPr id="2" name="Slide Image Placeholder 1"/><p:cNvSpPr><a:spLocks noGrp="1" noRot="1" noChangeAspect="1"/></p:cNvSpPr><p:nvPr><p:ph type="sldImg"/></p:nvPr></p:nvSpPr><p:spPr/></p:sp>` +
+    `<p:sp><p:nvSpPr><p:cNvPr id="3" name="Notes Placeholder 2"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>` +
+    `<p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/>${notesParagraph(text)}</p:txBody></p:sp>` +
+    `</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:notes>`;
+}
+
+// The notes master a notes slide is wired to: the one the presentation's own
+// `<p:notesMasterIdLst>` declares — the master its notes slides are drawn through
+// — or, for a deck stating none, the first the package holds. Either way it is a
+// part that is already there, so the name is the one the package really has.
+function notesMasterPart(zip) {
+  const presentation = zip.file(PPT_PRESENTATION);
+  const rels = zip.file(PPT_RELS);
+  const tag = presentation ? (presentation.asText().match(/<p:notesMasterId\b[^>]*>/) || [])[0] : undefined;
+  const id = tag === undefined ? undefined : relationshipId(tag);
+  const target = id === undefined || !rels ? undefined : relationshipMap(rels.asText()).get(id);
+  const declared = target === undefined ? null : resolvePart(PPT_BASE, target);
+  if (declared !== null && zip.file(declared)) return declared;
+  return firstPartName(zip, `${PPT_NOTES_MASTERS}notesMaster`);
+}
+
+// A notes part's relationships, written relative to its own directory: back to the
+// slide whose notes it holds, and to the master it draws through.
+const newNotesRelsXml = (base, slidePart, master) =>
+  `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+  `<Relationship Id="rId1" Type="${SLIDE_REL}" Target="${relativeTarget(base, slidePart)}"/>` +
+  `<Relationship Id="rId2" Type="${NOTES_MASTER_REL}" Target="${relativeTarget(base, master)}"/></Relationships>`;
+
+// The notes part `slidePart` is given its notes in: the one the slide declares —
+// created at that very name when the package has lost it, so the relationship it
+// already has resolves again — or a fresh part wired into the slide. A
+// presentation with no notes master cannot hold a notes slide, so adding one to
+// it is refused rather than written as a file a reader has to repair.
+function createNotesPart(editor, slidePart, text) {
+  const zip = editor.zip;
+  const declared = slideNotesPart(zip, slidePart);
+  const master = notesMasterPart(zip);
+  if (!master) throw new UsageError("the presentation has no notes master, so a notes slide cannot be created for it");
+  const part = declared || `${PPT_NOTES_SLIDES}notesSlide${Math.max(0, ...notesSlideNumbers(zip)) + 1}.xml`;
+  editor.add(part, newNotesXml(text));
+  editor.add(relsPartFor(part), newNotesRelsXml(partDirectory(part), slidePart, master));
+  if (!declared) addRelationship(editor, slidePart, NOTES_REL, part);
+  // A package that declares the part already says what it is — a `.pptm` declares
+  // its notes slides macro-enabled — and only a part the package knows nothing
+  // about is declared here. `pptxEdit` refuses a package with no
+  // `[Content_Types].xml`, so the part is there to rewrite.
+  editor.part("[Content_Types].xml", (xml) => (overrideFor(xml, part) === undefined ? withOverride(xml, part, NOTES_CONTENT_TYPE) : xml));
+  return part;
+}
+
+// The notes body of a notes slide: the `<p:txBody>` of the shape whose `<p:ph>`
+// is the body placeholder — the one place a reader draws notes from. A notes
+// slide's other shapes hold the slide image and the slide number, and a paragraph
+// must not land in either.
+function notesTextBody(xml) {
+  for (const shape of tagSpans(xml, SLIDE_SHAPE)) {
+    if (shape.selfClosing || shape.depth !== 1) continue;
+    const placeholder = xml.slice(shape.start, shape.end).match(/<p:ph\b[^>]*>/);
+    if (!placeholder) continue;
+    // Only a `<p:ph>` naming `body` is the notes one. The schema defaults
+    // `p:ph/@type` to `obj`, which a reader draws no speaker notes from, so a
+    // placeholder naming no type is not this body either — and the slide image
+    // and slide number placeholders always name a type of their own.
+    if (xmlAttribute(placeholder[0], "type") !== "body") continue;
+    const body = shapeTextBody(xml, shape);
+    if (body) return body;
+  }
+  return null;
+}
+
+// `pptx_edit`'s `add_notes`: `text` as a new paragraph of the addressed slide's
+// speaker notes, the notes part being written when the slide has none — a slide
+// without notes is not a failure to add them to.
+function addSlideNotes(editor, edit) {
+  const zip = editor.zip;
+  const part = addressedSlide(zip, edit.slide);
+  const text = editText(edit.text, "text");
+  const declared = slideNotesPart(zip, part);
+  if (declared && zip.file(declared)) {
+    editor.part(declared, (xml) => {
+      const body = notesTextBody(xml);
+      if (!body) throw new UsageError(`the notes of slide ${edit.slide} have no body to add a paragraph to`);
+      const at = body.end - "</p:txBody>".length;
+      return xml.slice(0, at) + notesParagraph(text) + xml.slice(at);
+    });
+    return;
+  }
+  createNotesPart(editor, part, text);
+}
+
+// The refusal a notes edit that searched and found nothing states.
+const missingNotesFind = (find, slide) => `the text ${JSON.stringify(find)} is not in the speaker notes of slide ${slide}`;
+
+// `pptx_edit`'s `replace_notes`/`remove_notes`: the notes are plain text, so a
+// fragment is matched in one notes paragraph's joined run text exactly as it is
+// on a slide. A slide that holds no notes part at all has nothing to search, and
+// that is said rather than reported as text that is not there.
+function editSlideNotes(editor, edit, op) {
+  const part = addressedSlide(editor.zip, edit.slide);
+  const notes = slideNotesPart(editor.zip, part);
+  if (!notes || !editor.zip.file(notes)) {
+    throw new UsageError(`slide ${edit.slide} has no speaker notes to ${op === "replace_notes" ? "replace text in" : "remove text from"}`);
+  }
+  editPartText(editor, notes, edit, op === "replace_notes", (find) => missingNotesFind(find, edit.slide));
+}
+
+// The children of a run-properties body at its own level: `<a:ln>` holds a
+// `<a:solidFill>` of its own — the outline's fill, not the run's — so the level
+// a child sits at is what tells the two apart.
+function topLevelChildren(body) {
+  const children = [];
+  const open = /<a:([A-Za-z0-9_]+)(?:\s[^>]*)?>|<a:([A-Za-z0-9_]+)(?:\s[^>]*)?\/>/g;
+  let match;
+  while ((match = open.exec(body)) !== null) {
+    const name = match[1] ?? match[2];
+    const selfClosing = match[0].endsWith("/>");
+    const close = selfClosing ? match.index + match[0].length : body.indexOf(`</a:${name}>`, open.lastIndex);
+    if (close < 0) continue;
+    // `</a:name>` is `<`, `/`, `a` and `:`, then the name and its `>`.
+    const end = selfClosing ? close : close + name.length + 5;
+    children.push({ name, start: match.index, end });
+    open.lastIndex = end;
+  }
+  return children;
+}
+
+// DrawingML's `CT_TextCharacterProperties` children in the sequence ECMA-376
+// requires: a `<a:solidFill>` written after a later child is dropped by a reader,
+// so a colour goes where the sequence puts it.
+const RUN_CHILD_ORDER = ["ln", "noFill", "solidFill", "gradFill", "blipFill", "pattFill", "grpFill", "effectLst", "effectDag", "highlight", "uLnTx", "uLn", "uFillTx", "uFill", "latin", "ea", "cs", "sym", "hlinkClick", "hlinkMouseOver", "rtl", "extLst"];
+// The members of DrawingML's `EG_FillProperties`, which is a choice group: the
+// six are exclusive, so a run stating its own fill drops whichever one it had.
+const RUN_FILL_CHILDREN = ["noFill", "solidFill", "gradFill", "blipFill", "pattFill", "grpFill"];
+
+// The `<a:rPr>` of a run as the run wrote it, or "" when it has none. DrawingML
+// states no run properties inside run properties, so the first element of the
+// family in a run is the run's own.
+const runPropertiesOf = (runXml) => (runXml.match(SLIDE_RUN_PROPERTIES) || [])[0] || "";
+
+// `body` with the run's own text fill replaced by `element`. The six members of
+// DrawingML's `EG_FillProperties` are a choice group, so whichever one the run
+// had goes, and the replacement is written where ECMA-376's child sequence puts
+// it rather than after a child it must precede. The removal and the write work on
+// the body's own level (see `topLevelChildren`).
+function withRunFill(body, element) {
+  // A name the sequence does not list ranks last, so a fill is written before it.
+  const rank = (name) => {
+    const at = RUN_CHILD_ORDER.indexOf(name);
+    return at < 0 ? RUN_CHILD_ORDER.length : at;
+  };
+  const fill = rank("solidFill");
+  let out = "";
+  let cursor = 0;
+  let written = false;
+  for (const child of topLevelChildren(body)) {
+    out += body.slice(cursor, child.start);
+    cursor = child.end;
+    if (RUN_FILL_CHILDREN.includes(child.name)) continue;
+    if (!written && rank(child.name) > fill) {
+      out += element;
+      written = true;
+    }
+    out += body.slice(child.start, cursor);
+  }
+  out += body.slice(cursor);
+  return written ? out : out + element;
+}
+
+// The run properties a format request writes for one run: `bold`, `italic` and
+// `underline` are attributes of `<a:rPr>`, `size` replaces its `sz` attribute
+// (DrawingML counts hundredths of a point in it) and `color` the run's own solid
+// fill. Everything the request does not name keeps the bytes it had, and a toggle
+// set to `false` writes the off value so it overrides what the run inherits.
+function formattedSlideRunProperties(runXml, format) {
+  const current = runPropertiesOf(runXml);
+  const open = current === "" ? "<a:rPr>" : (current.match(/^<a:rPr(?:\s[^>]*)?\/?>/) || [])[0];
+  let body = current.endsWith("/>") ? "" : current.slice(open.length, -"</a:rPr>".length);
+  let tag = open;
+  if (format.bold !== undefined) tag = setXmlAttribute(tag, "b", format.bold ? "1" : "0");
+  if (format.italic !== undefined) tag = setXmlAttribute(tag, "i", format.italic ? "1" : "0");
+  if (format.underline !== undefined) tag = setXmlAttribute(tag, "u", format.underline ? "sng" : "none");
+  if (format.size !== undefined) tag = setXmlAttribute(tag, "sz", format.size);
+  if (format.color !== undefined) {
+    body = withRunFill(body, `<a:solidFill><a:srgbClr val="${format.color}"/></a:solidFill>`);
+  }
+  const paired = tag.endsWith("/>") ? `${tag.slice(0, -2)}>` : tag;
+  return body ? `${paired}${body}</a:rPr>` : `${paired.slice(0, -1)}/>`;
+}
+
+// `xml` with the run-level properties of `format` written on the runs the named
+// fragments cover. A run is the smallest unit DrawingML states run properties in,
+// so a fragment covering part of a run formats that whole run — which the note
+// the caller raises says.
+function formatSlideRuns(xml, runs, runIndices, format) {
+  const pieces = [];
+  for (const index of [...runIndices].sort((a, b) => a - b)) {
+    const run = runs[index];
+    const runXml = xml.slice(run.start, run.end);
+    const open = runXml.match(/<a:r(?:\s[^>]*)?>/)[0];
+    const own = runPropertiesOf(runXml);
+    const at = own === "" ? -1 : runXml.indexOf(own);
+    const next = formattedSlideRunProperties(runXml, format);
+    pieces.push({
+      start: run.start,
+      end: run.end,
+      xml: at >= 0 ? runXml.slice(0, at) + next + runXml.slice(at + own.length) : open + next + runXml.slice(open.length),
+    });
+  }
+  pieces.sort((a, b) => b.start - a.start);
+  let out = xml;
+  for (const piece of pieces) out = out.slice(0, piece.start) + piece.xml + out.slice(piece.end);
+  return out;
+}
+
+// The paragraph with its alignment set. `<a:pPr>` is a paragraph's first child,
+// so one is written there when the paragraph has none; otherwise the attribute
+// goes on the paragraph's own `<a:pPr>` tag, never on its close.
+function alignSlideParagraph(element, align) {
+  const open = element.match(/<a:p(?:\s[^>]*)?>/);
+  if (!open) return element;
+  const ppr = element.match(SLIDE_PPR);
+  if (!ppr) return `${element.slice(0, open[0].length)}<a:pPr algn="${align}"/>${element.slice(open[0].length)}`;
+  const tag = ppr[0].match(/^<a:pPr(?:\s[^>]*)?\/?>/)[0];
+  const at = element.indexOf(ppr[0]);
+  return element.slice(0, at) + setXmlAttribute(tag, "algn", align) + ppr[0].slice(tag.length) + element.slice(at + ppr[0].length);
+}
+
+// The formatting a `format_text` states, normalized to what the writer needs:
+// `size` in DrawingML's hundredths of a point, `color` as `RULES.color_digits`
+// uppercase hex digits and `align` as the `algn` value its word names.
+function slideFormat(edit) {
+  const format = { runs: false };
+  // A `null` property counts as absent — the caller's own boundary treats a
+  // null-valued key that way — so only a stated one is written.
+  for (const name of ["bold", "italic", "underline"]) {
+    if (edit[name] == null) continue;
+    if (typeof edit[name] !== "boolean") throw new UsageError(`${name} must be true or false`);
+    format[name] = edit[name];
+    format.runs = true;
+  }
+  if (edit.size != null) {
+    if (!inSpan(edit.size, RULES.slide_text_size_points)) throw new UsageError(`size must be ${spanBounds(RULES.slide_text_size_points)} points, got: ${JSON.stringify(edit.size)}`);
+    format.size = String(Math.round(edit.size * 100));
+    format.runs = true;
+  }
+  if (edit.color != null) {
+    format.color = hexDigits(edit.color).toUpperCase();
+    format.runs = true;
+  }
+  if (edit.align != null) {
+    // The rules' own table, so an alignment with no `algn` value — or an
+    // inherited name such as "constructor" — is refused rather than written as
+    // an alignment no reader knows.
+    if (!SLIDE_ALIGNMENTS.has(edit.align)) throw new UsageError(`align must be ${listed([...SLIDE_ALIGNMENTS.keys()])}, got: ${JSON.stringify(edit.align)}`);
+    format.align = SLIDE_ALIGNMENTS.get(edit.align);
+  }
+  if (!format.runs && format.align === undefined) throw new UsageError("format_text needs at least one of bold, italic, underline, size, color or align");
+  return format;
+}
+
+// `pptx_edit`'s `format_text`: the run properties of `edit` on the runs the named
+// fragment covers, and its alignment on the paragraph holding it. Two things the
+// caller is owed a note about: run properties live on the run, so a fragment
+// covering part of one formats all of it, and `algn` is a paragraph's, so it
+// applies to the paragraph's whole text.
+function formatSlideText(editor, edit) {
+  const part = addressedSlide(editor.zip, edit.slide);
+  const find = editText(edit.find, "find");
+  if (!find) throw new UsageError("find must not be empty");
+  const format = slideFormat(edit);
+  editor.part(part, (xml) => {
+    let found = false;
+    const out = mapSlideParagraphs(xml, (paragraph) => {
+      const { runs, slots } = slideRuns(paragraph);
+      const text = slots.map((slot) => xmlUnescape(slot.raw)).join("");
+      const offsets = occurrences(text, find);
+      if (!offsets.length) return undefined;
+      found = true;
+      // The code points the fragments cover, so a run or paragraph the request
+      // reaches beyond them can be reported.
+      const covered = new Array([...text].length).fill(false);
+      for (const span of offsets) {
+        for (let at = span.start; at < span.end; at += 1) covered[at] = true;
+      }
+      const ranges = [];
+      let walked = 0;
+      for (const slot of slots) {
+        const length = [...xmlUnescape(slot.raw)].length;
+        ranges.push({ start: walked, end: walked + length });
+        walked += length;
+      }
+      const runIndices = new Set();
+      for (const span of offsets) {
+        const first = locateSlot(slots, span.start);
+        const last = locateSlot(slots, span.end, true);
+        for (let index = first.index; index <= last.index; index += 1) runIndices.add(slots[index].run);
+      }
+      // A run the fragments only partly cover: its properties are the run's, so
+      // the whole of it is formatted.
+      const partial = (slot, index) => {
+        if (!runIndices.has(slot.run)) return false;
+        for (let point = ranges[index].start; point < ranges[index].end; point += 1) {
+          if (!covered[point]) return true;
+        }
+        return false;
+      };
+      if (format.runs && slots.some(partial)) editor.note("[the named text is part of a longer run, so the formatting also applied to the rest of that run]");
+      let element = paragraph;
+      if (format.runs) element = formatSlideRuns(element, runs, runIndices, format);
+      if (format.align !== undefined) {
+        if (!covered.every(Boolean)) editor.note("[a paragraph's alignment is the whole paragraph's, so the text beside the named fragment was aligned too]");
+        element = alignSlideParagraph(element, format.align);
+      }
+      return element;
+    });
+    if (!found) throw new UsageError(missingSlideFind(find, edit.slide));
+    return out;
+  });
+}
+
+// The `N` numbers of the `ppt/media/imageN.ext` parts the package holds, whatever
+// extension each carries.
+const mediaNumbers = (zip) => Object.keys(zip.files).flatMap((name) => {
+  const match = name.match(new RegExp(`^${escapeRegExp(PPT_MEDIA)}image(\\d+)\\.[A-Za-z0-9]+$`));
+  return match ? [Number(match[1])] : [];
+});
+
+// A free `ppt/media/imageN.ext` name: one past the largest number the package
+// uses, whatever extension it carries, so the name is free by construction.
+function nextMediaPart(zip, extension) {
+  return `${PPT_MEDIA}image${Math.max(0, ...mediaNumbers(zip)) + 1}.${extension}`;
+}
+
+// The slide's own size in EMU, from the presentation's `<p:sldSz>`, or the
+// default a presentation stating none is read at (see `SLIDE_SIZE_DEFAULT`).
+function slideSize(zip) {
+  const presentation = zip.file(PPT_PRESENTATION);
+  const tag = presentation ? (presentation.asText().match(/<p:sldSz\b[^>]*>/) || [])[0] : undefined;
+  const side = (name, fallback) => {
+    const value = tag === undefined ? Number.NaN : Number(xmlAttribute(tag, name));
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+  };
+  return { width: side("cx", SLIDE_SIZE_DEFAULT.width), height: side("cy", SLIDE_SIZE_DEFAULT.height) };
+}
+
+// Where an added image goes, in EMU. `x` and `y` are fractions of the slide's
+// own width and height and so are `width` and `height`, which is what lets a
+// caller place an image without knowing the deck's size; an absent place is the
+// slide's middle and an absent size is the largest that fits the slide with the
+// image's own proportions. A size named on one side only keeps those proportions.
+function imagePlacement(image, edit, slide) {
+  for (const name of ["x", "y", "width", "height"]) {
+    const value = edit[name];
+    if (value == null) continue;
+    const span = name === "width" || name === "height" ? RULES.slide_size_fraction : RULES.slide_position_fraction;
+    if (!inSpan(value, span)) throw new UsageError(`${name} must be ${spanBounds(span)}, got: ${JSON.stringify(value)}`);
+  }
+  const natural = { width: image.width * PX_TO_EMU, height: image.height * PX_TO_EMU };
+  let width;
+  let height;
+  if (edit.width != null && edit.height != null) {
+    width = edit.width * slide.width;
+    height = edit.height * slide.height;
+  } else if (edit.width != null) {
+    width = edit.width * slide.width;
+    height = width * natural.height / natural.width;
+  } else if (edit.height != null) {
+    height = edit.height * slide.height;
+    width = height * natural.width / natural.height;
+  } else {
+    const scale = Math.min(slide.width / natural.width, slide.height / natural.height);
+    width = natural.width * scale;
+    height = natural.height * scale;
+  }
+  const round = (value) => Math.max(1, Math.round(value));
+  return {
+    x: Math.round(edit.x != null ? edit.x * slide.width : (slide.width - width) / 2),
+    y: Math.round(edit.y != null ? edit.y * slide.height : (slide.height - height) / 2),
+    cx: round(width),
+    cy: round(height),
+  };
+}
+
+// Where a new shape goes in a slide: the end of the slide's shape tree's own
+// content, before the tree's trailing `<p:extLst>`, which `CT_GroupShape` keeps
+// last — a shape written after it is out of the tree's element order. The tree's
+// own list is told from a nested one by its tail: a nested `<p:extLst>` sits
+// inside a shape, so that shape's close follows it, while the tree's own is
+// followed by nothing but whitespace to the tree's close. `null` when the xml
+// holds no shape tree — there is then nowhere for a shape to go. A self-closing
+// `<p:spTree/>` is not one: `CT_GroupShape` requires the group's own properties,
+// so a slide holding only that element is not a slide a picture may be added to.
+function shapeTreeEnd(xml) {
+  const tree = tagSpans(xml, SLIDE_SHAPE_TREE).find((span) => !span.selfClosing);
+  if (!tree) return null;
+  const close = tree.end - "</p:spTree>".length;
+  const trailing = (span) => tree.start < span.start && span.end <= close && xml.slice(span.end, close).trim() === "";
+  const extension = tagSpans(xml, tagPattern("p:extLst")).find(trailing);
+  return extension ? extension.start : close;
+}
+
+// The slide part's root declaring the relationships namespace as `r` when it does
+// not already: the picture reaches its media part through `r:embed`, and an
+// undeclared prefix is not XML — in a part the kit did not write itself.
+function withRelationshipNamespace(xml) {
+  const root = xml.match(/<p:sld(?:\s[^>]*)?>/);
+  if (!root || /\bxmlns:r=/.test(root[0])) return xml;
+  const declared = setXmlAttribute(root[0], "xmlns:r", REL_NS);
+  return xml.slice(0, root.index) + declared + xml.slice(root.index + root[0].length);
+}
+
+// `pptx_edit`'s `add_image`: the file's bytes become a media part, the slide
+// gains a relationship to it and a `<p:pic>` is appended to the slide's shape
+// tree — the picture is the slide's last shape and takes the next free shape id,
+// so nothing else on the slide is renamed. The image is placed and sized by
+// fraction of the slide (see `imagePlacement`). The part's own content type is
+// declared as an Override: the deck's `<Default>` for the extension may carry
+// another spelling of it (a writer's `image/jpg`, say), and an Override is the
+// declaration that decides for a part.
+function addSlideImage(editor, edit) {
+  const zip = editor.zip;
+  const part = addressedSlide(zip, edit.slide);
+  const image = readImage(edit.path);
+  const media = nextMediaPart(zip, image.kind);
+  editor.add(media, image.bytes);
+  editor.part("[Content_Types].xml", (xml) => withOverride(xml, media, image.contentType));
+  const id = addRelationship(editor, part, IMAGE_REL, media);
+  editor.part(part, (xml) => {
+    const namespaced = withRelationshipNamespace(xml);
+    const at = shapeTreeEnd(namespaced);
+    if (at === null) throw new UsageError("the slide has no shape tree to place an image in");
+    const shapeId = Math.max(1, ...[...namespaced.matchAll(/<p:cNvPr\b[^>]*\bid="(\d+)"/g)].map((match) => Number(match[1]))) + 1;
+    const placement = imagePlacement(image, edit, slideSize(zip));
+    const picture = `<p:pic><p:nvPicPr><p:cNvPr id="${shapeId}" name="Image ${shapeId}"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>` +
+      `<p:blipFill><a:blip r:embed="${id}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>` +
+      `<p:spPr><a:xfrm><a:off x="${placement.x}" y="${placement.y}"/><a:ext cx="${placement.cx}" cy="${placement.cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>`;
+    return namespaced.slice(0, at) + picture + namespaced.slice(at);
+  });
 }
 
 function pptxEdit(req) {
@@ -3406,10 +4054,16 @@ function pptxEdit(req) {
   for (const edit of edits) {
     const op = edit && edit.op;
     if (op === "replace_text" || op === "remove_text") editSlideText(editor, edit, op);
+    else if (op === "format_text") formatSlideText(editor, edit);
     else if (op === "add_paragraph") addSlideParagraph(editor, edit);
     else if (op === "remove_paragraph") removeSlideParagraphs(editor, edit);
+    else if (op === "add_image") addSlideImage(editor, edit);
     else if (op === "add_slide") addSlide(editor, edit);
     else if (op === "delete_slide") deleteSlide(editor, edit);
+    else if (op === "move_slide") moveSlide(editor, edit);
+    else if (op === "duplicate_slide") duplicateSlide(editor, edit);
+    else if (op === "replace_notes" || op === "remove_notes") editSlideNotes(editor, edit, op);
+    else if (op === "add_notes") addSlideNotes(editor, edit);
     else throw new UsageError(`unknown pptx edit: ${JSON.stringify(op)}`);
   }
   return editor.finish();
@@ -3464,11 +4118,16 @@ function pointNumber(value, name) {
 }
 // The digits a colour must have, taken once from the shared rules.
 const HEX_COLOR = new RegExp(`^[0-9a-fA-F]{${RULES.color_digits}}$`);
+// The digits of a colour the tool accepts: `color_digits` hex digits with an
+// optional leading "#". A colour is a string, so a JSON number is refused here
+// too rather than coerced into digits.
+const hexDigits = (color) => {
+  const digits = typeof color === "string" ? color.replace(/^#/, "") : "";
+  if (!HEX_COLOR.test(digits)) throw new UsageError(`color must be ${RULES.color_digits} hex digits, with an optional leading "#", got: ${color}`);
+  return digits;
+};
 const hexColor = (hex) => {
-  // A colour the tool accepts is a string; a JSON number is refused here too
-  // rather than coerced into digits.
-  const digits = typeof hex === "string" ? hex.replace(/^#/, "") : "";
-  if (!HEX_COLOR.test(digits)) throw new UsageError(`color must be ${RULES.color_digits} hex digits, with an optional leading "#", got: ${hex}`);
+  const digits = hexDigits(hex);
   const per = RULES.color_digits / 3;
   const channel = (index) => parseInt(digits.slice(index * per, (index + 1) * per), 16) / 255;
   return rgb(channel(0), channel(1), channel(2));
@@ -3648,8 +4307,10 @@ const operations = {
       writeOut(`${scratch}/probe_edited.xlsx`, edited.buffer);
     });
     // A deck with two slides and notes, edited through every presentation
-    // operation: a text replacement, an added paragraph and slide, and a deleted
-    // slide that carries notes.
+    // operation: a text replacement and a removal, formatting, an image, an
+    // added and a removed paragraph, notes replaced, removed and added, an added
+    // and a deleted slide, and a moved and a duplicated one — the last two on the
+    // slide whose notes the added notes landed on.
     await step("edit_pptx", async () => {
       writeOut(`${scratch}/probe_edit.pptx`, await createPptx({ content: [
         { type: "heading", level: 1, text: "Первый" }, { type: "paragraph", text: "Текст слайда" },
@@ -3657,9 +4318,19 @@ const operations = {
       ] }));
       const edited = pptxEdit({ input: `${scratch}/probe_edit.pptx`, edits: [
         { op: "replace_text", slide: 1, find: "слайда", replace: "правки" },
+        { op: "format_text", slide: 1, find: "Текст", bold: true, color: "#FF0000", align: "center" },
+        { op: "add_image", slide: 1, path: `${scratch}/probe.png`, width: 0.3 },
+        { op: "add_paragraph", slide: 1, text: "Лишнее" },
+        { op: "remove_paragraph", slide: 1, find: "Лишнее" },
         { op: "add_paragraph", slide: 1, text: "Добавлено" },
-        { op: "add_slide", after: 2, title: "Новый", bullets: ["раз", "два"] },
-        { op: "delete_slide", slide: 1 },
+        { op: "remove_text", slide: 1, find: "правки" },
+        { op: "replace_notes", slide: 1, find: "Заметка", replace: "Заметка правлена" },
+        { op: "remove_notes", slide: 1, find: "правлена" },
+        { op: "add_notes", slide: 2, text: "Новые заметки" },
+        { op: "add_slide", after: 1, title: "Новый", bullets: ["раз", "два"] },
+        { op: "delete_slide", slide: 2 },
+        { op: "duplicate_slide", slide: 2 },
+        { op: "move_slide", slide: 3, to: 2 },
       ] });
       writeOut(`${scratch}/probe_edited.pptx`, edited.buffer);
     });

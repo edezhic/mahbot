@@ -1457,9 +1457,10 @@ mod retry_policy_guard_tests {
     }
 }
 
-/// Deterministic per-pixel noise that defeats PNG compression (used by the
-/// reference-image loader and body-budget tests to build reliably large files).
-pub fn noisy_png(width: u32, height: u32) -> Vec<u8> {
+/// Deterministic per-pixel noise that defeats image compression (used by the
+/// reference-image loader and body-budget tests to build reliably large files),
+/// in the format the caller hands a writer.
+fn noisy_image(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
     use image::{ImageBuffer, Rgb};
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(width, height, |x, y| {
         let mut v = x.wrapping_mul(0x9E37_79B9) ^ y.wrapping_mul(0x85EB_CA6B);
@@ -1474,9 +1475,19 @@ pub fn noisy_png(width: u32, height: u32) -> Vec<u8> {
     });
     let mut out = Vec::new();
     image::DynamicImage::ImageRgb8(img)
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .write_to(&mut std::io::Cursor::new(&mut out), format)
         .unwrap();
     out
+}
+
+/// The PNG form of [`noisy_image`].
+pub fn noisy_png(width: u32, height: u32) -> Vec<u8> {
+    noisy_image(width, height, image::ImageFormat::Png)
+}
+
+/// The JPEG form of [`noisy_image`], for the writers that embed either kind.
+pub fn noisy_jpeg(width: u32, height: u32) -> Vec<u8> {
+    noisy_image(width, height, image::ImageFormat::Jpeg)
 }
 
 /// The canonical path as the resolvers hand it on: the platform's
