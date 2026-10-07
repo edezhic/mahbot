@@ -975,6 +975,9 @@ function openEdit(req, family) {
   };
   return {
     zip,
+    // The path the input was opened from, for a refusal that has to name the file
+    // it could not edit (see `missingContentTypes`).
+    input: req.input,
     charge,
     // A user-facing note, already bracketed: the Rust side appends it verbatim.
     // Kept once each, in the order the edits first raised it.
@@ -1125,6 +1128,23 @@ const DOCX_TXBX = tagPattern("w:txbxContent");
 const DOCX_TABLE = tagPattern("w:tbl");
 // A run's text, the same pattern the filler substitutes through.
 const DOCX_TEXT = runPattern("w:");
+// The part a docx edit rewrites, and the parts a package that saved one of the
+// conventional files elsewhere names through its own relationships (see
+// `documentPart`): the styles part a `format_paragraph` style name resolves
+// against, the settings part that says whether revisions are recorded, and the
+// numbering part a list is read from and written to.
+const DOCX_DOCUMENT = "word/document.xml";
+const DOCX_SETTINGS = "word/settings.xml";
+const DOCX_STYLES = "word/styles.xml";
+const DOCX_NUMBERING = "word/numbering.xml";
+// The OPC content type and the relationship type head a numbering part is declared
+// with when a package holds none (see `listNumId`) — the way the xlsx arm declares
+// the styles part it has to write (`stylesText`). The head has a spelling per
+// dialect, and a part written for a document has to be declared with the one that
+// document's own reader resolves (see `dialectOf`).
+const NUMBERING_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
+const WORD_RELATIONSHIPS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const STRICT_RELATIONSHIPS = "http://purl.oclc.org/ooxml/officeDocument/relationships";
 // The refusal every op that searched and found nothing states: the parts a body
 // edit does not look at are named, because the text there is real and the
 // caller may well expect it found.
@@ -1440,8 +1460,10 @@ function rewrittenSlot(slot, edits, prefix) {
 // keeps the characters after it. The replacement takes the formatting of the run
 // its span starts in, so a span covering any run with different formatting raises
 // a note saying so; a removal substitutes nothing, takes no formatting with it,
-// and raises nothing. `prefix` is the run/text namespace (`w:` for the docx edit,
-// `a:` for the pptx one).
+// and raises nothing. The answer is the rewritten `xml` and the spans of the slots
+// it wrote into — the parts of the paragraph the edit touched — so a caller can say
+// which markup inside them the rewrite reached. `prefix` is the run/text namespace
+// (`w:` for the docx edit, `a:` for the pptx one).
 function replaceOccurrences(xml, runs, slots, offsets, replacement, note, prefix) {
   const escaped = xmlEscape(replacement);
   // Whether the span's slots cover a run whose own properties differ from the run
@@ -1486,7 +1508,7 @@ function replaceOccurrences(xml, runs, slots, offsets, replacement, note, prefix
     const slot = slots[index];
     out = out.slice(0, slot.start) + rewrittenSlot(slot, edits.get(index), prefix) + out.slice(slot.end);
   }
-  return out;
+  return { xml: out, spans: [...edits.keys()].map((index) => slots[index]) };
 }
 
 // The pattern of an element of `name` in BOTH shapes a file may write it: a file
@@ -1533,6 +1555,14 @@ const writableElement = (xml, name, what) => {
 // the writer — so `insertOrderedChild` writes each child as one complete element.
 const RUN_PROPERTY_ORDER = ["rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline", "shadow", "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern", "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout", "specVanish", "oMath"];
 
+// ECMA-376's `EG_PPrBase` followed by the two children a `<w:pPr>` adds after it:
+// the order a paragraph's own properties must come in. Word drops a child written
+// out of sequence, so a property appended at the end of the body would be reported
+// as applied while the paragraph renders as it did — the same hazard
+// `RUN_PROPERTY_ORDER` states for a run. `w:rPr` and `w:sectPr` close the sequence;
+// `w:pPrChange` is not part of it at all and the caller keeps it last.
+const PARAGRAPH_PROPERTY_ORDER = ["pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl", "numPr", "suppressLineNumbers", "pBdr", "shd", "tabs", "suppressAutoHyphens", "kinsoku", "wordWrap", "overflowPunct", "topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd", "snapToGrid", "spacing", "ind", "contextualSpacing", "mirrorIndents", "suppressOverlap", "jc", "textDirection", "textAlignment", "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr"];
+
 // The run-properties body with a bold/italic toggle set or removed. Setting one
 // writes it at its place in the sequence, so a toggle added to a body that
 // already holds a later property (`<w:sz>`, `<w:u>`) is not written where Word
@@ -1542,12 +1572,43 @@ function runToggle(body, name, on) {
   return on ? insertOrderedChild(without, name, `<w:${name}/>`, RUN_PROPERTY_ORDER) : without;
 }
 
+// The `w:val` spellings `ST_OnOff` reads as false — a value stating the absence
+// where a toggle's own presence states it is on. The settings part's
+// tracked-revisions switch and the `w:default` a styles part states are read with it.
+const OFF_VALUES = new Set(["false", "0", "off"]);
+
+// The spellings a `<w:u>` reads as drawing no underline: `none`, the one
+// `ST_Underline` states in its own right, and the `ST_OnOff` spellings a run may
+// carry in its place. Reading `<w:u w:val="none"/>` as an underline already drawn
+// would let a `true` report success while the run kept the bytes it had, so the
+// property reads through its own set rather than `OFF_VALUES`.
+const NO_UNDERLINE = new Set(["none", "false", "0", "off"]);
+
+// Whether the body `body` states the property `name` as on: an element whose
+// `w:val` is absent, or states anything outside `off` — the spellings that count as
+// the property being absent. `OFF_VALUES` for a `<w:strike>`/`<w:dstrike>`, whose
+// vocabulary is `ST_OnOff`, and `NO_UNDERLINE` for a `<w:u>`, whose own set it is.
+const statesOn = (body, name, off) => [...body.matchAll(elementPattern(name))].some((match) => {
+  const value = xmlAttribute(match[0], "w:val");
+  return value === undefined || !off.has(value);
+});
+
 // The `<w:rPr>` the format request needs, from the run's own: a boolean writes
-// or drops a `<w:b>`/`<w:i>`, and `size` replaces the run's own `<w:sz>`/
-// `<w:szCs>` — in either shape — with the half-point value, the unit `<w:sz>`
-// counts in. Each property is written at its own place in `EG_RPrBase` (see
-// `insertOrderedChild`). A `null` property counts as absent — the caller's own
-// boundary treats a null-valued key that way — so only a stated one is written.
+// or drops a toggle (`<w:b>`, `<w:i>`, `<w:u>`, `<w:strike>`), `size` replaces the
+// run's own `<w:sz>`/`<w:szCs>` — in either shape — with the half-point value, the
+// unit `<w:sz>` counts in, and `color` replaces the run's own `<w:color>` — in
+// either shape — with the digits the caller stated. Each property is written at its
+// own place in `EG_RPrBase` (see `insertOrderedChild`). A `null` property counts as
+// absent — the caller's own boundary treats a null-valued key that way — so only a
+// stated one is written.
+//
+// An underline is not a plain toggle: a run's own `<w:u>` may state a richer one
+// (`double`, `dotted`, `wave`) and `<w:u w:val="single"/>` — the plain underline a
+// `true` asks for — would throw it away, so a body that already states an underline
+// keeps exactly what it states, and only a `false`, or a body whose every `<w:u>` is
+// off, is rewritten. A double strike is left the same way, for the same reason: a
+// run already struck keeps the strike it draws, and a `true` never rewrites a
+// `<w:dstrike/>` into the plain `<w:strike/>` a run with neither is given.
 //
 // A `<w:rPrChange>` holds the properties a tracked formatting revision recorded
 // — the state before that revision, not the run's own formatting — so only the
@@ -1572,15 +1633,55 @@ function formattedRunProperties(runXml, edit) {
     body = insertOrderedChild(without, "szCs", `<w:szCs w:val="${edit.size}"/>`, RUN_PROPERTY_ORDER);
     body = insertOrderedChild(body, "sz", `<w:sz w:val="${edit.size}"/>`, RUN_PROPERTY_ORDER);
   }
+  if (edit.color != null) {
+    body = insertOrderedChild(body.replace(elementPattern("w:color"), ""), "color", `<w:color w:val="${edit.color}"/>`, RUN_PROPERTY_ORDER);
+  }
+  if (edit.underline != null) {
+    // A `<w:u>` whose `w:val` is absent, or states anything outside the spellings
+    // that draw no underline, IS an underline — so a `true` leaves such a body
+    // exactly as it stands, richer underline and all, while a body stating none is
+    // given the plain one.
+    const stated = statesOn(body, "w:u", NO_UNDERLINE);
+    if (!(edit.underline && stated)) {
+      const without = body.replace(elementPattern("w:u"), "");
+      body = edit.underline ? insertOrderedChild(without, "u", '<w:u w:val="single"/>', RUN_PROPERTY_ORDER) : without;
+    }
+  }
+  if (edit.strike != null) {
+    // A double strike is the same property spelled another way, so a `true` leaves
+    // the strike a run already draws — the rule the underline above keeps — rather
+    // than rewriting a `<w:dstrike/>` into a single one the caller did not name,
+    // while a `false` takes either spelling away: a run that keeps one would answer
+    // a `false` with text that still reads as struck.
+    const struck = statesOn(body, "w:strike", OFF_VALUES) || statesOn(body, "w:dstrike", OFF_VALUES);
+    if (!(edit.strike && struck)) {
+      const without = body.replace(elementPattern("w:strike"), "").replace(elementPattern("w:dstrike"), "");
+      body = edit.strike ? insertOrderedChild(without, "strike", "<w:strike/>", RUN_PROPERTY_ORDER) : without;
+    }
+  }
   if (!body && !revision) return "";
   return `<w:rPr>${body}${revision ? inner.slice(revision.start) : ""}</w:rPr>`;
 }
 
-// `xml` with `edit`'s formatting applied to the runs a matched fragment covers.
-// Run properties live on the run, not on a character, so a fragment covering
-// part of a run formats that whole run — splitting a run to format half of it
-// would rewrite bytes the preservation promise is about. Nothing outside those
-// runs changes.
+// The parts of a run an edit that rewrote its properties reached, in the paragraph's
+// own coordinates: the run with the markers the request keeps byte-identically taken
+// out of it (see `writtenParts`) — naming one as reached would say the call took a
+// change it left exactly as it found it. Everything else the run holds is reached,
+// and the caller owes a note about the unnamed markup there: the run is the unit a run
+// property is stated on, so a reference or a deletion marker beside the text took the
+// formatting too.
+const runReached = (run, runXml) => writtenParts(0, runXml.length, preservedMarkers(runXml))
+  .map((part) => ({ start: run.start + part.start, end: run.start + part.end }));
+
+// `xml` with `edit`'s formatting applied to the runs a matched fragment covers,
+// together with the parts of the paragraph the edit reached — the runs whose bytes
+// it rewrote, so the caller can say which markup inside them it touched (see
+// `runReached`). A run the request left as it was is no part of that: it is not a
+// span, or an edit that rewrote nothing would report reaching markup it never
+// touched. Run properties live on the run, not on a character, so a fragment
+// covering part of a run formats that whole run — splitting a run to format half
+// of it would rewrite bytes the preservation promise is about. Nothing outside
+// those runs changes.
 function formatRuns(xml, runs, runIndices, edit) {
   const pieces = [];
   for (const index of [...runIndices].sort((a, b) => a - b)) {
@@ -1594,15 +1695,652 @@ function formatRuns(xml, runs, runIndices, edit) {
     // into that nested element instead of the run's own.
     const lead = runXml.slice(open.length).length - runXml.slice(open.length).trimStart().length;
     const own = run.rpr ? elementSpan(runXml, open.length + lead, "w:rPr") : undefined;
-    pieces.push({
-      start: run.start,
-      end: run.end,
-      xml: own ? runXml.slice(0, own.start) + next + runXml.slice(own.end) : open + next + runXml.slice(open.length),
-    });
+    // A run whose `<w:rPr>` is opened and never closed cannot be read, and a second
+    // one written beside it would leave the properties the call states inside the
+    // unclosed element, where no reader takes them — the refusal the paragraph path
+    // makes for a `<w:pPr>` (see `paragraphPropertiesSpan`).
+    if (!own && openedNotClosed(runXml, "w:rPr")) throw new UsageError("a run holds <w:rPr> opened and never closed, so its properties cannot be read");
+    const rewritten = own ? runXml.slice(0, own.start) + next + runXml.slice(own.end) : open + next + runXml.slice(open.length);
+    if (rewritten !== runXml) pieces.push({ start: run.start, end: run.end, xml: rewritten, reached: runReached(run, runXml) });
   }
   pieces.sort((a, b) => b.start - a.start);
   let out = xml;
   for (const piece of pieces) out = out.slice(0, piece.start) + piece.xml + out.slice(piece.end);
+  return { xml: out, spans: pieces.flatMap((piece) => piece.reached) };
+}
+
+// ── format_paragraph: a paragraph's own properties ─────────────
+// The alignment words a paragraph may name and the `<w:jc>` value each writes,
+// and the list kinds and the `w:numFmt` each writes — one statement of the pairs
+// in the shared rules, so the word a caller names and the value written for it
+// cannot drift.
+const PARAGRAPH_ALIGNMENTS = new Map(RULES.paragraph_alignments);
+const PARAGRAPH_LISTS = new Map(RULES.paragraph_lists);
+
+// The built-in paragraph style names Word resolves even when a document defines
+// none, each with Word's own language-independent `w:styleId`. The keys are
+// lowercased and trimmed the way the document index is (see `resolveParagraphStyle`),
+// so the English name, the Russian one and the run-together spelling all write the
+// same id. `Normal` is the default paragraph style; the three headings are the
+// built-ins a body edit names.
+const BUILTIN_STYLES = new Map([
+  ["normal", "Normal"], ["обычный", "Normal"], ["обычный текст", "Normal"],
+  ["heading 1", "Heading1"], ["heading1", "Heading1"], ["заголовок 1", "Heading1"], ["заголовок1", "Heading1"],
+  ["heading 2", "Heading2"], ["heading2", "Heading2"], ["заголовок 2", "Heading2"], ["заголовок2", "Heading2"],
+  ["heading 3", "Heading3"], ["heading3", "Heading3"], ["заголовок 3", "Heading3"], ["заголовок3", "Heading3"],
+]);
+
+// The part a docx edit's own relationships name for the relationship type whose tail
+// is `suffix` (`/styles`, `/numbering`, `/settings`), resolved against
+// `word/document.xml`'s directory the way `resolvePart` resolves every target, with
+// the conventional name as the fallback for a package that names none. The type is
+// matched by its TAIL, where the xlsx arm's `stylesPart` matches its whole string:
+// the transitional and the strict OOXML namespaces spell the head differently
+// (`schemas.openxmlformats.org/officeDocument/2006/relationships` against
+// `purl.oclc.org/ooxml/officeDocument/relationships`) while every kind keeps its own
+// local name, so a full-string match would leave a strict-namespace document's own
+// parts unresolved.
+function documentPart(editor, suffix, conventional) {
+  const named = relationships(editor.read(relsPartFor(DOCX_DOCUMENT)) ?? "").find((rel) => rel.type.endsWith(suffix));
+  return named ? resolvePart(partDirectory(DOCX_DOCUMENT), named.target) : conventional;
+}
+
+// The `[start, end]` span of a paragraph's OWN `<w:pPr>` — its first child element
+// — or `undefined` when it has none or its first child is not one, found the way
+// `runProperties` finds a run's `<w:rPr>`. The span is taken by balancing, because
+// a `<w:pPrChange>` a `<w:pPr>` holds carries its own `<w:pPr>` and a lazy close
+// match would stop inside it.
+function paragraphPropertiesSpan(paragraphXml) {
+  const open = paragraphXml.match(new RegExp(openTag("w:p")));
+  if (!open) return undefined;
+  const rest = paragraphXml.slice(open.index + open[0].length);
+  const lead = rest.length - rest.trimStart().length;
+  if (!new RegExp(`^(?:${openTag("w:pPr")}|${selfClosingTag("w:pPr")})`).test(rest.trimStart())) return undefined;
+  const span = elementSpan(paragraphXml, open.index + open[0].length + lead, "w:pPr");
+  // A `<w:pPr>` that never closes swallows everything after it, so the properties a
+  // paragraph has cannot be read and a second one must not be written beside it —
+  // the part is already one a reader offers to repair.
+  if (!span) throw new UsageError("the paragraph holds <w:pPr> opened and never closed, so its properties cannot be read");
+  return span;
+}
+
+// A paragraph's own `<w:pPr>`, or `undefined` when it has none.
+function paragraphProperties(paragraphXml) {
+  const span = paragraphPropertiesSpan(paragraphXml);
+  return span ? paragraphXml.slice(span.start, span.end) : undefined;
+}
+
+// The excerpt of a fragment that states what it holds NOW: everything before the
+// `<w:pPrChange>` a tracked revision recorded. What that revision wrote is the state
+// the properties held when it was recorded, never the one they render with, so no
+// reading of the live properties may look past it — the style a paragraph names, the
+// numbering it draws, the region a formatting writes into. Cut at the recorded
+// change's own TAG rather than at its close: a lazy element match would end at the
+// `<w:pPr>` the change nests, which leaves the tag inside an excerpt whose live
+// properties are already complete.
+const liveProperties = (xml) => {
+  const changeAt = xml.search(new RegExp(`${selfClosingTag("w:pPrChange")}|${openTag("w:pPrChange")}`));
+  return changeAt < 0 ? xml : xml.slice(0, changeAt);
+};
+
+// The `<w:pStyle>` id a paragraph's own `<w:pPr>` names — what it states now (see
+// `liveProperties`) — or `undefined` when it names no style.
+function paragraphStyleId(paragraphXml) {
+  const own = paragraphProperties(paragraphXml);
+  if (!own) return undefined;
+  const found = firstElement(liveProperties(own), "w:pStyle");
+  return found ? xmlAttribute(found[0], "w:val") : undefined;
+}
+
+// A point value a paragraph's indents, spacing and line height state, in the
+// twips (1/20 point) those attributes count in, refused when it is outside the
+// shared bound — the same rule the tool checks, so a value neither side writes is
+// never rounded into the part.
+const pointsToTwips = (points, key, span) => {
+  if (!inSpan(points, span)) throw new UsageError(`${key} must be ${spanBounds(span)} points, got: ${JSON.stringify(points)}`);
+  return Math.round(points * 20);
+};
+
+// The paragraph properties a `format_paragraph` names, each in the unit its
+// attribute counts in, refused when a word or a shape the writer has not is named.
+// `list` is `undefined` when none was named, `false` when the list is to be taken
+// away, and `{ kind, level }` when a kind was.
+function paragraphFormat(edit) {
+  const props = {};
+  if (edit.align != null) {
+    const value = PARAGRAPH_ALIGNMENTS.get(edit.align);
+    if (value === undefined) throw new UsageError(`align must be ${listed([...PARAGRAPH_ALIGNMENTS.keys()])}, got: ${JSON.stringify(edit.align)}`);
+    props.align = value;
+  }
+  if (edit.style != null) props.style = editText(edit.style, "style");
+  if (edit.indent_left != null) props.indentLeft = pointsToTwips(edit.indent_left, "indent_left", RULES.paragraph_indent_points);
+  if (edit.indent_right != null) props.indentRight = pointsToTwips(edit.indent_right, "indent_right", RULES.paragraph_indent_points);
+  if (edit.indent_first_line != null) props.indentFirst = pointsToTwips(edit.indent_first_line, "indent_first_line", RULES.paragraph_indent_points);
+  if (edit.spacing_before != null) props.spacingBefore = pointsToTwips(edit.spacing_before, "spacing_before", RULES.paragraph_spacing_points);
+  if (edit.spacing_after != null) props.spacingAfter = pointsToTwips(edit.spacing_after, "spacing_after", RULES.paragraph_spacing_points);
+  if (edit.line_spacing != null) props.lineSpacing = pointsToTwips(edit.line_spacing, "line_spacing", RULES.paragraph_line_points);
+  props.list = paragraphList(edit);
+  if (Object.values(props).every((value) => value === undefined)) {
+    throw new UsageError("format_paragraph needs at least one of align, style, indent_left, indent_right, indent_first_line, spacing_before, spacing_after, line_spacing or list");
+  }
+  return props;
+}
+
+// The list a `format_paragraph` names: `undefined` when the field is absent, `false`
+// when it is `false` (the list is taken away), else the kind and level. A `level` is
+// a depth a list has to hold the paragraph at, so one beside no list — or beside
+// `list: false` — names a depth there is nothing to belong to.
+function paragraphList(edit) {
+  if (edit.list === undefined || edit.list === null || edit.list === false) {
+    if (edit.level != null) throw new UsageError(`level needs a list to belong to — name "list" as ${listed([...PARAGRAPH_LISTS.keys()])} beside it`);
+    return edit.list === false ? false : undefined;
+  }
+  if (!PARAGRAPH_LISTS.has(edit.list)) throw new UsageError(`list must be ${listed([...PARAGRAPH_LISTS.keys()])}, or false to take the paragraph's list away, got: ${JSON.stringify(edit.list)}`);
+  const level = edit.level == null ? 0 : edit.level;
+  if (!Number.isInteger(level) || level < 0 || level > RULES.paragraph_level_max) throw new UsageError(`level must be a whole number from 0 to ${RULES.paragraph_level_max}, got: ${JSON.stringify(level)}`);
+  return { kind: edit.list, level };
+}
+
+// What a properties excerpt states about numbering: `"numbered"` when its own
+// `<w:numPr>` names a `<w:numId>` other than the cancellation id, `"cancelled"` when
+// that is exactly what it states — OOXML's `<w:numId w:val="0"/>`, the way a
+// paragraph or a style says it draws no numbering (see `cancelledNumbering`) — and
+// `undefined` when it states nothing either way. Only what the excerpt states NOW
+// counts (see `liveProperties`): a recorded revision of the properties states what
+// they held when it was recorded, never the numbering in force. A style stating only
+// the cancellation numbers nothing, and reading it as numbered would have `list:
+// false` write a cancellation the paragraph does not need and report it as a change.
+const numberingState = (xml) => {
+  const numPr = firstElement(liveProperties(xml), "w:numPr");
+  const numId = numPr ? firstElement(numPr[0], "w:numId") : undefined;
+  if (!numId) return undefined;
+  const id = xmlAttribute(numId[0], "w:val");
+  return id === undefined || Number(id) !== 0 ? "numbered" : "cancelled";
+};
+
+// Every `<w:style>` of a styles part, in part order, as its `w:styleId`, its
+// `w:type` (paragraph when absent, the default a reader takes), its
+// `<w:name w:val>`, the style it is `<w:basedOn>` — what it inherits what it does not
+// state from — what it states about numbering of its own (see `numberingState`), and
+// whether the document states it as its default.
+function styleEntries(styles) {
+  const entries = [];
+  for (const match of styles.matchAll(elementPattern("w:style"))) {
+    const name = firstElement(match[0], "w:name");
+    const basedOn = firstElement(match[0], "w:basedOn");
+    const isDefault = xmlAttribute(match[0], "w:default");
+    entries.push({
+      id: xmlAttribute(match[0], "w:styleId"),
+      type: xmlAttribute(match[0], "w:type") || "paragraph",
+      name: name ? xmlAttribute(name[0], "w:val") : undefined,
+      basedOn: basedOn ? xmlAttribute(basedOn[0], "w:val") : undefined,
+      numbering: numberingState(match[0]),
+      isDefault: isDefault !== undefined && !OFF_VALUES.has(isDefault),
+    });
+  }
+  return entries;
+}
+
+// The `w:styleId` the paragraph style `name` resolves to: the document's own style
+// of that name, matched case-insensitively against its id and its name, or one of
+// the built-in names that always work. A style the document defines under another
+// type cannot format a paragraph, and a name the document does not define is refused
+// naming the paragraph styles it does — so a caller reads what to ask for, and the
+// built-in spellings are always a way out.
+function resolveParagraphStyle(editor, name) {
+  const styles = editor.read(documentPart(editor, "/styles", DOCX_STYLES));
+  const entries = styles === undefined ? [] : styleEntries(styles);
+  const index = new Map();
+  for (const entry of entries) {
+    if (entry.id !== undefined) index.set(entry.id.trim().toLowerCase(), entry);
+    if (entry.name !== undefined) index.set(entry.name.trim().toLowerCase(), entry);
+  }
+  const hit = index.get(name.trim().toLowerCase());
+  if (hit && hit.id !== undefined) {
+    if (hit.type !== "paragraph") throw new UsageError(`${JSON.stringify(name)} is the document's ${hit.type} style, and paragraph formatting needs a paragraph style`);
+    return hit.id;
+  }
+  const builtin = BUILTIN_STYLES.get(name.trim().toLowerCase());
+  if (builtin !== undefined) return builtin;
+  const names = entries.filter((entry) => entry.type === "paragraph" && entry.name !== undefined).map((entry) => entry.name);
+  if (!names.length) throw new UsageError(`the document defines no paragraph styles, so ${JSON.stringify(name)} cannot be resolved — hint: a built-in name such as Normal or Heading 1 always works`);
+  throw new UsageError(`the document defines no paragraph style named ${JSON.stringify(name)} — it defines ${names.slice(0, 20).join(", ")} — hint: a built-in name such as Normal or Heading 1 always works`);
+}
+
+// Whether a paragraph style numbers the paragraphs that take it, as a walk over the
+// chain a reader follows: what the style states now, else the style it takes what it
+// does not state from (its `<w:basedOn>`), else the document's own `<w:docDefaults>`,
+// in the order a reader walks them. The walk starts at the style a paragraph renders
+// with: the one it names, or — for a paragraph naming none, or one the document does
+// not define — the default ENTRY the document flags `w:default` (or the one carrying
+// the built-in `Normal` name), read as an entry rather than by id, since such a style
+// states its numbering whether or not it carries a `w:styleId`. A style stating the
+// cancellation stops the walk there, the numbering the defaults would give being the
+// one it took away, and so does one the chain has already read. A `basedOn` naming no
+// style the document defines is ignored rather than followed (ECMA-376 17.7.2.4):
+// such a style is its own root, so only the defaults apply to it, never the default
+// style's own statements. `defaults` says whether the document's own defaults number
+// every paragraph no style does. Built once per call, since a fragment matching many
+// paragraphs asks about a style again and again.
+function styleNumbers(entries, defaults) {
+  const byId = new Map(entries.filter((entry) => entry.id !== undefined).map((entry) => [entry.id, entry]));
+  const normal = BUILTIN_STYLES.get("normal");
+  const fallback = entries.find((entry) => entry.type === "paragraph" && entry.isDefault)
+    ?? entries.find((entry) => entry.type === "paragraph" && (entry.id === normal || entry.name === normal));
+  return (styleId) => {
+    let entry = styleId === undefined ? undefined : byId.get(styleId);
+    if (entry === undefined) entry = fallback;
+    const seen = new Set();
+    while (entry !== undefined && !seen.has(entry)) {
+      seen.add(entry);
+      if (entry.numbering === "numbered") return true;
+      if (entry.numbering === "cancelled") return false;
+      entry = entry.basedOn === undefined ? undefined : byId.get(entry.basedOn);
+    }
+    return defaults;
+  };
+}
+
+// Whether the document's own defaults number every paragraph:
+// `<w:docDefaults><w:pPrDefault><w:pPr>` stating a `<w:numPr>` numbers the paragraphs
+// no style and no paragraph of their own does, so `list: false` on one of them has to
+// cancel it like any other inherited numbering.
+function defaultsNumbering(styles) {
+  const defaults = firstElement(styles, "w:docDefaults");
+  const paragraph = defaults && firstElement(defaults[0], "w:pPrDefault");
+  const properties = paragraph && firstElement(paragraph[0], "w:pPr");
+  return properties !== undefined && numberingState(properties[0]) === "numbered";
+}
+
+// The nine `<w:lvl>` a list definition of `kind` carries, one per level the shared
+// cap allows: a fixed start of 1, the format the kind maps to, the marker a reader
+// draws (`%N.` at level N for a number, a bullet for a bullet) and a leading-edge
+// justification. ECMA-376 writes the children in this order or a reader drops them,
+// and both the level list and the justification are stated in the dialect the part is
+// written in (see `dialectOf`).
+const listLevels = (format, kind, dialect) => Array.from(
+  { length: RULES.paragraph_level_max + 1 },
+  (_, level) => `<w:lvl w:ilvl="${level}"><w:start w:val="1"/><w:numFmt w:val="${format}"/><w:lvlText w:val="${kind === "number" ? `%${level + 1}.` : "●"}"/><w:lvlJc w:val="${justification(dialect, "left")}"/></w:lvl>`,
+).join("");
+const abstractNumElement = (abstractNumId, format, kind, dialect) => `<w:abstractNum w:abstractNumId="${abstractNumId}">${listLevels(format, kind, dialect)}</w:abstractNum>`;
+const numElement = (numId, abstractNumId) => `<w:num w:numId="${numId}"><w:abstractNumId w:val="${abstractNumId}"/></w:num>`;
+
+// The two wordprocessingml namespaces a document's own root may bind its `w` prefix
+// to — the transitional one `create` writes and the strict one some producers do (see
+// `documentPart`) — and the relationship namespaces that go with them.
+const WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const STRICT_WORD_NAMESPACE = "http://purl.oclc.org/ooxml/wordprocessingml/main";
+const WORD_NAMESPACES = { transitional: WORD_NAMESPACE, strict: STRICT_WORD_NAMESPACE };
+const RELATIONSHIP_NAMESPACES = { transitional: WORD_RELATIONSHIPS, strict: STRICT_RELATIONSHIPS };
+
+// The two readings of OOXML a part may be written in, and the dialect `part` — a
+// document being edited or a part it holds — is written in: `"strict"` when its root
+// binds `w` to the strict namespace, `"transitional"` otherwise. A reader resolves only
+// its own dialect's names and values, so every fact a call writes is the one the part
+// it writes into states (see `EDGE_INDENTS`, `JUSTIFICATIONS`), and a whole part is
+// created in the dialect of the document that has to read it.
+const dialectOf = (part) => (part.includes(`xmlns:w="${STRICT_WORD_NAMESPACE}"`) ? "strict" : "transitional");
+
+// The other dialect's own spelling of a fact a part may state twice (see
+// `EDGE_INDENTS`): writing it in one, the write clears the other, so exactly one of the
+// two states the value the call named.
+const otherDialect = (dialect) => (dialect === "strict" ? "transitional" : "strict");
+
+// The `<w:jc>` value each alignment names in a dialect (see `PARAGRAPH_ALIGNMENTS` for
+// the words): the strict schema spells a paragraph's leading and trailing edge
+// `start`/`end` where the transitional one spells them `left`/`right`, and a value a
+// part's own reader does not define leaves the paragraph where it was. Center and
+// both are spelled the same in either dialect, so only the edges are stated here.
+const JUSTIFICATIONS = {
+  transitional: { left: "left", right: "right" },
+  strict: { left: "start", right: "end" },
+};
+const justification = (dialect, value) => JUSTIFICATIONS[dialect][value] ?? value;
+
+// A whole numbering part holding one definition of `kind` — what a package that
+// holds none is given rather than refusing the list (see `listNumId`).
+const numberingPartXml = (abstractNumId, numId, format, kind, dialect) => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering xmlns:w="${WORD_NAMESPACES[dialect]}">${abstractNumElement(abstractNumId, format, kind, dialect)}${numElement(numId, abstractNumId)}</w:numbering>`;
+
+// The root of a numbering part, in the one reading of an element's shape
+// (`elementEdges`), and `undefined` for a part whose root is missing or never
+// closed — a part the writer cannot splice into must not be reported as written.
+function numberingRoot(xml) {
+  const found = firstElement(xml, "w:numbering");
+  if (!found) return undefined;
+  const edges = elementEdges(found[0], "w:numbering");
+  return { selfClosing: edges.selfClosing, close: found.index + edges.close };
+}
+
+// `xml` with a new `<w:abstractNum>` and the `<w:num>` that points at it, in the
+// order ECMA-376 requires of a numbering part: every `w:abstractNum` before every
+// `w:num`, so the abstract goes before the first `<w:num>` (before the root's close
+// when the part holds none) and the `<w:num>` last. A self-closing root is opened
+// around the pair. `dialect` is the part's own (see `dialectOf`), which its levels are
+// stated in so this part's reader resolves them.
+function withNewList(xml, abstractNumId, numId, format, kind, dialect) {
+  const root = numberingRoot(xml);
+  if (!root) throw new UsageError("the document's numbering part cannot be written into: its <w:numbering> root is missing or never closed");
+  const abstract = abstractNumElement(abstractNumId, format, kind, dialect);
+  const num = numElement(numId, abstractNumId);
+  if (root.selfClosing) return xml.slice(0, root.close - 2) + `>${abstract}${num}</w:numbering>` + xml.slice(root.close);
+  const firstNum = firstElement(xml, "w:num");
+  const at = firstNum ? firstNum.index : root.close;
+  return xml.slice(0, at) + abstract + xml.slice(at, root.close) + num + xml.slice(root.close);
+}
+
+// Every `w:abstractNumId` or `w:numId` a numbering part holds, as numbers. An
+// element stating no id of its own is dropped, so it never raises the fresh id a
+// new definition takes.
+const idsOf = (xml, name, attribute) => [...xml.matchAll(elementPattern(name))]
+  .map((match) => Number(xmlAttribute(match[0], attribute)))
+  .filter(Number.isFinite);
+
+// The `w:numFmt` a `<w:num>`'s own `<w:lvlOverride>` states at `level`, or
+// `undefined` when it overrides nothing there: an override that only restates the
+// level's start leaves the abstract's format in force, while one carrying its own
+// `<w:lvl>` renders what that level states — reusing such a definition would give
+// the paragraph another kind of list than the one the call named.
+const overrideFormat = (num, level) => {
+  for (const match of num.matchAll(elementPattern("w:lvlOverride"))) {
+    if (Number(xmlAttribute(match[0], "w:ilvl")) !== level) continue;
+    const numFmt = firstElement(match[0], "w:numFmt");
+    if (numFmt) return xmlAttribute(numFmt[0], "w:val");
+  }
+  return undefined;
+};
+
+// The `w:numId` of the FIRST `<w:num>` that renders `format` at `level` — the
+// format its abstract states there, or the one its own `<w:lvlOverride>` puts in
+// that state's place — or `undefined` when the part holds none. A document that
+// already has a suitable list is never given a second one.
+function existingListNumId(xml, format, level) {
+  const abstracts = new Map();
+  for (const match of xml.matchAll(elementPattern("w:abstractNum"))) {
+    const byLevel = new Map();
+    for (const lvl of match[0].matchAll(elementPattern("w:lvl"))) {
+      const numFmt = firstElement(lvl[0], "w:numFmt");
+      if (numFmt) byLevel.set(Number(xmlAttribute(lvl[0], "w:ilvl")), xmlAttribute(numFmt[0], "w:val"));
+    }
+    abstracts.set(Number(xmlAttribute(match[0], "w:abstractNumId")), byLevel);
+  }
+  for (const match of xml.matchAll(elementPattern("w:num"))) {
+    const id = Number(xmlAttribute(match[0], "w:numId"));
+    // A `<w:num>` stating no id of its own, or the reserved 0 — the id the
+    // cancellation idiom writes — names no list a paragraph may be given: reading it
+    // as one would hand the paragraph a `<w:numId w:val="NaN"/>` no reader can
+    // resolve, or the cancellation itself where the call meant to apply a list, the
+    // way the sibling `idsOf` drops an element with no id of its own.
+    if (!Number.isFinite(id) || id <= 0) continue;
+    const abstract = firstElement(match[0], "w:abstractNumId");
+    const byLevel = abstract ? abstracts.get(Number(xmlAttribute(abstract[0], "w:val"))) : undefined;
+    if (byLevel && (overrideFormat(match[0], level) ?? byLevel.get(level)) === format) return id;
+  }
+  return undefined;
+}
+
+// `name` made a part `word/document.xml`'s own relationships name, unless one
+// already does — a part no relationship points at is one no reader reads, and the
+// relationship is stated in the dialect `dialect` names, so the reader this document
+// belongs to resolves the part it points at.
+function nameNumberingPart(editor, name, dialect) {
+  if (relationships(editor.read(relsPartFor(DOCX_DOCUMENT)) ?? "").some((rel) => rel.type.endsWith("/numbering"))) return;
+  addRelationship(editor, DOCX_DOCUMENT, `${RELATIONSHIP_NAMESPACES[dialect]}/numbering`, name);
+}
+
+// The `w:numId` a paragraph's `list` writes: the document's own definition of that
+// format at that level, or a fresh one written into the numbering part — the part
+// the document's own relationships name, created and declared whole when the
+// package holds none. Read fresh on every call, so two lists in one edit list find
+// and reuse the definition the first wrote. `dialect` is the document's own, read
+// once by the caller: a part created here has to be stated in it, while a definition
+// spliced into a part that already exists takes that part's own.
+function listNumId(editor, kind, level, dialect) {
+  const format = PARAGRAPH_LISTS.get(kind);
+  const name = documentPart(editor, "/numbering", DOCX_NUMBERING);
+  const xml = editor.read(name);
+  if (xml !== undefined) {
+    const existing = existingListNumId(xml, format, level);
+    if (existing !== undefined) return existing;
+    const abstractNumId = Math.max(0, ...idsOf(xml, "w:abstractNum", "w:abstractNumId")) + 1;
+    const numId = Math.max(0, ...idsOf(xml, "w:num", "w:numId")) + 1;
+    editor.rewrite(name, xml, withNewList(xml, abstractNumId, numId, format, kind, dialectOf(xml)));
+    return numId;
+  }
+  if (!editor.zip.file("[Content_Types].xml")) throw missingContentTypes(editor.input);
+  editor.add(name, numberingPartXml(1, 1, format, kind, dialect));
+  editor.part("[Content_Types].xml", (contentTypes) => withOverride(contentTypes, name, NUMBERING_CONTENT_TYPE));
+  nameNumberingPart(editor, name, dialect);
+  return 1;
+}
+
+// Where a paragraph's `<w:pPr>` body stops being properties a call may rewrite: the
+// paragraph mark's own `<w:rPr>` and the section break `<w:sectPr>` follow every
+// `EG_PPrBase` child. Everything from the first of them on travels through untouched
+// — the run properties are not the paragraph's, and the `<w:spacing>` an `<w:rPr>`
+// holds is the mark's own character spacing, which writing the paragraph's would
+// otherwise rewrite.
+function paragraphTailAt(body) {
+  const at = [firstElement(body, "w:rPr"), firstElement(body, "w:sectPr")].filter(Boolean).map((found) => found.index);
+  return at.length ? Math.min(...at) : -1;
+}
+
+// The `<w:ind>` attributes each edge indent is stated in: the strict dialect spells an
+// indent's leading and trailing edge `w:start`/`w:end` and the transitional one
+// `w:left`/`w:right` (see `dialectOf`), so a document takes the attribute its own
+// reader resolves — writing the other dialect's would state an indent that reader
+// ignores, and the value the call named would not be applied at all. Each edge also
+// has a character-scaled spelling (`w:leftChars`, `w:startChars`), the same indent
+// counted in characters rather than twips, which is cleared either way.
+const EDGE_INDENTS = {
+  strict: { left: "w:start", leftChars: "w:startChars", right: "w:end", rightChars: "w:endChars" },
+  transitional: { left: "w:left", leftChars: "w:leftChars", right: "w:right", rightChars: "w:rightChars" },
+};
+
+// A `<w:pPr>` body with each property `props` names written at its own seat in
+// `PARAGRAPH_PROPERTY_ORDER` (see `insertOrderedChild`), so a property is never
+// written where Word would drop it. Every element the call does not name keeps its
+// own bytes, and an existing `<w:ind>`/`<w:spacing>` keeps the attributes the call
+// does not name — a named value that a sibling attribute could override clears that
+// sibling, or the paragraph would render a spacing or an indent the reply said it
+// had written. An indent, an alignment and a list level are stated in the dialect's
+// own spelling (`dialect`). `list` is the request's list property as far as the call
+// has resolved it: the definition `numId` the kind it named takes, or, for a request
+// taking the list away, whether the paragraph `numbered` draws a list item marker at
+// all (see `formatParagraph` for both).
+function applyParagraphProperties(body, props, styleId, list, dialect) {
+  let out = body;
+  const place = (name, element) => {
+    out = insertOrderedChild(out.replace(elementPattern(`w:${name}`), ""), name, element, PARAGRAPH_PROPERTY_ORDER);
+  };
+  if (props.style !== undefined) place("pStyle", `<w:pStyle w:val="${xmlEscape(styleId)}"/>`);
+  if (props.align !== undefined) place("jc", `<w:jc w:val="${justification(dialect, props.align)}"/>`);
+  if (props.indentLeft !== undefined || props.indentRight !== undefined || props.indentFirst !== undefined) {
+    const found = firstElement(out, "w:ind");
+    let ind = found ? found[0] : "<w:ind/>";
+    const mine = EDGE_INDENTS[dialect];
+    const other = EDGE_INDENTS[otherDialect(dialect)];
+    if (props.indentLeft !== undefined) {
+      ind = setXmlAttribute(ind, mine.left, props.indentLeft);
+      ind = setXmlAttribute(ind, mine.leftChars, null);
+      ind = setXmlAttribute(ind, other.left, null);
+      ind = setXmlAttribute(ind, other.leftChars, null);
+    }
+    if (props.indentRight !== undefined) {
+      ind = setXmlAttribute(ind, mine.right, props.indentRight);
+      ind = setXmlAttribute(ind, mine.rightChars, null);
+      ind = setXmlAttribute(ind, other.right, null);
+      ind = setXmlAttribute(ind, other.rightChars, null);
+    }
+    if (props.indentFirst !== undefined) {
+      // A negative first-line indent IS the hanging indent: Word states the two as
+      // mutually exclusive attributes of one `<w:ind>`, so only one is ever written.
+      const hanging = props.indentFirst < 0;
+      ind = setXmlAttribute(ind, hanging ? "w:hanging" : "w:firstLine", Math.abs(props.indentFirst));
+      ind = setXmlAttribute(ind, hanging ? "w:firstLine" : "w:hanging", null);
+      ind = setXmlAttribute(ind, "w:firstLineChars", null);
+      ind = setXmlAttribute(ind, "w:hangingChars", null);
+    }
+    place("ind", ind);
+  }
+  if (props.spacingBefore !== undefined || props.spacingAfter !== undefined || props.lineSpacing !== undefined) {
+    const found = firstElement(out, "w:spacing");
+    let spacing = found ? found[0] : "<w:spacing/>";
+    if (props.spacingBefore !== undefined) {
+      spacing = setXmlAttribute(spacing, "w:before", props.spacingBefore);
+      spacing = setXmlAttribute(spacing, "w:beforeLines", null);
+      spacing = setXmlAttribute(spacing, "w:beforeAutospacing", null);
+    }
+    if (props.spacingAfter !== undefined) {
+      spacing = setXmlAttribute(spacing, "w:after", props.spacingAfter);
+      spacing = setXmlAttribute(spacing, "w:afterLines", null);
+      spacing = setXmlAttribute(spacing, "w:afterAutospacing", null);
+    }
+    if (props.lineSpacing !== undefined) {
+      spacing = setXmlAttribute(spacing, "w:line", props.lineSpacing);
+      spacing = setXmlAttribute(spacing, "w:lineRule", "exact");
+    }
+    place("spacing", spacing);
+  }
+  if (props.list !== undefined) {
+    if (props.list === false) {
+      // A paragraph holding its own `<w:numPr>` states the cancelled id in it, so the
+      // level and the bytes around it survive; one holding none is given the statement
+      // when the list it draws is not its own — `list.numbered` is the whole chain a
+      // reader walks (see `formatParagraph`) — since a paragraph taking its number from
+      // a style would otherwise keep rendering as a list item while the call reported
+      // the list taken away.
+      const own = firstElement(out, "w:numPr");
+      if (own) place("numPr", cancelledNumbering(own[0]));
+      else if (list.numbered) place("numPr", '<w:numPr><w:numId w:val="0"/></w:numPr>');
+    } else {
+      place("numPr", `<w:numPr><w:ilvl w:val="${props.list.level}"/><w:numId w:val="${list.numId}"/></w:numPr>`);
+    }
+  }
+  return out;
+}
+
+// A `<w:numPr>` stating that its paragraph draws no numbering — OOXML's
+// `<w:numId w:val="0"/>`. Dropping the element alone would not say it: a paragraph
+// taking a number from its own style would keep rendering as a list item. The id the
+// paragraph already points at is set to 0 in place, so its level and the bytes around
+// it survive; a `<w:numPr>` naming no `<w:numId>` at all is given one after its
+// `<w:ilvl>`, the seat `CT_NumPr` puts the two in.
+function cancelledNumbering(numPr) {
+  const found = firstElement(numPr, "w:numId");
+  if (found) return numPr.slice(0, found.index) + setXmlAttribute(found[0], "w:val", 0) + numPr.slice(found.index + found[0].length);
+  const edges = elementEdges(numPr, "w:numPr");
+  if (edges.selfClosing) return `${numPr.slice(0, edges.bodyStart - 2)}><w:numId w:val="0"/></w:numPr>`;
+  const level = firstElement(numPr, "w:ilvl");
+  const at = level ? level.index + level[0].length : edges.bodyStart;
+  return `${numPr.slice(0, at)}<w:numId w:val="0"/>${numPr.slice(at)}`;
+}
+
+// The paragraph XML with `props` written into its own `<w:pPr>`, and the parts of the
+// region the call rewrote in the ORIGINAL paragraph — so the caller can say which
+// markup inside it the rewrite reached. That region is the properties before the
+// pPr's tail, never the whole element: the tail (the paragraph mark's own `<w:rPr>`
+// and the `<w:sectPr>`) and the `<w:pPrChange>` a tracked revision recorded travel
+// through byte for byte, and the preserved markers inside the region are taken out of
+// it (see `writtenParts`) — naming any of them as reached would report markup the
+// call kept exactly as it found it. One of them really sits in the region: a
+// `<w:numPr>` states the `<w:ins>` its `CT_NumPr` carries, which cancelling the list
+// around it leaves exactly as it was — while a list kind replaces that `<w:numPr>`
+// whole, so the marker inside it goes with it and stays among the parts reached. A
+// paragraph with no pPr gets a fresh one immediately after its own open tag; an
+// existing one keeps its own tag spelling, and the recorded change stays LAST, exactly
+// as `formattedRunProperties` treats `<w:rPrChange>`. Nothing is written when the named
+// properties are already what the paragraph holds, and no part is reported then either:
+// an edit that rewrote no bytes reached no markup, so the caller owes no note about
+// what it "also reached".
+function formattedParagraph(paragraphXml, props, styleId, list, dialect) {
+  const own = paragraphPropertiesSpan(paragraphXml);
+  const element = own ? paragraphXml.slice(own.start, own.end) : "";
+  const open = own ? element.match(new RegExp(`^(?:${selfClosingTag("w:pPr")}|${openTag("w:pPr")})`))[0] : "";
+  const selfClosing = own ? open.endsWith("/>") : false;
+  const close = own && !selfClosing ? element.match(new RegExp(closeTag("w:pPr") + "$"))[0] : undefined;
+  const inner = own ? (selfClosing ? "" : element.slice(open.length, element.length - close.length)) : "";
+  const beforeRevision = liveProperties(inner);
+  const revisionTail = inner.slice(beforeRevision.length);
+  const tailAt = paragraphTailAt(beforeRevision);
+  const mutable = tailAt < 0 ? beforeRevision : beforeRevision.slice(0, tailAt);
+  const written = applyParagraphProperties(mutable, props, styleId, list, dialect);
+  // An unchanged body is the one case that writes nothing — and the one case a
+  // property cannot have emptied it: every property the request names adds an
+  // element, so a body that came back as it was is a body no property was placed in.
+  if (written === mutable) return { xml: paragraphXml, spans: [] };
+  const body = written + (tailAt < 0 ? "" : beforeRevision.slice(tailAt)) + revisionTail;
+  if (!own) {
+    const p = paragraphXml.match(new RegExp(openTag("w:p")));
+    const at = p.index + p[0].length;
+    return { xml: paragraphXml.slice(0, at) + `<w:pPr>${body}</w:pPr>` + paragraphXml.slice(at), spans: [] };
+  }
+  const head = selfClosing ? open.slice(0, -2) + ">" : open;
+  const closeText = selfClosing ? "</w:pPr>" : close;
+  const at = own.start + open.length;
+  // A `<w:numPr>` a list kind replaces is gone WHOLE — the numbering the paragraph had
+  // and everything `CT_NumPr` states in it, a tracked change of that numbering and an
+  // insertion marker included — so a marker inside it is not one the request kept:
+  // taking it out of the parts would report a change the call really made as markup it
+  // left as it found it (see `writtenParts`), where the answer owes the note.
+  const replaced = props.list === undefined || props.list === false ? undefined : firstElement(mutable, "w:numPr");
+  const kept = preservedMarkers(paragraphXml).filter((marker) => replaced === undefined
+    || marker.start < at + replaced.index || marker.start >= at + replaced.index + replaced[0].length);
+  return {
+    xml: paragraphXml.slice(0, own.start) + head + body + closeText + paragraphXml.slice(own.end),
+    spans: writtenParts(own.start, at + mutable.length, kept),
+  };
+}
+
+// `xml` with `find`'s paragraph properties applied to every paragraph whose own
+// addressed text holds it — the same paragraphs a text op addresses, a table cell's
+// and a text box's own included, the markup around them untouched. The style and
+// the list definition are resolved on the first match only, so a fragment that
+// matches nothing refuses before it can write a definition, and one definition
+// serves every paragraph the call reaches.
+function formatParagraph(xml, edit, find, editor) {
+  const props = paragraphFormat(edit);
+  // The dialect every part and attribute this call writes has to state (see
+  // `dialectOf`), read from the body it edits.
+  const dialect = dialectOf(xml);
+  let styleId;
+  let numId;
+  let matched = 0;
+  // Whether the chain of styles a paragraph renders with numbers it (see
+  // `styleNumbers`). The styles part is read and parsed once per call and the walk is
+  // built with it: a fragment matching many paragraphs asks about a style again and
+  // again, and the part is charged on every read.
+  let styleNumbering;
+  const numberedByStyle = (id) => {
+    if (styleNumbering === undefined) {
+      const styles = editor.read(documentPart(editor, "/styles", DOCX_STYLES)) ?? "";
+      styleNumbering = styleNumbers(styleEntries(styles), defaultsNumbering(styles));
+    }
+    return styleNumbering(id);
+  };
+  const out = mapParagraphs(xml, (element, excluded) => {
+    if (!addressedText(element, excluded).includes(find)) return null;
+    if (props.style !== undefined && styleId === undefined) styleId = resolveParagraphStyle(editor, props.style);
+    if (props.list !== undefined && props.list !== false && numId === undefined) numId = listNumId(editor, props.list.kind, props.list.level, dialect);
+    matched += 1;
+    // Whether the paragraph draws a list item marker at all — what its own properties
+    // state (the state that decides on its own, a paragraph cancelling the numbering
+    // its style gives drawing none), else the chain of styles it renders with, in the
+    // order a reader walks them (see `styleNumbers`). It is what taking a list away has
+    // to answer for: the numbering its own body states is cancelled in place, and one
+    // it draws from anywhere else is cancelled with the id the cancellation is written
+    // as — while a paragraph that draws none keeps its bytes rather than taking a
+    // cancellation it does not need.
+    const list = { numId, numbered: false };
+    if (props.list === false) {
+      const own = numberingState(paragraphProperties(element) ?? "");
+      list.numbered = own === undefined ? numberedByStyle(styleId ?? paragraphStyleId(element)) : own === "numbered";
+    }
+    const written = formattedParagraph(element, props, styleId, list, dialect);
+    noteUnnamed(element, written.spans, editor.note);
+    return written.xml;
+  });
+  if (!matched) throw new UsageError(missingFind(find));
+  if (matched > 1) editor.note(`[the fragment matched ${matched} paragraphs — every one was formatted]`);
   return out;
 }
 
@@ -1638,12 +2376,18 @@ function bodyEnd(xml) {
 // is not — it is a paragraph nested inside another — and an `after` naming text
 // there is refused with a message saying where the text lies rather than
 // anchoring the new paragraph inside the box.
-function addParagraph(xml, edit) {
+//
+// A paragraph added after an anchor takes what the anchor holds: the style, the
+// paragraph formatting and the list membership of its own `<w:pPr>` (minus the
+// markers that must not be fabricated in new content — see `inheritedParagraph`)
+// and the run formatting of its first run, so a line added to a list stays a list
+// item and one added after a heading is a heading. With no `after`, a bare
+// paragraph goes at the end of the body, exactly as before.
+function addParagraph(xml, edit, note) {
   const text = editText(edit.text, "text");
-  const paragraph = `<w:p><w:r><w:t xml:space="preserve">${xmlEscape(text)}</w:t></w:r></w:p>`;
   if (edit.after === undefined) {
     const at = bodyEnd(xml);
-    return xml.slice(0, at) + paragraph + xml.slice(at);
+    return xml.slice(0, at) + addedParagraph(undefined, undefined, text) + xml.slice(at);
   }
   const after = editText(edit.after, "after");
   if (!after) throw new UsageError("after must not be empty");
@@ -1662,7 +2406,49 @@ function addParagraph(xml, edit) {
     if (buried) throw new UsageError(`the text ${JSON.stringify(after)} is inside a text box: an add_paragraph after anchors in the document's own paragraphs (a table cell's counts), and a text box's paragraph is a nested one`);
     throw new UsageError(missingFind(after));
   }
-  return xml.slice(0, span.end) + paragraph + xml.slice(span.end);
+  return xml.slice(0, span.end) + inheritedParagraph(xml.slice(span.start, span.end), text, note) + xml.slice(span.end);
+}
+
+// A `<w:p>` holding one run and `text`: the shape every `add_paragraph` writes,
+// with the anchor's own `<w:pPr>` and first run's `<w:rPr>` when it is inserted
+// after one. Both are `undefined` for a paragraph added at the end of the body.
+const addedParagraph = (pPr, rPr, text) => `<w:p>${pPr ?? ""}<w:r>${rPr ?? ""}<w:t xml:space="preserve">${xmlEscape(text)}</w:t></w:r></w:p>`;
+
+// A copied property body with the markers that must not be fabricated in new
+// content taken out: the recorded revisions the anchor's properties and its numbering
+// carry (`w:pPrChange`/`w:rPrChange`/`w:numberingChange`, the anchor's history rather
+// than the new paragraph's) and a tracked insertion, deletion or move, which would
+// annotate content this call never inserted as belonging to a revision that never
+// mentioned it — the one list `preservedMarkers` reads, so the two readings of a
+// marker cannot drift apart.
+const withoutTrackedMarkers = (xml) => TRACKED_MARKERS
+  .reduce((kept, name) => kept.replace(elementPattern(name), ""), xml);
+
+// The paragraph `add_paragraph` inserts after `anchor`: the anchor's own `<w:pPr>`
+// copied verbatim minus the markers that must not be fabricated in new content —
+// a section break belongs to the paragraph that ENDS the section, and copying it
+// would duplicate the break, while everything `withoutTrackedMarkers` takes is the
+// anchor's history, not the new paragraph's — and the anchor's first own run's
+// `<w:rPr>`, stripped the same way. The run is the one the arm's own `docxRuns`
+// sees at depth 1, so a text box's run is not taken.
+function inheritedParagraph(anchor, text, note) {
+  const pPr = paragraphProperties(anchor);
+  let inherited;
+  if (pPr) {
+    if (firstElement(pPr, "w:sectPr")) note("[the paragraph the new one follows ends a section, so the new one does not carry its section break]");
+    const kept = withoutTrackedMarkers(pPr.replace(elementPattern("w:sectPr"), ""));
+    // What the stripping left may be nothing at all — a paragraph whose only
+    // property was the section break — and an empty `<w:pPr>` is a change that
+    // states nothing (the rule a run's own properties are written under).
+    inherited = elementParts(kept, "w:pPr").body.trim() ? kept : undefined;
+  }
+  const { runs } = docxRuns(anchor);
+  const stripped = runs.length && runs[0].rpr ? withoutTrackedMarkers(runs[0].rpr) : undefined;
+  // The rule the paragraph's own properties are kept under, for the run's: what the
+  // stripping left may be nothing at all — a run whose only property was the recorded
+  // revision — and an empty `<w:rPr>` is a change that states nothing.
+  const rPr = stripped && elementParts(stripped, "w:rPr").body.trim() ? stripped : undefined;
+  return addedParagraph(inherited, rPr, text);
 }
 
 // `element` with every paragraph — itself or a nested one — whose joined text
@@ -1672,21 +2458,33 @@ function addParagraph(xml, edit) {
 // that reach into the element, relative to it. A nested edit rewrites bytes, so
 // the field regions and the element's own runs are located only after it —
 // exactly as `editParagraph` does.
-function removeParagraph(element, excluded, find, found) {
+function removeParagraph(element, excluded, find, found, note) {
   const children = childParagraphSpans(element);
   let out = element;
   let regions = excluded;
   for (let i = children.length - 1; i >= 0; i -= 1) {
     const [start, end] = children[i];
     const before = out.slice(start, end);
-    const removed = removeParagraph(before, clipSpans(regions, start, end), find, found);
+    const removed = removeParagraph(before, clipSpans(regions, start, end), find, found, note);
     if (removed === null) out = out.slice(0, start) + out.slice(end);
     else if (removed !== before) out = out.slice(0, start) + removed + out.slice(end);
     const delta = (removed === null ? 0 : removed.length) - before.length;
     if (delta) regions = regions.map(([from, to]) => (from >= end ? [from + delta, to + delta] : [from, to]));
   }
   if (!addressedText(out, regions).includes(find)) return out;
+  // A paragraph that ends a section or holds a page break carries a break the
+  // removal would take with it, and no note would bring the break back: the call
+  // is refused with the way that removes the text and keeps the break. Checked
+  // here, where the paragraph is really dropped, so a nested paragraph is checked
+  // too, and named with the fragment the call used.
+  const own = paragraphProperties(out);
+  if (own && firstElement(own, "w:sectPr")) throw new UsageError(`the paragraph holding ${JSON.stringify(find)} ends a section, and removing it would delete the section break — remove its text instead, with remove_text`);
+  if (elementWithAttribute("w:br", "w:type", "page").test(out)) throw new UsageError(`the paragraph holding ${JSON.stringify(find)} holds a page break, and removing it would delete the page break — remove its text instead, with remove_text`);
   found.value = true;
+  // The whole element goes, so everything drawn inside it goes too — and the note
+  // is raised here, where the paragraph really removed is known: a nested paragraph
+  // removed on its own reports its own fragment, not the one that draws its box.
+  noteUnnamed(element, [{ start: 0, end: element.length }], note);
   return null;
 }
 
@@ -1694,7 +2492,7 @@ function removeParagraph(element, excluded, find, found) {
 // last to the first so an earlier one's byte positions stay valid. The result is
 // assembled as the pieces of the part around the removed paragraphs and joined
 // once, the way `mapParagraphs` does.
-function removeParagraphs(xml, find, found) {
+function removeParagraphs(xml, find, found, note) {
   // A container a paragraph is removed from must keep a paragraph — ECMA-376
   // requires one in a `<w:tc>` and in a `<w:txbxContent>` — and the removal is
   // refused rather than written out as a part no reader may hold. The check runs
@@ -1707,7 +2505,7 @@ function removeParagraphs(xml, find, found) {
   for (let i = tops.length - 1; i >= 0; i -= 1) {
     const top = tops[i];
     const element = xml.slice(top.start, top.end);
-    const removed = removeParagraph(element, clipSpans(regions, top.start, top.end), find, found);
+    const removed = removeParagraph(element, clipSpans(regions, top.start, top.end), find, found, note);
     pieces.push(xml.slice(top.end, end));
     if (removed !== null) pieces.push(removed);
     end = top.start;
@@ -1716,23 +2514,114 @@ function removeParagraphs(xml, find, found) {
   return pieces.reverse().join("");
 }
 
+// ── the markup an edit reached without naming it ───────────────
+// A body edit addresses text, and a paragraph's markup travels with the text it
+// holds: a section break, a bookmark, a hyperlink, a comment anchor or a recorded
+// revision can sit inside the fragment the edit matched and be rewritten with it.
+// A caller named a fragment and the formatting for it, never that markup, so the
+// reply owes it a note saying what else went along.
+//
+// The kinds, in the order the note lists them, each with the phrase the note calls
+// it and the patterns the fragment is read for — through the file's own tag
+// spellings (`tagPattern`), so a `<w:br >` and a `<w:br/>` are read here as they are
+// everywhere else. A page break is a `<w:br>` carrying `w:type="page"` — a bare
+// `<w:br/>` is a line break, and `<w:lastRenderedPageBreak/>` is an artifact a reader
+// writes rather than a break the document holds — and an unaccepted tracked change
+// is the four elements the revision arms use plus any element whose local name ends
+// in `Change`, the family a formatting or paragraph-property revision is recorded in
+// — a name the tag spellings already close, so a local name merely containing
+// `Change` is not read as one, whatever prefix it carries. Built per call rather than
+// kept beside the other docx patterns: `elementWithAttribute` belongs to the reader
+// half of this file below, and a pattern built per call carries no global `lastIndex`
+// from one fragment to the next — the rule `elementPattern` states for itself.
+const unnamedKinds = () => [
+  { phrase: "a section break", patterns: [tagPattern("w:sectPr")] },
+  { phrase: "a page break", patterns: [elementWithAttribute("w:br", "w:type", "page")] },
+  { phrase: "a bookmark", patterns: [tagPattern("w:bookmarkStart"), tagPattern("w:bookmarkEnd")] },
+  { phrase: "a hyperlink", patterns: [tagPattern("w:hyperlink")] },
+  { phrase: "a footnote reference", patterns: [tagPattern("w:footnoteReference")] },
+  { phrase: "an endnote reference", patterns: [tagPattern("w:endnoteReference")] },
+  { phrase: "a comment", patterns: [tagPattern("w:commentReference"), tagPattern("w:commentRangeStart"), tagPattern("w:commentRangeEnd")] },
+  { phrase: "an unaccepted tracked change", patterns: [tagPattern("w:ins"), tagPattern("w:del"), tagPattern("w:moveFrom"), tagPattern("w:moveTo"), tagPattern("(?:\\w+:)?\\w*Change")] },
+];
+
+// The revision markers a docx element may carry: a recorded change of the properties
+// (`w:rPrChange`/`w:pPrChange`), a recorded change of the numbering a `<w:numPr>`
+// states (`w:numberingChange`, the child `CT_NumPr` puts after the id it changed), and
+// a tracked insertion, deletion or move. A formatting request keeps them
+// byte-identically wherever it leaves them (see `preservedMarkers`), and content added
+// to the document must not inherit them from the paragraph it is inserted after (see
+// `withoutTrackedMarkers`) — one list for both readings, so a marker added or renamed
+// cannot leave one of them behind. The one marker a request may really delete is the
+// one inside a `<w:numPr>` a list kind replaces, which it reports (see
+// `formattedParagraph`).
+const TRACKED_MARKERS = ["w:rPrChange", "w:pPrChange", "w:numberingChange", "w:ins", "w:del", "w:moveFrom", "w:moveTo"];
+
+// Every preserved marker of `fragment`, in the fragment's own order, as its balanced
+// span. An element opened and never closed yields none — the reading `tagSpans` gives
+// everywhere, and a marker the writer cannot read is not one this reports as kept.
+const preservedMarkers = (fragment) => TRACKED_MARKERS
+  .flatMap((name) => tagSpans(fragment, tagPattern(name)))
+  .sort((a, b) => a.start - b.start);
+
+// The parts of `[start, end)` a formatting request rewrote: the region with every
+// preserved marker lying WHOLLY inside it taken out. A marker WRAPPING the region —
+// an `<w:ins>` around the run the request formatted — is not inside it and stays, so
+// the run it wraps is still markup the call reached; a marker nested in one already
+// passed over is passed over too, so the parts never overlap. `markers` is sorted by
+// the caller (`preservedMarkers` sorts).
+const writtenParts = (start, end, markers) => {
+  const parts = [];
+  let at = start;
+  for (const marker of markers) {
+    if (marker.start >= end) break;
+    if (marker.start < at || marker.end > end) continue;
+    parts.push({ start: at, end: marker.start });
+    at = marker.end;
+  }
+  parts.push({ start: at, end });
+  return parts.filter((part) => part.start < part.end);
+};
+
+// The phrases as one English list ("a bookmark, a comment and a page break").
+// `listed` joins with "or", which is a set of alternatives to pick from; these are
+// several things an edit did at once.
+const conjoined = (phrases) => (phrases.length < 2 ? String(phrases[0] ?? "") : `${phrases.slice(0, -1).join(", ")} and ${phrases.at(-1)}`);
+
+// The one note an edit owes about the markup it reached beyond what the caller
+// named. `fragment` is the paragraph XML the edit worked on and `spans` are the
+// parts of it the edit rewrote, so a kind that merely sits elsewhere in the
+// paragraph is not reported — the edit did not reach it — while every kind
+// overlapping one of the spans is.
+function noteUnnamed(fragment, spans, note) {
+  if (!spans.length) return;
+  const overlaps = (element) => spans.some((span) => element.start < span.end && span.start < element.end);
+  const reached = unnamedKinds()
+    .filter((kind) => kind.patterns.some((pattern) => tagSpans(fragment, pattern).some(overlaps)))
+    .map((kind) => kind.phrase);
+  if (reached.length) note(`[the edit also reached ${conjoined(reached)}, which the call did not name]`);
+}
+
 // One docx edit applied to `xml`: the edit addresses the joined text of a
-// paragraph's runs, and every occurrence of `find` is rewritten.
-function applyDocxEdit(xml, edit, note) {
+// paragraph's runs, and every occurrence of `find` is rewritten. `editor` is what
+// an op that reads or writes another part of the package resolves it through —
+// the numbering part a list needs — and withholds its notes.
+function applyDocxEdit(xml, edit, editor) {
   const op = edit && edit.op;
-  if (op === "add_paragraph") return addParagraph(xml, edit);
+  if (op === "add_paragraph") return addParagraph(xml, edit, editor.note);
   const find = editText(edit && edit.find, "find");
   if (!find) throw new UsageError("find must not be empty");
   if (op === "remove_paragraph") {
     const found = { value: false };
-    const out = removeParagraphs(xml, find, found);
+    const out = removeParagraphs(xml, find, found, editor.note);
     if (!found.value) throw new UsageError(missingFind(find));
     return out;
   }
+  if (op === "format_paragraph") return formatParagraph(xml, edit, find, editor);
   if (!["replace_text", "insert_text", "remove_text", "format_text"].includes(op)) throw new UsageError(`unknown docx edit: ${JSON.stringify(op)}`);
-  const format = { bold: edit.bold, italic: edit.italic };
+  const format = { bold: edit.bold, italic: edit.italic, underline: edit.underline, strike: edit.strike };
   if (op === "format_text") {
-    if (edit.bold == null && edit.italic == null && edit.size == null) throw new UsageError("format_text needs at least one of bold, italic or size");
+    if (edit.bold == null && edit.italic == null && edit.underline == null && edit.strike == null && edit.size == null && edit.color == null) throw new UsageError("format_text needs at least one of bold, italic, underline, strike, size or color");
     if (edit.size != null) {
       if (!inSpan(edit.size, RULES.text_size_points)) throw new UsageError(`size must be ${spanBounds(RULES.text_size_points)} points, got: ${JSON.stringify(edit.size)}`);
       // `<w:sz>` counts half-points, and the shared bound's ends are the one and
@@ -1740,6 +2629,7 @@ function applyDocxEdit(xml, edit, note) {
       // allows never reaches the zero a reader cannot draw.
       format.size = String(Math.round(edit.size * 2));
     }
+    if (edit.color != null) format.color = hexDigits(edit.color).toUpperCase();
   }
   let replacement = "";
   if (op === "replace_text") replacement = editText(edit.replace, "replace");
@@ -1751,43 +2641,89 @@ function applyDocxEdit(xml, edit, note) {
     replacement = position === "before" ? insert + find : find + insert;
   }
   let inserted = false;
+  let matched = 0;
+  let spilled = false;
   const out = mapParagraphs(xml, (element, excluded) => {
     const { runs, slots } = docxRuns(element, excluded);
     const text = slots.map((slot) => xmlUnescape(slot.raw)).join("");
     const offsets = occurrences(text, find);
     if (!offsets.length) return null;
     inserted = true;
+    matched += offsets.length;
     if (op === "format_text") {
+      // Each run's own extent in the joined text, from the slots it holds: a run's
+      // slots are consecutive there, so the first one opens it and the last closes
+      // it.
+      const extents = new Map();
+      let walked = 0;
+      for (const slot of slots) {
+        const length = [...xmlUnescape(slot.raw)].length;
+        const extent = extents.get(slot.run);
+        if (extent) extent.end = walked + length;
+        else extents.set(slot.run, { start: walked, end: walked + length });
+        walked += length;
+      }
       // The runs the matched fragments cover, found once and formatted together:
-      // a later edit could not move an earlier one's run.
+      // a later edit could not move an earlier one's run. A fragment whose first
+      // run opens before it, or whose last run closes after it, covers only part of
+      // a run — and a run is the smallest unit a run property is stated on, so the
+      // rest of it took the formatting too.
       const runIndices = new Set();
       for (const span of offsets) {
         const first = locateSlot(slots, span.start);
         const last = locateSlot(slots, span.end, true);
         for (let i = first.index; i <= last.index; i += 1) runIndices.add(slots[i].run);
+        if (extents.get(slots[first.index].run).start < span.start || extents.get(slots[last.index].run).end > span.end) spilled = true;
       }
-      return formatRuns(element, runs, runIndices, format);
+      const formatted = formatRuns(element, runs, runIndices, format);
+      noteUnnamed(element, formatted.spans, editor.note);
+      return formatted.xml;
     }
     // Every occurrence is written in one pass over the same runs and slots, so
     // no occurrence's offsets can go stale against another's.
-    return replaceOccurrences(element, runs, slots, offsets, replacement, note, "w:");
+    const written = replaceOccurrences(element, runs, slots, offsets, replacement, editor.note, "w:");
+    noteUnnamed(element, written.spans, editor.note);
+    return written.xml;
   });
   if (!inserted) throw new UsageError(missingFind(find));
+  if (op === "format_text" && matched > 1) editor.note(`[the fragment matched ${matched} times — every one was formatted]`);
+  if (spilled) editor.note("[the fragment covers only part of a run, and a run is the smallest unit formatting is stated on — the rest of that run's text took the formatting too]");
   return out;
+}
+
+// Whether the document's settings part turns recorded revisions on. The part is
+// resolved through `word/document.xml`'s own relationships rather than assumed to
+// sit at the conventional `DOCX_SETTINGS` (see `documentPart`) — a package that
+// saved its settings elsewhere has a reader consult the part the relationship
+// names, and the conventional name is the fallback for a package naming none. Read
+// through `read`, so the walk is charged like every other one, and by the caller
+// only once something changed. `<w:trackRevisions>` with no `w:val`, or one outside
+// the off spellings, is the mode a reader draws on — the element the schema states
+// and the one Word, LibreOffice and the docx library this kit writes with all
+// write; a package with no settings part at all records no revision, which is the
+// same answer a part stating `<w:trackRevisions w:val="false"/>` gives.
+function trackedChangesOn(editor) {
+  const settings = editor.read(documentPart(editor, "/settings", DOCX_SETTINGS));
+  return settings !== undefined && statesOn(settings, "w:trackRevisions", OFF_VALUES);
 }
 
 function docxEdit(req) {
   const editor = openEdit(req, "docx");
   const edits = editList(req);
-  editor.part("word/document.xml", (xml) => {
+  editor.part(DOCX_DOCUMENT, (xml) => {
+    const before = xml;
     for (const edit of edits) {
       // Each edit walks the whole body text, and what it walks is a part it does
       // not open through `part` — so it charges its own walk, and the budget
       // covers a long edit list over a large body rather than one document
       // length.
       editor.charge(xml.length);
-      xml = applyDocxEdit(xml, edit, (message) => editor.note(message));
+      xml = applyDocxEdit(xml, edit, editor);
     }
+    // `part` writes the part only when its text differs, which is the same test the
+    // note is owed under: a call whose edits all rewrote their own bytes back is a
+    // call that changed nothing to record a revision of.
+    if (xml !== before && trackedChangesOn(editor)) editor.note("[the document has tracked changes turned on, and what this call changed is written as plain content, not as a recorded revision]");
     return xml;
   });
   return editor.finish();
@@ -4437,7 +5373,7 @@ function editPartText(editor, part, edit, replacing, missing) {
       const offsets = occurrences(slots.map((slot) => xmlUnescape(slot.raw)).join(""), find);
       if (!offsets.length) return undefined;
       found = true;
-      return replaceOccurrences(paragraph, runs, slots, offsets, replacement, editor.note, "a:");
+      return replaceOccurrences(paragraph, runs, slots, offsets, replacement, editor.note, "a:").xml;
     });
     if (!found) throw new UsageError(missing(find));
     return out;
@@ -5586,6 +6522,7 @@ const operations = {
     // skips it.
     await step("edit_docx", async () => {
       writeOut(`${scratch}/probe_edit.docx`, await createDocx({ content: [
+        { type: "heading", level: 1, text: "Заголовок" },
         { type: "paragraph", text: "Проверка текста" }, { type: "paragraph", text: "Лишний абзац" },
       ] }));
       const edited = docxEdit({ input: `${scratch}/probe_edit.docx`, edits: [
@@ -5593,7 +6530,13 @@ const operations = {
         { op: "insert_text", find: "Проверка", insert: " новая", position: "after" },
         { op: "remove_text", find: " новая" },
         { op: "format_text", find: "Проверка", bold: true, italic: true, size: 14 },
+        { op: "format_text", find: "правки", color: "FF0000", underline: true, strike: true },
+        { op: "format_text", find: "правки", underline: false, strike: false },
+        { op: "format_paragraph", find: "Проверка", align: "center", style: "Heading 1",
+          indent_left: 12, indent_right: 6, indent_first_line: 10,
+          spacing_before: 6, spacing_after: 6, line_spacing: 14, list: "bullet", level: 1 },
         { op: "add_paragraph", after: "Проверка", text: "Добавлено" },
+        { op: "add_paragraph", after: "Заголовок", text: "После заголовка" },
         { op: "remove_paragraph", find: "Лишний" },
       ] });
       writeOut(`${scratch}/probe_edited.docx`, edited.buffer);

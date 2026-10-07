@@ -105,11 +105,12 @@ const ACTIONS: [&str; 11] = [
 /// The ops each family's edit action accepts, in the order the refusal names
 /// them. The kit owns the same vocabularies; these lists are what the boundary
 /// check answers an unknown `op` with, before a runtime is spawned.
-const DOCX_EDIT_OPS: [&str; 6] = [
+const DOCX_EDIT_OPS: [&str; 7] = [
     "replace_text",
     "insert_text",
     "remove_text",
     "format_text",
+    "format_paragraph",
     "add_paragraph",
     "remove_paragraph",
 ];
@@ -207,6 +208,34 @@ struct Rules {
     /// number and both sides refuse past this bound rather than write a
     /// `<w:sz>` a reader cannot hold.
     text_size_points: Span,
+    /// A docx `format_paragraph` alignment: the word a caller names and the
+    /// `<w:jc>` value ECMA-376 writes for it, the kit's writer reading the same
+    /// pairs so the word and the value written for it cannot drift.
+    paragraph_alignments: Vec<(String, String)>,
+    /// The kinds a docx `format_paragraph` `list` may name, each paired with the
+    /// list kind the paragraph's own `<w:numPr>` carries, the kit reading the
+    /// same pairs the way it reads the alignments'.
+    paragraph_lists: Vec<(String, String)>,
+    /// A docx `format_paragraph` indent in points — the unit the tool states and
+    /// the kit writes to Word's twips — for `indent_left`, `indent_right` and
+    /// `indent_first_line`. The range reaches below zero because the kit writes a
+    /// first-line indent as `<w:firstLine>` when it is positive and as
+    /// `<w:hanging>` when it is negative.
+    paragraph_indent_points: Span,
+    /// A docx `format_paragraph` spacing in points (`spacing_before`,
+    /// `spacing_after`), the unit Word's `<w:spacing w:before>`/`w:after` holds.
+    paragraph_spacing_points: Span,
+    /// A docx `format_paragraph` line height in points (`line_spacing`), the unit
+    /// Word's `<w:spacing w:line>` holds. The kit writes the value in whole
+    /// twips — a twentieth of a point — by rounding, so a floor below about
+    /// 0.025 would round to the zero twips a reader draws as no line at all; the
+    /// bound is stated at a round 0.05 above that boundary rather than resting on
+    /// it.
+    paragraph_line_points: Span,
+    /// The longest docx `format_paragraph` `style` name. The kit resolves the
+    /// name against the document's own styles and refuses an unknown one, so
+    /// this is only a length no style name reaches, not a check that one exists.
+    paragraph_style_max: usize,
     /// A pptx `format_text` size in points. DrawingML's `<a:rPr sz>` counts
     /// hundredths of a point, so the ruler is its own — unlike
     /// [`Rules::text_size_points`], which is Word's half-point cap.
@@ -253,6 +282,8 @@ struct Rules {
     paragraph_level_max: u32,
     sheet_row_max: u32,
     sheet_column_max: u32,
+    /// The longest xlsx `set_cell`/`format_cells` `number_format`: text inside
+    /// the shared cap, an empty format not being one.
     number_format_max: usize,
 }
 
@@ -306,13 +337,18 @@ impl Tool for DocumentTool {
         let slide_size_fraction = RULES.slide_size_fraction.bounds();
         let pdf_size_points = RULES.pdf_size_points.bounds();
         let text_size_points = RULES.text_size_points.bounds();
+        let paragraph_indent_points = RULES.paragraph_indent_points.bounds();
+        let paragraph_spacing_points = RULES.paragraph_spacing_points.bounds();
+        let paragraph_line_points = RULES.paragraph_line_points.bounds();
         let slide_text_size_points = RULES.slide_text_size_points.bounds();
         let cell_font_points = RULES.cell_font_points.bounds();
         let column_width_chars = RULES.column_width_chars.bounds();
         let row_height_points = RULES.row_height_points.bounds();
         // The alignments, colours and sets the prompt spells in a JSON edit:
         // quoted and pipe-separated, in the order the rules state them.
-        let slide_alignments = quoted_words(&align_words());
+        let slide_alignments = quoted_words(&pair_words(&RULES.slide_alignments));
+        let paragraph_alignments = quoted_words(&pair_words(&RULES.paragraph_alignments));
+        let paragraph_lists = quoted_words(&pair_words(&RULES.paragraph_lists));
         let cell_alignments = quoted_words(&RULES.cell_alignments);
         let cell_verticals = quoted_words(&RULES.cell_verticals);
         let cell_border_sides = quoted_words(&RULES.cell_border_sides);
@@ -327,6 +363,7 @@ impl Tool for DocumentTool {
         let edits_max = RULES.edits_max.to_string();
         let bullets_max = RULES.bullets_max.to_string();
         let paragraph_level_max = RULES.paragraph_level_max.to_string();
+        let paragraph_style_max = RULES.paragraph_style_max.to_string();
         let sheet_row_max = RULES.sheet_row_max.to_string();
         let sheet_column_max = RULES.sheet_column_max.to_string();
         let number_format_max = RULES.number_format_max.to_string();
@@ -345,6 +382,12 @@ impl Tool for DocumentTool {
                 ("{{slide_size_fraction}}", &slide_size_fraction),
                 ("{{pdf_size_points}}", &pdf_size_points),
                 ("{{text_size_points}}", &text_size_points),
+                ("{{paragraph_alignments}}", &paragraph_alignments),
+                ("{{paragraph_lists}}", &paragraph_lists),
+                ("{{paragraph_indent_points}}", &paragraph_indent_points),
+                ("{{paragraph_spacing_points}}", &paragraph_spacing_points),
+                ("{{paragraph_line_points}}", &paragraph_line_points),
+                ("{{paragraph_style_max}}", &paragraph_style_max),
                 ("{{slide_text_size_points}}", &slide_text_size_points),
                 ("{{cell_font_points}}", &cell_font_points),
                 ("{{column_width_chars}}", &column_width_chars),
@@ -1351,9 +1394,34 @@ fn validate_docx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &st
             edit_string_non_empty(object, "find", at)?;
         }
         "format_text" => {
-            keys(&["find", "bold", "italic", "size"])?;
+            keys(&[
+                "find",
+                "bold",
+                "italic",
+                "underline",
+                "strike",
+                "size",
+                "color",
+            ])?;
             edit_string_non_empty(object, "find", at)?;
             require_format(object, at)?;
+        }
+        "format_paragraph" => {
+            keys(&[
+                "find",
+                "align",
+                "style",
+                "indent_left",
+                "indent_right",
+                "indent_first_line",
+                "spacing_before",
+                "spacing_after",
+                "line_spacing",
+                "list",
+                "level",
+            ])?;
+            edit_string_non_empty(object, "find", at)?;
+            require_paragraph_format(object, at)?;
         }
         "add_paragraph" => {
             keys(&["text", "after"])?;
@@ -1431,9 +1499,10 @@ fn require_stated_number(
 
 /// Require a `format_text` to name at least one property, and each property to
 /// be the shape the kit writes: a boolean toggle, or a point size inside the
-/// shared bound (`<w:sz>` counts half-points and tops out at 1638 of them).
+/// shared bound (`<w:sz>` counts half-points and tops out at 1638 of them), or a
+/// colour.
 fn require_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
-    let mut any = require_toggles(object, &["bold", "italic"], at)?;
+    let mut any = require_toggles(object, &["bold", "italic", "underline", "strike"], at)?;
     any |= require_stated_number(
         object,
         "size",
@@ -1441,10 +1510,121 @@ fn require_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<(
         "give a size in points",
         at,
     )?;
+    any |= require_color(object, at)?;
     if !any {
         anyhow::bail!(
-            "usage: {at} (format_text) needs at least one of bold, italic or size — hint: a \
-             boolean toggles bold or italic, size is in points"
+            "usage: {at} (format_text) needs at least one of bold, italic, underline, strike, \
+             size or color — hint: a boolean toggles bold, italic, underline or strike, size is \
+             in points and color is {} hex digits",
+            RULES.color_digits
+        );
+    }
+    Ok(())
+}
+
+/// Require a `format_paragraph` to name at least one property, and each to be the
+/// shape the kit writes: an alignment word, a style name, an indent, a spacing or
+/// a line height inside the shared point bounds, or a list — a kind with an
+/// optional level that belongs to it, or `false` taking the list away.
+fn require_paragraph_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let indent = "give an indent in points";
+    let spacing = "give spacing in points";
+    let mut any = require_alignment(
+        object,
+        "align",
+        &pair_words(&RULES.paragraph_alignments),
+        at,
+    )?;
+    // Nothing here can check that the named style exists: the kit resolves the name
+    // against the document's own styles and refuses an unknown one.
+    any |= require_name(object, "style", RULES.paragraph_style_max, at)?;
+    for (key, span, what) in [
+        ("indent_left", &RULES.paragraph_indent_points, indent),
+        ("indent_right", &RULES.paragraph_indent_points, indent),
+        ("indent_first_line", &RULES.paragraph_indent_points, indent),
+        ("spacing_before", &RULES.paragraph_spacing_points, spacing),
+        ("spacing_after", &RULES.paragraph_spacing_points, spacing),
+        (
+            "line_spacing",
+            &RULES.paragraph_line_points,
+            "give a line height in points",
+        ),
+    ] {
+        any |= require_stated_number(object, key, span, what, at)?;
+    }
+    any |= require_list(object, at)?;
+    require_list_level(object, at)?;
+    if !any {
+        anyhow::bail!(
+            "usage: {at} (format_paragraph) needs at least one of align, style, indent_left, \
+             indent_right, indent_first_line, spacing_before, spacing_after, line_spacing or \
+             list — hint: name the property the paragraph is to take"
+        );
+    }
+    Ok(())
+}
+
+/// Require an optional name-shaped field — a style name, a font name, a
+/// number format — to be a non-empty string of at most `max` characters, the
+/// shared `edit_text_max` applied first as for any other string field. Reports
+/// whether it was stated.
+fn require_name(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    max: usize,
+    at: &str,
+) -> Result<bool> {
+    match edit_string(object, key, at)? {
+        None => Ok(false),
+        Some("") => anyhow::bail!("usage: {at}.{key} must not be empty"),
+        Some(name) if name.chars().count() <= max => Ok(true),
+        Some(name) => anyhow::bail!(
+            "usage: {at}.{key} must be at most {max} characters, got {}",
+            name.chars().count()
+        ),
+    }
+}
+
+/// Require an optional `format_paragraph` `list`: a word the shared rules state,
+/// or `false` to take the paragraph's list away. A word the writer has not, or a
+/// value of another type, is refused rather than written as a list the kit cannot
+/// place. Reports whether the field was stated, the `false` included.
+fn require_list(object: &serde_json::Map<String, Value>, at: &str) -> Result<bool> {
+    let kinds = pair_words(&RULES.paragraph_lists);
+    match object.get("list") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(false)) => Ok(true),
+        Some(Value::String(kind)) if kinds.contains(&kind.as_str()) => Ok(true),
+        Some(Value::String(kind)) => anyhow::bail!(
+            "usage: {at}.list must be {}, or false to take the paragraph's list away, got \
+             \"{kind}\"",
+            listed(&kinds)
+        ),
+        Some(value) => Err(super::wrong_type(
+            &format!("{at}.list"),
+            "a list kind or false",
+            value,
+        )),
+    }
+}
+
+/// Require an optional `format_paragraph` `level` to be a whole number inside the
+/// shared cap and to have a list to belong to: a level beside no `list`, or
+/// beside `list: false`, names a depth there is no list at.
+fn require_list_level(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let Some(level) = edit_integer(object, "level", at)? else {
+        return Ok(());
+    };
+    if !matches!(object.get("list"), Some(Value::String(_))) {
+        anyhow::bail!(
+            "usage: {at}.level needs a list to belong to — hint: name \"list\" as {} beside it",
+            listed(&pair_words(&RULES.paragraph_lists))
+        );
+    }
+    if level > u64::from(RULES.paragraph_level_max) {
+        anyhow::bail!(
+            "usage: {at}.level must be a whole number from 0 to {}, got {level}",
+            RULES.paragraph_level_max
         );
     }
     Ok(())
@@ -1573,22 +1753,6 @@ fn require_format_cells_range(object: &serde_json::Map<String, Value>, at: &str)
         );
     }
     Ok(())
-}
-
-/// Require an optional xlsx `format_cells` `font` name: text inside Excel's own
-/// name length, which `<name val>` carries verbatim. Reports whether it was
-/// stated.
-fn require_font_name(object: &serde_json::Map<String, Value>, at: &str) -> Result<bool> {
-    match edit_string(object, "font", at)? {
-        None => Ok(false),
-        Some("") => anyhow::bail!("usage: {at}.font must not be empty"),
-        Some(name) if name.chars().count() <= RULES.font_name_max => Ok(true),
-        Some(name) => anyhow::bail!(
-            "usage: {at}.font must be at most {} characters, got {}",
-            RULES.font_name_max,
-            name.chars().count()
-        ),
-    }
 }
 
 /// Require an optional `color` — a `format_text`'s or a xlsx `format_cells`'s
@@ -1741,7 +1905,7 @@ fn validate_xlsx_edit(
         "set_cell" => {
             keys(&["sheet", "cell", "value", "number_format"])?;
             require_cell(object, at)?;
-            require_number_format(object, at)?;
+            require_name(object, "number_format", RULES.number_format_max, at)?;
             let mut normalized = edit.clone();
             normalized["value"] = require_cell_value(object, at)?;
             return Ok(normalized);
@@ -1757,7 +1921,8 @@ fn validate_xlsx_edit(
                 FormatCellsTarget::Range => {
                     require_format_cells_range(object, at)?;
                     let mut named = require_toggles(object, &["bold", "italic", "wrap"], at)?;
-                    named |= require_font_name(object, at)?;
+                    // Excel's own name length; `<name val>` carries the name verbatim.
+                    named |= require_name(object, "font", RULES.font_name_max, at)?;
                     named |= require_stated_number(
                         object,
                         "size",
@@ -1771,7 +1936,7 @@ fn validate_xlsx_edit(
                     named |= require_alignment(object, "align", &RULES.cell_alignments, at)?;
                     named |= require_alignment(object, "vertical", &RULES.cell_verticals, at)?;
                     if stated(object, "number_format") {
-                        require_number_format(object, at)?;
+                        require_name(object, "number_format", RULES.number_format_max, at)?;
                         named = true;
                     }
                     named
@@ -1927,21 +2092,6 @@ fn require_column(object: &serde_json::Map<String, Value>, at: &str) -> Result<(
     }
 }
 
-/// Require an optional `set_cell` `number_format` to be text inside the shared
-/// cap; an empty format is not one.
-fn require_number_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
-    match edit_string(object, "number_format", at)? {
-        None => Ok(()),
-        Some("") => anyhow::bail!("usage: {at}.number_format must not be empty"),
-        Some(format) if format.chars().count() <= RULES.number_format_max => Ok(()),
-        Some(format) => anyhow::bail!(
-            "usage: {at}.number_format must be at most {} characters, got {}",
-            RULES.number_format_max,
-            format.chars().count()
-        ),
-    }
-}
-
 /// The pptx edit vocabulary: a slide is its 1-based number as the reader shows
 /// it, and a text op names a fragment that must be on that slide.
 fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &str) -> Result<()> {
@@ -2081,15 +2231,11 @@ fn require_bullets(object: &serde_json::Map<String, Value>, at: &str) -> Result<
     Ok(())
 }
 
-/// The `align` words the shared rules state, in their own order: the one list the
-/// refusal and the model-facing hint read, so a word added to the rules cannot
-/// leave either of them stale.
-fn align_words() -> Vec<&'static str> {
-    RULES
-        .slide_alignments
-        .iter()
-        .map(|(word, _)| word.as_str())
-        .collect()
+/// The words of a shared `(word, value)` pair list, in the order the rules state
+/// them: the one list a refusal and the model-facing hint both read, so a word
+/// added to the rules cannot leave either of them stale.
+fn pair_words(list: &[(String, String)]) -> Vec<&str> {
+    list.iter().map(|(word, _)| word.as_str()).collect()
 }
 
 /// A rule's values as the prompt spells one in a JSON edit: quoted and
@@ -2115,13 +2261,13 @@ fn require_pptx_format(object: &serde_json::Map<String, Value>, at: &str) -> Res
         at,
     )?;
     any |= require_color(object, at)?;
-    any |= require_alignment(object, "align", &align_words(), at)?;
+    any |= require_alignment(object, "align", &pair_words(&RULES.slide_alignments), at)?;
     if !any {
         anyhow::bail!(
             "usage: {at} (format_text) needs at least one of bold, italic, underline, size, color \
              or align — hint: a boolean toggles bold, italic or underline, size is in points, \
              color is hex digits and align is {}",
-            listed(&align_words())
+            listed(&pair_words(&RULES.slide_alignments))
         );
     }
     Ok(())
@@ -5603,6 +5749,8 @@ mod tests {
         let too_many: Vec<Value> = (0..=RULES.edits_max)
             .map(|_| json!({ "op": "replace_text", "find": "x", "replace": "y" }))
             .collect();
+        let long_style = "a".repeat(RULES.paragraph_style_max + 1);
+        let style_cap = format!("must be at most {} characters", RULES.paragraph_style_max);
         let calls = [
             (
                 json!({ "action": "docx_edit", "path": "doc.docx",
@@ -5654,6 +5802,90 @@ mod tests {
                 json!({ "action": "docx_edit", "path": "doc.docx",
                         "edits": [{ "op": "format_text", "find": "x", "size": f64::INFINITY }] }),
                 "at least one of bold",
+            ),
+            // A `format_text` naming an attribute the op does not take beside one
+            // it does: the kit reads only the fields it knows, so the extra one
+            // would be dropped in silence.
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_text", "find": "x", "bold": true,
+                                    "level": 1 }] }),
+                "level is not a field of docx",
+            ),
+            // A known attribute whose value the writer has not: a colour that is
+            // not hex digits, and a paragraph alignment the closed set does not
+            // hold.
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_text", "find": "x", "color": "red" }] }),
+                "got \"red\"",
+            ),
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_paragraph", "find": "x",
+                                    "align": "middle" }] }),
+                "got \"middle\"",
+            ),
+            // A `format_paragraph` naming no property: it would otherwise rewrite
+            // the paragraph and change nothing.
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_paragraph", "find": "x" }] }),
+                "at least one of align",
+            ),
+            // A `level` with no list to belong to: alone, and beside `list: false`.
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_paragraph", "find": "x", "level": 2 }] }),
+                "needs a list to belong to",
+            ),
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_paragraph", "find": "x", "list": false,
+                                    "level": 2 }] }),
+                "needs a list to belong to",
+            ),
+            // A list kind outside the closed set, and a style name past the cap.
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_paragraph", "find": "x",
+                                    "list": "dash" }] }),
+                "got \"dash\"",
+            ),
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_paragraph", "find": "x",
+                                    "style": long_style }] }),
+                style_cap.as_str(),
+            ),
+            // An indent and a line height outside the shared bounds, the line
+            // height's zero included: a line that takes no room is not a height.
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_paragraph", "find": "x",
+                                    "indent_left": 3000 }] }),
+                "indent_left must be",
+            ),
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_paragraph", "find": "x",
+                                    "line_spacing": 0 }] }),
+                "line_spacing must be",
+            ),
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "format_paragraph", "find": "x",
+                                    "line_spacing": 3000 }] }),
+                "line_spacing must be",
+            ),
+            // A well-formed `format_paragraph` passes the boundary's own check:
+            // the refusal it meets is the family one a path that is not a `.docx`
+            // is owed, after the shape was accepted.
+            (
+                json!({ "action": "docx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_paragraph", "find": "x", "align": "center",
+                                    "list": "bullet", "level": 2 }] }),
+                "edits only a .docx/.docm file",
             ),
             // A `set_cell` needs a `value`: a value-less one is refused with a
             // pointer to the `format_cells` op, which formats without writing one.
@@ -6139,9 +6371,10 @@ mod tests {
     /// the cell and write a part Word calls damaged.
     const NESTED_TABLE_CELL_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>CELL-GO</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>INNER</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>CELL-KEEP</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>outside</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
 
-    /// A created document with one body part swapped for `body`.
-    async fn docx_body_fixture(ws: &Workspace, name: &str, body: &str) -> PathBuf {
-        let created = single(
+    /// A freshly created one-paragraph docx package: the starting point every
+    /// fixture builder below swaps parts of.
+    async fn created_docx(ws: &Workspace, name: &str) -> PathBuf {
+        single(
             &run(
                 ws,
                 json!({
@@ -6150,12 +6383,178 @@ mod tests {
                 }),
             )
             .await,
-        );
-        let package = with_parts(
-            &std::fs::read(&created).expect("read base package"),
-            &[("word/document.xml", body.as_bytes())],
+        )
+    }
+
+    /// `created` with its own body part swapped for `body` and every `(part,
+    /// bytes)` written beside it — a name the package already holds replaced, one
+    /// it does not added — with each part named in `dropped` left out. Written back
+    /// as `{name}.docx`.
+    fn assembled_docx_fixture(
+        ws: &Workspace,
+        name: &str,
+        created: &Path,
+        body: &str,
+        parts: &[(&str, &[u8])],
+        dropped: &[&str],
+    ) -> PathBuf {
+        let mut named = parts.to_vec();
+        named.push(("word/document.xml", body.as_bytes()));
+        let package = repacked(
+            &std::fs::read(created).expect("read base package"),
+            dropped,
+            &named,
         );
         write_fixture(ws, &format!("{name}.docx"), &package)
+    }
+
+    /// A created document with one body part swapped for `body`.
+    async fn docx_body_fixture(ws: &Workspace, name: &str, body: &str) -> PathBuf {
+        docx_part_fixture(ws, name, body, &[], &[]).await
+    }
+
+    /// [`docx_body_fixture`] with the package's own parts adjusted: each `(name,
+    /// text)` replaces the part the created package holds or adds one it does not,
+    /// and a part named in `dropped` is taken out. A document whose styles or list
+    /// definitions are not the ones `create` writes — or one with no styles part at
+    /// all — is what a style name, a list and its refusal have to be read against.
+    async fn docx_part_fixture(
+        ws: &Workspace,
+        name: &str,
+        body: &str,
+        parts: &[(&str, &str)],
+        dropped: &[&str],
+    ) -> PathBuf {
+        let created = created_docx(ws, name).await;
+        let named: Vec<(&str, &[u8])> = parts
+            .iter()
+            .map(|(part, text)| (*part, text.as_bytes()))
+            .collect();
+        assembled_docx_fixture(ws, name, &created, body, &named, dropped)
+    }
+
+    /// [`docx_part_fixture`] with the created package's numbering part taken out
+    /// and no longer named anywhere: `[Content_Types].xml` and
+    /// `word/_rels/document.xml.rels` are read from the created package's own
+    /// parts — the fixture must not carry a copy of a part list the writer owns —
+    /// and the ONE element that names the part is dropped from each, an element of
+    /// either part being a piece up to its own `>` since neither holds text. This is
+    /// the state a document whose numbering part a call has to CREATE is read from.
+    async fn docx_unnumbered_fixture(ws: &Workspace, name: &str, body: &str) -> PathBuf {
+        let created = created_docx(ws, name).await;
+        let unnumbered = |part: &str, marker: &str| {
+            part.split_inclusive('>')
+                .filter(|element| !element.contains(marker))
+                .collect::<String>()
+        };
+        let content_types = unnumbered(
+            &part_text(&created, "[Content_Types].xml"),
+            "/word/numbering.xml",
+        );
+        let rels = unnumbered(
+            &part_text(&created, "word/_rels/document.xml.rels"),
+            "/numbering",
+        );
+        assembled_docx_fixture(
+            ws,
+            name,
+            &created,
+            body,
+            &[
+                ("[Content_Types].xml", content_types.as_bytes()),
+                ("word/_rels/document.xml.rels", rels.as_bytes()),
+            ],
+            &["word/numbering.xml"],
+        )
+    }
+
+    /// The styles part the paragraph tests resolve a name against: the default
+    /// `Normal`, a paragraph style whose NAME is Russian and whose id is not, and a
+    /// character style — the three answers a `style` can get.
+    const FIRM_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Normal" w:default="1"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="Firm"><w:name w:val="Фирменный"/></w:style><w:style w:type="character" w:styleId="Red"><w:name w:val="Red ink"/></w:style></w:styles>"#;
+
+    /// The settings part of a document whose tracked changes are turned on, under
+    /// the element the schema — and Word, LibreOffice and the docx library this kit
+    /// writes with — really states it in.
+    const TRACKING_SETTINGS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:trackRevisions/></w:settings>"#;
+
+    /// A styles part whose own paragraph style numbers the paragraphs that take it,
+    /// and one deriving from it by `basedOn`: the numbering a paragraph stating no
+    /// `<w:numPr>` of its own still draws, which `list: false` has to cancel rather
+    /// than drop. A third style states only the cancellation `<w:numId w:val="0"/>`,
+    /// numbering nothing, so `list: false` on a paragraph taking it writes nothing
+    /// and reports nothing. A fourth records the cancellation in a `<w:pPrChange>`
+    /// while stating no properties of its own, taking its list from `basedOn`: a
+    /// recorded change is history, so the walk continues to the list it really
+    /// draws and has to cancel that.
+    const NUMBERED_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Normal" w:default="1"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="Bulleted"><w:name w:val="Bulleted"/><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Derived"><w:name w:val="Derived"/><w:basedOn w:val="Bulleted"/></w:style><w:style w:type="paragraph" w:styleId="Recorded"><w:name w:val="Recorded"/><w:basedOn w:val="Bulleted"/><w:pPr><w:pPrChange w:id="9" w:author="A" w:date="2024-01-01T00:00:00Z"><w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:pPrChange></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Cancelled"><w:name w:val="Cancelled"/><w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:style></w:styles>"#;
+
+    /// A styles part whose `<w:docDefaults>` state a numbering every paragraph
+    /// draws unless it says otherwise, and one style that already states the
+    /// cancellation: `list: false` on a plain paragraph has to cancel the default
+    /// numbering, while the style cancels it for its own paragraphs, so the walk
+    /// stops there and nothing is written for them. A second style derives from one
+    /// the document does not define: that `basedOn` is ignored (ECMA-376 17.7.2.4),
+    /// so the style is its own root and only the defaults apply to it — the same
+    /// numbering a paragraph naming no style the document has draws.
+    const DEFAULT_NUMBERED_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:pPrDefault><w:pPr><w:numPr><w:numId w:val="3"/></w:numPr></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:styleId="Normal" w:default="1"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="Vanishing"><w:name w:val="Vanishing"/><w:basedOn w:val="Vanished"/></w:style><w:style w:type="paragraph" w:styleId="Off"><w:name w:val="Off"/><w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:style></w:styles>"#;
+
+    /// A styles part whose only statement about numbering sits inside a
+    /// `<w:pPrChange>` of its `<w:docDefaults>`: the document's live defaults number
+    /// nothing, so a `list: false` on a paragraph taking them leaves it as it is
+    /// instead of writing a cancellation for a list that was never there.
+    const RECORDED_DEFAULT_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:pPrDefault><w:pPr><w:pPrChange w:id="5" w:author="A" w:date="2024-01-01T00:00:00Z"><w:pPr><w:numPr><w:numId w:val="3"/></w:numPr></w:pPr></w:pPrChange></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:styleId="Normal" w:default="1"><w:name w:val="Normal"/></w:style></w:styles>"#;
+
+    /// A styles part whose default paragraph style numbers the paragraphs that take
+    /// it: the rung of the chain a paragraph naming no style of its own — or one the
+    /// document does not define, or one deriving from it — renders with. Nothing
+    /// flags the style as the default, so it is the one a reader falls back to by its
+    /// built-in name, and its numbering is what a `list: false` has to cancel for all
+    /// three of them. A style that states nothing of its own draws no list — a
+    /// `basedOn` is what carries another style's numbering, not the fallback — so a
+    /// paragraph taking it keeps its bytes, as does one whose style states the
+    /// cancellation.
+    const NORMAL_NUMBERED_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Body"><w:name w:val="Normal"/><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="5"/></w:numPr></w:pPr></w:style><w:style w:type="paragraph" w:styleId="OnNormal"><w:name w:val="On Normal"/><w:basedOn w:val="Body"/></w:style><w:style w:type="paragraph" w:styleId="Plain"><w:name w:val="Plain"/></w:style><w:style w:type="paragraph" w:styleId="Off"><w:name w:val="Off"/><w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:style></w:styles>"#;
+
+    /// A styles part whose rungs above a style disagree: the `<w:docDefaults>` number
+    /// every paragraph no style does, while the default paragraph style states the
+    /// cancellation. A style deriving from one the document does not define ignores
+    /// that `basedOn` and is its own root (ECMA-376 17.7.2.4), so the default style's
+    /// statement never reaches it — only the defaults do — and its paragraphs still
+    /// draw the default numbering, which `list: false` has to cancel; one deriving
+    /// from the default style really does draw none.
+    const CANCELLED_DEFAULT_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:pPrDefault><w:pPr><w:numPr><w:numId w:val="3"/></w:numPr></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:styleId="Normal" w:default="1"><w:name w:val="Normal"/><w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Vanishing"><w:name w:val="Vanishing"/><w:basedOn w:val="Vanished"/></w:style><w:style w:type="paragraph" w:styleId="OnNormal"><w:name w:val="On Normal"/><w:basedOn w:val="Normal"/></w:style></w:styles>"#;
+
+    /// A styles part whose default paragraph style states no `<w:styleId>` at all:
+    /// the style a reader falls back to is the ENTRY the document flags, not an id, so
+    /// the numbering it states reaches a paragraph naming no style — and one naming a
+    /// style the document does not define — which `list: false` has to cancel. The
+    /// second style states nothing and derives from nothing: it is its own root, so no
+    /// numbering reaches it and it keeps its bytes.
+    const UNIDENTIFIED_DEFAULT_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:default="1"><w:name w:val="Normal"/><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="6"/></w:numPr></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Else"><w:name w:val="Else"/></w:style></w:styles>"#;
+
+    /// A numbering part holding ONE named definition — a numbered list at level 0
+    /// and nothing else — so a bullet list has none to use and one has to be
+    /// written. A second `<w:num>` states no `w:numId` at all: it names no id a
+    /// call may reuse, so reading one would take an id the element never stated.
+    /// The first one states the reserved 0 — the cancellation idiom's own id, which
+    /// names no list at all: reusing it would take the paragraph's list away where
+    /// the call meant to apply one.
+    const NUMBERED_ONLY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:lvlJc w:val="left"/></w:lvl></w:abstractNum><w:num w:numId="0"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num><w:abstractNumId w:val="0"/></w:num></w:numbering>"#;
+
+    /// A numbering part whose one `<w:num>` carries a `<w:lvlOverride>` at level
+    /// 0 with a `<w:lvl>` of its own: the abstract states `decimal` there, while
+    /// the override makes numId 1 render a bullet — so the same id is a number
+    /// list's and a bullet list's at once, and a call reusing it has to read the
+    /// kind it RENDERS at the level it names rather than the abstract's format.
+    const OVERRIDDEN_NUMBERING: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:lvlJc w:val="left"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="●"/><w:lvlJc w:val="left"/></w:lvl></w:lvlOverride></w:num></w:numbering>"#;
+
+    /// The document part a docx fixture is built from: `inner` is the body's own
+    /// content, and the part a test writes is what an edit really reads.
+    fn docx_document(inner: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{inner}<w:sectPr/></w:body></w:document>"#
+        )
     }
 
     /// `add_paragraph` with no anchor appends before the body's OWN `<w:sectPr>`,
@@ -6767,6 +7166,1420 @@ mod tests {
         assert!(
             edited.contains(r#"<w:t xml:space="preserve">APPENDED</w:t>"#),
             "the added paragraph is not in the body: {edited}"
+        );
+    }
+
+    /// The colour, the underline and the strike a `format_text` names land in the
+    /// run's own `<w:rPr>` at their places in `EG_RPrBase`, a `false` clears one
+    /// again, and a run that already draws a richer underline or a double strike
+    /// keeps exactly what it draws — while a run that states it draws no underline
+    /// really takes the one a `true` asks for.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_formats_text_with_colour_underline_and_strike() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(
+            &ws,
+            "run-colour",
+            &docx_document(
+                r#"<w:p><w:r><w:t>PLAIN</w:t></w:r></w:p><w:p><w:r><w:rPr><w:u w:val="double"/></w:rPr><w:t>RICH</w:t></w:r></w:p><w:p><w:r><w:rPr><w:u w:val="none"/></w:rPr><w:t>NO UNDERLINE</w:t></w:r></w:p><w:p><w:r><w:rPr><w:dstrike/></w:rPr><w:t>KEEP DOUBLE</w:t></w:r></w:p><w:p><w:r><w:rPr><w:dstrike/></w:rPr><w:t>DROP DOUBLE</w:t></w:r></w:p><w:p><w:r><w:rPr><w:dstrike w:val="false"/></w:rPr><w:t>OFF STRIKE</w:t></w:r></w:p>"#,
+            ),
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_text", "find": "PLAIN", "color": "#00aaff",
+                      "underline": true, "strike": true },
+                    // A run's own underline may be a richer one than the plain `true`
+                    // asks for, and a request never throws that away.
+                    { "op": "format_text", "find": "RICH", "underline": true },
+                    { "op": "format_text", "find": "PLAIN", "underline": false, "strike": false },
+                    // `<w:u w:val="none"/>` is a run saying it draws no underline —
+                    // `ST_Underline`'s own off spelling — so a `true` writes one.
+                    { "op": "format_text", "find": "NO UNDERLINE", "underline": true },
+                    // A double strike is the same property spelled another way, and a
+                    // `true` leaves the one the run already draws.
+                    { "op": "format_text", "find": "KEEP DOUBLE", "strike": true },
+                    { "op": "format_text", "find": "DROP DOUBLE", "strike": false },
+                    // A `<w:dstrike w:val="false"/>` is a run saying it draws no
+                    // strike, so the `true` writes the plain one it asks for.
+                    { "op": "format_text", "find": "OFF STRIKE", "strike": true },
+                ],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(r#"<w:rPr><w:color w:val="00AAFF"/></w:rPr><w:t>PLAIN</w:t></w:r>"#),
+            "the colour did not survive the toggles being cleared, or a toggle stayed: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:rPr><w:u w:val="double"/></w:rPr>"#),
+            "the double underline was not kept byte for byte: {edited}"
+        );
+        assert!(
+            edited.contains(r"<w:rPr><w:dstrike/></w:rPr><w:t>KEEP DOUBLE</w:t></w:r>"),
+            "a double strike was rewritten into a single one the call did not name: {edited}"
+        );
+        assert!(
+            edited.contains(r"<w:p><w:r><w:t>DROP DOUBLE</w:t></w:r></w:p>"),
+            "a `false` left the run struck: {edited}"
+        );
+        assert!(
+            edited.contains(r"<w:rPr><w:strike/></w:rPr><w:t>OFF STRIKE</w:t></w:r>"),
+            "a run stating its strike is off reported success without one: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:rPr><w:u w:val="single"/></w:rPr><w:t>NO UNDERLINE</w:t></w:r>"#),
+            "a run stating it draws no underline reported success without one: {edited}"
+        );
+        assert_eq!(
+            edited.matches("<w:u ").count(),
+            2,
+            "a run that draws its own underline was given the plain one: {edited}"
+        );
+    }
+
+    /// `format_paragraph` writes the properties it names into the paragraph's own
+    /// `<w:pPr>`, at their places in `EG_PPrBase` — a paragraph inside a table cell
+    /// as much as one in the body, the table keeping the shape it had — and a style
+    /// is resolved by the name the document gives it. An indent written on one of
+    /// `CT_Ind`'s other spellings for the same edge is cleared with it, so the
+    /// indent the call named is the one the paragraph renders.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_formats_a_paragraph_inside_a_table_cell() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "paragraph-in-cell",
+            &docx_document(
+                r#"<w:tbl><w:tr><w:tc><w:tcPr/><w:p><w:pPr><w:ind w:left="100" w:firstLine="200"/></w:pPr><w:r><w:t>CELL TEXT</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>BODY TEXT</w:t></w:r></w:p><w:p><w:pPr><w:ind w:start="720" w:startChars="1080" w:end="1440" w:endChars="720"/></w:pPr><w:r><w:t>EDGE INDENT</w:t></w:r></w:p>"#,
+            ),
+            &[("word/styles.xml", FIRM_STYLES)],
+            &[],
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_paragraph", "find": "CELL TEXT", "align": "center",
+                      "indent_left": 18, "spacing_after": 6, "style": "Фирменный" },
+                    // A negative first-line indent is the hanging indent Word states,
+                    // and a line height is the line's own size in points.
+                    { "op": "format_paragraph", "find": "BODY TEXT", "align": "justify",
+                      "indent_first_line": -12, "line_spacing": 14 },
+                    { "op": "format_paragraph", "find": "EDGE INDENT", "indent_left": 18,
+                      "indent_right": 9 },
+                ],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:pStyle w:val="Firm"/><w:spacing w:after="120"/><w:ind w:left="360" w:firstLine="200"/><w:jc w:val="center"/></w:pPr>"#
+            ),
+            "the cell's paragraph did not take the properties in the order a pPr holds them, or an indent the call never named was lost: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:spacing w:line="280" w:lineRule="exact"/><w:ind w:hanging="240"/><w:jc w:val="both"/></w:pPr>"#
+            ),
+            "the hanging indent, the line height or the justification is not what was asked: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:ind w:left="360" w:right="180"/></w:pPr>"#),
+            "an indent stated on the leading/trailing-edge spelling kept overriding the one the call wrote: {edited}"
+        );
+        assert_eq!(
+            (
+                edited.matches("<w:tbl>").count(),
+                edited.matches("<w:tr>").count(),
+                edited.matches("<w:tc>").count()
+            ),
+            (1, 1, 1),
+            "formatting a cell's paragraph changed the table: {edited}"
+        );
+    }
+
+    /// A style the document does not define is refused with the styles it does
+    /// define, a style that is not a paragraph style is refused as what it is, and
+    /// the built-in names work in a document that defines no styles at all.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_refuses_a_style_the_document_does_not_define() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "style-answers",
+            &docx_document(r"<w:p><w:r><w:t>TEXT</w:t></w:r></w:p>"),
+            &[("word/styles.xml", FIRM_STYLES)],
+            &[],
+        )
+        .await;
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "format_paragraph", "find": "TEXT", "style": "Red ink" }],
+                }),
+            )
+            .await
+            .expect_err("a character style cannot format a paragraph");
+        assert!(err.to_string().contains("character style"), "got: {err}");
+
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "format_paragraph", "find": "TEXT", "style": "Заголовок 7" }],
+                }),
+            )
+            .await
+            .expect_err("a style the document does not define");
+        assert!(
+            err.to_string().contains("Фирменный"),
+            "the refusal does not name the styles the document defines: {err}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        // A document that saved no styles of its own still takes the built-in names.
+        let bare = docx_part_fixture(
+            &ws,
+            "style-builtin",
+            &docx_document(r"<w:p><w:r><w:t>TEXT</w:t></w:r></w:p>"),
+            &[],
+            &["word/styles.xml"],
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": bare.to_string_lossy(),
+                "edits": [{ "op": "format_paragraph", "find": "TEXT", "style": "Heading 2" }],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(r#"<w:pPr><w:pStyle w:val="Heading2"/></w:pPr>"#),
+            "the built-in name did not resolve in a document with no styles part: {edited}"
+        );
+    }
+
+    /// A `format_paragraph` list uses the document's own definition of that kind and
+    /// level, writes the one it needs when the document holds none — and the second
+    /// edit of a call reuses what the first wrote — while `false` takes a
+    /// paragraph's list away.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_writes_the_list_definition_it_needs() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "list-kinds",
+            &docx_document(
+                r#"<w:p><w:r><w:t>BULLET ONE</w:t></w:r></w:p><w:p><w:r><w:t>BULLET TWO</w:t></w:r></w:p><w:p><w:r><w:t>NUMBERED</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>UNLISTED</w:t></w:r></w:p>"#,
+            ),
+            &[("word/numbering.xml", NUMBERED_ONLY)],
+            &[],
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_paragraph", "find": "BULLET ONE", "list": "bullet", "level": 1 },
+                    { "op": "format_paragraph", "find": "BULLET TWO", "list": "bullet", "level": 1 },
+                    { "op": "format_paragraph", "find": "NUMBERED", "list": "number" },
+                    { "op": "format_paragraph", "find": "UNLISTED", "list": false },
+                ],
+            }),
+        )
+        .await;
+        let out = single(&reply);
+        let edited = part_text(&out, "word/document.xml");
+        assert_eq!(
+            edited
+                .matches(r#"<w:numPr><w:ilvl w:val="1"/><w:numId w:val="2"/></w:numPr>"#)
+                .count(),
+            2,
+            "the second bullet did not reuse the definition the first edit wrote: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>"#),
+            "the document's own numbered definition was not used: {edited}"
+        );
+        assert_eq!(
+            edited.matches("<w:numPr>").count(),
+            4,
+            "the paragraph's own list was not cancelled: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr></w:pPr><w:r><w:t>UNLISTED</w:t></w:r></w:p>"#),
+            "taking the list away did not state the cancelled numbering: {edited}"
+        );
+
+        let numbering = part_text(&out, "word/numbering.xml");
+        assert!(
+            numbering.contains(
+                r#"<w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/>"#
+            ),
+            "no bullet definition was written: {numbering}"
+        );
+        assert!(
+            numbering
+                .contains(r#"<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="bullet"/>"#),
+            "the written definition is not a bullet at the level the call named: {numbering}"
+        );
+        assert!(
+            numbering.contains(r#"<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>"#),
+            "the written definition is not named by the fresh id: {numbering}"
+        );
+        assert!(
+            numbering.contains(r#"<w:num><w:abstractNumId w:val="0"/></w:num>"#),
+            "the id-less num was read from or rewritten: {numbering}"
+        );
+        assert!(
+            numbering.find(r#"<w:abstractNum w:abstractNumId="1">"#)
+                < numbering.find(r#"<w:num w:numId="1">"#),
+            "the abstract definition was not written before the nums: {numbering}"
+        );
+
+        // An edit list is applied whole or not at all: the first edit here would
+        // write a bullet definition and the second refuses, so the call must leave
+        // neither a definition nor an output behind.
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": source.to_string_lossy(),
+                    "edits": [
+                        { "op": "format_paragraph", "find": "NUMBERED", "list": "bullet" },
+                        { "op": "format_paragraph", "find": "NUMBERED", "style": "Заголовок 7" },
+                    ],
+                }),
+            )
+            .await
+            .expect_err("the second edit names a style the document does not define");
+        assert!(err.to_string().contains("Заголовок 7"), "got: {err}");
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a call that refused partway left an output"
+        );
+    }
+
+    /// An added paragraph takes the style, the formatting and the list membership of
+    /// the paragraph it is inserted after — a heading's heading, a list item's list
+    /// item — and the section break such a paragraph ends is not copied to it.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_add_paragraph_inherits_the_paragraph_it_follows() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(
+            &ws,
+            "inherit",
+            &docx_document(
+                r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>HEADING ONE</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="ListParagraph"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/><w:numberingChange w:id="11" w:author="A" w:date="2024-01-01T00:00:00Z"/></w:numPr></w:pPr><w:r><w:t>LIST ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Normal"/><w:pPrChange w:id="3" w:author="A"><w:pPr><w:pStyle w:val="Heading1"/></w:pPr></w:pPrChange></w:pPr><w:r><w:rPr><w:ins w:id="7" w:author="A"/><w:b/></w:rPr><w:t>TRACKED ANCHOR</w:t></w:r></w:p><w:p><w:pPr><w:sectPr><w:pgSz w:w="16838" w:h="11906"/></w:sectPr></w:pPr><w:r><w:t>SECTION END</w:t></w:r></w:p>"#,
+            ),
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "add_paragraph", "text": "AFTER HEADING", "after": "HEADING ONE" },
+                    { "op": "add_paragraph", "text": "AFTER ITEM", "after": "LIST ITEM" },
+                    { "op": "add_paragraph", "text": "AFTER TRACKED", "after": "TRACKED ANCHOR" },
+                    { "op": "add_paragraph", "text": "AFTER SECTION", "after": "SECTION END" },
+                ],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(
+                r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">AFTER HEADING</w:t></w:r></w:p>"#
+            ),
+            "the added paragraph is not the heading the anchor is: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:p><w:pPr><w:pStyle w:val="ListParagraph"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">AFTER ITEM</w:t></w:r></w:p>"#
+            ),
+            "the added paragraph is not a list item of the anchor's own list: {edited}"
+        );
+        // The anchor's own history is not the new paragraph's: the recorded revisions
+        // — of the properties and of the numbering — and the tracked insertion go with
+        // the copy, while the style and the bold do not, and the anchor itself keeps
+        // every marker.
+        assert!(
+            edited.contains(
+                r#"<w:p><w:pPr><w:pStyle w:val="Normal"/></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">AFTER TRACKED</w:t></w:r></w:p>"#
+            ),
+            "the added paragraph carries a recorded revision or a tracked insertion: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:r><w:rPr><w:ins w:id="7" w:author="A"/><w:b/></w:rPr><w:t>TRACKED ANCHOR</w:t></w:r>"#
+            ),
+            "the anchor paragraph lost the markers of its own history: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/><w:numberingChange w:id="11" w:author="A" w:date="2024-01-01T00:00:00Z"/></w:numPr>"#),
+            "the anchor paragraph lost the marker of its own numbering's history: {edited}"
+        );
+        assert!(
+            edited
+                .contains(r#"<w:p><w:r><w:t xml:space="preserve">AFTER SECTION</w:t></w:r></w:p>"#),
+            "the section break was copied to the added paragraph: {edited}"
+        );
+        assert_eq!(
+            edited.matches("<w:sectPr").count(),
+            2,
+            "the section break is not left exactly where it was: {edited}"
+        );
+        assert!(
+            reply.contains("ends a section"),
+            "the answer did not say the break was not copied: {reply}"
+        );
+    }
+
+    /// An edit that reaches markup the call never named says so — a hyperlink, a
+    /// tracked change, a bookmark — and a document in tracked-changes mode is told
+    /// that what the call wrote is plain content rather than a recorded revision.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_says_what_it_reached_beyond_the_fragment() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "reached-markup",
+            &docx_document(
+                r#"<w:p><w:hyperlink w:anchor="top"><w:r><w:t>LINKED</w:t></w:r></w:hyperlink></w:p><w:p><w:ins w:id="9" w:author="A"><w:r><w:t>INSERTED</w:t></w:r></w:ins></w:p><w:p><w:bookmarkStart w:id="1" w:name="BM"/><w:r><w:t>BOOKMARKED</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p><w:p><w:pPr><w:pPrChange w:id="2" w:author="A"><w:pPr><w:jc w:val="center"/></w:pPr></w:pPrChange></w:pPr><w:r><w:t>REVISED</w:t></w:r></w:p>"#,
+            ),
+            &[("word/settings.xml", TRACKING_SETTINGS)],
+            &[],
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_text", "find": "LINKED", "bold": true },
+                    { "op": "format_text", "find": "INSER", "italic": true },
+                    { "op": "remove_paragraph", "find": "BOOKMARKED" },
+                    { "op": "format_paragraph", "find": "REVISED", "align": "right" },
+                ],
+            }),
+        )
+        .await;
+        for expected in [
+            "also reached a hyperlink",
+            "also reached an unaccepted tracked change",
+            "also reached a bookmark",
+            "tracked changes turned on",
+        ] {
+            assert!(
+                reply.contains(expected),
+                "the answer does not say {expected:?}: {reply}"
+            );
+        }
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(
+                r#"<w:jc w:val="right"/><w:pPrChange w:id="2" w:author="A"><w:pPr><w:jc w:val="center"/></w:pPr></w:pPrChange>"#
+            ),
+            "the recorded revision was rewritten, or the new property did not go before it: {edited}"
+        );
+        assert_eq!(
+            (
+                edited.matches("<w:ins ").count(),
+                edited.matches("<w:del ").count()
+            ),
+            (1, 0),
+            "the call wrote a tracked change of its own: {edited}"
+        );
+        assert!(
+            !edited.contains("BOOKMARKED"),
+            "the paragraph holding the bookmark was not removed: {edited}"
+        );
+    }
+
+    /// Formatting that lands wider than the fragment named says so: a fragment that
+    /// matches in several places, and a fragment that covers only part of the run it
+    /// sits in — where the whole run takes the formatting.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_says_when_the_formatting_landed_wider_than_named() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(
+            &ws,
+            "wider-than-named",
+            &docx_document(
+                r"<w:p><w:r><w:t>SHARED and SHARED again</w:t></w:r></w:p><w:p><w:r><w:t>SHARED</w:t></w:r></w:p><w:p><w:r><w:t>LONGER RUN</w:t></w:r></w:p>",
+            ),
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_text", "find": "SHARED", "bold": true },
+                    { "op": "format_text", "find": "LONG", "italic": true },
+                ],
+            }),
+        )
+        .await;
+        assert!(
+            reply.contains("matched 3 times — every one was formatted"),
+            "the answer does not say how many places took the formatting: {reply}"
+        );
+        assert!(
+            reply.contains("covers only part of a run"),
+            "the answer does not say the formatting was wider than the fragment: {reply}"
+        );
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(r"<w:rPr><w:i/></w:rPr><w:t>LONGER RUN</w:t></w:r>"),
+            "the run the fragment sits in did not take the formatting: {edited}"
+        );
+    }
+
+    /// Removing a paragraph that holds a page break or ends a section is refused,
+    /// because no note would bring the break back, while a paragraph beside a break
+    /// is removed as usual.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_refuses_removing_a_paragraph_that_holds_a_break() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(
+            &ws,
+            "breaks",
+            &docx_document(
+                r#"<w:p><w:r><w:t>PLAIN</w:t></w:r></w:p><w:p><w:r><w:br w:type="page"/></w:r><w:r><w:t>PAGE BREAK</w:t></w:r></w:p><w:p><w:pPr><w:sectPr><w:pgSz w:w="16838" w:h="11906"/></w:sectPr></w:pPr><w:r><w:t>SECTION END</w:t></w:r></w:p>"#,
+            ),
+        )
+        .await;
+        let before = generated_count(&ws);
+        for (find, expected) in [
+            ("PAGE BREAK", "would delete the page break"),
+            ("SECTION END", "would delete the section break"),
+        ] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "docx_edit", "path": source.to_string_lossy(),
+                        "edits": [{ "op": "remove_paragraph", "find": find }],
+                    }),
+                )
+                .await
+                .expect_err("a break must not go with the paragraph");
+            assert!(err.to_string().contains(expected), "got: {err}");
+        }
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "remove_paragraph", "find": "PLAIN" }],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(!edited.contains("PLAIN"), "the paragraph stayed: {edited}");
+        assert!(
+            edited.contains("PAGE BREAK") && edited.contains("SECTION END"),
+            "a break went with a paragraph that did not hold it: {edited}"
+        );
+    }
+
+    /// Taking a list away reaches the numbering a paragraph draws from its style — a
+    /// paragraph stating no `<w:numPr>` of its own is given the cancelled id OOXML
+    /// cancels an inherited number with, one deriving its style by `basedOn` too —
+    /// while a paragraph that draws no numbering writes nothing at all: neither one
+    /// stating none nor one whose style only states the cancellation is touched, and
+    /// a call that changed no bytes reports no markup it "also reached".
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_takes_a_list_away_from_a_style_numbered_paragraph() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "style-numbered",
+            &docx_document(
+                r#"<w:p><w:pPr><w:pStyle w:val="Bulleted"/></w:pPr><w:r><w:t>STYLED ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Derived"/></w:pPr><w:r><w:t>DERIVED ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Recorded"/></w:pPr><w:r><w:t>RECORDED ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Cancelled"/></w:pPr><w:r><w:t>CANCELLED ITEM</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="2"/><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>OWN ITEM</w:t></w:r></w:p><w:p><w:r><w:t>PLAIN TEXT</w:t></w:r></w:p><w:p><w:pPr><w:jc w:val="left"/><w:sectPr><w:pgSz w:w="16838" w:h="11906"/></w:sectPr></w:pPr><w:r><w:t>SECTION END</w:t></w:r></w:p>"#,
+            ),
+            &[("word/styles.xml", NUMBERED_STYLES)],
+            &[],
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_paragraph", "find": "STYLED ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "DERIVED ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "RECORDED ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "CANCELLED ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "OWN ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "PLAIN TEXT", "list": false },
+                    // Already what the paragraph states, so the call writes nothing —
+                    // and a paragraph whose own `<w:pPr>` ends a section is then not
+                    // markup the answer may claim the edit reached.
+                    { "op": "format_paragraph", "find": "SECTION END", "align": "left" },
+                ],
+            }),
+        )
+        .await;
+        let out = single(&reply);
+        let edited = part_text(&out, "word/document.xml");
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:pStyle w:val="Bulleted"/><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>"#
+            ),
+            "the numbering the style gives the paragraph was not cancelled: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:pStyle w:val="Derived"/><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>"#
+            ),
+            "the numbering a style inherits by basedOn was not cancelled: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:pStyle w:val="Recorded"/><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>"#
+            ),
+            "the numbering a style draws was read from the change it recorded rather than from the list it draws: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:numPr><w:ilvl w:val="2"/><w:numId w:val="0"/></w:numPr>"#),
+            "the paragraph's own numbering was not cancelled in place, or its level was lost: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:p><w:pPr><w:pStyle w:val="Cancelled"/></w:pPr><w:r><w:t>CANCELLED ITEM</w:t></w:r></w:p>"#
+            ),
+            "a paragraph whose style only cancels its numbering was written to: {edited}"
+        );
+        assert!(
+            edited.contains(r"<w:p><w:r><w:t>PLAIN TEXT</w:t></w:r></w:p>"),
+            "a paragraph that draws no list took a numbering statement: {edited}"
+        );
+        // A paragraph that draws no numbering at all and one whose style only states
+        // the cancellation both keep their bytes, so the answer owes no note about
+        // markup the call "reached" — nor about the section break the no-op alignment
+        // edit left byte-identical.
+        assert!(
+            !reply.contains("also reached"),
+            "a call that wrote nothing reported reaching markup: {reply}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:jc w:val="left"/><w:sectPr><w:pgSz w:w="16838" w:h="11906"/></w:sectPr></w:pPr><w:r><w:t>SECTION END</w:t></w:r></w:p>"#
+            ),
+            "a paragraph already stating the property the call named was rewritten: {edited}"
+        );
+        let styles = part_text(&out, "word/styles.xml");
+        assert!(
+            styles.contains(r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr>"#),
+            "the style's own numbering was rewritten: {styles}"
+        );
+        assert!(
+            styles.contains(
+                r#"<w:style w:type="paragraph" w:styleId="Cancelled"><w:name w:val="Cancelled"/><w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:style>"#
+            ),
+            "the cancellation the style states was rewritten: {styles}"
+        );
+    }
+
+    /// A `list: false` cancels numbering the document's own `<w:docDefaults>` state,
+    /// while a style that itself states the cancellation stops the walk: nothing is
+    /// written for its paragraphs, so the answer reports no markup reached. A style
+    /// the document does not define — and a style deriving from one — falls back to
+    /// the default style a reader takes for it, so the default numbering reaches
+    /// those paragraphs as well and is cancelled for them too.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_cancels_numbering_the_document_defaults_state() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "default-numbered",
+            &docx_document(
+                r#"<w:p><w:r><w:t>DEFAULT NUMBERED</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Off"/></w:pPr><w:r><w:t>OFF ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Vanishing"/></w:pPr><w:r><w:t>VANISHING ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Gone"/></w:pPr><w:r><w:t>GONE ITEM</w:t></w:r></w:p>"#,
+            ),
+            &[("word/styles.xml", DEFAULT_NUMBERED_STYLES)],
+            &[],
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_paragraph", "find": "DEFAULT NUMBERED", "list": false },
+                    { "op": "format_paragraph", "find": "OFF ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "VANISHING ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "GONE ITEM", "list": false },
+                ],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr><w:r><w:t>DEFAULT NUMBERED</w:t></w:r></w:p>"#
+            ),
+            "the numbering the document defaults state was not cancelled: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:pStyle w:val="Vanishing"/><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>"#
+            ),
+            "a style deriving from one the document does not define drew no default numbering: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:pStyle w:val="Gone"/><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>"#
+            ),
+            "a paragraph naming a style the document does not define drew no default numbering: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:p><w:pPr><w:pStyle w:val="Off"/></w:pPr><w:r><w:t>OFF ITEM</w:t></w:r></w:p>"#
+            ),
+            "a paragraph whose style states the cancellation was written to: {edited}"
+        );
+        assert!(
+            !reply.contains("also reached"),
+            "a call that wrote nothing reported reaching markup: {reply}"
+        );
+    }
+
+    /// A recorded change is history, not the state a paragraph renders with: a
+    /// document whose `<w:docDefaults>` only ever recorded a numbering draws none, so
+    /// `list: false` on a paragraph taking the defaults writes nothing — a
+    /// cancellation there would be a change the paragraph never needed.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_ignores_a_numbering_the_defaults_only_recorded() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "recorded-defaults",
+            &docx_document(r"<w:p><w:r><w:t>RECORDED DEFAULT</w:t></w:r></w:p>"),
+            &[("word/styles.xml", RECORDED_DEFAULT_STYLES)],
+            &[],
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_paragraph", "find": "RECORDED DEFAULT", "list": false }],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(r"<w:p><w:r><w:t>RECORDED DEFAULT</w:t></w:r></w:p>"),
+            "a numbering the defaults only recorded was cancelled: {edited}"
+        );
+        assert!(
+            !reply.contains("also reached"),
+            "a call that wrote nothing reported reaching markup: {reply}"
+        );
+    }
+
+    /// The chain a reader walks to decide whether a paragraph draws a list item
+    /// marker: the paragraph's own properties, the style it is given, the styles that
+    /// style derives from, the default paragraph style (the one a reader falls back to
+    /// by its built-in name when the document flags none, and the one a paragraph
+    /// naming no style or a style the document does not define renders with) and the
+    /// document's own defaults. `list: false` cancels the numbering of every
+    /// paragraph the chain finds one for, wherever it came from — while only what each
+    /// rung states NOW counts, so a cancellation or a numbering a paragraph's own
+    /// properties merely recorded is history rather than the list it draws — and a
+    /// style that states nothing of its own draws no list at all, so its paragraph
+    /// keeps its bytes.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_cancels_numbering_the_normal_style_gives() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "normal-numbered",
+            &docx_document(
+                r#"<w:p><w:r><w:t>NO STYLE ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Gone"/></w:pPr><w:r><w:t>GONE STYLE ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="OnNormal"/></w:pPr><w:r><w:t>DERIVED ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="OnNormal"/><w:pPrChange w:id="5" w:author="A"><w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:pPrChange></w:pPr><w:r><w:t>RECORDED ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Plain"/><w:pPrChange w:id="6" w:author="A"><w:pPr><w:numPr><w:numId w:val="5"/></w:numPr></w:pPr></w:pPrChange></w:pPr><w:r><w:t>RECORDED PLAIN</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Plain"/></w:pPr><w:r><w:t>PLAIN ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Off"/></w:pPr><w:r><w:t>OFF ITEM</w:t></w:r></w:p>"#,
+            ),
+            &[("word/styles.xml", NORMAL_NUMBERED_STYLES)],
+            &[],
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_paragraph", "find": "NO STYLE ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "GONE STYLE ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "DERIVED ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "RECORDED ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "RECORDED PLAIN", "list": false },
+                    { "op": "format_paragraph", "find": "PLAIN ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "OFF ITEM", "list": false },
+                ],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(
+                r#"<w:p><w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr><w:r><w:t>NO STYLE ITEM</w:t></w:r></w:p>"#
+            ),
+            "the numbering the default paragraph style gives was not cancelled: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:pStyle w:val="Gone"/><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>"#
+            ),
+            "a paragraph naming a style the document does not define drew no default numbering: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:pStyle w:val="OnNormal"/><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>"#
+            ),
+            "the numbering a style takes from the default style by basedOn was not cancelled: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:pStyle w:val="OnNormal"/><w:numPr><w:numId w:val="0"/></w:numPr><w:pPrChange w:id="5" w:author="A"><w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:pPrChange></w:pPr>"#
+            ),
+            "the cancellation a paragraph's own properties only recorded was read as the list it draws, instead of the one its style gives: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:pStyle w:val="Plain"/><w:pPrChange w:id="6" w:author="A"><w:pPr><w:numPr><w:numId w:val="5"/></w:numPr></w:pPr></w:pPrChange></w:pPr>"#
+            ),
+            "a paragraph was given a cancellation for a numbering its own properties only recorded: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:p><w:pPr><w:pStyle w:val="Plain"/></w:pPr><w:r><w:t>PLAIN ITEM</w:t></w:r></w:p>"#
+            ),
+            "a paragraph whose style states nothing of its own took a numbering statement: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:p><w:pPr><w:pStyle w:val="Off"/></w:pPr><w:r><w:t>OFF ITEM</w:t></w:r></w:p>"#
+            ),
+            "a paragraph whose style states the cancellation was written to: {edited}"
+        );
+        assert!(
+            !reply.contains("also reached"),
+            "a call that wrote nothing reported reaching markup: {reply}"
+        );
+    }
+
+    /// An unfamiliar `w:pStyle`, and a `w:basedOn` naming a style the document does not
+    /// define, are not rungs of the chain a reader walks: a paragraph naming no style
+    /// the document has renders with the default one, while a style whose `basedOn`
+    /// cannot be resolved is its own root, so only the document's defaults apply to it.
+    /// Here the two rungs disagree — the defaults number paragraphs and the default
+    /// style states the cancellation — so the two paragraphs owe opposite answers:
+    /// cancelling a numbering the defaults give, and leaving untouched a paragraph the
+    /// default style's own statement never reaches.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_ends_the_chain_where_the_document_does() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "cancelled-default",
+            &docx_document(
+                r#"<w:p><w:pPr><w:pStyle w:val="Vanishing"/></w:pPr><w:r><w:t>VANISHING ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="OnNormal"/></w:pPr><w:r><w:t>ONNORMAL ITEM</w:t></w:r></w:p>"#,
+            ),
+            &[("word/styles.xml", CANCELLED_DEFAULT_STYLES)],
+            &[],
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_paragraph", "find": "VANISHING ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "ONNORMAL ITEM", "list": false },
+                ],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:pStyle w:val="Vanishing"/><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>"#
+            ),
+            "a style whose basedOn the document does not define was read as taking the default style's cancellation instead of the numbering the defaults give: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:p><w:pPr><w:pStyle w:val="OnNormal"/></w:pPr><w:r><w:t>ONNORMAL ITEM</w:t></w:r></w:p>"#
+            ),
+            "a paragraph deriving from the style that states the cancellation was written to: {edited}"
+        );
+        assert!(
+            !reply.contains("also reached"),
+            "a call that wrote one cancellation reported reaching markup: {reply}"
+        );
+    }
+
+    /// The default paragraph style a reader falls back to is the ENTRY the document
+    /// flags, not an id: one stating its numbering without a `w:styleId` still numbers
+    /// every paragraph that renders with it — one naming no style, and one naming a
+    /// style the document does not define — so `list: false` cancels them, while a
+    /// paragraph whose own style derives from nothing keeps its bytes.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_cancels_numbering_an_unidentified_default_style_gives() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "unidentified-default",
+            &docx_document(
+                r#"<w:p><w:r><w:t>NO STYLE ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Gone"/></w:pPr><w:r><w:t>GONE ITEM</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Else"/></w:pPr><w:r><w:t>ELSE ITEM</w:t></w:r></w:p>"#,
+            ),
+            &[("word/styles.xml", UNIDENTIFIED_DEFAULT_STYLES)],
+            &[],
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_paragraph", "find": "NO STYLE ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "GONE ITEM", "list": false },
+                    { "op": "format_paragraph", "find": "ELSE ITEM", "list": false },
+                ],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr><w:r><w:t>NO STYLE ITEM</w:t></w:r></w:p>"#
+            ),
+            "the numbering a default style stating no w:styleId gives was not cancelled: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:pPr><w:pStyle w:val="Gone"/><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>"#
+            ),
+            "a paragraph naming a style the document does not define drew no default numbering: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:p><w:pPr><w:pStyle w:val="Else"/></w:pPr><w:r><w:t>ELSE ITEM</w:t></w:r></w:p>"#
+            ),
+            "a paragraph whose style derives from nothing was given a numbering statement: {edited}"
+        );
+    }
+
+    /// A `format_paragraph` list whose document holds no numbering part creates one:
+    /// the package gains `word/numbering.xml`, the content type and the single
+    /// relationship that declare it — a numbering part named twice, or one no
+    /// relationship points at, is the shape Word offers to repair.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_creates_the_numbering_part_it_needs() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_unnumbered_fixture(
+            &ws,
+            "needs-numbering",
+            &docx_document(r"<w:p><w:r><w:t>UNLISTED</w:t></w:r></w:p>"),
+        )
+        .await;
+        let names = zip_names(&source);
+        assert!(
+            !names.iter().any(|name| name == "word/numbering.xml"),
+            "the fixture still holds a numbering part: {names:?}"
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_paragraph", "find": "UNLISTED", "list": "bullet" }],
+            }),
+        )
+        .await;
+        let out = single(&reply);
+        assert_parts(&out, &["word/numbering.xml"]);
+        let edited = part_text(&out, "word/document.xml");
+        assert!(
+            edited.contains(r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>"#),
+            "the paragraph did not take the numbering the edit wrote: {edited}"
+        );
+        let numbering = part_text(&out, "word/numbering.xml");
+        assert!(
+            numbering.contains(
+                r#"<w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/>"#
+            ),
+            "the created part holds no bullet definition at level 0: {numbering}"
+        );
+        assert!(
+            numbering.contains(r#"<w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>"#),
+            "the created definition is not named by a num: {numbering}"
+        );
+        let content_types = part_text(&out, "[Content_Types].xml");
+        assert_eq!(
+            content_types.matches("/word/numbering.xml").count(),
+            1,
+            "the numbering part is declared more than once: {content_types}"
+        );
+        assert!(
+            content_types.contains(
+                r#"ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml""#
+            ),
+            "the numbering part does not carry the numbering content type: {content_types}"
+        );
+        let rels = part_text(&out, "word/_rels/document.xml.rels");
+        assert_eq!(
+            rels.matches("/relationships/numbering").count(),
+            1,
+            "the document names more than one numbering relationship: {rels}"
+        );
+        assert!(
+            rels.contains(r#"Target="numbering.xml""#),
+            "the numbering relationship does not point at the part: {rels}"
+        );
+    }
+
+    /// A body part of a document written in the strict dialect, and the
+    /// relationships part that declares its own parts in it.
+    const STRICT_DOCUMENT: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://purl.oclc.org/ooxml/wordprocessingml/main"><w:body><w:p><w:r><w:t>STRICT ITEM</w:t></w:r></w:p><w:p><w:r><w:t>STRICT RIGHT</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+    const STRICT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://purl.oclc.org/ooxml/officeDocument/relationships/styles" Target="styles.xml"/></Relationships>"#;
+
+    /// A document written in the strict dialect gets every part, name and value a call
+    /// writes for it stated in that dialect: the numbering part a list needs, the
+    /// relationship naming it and the justification of its levels (a reader of one
+    /// dialect resolves only its own spellings, so a part written the other way — or a
+    /// value its schema does not define — is one it never reads), an indent, which the
+    /// strict schema spells `w:start`/`w:end` where the transitional one spells
+    /// `w:left`/`w:right`, and an alignment, which spells the leading and trailing edge
+    /// `start`/`end` the same way. The other dialect's spelling of either is cleared or
+    /// never written, so only the one this document's reader resolves is left.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_writes_a_strict_documents_own_dialect() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "strict-list",
+            STRICT_DOCUMENT,
+            &[("word/_rels/document.xml.rels", STRICT_RELS)],
+            &["word/numbering.xml"],
+        )
+        .await;
+        let out = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "docx_edit", "file_name": "edited",
+                    "path": source.to_string_lossy(),
+                    "edits": [
+                        { "op": "format_paragraph", "find": "STRICT ITEM", "list": "bullet",
+                          "indent_left": 18, "indent_right": 9, "align": "left" },
+                        { "op": "format_paragraph", "find": "STRICT RIGHT", "align": "right" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let edited = part_text(&out, "word/document.xml");
+        assert!(
+            edited.contains(r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>"#),
+            "the paragraph did not take the numbering the edit wrote: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:ind w:start="360" w:end="180"/>"#),
+            "the indent is not stated in the dialect this document's own reader resolves: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:jc w:val="start"/>"#)
+                && edited.contains(r#"<w:jc w:val="end"/>"#),
+            "an alignment is not stated in the dialect this document's own reader resolves: {edited}"
+        );
+        assert!(
+            !edited.contains(r"w:left=")
+                && !edited.contains(r"w:right=")
+                && !edited.contains(r#"<w:jc w:val="left"/>"#)
+                && !edited.contains(r#"<w:jc w:val="right"/>"#),
+            "a name or value is also stated in the other dialect's spelling: {edited}"
+        );
+        let numbering = part_text(&out, "word/numbering.xml");
+        assert!(
+            numbering.contains(
+                r#"<w:numbering xmlns:w="http://purl.oclc.org/ooxml/wordprocessingml/main">"#
+            ),
+            "the created numbering part is not in the document's own dialect: {numbering}"
+        );
+        assert!(
+            numbering.contains(r#"<w:lvlJc w:val="start"/>"#)
+                && !numbering.contains(r#"<w:lvlJc w:val="left"/>"#),
+            "a list level is justified in a value this document's own schema does not define: {numbering}"
+        );
+        let rels = part_text(&out, "word/_rels/document.xml.rels");
+        assert!(
+            rels.contains(
+                r#"Type="http://purl.oclc.org/ooxml/officeDocument/relationships/numbering""#
+            ),
+            "the created part is not named by a relationship this document's reader resolves: {rels}"
+        );
+    }
+
+    /// Giving a paragraph another kind of list replaces the `<w:numPr>` it had whole —
+    /// and `CT_NumPr` states the revision markers of that numbering, so the request
+    /// really takes them with it. The answer owes the note about the unaccepted
+    /// tracked change it deleted, and the marker is gone from the file rather than
+    /// reported as markup the call left alone.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_says_when_a_replaced_number_took_a_revision() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(
+            &ws,
+            "replaced-number",
+            &docx_document(
+                r#"<w:p><w:pPr><w:numPr><w:numId w:val="7"/><w:numberingChange w:id="11" w:author="A" w:date="2024-01-01T00:00:00Z"/><w:ins w:id="9" w:author="A"/></w:numPr></w:pPr><w:r><w:t>NUMBERED ITEM</w:t></w:r></w:p>"#,
+            ),
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_paragraph", "find": "NUMBERED ITEM", "list": "bullet" }],
+            }),
+        )
+        .await;
+        assert!(
+            reply.contains("also reached an unaccepted tracked change"),
+            "the answer does not say the replacement took a recorded revision: {reply}"
+        );
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>"#),
+            "the paragraph did not take the list the call named: {edited}"
+        );
+        for gone in ["<w:numberingChange", "<w:ins "] {
+            assert!(
+                !edited.contains(gone),
+                "a revision marker of the replaced number is still in the file: {edited}"
+            );
+        }
+    }
+
+    /// An edit reaches only the region it rewrote: a paragraph's own section break
+    /// survives byte for byte with the new property written before it, a run's
+    /// recorded revision and tracked insertion marker survive with the new property
+    /// beside them, and the revision markers a `<w:numPr>` states survive a list taken
+    /// away from it — none is markup the answer may claim the call "also reached".
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_names_nothing_it_preserved() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(
+            &ws,
+            "preserved",
+            &docx_document(
+                r#"<w:p><w:pPr><w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr></w:pPr><w:r><w:t>SECT END</w:t></w:r></w:p><w:p><w:r><w:rPr><w:rPrChange w:id="4" w:author="A"><w:rPr><w:b/></w:rPr></w:rPrChange></w:rPr><w:t>REVISED RPR</w:t></w:r></w:p><w:p><w:r><w:rPr><w:ins w:id="7" w:author="A"/><w:b/></w:rPr><w:t>INSIDE RPR</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:numId w:val="7"/><w:numberingChange w:id="11" w:author="A" w:date="2024-01-01T00:00:00Z"/><w:ins w:id="9" w:author="A"/></w:numPr></w:pPr><w:r><w:t>NUMBERED ITEM</w:t></w:r></w:p>"#,
+            ),
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_paragraph", "find": "SECT END", "align": "center" },
+                    { "op": "format_text", "find": "REVISED RPR", "italic": true },
+                    { "op": "format_text", "find": "INSIDE RPR", "italic": true },
+                    { "op": "format_paragraph", "find": "NUMBERED ITEM", "list": false },
+                ],
+            }),
+        )
+        .await;
+        assert!(
+            !reply.contains("also reached a section break"),
+            "the paragraph's own section break was reported as reached: {reply}"
+        );
+        assert!(
+            !reply.contains("also reached an unaccepted tracked change"),
+            "a recorded revision or its run's insertion marker was reported as reached: {reply}"
+        );
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(
+                r#"<w:jc w:val="center"/><w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>"#
+            ),
+            "the section break was rewritten, or the property did not go before it: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:rPr><w:i/><w:rPrChange w:id="4" w:author="A">"#),
+            "the recorded revision was rewritten, or the new property did not go before it: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:rPr><w:i/><w:ins w:id="7" w:author="A"/><w:b/></w:rPr>"#),
+            "the insertion marker was rewritten, or the new property did not go beside it: {edited}"
+        );
+        assert!(
+            edited.contains(
+                r#"<w:numPr><w:numId w:val="0"/><w:numberingChange w:id="11" w:author="A" w:date="2024-01-01T00:00:00Z"/><w:ins w:id="9" w:author="A"/></w:numPr>"#
+            ),
+            "cancelling the list rewrote the revision markers its numPr carries: {edited}"
+        );
+    }
+
+    /// A run whose `<w:rPr>` holds an `<w:rPrChange>` opened and never closed no
+    /// longer makes the kit throw: the call succeeds — going through `run` is
+    /// itself the regression check — leaves the revision's bytes as they were, and
+    /// reports no markup it "also reached".
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_survives_an_unclosed_revision() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(
+            &ws,
+            "unclosed-revision",
+            &with_first(
+                &docx_document(
+                    r#"<w:p><w:r><w:rPr><w:rPrChange w:id="4" w:author="A"><w:rPr><w:b/></w:rPr></w:rPrChange></w:rPr><w:t>UNCLOSED RPR</w:t></w:r></w:p>"#,
+                ),
+                "</w:rPrChange>",
+                "",
+            ),
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_text", "find": "UNCLOSED RPR", "italic": true }],
+            }),
+        )
+        .await;
+        assert!(
+            !reply.contains("also reached"),
+            "an unclosed revision was reported as reached: {reply}"
+        );
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(r#"<w:rPrChange w:id="4" w:author="A">"#),
+            "the unclosed revision's bytes were rewritten: {edited}"
+        );
+    }
+
+    /// A run whose own `<w:rPr>` is opened and never closed is refused rather than
+    /// given a second one beside it: the properties the call states would land inside
+    /// the unclosed element, where no reader takes them, and the call would report a
+    /// formatting it never applied — the refusal a paragraph's unclosed `<w:pPr>`
+    /// already gets.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_refuses_a_run_whose_properties_never_close() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(
+            &ws,
+            "unclosed-run-properties",
+            &docx_document(r"<w:p><w:r><w:rPr><w:b/><w:t>UNCLOSED OWN RPR</w:t></w:r></w:p>"),
+        )
+        .await;
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "format_text", "find": "UNCLOSED OWN RPR", "italic": true }],
+                }),
+            )
+            .await
+            .expect_err("a run whose properties never close cannot be formatted");
+        assert!(
+            err.to_string().contains("never closed"),
+            "the refusal does not name the unclosed properties: {err}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A list edit reuses only a definition that RENDERS the kind it names: a
+    /// `<w:num>` whose abstract states `decimal` but whose own `<w:lvlOverride>`
+    /// renders a bullet is reused for a bullet list and refused for a numbered one,
+    /// which writes a fresh definition of its own instead.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_reuses_only_a_list_definition_that_renders_the_kind() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "override-kinds",
+            &docx_document(
+                r"<w:p><w:r><w:t>BULLET OVERRIDE</w:t></w:r></w:p><w:p><w:r><w:t>NUMBER FRESH</w:t></w:r></w:p>",
+            ),
+            &[("word/numbering.xml", OVERRIDDEN_NUMBERING)],
+            &[],
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_paragraph", "find": "BULLET OVERRIDE", "list": "bullet" },
+                    { "op": "format_paragraph", "find": "NUMBER FRESH", "list": "number" },
+                ],
+            }),
+        )
+        .await;
+        let out = single(&reply);
+        let edited = part_text(&out, "word/document.xml");
+        assert!(
+            edited.contains(r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>"#),
+            "the bullet list did not reuse the definition that renders one: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr>"#),
+            "the numbered list reused an id that renders a bullet there: {edited}"
+        );
+        let numbering = part_text(&out, "word/numbering.xml");
+        assert!(
+            numbering.contains(
+                r#"<w:num w:numId="1"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0">"#
+            ),
+            "the reused definition was rewritten: {numbering}"
+        );
+        assert!(
+            numbering.contains(
+                r#"<w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/>"#
+            ),
+            "no fresh decimal definition was written: {numbering}"
+        );
+        assert!(
+            numbering.contains(r#"<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>"#),
+            "the fresh definition is not named by a num: {numbering}"
         );
     }
 
@@ -13422,6 +15235,11 @@ mod tests {
         assert!(!rules.cell_verticals.is_empty(), "no cell verticals");
         assert!(!rules.cell_border_sides.is_empty(), "no cell border sides");
         assert!(
+            !rules.paragraph_alignments.is_empty(),
+            "no paragraph alignments"
+        );
+        assert!(!rules.paragraph_lists.is_empty(), "no paragraph lists");
+        assert!(
             rules.image_side_px.min < rules.image_side_px.max,
             "an empty image-side range"
         );
@@ -13440,6 +15258,18 @@ mod tests {
         assert!(
             rules.text_size_points.min < rules.text_size_points.max,
             "an empty text-size range"
+        );
+        assert!(
+            rules.paragraph_indent_points.min < rules.paragraph_indent_points.max,
+            "an empty paragraph-indent range"
+        );
+        assert!(
+            rules.paragraph_spacing_points.min < rules.paragraph_spacing_points.max,
+            "an empty paragraph-spacing range"
+        );
+        assert!(
+            rules.paragraph_line_points.min < rules.paragraph_line_points.max,
+            "an empty paragraph-line range"
         );
         assert!(
             rules.slide_text_size_points.min < rules.slide_text_size_points.max,
@@ -13485,6 +15315,7 @@ mod tests {
             ("number_format_max", rules.number_format_max),
             ("font_name_max", rules.font_name_max),
             ("format_cells_max", rules.format_cells_max),
+            ("paragraph_style_max", rules.paragraph_style_max),
         ] {
             assert!(cap > 0, "{name} refuses every value");
         }
@@ -13538,11 +15369,16 @@ mod tests {
             RULES.slide_size_fraction.bounds(),
             RULES.pdf_size_points.bounds(),
             RULES.text_size_points.bounds(),
+            RULES.paragraph_indent_points.bounds(),
+            RULES.paragraph_spacing_points.bounds(),
+            RULES.paragraph_line_points.bounds(),
             RULES.slide_text_size_points.bounds(),
             RULES.cell_font_points.bounds(),
             RULES.column_width_chars.bounds(),
             RULES.row_height_points.bounds(),
-            quoted_words(&align_words()),
+            quoted_words(&pair_words(&RULES.slide_alignments)),
+            quoted_words(&pair_words(&RULES.paragraph_alignments)),
+            quoted_words(&pair_words(&RULES.paragraph_lists)),
             quoted_words(&RULES.cell_alignments),
             quoted_words(&RULES.cell_verticals),
             quoted_words(&RULES.cell_border_sides),
@@ -13554,6 +15390,7 @@ mod tests {
             RULES.edits_max.to_string(),
             RULES.bullets_max.to_string(),
             RULES.paragraph_level_max.to_string(),
+            RULES.paragraph_style_max.to_string(),
             RULES.sheet_row_max.to_string(),
             RULES.sheet_column_max.to_string(),
             RULES.number_format_max.to_string(),
