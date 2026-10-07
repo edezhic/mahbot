@@ -653,7 +653,7 @@ mod tests {
             out.text
         );
         assert!(
-            !out.text.contains("1: "),
+            !out.text.lines().any(|line| line.starts_with("1: ")),
             "a document is converted, not line-numbered: {}",
             out.text
         );

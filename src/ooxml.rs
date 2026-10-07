@@ -4,7 +4,10 @@
 //! non-ZIP container. Every other format it converts is an OOXML package: a ZIP
 //! of XML parts, read here with the shared `zip` + `quick_xml` plumbing. Word,
 //! Excel and PowerPoint differ only in which parts hold the text, how a cell
-//! address is written, and where the embedded media live.
+//! address is written, and where the embedded media live — and in how much of a
+//! walk the format needs: Word's is the only one that carries tables, tracked
+//! changes and content beyond the body part, so its reader is the module
+//! [`docx`], built on this module's package helpers.
 //!
 //! # Invariants
 //!
@@ -24,17 +27,15 @@ use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
+mod docx;
+pub(crate) use docx::convert_docx;
+
 // ── Package parts and bounds ────────────────────────────────────
 
 /// Maximum bytes decompressed from a single ZIP entry, so a lying size header
 /// cannot inflate the temp dir. Deliberately not an aggregate bound: the entry
 /// count is unbounded.
 const MAX_ZIP_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Part holding the WordprocessingML body.
-const DOCX_BODY_PART: &str = "word/document.xml";
-/// Prefix of the embedded-media parts in a Word package.
-const DOCX_MEDIA_PREFIX: &str = "word/media/";
 
 /// Part holding the workbook's sheet names and their relationship ids.
 const WORKBOOK_PART: &str = "xl/workbook.xml";
@@ -107,80 +108,6 @@ pub(crate) fn family_of(path: &Path) -> Option<Family> {
     } else {
         None
     }
-}
-
-// ── Word ────────────────────────────────────────────────────────
-
-/// Extract body text and embedded images from a `.docx`/`.docm` ZIP package.
-#[must_use]
-pub(crate) fn convert_docx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
-    let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
-        return unreadable(".docx");
-    };
-    let Some(body_xml) = read_zip_entry(&mut archive, DOCX_BODY_PART).bytes() else {
-        return unreadable(".docx");
-    };
-    let Some(text) = docx_body_text(&body_xml) else {
-        return unreadable(".docx");
-    };
-
-    ensure_out_dir(out_dir);
-
-    let mut skipped = SkippedImages::default();
-    let images = write_media_parts(&mut archive, DOCX_MEDIA_PREFIX, out_dir, &mut skipped);
-    DocOutcome::Text {
-        text,
-        images,
-        notes: skipped.notes(),
-        all_page_text_lost: false,
-    }
-}
-
-/// Extract the readable body of a `word/document.xml` part: the content of
-/// every `w:t` run-text element, a tab at `w:tab`, a newline at `w:br`, and a
-/// newline at each `w:p` paragraph end.
-///
-/// Elements are matched on their local name (after any namespace prefix) so a
-/// producer using a prefix other than `w:` still parses. `None` on any XML
-/// error — a body that cannot be read as XML is reported as corrupt.
-fn docx_body_text(xml: &[u8]) -> Option<String> {
-    let mut reader = Reader::from_reader(xml);
-    let mut buffer = Vec::new();
-    let mut text = String::new();
-    let mut in_run_text = false;
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(event)) => match event.local_name().as_ref() {
-                b"t" => in_run_text = true,
-                b"tab" => text.push('\t'),
-                b"br" => text.push('\n'),
-                _ => {}
-            },
-            Ok(Event::Empty(event)) => match event.local_name().as_ref() {
-                b"tab" => text.push('\t'),
-                b"br" => text.push('\n'),
-                _ => {}
-            },
-            Ok(Event::Text(event)) if in_run_text => {
-                if let Ok(chunk) = event.xml10_content() {
-                    text.push_str(&chunk);
-                }
-            }
-            Ok(Event::GeneralRef(event)) if in_run_text => append_entity(&mut text, &event),
-            Ok(Event::End(event)) => match event.local_name().as_ref() {
-                b"t" => in_run_text = false,
-                b"p" => text.push('\n'),
-                _ => {}
-            },
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return None,
-        }
-        buffer.clear();
-    }
-    // Every `w:p` leaves a trailing break; drop the document's final one so the
-    // inlined text does not end with a blank line.
-    Some(text.trim_end().to_string())
 }
 
 // ── Excel ───────────────────────────────────────────────────────
@@ -813,8 +740,8 @@ fn push_lines(lines: &mut Vec<String>, current: &mut String) {
 
 // ── Shared package plumbing ─────────────────────────────────────
 
-/// `header` then one indented line per entry. Shared with [`crate::legacy`], so
-/// the text shapes stay one implementation.
+/// `header` then one indented line per entry. Shared with [`crate::legacy`] and
+/// the Word reader, so the text shapes stay one implementation.
 pub(crate) fn text_lines(header: &str, lines: &[String]) -> String {
     let indented = lines
         .iter()
@@ -919,11 +846,14 @@ fn relationships(xml: &[u8]) -> Option<Vec<Relationship>> {
 
 /// Relationship id -> target, for the parts a rId alone names.
 fn relationship_map(xml: &[u8]) -> HashMap<String, String> {
-    relationships(xml)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|rel| (rel.id, rel.target))
-        .collect()
+    relationship_targets(relationships(xml).unwrap_or_default())
+}
+
+/// [`relationship_map`] over an already-read relationship list. The Word reader
+/// reads the list itself — the notes parts are named there by kind, before the
+/// list becomes this lookup — and shares the mapping.
+fn relationship_targets(rels: Vec<Relationship>) -> HashMap<String, String> {
+    rels.into_iter().map(|rel| (rel.id, rel.target)).collect()
 }
 
 /// Resolve a relationship target against the part that owns it: a relative
@@ -1157,95 +1087,6 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::test_fixtures::*;
     use super::*;
-
-    // ── Word ────────────────────────────────────────────────────
-
-    #[test]
-    fn docx_extracts_paragraphs_and_media() {
-        let bytes = zip_fixture(&[
-            ("word/document.xml", DOCX_BODY),
-            ("word/media/pic.png", b"\x89PNG\r\n\x1a\nfake image bytes"),
-            // A directory entry is not media: skipping it must not produce a
-            // "skipped embedded image media" note (asserted by `notes.is_empty`).
-            ("word/media/", b""),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            ..
-        } = convert_docx(&bytes, dir.path())
-        else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(text, "First paragraph\nSecond paragraph");
-        assert_eq!(images, vec![dir.path().join("pic.png")]);
-        assert!(notes.is_empty());
-        assert_eq!(
-            std::fs::read(&images[0]).expect("read written image"),
-            b"\x89PNG\r\n\x1a\nfake image bytes"
-        );
-    }
-
-    #[test]
-    fn docx_notes_media_entries_it_cannot_convert() {
-        let bytes = zip_fixture(&[
-            ("word/document.xml", DOCX_BODY),
-            (
-                "word/media/diagram.emf",
-                b"EMF bytes this stack cannot decode",
-            ),
-            (
-                "word/media/vector.wmf",
-                b"WMF bytes this stack cannot decode",
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { images, notes, .. } = convert_docx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert!(images.is_empty(), "an undecodable entry yields no image");
-        assert_eq!(
-            notes,
-            ["skipped 2 embedded image(s) in a format this pipeline cannot convert"]
-        );
-    }
-
-    /// A media entry name carrying a bracket would close the `[File ...]` note
-    /// (and the `[IMAGE:...]` marker built from it) early.
-    #[test]
-    fn docx_media_entry_names_are_marker_safe() {
-        let bytes = zip_fixture(&[
-            ("word/document.xml", DOCX_BODY),
-            ("word/media/a]b.png", b"\x89PNG\r\n\x1a\nfake image bytes"),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { images, .. } = convert_docx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(images, vec![dir.path().join("a_b.png")]);
-    }
-
-    /// Two entries can share a base name under different directories, and only
-    /// the base name survives into `out_dir`: each must get its own file, or one
-    /// is silently overwritten and the survivor ingested twice.
-    #[test]
-    fn docx_duplicate_media_base_names_get_distinct_files() {
-        let bytes = zip_fixture(&[
-            ("word/document.xml", DOCX_BODY),
-            ("word/media/pic.png", b"\x89PNG\r\n\x1a\nfirst"),
-            ("word/media/sub/pic.png", b"\x89PNG\r\n\x1a\nsecond"),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { images, .. } = convert_docx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(
-            images,
-            vec![dir.path().join("pic.png"), dir.path().join("pic_2.png")]
-        );
-    }
 
     // ── Excel ───────────────────────────────────────────────────
 
@@ -1583,5 +1424,42 @@ mod tests {
             assert_eq!(text, "Slide 1:\n  Slide text");
             assert_eq!(notes, ["slide 1 notes could not be read"]);
         }
+    }
+
+    // ── Word ────────────────────────────────────────────────────
+
+    /// A media entry name carrying a bracket would close the `[File ...]` note
+    /// (and the `[IMAGE:...]` marker built from it) early.
+    #[test]
+    fn docx_media_entry_names_are_marker_safe() {
+        let bytes = zip_fixture(&[
+            ("word/document.xml", DOCX_BODY),
+            ("word/media/a]b.png", b"\x89PNG\r\n\x1a\nfake image bytes"),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { images, .. } = convert_docx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a well-formed docx");
+        };
+        assert_eq!(images, vec![dir.path().join("a_b.png")]);
+    }
+
+    /// Two entries can share a base name under different directories, and only
+    /// the base name survives into `out_dir`: each must get its own file, or one
+    /// is silently overwritten and the survivor ingested twice.
+    #[test]
+    fn docx_duplicate_media_base_names_get_distinct_files() {
+        let bytes = zip_fixture(&[
+            ("word/document.xml", DOCX_BODY),
+            ("word/media/pic.png", b"\x89PNG\r\n\x1a\nfirst"),
+            ("word/media/sub/pic.png", b"\x89PNG\r\n\x1a\nsecond"),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { images, .. } = convert_docx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a well-formed docx");
+        };
+        assert_eq!(
+            images,
+            vec![dir.path().join("pic.png"), dir.path().join("pic_2.png")]
+        );
     }
 }
