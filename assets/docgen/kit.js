@@ -300,6 +300,20 @@ function createDocx(req) {
 // ── create: xlsx ───────────────────────────────────────────────
 // Written by hand: the package is small, and owning the writer is what keeps a
 // text cell that starts with "=" a text cell and a formula cell a formula.
+//
+// The parts a workbook names its cell styles by, and the content type and
+// relationship type OPC declares one with. A workbook that never saved styles
+// carries no styles part at all; an edit that brings formatting to it writes the
+// same part `createXlsx` would have (see `stylesText`, and the entries and blocks
+// it shares with the style machinery under `STYLE_BLOCKS`). The name below is the
+// one every writer uses and the one a workbook this kit creates gets; an edit
+// writes the part the workbook's OWN relationships name, which is this one unless
+// the package saved its styles elsewhere (`stylesPart`).
+const XLSX_STYLES = "xl/styles.xml";
+const XLSX_WORKBOOK = "xl/workbook.xml";
+const XLSX_WORKBOOK_RELS = "xl/_rels/workbook.xml.rels";
+const STYLES_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml";
+const STYLES_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles";
 const xmlEscape = (value) => String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[c]));
 const colName = (index) => {
   let name = "";
@@ -307,6 +321,19 @@ const colName = (index) => {
   while (n > 0) { const rest = (n - 1) % 26; name = String.fromCharCode(65 + rest) + name; n = Math.floor((n - 1) / 26); }
   return name;
 };
+// The three spellings a tag of `name` is written in — an open tag, a close tag and
+// one that closes itself — stated once, so every pattern that reads a part's tags is
+// built from one rule and no two readers can disagree about which shape a part is:
+// such a disagreement has read an element as absent and made a writer place a second
+// one beside it. `middle` is the attributes and whitespace between a name and its
+// tag's end, stopping at the first `>` so no read runs past the tag it is on; the
+// close tag and a self-closing tag take the whitespace XML allows before their `>` or
+// `/>`. A POSITION taken from a match built here comes from the match's own span or
+// from `elementEdges`, never from a close tag spelled out again to measure it.
+const TAG_MIDDLE = "(?:\\s[^>]*)?";
+const openTag = (name, middle = TAG_MIDDLE) => `<${name}${middle}>`;
+const selfClosingTag = (name, middle = TAG_MIDDLE) => `<${name}${middle}\\s*/>`;
+const closeTag = (name) => `</${name}\\s*>`;
 // The text a formula cell holds: the object names `formula` alone, and the text
 // — with its one optional leading `=` and the spacing removed — is a formula, so
 // a second `=` is refused rather than written into the `<f>` element as text.
@@ -371,19 +398,19 @@ function createXlsx(req) {
   const contentTypes = [
     '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
     '<Default Extension="xml" ContentType="application/xml"/>',
-    '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+    `<Override PartName="/${XLSX_WORKBOOK}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>`,
     ...sheets.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`),
-    '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>',
+    `<Override PartName="/${XLSX_STYLES}" ContentType="${STYLES_CONTENT_TYPE}"/>`,
   ];
   zip.file("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">${contentTypes.join("")}</Types>`);
-  zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`);
-  zip.file("xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheets.map((sheet, i) => `<sheet name="${xmlEscape(sheet.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("")}</sheets></workbook>`);
+  zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="${XLSX_WORKBOOK}"/></Relationships>`);
+  zip.file(XLSX_WORKBOOK, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheets.map((sheet, i) => `<sheet name="${xmlEscape(sheet.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("")}</sheets></workbook>`);
   const workbookRels = [
     ...sheets.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`),
-    `<Relationship Id="rId${sheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>`,
+    `<Relationship Id="rId${sheets.length + 1}" Type="${STYLES_REL_TYPE}" Target="styles.xml"/>`,
   ];
-  zip.file("xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${workbookRels.join("")}</Relationships>`);
-  zip.file("xl/styles.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>`);
+  zip.file(XLSX_WORKBOOK_RELS, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${workbookRels.join("")}</Relationships>`);
+  zip.file(XLSX_STYLES, MINIMAL_STYLES);
   sheets.forEach((sheet, i) => {
     // A worksheet's cells nest inside their `<row>`; a sheet whose cells sit
     // directly under `<sheetData>` is schema-invalid and opens empty in real
@@ -611,7 +638,7 @@ async function createPdf(req) {
 const PLACEHOLDER = /\{([^{}]+)\}/g;
 // The run element of a part, capturing its text. `prefix` is the run element's
 // name up to the tag itself: `a:` in a drawing part, empty in a workbook part.
-const runPattern = (prefix) => new RegExp(`<${prefix}t(?:\\s[^>]*)?>([\\s\\S]*?)</${prefix}t>`, "g");
+const runPattern = (prefix) => new RegExp(`${openTag(`${prefix}t`)}([\\s\\S]*?)${closeTag(`${prefix}t`)}`, "g");
 // The workbook's shared-string table, its `<si>` entries read as elements.
 const SHARED_STRINGS_PART = "xl/sharedStrings.xml";
 
@@ -745,7 +772,7 @@ function templateError(error) {
 // convention, which the reader that does know it can still accept.
 function packageFamily(zip) {
   if (zip.file("word/document.xml")) return "docx";
-  if (zip.file("xl/workbook.xml")) return "xlsx";
+  if (zip.file(XLSX_WORKBOOK)) return "xlsx";
   if (zip.file("ppt/presentation.xml")) return "pptx";
   return null;
 }
@@ -800,6 +827,10 @@ function fillDocxOrPptx(req) {
   return { buffer: out.generate({ type: "nodebuffer", compression: "DEFLATE" }), missing: [...missing], placeholders: tags.size };
 }
 
+// A cell's `<v>` element, read with the shared spellings (`openTag`/`closeTag`), so a
+// `<v >` is the element a `<v>` is, like every other element this kit reads.
+const CELL_VALUE = new RegExp(`${openTag("v")}\\s*(\\d+)\\s*${closeTag("v")}`);
+
 // The shared string a `t="s"` cell indexes into, joined and unescaped, or `null`
 // when the cell is not a shared-string cell (or the table does not have that
 // index). A workbook written by Excel, Sheets or LibreOffice keeps EVERY string
@@ -807,7 +838,7 @@ function fillDocxOrPptx(req) {
 // displays.
 function sharedStringOf(cell, shared) {
   if (!/\bt="s"/.test(cell)) return null;
-  const index = Number((cell.match(/<v>\s*(\d+)\s*<\/v>/) || [])[1]);
+  const index = Number((cell.match(CELL_VALUE) || [])[1]);
   return shared[index] ?? null;
 }
 
@@ -852,7 +883,7 @@ function fillCell(cell, reference, values, seen, missing, shared) {
 function fillXlsxSheet(xml, values, seen, missing, shared) {
   let rowNumber = 0;
   let column = 0;
-  return xml.replace(/<row\b[^>]*\/>|<row\b[^>]*>|<c\b[^>]*\/>|<c\b[^>]*>[\s\S]*?<\/c>/g, (part) => {
+  return xml.replace(new RegExp(`${selfClosingTag("row")}|${openTag("row")}|${selfClosingTag("c")}|${openTag("c")}[\\s\\S]*?${closeTag("c")}`, "g"), (part) => {
     if (part.startsWith("<row")) {
       rowNumber = Number((part.match(/\br="(\d+)"/) || [])[1]) || rowNumber + 1;
       column = 0;
@@ -930,9 +961,14 @@ function openEdit(req, family) {
   let changed = false;
   let touched = false;
   let work = 0;
-  // Charge one walk over a part's text against the call's budget. `part` charges
-  // the pass it makes; an arm whose edits walk a part outside one `part` call
-  // charges its own walks with this, so the budget covers them too.
+  // Charge one walk over a part's text against the call's budget. The budget bounds
+  // the work a call does rather than the distinct bytes it touches, so a part taken
+  // into hand twice is charged twice: `part`, `sheet` and `read` charge the pass each
+  // makes, `rewrite` none, and the arms that walk a part of their own charge theirs
+  // with this (the docx arm, `formatCells`' index cache, `addRelationship`). The pptx
+  // arms that read a slide, a notes part or the presentation off the archive with
+  // `zip.file(…).asText()` walk their parts uncharged, so the bound is short of the
+  // work they do.
   const charge = (length) => {
     work += length;
     if (work > EDIT_WORK_MAX) throw editWorkRefusal(work);
@@ -962,6 +998,48 @@ function openEdit(req, family) {
       const written = change(xml);
       if (written !== xml) { zip.file(name, written); changed = true; }
     },
+    // `part`'s own rule (only a real change is written), for the SHEET parts, plus
+    // the one refusal this family needs: the written part must not hold two elements
+    // at an address the part arrived as holding fewer of — a `<row>` number or a `<c>`
+    // address two of them share, which a reader offers to repair and the reply would
+    // pass off as a success. An edit places its content by the address it reads, so a
+    // row it removes or adds can move an element that states no `r` onto the address
+    // another one already holds. A repeat the part arrived with is passed over where
+    // it stands and a part whose rows cannot be read is not refused for the check's
+    // own sake (see `addedRepeat`); the two readings are charged like every other
+    // walk, and a change that changed nothing is not read a third time.
+    sheet(name, change) {
+      const file = zip.file(name);
+      if (!file) return;
+      const before = file.asText();
+      charge(before.length);
+      const after = change(before);
+      if (after === before) return;
+      charge(after.length);
+      const repeated = addedRepeat(before, after);
+      if (repeated) throw new UsageError(`${addressLabel(repeated)} would be stated twice in the sheet part — two elements claiming one address is a part a reader offers to repair, so this edit was refused rather than written`);
+      zip.file(name, after);
+      changed = true;
+    },
+    // Read a part's text and charge the walk over it, for an arm that reads a part
+    // outside one `part` call (see `charge`). `undefined` for a part the package
+    // does not hold, so a caller can tell "no part" from "an empty one".
+    read(name) {
+      const file = zip.file(name);
+      if (!file) return undefined;
+      const xml = file.asText();
+      charge(xml.length);
+      return xml;
+    },
+    // Write a part back as the text the caller read and charged, `from`, compared
+    // against it: `part`/`sheet` would read and charge the same text again, counting
+    // one call's work twice (`formatCells` and `setCell` grow the styles part across
+    // a whole walk and write it once, this way).
+    rewrite(name, from, to) {
+      if (from === to) return;
+      zip.file(name, to);
+      changed = true;
+    },
     // Add a part the input did not have, or put one back with new content —
     // `pptx_edit`'s slide add is the operation that means to. A name the package
     // already holds with the same content is not a change.
@@ -990,6 +1068,11 @@ function editList(req) {
   if (req.edits.length > RULES.edits_max) throw new UsageError(`a call may carry at most ${RULES.edits_max} edits, got: ${req.edits.length}`);
   return req.edits;
 }
+
+// A package with no `[Content_Types].xml` is not one this kit can edit: it could
+// not declare a part it adds. The sentence names the file the way the pptx media
+// path names it, so both families refuse it the same way.
+const missingContentTypes = (input) => new UsageError(`cannot edit ${nodePath.basename(input)}: it has no [Content_Types].xml part`);
 
 // One string an edit names — a find, a replacement, an inserted text — as the
 // kit's last line after the tool's own boundary: text, and inside the cap the
@@ -1023,10 +1106,10 @@ function occurrences(text, find) {
 }
 
 // ── docx_edit ──────────────────────────────────────────────────
-// The three spellings a tag is written in — `<w:p/>`, `<w:p …>`, `</w:p>` — as
-// the balanced walker `tagSpans` reads them. One definition of the rule, so a
+// The three spellings a tag is written in (`selfClosingTag`/`openTag`/`closeTag`),
+// as the balanced walker `tagSpans` reads them. One definition of the rule, so a
 // family walked later cannot be handed a pattern missing a spelling.
-const tagPattern = (name) => new RegExp(`<${name}(?:\\s[^>]*)?/>|<${name}(?:\\s[^>]*)?>|</${name}>`, "g");
+const tagPattern = (name) => new RegExp(`${selfClosingTag(name)}|${openTag(name)}|${closeTag(name)}`, "g");
 
 // A text edit addresses the joined, unescaped text of a `<w:p>` paragraph's
 // `<w:t>` runs. A field's cached result is not body text, and a run inside a
@@ -1049,11 +1132,13 @@ const missingFind = (find) => `the text ${JSON.stringify(find)} is not in the do
 
 // The one balanced scan every "walk the elements of one tag family" caller here
 // is built on. It returns one entry per COMPLETE element of `pattern`'s family:
-// `start`/`end` are byte offsets, `depth` is the element's own nesting level
-// among its family (`1` for a top-level one), and `selfClosing` says whether it
-// was written `<name/>`. A self-closing element is complete where it opens, a
-// child-bearing one where its own close balances it, so the entries come out in
-// the order the scan finishes them — the order each walk this replaced produced.
+// `start`/`end` are byte offsets, `closeAt` is where the element's own close tag
+// begins (the place a child added "at the end" goes), `depth` is the element's own
+// nesting level among its family (`1` for a top-level one) and `selfClosing` says
+// whether it was written `<name/>`. A self-closing element is complete where it
+// opens, a child-bearing one where its own close balances it, so the entries come
+// out in the order the scan finishes them — the order each walk this replaced
+// produced.
 function tagSpans(xml, pattern) {
   const spans = [];
   const stack = [];
@@ -1065,7 +1150,7 @@ function tagSpans(xml, pattern) {
     }
     if (tag.startsWith("</")) {
       const open = stack.pop();
-      if (open) spans.push({ start: open.start, end: match.index + tag.length, depth: open.depth, selfClosing: false });
+      if (open) spans.push({ start: open.start, end: match.index + tag.length, closeAt: match.index, depth: open.depth, selfClosing: false });
     } else {
       stack.push({ start: match.index, depth: stack.length + 1 });
     }
@@ -1191,7 +1276,7 @@ function runSpans(fragment) {
 // over the whole part — this runs once per run, so re-scanning the whole part
 // each time would be quadratic.
 function elementSpan(xml, at, name) {
-  const open = new RegExp(`<${name}(?:\\s[^>]*)?>|<${name}(?:\\s[^>]*)?/>`, "g");
+  const open = new RegExp(`${selfClosingTag(name)}|${openTag(name)}`, "g");
   open.lastIndex = at;
   const first = open.exec(xml);
   if (!first || first.index !== at) return undefined;
@@ -1212,11 +1297,11 @@ function elementSpan(xml, at, name) {
 // nested `<w:rPrChange>` holds (a tracked formatting revision would otherwise
 // take the edit meant for the run).
 function runProperties(runXml) {
-  const open = runXml.match(/<w:r(?:\s[^>]*)?>/);
+  const open = runXml.match(new RegExp(openTag("w:r")));
   if (!open) return undefined;
   const rest = runXml.slice(open.index + open[0].length);
   const lead = rest.length - rest.trimStart().length;
-  if (!/^<w:rPr(?:\s[^>]*)?>|^<w:rPr(?:\s[^>]*)?\/>/.test(rest.trimStart())) return undefined;
+  if (!new RegExp(`^(?:${openTag("w:rPr")}|${selfClosingTag("w:rPr")})`).test(rest.trimStart())) return undefined;
   const span = elementSpan(runXml, open.index + open[0].length + lead, "w:rPr");
   return span ? runXml.slice(span.start, span.end) : undefined;
 }
@@ -1238,7 +1323,7 @@ function docxRuns(fragment, extra = []) {
   for (const span of runSpans(fragment)) {
     if (span.depth !== 1 || inExcluded(span.start)) continue;
     const runXml = fragment.slice(span.start, span.end);
-    if (/<w:rPr(?:\s[^>]*)?>[\s\S]*?<w:sectPr\b/.test(runXml)) continue;
+    if (new RegExp(`${openTag("w:rPr")}[\\s\\S]*?<w:sectPr\\b`).test(runXml)) continue;
     const index = runs.length;
     runs.push({ start: span.start, end: span.end, rpr: runProperties(runXml) });
     for (const match of runXml.matchAll(DOCX_TEXT)) {
@@ -1411,35 +1496,42 @@ function replaceOccurrences(xml, runs, slots, offsets, replacement, note, prefix
 // being shifted, an old `<w:sz>` left beside the new one). `middle` is what the
 // open tag holds between the name and the tag's own close (`>` or `/>`); the
 // default states nothing but whatever attributes the tag carries. Built per call,
-// so no `lastIndex` of a global pattern is carried from one use to the next.
-const elementForms = (name, middle = "(?:\\s[^>]*)?") => new RegExp(`<${name}${middle}/>|<${name}${middle}>[\\s\\S]*?</${name}>`, "g");
+// so no `lastIndex` of a global pattern is carried from one use to the next. The
+// two shapes are the shared spellings (`selfClosingTag`/`openTag`/`closeTag`), so
+// this reader, `tagPattern`'s walk and `elementEdges`' own read cannot disagree
+// about what a tag of `name` looks like.
+const elementForms = (name, middle = TAG_MIDDLE) => new RegExp(`${selfClosingTag(name, middle)}|${openTag(name, middle)}[\\s\\S]*?${closeTag(name)}`, "g");
 const elementPattern = (name) => elementForms(name);
+
+// The FIRST `<name>` element of `xml`, as a match object with its own `index`:
+// `elementPattern` is global, and `String.match` with a global pattern returns
+// the matched TEXTS rather than a match with an index, so anything that needs
+// the position of an element uses this. Only the first match is taken, so no
+// caller materializes the rest of the part.
+const firstElement = (xml, name) => xml.matchAll(elementPattern(name)).next().value;
+
+// The `<name>` element a caller is about to write BESIDE — `firstElement`'s own
+// answer, with a part that states the element's open tag and no close refused rather
+// than read as absent: `elementForms` reads the closed shapes alone, and a second
+// `<sheetData>`, `<cols>` or styles block written beside an unclosed one is a part a
+// reader offers to repair, the one outcome an edit must not report as a success.
+// `what` names the part the caller is writing into.
+const writableElement = (xml, name, what) => {
+  const found = firstElement(xml, name);
+  if (found) return found;
+  if (openedNotClosed(xml, name)) {
+    throw new UsageError(`${what} holds <${name}> opened and never closed, so a second <${name}> cannot be written beside it`);
+  }
+  return undefined;
+};
 
 // ECMA-376's `EG_RPrBase`: the order a run's own `<w:rPr>` children must come in.
 // Word drops a child written out of sequence, so a property appended at the end
 // of the body would be reported as applied while the run renders as it did.
-// `<w:rPrChange>` is not part of the sequence; the caller keeps it last.
+// `<w:rPrChange>` is not part of the sequence; the caller keeps it last. The body
+// is flat — that one child, which holds others, is split off before a body reaches
+// the writer — so `insertOrderedChild` writes each child as one complete element.
 const RUN_PROPERTY_ORDER = ["rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline", "shadow", "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern", "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout", "specVanish", "oMath"];
-
-// Where a run property sorts in that sequence; a name the sequence does not hold
-// sorts after every one it does, so nothing is written before an element this
-// kit cannot place.
-const runPropertyRank = (name) => {
-  const rank = RUN_PROPERTY_ORDER.indexOf(name);
-  return rank < 0 ? RUN_PROPERTY_ORDER.length : rank;
-};
-
-// `body` with `element` written where `EG_RPrBase` puts it: after every child the
-// sequence puts before it and before the first it puts after it. A body is flat —
-// the one child that holds others, `<w:rPrChange>`, is split off before a body
-// reaches here — so each child is one complete `<w:name>` element.
-function insertRunProperty(body, name, element) {
-  const rank = runPropertyRank(name);
-  for (const match of body.matchAll(/<w:([A-Za-z0-9_]+)(?:\s[^>]*)?\/>|<w:([A-Za-z0-9_]+)(?:\s[^>]*)?>[\s\S]*?<\/w:\2>/g)) {
-    if (runPropertyRank(match[1] ?? match[2]) > rank) return body.slice(0, match.index) + element + body.slice(match.index);
-  }
-  return body + element;
-}
 
 // The run-properties body with a bold/italic toggle set or removed. Setting one
 // writes it at its place in the sequence, so a toggle added to a body that
@@ -1447,14 +1539,14 @@ function insertRunProperty(body, name, element) {
 // would drop it.
 function runToggle(body, name, on) {
   const without = body.replace(elementPattern(`w:${name}`), "");
-  return on ? insertRunProperty(without, name, `<w:${name}/>`) : without;
+  return on ? insertOrderedChild(without, name, `<w:${name}/>`, RUN_PROPERTY_ORDER) : without;
 }
 
 // The `<w:rPr>` the format request needs, from the run's own: a boolean writes
 // or drops a `<w:b>`/`<w:i>`, and `size` replaces the run's own `<w:sz>`/
 // `<w:szCs>` — in either shape — with the half-point value, the unit `<w:sz>`
 // counts in. Each property is written at its own place in `EG_RPrBase` (see
-// `insertRunProperty`). A `null` property counts as absent — the caller's own
+// `insertOrderedChild`). A `null` property counts as absent — the caller's own
 // boundary treats a null-valued key that way — so only a stated one is written.
 //
 // A `<w:rPrChange>` holds the properties a tracked formatting revision recorded
@@ -1469,16 +1561,16 @@ function runToggle(body, name, on) {
 // answering itself by deleting a recorded change.
 function formattedRunProperties(runXml, edit) {
   const current = runProperties(runXml);
-  const inner = current ? current.replace(/^<w:rPr(?:\s[^>]*)?\/?>/, "").replace(/<\/w:rPr>$/, "") : "";
-  const revisionAt = inner.search(/<w:rPrChange(?:\s[^>]*)?\/?>/);
+  const inner = current ? current.replace(new RegExp(`^(?:${selfClosingTag("w:rPr")}|${openTag("w:rPr")})`), "").replace(new RegExp(closeTag("w:rPr") + "$"), "") : "";
+  const revisionAt = inner.search(new RegExp(`${selfClosingTag("w:rPrChange")}|${openTag("w:rPrChange")}`));
   const revision = revisionAt < 0 ? undefined : elementSpan(inner, revisionAt, "w:rPrChange");
   let body = revision ? inner.slice(0, revision.start) : inner;
   if (edit.bold != null) body = runToggle(body, "b", edit.bold);
   if (edit.italic != null) body = runToggle(body, "i", edit.italic);
   if (edit.size != null) {
     const without = body.replace(elementPattern("w:sz"), "").replace(elementPattern("w:szCs"), "");
-    body = insertRunProperty(without, "szCs", `<w:szCs w:val="${edit.size}"/>`);
-    body = insertRunProperty(body, "sz", `<w:sz w:val="${edit.size}"/>`);
+    body = insertOrderedChild(without, "szCs", `<w:szCs w:val="${edit.size}"/>`, RUN_PROPERTY_ORDER);
+    body = insertOrderedChild(body, "sz", `<w:sz w:val="${edit.size}"/>`, RUN_PROPERTY_ORDER);
   }
   if (!body && !revision) return "";
   return `<w:rPr>${body}${revision ? inner.slice(revision.start) : ""}</w:rPr>`;
@@ -1494,7 +1586,7 @@ function formatRuns(xml, runs, runIndices, edit) {
   for (const index of [...runIndices].sort((a, b) => a - b)) {
     const run = runs[index];
     const runXml = xml.slice(run.start, run.end);
-    const open = runXml.match(/<w:r(?:\s[^>]*)?>/)[0];
+    const open = runXml.match(new RegExp(openTag("w:r")))[0];
     const next = formattedRunProperties(runXml, edit);
     // A run's properties sit immediately after its open tag, before its content,
     // and are replaced by their own balanced span: a lazy regex would stop at the
@@ -1521,10 +1613,13 @@ function formatRuns(xml, runs, runIndices, edit) {
 // sits inside a paragraph's `<w:pPr>` — so only a `<w:sectPr>` outside every
 // paragraph counts, and the body's own is the last of those.
 function bodyEnd(xml) {
-  const body = xml.match(/<w:body(?:\s[^>]*)?>[\s\S]*<\/w:body>/);
+  const body = xml.match(new RegExp(`${openTag("w:body")}([\\s\\S]*)${closeTag("w:body")}`));
   if (!body) throw new UsageError("the document has no body to add a paragraph to");
+  // The content is the match's own middle, not a slice up to a close tag spelled
+  // out again: a body whose close carries whitespace (`</w:body >`) is read by the
+  // pattern above and by nothing else.
+  const content = body[1];
   const open = body[0].indexOf(">") + 1;
-  const content = body[0].slice(open, body[0].lastIndexOf("</w:body>"));
   const paragraphs = docxParagraphs(content);
   const insideParagraph = (at) => paragraphs.some((span) => at >= span.start && at < span.end);
   let at = content.length;
@@ -1705,29 +1800,61 @@ const ROW_ELEMENT = elementPattern("row");
 const CELL_ELEMENT = elementPattern("c");
 const styleOf = (cell) => (cell.match(/\bs="(\d+)"/) || [])[1];
 
-// The `<row>` elements of a sheet, each with the number it holds and its span: a
-// row that left `r` out stands for the one after its predecessor.
+// Whether a part opens a `<name>` element and never closes it. `elementPattern` reads
+// the closed shapes alone, so such an element is invisible to every reader here, and a
+// writer places its content relative to what it cannot see — a second `<row>` beside
+// the one it missed, a `<c>` nested inside it. A sheet's rows, and a row's cells, hold
+// no elements of their own kind, so the tag spellings are counted rather than parsed —
+// the shared ones (`tagPattern`), so this test and the walk agree about every shape.
+const openedNotClosed = (xml, name) => {
+  let opens = 0;
+  let closes = 0;
+  for (const tag of xml.matchAll(tagPattern(name))) {
+    if (tag[0].startsWith("</")) closes += 1;
+    else if (!tag[0].endsWith("/>")) opens += 1;
+  }
+  return opens > closes;
+};
+
+// `items` in ascending order of the number `at` reads off one: a list already
+// ascending is returned as it stands — so a caller can keep the text between the
+// items of a part it does not reorder — while one no writer produces is put in
+// address order, the way a reader expects them rather than the way they arrived. An
+// item that states no address of its own IS the position it sits in, so such a list
+// is refused (`where` names it) rather than silently relocated.
+const ascending = (items, at, where) => {
+  if (items.every((item, index) => index === 0 || at(item) > at(items[index - 1]))) return items;
+  if (items.some((item) => !item.stated)) throw new UsageError(`${where} are not in address order and one of them states no address of its own, so reordering them would move what it holds`);
+  return [...items].sort((a, b) => at(a) - at(b));
+};
+
+// The `<row>` elements of a sheet, each with the number it holds, its span and whether
+// it states that number itself: a row that left `r` out stands for the one after its
+// predecessor.
 function sheetRows(xml) {
+  if (openedNotClosed(xml, "row")) throw new UsageError("the sheet part holds a <row> opened and never closed, so its rows cannot be read");
   const rows = [];
   let number = 0;
   for (const match of xml.matchAll(ROW_ELEMENT)) {
     const attribute = (match[0].match(/\br="(\d+)"/) || [])[1];
     number = attribute ? Number(attribute) : number + 1;
-    rows.push({ start: match.index, end: match.index + match[0].length, number, xml: match[0] });
+    rows.push({ start: match.index, end: match.index + match[0].length, number, stated: attribute !== undefined, xml: match[0] });
   }
   return rows;
 }
 
-// The `<c>` elements of one row, each with the zero-based column it addresses: a
-// cell that left `r` out stands for the position it sits in.
+// The `<c>` elements of one row, each with the zero-based column it addresses and
+// whether it states that address itself: a cell that left `r` out stands for the
+// position it sits in.
 function rowCells(rowXml) {
+  if (openedNotClosed(rowXml, "c")) throw new UsageError("the sheet part holds a <c> opened and never closed, so its cells cannot be read");
   const cells = [];
   let column = 0;
   for (const match of rowXml.matchAll(CELL_ELEMENT)) {
     const attribute = (match[0].match(/\br="([A-Za-z]+\d+)"/) || [])[1];
     const index = attribute ? columnOf(attribute) : column;
     column = index + 1;
-    cells.push({ start: match.index, end: match.index + match[0].length, column: index, xml: match[0] });
+    cells.push({ start: match.index, end: match.index + match[0].length, column: index, address: attribute, stated: attribute !== undefined, xml: match[0] });
   }
   return cells;
 }
@@ -1744,18 +1871,83 @@ function usedRange(xml) {
   return { rowMax, columnMax };
 }
 
+// How many elements a sheet part holds at each address, or `undefined` for a part
+// whose rows or cells a reader refuses (see `openedNotClosed`) — a reading with
+// nothing to compare against is skipped rather than turned into a refusal an edit
+// that never needed the rows (a column width) does not owe. An address is keyed by
+// itself — a row as `#3`, a cell by its reference folded to upper case, so two
+// spellings of one address are one key — and an element that states no `r` of its own
+// counts at the position `sheetRows`/`rowCells` resolve for it, the format making `r`
+// optional and inferred. A count above one is two elements claiming one address.
+const rowKey = (number) => `#${number}`;
+function addressCounts(xml) {
+  const counts = new Map();
+  const bump = (key) => counts.set(key, (counts.get(key) ?? 0) + 1);
+  try {
+    for (const row of sheetRows(xml)) {
+      bump(rowKey(row.number));
+      for (const cell of rowCells(row.xml)) bump((cell.address ?? `${colName(cell.column)}${row.number}`).toUpperCase());
+    }
+  } catch (error) {
+    if (error instanceof UsageError) return undefined;
+    throw error;
+  }
+  return counts;
+}
+
+// The words an answer names one of those addresses by.
+const addressLabel = (key) => (key.startsWith("#") ? `the row ${key.slice(1)}` : `the cell ${key}`);
+
+// The first address `after` holds more elements at than `before` did, or `undefined`
+// when there is none to tell. A repeat counts only where the part the edit was built
+// from held fewer there, so a repeat that part arrived with is passed over where it
+// stands and refused only once an edit carries it onto an address the part held one
+// element at; a part whose rows cannot be read is not refused for the check's own
+// sake.
+function addedRepeat(before, after) {
+  const was = addressCounts(before);
+  if (!was) return undefined;
+  for (const [address, count] of addressCounts(after) ?? []) {
+    if (count > 1 && count > (was.get(address) ?? 0)) return address;
+  }
+  return undefined;
+}
+
+// A sheet's `<col>` entries in the file's own order: the text each is spelled with,
+// its 1-based `min`/`max` span (`NaN` for one a reader cannot place, which therefore
+// covers no column) and the `style` it states. ONE reading of the block for the three
+// callers that each had their own copy of it — the style a cell inherits
+// (`columnStyleEntries`), the entry a `format_cells` covers (`formatColumn`) and the
+// entry it splits (`splitColumn`) — and every entry's own text is kept, so a block
+// rewritten from these keeps the entries it does not name byte for byte. `[]` for a
+// sheet with no `<cols>` block at all.
+const colEntries = (sheet) => {
+  const cols = firstElement(sheet, "cols");
+  if (!cols) return [];
+  return [...cols[0].matchAll(elementPattern("col"))].map((match) => ({
+    text: match[0],
+    min: Number((match[0].match(/\bmin="(\d+)"/) || [])[1]),
+    max: Number((match[0].match(/\bmax="(\d+)"/) || [])[1]),
+    style: (match[0].match(/\bstyle="(\d+)"/) || [])[1],
+  }));
+};
+
 // The workbook's sheets in its own order, each `<sheet>` element's name beside the
 // part it addresses: the target of the relationship its `r:id` names, resolved by
 // the one OPC resolver `resolvePart` — an absolute `/xl/worksheets/sheet1.xml`, a
 // relative `worksheets/sheet1.xml` and a target spelled with `..` all name the part
 // the resolver folds them to — and, for a relationship the workbook does not
 // declare, the conventional part name for that position, the same fallback the
-// reader makes. `named` says which of the two it was.
-function workbookSheets(zip) {
-  const workbook = zip.file("xl/workbook.xml");
-  if (!workbook) return [];
-  const targets = relationshipMap(zip.file("xl/_rels/workbook.xml.rels")?.asText() ?? "");
-  return [...workbook.asText().matchAll(/<sheet\b[^>]*\/>|<sheet\b[^>]*>/g)].map((match, index) => {
+// reader makes. `named` says which of the two it was. Both parts are read through
+// the editor (`read`), so the workbook and its relationships are charged like every
+// other part an edit takes into hand: reading them is work a check can spend the
+// call's budget on, and a read that skipped the charge would be a hole in the bound
+// the caller is refused by.
+function workbookSheets(editor) {
+  const workbook = editor.read(XLSX_WORKBOOK);
+  if (workbook === undefined) return [];
+  const targets = relationshipMap(editor.read(XLSX_WORKBOOK_RELS) ?? "");
+  return [...workbook.matchAll(new RegExp(`${selfClosingTag("sheet")}|${openTag("sheet")}`, "g"))].map((match, index) => {
     const id = xmlAttribute(match[0], "r:id");
     const target = id === undefined ? undefined : targets.get(id);
     return {
@@ -1768,14 +1960,16 @@ function workbookSheets(zip) {
 
 // The part a sheet NAME addresses, through `xl/workbook.xml` and its
 // relationships. The name is matched the way Excel matches one — ignoring case,
-// in the workbook's own order — while a refusal keeps the file's spelling.
-function sheetPart(zip, name) {
-  const sheets = workbookSheets(zip);
+// in the workbook's own order — while a refusal keeps the file's spelling. The
+// part's own presence is checked on the archive (`zip.file`), which decompresses
+// nothing; the sheet's text is the caller's own read, charged once there.
+function sheetPart(editor, name) {
+  const sheets = workbookSheets(editor);
   const wanted = typeof name === "string" ? name.toLowerCase() : null;
   const index = wanted === null ? -1 : sheets.findIndex((sheet) => sheet.name.toLowerCase() === wanted);
   if (index < 0) throw new UsageError(`there is no sheet named ${JSON.stringify(name)}: this workbook has ${listed(sheets.map((sheet) => sheet.name)) || "no sheets"}`);
   const { part, named } = sheets[index];
-  if (!zip.file(part)) {
+  if (!editor.zip.file(part)) {
     throw new UsageError(named
       ? `the sheet ${JSON.stringify(sheets[index].name)} names the part ${part}, which the package does not have`
       : `the sheet ${JSON.stringify(sheets[index].name)} has no worksheet part: the workbook's relationships do not name one and the package has no ${part}`);
@@ -1800,8 +1994,15 @@ function rowNumber(value) {
   return value;
 }
 
+// The 1-based column a caller's own `column` field names: one to three UPPERCASE
+// letters, exactly the shape the Rust boundary's `column_number` accepts, so the
+// kit cannot take a spelling the boundary would already have refused. The
+// cell-address reader (`cellAddress`) stays tolerant of either case because it
+// also reads the refs a file states of its own — a `<mergeCell ref>`, an
+// `<autoFilter ref>` — where a lowercase letter is a writer's spelling rather
+// than a request this kit gets to judge.
 function columnNumber(value) {
-  if (typeof value !== "string" || !/^[A-Za-z]{1,3}$/.test(value) || columnOf(value) + 1 > RULES.sheet_column_max) {
+  if (typeof value !== "string" || !/^[A-Z]{1,3}$/.test(value) || columnOf(value) + 1 > RULES.sheet_column_max) {
     throw new UsageError(`column must be column letters between A and ${colName(RULES.sheet_column_max - 1)}, got: ${JSON.stringify(value)}`);
   }
   return columnOf(value) + 1;
@@ -1821,76 +2022,455 @@ function valueCell(reference, value, style) {
   return `<c r="${reference}"${attribute} t="inlineStr"><is><t xml:space="preserve">${xmlEscape(scalar)}</t></is></c>`;
 }
 
-// The `<xf>` entries of a `<cellXfs>` block, in either shape: an entry may hold
-// an `<alignment>` or a `<protection>` (both legal `CT_Xf`), and a filter that
-// kept only the self-closing ones would drop those entries and shift every cell's
-// `s=` index.
-const CELL_XFS = elementPattern("xf");
+// The blocks of a `<styleSheet>` an edit reads or grows, and the element name one
+// entry of each takes: they are read and grown by one rule rather than one per
+// block. Each entry is matched in either shape — an `<xf>`, say, may hold an
+// `<alignment>` or a `<protection>` (both legal `CT_Xf`), and a matcher that kept
+// only the self-closing ones would drop the entry and shift every cell's `s=`
+// index. `<cellStyleXfs>` is where an id a cell xf omits resolves from and
+// `<cellStyles>` where a workbook's named styles live: both are read wherever the
+// part states them, and written with the default entry only when it states none —
+// a cell xf names a style in `<cellStyleXfs>` and a workbook states its default
+// style in `<cellStyles>`, so a part grown without them would point at blocks it
+// does not hold (see `STYLE_REFERENCES`).
+const STYLE_BLOCKS = { numFmts: "numFmt", fonts: "font", fills: "fill", borders: "border", cellXfs: "xf", cellStyleXfs: "xf", cellStyles: "cellStyle" };
 
-// The `<numFmt>` entries of a `<numFmts>` block, both shapes for the same reason
-// as the `<xf>` match above: a part that spelled an entry the paired way would
-// otherwise be dropped and its id handed to a different format.
-const NUM_FMT = elementPattern("numFmt");
+// `CT_Stylesheet`'s child order. A block the part lacks is created at its own
+// place in it: a `<fonts>` written after `<cellXfs>`, say, is a styles part a
+// reader may drop.
+const STYLESHEET_ORDER = ["numFmts", "fonts", "fills", "borders", "cellStyleXfs", "cellXfs", "cellStyles", "dxfs", "tableStyles", "colors", "extLst"];
+const stylesheetRank = (name) => {
+  const rank = STYLESHEET_ORDER.indexOf(name);
+  return rank < 0 ? STYLESHEET_ORDER.length : rank;
+};
 
-// `xf` — either form — with its number format set to `id` and `applyNumberFormat`
-// stated. Cloning the entry a cell already uses keeps that cell's font, fill,
-// border and alignment; the attribute is set even when the entry states it, since
-// the entry is cloned for the format the caller asked for and a `0` the cell's own
-// entry left behind would write the id and leave the format inert.
-function withNumberFormat(xf, id) {
-  let out = xf.replace(/\bnumFmtId="[^"]*"/, () => `numFmtId="${id}"`);
-  if (!/\bnumFmtId=/.test(out)) out = out.replace(/^<xf\b/, (open) => `${open} numFmtId="${id}"`);
-  out = /\bapplyNumberFormat=/.test(out)
-    ? out.replace(/\bapplyNumberFormat="[^"]*"/, () => 'applyNumberFormat="1"')
-    : out.replace(/^<xf\b/, (open) => `${open} applyNumberFormat="1"`);
-  return out;
+// The neutral `<xf>` the two xf blocks' index-0 entries are built from: it names
+// every format as 0 — no number format, font, fill or border of its own — so it
+// restyles nothing. The cell xf adds the `xfId="0"` that points it at cell style
+// 0; the cell-style xf states none, since it is the style an id resolves from.
+const NEUTRAL_XF = '<xf numFmtId="0" fontId="0" fillId="0" borderId="0"';
+
+// The entry each `<styleSheet>` block states when it holds one, and the block a
+// part states with it: ONE statement of the defaults, read by `MINIMAL_STYLES`
+// (the part a workbook this kit creates gets) and by the entries a part that never
+// stated a block is grown with (`putStyleEntry`), so a created workbook and a grown
+// part state the same font 0, fill 0 and `<xf>` 0.
+const STYLE_PART_ENTRIES = {
+  fonts: '<font><sz val="11"/><name val="Calibri"/></font>',
+  fills: '<fill><patternFill patternType="none"/></fill>',
+  borders: "<border/>",
+  cellStyleXfs: `${NEUTRAL_XF}/>`,
+  cellXfs: `${NEUTRAL_XF} xfId="0"/>`,
+  cellStyles: '<cellStyle name="Normal" xfId="0" builtinId="0"/>',
+};
+// The block a styles part states with one entry in it.
+const styleBlock = (block) => `<${block} count="1">${STYLE_PART_ENTRIES[block]}</${block}>`;
+
+// The styles part a workbook this kit creates is written with, in `CT_Stylesheet`'s own
+// order: one font, the "none" fill, no border and the `<cellStyleXfs>`/`<cellXfs>` pair
+// every `<styleSheet>` states — the blocks and entries `STYLE_PART_ENTRIES` states once,
+// so a created workbook and a part an edit grows state the same font 0, fill 0 and `<xf>`
+// 0. The default style `<cellStyles>` holds is not among them: creating a workbook has
+// never written one (this op leaves creation as it was), and a part grown for a style
+// entry is given the blocks that entry's ids resolve into (`STYLE_REFERENCES`),
+// `<cellStyles>` included.
+const MINIMAL_STYLES = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${Object.keys(STYLE_PART_ENTRIES).filter((block) => block !== "cellStyles").sort((a, b) => stylesheetRank(a) - stylesheetRank(b)).map(styleBlock).join("")}</styleSheet>`;
+
+// The `<styleSheet>` root of a styles part, in the one reading of an element's shape
+// (`elementEdges`), and `undefined` for a part whose root is missing or never closed —
+// `firstElement` reads closed elements alone — so an opening check and a writer reading
+// through this cannot disagree about what "writable" means: a part spelled
+// `</styleSheet >` is sound, and a writer matching the close tag literally would write
+// past it and report a success over a part that never took the child.
+function stylesRoot(styles) {
+  const found = firstElement(styles, "styleSheet");
+  if (!found) return undefined;
+  const edges = elementEdges(found[0], "styleSheet");
+  return { open: edges.open, selfClosing: edges.selfClosing, close: found.index + edges.close };
 }
 
-// The `<cellXfs>` index a cell takes for `formatCode`: the cell's own entry —
-// `cellStyle`, when it indexes a real `<xf>` — cloned with the format changed,
-// or a fresh minimal entry for a cell with no style. An identical entry already
-// in the list is reused rather than appended twice, and the index returned is the
-// entry's real position in the list. The lookup is through the workbook's own
-// `<numFmts>` table: a built-in id the file does not spell out resolves to
-// whatever code the reader's locale gives it, so it is not guessed at, and a
-// format code is compared as text.
-function numberFormatStyle(styles, formatCode, cellStyle) {
+// `xml` with a whole `<name>` block inserted where `CT_Stylesheet` puts it: after every
+// block the schema orders before it and before the first it orders after. The scan is
+// over the schema's own block names, since an element scan would stop on an entry
+// nested in a block — a `<numFmt>` inside `<numFmts>` — instead of on the block itself.
+// A block written here is one its caller read through `writableElement` and found
+// absent, so a part that states its open tag without its close is already refused; a
+// self-closing root is opened around the element and a closed one takes it before its
+// own close.
+function insertStylesChild(xml, name, element) {
+  const root = stylesRoot(xml);
+  // An internal invariant rather than a caller's fault: `requireStylesRoot` refuses
+  // a part without a root before any edit runs.
+  if (!root) throw new Error(`there is no <styleSheet> root to write a <${name}> block into`);
+  if (root.selfClosing) return xml.slice(0, root.close - 2) + `>${element}</styleSheet>` + xml.slice(root.close);
+  const rank = stylesheetRank(name);
+  for (const later of STYLESHEET_ORDER.slice(rank + 1)) {
+    const found = firstElement(xml, later);
+    if (found) return xml.slice(0, found.index) + element + xml.slice(found.index);
+  }
+  return xml.slice(0, root.close) + element + xml.slice(root.close);
+}
+
+// The entries of a styles part's block — `<fonts>`, `<fills>`, `<borders>`,
+// `<cellXfs>`, `<cellStyleXfs>`, `<cellStyles>` — in the file's own order; `[]`
+// when the part has no such block at all. `putStyleEntry` is what adds one.
+function styleBlockEntries(styles, block) {
+  // A block the table states no entry element for is a rule this kit forgot, not
+  // a part with no entries: `elementPattern(undefined)` matches nothing, so the
+  // caller reads "this block states no entry" and writes its default over every
+  // byte the block really held. That is how a part whose `<cellStyles>` stated
+  // three named styles was replaced by the one default style.
+  if (!STYLE_BLOCKS[block]) throw new Error(`STYLE_BLOCKS states no entry element for the ${block} block`);
+  const found = firstElement(styles, block);
+  return found ? [...found[0].matchAll(elementPattern(STYLE_BLOCKS[block]))].map((match) => match[0]) : [];
+}
+
+// The blocks a style entry's ids resolve into, and the block a workbook states
+// its default style in. The entries this kit writes carry ids of their own: the
+// index-0 entry `STYLE_PART_ENTRIES` states names font 0, fill 0, border 0 and
+// style 0, and an `<xf>` omits what it does not state, which means id 0 too — so
+// a part that states none of those blocks would hold entries naming an id nothing
+// resolves, the dangling reference a reader refuses the whole styles part over.
+const STYLE_REFERENCES = { cellStyleXfs: ["fonts", "fills", "borders"], cellXfs: ["fonts", "fills", "borders", "cellStyleXfs", "cellStyles"] };
+
+// `styles` with `name` holding at least one entry, so the ids an entry names
+// resolve. A block the part does not state at all is written at its own
+// `CT_Stylesheet` place (`insertStylesChild`); a block the part states holding no
+// entry — a `<fills count="0"/>`, the shape a stripped workbook leaves — is
+// written over the block element itself, since there is no body to append an entry
+// to. A block that already states one keeps its own bytes.
+function ensureStyleBlock(styles, name) {
+  const found = writableElement(styles, name, "the styles part");
+  if (found && styleBlockEntries(styles, name).length) return styles;
+  return found ? styles.replace(found[0], () => styleBlock(name)) : insertStylesChild(styles, name, styleBlock(name));
+}
+
+// `styles` with every block `STYLE_REFERENCES` says `block`'s entries resolve into
+// grown, and each of those grown in turn: a `cellXfs` brings its `cellStyleXfs`,
+// whose own entry needs fonts, fills and borders. A no-op for a block that resolves
+// nothing — `fonts`, `fills`, `borders`, `numFmts` — so it runs unconditionally.
+function ensureStyleBlocks(styles, block) {
+  return (STYLE_REFERENCES[block] ?? []).reduce(
+    (out, name) => ensureStyleBlocks(ensureStyleBlock(out, name), name),
+    styles,
+  );
+}
+
+// The index `entry` takes in `block`'s list: an identical entry already there is reused
+// rather than added twice, else `entry` is appended and the block's `count` recomputed.
+// Entries keep their raw spelling, so adding one never rewrites the others. A block with
+// no entries takes the index-0 entry `STYLE_PART_ENTRIES` states first and `entry` at
+// index 1, so the entry never lands on the slot that restyles every cell naming no style
+// — and the blocks its ids resolve into are ensured first (`ensureStyleBlocks`).
+function putStyleEntry(styles, block, entry) {
+  const found = writableElement(styles, block, "the styles part");
+  const entries = found ? styleBlockEntries(styles, block) : [];
+  const existing = entries.indexOf(entry);
+  if (existing >= 0) return { styles, index: existing };
+  const written = entries.length ? [...entries, entry] : [STYLE_PART_ENTRIES[block], entry];
+  const body = written.join("");
+  const index = written.length - 1;
+  // The referenced blocks go into the text this call inserts into, so the block
+  // lands after them; the string match below still finds the element itself.
+  const base = ensureStyleBlocks(styles, block);
+  if (!found) return { styles: insertStylesChild(base, block, `<${block} count="${written.length}">${body}</${block}>`), index };
+  // The block's own open tag is kept — a `<cellXfs>`'s attributes, whatever it
+  // spells — and read through `elementParts`, so a close tag spelled with the
+  // whitespace XML allows does not make a closed block read as self-closing.
+  const { open } = elementParts(found[0], block);
+  return { styles: base.replace(found[0], () => `${setXmlAttribute(open, "count", String(written.length))}${body}</${block}>`), index };
+}
+
+// The open-tag/body/close shape of an element a part states: its own tag byte for byte
+// — a handler that rewrites a child keeps a `<border diagonalUp="1">` or a `<font>`'s
+// own attributes, which a rebuild from the tag name alone would drop — where its body
+// starts, whether it is self-closing and where its close tag starts. ONE reading of
+// the shape, shared by the element handlers (`elementParts`), the styles root
+// (`stylesRoot`) and a sheet's body (`sheetBody`). The close tag is read with the
+// whitespace XML allows before its `>` (`</name >`), the tolerance `elementForms`
+// states: a literal `</name>` test reads a sound element as self-closing and splices
+// its own open tag's close into the middle of it. This assumes `element` starts at the
+// element, which every caller's own match does. `close` is `undefined` for an element
+// a part opens and never closes.
+function elementEdges(element, name) {
+  // The open-tag pattern reads a self-closing tag too, whether or not the tag states
+  // an attribute before its `/` (`<border/>`): such a tag is the self-closing form and
+  // has no body.
+  const open = element.match(new RegExp(`^(?:${selfClosingTag(name)}|${openTag(name)})`))[0];
+  const bodyStart = open.length;
+  if (open.endsWith("/>")) return { open, bodyStart, selfClosing: true, close: bodyStart };
+  const close = element.slice(bodyStart).match(new RegExp(closeTag(name)));
+  return { open, bodyStart, selfClosing: false, close: close ? bodyStart + close.index : undefined };
+}
+
+// An element's open tag — the self-closing form opened, so a caller can write children
+// into it — and the text of its body, `""` for a self-closing element.
+function elementParts(element, name) {
+  const edges = elementEdges(element, name);
+  return edges.selfClosing
+    ? { open: `${edges.open.slice(0, -2)}>`, body: "" }
+    : { open: edges.open, body: element.slice(edges.bodyStart, edges.close) };
+}
+
+// `element` with `name="value"` set on its OWN open tag — the text up to and
+// including the first `>` — or, when it states no such attribute, ` name="value"`
+// inserted just before that tag's close, so a self-closing tag stays
+// self-closing; `null` removes the attribute instead. Only the open tag is
+// touched, so an attribute of the same name on a child element is the child's own
+// and the text around the tag is byte-identical. A function replacement
+// throughout, so a `$` in `value` is never read as a substitution pattern.
+function setXmlAttribute(element, name, value) {
+  const close = element.indexOf(">");
+  const open = element.slice(0, close + 1);
+  const pattern = new RegExp(`\\s${name}="[^"]*"`);
+  let written;
+  if (value === null) written = open.replace(pattern, "");
+  else if (pattern.test(open)) written = open.replace(pattern, () => ` ${name}="${value}"`);
+  else written = open.replace(/(\s*\/?>)$/, (end) => ` ${name}="${value}"${end}`);
+  return written + element.slice(close + 1);
+}
+
+// ECMA-376's `EG_Font` order: a `<font>`'s children must come in it, or a reader
+// may drop one written out of sequence, and a property appended at the end would
+// be reported as applied while the font renders as it did.
+const FONT_PROPERTY_ORDER = ["b", "i", "strike", "condense", "extend", "outline", "shadow", "u", "vertAlign", "sz", "color", "name", "family", "charset", "scheme"];
+
+// An element whose name the pattern itself captures: the self-closing shape
+// first, then the open/close shape whose close carries the name back. The readers
+// that walk children whose names are not known ahead build on this, so such a
+// child is read with the same tag spellings every other reader here uses.
+const ANY_ELEMENT = new RegExp(
+  `${selfClosingTag("([A-Za-z][A-Za-z0-9:]*)")}|${openTag("([A-Za-z][A-Za-z0-9:]*)")}[\\s\\S]*?${closeTag("\\2")}`,
+  "g",
+);
+
+// `body` with `element` written where `order` puts it: after every child the
+// sequence puts before it and before the first it puts after it. A body is flat —
+// the children of a `<font>` and the sides of a `<border>` hold no elements of
+// their own, and the docx arm's `<w:rPr>` one that does is split off before the
+// body arrives — so each child is one complete element. The docx arm's order is
+// `EG_RPrBase` (`RUN_PROPERTY_ORDER`); a child is ranked by its own local name,
+// since such a body spells its children with a namespace prefix (`<w:sz>`).
+function insertOrderedChild(body, name, element, order) {
+  const rank = (found) => {
+    const at = order.indexOf(found.slice(found.indexOf(":") + 1));
+    return at < 0 ? order.length : at;
+  };
+  const placed = rank(name);
+  for (const match of body.matchAll(ANY_ELEMENT)) {
+    if (rank(match[1] ?? match[2]) > placed) return body.slice(0, match.index) + element + body.slice(match.index);
+  }
+  return body + element;
+}
+
+// The workbook's own `<numFmts>` id for `formatCode`: an existing `<numFmt>` with
+// the same code is reused, else the id after the highest in use — at least the
+// first custom id, 164 — is allocated and its `<numFmts>` block written back. The
+// lookup is the block's own entries, not every `<numFmt>` in the part: a
+// `<numFmt>` a `<dxf>` holds is not a member of the workbook's table, and reading
+// one would reuse its id for a cell format the block never states. A built-in id
+// the file does not spell out resolves to whatever code the reader's locale gives
+// it, so it is not guessed at, and a format code is compared as text.
+function numberFormatId(styles, formatCode) {
   const length = [...formatCode].length;
   if (length > RULES.number_format_max) throw new UsageError(`a number format must be at most ${RULES.number_format_max} characters, got: ${length}`);
+  const entries = styleBlockEntries(styles, "numFmts");
   const formats = new Map();
-  for (const match of styles.matchAll(NUM_FMT)) {
-    const id = Number((match[0].match(/\bnumFmtId="(\d+)"/) || [])[1]);
-    const code = (match[0].match(/\bformatCode="([^"]*)"/) || [])[1];
+  for (const entry of entries) {
+    const id = Number((entry.match(/\bnumFmtId="(\d+)"/) || [])[1]);
+    const code = (entry.match(/\bformatCode="([^"]*)"/) || [])[1];
     if (Number.isFinite(id) && code !== undefined) formats.set(id, xmlUnescape(code));
   }
-  const cellXfs = styles.match(elementPattern("cellXfs"));
-  if (!cellXfs) throw new UsageError("the workbook's xl/styles.xml has no <cellXfs> to hold a number format");
-  const xfs = [...cellXfs[0].matchAll(CELL_XFS)].map((match) => match[0]);
   let edited = styles;
   let id = [...formats.entries()].find(([, code]) => code === formatCode)?.[0];
   if (id === undefined) {
     id = Math.max(163, ...formats.keys()) + 1;
     // The entries keep their raw spelling, so a format the file already had is
-    // not rewritten by this one being added. `<numFmts>` sits directly after
-    // `<styleSheet>`, before `<fonts>`. Everything rewritten in is the file's own
-    // text or the caller's code, so a function replacement is used: a `$` in
-    // either would otherwise be a substitution pattern (`$&`, `$$`, `` $` ``,
-    // `$'`) and corrupt the part.
-    const entries = [...styles.matchAll(NUM_FMT)].map((match) => match[0]);
+    // not rewritten by this one being added. `insertStylesChild` writes the block
+    // at its own `CT_Stylesheet` place — `<numFmts>` directly after
+    // `<styleSheet>`, before `<fonts>` — and opens a self-closing root so the
+    // block lands inside it rather than beside a second top-level element.
+    // Everything rewritten in is the file's own text or the caller's code, so a
+    // function replacement is used: a `$` in either would otherwise be a
+    // substitution pattern (`$&`, `$$`, `` $` ``, `$'`) and corrupt the part.
     const block = `<numFmts count="${entries.length + 1}">${entries.join("")}<numFmt numFmtId="${id}" formatCode="${xmlEscape(formatCode)}"/></numFmts>`;
-    const numFmts = styles.match(elementPattern("numFmts"));
+    const numFmts = writableElement(styles, "numFmts", "the styles part");
     edited = numFmts
       ? edited.replace(numFmts[0], () => block)
-      : edited.replace(/(<styleSheet\b[^>]*>)/, (whole, open) => open + block);
+      : insertStylesChild(edited, "numFmts", block);
   }
-  const own = cellStyle !== undefined && cellStyle !== null && Number.isInteger(Number(cellStyle)) && xfs[Number(cellStyle)] !== undefined ? xfs[Number(cellStyle)] : undefined;
-  const xf = own === undefined
-    ? `<xf numFmtId="${id}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`
-    : withNumberFormat(own, id);
-  const existing = xfs.indexOf(xf);
-  if (existing >= 0) return { styles: edited, index: existing };
-  edited = edited.replace(cellXfs[0], () => `<cellXfs count="${xfs.length + 1}">${xfs.join("")}${xf}</cellXfs>`);
-  return { styles: edited, index: xfs.length };
+  return { styles: edited, id };
+}
+
+// The `<font>` a request needs, from the cell's own: a toggle writes or drops
+// `<b/>`/`<i/>`, `size` replaces `<sz>`, `color` replaces `<color rgb="FF……"/>`
+// (the digits uppercased under a full alpha, the spelling Excel writes) and `font`
+// replaces `<name>` — and takes the font out of the theme's scheme with it: a
+// `<scheme val="minor"/>` beside a `<name>` says the face is the one the workbook's
+// THEME states, so a requested face kept beside it would still render as the
+// theme's and be rewritten by a theme change (the scheme element is what tells a
+// reader the font IS the theme's — ISO/IEC 29500 §18.8.35). `<family>`, `<charset>`
+// and anything the request did not name keep their own bytes, `<scheme>` among them
+// when the face is not named; a child written back goes at its place in `EG_Font`
+// (`insertOrderedChild`), so it is not written where a reader would drop it.
+function formatFont(font, edit) {
+  const { open, body } = elementParts(font, "font");
+  let out = body;
+  for (const [name, toggle] of [["b", "bold"], ["i", "italic"]]) {
+    if (edit[toggle] === undefined) continue;
+    const without = out.replace(elementPattern(name), "");
+    out = edit[toggle] ? insertOrderedChild(without, name, `<${name}/>`, FONT_PROPERTY_ORDER) : without;
+  }
+  if (edit.size !== undefined) out = replaceFontChild(out, "sz", `<sz val="${edit.size}"/>`);
+  if (edit.color !== undefined) out = replaceFontChild(out, "color", `<color rgb="FF${edit.color}"/>`);
+  if (edit.font !== undefined) {
+    out = replaceFontChild(out.replace(elementPattern("scheme"), ""), "name", `<name val="${xmlEscape(edit.font)}"/>`);
+  }
+  return `${open}${out}</font>`;
+}
+
+// `body` with the `<name>` child it states replaced by `element`, or `element`
+// written at that child's place in `EG_Font` when it states none.
+function replaceFontChild(body, name, element) {
+  const held = firstElement(body, name);
+  if (held) return body.slice(0, held.index) + element + body.slice(held.index + held[0].length);
+  return insertOrderedChild(body, name, element, FONT_PROPERTY_ORDER);
+}
+
+// `CT_Border`'s own child order: `start`/`end` are the table-border sides a
+// reader would drop a child written before, and a request names only the sides a
+// cell draws.
+const BORDER_SIDES = ["start", "end", "left", "right", "top", "bottom", "diagonal", "vertical", "horizontal"];
+// The sides a `border` request may name, from the shared rules (rules.json).
+const CELL_BORDER_SIDES = RULES.cell_border_sides;
+
+// The `<border>` a request needs, from the cell's own: a named side `true` is a
+// thin default-coloured border (the spelling Excel itself uses) and `false` an
+// empty side that draws nothing. A side the request did not name — `<diagonal>`
+// included — keeps its own bytes, and a side written back goes at its place in
+// `CT_Border`.
+function formatBorder(border, edit) {
+  const { open, body } = elementParts(border, "border");
+  let out = body;
+  for (const side of CELL_BORDER_SIDES) {
+    if (edit.border[side] === undefined) continue;
+    const element = edit.border[side] ? `<${side} style="thin"><color indexed="64"/></${side}>` : `<${side}/>`;
+    const held = firstElement(out, side);
+    out = held ? out.slice(0, held.index) + element + out.slice(held.index + held[0].length) : insertOrderedChild(out, side, element, BORDER_SIDES);
+  }
+  return `${open}${out}</border>`;
+}
+
+// `CT_Xf`'s children after the entry's own attributes, in the order the schema
+// writes them: a child a request adds goes at its place, never before one that
+// must come first.
+const XF_CHILD_ORDER = ["alignment", "protection"];
+
+// The `<cellStyleXfs>` entry a cell xf's own `xfId` names — the named style it
+// takes anything it omits from — or `undefined` when the id names no entry.
+const namedStyleXf = (styles, xf) => styleBlockEntries(styles, "cellStyleXfs")[Number((xf.match(/\bxfId="(\d+)"/) || [])[1])];
+
+// The `<xf>` with its `<alignment>` changed by the named `align`/`vertical`/`wrap`
+// properties: each writes or replaces one attribute and every attribute the
+// element states keeps its value, so a cell with its own `vertical` that is asked
+// only for `align` keeps it. The base element is the xf's own `<alignment>` when it
+// states one or claims to apply its own alignment (`applyAlignment="1"`), else the
+// one the named style the xf's `xfId` references carries — the rule
+// `xfAttributeId` applies to a font, fill or border id, so naming only `align`
+// does not drop the `vertical`/`wrapText` the cell renders through its named
+// style; an inherited element is materialized onto the cell at the xf's own child
+// place, as a newly added one is. An `<alignment>` left stating nothing at all is
+// removed rather than written empty.
+function withAlignment(styles, xf, edit) {
+  const { open, body } = elementParts(xf, "xf");
+  const held = firstElement(body, "alignment");
+  const inherited = held || /\bapplyAlignment="1"/.test(xf) ? null : firstElement(namedStyleXf(styles, xf) ?? "", "alignment");
+  let element = held ? held[0] : inherited ? inherited[0] : "<alignment/>";
+  if (edit.align !== undefined) element = setXmlAttribute(element, "horizontal", edit.align);
+  if (edit.vertical !== undefined) element = setXmlAttribute(element, "vertical", edit.vertical);
+  if (edit.wrap !== undefined) element = edit.wrap ? setXmlAttribute(element, "wrapText", "1") : setXmlAttribute(element, "wrapText", null);
+  const bare = !/<alignment\b[^>]*[A-Za-z]+=/.test(element);
+  let out;
+  if (held) out = body.slice(0, held.index) + (bare ? "" : element) + body.slice(held.index + held[0].length);
+  else out = bare ? body : insertOrderedChild(body, "alignment", element, XF_CHILD_ORDER);
+  return `${open}${out}</xf>`;
+}
+
+// The id an `<xf>` states for `attribute`, or the one the named style it
+// references carries: a cell xf that omits an id takes it from the
+// `<cellStyleXfs>` entry its own `xfId` names (see `namedStyleXf`), so resolving
+// such an id to 0 would base the new entry on a look the cell never had. An entry
+// that claims to apply its own formatting (`applied`) yet states no id is the
+// schema default 0 instead — it inherits nothing.
+function xfAttributeId(styles, xf, attribute, applied) {
+  const pattern = new RegExp(`\\b${attribute}="(\\d+)"`);
+  const own = (xf.match(pattern) || [])[1];
+  if (own !== undefined) return Number(own);
+  if (new RegExp(`\\b${applied}="1"`).test(xf)) return 0;
+  const inherited = (namedStyleXf(styles, xf)?.match(pattern) || [])[1];
+  return inherited === undefined ? 0 : Number(inherited);
+}
+
+// The `<cellXfs>` entry the named properties need, from `xf` — the cell's own, or
+// the minimal default for a cell that names no style — with ONLY those properties
+// changed: everything unnamed (the number format, the fill, the borders, the
+// wrap, the vertical alignment, the protection) is the entry's own bytes. The
+// font, fill and border a named property needs are added to `styles` and
+// referenced by the entry's own ids, and the `apply…` flag is stated for every
+// property the request NAMED — the entry is cloned for what the caller asked for,
+// and an id written without its flag would leave the format inert.
+function styledXf(styles, xf, edit) {
+  let current = styles;
+  let out = xf;
+  if (["font", "size", "bold", "italic", "color"].some((name) => edit[name] !== undefined)) {
+    const fontId = xfAttributeId(current, out, "fontId", "applyFont");
+    const put = putStyleEntry(current, "fonts", formatFont(styleBlockEntries(current, "fonts")[fontId] ?? STYLE_PART_ENTRIES.fonts, edit));
+    current = put.styles;
+    out = setXmlAttribute(setXmlAttribute(out, "fontId", String(put.index)), "applyFont", "1");
+  }
+  if (edit.fill !== undefined) {
+    const fill = edit.fill === false
+      ? '<fill><patternFill patternType="none"/></fill>'
+      : `<fill><patternFill patternType="solid"><fgColor rgb="FF${edit.fill}"/><bgColor indexed="64"/></patternFill></fill>`;
+    const put = putStyleEntry(current, "fills", fill);
+    current = put.styles;
+    out = setXmlAttribute(setXmlAttribute(out, "fillId", String(put.index)), "applyFill", "1");
+  }
+  if (edit.border !== undefined) {
+    const borderId = xfAttributeId(current, out, "borderId", "applyBorder");
+    const put = putStyleEntry(current, "borders", formatBorder(styleBlockEntries(current, "borders")[borderId] ?? STYLE_PART_ENTRIES.borders, edit));
+    current = put.styles;
+    out = setXmlAttribute(setXmlAttribute(out, "borderId", String(put.index)), "applyBorder", "1");
+  }
+  if (edit.align !== undefined || edit.vertical !== undefined || edit.wrap !== undefined) {
+    // The flag is stated even when `withAlignment` left no `<alignment>` child —
+    // turning every named property off means the cell renders no alignment of its
+    // own, and without the flag a reader would fall back to the one the named style
+    // the xf's `xfId` references carries.
+    out = setXmlAttribute(withAlignment(current, out, edit), "applyAlignment", "1");
+  }
+  if (edit.number_format !== undefined) {
+    const format = numberFormatId(current, edit.number_format);
+    current = format.styles;
+    out = setXmlAttribute(setXmlAttribute(out, "numFmtId", String(format.id)), "applyNumberFormat", "1");
+  }
+  return { styles: current, xf: out };
+}
+
+// The `<cellXfs>` index a cell takes for the properties `edit` names: the base
+// style changed by exactly those properties — the cell's own `<cellXfs>` entry,
+// or the list's first for a cell that names no style of its own. An identical
+// entry already in the list is reused rather than appended twice, and the index
+// returned is the entry's real position in the list.
+function cellStyleIndex(styles, edit, cellStyle) {
+  const xfs = styleBlockEntries(styles, "cellXfs");
+  const index = Number(cellStyle);
+  // The cell's own entry, or — for a cell that names no `s=` — the list's first,
+  // which is the base style such a cell renders as: a hard-coded default instead
+  // would take away a font, fill or alignment the entry states.
+  const own = Number.isInteger(index) && xfs[index] !== undefined ? xfs[index] : xfs[0];
+  const styled = styledXf(styles, own ?? STYLE_PART_ENTRIES.cellXfs, edit);
+  return putStyleEntry(styled.styles, "cellXfs", styled.xf);
 }
 
 // Whether a line moves for an insert (a line at or after the point) or a delete
@@ -2140,7 +2720,9 @@ const SQUREF_CONTAINERS = [
 // (`[^<>]*` never crosses a `<` or `>`), so a cell whose own TEXT reads
 // `sqref="…"` is content and stays as it is.
 function shiftSqrefs(xml, kind, at, delta, note) {
-  const element = /<([A-Za-z0-9_]+(?::[A-Za-z0-9_]+)?)\b[^<>]*\bsqref="([^"]*)"[^<>]*\/>|<([A-Za-z0-9_]+(?::[A-Za-z0-9_]+)?)\b[^<>]*\bsqref="([^"]*)"[^<>]*>[\s\S]*?<\/\3>/g;
+  const name = "([A-Za-z0-9_]+(?::[A-Za-z0-9_]+)?)";
+  const middle = "\\b[^<>]*\\bsqref=\"([^\"]*)\"[^<>]*";
+  const element = new RegExp(`${selfClosingTag(name, middle)}|${openTag(name, middle)}[\\s\\S]*?${closeTag("\\3")}`, "g");
   const inContainer = new Set(SQUREF_CONTAINERS.map(([, , name]) => name));
   let moved = xml.replace(element, (whole, selfName, selfValue, name, value) => {
     const elementName = selfName ?? name;
@@ -2273,22 +2855,19 @@ const X14_CONDITIONAL_FORMATTING = elementPattern("x14:conditionalFormatting");
 const X14_DATA_VALIDATION = elementPattern("x14:dataValidation");
 // Only `<xm:f>` holds formula text: an `<x14:formula1>` merely WRAPS one, so
 // matching the wrapper too would hand the reference rewriter its child markup and
-// let it read a tag name as a range.
-const EXTENDED_FORMULA = /<(xm:f)(?:\s[^<>]*)?>([\s\S]*?)<\/\1>/g;
-
-// The text of an `<xm:sqref>` element — the same whitespace-separated range list
-// an `sqref` attribute holds. Empty for a self-closing element, which holds none.
-const sqrefElementText = (element) => {
-  const open = element.match(/^<xm:sqref(?:\s[^<>]*)?>/);
-  return open ? element.slice(open[0].length, -"</xm:sqref>".length) : "";
-};
+// let it read a tag name as a range. The element's name is the pattern's own
+// capture and both its tags are the shared spellings, so the close tag's
+// whitespace is read here as everywhere else.
+const EXTENDED_FORMULA = new RegExp(`${openTag("(xm:f)")}([\\s\\S]*?)${closeTag("\\1")}`, "g");
 
 // One extended rule, or `null` to drop it when the delete took its whole range.
 // `what` is the rule in the words a reader of the answer knows it by.
 function extendedRule(entry, what, kind, at, delta, sheet, note) {
   const sqref = entry.match(XM_SQREF);
   if (sqref) {
-    const range = sqrefElementText(sqref[0]);
+    // The element's own body is the range list, as the shared element reading gives
+    // it: `""` for a self-closing element.
+    const range = elementParts(sqref[0], "xm:sqref").body;
     const kept = movedRange(range, what, kind, at, delta, note);
     if (kept === null) return null;
     if (kept.length) entry = entry.replace(XM_SQREF, () => `<xm:sqref>${kept.join(" ")}</xm:sqref>`);
@@ -2339,7 +2918,7 @@ function extendedRules(xml, kind, at, delta, sheet, note) {
     // goes with them. The close tag reads `</…` to the test, never `<…`.
     return /<[A-Za-z]/.test(shifted.slice(shifted.indexOf(">") + 1)) ? shifted : "";
   };
-  return xml.replace(/<extLst\b[^<>]*\/>|<extLst\b[^<>]*>[\s\S]*?<\/extLst>/g, (block) => {
+  return xml.replace(elementForms("extLst", "\\b[^<>]*"), (block) => {
     if (!/<ext\b/.test(block)) return block;
     const shifted = block.replace(elementPattern("ext"), wrapper);
     return /<ext\b/.test(shifted) ? shifted : "";
@@ -2428,9 +3007,9 @@ function shiftSheet(editor, xml, kind, at, delta, { stale, sheet, removed, addre
     // qualified with this sheet's own name — so a rule keeps testing the cells it
     // was written for. A cell's `<f>` is not touched — see `formulaNote`.
     .replace(elementPattern("conditionalFormatting"), (block) =>
-      block.replace(/(<formula\b[^>]*>)([\s\S]*?)(<\/formula>)/g, (whole, open, text, close) => open + shiftFormula(text, kind, at, delta, sheet) + close))
+      block.replace(new RegExp(`(${openTag("formula")})([\\s\\S]*?)(${closeTag("formula")})`, "g"), (whole, open, text, close) => open + shiftFormula(text, kind, at, delta, sheet) + close))
     .replace(DATA_VALIDATION, (entry) =>
-      entry.replace(/(<formula[12]\b[^>]*>)([\s\S]*?)(<\/formula[12]>)/g, (whole, open, text, close) => open + shiftFormula(text, kind, at, delta, sheet) + close));
+      entry.replace(new RegExp(`(${openTag("formula1")}|${openTag("formula2")})([\\s\\S]*?)(${closeTag("formula1")}|${closeTag("formula2")})`, "g"), (whole, open, text, close) => open + shiftFormula(text, kind, at, delta, sheet) + close));
   // The extended forms of the same two rules live in an `<extLst>` beside them
   // and move the same way.
   const moved = extendedRules(sqrefs, kind, at, delta, sheet, note);
@@ -2446,24 +3025,30 @@ function shiftSheet(editor, xml, kind, at, delta, { stale, sheet, removed, addre
   return shiftedPart ? moved : xml;
 }
 
+// Whether an element's own open tag states an `r` at all: an address this kit's
+// reader can place (`A1`) and one it cannot (`$A$1`) are both addresses the element
+// names, and writing a second `r` beside either would state the attribute twice.
+const statesAddress = (element) => /\sr\s*=/.test(element.slice(0, element.indexOf(">") + 1));
+
 // The sheet part with the addresses its writer left implicit made explicit: each
 // `<row>` gets the computed `r` it stands for, each addressless `<c>` its
 // computed `r`. The product's own reader already numbers them that way — an
 // addressless cell is its position in the row, an addressless row is the one
 // after its predecessor — so a shift that moved only written addresses would
 // move the wrong cells, or none. This rewrites the part the shift already
-// rewrites and no other.
+// rewrites and no other, and an element that already states an address of its own
+// keeps its bytes (see `statesAddress`).
 function materializeAddresses(xml) {
   let number = 0;
   return xml.replace(ROW_ELEMENT, (rowXml) => {
     const attribute = (rowXml.match(/\br="(\d+)"/) || [])[1];
     number = attribute ? Number(attribute) : number + 1;
-    const row = attribute ? rowXml : rowXml.replace(/^<row\b/, (open) => `${open} r="${number}"`);
+    const row = statesAddress(rowXml) ? rowXml : rowXml.replace(/^<row\b/, (open) => `${open} r="${number}"`);
     const cells = rowCells(row);
     let out = row;
     for (let i = cells.length - 1; i >= 0; i -= 1) {
       const cell = cells[i];
-      if (/\br="/.test(cell.xml)) continue;
+      if (statesAddress(cell.xml)) continue;
       const addressed = cell.xml.replace(/^<c\b/, (open) => `${open} r="${colName(cell.column)}${number}"`);
       out = out.slice(0, cell.start) + addressed + out.slice(cell.end);
     }
@@ -2487,21 +3072,79 @@ function shiftSheetData(xml, kind, at, delta) {
 function insertCell(rowXml, cells, column, element) {
   const after = cells.find((cell) => cell.column > column);
   if (after) return rowXml.slice(0, after.start) + element + rowXml.slice(after.start);
-  const close = rowXml.lastIndexOf("</row>");
-  // A self-closing `<row r="1"/>` becomes a row that holds the new cell.
-  if (close < 0) return `${rowXml.slice(0, -2)}>${element}</row>`;
-  return rowXml.slice(0, close) + element + rowXml.slice(close);
+  // A self-closing `<row r="1"/>` is opened to hold the new cell; one already open
+  // takes it before its close, which `elementParts` reads in either spelling.
+  const { open, body } = elementParts(rowXml, "row");
+  return `${open}${body}${element}</row>`;
 }
 
-// Insert a `<row>` into `<sheetData>` in row order.
+// `CT_Worksheet`'s children from `<sheetData>` on, in the sequence ISO/IEC 29500
+// states: a sheet part that states no `<sheetData>` gets one written before the
+// first child the sequence puts after it, so the part stays one a reader accepts.
+// The tail is the schema's own, `drawingHF` included — a sheet's header/footer
+// images are declared there — which some published copies of the type leave out.
+const WORKSHEET_AFTER_SHEET_DATA = ["sheetCalcPr", "sheetProtection", "protectedRanges", "scenarios", "autoFilter", "sortState", "dataConsolidate", "customSheetViews", "mergeCells", "phoneticPr", "conditionalFormatting", "dataValidations", "hyperlinks", "printOptions", "pageMargins", "pageSetup", "headerFooter", "rowBreaks", "colBreaks", "customProperties", "cellWatches", "ignoredErrors", "smartTags", "drawing", "legacyDrawing", "legacyDrawingHF", "drawingHF", "picture", "oleObjects", "controls", "webPublishItems", "tableParts", "extLst"];
+
+// The worksheet root's two tags, in the shared spellings (`openTag`/`closeTag`), for
+// the two places that need a position in the root rather than the elements it holds.
+const WORKSHEET_OPEN = new RegExp(openTag("worksheet"));
+const WORKSHEET_CLOSE = new RegExp(closeTag("worksheet"));
+
+// `xml` with a `<sheetData/>` written at its `CT_Worksheet` place when the sheet
+// part states none: an edit that brings a value or formatting to such a sheet
+// writes the element it needs rather than refusing a legal part.
+function ensureSheetData(xml) {
+  // The element a written `<sheetData/>` would go beside, or none: one the part leaves
+  // open is refused (`writableElement`).
+  if (writableElement(xml, "sheetData", "the sheet part")) return xml;
+  for (const later of WORKSHEET_AFTER_SHEET_DATA) {
+    const found = firstElement(xml, later);
+    if (found) return xml.slice(0, found.index) + "<sheetData/>" + xml.slice(found.index);
+  }
+  const close = xml.match(WORKSHEET_CLOSE);
+  if (!close) throw new UsageError("the sheet part has no </worksheet> to write a <sheetData> into");
+  return xml.slice(0, close.index) + "<sheetData/>" + xml.slice(close.index);
+}
+
+// The `<sheetData>` a row- or cell-writing edit works in: the index its open tag starts
+// at, the tag it is spelled with, where its body ends and whether it is self-closing —
+// ONE reading of the element (`writableElement`, which refuses a part that leaves it
+// open), and `undefined` for a part that states none (`ensureSheetData` writes one). A
+// worksheet holds its rows in ONE `<sheetData>` (`CT_Worksheet` states exactly one), so
+// a part that states a second, or a `<row>` outside this one, is a shape no writer
+// produces and one no edit can write into without guessing which body is the sheet's:
+// refused by the callers that write into the body — a row created in it, the body
+// rebuilt — since a success over a part a reader offers to repair is the one outcome
+// an edit must not report. A caller that places a block BESIDE the body (a column
+// width's `<cols>`) needs the element's own index and reads no rows. An edit that
+// rewrites a cell inside a row it found changes nothing structural and leaves the
+// part as healthy as it arrived.
+function sheetBody(xml) {
+  const found = writableElement(xml, "sheetData", "the sheet part");
+  if (!found) return undefined;
+  const edges = elementEdges(found[0], "sheetData");
+  const bodyStart = found.index + edges.bodyStart;
+  const bodyEnd = found.index + edges.close;
+  const outside = sheetRows(xml).some((row) => row.start < bodyStart || row.end > bodyEnd);
+  if (outside || xml.slice(bodyEnd).includes("<sheetData")) {
+    throw new UsageError("the sheet part states a <row> outside its <sheetData>, or a second <sheetData>: a worksheet holds its rows in one body, which this tool does not edit around");
+  }
+  return { index: found.index, open: edges.open, selfClosing: edges.selfClosing, bodyStart, bodyEnd };
+}
+
+// Insert a `<row>` into the sheet's own `<sheetData>` in row order.
 function insertSheetRow(xml, rows, number, element) {
+  const source = ensureSheetData(xml);
+  // A part whose rows stand outside its `<sheetData>` is refused here, and a part
+  // that states none has no rows for `after` to name — so the positions `rows`
+  // carries are positions in `source` whenever `after` is found.
+  const body = sheetBody(source);
   const after = rows.find((row) => row.number > number);
-  if (after) return xml.slice(0, after.start) + element + xml.slice(after.start);
-  const close = xml.indexOf("</sheetData>");
-  if (close >= 0) return xml.slice(0, close) + element + xml.slice(close);
-  const empty = xml.match(/<sheetData\b[^>]*\/>/);
-  if (empty) return xml.replace(empty[0], `<sheetData>${element}</sheetData>`);
-  throw new UsageError("the sheet has no <sheetData> to add a row to");
+  if (after) return source.slice(0, after.start) + element + source.slice(after.start);
+  // No row to order after: the element is the sheet's first, so the body holding
+  // the rows is opened when the one it states is self-closing.
+  if (!body.selfClosing) return source.slice(0, body.bodyEnd) + element + source.slice(body.bodyEnd);
+  return source.slice(0, body.index) + `${body.open.slice(0, -2)}>${element}</sheetData>` + source.slice(body.bodyStart);
 }
 
 // The cells a deleted column held, removed from their rows — the row itself
@@ -2520,8 +3163,8 @@ function removeColumn(xml, column) {
 // formula states and the formula's own text. A formula is the only place a
 // reference lives, so this is what a scan for one reads — a cell's own text is
 // content, and one that merely reads like a reference names nothing.
-const cellFormulas = (text) => [...text.matchAll(/<f\b([^<>]*)(?:\/>|>([\s\S]*?)<\/f>)/g)]
-  .map((match) => ({ range: (match[1].match(/\bref="([^"]*)"/) || [])[1], text: match[2] ?? "" }));
+const cellFormulas = (text) => [...text.matchAll(new RegExp(`${selfClosingTag("f", "\\b([^<>]*)")}|${openTag("f", "\\b([^<>]*)")}([\\s\\S]*?)${closeTag("f")}`, "g"))]
+  .map((match) => ({ range: ((match[1] ?? match[2]).match(/\bref="([^"]*)"/) || [])[1], text: match[3] ?? "" }));
 
 // One note when a sheet a row or column shift touched holds cell formulas naming a
 // cell the shift moved: their own text is not rewritten — rewriting references is a
@@ -2551,10 +3194,10 @@ function formulaNote(editor, xml, kind, at, delta, sheet) {
 // and column a floating drawing anchors its object at (0-based in the markup, so
 // one is added).
 const partRefs = (text) => [...text.matchAll(/\bref="([^"]*)"/g)].map((match) => match[1]);
-const definedNameTexts = (text) => [...text.matchAll(/<definedName\b[^>]*>([\s\S]*?)<\/definedName>/g)].map((match) => xmlUnescape(match[1]));
-const anchoredCells = (text) => [...text.matchAll(/<xdr:(?:from|to)\b[\s\S]*?<\/xdr:(?:from|to)>/g)].flatMap((anchor) => {
-  const column = (anchor[0].match(/<xdr:col>(\d+)<\/xdr:col>/) || [])[1];
-  const row = (anchor[0].match(/<xdr:row>(\d+)<\/xdr:row>/) || [])[1];
+const definedNameTexts = (text) => [...text.matchAll(new RegExp(`${openTag("definedName")}([\\s\\S]*?)${closeTag("definedName")}`, "g"))].map((match) => xmlUnescape(match[1]));
+const anchoredCells = (text) => [...text.matchAll(new RegExp(`${openTag("xdr:(?:from|to)", "\\b[\\s\\S]*?")}${closeTag("xdr:(?:from|to)")}`, "g"))].flatMap((anchor) => {
+  const column = (anchor[0].match(new RegExp(`${openTag("xdr:col")}(\\d+)${closeTag("xdr:col")}`)) || [])[1];
+  const row = (anchor[0].match(new RegExp(`${openTag("xdr:row")}(\\d+)${closeTag("xdr:row")}`)) || [])[1];
   return column === undefined || row === undefined ? [] : [`${colName(Number(column))}${Number(row) + 1}`];
 });
 
@@ -2574,10 +3217,11 @@ const anchoredCells = (text) => [...text.matchAll(/<xdr:(?:from|to)\b[\s\S]*?<\/
 // one being edited. What is collected, the reply names, the way it names formulas,
 // charts and pivots.
 function staleRefs(editor, part, xml, stale, kind, at, delta, sheet) {
-  const zip = editor.zip;
   const base = part.slice(0, part.lastIndexOf("/") + 1);
-  const rels = zip.file(relsPartFor(part));
-  const relations = rels ? relationships(rels.asText()) : [];
+  // Every part this check reads goes through the editor (`read`), so the walks it
+  // makes are charged like the ones the edits themselves make: a check that read
+  // whole parts around the budget would be the very hole the bound exists to close.
+  const relations = relationships(editor.read(relsPartFor(part)) ?? "");
   // Whether the shift changes what an address names. The test is the shift's own
   // reference rule, so a part anchored on a line the delete took is stale like one
   // below it.
@@ -2588,11 +3232,11 @@ function staleRefs(editor, part, xml, stale, kind, at, delta, sheet) {
   const movedPart = (what, addresses) => relations
     .filter((rel) => rel.type.endsWith(`/${what}`))
     .some((rel) => {
-      const file = zip.file(resolvePart(base, rel.target));
-      return !file || anyMoves(addresses(file.asText()));
+      const text = editor.read(resolvePart(base, rel.target));
+      return text === undefined || anyMoves(addresses(text));
     });
-  const workbook = zip.file("xl/workbook.xml");
-  if (workbook && anyMoves(definedNameTexts(workbook.asText()))) stale.add("the workbook's defined names");
+  const workbook = editor.read(XLSX_WORKBOOK);
+  if (workbook !== undefined && anyMoves(definedNameTexts(workbook))) stale.add("the workbook's defined names");
   // A table declared by the sheet's `<tableParts>` but named by no relationship of
   // its own can be neither read nor ruled out.
   if (movedPart("table", partRefs) || (/<tableParts\b/.test(xml) && !declares("table"))) stale.add("the sheet's table ranges");
@@ -2609,23 +3253,73 @@ function staleRefs(editor, part, xml, stale, kind, at, delta, sheet) {
   // `<f>` elements the part holds rather than its whole text: a cell's own text
   // can read like a reference and is content, not a formula, and naming it would
   // state a loss that did not happen.
-  const others = workbookSheets(zip).map((entry) => entry.part).filter((name) => name !== part);
+  const others = workbookSheets(editor).map((entry) => entry.part).filter((name) => name !== part);
   const staleElsewhere = others.some((name) => {
-    const file = zip.file(name);
-    if (!file) return false;
-    const text = file.asText();
-    editor.charge(text.length);
-    return cellFormulas(text).some((formula) => qualifiedRefs(formula.text, sheet).some(movesAddress));
+    const text = editor.read(name);
+    return text !== undefined && cellFormulas(text).some((formula) => qualifiedRefs(formula.text, sheet).some(movesAddress));
   });
   if (staleElsewhere) stale.add("the other sheets' formulas naming this sheet");
+}
+
+// `xml` with a `<dimension>` added for a workbook that states none, at
+// `CT_Worksheet`'s own place for it: directly after `<sheetPr>` when the sheet
+// has one, else as the worksheet's first child. A created workbook's sheet holds
+// only `<sheetData>`, so this is the sheet an edit widens for the first time.
+function insertDimension(xml, ref) {
+  const element = `<dimension ref="${ref}"/>`;
+  const sheetPr = firstElement(xml, "sheetPr");
+  const at = sheetPr ? sheetPr.index + sheetPr[0].length : (() => {
+    const open = xml.match(WORKSHEET_OPEN);
+    return open ? open.index + open[0].length : -1;
+  })();
+  if (at < 0) return xml;
+  return xml.slice(0, at) + element + xml.slice(at);
+}
+
+// The `<dimension ref>` a sheet that states none gets, so a write into it can
+// extend a declared reach it did not have: the smallest rectangle covering every
+// cell the part holds AND the address a write names, because a ref naming the
+// written cell alone would describe a part holding more than the ref says. The
+// cells' own addresses (`sheetRows`/`rowCells`) already resolve what a writer left
+// implicit, so the computed numbers are the ones a reader uses.
+function dimensionRef(xml, row, column) {
+  let firstRow = row;
+  let lastRow = row;
+  let firstColumn = column;
+  let lastColumn = column;
+  for (const entry of sheetRows(xml)) {
+    for (const cell of rowCells(entry.xml)) {
+      firstRow = Math.min(firstRow, entry.number);
+      lastRow = Math.max(lastRow, entry.number);
+      firstColumn = Math.min(firstColumn, cell.column);
+      lastColumn = Math.max(lastColumn, cell.column);
+    }
+  }
+  const low = `${colName(firstColumn)}${firstRow}`;
+  const high = `${colName(lastColumn)}${lastRow}`;
+  return low === high ? low : `${low}:${high}`;
 }
 
 // A worksheet's `<dimension ref>` widened so it covers a cell a `set_cell` wrote:
 // the cell may lie outside the sheet's declared reach, and a ref that does not
 // name it describes a part holding more than the ref says. The ref's own bounds
-// are the extent a write extends; one this reader cannot parse is left alone, as
-// a row or column shift updates the ref the ordinary way.
+// are the extent a write extends; a sheet that states no `<dimension>` at all
+// gets one covering its cells and the written address, since a part with no
+// declared reach is what an edit first brings formatting to, and one that states
+// a `<dimension>` with no `ref` (a part no writer would produce) takes the ref on
+// that element rather than a second element beside it. One the reader cannot
+// parse is left alone, as a row or column shift updates the ref the ordinary way.
 function widenDimension(xml, row, column) {
+  // The `<dimension>` element the ref goes on, or none: one the part leaves open is
+  // refused (`writableElement`).
+  const dimension = writableElement(xml, "dimension", "the sheet part");
+  if (!dimension) return insertDimension(xml, dimensionRef(xml, row, column));
+  if (!/\bref="/.test(dimension[0])) {
+    // `setXmlAttribute` keeps a self-closing tag self-closing, so `<dimension/>`
+    // becomes `<dimension ref="A1:B2"/>` rather than gaining a second element.
+    const covering = setXmlAttribute(dimension[0], "ref", dimensionRef(xml, row, column));
+    return xml.slice(0, dimension.index) + covering + xml.slice(dimension.index + dimension[0].length);
+  }
   return xml.replace(/(<dimension\b[^>]*\bref=")([^"]*)(")/, (whole, before, value, after) => {
     const cells = value.split(":").map((part) => part.match(/^([A-Za-z]+)(\d+)$/));
     if (cells.length > 2 || cells.some((cell) => cell === null)) return whole;
@@ -2637,36 +3331,42 @@ function widenDimension(xml, row, column) {
   });
 }
 
-function setCell(editor, edit) {
-  const { part, name } = sheetPart(editor.zip, edit.sheet);
+function setCell(editor, edit, input, stylesName) {
+  const { part } = sheetPart(editor, edit.sheet);
   const address = cellAddress(edit.cell);
   const reference = colName(address.column) + address.row;
-  let style = null;
-  if (edit.number_format !== undefined) {
-    const format = editText(edit.number_format, "number_format");
-    if (!editor.zip.file("xl/styles.xml")) throw new UsageError(`sheet ${JSON.stringify(name)}: the workbook has no xl/styles.xml to hold a number format`);
-    // The cell's own `s=`, read before the entry is built: the new format's entry
-    // is a clone of it, so setting a number format does not drop the cell's font,
-    // fill, border or alignment.
-    const sheet = editor.zip.file(part).asText();
-    const rows = sheetRows(sheet);
-    const row = rows.find((candidate) => candidate.number === address.row);
-    const cell = row ? rowCells(row.xml).find((candidate) => candidate.column === address.column) : undefined;
-    // The change is computed from the styles part the callback is handed — the
-    // part `part` is about to write — so the index the cell is given is the one
-    // the written part really holds. Through `part`, a styles change counts for
-    // `finish` (the signature note keys off it) and a no-op writes nothing.
-    editor.part("xl/styles.xml", (xml) => {
-      const applied = numberFormatStyle(xml, format, cell ? styleOf(cell.xml) : undefined);
+  // A `set_cell` writes a value; changing a cell's formatting without writing one
+  // is the `format_cells` op's job, so there is one spelling of "format only".
+  // Writing through the value path with no value would answer such a request by
+  // emptying the cell it was given.
+  if (edit.value === undefined) throw new UsageError("set_cell needs a value — hint: use the format_cells op to change only a cell's formatting");
+  const format = edit.number_format === undefined ? null : editText(edit.number_format, "number_format");
+  // A workbook that never saved styles gets the part written rather than a
+  // refusal: setting a number format is exactly the edit that needs one.
+  const styles = format !== null ? stylesText(editor, input, stylesName) : null;
+  // The sheet is read and written by the one `sheet` call (its own duplicate check
+  // included), and the styles part by `stylesText` — each read charged — with the
+  // grown styles written back through `rewrite` rather than read again for the write
+  // (see `charge`'s doc).
+  editor.sheet(part, (sheet) => {
+    let style = null;
+    if (format !== null) {
+      const rows = sheetRows(sheet);
+      const row = rows.find((candidate) => candidate.number === address.row);
+      const cell = row ? rowCells(row.xml).find((candidate) => candidate.column === address.column) : undefined;
+      // The entry the number format clones is the style the cell already renders
+      // as — its own `s=` when it states one, else the one it inherits from its row
+      // or column — so setting a number format does not drop the cell's font, fill,
+      // border or alignment.
+      const base = (cell ? styleOf(cell.xml) : undefined) ?? inheritedStyle(rowStyleOf(row?.xml), columnStyleEntries(sheet), address.column);
+      const applied = cellStyleIndex(styles, { number_format: format }, base);
       style = String(applied.index);
-      return applied.styles;
-    });
-  }
-  editor.part(part, (xml) => {
-    const written = writeCell(xml, edit, address, reference, style);
+      editor.rewrite(stylesName, styles, applied.styles);
+    }
+    const written = writeCell(sheet, edit, address, reference, style);
     // A write that landed on the value the cell already held changed no content,
     // so the caveats keyed on content are not owed for it.
-    if (written !== xml) editor.markContent();
+    if (written !== sheet) editor.markContent();
     return written;
   });
 }
@@ -2690,22 +3390,42 @@ function writeCell(xml, edit, address, reference, style) {
 }
 
 function clearCell(editor, edit) {
-  const { part, name } = sheetPart(editor.zip, edit.sheet);
+  const { part, name } = sheetPart(editor, edit.sheet);
   const address = cellAddress(edit.cell);
-  editor.part(part, (xml) => {
+  editor.sheet(part, (xml) => {
+    // The cell is found by the address it stands for, read the way the rest of the
+    // kit reads one: `sheetRows`/`rowCells` resolve an addressless `<c>` to the
+    // position it sits in, so the target is found without rewriting the part's
+    // addresses. The emptied cell keeps its own address and style, and every other
+    // cell and row keeps its exact bytes.
     const rows = sheetRows(xml);
     const row = rows.find((candidate) => candidate.number === address.row);
     const existing = row ? rowCells(row.xml).find((candidate) => candidate.column === address.column) : null;
     if (!existing) throw new UsageError(`the cell ${edit.cell} is not in sheet ${JSON.stringify(name)}`);
     editor.markContent();
-    return xml.slice(0, row.start) + row.xml.slice(0, existing.start) + row.xml.slice(existing.end) + xml.slice(row.end);
+    // The cell is emptied, not unstyled: clearing takes what the cell holds, and
+    // the look it was given — the `s=` a `format_cells` wrote, an `apply…` entry's
+    // own style — stays its own. The `t`/`cm`/`vm` attributes go with the value, by
+    // the rule `valueCell` states, and so do the children; the address the emptied
+    // element states is its own, so the emptied cell stays where it was.
+    const emptied = emptiedCell(existing.xml);
+    return xml.slice(0, row.start) + row.xml.slice(0, existing.start) + emptied + row.xml.slice(existing.end) + xml.slice(row.end);
   });
 }
 
+// The `<c>` element an emptied cell leaves: its address and its style index, in
+// the file's own spelling — the two attributes a cell keeps when its content is
+// taken out. Every other attribute described the value being removed.
+function emptiedCell(cell) {
+  const open = cell.slice(0, cell.indexOf(">") + 1);
+  const kept = ["r", "s"].map((name) => open.match(new RegExp(`\\s${name}="[^"]*"`))).filter(Boolean);
+  return `<c${kept.map((held) => held[0]).join("")}/>`;
+}
+
 function insertRow(editor, edit, stale) {
-  const { part, name } = sheetPart(editor.zip, edit.sheet);
+  const { part, name } = sheetPart(editor, edit.sheet);
   const row = rowNumber(edit.row);
-  editor.part(part, (xml) => {
+  editor.sheet(part, (xml) => {
     const { rowMax } = usedRange(xml);
     if (rowMax === 0) throw new UsageError(`sheet ${JSON.stringify(name)} has no rows to insert into`);
     if (row > rowMax + 1) throw new UsageError(`row ${row} is past the sheet's used range (1-${rowMax})`);
@@ -2721,9 +3441,9 @@ function insertRow(editor, edit, stale) {
 }
 
 function deleteRow(editor, edit, stale) {
-  const { part, name } = sheetPart(editor.zip, edit.sheet);
+  const { part, name } = sheetPart(editor, edit.sheet);
   const row = rowNumber(edit.row);
-  editor.part(part, (xml) => {
+  editor.sheet(part, (xml) => {
     const { rowMax } = usedRange(xml);
     if (rowMax === 0) throw new UsageError(`sheet ${JSON.stringify(name)} has no rows`);
     if (row > rowMax) throw new UsageError(`row ${row} is past the sheet's used range (1-${rowMax})`);
@@ -2731,23 +3451,28 @@ function deleteRow(editor, edit, stale) {
     // A line inside the used range the writer left no `<row>` element for is
     // still a line the delete takes: everything below it moves up by one, the
     // same rule the column arm follows. Only a line past the used range is
-    // refused.
-    const target = sheetRows(xml).find((candidate) => candidate.number === row);
-    const without = target ? xml.slice(0, target.start) + xml.slice(target.end) : xml;
+    // refused. The addresses a writer left implicit are materialized BEFORE the
+    // line goes, the column arm's own rule: an addressless `<row>` counts as "one
+    // after its predecessor", so a line taken out from above it would otherwise be
+    // renumbered by that count instead of moved by the shift, and the surviving
+    // row would come out stating a number its cells no longer sit at.
+    const materialized = materializeAddresses(xml);
+    const target = sheetRows(materialized).find((candidate) => candidate.number === row);
+    const without = target ? materialized.slice(0, target.start) + materialized.slice(target.end) : materialized;
     // The delete takes the content the line held, whether or not it moves a
     // surviving address: deleting the last used line leaves nothing to shift, and
     // the caveats about a workbook's charts and pivots are owed for a change of
     // content — a line the writer left holding no cell changed none. The shift
     // raises the notes that change owes (see `shiftSheet`).
     const tookCells = Boolean(target && rowCells(target.xml).length);
-    return shiftSheet(editor, without, "row", row, -1, { stale, sheet: name, removed: tookCells });
+    return shiftSheet(editor, without, "row", row, -1, { stale, sheet: name, removed: tookCells, addressed: true });
   });
 }
 
 function insertColumn(editor, edit, stale) {
-  const { part, name } = sheetPart(editor.zip, edit.sheet);
+  const { part, name } = sheetPart(editor, edit.sheet);
   const column = columnNumber(edit.column);
-  editor.part(part, (xml) => {
+  editor.sheet(part, (xml) => {
     const { columnMax } = usedRange(xml);
     if (columnMax === 0) throw new UsageError(`sheet ${JSON.stringify(name)} has no columns to insert into`);
     if (column > columnMax + 1) throw new UsageError(`column ${edit.column} is past the sheet's used range (A-${colName(columnMax - 1)})`);
@@ -2760,9 +3485,9 @@ function insertColumn(editor, edit, stale) {
 }
 
 function deleteColumn(editor, edit, stale) {
-  const { part, name } = sheetPart(editor.zip, edit.sheet);
+  const { part, name } = sheetPart(editor, edit.sheet);
   const column = columnNumber(edit.column);
-  editor.part(part, (xml) => {
+  editor.sheet(part, (xml) => {
     const { columnMax } = usedRange(xml);
     if (columnMax === 0) throw new UsageError(`sheet ${JSON.stringify(name)} has no columns`);
     if (column > columnMax) throw new UsageError(`column ${edit.column} is past the sheet's used range (A-${colName(columnMax - 1)})`);
@@ -2778,6 +3503,524 @@ function deleteColumn(editor, edit, stale) {
   });
 }
 
+// ── xlsx_edit: format_cells ────────────────────────────────────
+// `format_cells` writes only the properties a request names; everything else on
+// the cell is its own `<cellXfs>` entry's bytes (see `styledXf`). The closed sets
+// are the shared rules', so an alignment with no reader value — or an inherited
+// name such as "constructor" — is refused rather than written as one no reader
+// knows, and a border side outside the rule's list is refused the same way.
+const CELL_ALIGNMENTS = new Set(RULES.cell_alignments);
+const CELL_VERTICALS = new Set(RULES.cell_verticals);
+
+// The refusal a styles part whose root cannot be written into states: a
+// self-closing `<styleSheet/>` is opened by `insertStylesChild` around whatever
+// goes into it while a closed one takes children before its close, so either is
+// writable; a part with no root element, or one whose root never closes, has
+// nothing to write into, and a change that would splice into it must not be
+// reported as written. Read through the same reader the writer uses
+// (`stylesRoot`), so this opening check and the write cannot disagree about the
+// root's spelling.
+function requireStylesRoot(styles) {
+  if (!stylesRoot(styles)) throw new UsageError("the workbook's styles part cannot be written into: its <styleSheet> root is missing or never closed");
+}
+
+// The part the workbook's own relationships name for its styles, resolved like a
+// sheet's part is (`resolvePart` of the relationship's target) rather than assumed to
+// sit at the conventional `XLSX_STYLES`: a workbook whose styles were saved elsewhere
+// is one whose formatting has to go where the relationship points, or it lands in a
+// part no reader consults while the cells' own `s=` keep pointing at the part the
+// relationship names. The relationship list is read whether or not it can be written
+// into — the same reading `workbookSheets` makes, so sheets and styles resolve by one
+// rule — and the conventional name is the fallback for a package that names no styles
+// part at all: the name a relationship has to be added for, by `nameStylesPart`.
+function stylesPart(editor) {
+  const named = relationships(editor.read(XLSX_WORKBOOK_RELS) ?? "").find((rel) => rel.type === STYLES_REL_TYPE);
+  return named ? resolvePart(partDirectory(XLSX_WORKBOOK), named.target) : XLSX_STYLES;
+}
+
+// `name` — the styles part `stylesPart` resolved — made one the workbook's own
+// relationships name: a part no relationship points at is one no reader reads, so the
+// formatting would sit in a part nobody consults. Says whether the part ends up named.
+// `false` is a package whose relationship list cannot be written into — absent, or
+// holding no close of its own — which this kit does not refuse: a reader falls back to
+// the conventional part names for such a package and so does this kit (see
+// `workbookSheets`), and an edit that writes no style has nothing to gain from the
+// naming. An edit that DOES write styles cannot accept it — see `stylesText`.
+function nameStylesPart(editor, name) {
+  const rels = editor.read(XLSX_WORKBOOK_RELS);
+  if (!relsWritable(rels)) return false;
+  if (relationships(rels).some((rel) => rel.type === STYLES_REL_TYPE)) return true;
+  addRelationship(editor, XLSX_WORKBOOK, STYLES_REL_TYPE, name);
+  return true;
+}
+
+// The text of `name`, the styles part `stylesPart` resolved, added and declared when the
+// workbook has none: an edit that brings formatting to a workbook that never saved styles
+// writes the part `createXlsx` would have rather than refusing, and the part a reader
+// reads is the one the workbook's own relationships name — a package whose relationships
+// cannot name it is refused (`nameStylesPart`) rather than answered with formatting
+// nobody consults. The text is the caller's own read, charged like every other walk over
+// a part, and the root was checked once before any edit ran (`xlsxEdit`).
+function stylesText(editor, input, name) {
+  if (!editor.zip.file("[Content_Types].xml")) throw missingContentTypes(input);
+  if (!editor.zip.file(name)) editor.add(name, MINIMAL_STYLES);
+  editor.part("[Content_Types].xml", (xml) => withOverride(xml, name, STYLES_CONTENT_TYPE));
+  if (!nameStylesPart(editor, name)) throw new UsageError(`cannot edit ${nodePath.basename(input)}: the workbook's relationships cannot name a styles part, so the formatting would sit in a part no reader reads`);
+  return editor.read(name);
+}
+
+// The rectangle an A1 cell or `A1:B2` range covers, its endpoints normalized so
+// `first` is the top-left: `cellAddress` reads each end (refusing a bad address or
+// one past the grid) and the ends are swapped. Every cell inside is on the grid by
+// construction.
+function gridRect(range) {
+  const parts = typeof range === "string" ? range.split(":") : [];
+  if (parts.length === 0 || parts.length > 2) throw new UsageError(`range must be an A1 address or an A1:B2 range, got: ${JSON.stringify(range)}`);
+  const ends = parts.map((part) => cellAddress(part, "range"));
+  const [a, b] = ends.length === 1 ? [ends[0], ends[0]] : ends;
+  return {
+    firstRow: Math.min(a.row, b.row),
+    lastRow: Math.max(a.row, b.row),
+    firstColumn: Math.min(a.column, b.column),
+    lastColumn: Math.max(a.column, b.column),
+  };
+}
+
+// The caller's own range: `gridRect` plus the one bound on how many cells a format
+// may name.
+function rangeRect(range) {
+  const rect = gridRect(range);
+  requireRangeCap(rect, range);
+  return rect;
+}
+
+// The one bound that keeps a format from walking a rectangle no call could
+// finish. A rect is checked when it is read and again when a merge widens it: a
+// `<mergeCell>` covering more cells than the rule allows would otherwise slip
+// past the check the caller's own range passed.
+const requireRangeCap = (rect, label) => {
+  const cells = (rect.lastRow - rect.firstRow + 1) * (rect.lastColumn - rect.firstColumn + 1);
+  if (cells > RULES.format_cells_max) throw new UsageError(`the range ${label} covers ${cells} cells, more than the ${RULES.format_cells_max} one format may name`);
+};
+
+// The `A1:C1` (or single `A1`) spelling a rectangle is named by.
+const rectLabel = (rect) => {
+  const first = `${colName(rect.firstColumn)}${rect.firstRow}`;
+  const last = `${colName(rect.lastColumn)}${rect.lastRow}`;
+  return first === last ? first : `${first}:${last}`;
+};
+
+// A rectangle widened to cover every `<mergeCell>` it touches: Excel formats a
+// merged cell as one, so a format aimed at part of one must land on the whole.
+// Returns the widened rectangle, the label a reply names it by, whether it
+// changed, and how many merges the widened rectangle covers — an L of merges
+// closes over more than one, and the note a reply carries must not call them one.
+// Each `<mergeCell ref>` is read through `gridRect`, so one this reader
+// cannot parse or one the grid cannot hold is skipped rather than allowed to widen
+// the rectangle to nonsense; the caller's own range is grid-checked, a merge's is
+// not (see `gridRect`). Widening can bring a merge the rectangle did not touch into
+// reach — an L of merges whose far arm only the first widening reaches — so the
+// passes repeat until the rectangle stops growing, each pass taking in at least one
+// merge. A merge that widens the rectangle past the cap is NOT skipped:
+// `requireRangeCap` runs on the WIDENED rect at the call site, so a merge that
+// covers more cells than the rule allows still refuses the call.
+function mergedRect(xml, rect) {
+  const merges = [...xml.matchAll(elementPattern("mergeCell"))].flatMap((match) => {
+    const ref = (match[0].match(/\bref="([^"]*)"/) || [])[1];
+    if (ref === undefined) return [];
+    // A ref this reader cannot parse or one the grid cannot hold is skipped: the
+    // caller's own range is grid-checked, a merge's is not, and widening to a ref
+    // the grid cannot hold would write an address no sheet has.
+    try { return [gridRect(ref)]; } catch { return []; }
+  });
+  let out = { ...rect };
+  let growing = true;
+  while (growing) {
+    growing = false;
+    for (const merge of merges) {
+      if (merge.lastRow < out.firstRow || merge.firstRow > out.lastRow || merge.lastColumn < out.firstColumn || merge.firstColumn > out.lastColumn) continue;
+      const grown = {
+        firstRow: Math.min(out.firstRow, merge.firstRow),
+        lastRow: Math.max(out.lastRow, merge.lastRow),
+        firstColumn: Math.min(out.firstColumn, merge.firstColumn),
+        lastColumn: Math.max(out.lastColumn, merge.lastColumn),
+      };
+      if (grown.firstRow !== out.firstRow || grown.lastRow !== out.lastRow || grown.firstColumn !== out.firstColumn || grown.lastColumn !== out.lastColumn) growing = true;
+      out = grown;
+    }
+  }
+  const widened = out.firstRow !== rect.firstRow || out.lastRow !== rect.lastRow || out.firstColumn !== rect.firstColumn || out.lastColumn !== rect.lastColumn;
+  // How many merges the widened rectangle covers, so the note can say whether the
+  // format landed on one merged cell or on several: widening closes over every
+  // merge a merge reaches, so a rectangle grown by an L of them covers more than
+  // one and a note that called them one would be wrong.
+  const covered = merges.filter((merge) => !(merge.lastRow < out.firstRow || merge.firstRow > out.lastRow || merge.lastColumn < out.firstColumn || merge.firstColumn > out.lastColumn)).length;
+  return { rect: out, label: rectLabel(out), widened, covered };
+}
+
+// A `border` request: an object whose keys are the sides a cell draws and whose
+// values are booleans, at least one side named. An unknown key, a non-boolean
+// value or an empty object is refused rather than silently dropped, since the
+// caller would otherwise be told a border was applied that no reader shows.
+function rangeBorder(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new UsageError(`border must be an object naming sides (${listed(CELL_BORDER_SIDES)}), got: ${JSON.stringify(value)}`);
+  const keys = Object.keys(value);
+  if (!keys.length) throw new UsageError(`border must name at least one side (${listed(CELL_BORDER_SIDES)})`);
+  const border = {};
+  for (const key of keys) {
+    if (!CELL_BORDER_SIDES.includes(key)) throw new UsageError(`border has no side ${JSON.stringify(key)} — hint: use ${listed(CELL_BORDER_SIDES)}`);
+    if (typeof value[key] !== "boolean") throw new UsageError(`border.${key} must be true or false`);
+    border[key] = value[key];
+  }
+  return border;
+}
+
+// The properties a `range` target names, normalized for `styledXf`: each one
+// bounded, colours reduced to their digits and booleans checked, so a value the
+// Rust boundary refused first is refused here too rather than written. A target
+// that names none is refused — the op would otherwise rewrite the sheet and
+// change nothing.
+function rangeFormat(edit) {
+  const format = {};
+  let named = false;
+  if (edit.font !== undefined) {
+    const font = editText(edit.font, "font");
+    if (!font) throw new UsageError("font must not be empty");
+    if ([...font].length > RULES.font_name_max) throw new UsageError(`font must be at most ${RULES.font_name_max} characters, got: ${[...font].length}`);
+    format.font = font;
+    named = true;
+  }
+  if (edit.size !== undefined) {
+    if (!inSpan(edit.size, RULES.cell_font_points)) throw new UsageError(`size must be ${spanBounds(RULES.cell_font_points)} points, got: ${JSON.stringify(edit.size)}`);
+    format.size = edit.size;
+    named = true;
+  }
+  for (const toggle of ["bold", "italic"]) {
+    if (edit[toggle] === undefined) continue;
+    if (typeof edit[toggle] !== "boolean") throw new UsageError(`${toggle} must be true or false`);
+    format[toggle] = edit[toggle];
+    named = true;
+  }
+  if (edit.color !== undefined) {
+    format.color = hexDigits(edit.color).toUpperCase();
+    named = true;
+  }
+  if (edit.fill !== undefined) {
+    format.fill = edit.fill === false ? false : hexDigits(edit.fill).toUpperCase();
+    named = true;
+  }
+  if (edit.border !== undefined) {
+    format.border = rangeBorder(edit.border);
+    named = true;
+  }
+  if (edit.align !== undefined) {
+    if (!CELL_ALIGNMENTS.has(edit.align)) throw new UsageError(`align must be ${listed([...CELL_ALIGNMENTS])}, got: ${JSON.stringify(edit.align)}`);
+    format.align = edit.align;
+    named = true;
+  }
+  if (edit.vertical !== undefined) {
+    if (!CELL_VERTICALS.has(edit.vertical)) throw new UsageError(`vertical must be ${listed([...CELL_VERTICALS])}, got: ${JSON.stringify(edit.vertical)}`);
+    format.vertical = edit.vertical;
+    named = true;
+  }
+  if (edit.wrap !== undefined) {
+    if (typeof edit.wrap !== "boolean") throw new UsageError("wrap must be true or false");
+    format.wrap = edit.wrap;
+    named = true;
+  }
+  if (edit.number_format !== undefined) {
+    const code = editText(edit.number_format, "number_format");
+    if (!code) throw new UsageError("number_format must not be empty");
+    if ([...code].length > RULES.number_format_max) throw new UsageError(`a number format must be at most ${RULES.number_format_max} characters, got: ${[...code].length}`);
+    format.number_format = code;
+    named = true;
+  }
+  if (!named) throw new UsageError("a format_cells range target names no property — hint: name at least one of font, size, bold, italic, color, fill, border, align, vertical, wrap or number_format");
+  return format;
+}
+
+// The style a `<row>` itself carries, which the cells that name none inherit: it
+// is stated with `customFormat="1"` — a bare `s=` a writer left on a row is not a
+// style a reader applies — and a `customFormat` row with no readable `s=` takes
+// the schema default, entry 0, so the row still wins over a covering `<col>`. A
+// row that is not there at all has no style, so a failed lookup's `undefined`
+// passes through.
+const rowStyleOf = (rowXml) => {
+  if (rowXml === undefined) return undefined;
+  const open = elementParts(rowXml, "row").open;
+  return /customFormat="1"/.test(open) ? (styleOf(open) ?? "0") : undefined;
+};
+
+// The `<col>` entries of a sheet that state a `style`, each with the span it covers:
+// a cell that names no style of its own takes the last entry covering its column.
+const columnStyleEntries = (sheet) => colEntries(sheet)
+  .filter((entry) => entry.style !== undefined && Number.isFinite(entry.min) && Number.isFinite(entry.max));
+
+// The style a cell that names no `s=` of its own renders by: the row's when it
+// has one — the row wins, as a reader applies them — else the last `<col>` entry
+// covering the column, else `undefined`, which is entry 0.
+const inheritedStyle = (rowStyle, columns, column) => {
+  if (rowStyle !== undefined) return rowStyle;
+  let found;
+  for (const entry of columns) if (column + 1 >= entry.min && column + 1 <= entry.max) found = entry.style;
+  return found;
+};
+
+// The `format_cells` op on a cell range: the sheet rebuilt in ONE pass, so the
+// rect's cells are rewritten and its missing rows and cells created while rows
+// outside the rect stay byte-identical (a body whose rows are not in address order
+// is written back in it — see the rows below). Every read is charged — the styles
+// part by `stylesText`, the sheet by the caller, each new style entry's parse here —
+// so a rect the rule allows but no machine could finish is refused the way any other
+// call over its budget is. The rebuilt text is RETURNED rather than written, so the
+// `sheet` call that read the part writes it once against the text it arrived as.
+function formatCells(editor, sheet, rect, edit, input, stylesName) {
+  const openedStyles = stylesText(editor, input, stylesName);
+  let styles = openedStyles;
+  const indices = new Map();
+  // The index a cell's base style takes — its own `s=`, or the style it inherits
+  // from its row or column when it names none — computed once per distinct base
+  // against the styles part as it grows: a rect may hold `RULES.format_cells_max`
+  // cells, and re-parsing the styles part for every cell of one base would be
+  // quadratic in the worst case the rule allows. The parse each new base costs is
+  // charged, so a rect of all-distinct bases is refused with a split hint rather
+  // than run into the kit's own time limit.
+  const indexFor = (base) => {
+    const key = base ?? "";
+    let index = indices.get(key);
+    if (index === undefined) {
+      editor.charge(styles.length);
+      const applied = cellStyleIndex(styles, edit, base);
+      styles = applied.styles;
+      index = String(applied.index);
+      indices.set(key, index);
+    }
+    return index;
+  };
+  const colStyles = columnStyleEntries(sheet);
+  const present = new Set(sheetRows(sheet).map((row) => row.number));
+  // The rows of the rect the sheet states no element for: the numbers come from
+  // the sheet's own set rather than from a cursor over document order, so a
+  // document that is not ascending cannot make one be created twice. An addressless
+  // `<row>` counts as "one after its predecessor", so a row element inserted among
+  // such rows renumbers every successor (see `materializeAddresses`). The addresses
+  // are made explicit before any row is inserted, but only when one of these has to
+  // be written.
+  const missing = [];
+  for (let row = rect.firstRow; row <= rect.lastRow; row += 1) {
+    if (!present.has(row)) missing.push(row);
+  }
+  const source = ensureSheetData(missing.length ? materializeAddresses(sheet) : sheet);
+  const body = sheetBody(source);
+  let created = false;
+  const newCell = (column, number, rowStyle) => {
+    created = true;
+    return `<c r="${colName(column)}${number}" s="${indexFor(inheritedStyle(rowStyle, colStyles, column))}"/>`;
+  };
+  // A whole row the sheet has none of: one created cell per column of the rect.
+  const rowElement = (number) => {
+    const cells = [];
+    for (let column = rect.firstColumn; column <= rect.lastColumn; column += 1) cells.push(newCell(column, number, undefined));
+    return `<row r="${number}">${cells.join("")}</row>`;
+  };
+  const rowBody = (row) => {
+    const stated = rowCells(row.xml);
+    // The row's own cells in address order: the row is rebuilt here either way, so its
+    // cells go back the way a reader reads them rather than the way they arrived, each
+    // address stated once (a row whose cells state none is refused — `ascending`).
+    const cells = ascending(stated, (cell) => cell.column, "the cells of a sheet row");
+    const rowStyle = rowStyleOf(row.xml);
+    const inRect = (column) => column >= rect.firstColumn && column <= rect.lastColumn;
+    // The rect's columns the row holds no cell for, in address order: emitted before
+    // the first stated cell they precede, so the row is rebuilt in ONE pass rather
+    // than rescanned per created cell (a rect may hold `RULES.format_cells_max` cells
+    // in one row). The cursor is the next column of the rect not yet written, so a
+    // cell LEFT of the rect leaves it where it is — stepping it back would create a
+    // neighbouring column the caller never named.
+    let column = rect.firstColumn;
+    const pending = (before) => {
+      let out = "";
+      while (column <= rect.lastColumn && column < before) {
+        out += newCell(column, row.number, rowStyle);
+        column += 1;
+      }
+      return out;
+    };
+    if (!cells.length) {
+      const filled = pending(Number.POSITIVE_INFINITY);
+      // A self-closing `<row r="1"/>` is opened to hold them; one already open
+      // takes them before its close (`elementParts` reads either spelling).
+      const { open, body } = elementParts(row.xml, "row");
+      return `${open}${body}${filled}</row>`;
+    }
+    // The row's own text around its cells — its open tag and whatever follows the
+    // last one — is kept as it stands: the text BETWEEN cells is a writer's own
+    // layout, and the row is written from the cells it holds.
+    let out = "";
+    for (const cell of cells) {
+      out += pending(cell.column);
+      // An existing in-rect cell has only its `s=` set — to the style it already
+      // renders as, its own or the one it inherits; one outside the rect is
+      // byte-identical, and the created columns go at their own place.
+      out += inRect(cell.column)
+        ? setXmlAttribute(cell.xml, "s", indexFor(styleOf(cell.xml) ?? inheritedStyle(rowStyle, colStyles, cell.column)))
+        : cell.xml;
+      column = Math.max(column, cell.column + 1);
+    }
+    out += pending(Number.POSITIVE_INFINITY);
+    return row.xml.slice(0, stated[0].start) + out + row.xml.slice(stated[stated.length - 1].end);
+  };
+  // The rows of the body in the order they go back: one the sheet states in address
+  // order is written where it stands, with the text between its rows kept byte for
+  // byte, while a body whose rows are not in order — a shape no writer produces — is
+  // rebuilt in address order, since the body is rewritten here anyway and each of the
+  // rect's rows is then stated once (a row stating no number of its own cannot be
+  // reordered and is refused — `ascending`).
+  const stated = sheetRows(source);
+  const rows = ascending(stated, (row) => row.number, "the sheet's rows");
+  const kept = rows === stated;
+  let text = source.slice(0, body.index) + (body.selfClosing ? `${body.open.slice(0, -2)}>` : body.open);
+  let cursor = body.bodyStart;
+  let next = 0;
+  const absent = (before) => {
+    let out = "";
+    while (next < missing.length && (before === null || missing[next] < before)) {
+      out += rowElement(missing[next]);
+      next += 1;
+    }
+    return out;
+  };
+  for (const row of rows) {
+    if (kept) text += source.slice(cursor, row.start);
+    text += absent(row.number);
+    if (row.number >= rect.firstRow && row.number <= rect.lastRow) {
+      text += rowBody(row);
+    } else {
+      text += source.slice(row.start, row.end);
+    }
+    cursor = row.end;
+  }
+  text += absent(null);
+  if (kept) text += source.slice(cursor, body.bodyEnd);
+  text += body.selfClosing ? `</sheetData>${source.slice(body.bodyEnd)}` : source.slice(body.bodyEnd);
+  // The sheet's declared reach covers the addressed rectangle only when a cell
+  // was really created: rewriting an existing cell's style moves no address, and
+  // a ref widened for it would be a change the caller did not ask for.
+  if (created) {
+    text = widenDimension(text, rect.firstRow, rect.firstColumn);
+    text = widenDimension(text, rect.lastRow, rect.lastColumn);
+  }
+  editor.rewrite(stylesName, openedStyles, styles);
+  return text;
+}
+
+// `entry` — a `colEntries` entry, so its own text and span are already read — split
+// so exactly `column` names `width` while the spans on either side keep the entry's
+// own attributes: each side is the same `<col>` with its `min`/`max` narrowed, and
+// the named column's copy has the new width and `customWidth` stated. A span the
+// named column does not touch produces no side piece.
+function splitColumn(entry, column, width) {
+  const span = (lo, hi) => setXmlAttribute(setXmlAttribute(entry.text, "min", String(lo)), "max", String(hi));
+  const parts = [];
+  if (column > entry.min) parts.push(span(entry.min, column - 1));
+  parts.push(setXmlAttribute(setXmlAttribute(span(column, column), "width", String(width)), "customWidth", "1"));
+  if (column < entry.max) parts.push(span(column + 1, entry.max));
+  return parts;
+}
+
+// The `format_cells` op on a column: the width goes into a `<col min max width
+// customWidth="1"/>` entry covering exactly that column. An entry covering a
+// WIDER span is SPLIT so the columns on either side keep exactly the entry they
+// had (same width, style, hidden, outlineLevel, collapsed, bestFit bytes) and
+// only the named column changes; a sheet with no `<cols>` block gets one created
+// directly before `<sheetData>`, the place `CT_Worksheet` requires of it.
+function formatColumn(editor, part, edit) {
+  const column = columnNumber(edit.column);
+  const width = edit.width;
+  editor.sheet(part, (xml) => {
+    const source = ensureSheetData(xml);
+    // The block the entry goes into, or `undefined` for a sheet that states none; one
+    // the part leaves open is refused (`writableElement`).
+    const cols = writableElement(source, "cols", "the sheet part");
+    const entries = colEntries(source);
+    const covering = entries.findIndex((entry) => Number.isFinite(entry.min) && column >= entry.min && column <= entry.max);
+    const written = entries.map((entry) => entry.text);
+    if (covering >= 0) {
+      written[covering] = splitColumn(entries[covering], column, width).join("");
+    } else {
+      const placed = entries.findIndex((entry) => entry.min > column);
+      // The new entry is written at its `min`'s place, so the block stays ordered
+      // whether or not the sheet had a `<col>` for the column already.
+      written.splice(placed < 0 ? written.length : placed, 0, `<col min="${column}" max="${column}" width="${width}" customWidth="1"/>`);
+    }
+    const block = `<cols>${written.join("")}</cols>`;
+    if (cols) return source.slice(0, cols.index) + block + source.slice(cols.index + cols[0].length);
+    // No `<cols>` to write into: the block goes at its own `CT_Worksheet` place,
+    // directly before the body the sheet's rows live in. Only that element's place is
+    // read (`writableElement`; `ensureSheetData` above guarantees it exists), and no
+    // row is: a column width never writes into the body, so a part whose rows cannot
+    // be read is no reason to refuse it.
+    const body = writableElement(source, "sheetData", "the sheet part");
+    return source.slice(0, body.index) + block + source.slice(body.index);
+  });
+}
+
+// The `format_cells` op on a row: `ht` and `customHeight` are set on the row
+// element, everything else on it (its `spans`, its `s`, its cells) kept. A sheet
+// with no such row gets `<row r="N" ht="…" customHeight="1"/>` inserted in row
+// order; the addresses are made explicit before the element goes in, since an
+// addressless row counts as "one after its predecessor" and an inserted element
+// would renumber the rows after it.
+function formatRow(editor, part, edit) {
+  const row = rowNumber(edit.row);
+  const height = edit.height;
+  editor.sheet(part, (xml) => {
+    const existing = sheetRows(xml).find((candidate) => candidate.number === row);
+    if (existing) {
+      const element = setXmlAttribute(setXmlAttribute(existing.xml, "ht", String(height)), "customHeight", "1");
+      return xml.slice(0, existing.start) + element + xml.slice(existing.end);
+    }
+    const source = materializeAddresses(xml);
+    return insertSheetRow(source, sheetRows(source), row, `<row r="${row}" ht="${height}" customHeight="1"/>`);
+  });
+}
+
+// The `format_cells` op: a cell range, a column or a row, exactly one target
+// named and exactly the properties that target takes. Only the keys a target
+// knows are read — a key outside its set is the Rust boundary's refusal — and
+// every bound is stated here as the kit's own last line. A range target's sheet
+// part is read and charged once here (`sheet`), then handed to `mergedRect` and
+// `formatCells`, which returns the text the same call writes.
+function xlsxFormatCells(editor, edit, input, stylesName) {
+  const { part } = sheetPart(editor, edit.sheet);
+  const targets = ["range", "column", "row"].filter((key) => edit[key] !== undefined);
+  if (!targets.length) throw new UsageError("a format_cells edit needs one of range, column or row");
+  if (targets.length > 1) throw new UsageError(`a format_cells edit names more than one target (${listed(targets)}), but takes exactly one`);
+  if (targets[0] === "range") {
+    const rect = rangeRect(edit.range);
+    const format = rangeFormat(edit);
+    editor.sheet(part, (sheet) => {
+      const merged = mergedRect(sheet, rect);
+      if (merged.widened) {
+        requireRangeCap(merged.rect, `${merged.label} (${rectLabel(rect)} widened by a merged cell)`);
+        const merge = merged.covered === 1 ? "those cells are one merged cell" : `those cells are covered by ${merged.covered} merged cells`;
+        editor.note(`[the range ${rectLabel(rect)} was widened to ${merged.label}: ${merge}]`);
+      }
+      return formatCells(editor, sheet, merged.rect, format, input, stylesName);
+    });
+    return;
+  }
+  if (targets[0] === "column") {
+    if (edit.width === undefined) throw new UsageError("a format_cells column target names no width — hint: name width");
+    if (!inSpan(edit.width, RULES.column_width_chars)) throw new UsageError(`width must be ${spanBounds(RULES.column_width_chars)} characters, got: ${JSON.stringify(edit.width)}`);
+    formatColumn(editor, part, edit);
+    return;
+  }
+  if (edit.height === undefined) throw new UsageError("a format_cells row target names no height — hint: name height");
+  if (!inSpan(edit.height, RULES.row_height_points)) throw new UsageError(`height must be ${spanBounds(RULES.row_height_points)} points, got: ${JSON.stringify(edit.height)}`);
+  formatRow(editor, part, edit);
+}
+
 function xlsxEdit(req) {
   const editor = openEdit(req, "xlsx");
   const edits = editList(req);
@@ -2789,17 +4032,34 @@ function xlsxEdit(req) {
   // caveat of its own.
   const charts = names.some((name) => /^xl\/charts\/chart[^/]*\.xml$/.test(name));
   const pivots = names.some((name) => /^xl\/pivotTables\/pivotTable[^/]*\.xml$/.test(name) || /^xl\/pivotCache\/pivotCache(?:Definition|Records)[^/]*\.xml$/.test(name));
+  // The styles part is taken into hand before any edit runs, whatever the edit is: the
+  // part the workbook's own relationships name (`stylesPart`), a root not one a child
+  // can be written into (`requireStylesRoot`) and a part the workbook does not name
+  // (`nameStylesPart` — best effort here, while a styles-writing edit refuses a
+  // workbook whose relationships cannot name it, see `stylesText`). The read is charged
+  // (`read`), as is the one the edit that grows the part makes itself, so the work
+  // budget counts the part twice on a styles-writing call — the bound is on the work a
+  // call does, not on the distinct bytes it touches. What the part holds between its
+  // entries is not vetted, since an input already damaged there is no worse for this
+  // edit. A workbook with no styles part has nothing to check and keeps working.
+  const stylesName = stylesPart(editor);
+  const styles = editor.read(stylesName);
+  if (styles !== undefined) {
+    requireStylesRoot(styles);
+    nameStylesPart(editor, stylesName);
+  }
   // The stale references a shift cannot rewrite, collected while the edits run
   // so the reply names them once.
   const stale = new Set();
   for (const edit of edits) {
     const op = edit && edit.op;
-    if (op === "set_cell") setCell(editor, edit);
+    if (op === "set_cell") setCell(editor, edit, req.input, stylesName);
     else if (op === "clear_cell") clearCell(editor, edit);
     else if (op === "insert_row") insertRow(editor, edit, stale);
     else if (op === "delete_row") deleteRow(editor, edit, stale);
     else if (op === "insert_column") insertColumn(editor, edit, stale);
     else if (op === "delete_column") deleteColumn(editor, edit, stale);
+    else if (op === "format_cells") xlsxFormatCells(editor, edit, req.input, stylesName);
     else throw new UsageError(`unknown xlsx edit: ${JSON.stringify(op)}`);
   }
   // The editor knows whether the call changed the sheet's content at all — a
@@ -2913,25 +4173,31 @@ function relsPartFor(part) {
 // The directory a part's own relationships resolve their targets against.
 const partDirectory = (part) => part.slice(0, part.lastIndexOf("/") + 1);
 
-// A tag's own XML with attribute `name` set to `value`, or removed when the
-// value is null. The attribute is written just before the tag's own close, so a
-// self-closing tag stays self-closing.
-function setXmlAttribute(tag, name, value) {
-  const pattern = new RegExp(`\\s${name}="[^"]*"`);
-  if (value === null) return tag.replace(pattern, "");
-  if (pattern.test(tag)) return tag.replace(pattern, ` ${name}="${value}"`);
-  return tag.replace(/(\s*\/?>)$/, ` ${name}="${value}"$1`);
-}
-
+// Whether a `.rels` part is one a relationship can be written into: a part with no
+// close of its own has nowhere to insert one. The close is read with the shared
+// spelling rule (see `closeTag`), so a part spelled `</Relationships >` is not read
+// as one that never closes. A package whose relationships cannot be read is still
+// edited — a reader falls back to the conventional part names for it and so does
+// this kit (`workbookSheets`) — so this says what can be written, not what is
+// refused.
+const RELATIONSHIPS_CLOSE = new RegExp(closeTag("Relationships"));
+const relsWritable = (rels) => rels !== undefined && RELATIONSHIPS_CLOSE.test(rels);
 // Add a relationship of `type` to `part`'s own relationships, naming the
 // absolute package path `target`, and return the fresh id it took. The
 // relationship part is created when the package has none.
 function addRelationship(editor, part, type, target) {
   const rels = relsPartFor(part);
   const file = editor.zip.file(rels);
-  // Every id the part already holds is stepped over, whether or not its element
-  // is one this kit would read: two relationships sharing an id name each other.
-  const used = file ? [...file.asText().matchAll(/\bId="rId(\d+)"/g)].map((match) => Number(match[1])) : [];
+  // Every id the owning part already holds is stepped over: the `.rels` part's own
+  // `Id="rIdN"` when the package has one, else the part's own `r:id="rIdN"`
+  // references — a package with no `.rels` part still spells references of its own
+  // (`<sheet r:id="rId1"/>`), and an id one of those took must not be handed to the
+  // new relationship, or the reference would point at it. Two relationships sharing
+  // an id name each other either way, so an element this kit would not read counts.
+  const holder = file ? file.asText() : editor.zip.file(part)?.asText() ?? "";
+  editor.charge(holder.length);
+  const pattern = file ? /\bId="rId(\d+)"/g : /\br:id="rId(\d+)"/g;
+  const used = [...holder.matchAll(pattern)].map((match) => Number(match[1]));
   const id = `rId${Math.max(0, ...used) + 1}`;
   const element = `<Relationship Id="${id}" Type="${type}" Target="${relativeTarget(partDirectory(part), target)}"/>`;
   if (!file) {
@@ -2939,8 +4205,9 @@ function addRelationship(editor, part, type, target) {
     return id;
   }
   editor.part(rels, (xml) => {
-    if (!xml.includes("</Relationships>")) throw new UsageError(`the relationships of ${part} are not readable`);
-    return xml.replace("</Relationships>", () => `${element}</Relationships>`);
+    const close = xml.match(RELATIONSHIPS_CLOSE);
+    if (!close) throw new UsageError(`the relationships of ${part} are not readable`);
+    return xml.slice(0, close.index) + element + xml.slice(close.index);
   });
   return id;
 }
@@ -3079,15 +4346,18 @@ const SLIDE_SHAPE_TREE = tagPattern("p:spTree");
 const SLIDE_SHAPE = tagPattern("p:sp");
 const SLIDE_FRAME = tagPattern("p:graphicFrame");
 const SLIDE_GROUP = tagPattern("p:grpSp");
-const SLIDE_TX_BODY = /<p:txBody(?:\s[^>]*)?>[\s\S]*?<\/p:txBody>/;
+const SLIDE_TX_BODY = new RegExp(`${openTag("p:txBody")}([\\s\\S]*?)(${closeTag("p:txBody")})`);
 
 // The `<p:txBody>` span of a shape, or null when it holds none (a self-closing
-// `<p:txBody/>` has nowhere for a paragraph to go).
+// `<p:txBody/>` has nowhere for a paragraph to go). `closeAt` is where the body's
+// own close tag begins — the place a paragraph added at its end goes — taken from
+// the match rather than from a close tag spelled out again.
 function shapeTextBody(xml, shape) {
   const body = xml.slice(shape.start, shape.end).match(SLIDE_TX_BODY);
   if (!body) return null;
   const start = shape.start + body.index;
-  return { start, end: start + body[0].length };
+  const end = start + body[0].length;
+  return { start, end, closeAt: end - body[2].length };
 }
 
 // The slide's OWN text: the `<p:txBody>` bodies of its top-level `<p:sp>` shapes
@@ -3233,7 +4503,7 @@ function addSlideParagraph(editor, edit) {
       anchor = xml.slice(span.start, span.end);
       at = span.end;
     } else if (bodies.length) {
-      at = bodies[bodies.length - 1].end - "</p:txBody>".length;
+      at = bodies[bodies.length - 1].closeAt;
     } else {
       throw new UsageError("the slide has no text body to add a paragraph to");
     }
@@ -3245,7 +4515,7 @@ function addSlideParagraph(editor, edit) {
 // `<a:txBody>` — each a `CT_TextBody`, which ECMA-376 requires to hold at least
 // one paragraph. A body never nests inside another, so one sweep over the bodies
 // and the paragraphs in order groups the paragraphs by the body holding them.
-const SLIDE_TEXT_BODIES = /<p:txBody(?:\s[^>]*)?>[\s\S]*?<\/p:txBody>|<a:txBody(?:\s[^>]*)?>[\s\S]*?<\/a:txBody>/g;
+const SLIDE_TEXT_BODIES = new RegExp(`${openTag("p:txBody")}[\\s\\S]*?${closeTag("p:txBody")}|${openTag("a:txBody")}[\\s\\S]*?${closeTag("a:txBody")}`, "g");
 
 // `pptx_edit`'s `remove_paragraph`: every paragraph whose joined text holds
 // `find` is dropped whole, so a fragment matching several paragraphs removes
@@ -3330,12 +4600,14 @@ const addSlideRelationship = (editor, part) => addRelationship(editor, PPT_PRESE
 // slide, or `null` when the presentation has no such list. An entry with no
 // relationship id names no slide the reader shows, so it takes no slot and no
 // position counts it; the entries are matched against the list's own text, so
-// each `entry.index` is relative to `text`.
+// each `entry.index` is relative to `text`, and `closeAt` is where the list's own
+// close tag begins inside `text` — the place an entry appended at its end goes,
+// taken from the match so a close tag carrying whitespace is not mis-measured.
 function slideListEntries(xml) {
-  const match = xml.match(/<p:sldIdLst(?:\s[^>]*)?>[\s\S]*?<\/p:sldIdLst>/);
+  const match = xml.match(new RegExp(`${openTag("p:sldIdLst")}([\\s\\S]*?)(${closeTag("p:sldIdLst")})`));
   if (!match) return null;
   const entries = [...match[0].matchAll(/<p:sldId\b[^>]*>/g)].filter((entry) => relationshipId(entry[0]) !== undefined);
-  return { index: match.index, text: match[0], entries };
+  return { index: match.index, text: match[0], entries, closeAt: match[0].length - match[2].length };
 }
 
 // That list, when its entries are exactly the slides the reader numbers — one per
@@ -3374,7 +4646,7 @@ function withSldId(xml, element, before) {
   const list = slideListEntries(xml);
   if (!list) throw new UsageError("the presentation has no slide list to add a slide to");
   const at = before === undefined || before >= list.entries.length
-    ? list.index + list.text.lastIndexOf("</p:sldIdLst>")
+    ? list.index + list.closeAt
     : list.index + list.entries[before].index;
   return xml.slice(0, at) + element + xml.slice(at);
 }
@@ -3388,12 +4660,15 @@ const overrideFor = (xml, part) => [...xml.matchAll(/<Override\b[^>]*>/g)].find(
 // written before the closing `</Types>` — after every `<Default>`, the
 // schema-correct place for one. A package that already declares the part has that
 // declaration given the type instead of a second one added beside it, which is also
-// what leaves a stale declaration saying what the part really is.
+// what leaves a stale declaration saying what the part really is. The close is
+// found with the shared spelling rule (`closeTag`), never spelled out again.
+const TYPES_CLOSE = new RegExp(closeTag("Types"));
 function withOverride(xml, part, contentType) {
-  if (!xml.includes("</Types>")) throw new UsageError("[Content_Types].xml has no <Types> close to hold a part's content type");
+  const close = xml.match(TYPES_CLOSE);
+  if (!close) throw new UsageError("[Content_Types].xml has no <Types> close to hold a part's content type");
   const declaration = `<Override PartName="/${part}" ContentType="${contentType}"/>`;
   const declared = overrideFor(xml, part);
-  if (declared === undefined) return xml.replace("</Types>", () => `${declaration}</Types>`);
+  if (declared === undefined) return xml.slice(0, close.index) + declaration + xml.slice(close.index);
   return xml.slice(0, declared.index) + declaration + xml.slice(declared.index + declared[0].length);
 }
 
@@ -3528,7 +4803,7 @@ function moveSlide(editor, edit) {
   // The slide takes the position the `to`-th slide of the RESULT holds: in front
   // of the entry that follows it there, or after the last one when it is that
   // deck's last slide.
-  const before = edit.to - 1 < rest.length ? list.index + rest[edit.to - 1].index : list.index + list.text.lastIndexOf("</p:sldIdLst>");
+  const before = edit.to - 1 < rest.length ? list.index + rest[edit.to - 1].index : list.index + list.closeAt;
   editor.part(PPT_PRESENTATION, (xml) => {
     const out = xml.slice(0, cut) + xml.slice(cut + entry[0].length);
     const at = before > cut ? before - entry[0].length : before;
@@ -3686,7 +4961,7 @@ function addSlideNotes(editor, edit) {
     editor.part(declared, (xml) => {
       const body = notesTextBody(xml);
       if (!body) throw new UsageError(`the notes of slide ${edit.slide} have no body to add a paragraph to`);
-      const at = body.end - "</p:txBody>".length;
+      const at = body.closeAt;
       return xml.slice(0, at) + notesParagraph(text) + xml.slice(at);
     });
     return;
@@ -3715,15 +4990,21 @@ function editSlideNotes(editor, edit, op) {
 // a child sits at is what tells the two apart.
 function topLevelChildren(body) {
   const children = [];
-  const open = /<a:([A-Za-z0-9_]+)(?:\s[^>]*)?>|<a:([A-Za-z0-9_]+)(?:\s[^>]*)?\/>/g;
+  const open = new RegExp(`${openTag("a:([A-Za-z0-9_]+)")}|${selfClosingTag("a:([A-Za-z0-9_]+)")}`, "g");
   let match;
   while ((match = open.exec(body)) !== null) {
     const name = match[1] ?? match[2];
-    const selfClosing = match[0].endsWith("/>");
-    const close = selfClosing ? match.index + match[0].length : body.indexOf(`</a:${name}>`, open.lastIndex);
-    if (close < 0) continue;
-    // `</a:name>` is `<`, `/`, `a` and `:`, then the name and its `>`.
-    const end = selfClosing ? close : close + name.length + 5;
+    let end = match.index + match[0].length;
+    if (!match[0].endsWith("/>")) {
+      // The element's own close, found with the shared spelling rule (`name` is the
+      // capture, so the `a:` prefix the pattern names is put back): a close tag
+      // carrying whitespace before its `>` ends the child there too.
+      const close = new RegExp(closeTag(`a:${name}`), "g");
+      close.lastIndex = open.lastIndex;
+      const found = close.exec(body);
+      if (!found) continue;
+      end = found.index + found[0].length;
+    }
     children.push({ name, start: match.index, end });
     open.lastIndex = end;
   }
@@ -3779,8 +5060,11 @@ function withRunFill(body, element) {
 // set to `false` writes the off value so it overrides what the run inherits.
 function formattedSlideRunProperties(runXml, format) {
   const current = runPropertiesOf(runXml);
-  const open = current === "" ? "<a:rPr>" : (current.match(/^<a:rPr(?:\s[^>]*)?\/?>/) || [])[0];
-  let body = current.endsWith("/>") ? "" : current.slice(open.length, -"</a:rPr>".length);
+  // The properties read through the shared element rule — `elementParts` opens a
+  // self-closing tag and gives the body of a closed one — so a close tag carrying
+  // whitespace before its `>` is not read as part of the body.
+  const { open, body: own } = current === "" ? { open: "<a:rPr>", body: "" } : elementParts(current, "a:rPr");
+  let body = own;
   let tag = open;
   if (format.bold !== undefined) tag = setXmlAttribute(tag, "b", format.bold ? "1" : "0");
   if (format.italic !== undefined) tag = setXmlAttribute(tag, "i", format.italic ? "1" : "0");
@@ -3789,8 +5073,9 @@ function formattedSlideRunProperties(runXml, format) {
   if (format.color !== undefined) {
     body = withRunFill(body, `<a:solidFill><a:srgbClr val="${format.color}"/></a:solidFill>`);
   }
-  const paired = tag.endsWith("/>") ? `${tag.slice(0, -2)}>` : tag;
-  return body ? `${paired}${body}</a:rPr>` : `${paired.slice(0, -1)}/>`;
+  // `elementParts`'s open tag is the opened form, so an empty body is written back
+  // as the self-closing tag it was.
+  return body ? `${tag}${body}</a:rPr>` : `${tag.slice(0, -1)}/>`;
 }
 
 // `xml` with the run-level properties of `format` written on the runs the named
@@ -3802,7 +5087,7 @@ function formatSlideRuns(xml, runs, runIndices, format) {
   for (const index of [...runIndices].sort((a, b) => a - b)) {
     const run = runs[index];
     const runXml = xml.slice(run.start, run.end);
-    const open = runXml.match(/<a:r(?:\s[^>]*)?>/)[0];
+    const open = runXml.match(new RegExp(openTag("a:r")))[0];
     const own = runPropertiesOf(runXml);
     const at = own === "" ? -1 : runXml.indexOf(own);
     const next = formattedSlideRunProperties(runXml, format);
@@ -3822,11 +5107,11 @@ function formatSlideRuns(xml, runs, runIndices, format) {
 // so one is written there when the paragraph has none; otherwise the attribute
 // goes on the paragraph's own `<a:pPr>` tag, never on its close.
 function alignSlideParagraph(element, align) {
-  const open = element.match(/<a:p(?:\s[^>]*)?>/);
+  const open = element.match(new RegExp(openTag("a:p")));
   if (!open) return element;
   const ppr = element.match(SLIDE_PPR);
   if (!ppr) return `${element.slice(0, open[0].length)}<a:pPr algn="${align}"/>${element.slice(open[0].length)}`;
-  const tag = ppr[0].match(/^<a:pPr(?:\s[^>]*)?\/?>/)[0];
+  const tag = ppr[0].match(new RegExp(`^(?:${selfClosingTag("a:pPr")}|${openTag("a:pPr")})`))[0];
   const at = element.indexOf(ppr[0]);
   return element.slice(0, at) + setXmlAttribute(tag, "algn", align) + ppr[0].slice(tag.length) + element.slice(at + ppr[0].length);
 }
@@ -3999,7 +5284,9 @@ function imagePlacement(image, edit, slide) {
 function shapeTreeEnd(xml) {
   const tree = tagSpans(xml, SLIDE_SHAPE_TREE).find((span) => !span.selfClosing);
   if (!tree) return null;
-  const close = tree.end - "</p:spTree>".length;
+  // Where the tree's own close begins, read from the scan's own span rather than
+  // measured off a close tag spelled out again (see `tagSpans`).
+  const close = tree.closeAt;
   const trailing = (span) => tree.start < span.start && span.end <= close && xml.slice(span.end, close).trim() === "";
   const extension = tagSpans(xml, tagPattern("p:extLst")).find(trailing);
   return extension ? extension.start : close;
@@ -4009,7 +5296,7 @@ function shapeTreeEnd(xml) {
 // not already: the picture reaches its media part through `r:embed`, and an
 // undeclared prefix is not XML — in a part the kit did not write itself.
 function withRelationshipNamespace(xml) {
-  const root = xml.match(/<p:sld(?:\s[^>]*)?>/);
+  const root = xml.match(new RegExp(openTag("p:sld")));
   if (!root || /\bxmlns:r=/.test(root[0])) return xml;
   const declared = setXmlAttribute(root[0], "xmlns:r", REL_NS);
   return xml.slice(0, root.index) + declared + xml.slice(root.index + root[0].length);
@@ -4049,7 +5336,7 @@ function pptxEdit(req) {
   // A package without content types is not a presentation this kit can edit: it
   // could not name a new slide's type. The caller can supply one that has it,
   // not the kit.
-  if (!editor.zip.file("[Content_Types].xml")) throw new UsageError(`cannot edit ${nodePath.basename(req.input)}: it has no [Content_Types].xml part`);
+  if (!editor.zip.file("[Content_Types].xml")) throw missingContentTypes(req.input);
   const edits = editList(req);
   for (const edit of edits) {
     const op = edit && edit.op;
@@ -4293,17 +5580,37 @@ const operations = {
       const filled = fillXlsx({ template: `${scratch}/probe.xlsx`, values: { name: "Проверка" } });
       writeOut(`${scratch}/probe_filled.xlsx`, filled.buffer);
     });
-    // The edit paths run over packages the create arms just wrote, so every op
-    // they advertise — a text replacement and a cell write with a row insert —
-    // really runs rather than being probed on a package that skips it.
+    // The edit paths run over packages the create arms just wrote, and each
+    // family's step runs every op it advertises, so an op that fails on the
+    // smallest input really runs rather than being probed on a package that
+    // skips it.
     await step("edit_docx", async () => {
-      writeOut(`${scratch}/probe_edit.docx`, await createDocx({ content: [{ type: "paragraph", text: "Проверка текста" }] }));
-      const edited = docxEdit({ input: `${scratch}/probe_edit.docx`, edits: [{ op: "replace_text", find: "текста", replace: "правки" }] });
+      writeOut(`${scratch}/probe_edit.docx`, await createDocx({ content: [
+        { type: "paragraph", text: "Проверка текста" }, { type: "paragraph", text: "Лишний абзац" },
+      ] }));
+      const edited = docxEdit({ input: `${scratch}/probe_edit.docx`, edits: [
+        { op: "replace_text", find: "текста", replace: "правки" },
+        { op: "insert_text", find: "Проверка", insert: " новая", position: "after" },
+        { op: "remove_text", find: " новая" },
+        { op: "format_text", find: "Проверка", bold: true, italic: true, size: 14 },
+        { op: "add_paragraph", after: "Проверка", text: "Добавлено" },
+        { op: "remove_paragraph", find: "Лишний" },
+      ] });
       writeOut(`${scratch}/probe_edited.docx`, edited.buffer);
     });
     await step("edit_xlsx", () => {
-      writeOut(`${scratch}/probe_edit.xlsx`, createXlsx({ sheets: [{ name: "Данные", rows: [["Проверка", 1]] }] }));
-      const edited = xlsxEdit({ input: `${scratch}/probe_edit.xlsx`, edits: [{ op: "set_cell", sheet: "Данные", cell: "C3", value: "правка" }, { op: "insert_row", sheet: "Данные", row: 1 }] });
+      writeOut(`${scratch}/probe_edit.xlsx`, createXlsx({ sheets: [{ name: "Данные", rows: [["Проверка", 1], ["черновик", 2]] }] }));
+      const edited = xlsxEdit({ input: `${scratch}/probe_edit.xlsx`, edits: [
+        { op: "set_cell", sheet: "Данные", cell: "C3", value: "правка" },
+        { op: "clear_cell", sheet: "Данные", cell: "A2" },
+        { op: "format_cells", sheet: "Данные", range: "A1:B1", size: 12, bold: true, italic: false, color: "FF0000", fill: "FFF2CC", border: { top: true, bottom: false }, align: "center", vertical: "top", wrap: true, number_format: "#,##0.00" },
+        { op: "format_cells", sheet: "Данные", column: "A", width: 14 },
+        { op: "format_cells", sheet: "Данные", row: 1, height: 20 },
+        { op: "insert_row", sheet: "Данные", row: 1 },
+        { op: "delete_row", sheet: "Данные", row: 4 },
+        { op: "insert_column", sheet: "Данные", column: "A" },
+        { op: "delete_column", sheet: "Данные", column: "A" },
+      ] });
       writeOut(`${scratch}/probe_edited.xlsx`, edited.buffer);
     });
     // A deck with two slides and notes, edited through every presentation

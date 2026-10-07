@@ -114,9 +114,10 @@ const DOCX_EDIT_OPS: [&str; 6] = [
     "remove_paragraph",
 ];
 
-const XLSX_EDIT_OPS: [&str; 6] = [
+const XLSX_EDIT_OPS: [&str; 7] = [
     "set_cell",
     "clear_cell",
+    "format_cells",
     "insert_row",
     "delete_row",
     "insert_column",
@@ -210,12 +211,39 @@ struct Rules {
     /// hundredths of a point, so the ruler is its own — unlike
     /// [`Rules::text_size_points`], which is Word's half-point cap.
     slide_text_size_points: Span,
+    /// A xlsx `format_cells` font size in points, `<sz val>`'s own unit: Excel's
+    /// own size box holds 1 to 409 points, and a size past it is a font no reader
+    /// shows as asked.
+    cell_font_points: Span,
+    /// A xlsx `format_cells` column width in characters — the unit `<col width>`
+    /// carries and Excel's own column-width box shows.
+    column_width_chars: Span,
+    /// A xlsx `format_cells` row height in points, `<row ht>`'s own unit.
+    row_height_points: Span,
+    /// The longest xlsx `format_cells` font name: Excel's own limit, and
+    /// `<name val>` carries the name verbatim.
+    font_name_max: usize,
+    /// The most cells one xlsx `format_cells` range may address. A range is
+    /// written out cell by cell — an empty one included, because a formatted cell
+    /// is part of the sheet's used range — so a whole-column spelling
+    /// (`"A1:A1048576"`) would write a sheet-sized body instead of the handful
+    /// of cells the caller meant.
+    format_cells_max: usize,
     pdf_point_abs_max: f64,
     color_digits: usize,
     /// A pptx `format_text` alignment: the word a caller names, and the `algn`
     /// value ECMA-376 writes for it. The kit's writer reads the same pairs, so
     /// the word a call may name and the value written for it cannot drift.
     slide_alignments: Vec<(String, String)>,
+    /// The values a xlsx `format_cells` may name for `align`: the `<alignment
+    /// horizontal>` tokens themselves, since the word and the value are one.
+    cell_alignments: Vec<String>,
+    /// The values a xlsx `format_cells` may name for `vertical`, the `<alignment
+    /// vertical>` tokens.
+    cell_verticals: Vec<String>,
+    /// The sides a xlsx `format_cells` border may name, in the order the prompt
+    /// states them. The kit's reader and writer read the same list.
+    cell_border_sides: Vec<String>,
     degrees_step: i64,
     sheet_name_max: usize,
     sheet_name_forbidden: String,
@@ -279,13 +307,15 @@ impl Tool for DocumentTool {
         let pdf_size_points = RULES.pdf_size_points.bounds();
         let text_size_points = RULES.text_size_points.bounds();
         let slide_text_size_points = RULES.slide_text_size_points.bounds();
-        // The alignments as the prompt spells one in a JSON edit: quoted and
-        // pipe-separated, in the order the rules state them.
-        let slide_alignments = align_words()
-            .iter()
-            .map(|word| format!("\"{word}\""))
-            .collect::<Vec<_>>()
-            .join("|");
+        let cell_font_points = RULES.cell_font_points.bounds();
+        let column_width_chars = RULES.column_width_chars.bounds();
+        let row_height_points = RULES.row_height_points.bounds();
+        // The alignments, colours and sets the prompt spells in a JSON edit:
+        // quoted and pipe-separated, in the order the rules state them.
+        let slide_alignments = quoted_words(&align_words());
+        let cell_alignments = quoted_words(&RULES.cell_alignments);
+        let cell_verticals = quoted_words(&RULES.cell_verticals);
+        let cell_border_sides = quoted_words(&RULES.cell_border_sides);
         let pdf_point_abs_max = RULES.pdf_point_abs_max.to_string();
         let color_digits = RULES.color_digits.to_string();
         let merge_inputs = MAX_MERGE_INPUTS.to_string();
@@ -300,6 +330,8 @@ impl Tool for DocumentTool {
         let sheet_row_max = RULES.sheet_row_max.to_string();
         let sheet_column_max = RULES.sheet_column_max.to_string();
         let number_format_max = RULES.number_format_max.to_string();
+        let font_name_max = RULES.font_name_max.to_string();
+        let format_cells_max = RULES.format_cells_max.to_string();
         // The set with its backslash escaped, as a quoted string spells one: a
         // bare `\` before the closing quote reads as an escaped quote.
         let sheet_name_forbidden = format!("{:?}", RULES.sheet_name_forbidden);
@@ -314,7 +346,13 @@ impl Tool for DocumentTool {
                 ("{{pdf_size_points}}", &pdf_size_points),
                 ("{{text_size_points}}", &text_size_points),
                 ("{{slide_text_size_points}}", &slide_text_size_points),
+                ("{{cell_font_points}}", &cell_font_points),
+                ("{{column_width_chars}}", &column_width_chars),
+                ("{{row_height_points}}", &row_height_points),
                 ("{{slide_alignments}}", &slide_alignments),
+                ("{{cell_alignments}}", &cell_alignments),
+                ("{{cell_verticals}}", &cell_verticals),
+                ("{{cell_border_sides}}", &cell_border_sides),
                 ("{{pdf_point_abs_max}}", &pdf_point_abs_max),
                 ("{{color_digits}}", &color_digits),
                 ("{{merge_inputs}}", &merge_inputs),
@@ -330,6 +368,8 @@ impl Tool for DocumentTool {
                 ("{{sheet_row_max}}", &sheet_row_max),
                 ("{{sheet_column_max}}", &sheet_column_max),
                 ("{{number_format_max}}", &number_format_max),
+                ("{{font_name_max}}", &font_name_max),
+                ("{{format_cells_max}}", &format_cells_max),
             ],
         )
     }
@@ -1175,14 +1215,20 @@ fn validate_edit(
 /// the kit tests only `!== undefined`: a null left in would reach it as a value
 /// — a `format_text`'s `bold: null` would strip the run's own bold where the
 /// model meant to leave it, and an `after: null` would be read as a text field.
-/// Validation runs before the keys are dropped, so a `null` where a value is
-/// required is still refused as a missing one.
+/// A null is "absent" at every level, so the drop reaches into an object-valued
+/// field's own keys too: an xlsx `format_cells` `border` of `{"top": null,
+/// "left": true}` is forwarded as `{"left": true}` rather than reaching the kit
+/// with a side it refuses. An array is left as it is — a null inside one is an
+/// element, and dropping it would change what the array says. Validation runs
+/// before the keys are dropped, so a `null` where a value is required is still
+/// refused as a missing one.
 fn without_nulls(edit: Value) -> Value {
     match edit {
         Value::Object(object) => Value::Object(
             object
                 .into_iter()
                 .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (key, without_nulls(value)))
                 .collect(),
         ),
         other => other,
@@ -1286,24 +1332,31 @@ fn edit_number(
 /// runs in the body, so the field each op needs and the shapes it accepts are
 /// stated here once.
 fn validate_docx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &str) -> Result<()> {
+    let keys =
+        |allowed: &[&str]| require_edit_keys(object, crate::ooxml::Family::Docx, op, allowed, at);
     match op {
         "replace_text" => {
+            keys(&["find", "replace"])?;
             edit_string_non_empty(object, "find", at)?;
             edit_string_present(object, "replace", at)?;
         }
         "insert_text" => {
+            keys(&["find", "insert", "position"])?;
             edit_string_non_empty(object, "find", at)?;
             edit_string_non_empty(object, "insert", at)?;
             require_position(object, at)?;
         }
         "remove_text" | "remove_paragraph" => {
+            keys(&["find"])?;
             edit_string_non_empty(object, "find", at)?;
         }
         "format_text" => {
+            keys(&["find", "bold", "italic", "size"])?;
             edit_string_non_empty(object, "find", at)?;
             require_format(object, at)?;
         }
         "add_paragraph" => {
+            keys(&["text", "after"])?;
             edit_string_present(object, "text", at)?;
             require_optional_text(object, "after", at)?;
         }
@@ -1362,16 +1415,18 @@ fn require_span_number(
     }
 }
 
-/// Require an optional `format_text` `size` to sit inside `span`, and report
-/// whether it was stated — the presence a `format_text`'s "at least one
-/// property" test counts, read the way [`edit_number`] reads one.
-fn require_text_size(
+/// Require an optional numeric field to sit inside `span`, and report whether it
+/// was stated — the presence a `format_text`'s or a `format_cells`'s "at least
+/// one property" test counts, read the way [`edit_number`] reads one.
+fn require_stated_number(
     object: &serde_json::Map<String, Value>,
+    key: &str,
     span: &Span,
+    what: &str,
     at: &str,
 ) -> Result<bool> {
-    require_span_number(object, "size", span, "give a size in points", at)?;
-    Ok(!matches!(object.get("size"), None | Some(Value::Null)))
+    require_span_number(object, key, span, what, at)?;
+    Ok(stated(object, key))
 }
 
 /// Require a `format_text` to name at least one property, and each property to
@@ -1379,7 +1434,13 @@ fn require_text_size(
 /// shared bound (`<w:sz>` counts half-points and tops out at 1638 of them).
 fn require_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
     let mut any = require_toggles(object, &["bold", "italic"], at)?;
-    any |= require_text_size(object, &RULES.text_size_points, at)?;
+    any |= require_stated_number(
+        object,
+        "size",
+        &RULES.text_size_points,
+        "give a size in points",
+        at,
+    )?;
     if !any {
         anyhow::bail!(
             "usage: {at} (format_text) needs at least one of bold, italic or size — hint: a \
@@ -1389,29 +1450,369 @@ fn require_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<(
     Ok(())
 }
 
+/// A xlsx `format_cells`'s one target. The three are exclusive — a cell
+/// rectangle, a column (its width) and a row (its height) are different things —
+/// so an edit naming two of them is refused rather than settled by a precedence
+/// rule the caller cannot read.
+#[derive(Clone, Copy)]
+enum FormatCellsTarget {
+    Range,
+    Column,
+    Row,
+}
+
+impl FormatCellsTarget {
+    /// The key that names this target.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Range => "range",
+            Self::Column => "column",
+            Self::Row => "row",
+        }
+    }
+
+    /// The formatting properties this target takes — the keys an edit naming
+    /// nothing is refused by, and the ones an unknown key is refused against.
+    fn attributes(self) -> &'static [&'static str] {
+        match self {
+            Self::Range => &[
+                "font",
+                "size",
+                "bold",
+                "italic",
+                "color",
+                "fill",
+                "border",
+                "align",
+                "vertical",
+                "wrap",
+                "number_format",
+            ],
+            Self::Column => &["width"],
+            Self::Row => &["height"],
+        }
+    }
+
+    /// Every key this target's edit takes: the sheet, the target itself and the
+    /// properties it formats.
+    fn keys(self) -> Vec<&'static str> {
+        let mut keys = vec!["sheet", self.key()];
+        keys.extend_from_slice(self.attributes());
+        keys
+    }
+}
+
+/// Whether an edit stated a field: a `null` is absent, the way the whole
+/// boundary reads one.
+fn stated(object: &serde_json::Map<String, Value>, key: &str) -> bool {
+    !matches!(object.get(key), None | Some(Value::Null))
+}
+
+/// The one target a xlsx `format_cells` names.
+fn require_format_cells_target(
+    object: &serde_json::Map<String, Value>,
+    at: &str,
+) -> Result<FormatCellsTarget> {
+    let named = ["range", "column", "row"]
+        .into_iter()
+        .filter(|key| stated(object, key))
+        .collect::<Vec<_>>();
+    match named.as_slice() {
+        [] => anyhow::bail!(
+            "usage: {at} names no target — hint: name \"range\" (a cell or a range of cells), \
+             \"column\" (a column's letters, for its width) or \"row\" (a 1-based row, for its \
+             height)"
+        ),
+        ["range"] => Ok(FormatCellsTarget::Range),
+        ["column"] => Ok(FormatCellsTarget::Column),
+        ["row"] => Ok(FormatCellsTarget::Row),
+        both => {
+            let listed = both
+                .iter()
+                .map(|key| format!("\"{key}\""))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            anyhow::bail!(
+                "usage: {at} names more than one target ({listed}) — hint: an edit formats one of \
+                 \"range\", \"column\" or \"row\""
+            )
+        }
+    }
+}
+
+/// Require a xlsx `format_cells`'s `range` to be a cell (`"B2"`) or a
+/// rectangular range (`"B2:D2"`) inside the sheet's grid. The corners may be
+/// named in either order — the rectangle is what they enclose — and it may hold
+/// at most `format_cells_max` cells, because the kit writes it out cell by cell:
+/// a whole-column spelling would write a sheet-sized body rather than format the
+/// cells the caller meant.
+fn require_format_cells_range(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let field = format!("{at}.range");
+    let range = edit_string_non_empty(object, "range", at)?;
+    let mut corners = range.split(':');
+    let first = corners.next().unwrap_or_default();
+    let second = corners.next();
+    if corners.next().is_some() {
+        anyhow::bail!(
+            "usage: {field} must be a cell or a rectangular range like B2:D2, got \"{range}\""
+        );
+    }
+    let (first_row, first_column) = check_cell_address(first, &field)?;
+    let (last_row, last_column) = match second {
+        Some(second) => check_cell_address(second, &field)?,
+        None => (first_row, first_column),
+    };
+    let rows = u64::from(last_row.abs_diff(first_row)) + 1;
+    let columns = u64::from(last_column.abs_diff(first_column)) + 1;
+    let cells = rows * columns;
+    if cells > RULES.format_cells_max as u64 {
+        anyhow::bail!(
+            "usage: {field} \"{range}\" holds {cells} cells, more than one edit formats ({}) — \
+             hint: name the rows and columns you mean",
+            RULES.format_cells_max
+        );
+    }
+    Ok(())
+}
+
+/// Require an optional xlsx `format_cells` `font` name: text inside Excel's own
+/// name length, which `<name val>` carries verbatim. Reports whether it was
+/// stated.
+fn require_font_name(object: &serde_json::Map<String, Value>, at: &str) -> Result<bool> {
+    match edit_string(object, "font", at)? {
+        None => Ok(false),
+        Some("") => anyhow::bail!("usage: {at}.font must not be empty"),
+        Some(name) if name.chars().count() <= RULES.font_name_max => Ok(true),
+        Some(name) => anyhow::bail!(
+            "usage: {at}.font must be at most {} characters, got {}",
+            RULES.font_name_max,
+            name.chars().count()
+        ),
+    }
+}
+
+/// Require an optional `color` — a `format_text`'s or a xlsx `format_cells`'s
+/// font colour — to be the shape the kit parses (see [`require_hex_color`]);
+/// returns whether it was stated.
+fn require_color(object: &serde_json::Map<String, Value>, at: &str) -> Result<bool> {
+    match object.get("color") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(color)) => {
+            require_hex_color(&format!("{at}.color"), color)?;
+            Ok(true)
+        }
+        Some(v) => Err(super::wrong_type(&format!("{at}.color"), "a string", v)),
+    }
+}
+
+/// Require an optional xlsx `format_cells` `fill`: a colour, or `false` for
+/// taking the cell's fill away — the shape the other named properties use for
+/// "off", since no colour means "no fill". Reports whether it was stated.
+fn require_fill(object: &serde_json::Map<String, Value>, at: &str) -> Result<bool> {
+    match object.get("fill") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(false)) => Ok(true),
+        Some(Value::Bool(true)) => anyhow::bail!(
+            "usage: {at}.fill must be a colour or false — hint: false takes the cell's fill away, \
+             and a fill cannot be named without its colour"
+        ),
+        Some(Value::String(color)) => {
+            // The colour is refused with the shared message, with the one other
+            // shape a `fill` takes named beside it: "none" is the spelling a
+            // caller reaches for when they mean "take the fill away".
+            require_hex_color(&format!("{at}.fill"), color).map_err(|color_error| {
+                anyhow::anyhow!("{color_error} — or pass false to take the cell's fill away")
+            })?;
+            Ok(true)
+        }
+        Some(value) => Err(super::wrong_type(
+            &format!("{at}.fill"),
+            "a colour or false",
+            value,
+        )),
+    }
+}
+
+/// Require an optional xlsx `format_cells` `border`: an object naming at least
+/// one side, each a boolean — true puts a thin border on that side, false takes
+/// that side's own border away. An object naming no side states nothing, and an
+/// unknown side would be dropped in silence, so both are refused. Returns
+/// whether the property was stated.
+fn require_border(object: &serde_json::Map<String, Value>, at: &str) -> Result<bool> {
+    let border = match object.get("border") {
+        None | Some(Value::Null) => return Ok(false),
+        Some(Value::Object(border)) => border,
+        Some(value) => {
+            return Err(super::wrong_type(
+                &format!("{at}.border"),
+                "an object of sides",
+                value,
+            ));
+        }
+    };
+    let stated = border
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .collect::<Vec<_>>();
+    if stated.is_empty() {
+        anyhow::bail!(
+            "usage: {at}.border names no side — hint: it takes {}",
+            listed(&RULES.cell_border_sides)
+        );
+    }
+    for (side, value) in stated {
+        if !RULES.cell_border_sides.contains(side) {
+            anyhow::bail!(
+                "usage: {at}.border.{side} is not a side — hint: it takes {}",
+                listed(&RULES.cell_border_sides)
+            );
+        }
+        if !matches!(value, Value::Bool(_)) {
+            return Err(super::wrong_type(
+                &format!("{at}.border.{side}"),
+                "a boolean",
+                value,
+            ));
+        }
+    }
+    Ok(true)
+}
+
+/// Require an optional alignment field to be one the writer has — a word the
+/// caller passes in from the shared rules, whose values are the alignment
+/// tokens themselves. Returns whether it was stated.
+fn require_alignment<W: AsRef<str> + std::fmt::Display>(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    values: &[W],
+    at: &str,
+) -> Result<bool> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(value)) if values.iter().any(|allowed| allowed.as_ref() == value) => {
+            Ok(true)
+        }
+        Some(Value::String(value)) => anyhow::bail!(
+            "usage: {at}.{key} must be {}, got \"{value}\"",
+            listed(values)
+        ),
+        Some(value) => Err(super::wrong_type(&format!("{at}.{key}"), "a string", value)),
+    }
+}
+
+/// Refuse an edit's key that its op does not take, naming the fields the op does:
+/// the kit reads only those, so an extra one would be dropped in silence. A null
+/// value is not stated — the boundary reads a `null` as absent everywhere (see
+/// `stated`) — so a key whose value is null is not a key the op does not take.
+fn require_edit_keys(
+    object: &serde_json::Map<String, Value>,
+    family: crate::ooxml::Family,
+    op: &str,
+    allowed: &[&str],
+    at: &str,
+) -> Result<()> {
+    for key in object.keys() {
+        if key != "op" && !allowed.contains(&key.as_str()) && stated(object, key) {
+            anyhow::bail!(
+                "usage: {at}.{key} is not a field of {} \"{op}\" — hint: it takes {}",
+                family.name(),
+                allowed.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The xlsx edit vocabulary and the cell, row and column shapes its writer
 /// knows: a sheet is named, a cell is an A1 address, a row and a column are the
-/// 1-based units the reader shows.
+/// 1-based units the reader shows, and `format_cells` names one of a cell range,
+/// a column's width or a row's height and the properties it applies to it.
 fn validate_xlsx_edit(
     edit: &Value,
     object: &serde_json::Map<String, Value>,
     op: &str,
     at: &str,
 ) -> Result<Value> {
+    let keys =
+        |allowed: &[&str]| require_edit_keys(object, crate::ooxml::Family::Xlsx, op, allowed, at);
     let sheet = edit_string_non_empty(object, "sheet", at)?;
     require_sheet_name_length(sheet, &format!("{at}.sheet"))?;
     match op {
         "set_cell" => {
+            keys(&["sheet", "cell", "value", "number_format"])?;
             require_cell(object, at)?;
-            let value = require_cell_value(object, at)?;
             require_number_format(object, at)?;
             let mut normalized = edit.clone();
-            normalized["value"] = value;
+            normalized["value"] = require_cell_value(object, at)?;
             return Ok(normalized);
         }
-        "clear_cell" => require_cell(object, at)?,
-        "insert_row" | "delete_row" => require_row(object, at)?,
-        "insert_column" | "delete_column" => require_column(object, at)?,
+        "clear_cell" => {
+            keys(&["sheet", "cell"])?;
+            require_cell(object, at)?;
+        }
+        "format_cells" => {
+            let target = require_format_cells_target(object, at)?;
+            keys(&target.keys())?;
+            let named = match target {
+                FormatCellsTarget::Range => {
+                    require_format_cells_range(object, at)?;
+                    let mut named = require_toggles(object, &["bold", "italic", "wrap"], at)?;
+                    named |= require_font_name(object, at)?;
+                    named |= require_stated_number(
+                        object,
+                        "size",
+                        &RULES.cell_font_points,
+                        "give a size in points",
+                        at,
+                    )?;
+                    named |= require_color(object, at)?;
+                    named |= require_fill(object, at)?;
+                    named |= require_border(object, at)?;
+                    named |= require_alignment(object, "align", &RULES.cell_alignments, at)?;
+                    named |= require_alignment(object, "vertical", &RULES.cell_verticals, at)?;
+                    if stated(object, "number_format") {
+                        require_number_format(object, at)?;
+                        named = true;
+                    }
+                    named
+                }
+                FormatCellsTarget::Column => {
+                    require_column(object, at)?;
+                    require_stated_number(
+                        object,
+                        "width",
+                        &RULES.column_width_chars,
+                        "give a width in characters, as Excel shows one",
+                        at,
+                    )?
+                }
+                FormatCellsTarget::Row => {
+                    require_row(object, at)?;
+                    require_stated_number(
+                        object,
+                        "height",
+                        &RULES.row_height_points,
+                        "give a height in points",
+                        at,
+                    )?
+                }
+            };
+            if !named {
+                anyhow::bail!(
+                    "usage: {at} names no formatting — hint: name at least one of {}, beyond the \
+                     target it applies to",
+                    target.attributes().join(", ")
+                );
+            }
+        }
+        "insert_row" | "delete_row" => {
+            keys(&["sheet", "row"])?;
+            require_row(object, at)?;
+        }
+        "insert_column" | "delete_column" => {
+            keys(&["sheet", "column"])?;
+            require_column(object, at)?;
+        }
         _ => unreachable!("the op was checked against the family's vocabulary"),
     }
     Ok(edit.clone())
@@ -1449,36 +1850,45 @@ fn cell_address(cell: &str) -> Option<(u32, u32)> {
     Some((digits.parse().ok()?, column))
 }
 
-/// Require an edit's `cell` to be an A1 address inside the sheet's grid, with
-/// its row and column within the shared limits.
-fn require_cell(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
-    let cell = edit_string_non_empty(object, "cell", at)?;
+/// The row and column an A1 address names, inside the sheet's grid: the shape
+/// [`cell_address`] reads, refused with `what` naming the field a caller gave
+/// it in.
+fn check_cell_address(cell: &str, what: &str) -> Result<(u32, u32)> {
     let Some((row, column)) = cell_address(cell) else {
-        anyhow::bail!("usage: {at}.cell must be an A1 address like B7, got \"{cell}\"");
+        anyhow::bail!("usage: {what} must be an A1 address like B7, got \"{cell}\"");
     };
     if row > RULES.sheet_row_max {
         anyhow::bail!(
-            "usage: {at}.cell \"{cell}\": the row must be between 1 and {}",
+            "usage: {what} \"{cell}\": the row must be between 1 and {}",
             RULES.sheet_row_max
         );
     }
     if column > RULES.sheet_column_max {
         anyhow::bail!(
-            "usage: {at}.cell \"{cell}\": the column must be between A and {}",
+            "usage: {what} \"{cell}\": the column must be between A and {}",
             crate::ooxml::column_letters(RULES.sheet_column_max - 1)
         );
     }
-    Ok(())
+    Ok((row, column))
+}
+
+/// Require an edit's `cell` to be an A1 address inside the sheet's grid, with
+/// its row and column within the shared limits.
+fn require_cell(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let cell = edit_string_non_empty(object, "cell", at)?;
+    check_cell_address(cell, &format!("{at}.cell")).map(|_| ())
 }
 
 /// The `value` a `set_cell` writes: a scalar the writer stringifies, or a
 /// `{"formula": "…"}` object normalized to its text — the same rule `create`'s
-/// cells follow.
+/// cells follow. A `null` is absent, the way the whole boundary reads one, and a
+/// cell's formatting is the `format_cells` op's to change without a value.
 fn require_cell_value(object: &serde_json::Map<String, Value>, at: &str) -> Result<Value> {
-    let Some(value) = object.get("value") else {
+    let Some(value) = object.get("value").filter(|value| !value.is_null()) else {
         anyhow::bail!(
             "usage: {at} has no \"value\" — hint: pass a string, a number, a boolean or \
-             {{\"formula\": \"SUM(A1:A2)\"}}"
+             {{\"formula\": \"SUM(A1:A2)\"}}, or use the \"format_cells\" op to change only the \
+             cell's formatting"
         );
     };
     if is_scalar(value) {
@@ -1535,62 +1945,50 @@ fn require_number_format(object: &serde_json::Map<String, Value>, at: &str) -> R
 /// The pptx edit vocabulary: a slide is its 1-based number as the reader shows
 /// it, and a text op names a fragment that must be on that slide.
 fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &str) -> Result<()> {
-    // Refuse a key the op does not take before any field is read: the kit reads
-    // only the fields its op knows, so a mistyped or extra parameter would be
-    // dropped in silence and the model would believe it asked for something it
-    // did not.
+    let keys =
+        |allowed: &[&str]| require_edit_keys(object, crate::ooxml::Family::Pptx, op, allowed, at);
     match op {
         "replace_text" | "replace_notes" => {
-            require_pptx_keys(object, op, &["slide", "find", "replace"], at)?;
+            keys(&["slide", "find", "replace"])?;
             require_slide(object, at)?;
             edit_string_non_empty(object, "find", at)?;
             edit_string_present(object, "replace", at)?;
         }
         "remove_text" | "remove_paragraph" | "remove_notes" => {
-            require_pptx_keys(object, op, &["slide", "find"], at)?;
+            keys(&["slide", "find"])?;
             require_slide(object, at)?;
             edit_string_non_empty(object, "find", at)?;
         }
         "format_text" => {
-            require_pptx_keys(
-                object,
-                op,
-                &[
-                    "slide",
-                    "find",
-                    "bold",
-                    "italic",
-                    "underline",
-                    "size",
-                    "color",
-                    "align",
-                ],
-                at,
-            )?;
+            keys(&[
+                "slide",
+                "find",
+                "bold",
+                "italic",
+                "underline",
+                "size",
+                "color",
+                "align",
+            ])?;
             require_slide(object, at)?;
             edit_string_non_empty(object, "find", at)?;
             require_pptx_format(object, at)?;
         }
         "add_paragraph" => {
-            require_pptx_keys(object, op, &["slide", "text", "after", "level"], at)?;
+            keys(&["slide", "text", "after", "level"])?;
             require_slide(object, at)?;
             edit_string_present(object, "text", at)?;
             require_optional_text(object, "after", at)?;
             require_optional_level(object, at)?;
         }
         "add_image" => {
-            require_pptx_keys(
-                object,
-                op,
-                &["slide", "path", "x", "y", "width", "height"],
-                at,
-            )?;
+            keys(&["slide", "path", "x", "y", "width", "height"])?;
             require_slide(object, at)?;
             edit_string_non_empty(object, "path", at)?;
             require_image_geometry(object, at)?;
         }
         "add_slide" => {
-            require_pptx_keys(object, op, &["after", "title", "bullets"], at)?;
+            keys(&["after", "title", "bullets"])?;
             if edit_integer(object, "after", at)? == Some(0) {
                 anyhow::bail!("usage: {at}.after must be a whole number of at least 1");
             }
@@ -1598,39 +1996,20 @@ fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &st
             require_bullets(object, at)?;
         }
         "delete_slide" | "duplicate_slide" => {
-            require_pptx_keys(object, op, &["slide"], at)?;
+            keys(&["slide"])?;
             require_slide(object, at)?;
         }
         "move_slide" => {
-            require_pptx_keys(object, op, &["slide", "to"], at)?;
+            keys(&["slide", "to"])?;
             require_slide(object, at)?;
             require_slide_number(object, "to", at)?;
         }
         "add_notes" => {
-            require_pptx_keys(object, op, &["slide", "text"], at)?;
+            keys(&["slide", "text"])?;
             require_slide(object, at)?;
             edit_string_present(object, "text", at)?;
         }
         _ => unreachable!("the op was checked against the family's vocabulary"),
-    }
-    Ok(())
-}
-
-/// Refuse a pptx edit's key that its op does not take, naming the fields the op
-/// does: the kit reads only those, so an extra one would be dropped in silence.
-fn require_pptx_keys(
-    object: &serde_json::Map<String, Value>,
-    op: &str,
-    allowed: &[&str],
-    at: &str,
-) -> Result<()> {
-    for key in object.keys() {
-        if key != "op" && !allowed.contains(&key.as_str()) {
-            anyhow::bail!(
-                "usage: {at}.{key} is not a field of pptx \"{op}\" — hint: it takes {}",
-                allowed.join(", ")
-            );
-        }
     }
     Ok(())
 }
@@ -1702,38 +2081,6 @@ fn require_bullets(object: &serde_json::Map<String, Value>, at: &str) -> Result<
     Ok(())
 }
 
-/// Require an optional `format_text` `color` to be the shape the kit parses (see
-/// [`require_hex_color`]); returns whether it was stated.
-fn require_color(object: &serde_json::Map<String, Value>, at: &str) -> Result<bool> {
-    match object.get("color") {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::String(color)) => {
-            require_hex_color(&format!("{at}.color"), color)?;
-            Ok(true)
-        }
-        Some(v) => Err(super::wrong_type(&format!("{at}.color"), "a string", v)),
-    }
-}
-
-/// Require an optional `format_text` `align` to be one the paragraph writer has —
-/// a word the shared rules state, and the `algn` value its own pair writes;
-/// returns whether it was stated.
-fn require_align(object: &serde_json::Map<String, Value>, at: &str) -> Result<bool> {
-    match object.get("align") {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::String(align)) => {
-            if !RULES.slide_alignments.iter().any(|(word, _)| word == align) {
-                anyhow::bail!(
-                    "usage: {at}.align must be {}, got \"{align}\"",
-                    listed(&align_words())
-                );
-            }
-            Ok(true)
-        }
-        Some(v) => Err(super::wrong_type(&format!("{at}.align"), "a string", v)),
-    }
-}
-
 /// The `align` words the shared rules state, in their own order: the one list the
 /// refusal and the model-facing hint read, so a word added to the rules cannot
 /// leave either of them stale.
@@ -1745,14 +2092,30 @@ fn align_words() -> Vec<&'static str> {
         .collect()
 }
 
+/// A rule's values as the prompt spells one in a JSON edit: quoted and
+/// pipe-separated, in the order the rules state them.
+fn quoted_words<S: AsRef<str>>(words: &[S]) -> String {
+    words
+        .iter()
+        .map(|word| format!("\"{}\"", word.as_ref()))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// Require a pptx `format_text` to name at least one property, and each to be
 /// the shape the kit writes: a boolean run toggle, a point size inside the
 /// presentation's own bound, a hex colour, or a paragraph alignment.
 fn require_pptx_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
     let mut any = require_toggles(object, &["bold", "italic", "underline"], at)?;
-    any |= require_text_size(object, &RULES.slide_text_size_points, at)?;
+    any |= require_stated_number(
+        object,
+        "size",
+        &RULES.slide_text_size_points,
+        "give a size in points",
+        at,
+    )?;
     any |= require_color(object, at)?;
-    any |= require_align(object, at)?;
+    any |= require_alignment(object, "align", &align_words(), at)?;
     if !any {
         anyhow::bail!(
             "usage: {at} (format_text) needs at least one of bold, italic, underline, size, color \
@@ -2841,6 +3204,124 @@ mod tests {
         bytes
     }
 
+    /// The elements named `child` inside the `container` element of `xml`, in
+    /// the file's own order and each taken whole — a styles part's
+    /// `<font>`/`<fill>`/`<border>`/`<xf>` entries. The self-closing shape is
+    /// taken as it is and the child-bearing one with its close.
+    fn element_children<'a>(xml: &'a str, container: &str, child: &str) -> Vec<&'a str> {
+        let at = xml
+            .find(&format!("<{container}"))
+            .unwrap_or_else(|| panic!("no <{container}> in: {xml}"));
+        let body_start = xml[at..].find('>').expect("a container open tag") + at + 1;
+        let body_end = xml[body_start..]
+            .find(&format!("</{container}>"))
+            .expect("a container close tag")
+            + body_start;
+        let closing = format!("</{child}>");
+        let mut rest = &xml[body_start..body_end];
+        let mut entries = Vec::new();
+        while let Some(found) = rest.find(&format!("<{child}")) {
+            let element = &rest[found..];
+            let open_end = element.find('>').expect("an element open tag");
+            let length = if element.as_bytes()[open_end - 1] == b'/' {
+                open_end + 1
+            } else {
+                element.find(&closing).expect("an element close tag") + closing.len()
+            };
+            entries.push(&element[..length]);
+            rest = &element[length..];
+        }
+        entries
+    }
+
+    /// An element's own `name="…"` attribute, read from its open tag alone, or
+    /// `None` when it states none.
+    fn attribute_value<'a>(element: &'a str, name: &str) -> Option<&'a str> {
+        let open = &element[..element.find('>').expect("an element open tag")];
+        let needle = format!(" {name}=\"");
+        let at = open.find(&needle)?;
+        let value = &open[at + needle.len()..];
+        Some(&value[..value.find('"').expect("a closing quote")])
+    }
+
+    /// An element's own `name="…"` attribute, read from its open tag alone.
+    fn attribute_of<'a>(element: &'a str, name: &str) -> &'a str {
+        attribute_value(element, name).unwrap_or_else(|| panic!("no {name} on: {element}"))
+    }
+
+    /// Assert a styles part this kit grew is one a reader can open: every block a
+    /// `cellXfs`/`cellStyleXfs` entry's ids resolve into is stated, each with its
+    /// entry 0, in `CT_Stylesheet` order — so no `<xf>` names a `fontId`, `fillId`,
+    /// `borderId` or `xfId` of a block the part does not hold.
+    fn assert_styles_part_is_openable(styles: &str) {
+        // Each id a `<xf>` may state, the block it resolves into, and that block's
+        // own entry element.
+        let references = [
+            ("fontId", "fonts", "font"),
+            ("fillId", "fills", "fill"),
+            ("borderId", "borders", "border"),
+            ("xfId", "cellStyleXfs", "xf"),
+        ];
+        // The blocks a reader meets in this order, top to bottom.
+        let order = [
+            "fonts",
+            "fills",
+            "borders",
+            "cellStyleXfs",
+            "cellXfs",
+            "cellStyles",
+        ];
+        let found: Vec<usize> = order
+            .iter()
+            .map(|block| {
+                styles
+                    .find(&format!("<{block}"))
+                    .unwrap_or_else(|| panic!("the grown part states no <{block}>: {styles}"))
+            })
+            .collect();
+        assert!(
+            found.windows(2).all(|pair| pair[0] < pair[1]),
+            "the grown part's blocks are out of CT_Stylesheet order: {styles}"
+        );
+        for (_, block, entry) in references {
+            assert!(
+                !element_children(styles, block, entry).is_empty(),
+                "the grown part states no <{block}> entry 0: {styles}"
+            );
+        }
+        for parent in ["cellStyleXfs", "cellXfs"] {
+            for xf in element_children(styles, parent, "xf") {
+                for (attribute, block, entry) in references {
+                    let Some(index) = attribute_value(xf, attribute) else {
+                        continue;
+                    };
+                    let index: usize = index.parse().expect("a numeric id");
+                    let entries = element_children(styles, block, entry).len();
+                    assert!(
+                        index < entries,
+                        "the <xf> names {attribute}=\"{index}\" past the {entries} <{block}> \
+                         entries: {styles}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The `<c>` element addressing `address` in a sheet part, taken whole.
+    fn cell_element<'a>(sheet: &'a str, address: &str) -> &'a str {
+        let at = sheet
+            .find(&format!("<c r=\"{address}\""))
+            .unwrap_or_else(|| panic!("no cell {address} in: {sheet}"));
+        let element = &sheet[at..];
+        let open_end = element.find('>').expect("a cell open tag");
+        let length = if element.as_bytes()[open_end - 1] == b'/' {
+            open_end + 1
+        } else {
+            element.find("</c>").expect("a cell close tag") + "</c>".len()
+        };
+        &element[..length]
+    }
+
     /// Whether `needle` sits between an `open` tag and its `close` tag in `xml`:
     /// the opens before it outnumber the closes, so the caller states the exact
     /// tags a nesting is measured with.
@@ -2955,6 +3436,15 @@ mod tests {
         repacked(package, &[], parts)
     }
 
+    /// `xml` with the first `needle` replaced by `with`: a fixture that states an
+    /// element the way no writer does (a container opened and never closed).
+    fn with_first(xml: &str, needle: &str, with: &str) -> String {
+        let at = xml
+            .find(needle)
+            .unwrap_or_else(|| panic!("no {needle} in: {xml}"));
+        format!("{}{}{}", &xml[..at], with, &xml[at + needle.len()..])
+    }
+
     /// A `pptx` package whose parts are not the ones a number spells: its layout is
     /// numbered with a leading zero (`slideLayout01.xml`, and no `slideLayout1.xml`),
     /// and of the two notes masters it holds it declares and uses the second, the
@@ -3013,6 +3503,22 @@ mod tests {
         let path = ws.as_path().join(name);
         std::fs::write(&path, bytes).expect("write fixture");
         path
+    }
+
+    /// A freshly created one-sheet workbook (`S`, one seed row): the package the
+    /// format tests start from, each writing the parts it means to edit over it.
+    async fn created_xlsx(ws: &Workspace) -> Vec<u8> {
+        let path = single(
+            &run(
+                ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
+        std::fs::read(&path).expect("read base package")
     }
 
     /// The same package with one part dropped — the shape a deck has when it
@@ -3291,6 +3797,16 @@ mod tests {
         assert!(
             sheet.contains("<row r=\"1\">"),
             "cells must sit in their row: {sheet}"
+        );
+        // The styles part is the one `create` has always written — a `format_cells`
+        // edit must not change what creating a workbook produces: entry 0 of each
+        // block it needs, and no default style, which a workbook that names no style
+        // does not state.
+        let styles = part_text(&path, "xl/styles.xml");
+        assert!(
+            styles.contains(r#"<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>"#)
+                && !styles.contains("<cellStyles"),
+            "the styles part a created workbook carries changed: {styles}"
         );
     }
 
@@ -4599,6 +5115,16 @@ mod tests {
             .await,
         );
         let pdf = pdf_with(&ws, "base", "Страница").await;
+        let book = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["seed"]] }],
+                }),
+            )
+            .await,
+        );
         let fake = ws.as_path().join("fake.png");
         std::fs::write(&fake, b"\x89PNG\r\n\x1a\ngarbage").expect("write a fake png");
         // A frame marker with nothing after it: the walk must refuse it without
@@ -4768,6 +5294,18 @@ mod tests {
                 json!({ "op": "create", "format": "xlsx",
                         "sheets": [{ "name": "a".repeat(RULES.sheet_name_max + 1), "rows": [["a"]] }],
                         "output": out.join("o.xlsx").to_string_lossy() }),
+            ),
+            // An alignment word the closed set does not hold: both sides refuse it
+            // rather than writing a value no reader knows.
+            (
+                "an xlsx format_cells alignment the writer has not",
+                json!({ "action": "xlsx_edit", "path": book.to_string_lossy(),
+                        "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1",
+                                    "align": "middle" }] }),
+                json!({ "op": "xlsx_edit", "input": book.to_string_lossy(),
+                        "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1",
+                                    "align": "middle" }],
+                        "output": out.join("p.xlsx").to_string_lossy() }),
             ),
         ];
         for (what, tool_args, kit_request) in cases {
@@ -5117,12 +5655,13 @@ mod tests {
                         "edits": [{ "op": "format_text", "find": "x", "size": f64::INFINITY }] }),
                 "at least one of bold",
             ),
-            // A null cannot stand in for a `set_cell`'s required `value`.
+            // A `set_cell` needs a `value`: a value-less one is refused with a
+            // pointer to the `format_cells` op, which formats without writing one.
             (
                 json!({ "action": "xlsx_edit", "path": "book.xlsx",
                         "edits": [{ "op": "set_cell", "sheet": "Values", "cell": "A1",
-                                    "value": null }] }),
-                "must be text, a number or a boolean",
+                                    "number_format": "0.00" }] }),
+                "has no \"value\"",
             ),
             (
                 json!({ "action": "docx_edit", "path": "doc.docx",
@@ -5159,6 +5698,129 @@ mod tests {
                         "edits": [{ "op": "insert_column", "sheet": "Values", "column": "A1" }] }),
                 "column must be column letters",
             ),
+            // A `format_cells` target's own address is checked like every other
+            // op's: a malformed or lowercase column, and a row past the grid, are
+            // refused here rather than by the kit.
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "column": "A1",
+                                    "width": 10 }] }),
+                "column must be column letters",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "column": "b",
+                                    "width": 10 }] }),
+                "column must be column letters",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "row": 99_999_999,
+                                    "height": 20 }] }),
+                "row must be a whole number",
+            ),
+            // A xlsx `format_cells` naming no target, more than one target, or only
+            // the target and none of the properties it takes: the op would
+            // otherwise rewrite the sheet and change nothing.
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "bold": true }] }),
+                "names no target",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "range": "A1",
+                                    "column": "B", "bold": true }] }),
+                "names more than one target",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "range": "A1" }] }),
+                "names no formatting",
+            ),
+            // A property that is the wrong type, and one the target does not take:
+            // the kit reads only the keys it knows, so an extra one would be
+            // dropped in silence.
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "range": "A1",
+                                    "bold": "yes" }] }),
+                "must be a boolean",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "range": "A1",
+                                    "shade": "FF0000" }] }),
+                "is not a field of xlsx",
+            ),
+            // The same for a docx key the op does not take: a field named for
+            // another op (`position` is an `insert_text`'s) would otherwise be
+            // dropped in silence.
+            (
+                json!({ "action": "docx_edit", "path": "doc.docx",
+                        "edits": [{ "op": "replace_text", "find": "x", "replace": "y",
+                                    "position": "after" }] }),
+                "is not a field of docx",
+            ),
+            // An alignment word and a border side the closed sets do not hold, and
+            // a border that names no side at all.
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "range": "A1",
+                                    "align": "middle" }] }),
+                "align must be",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "range": "A1",
+                                    "border": { "leftish": true } }] }),
+                "is not a side",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "range": "A1",
+                                    "border": {} }] }),
+                "names no side",
+            ),
+            // A size, a width and a height outside the shared bounds, and a range
+            // holding more cells than one `format_cells` may name.
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "range": "A1",
+                                    "size": 500 }] }),
+                "size must be",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "column": "B",
+                                    "width": 300 }] }),
+                "width must be",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "row": 3,
+                                    "height": 500 }] }),
+                "height must be",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "range": "A1:A999999",
+                                    "bold": true }] }),
+                "more than one edit formats",
+            ),
+            // A colour and a fill that are not six hex digits.
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "range": "A1",
+                                    "color": "red" }] }),
+                "color must be",
+            ),
+            (
+                json!({ "action": "xlsx_edit", "path": "book.xlsx",
+                        "edits": [{ "op": "format_cells", "sheet": "Values", "range": "A1",
+                                    "fill": "red" }] }),
+                "fill must be",
+            ),
             // A slide number below one.
             (
                 json!({ "action": "pptx_edit", "path": "deck.pptx",
@@ -5186,7 +5848,8 @@ mod tests {
     /// A `null` for an optional edit field is the boundary's "absent", and the
     /// request spells it that way: the kit tests only `!== undefined`, so a null
     /// left in would reach it as a value — a `format_text`'s `bold: null` would
-    /// strip a run's own bold, and a text field's null would be read as text.
+    /// strip a run's own bold, and a text field's null would be read as text. A
+    /// null inside an object-valued field is dropped at that level too.
     #[test]
     fn edit_nulls_are_dropped_before_the_request_is_forwarded() {
         use crate::ooxml::Family;
@@ -5209,18 +5872,25 @@ mod tests {
         );
 
         // The set_cell object's normalized `value` survives beside the dropped
-        // `number_format`.
+        // `number_format`, and the nested null inside the `format_cells`
+        // `border` object is dropped at that level too.
         let xlsx = validate_edits(
             Family::Xlsx,
             &json!({ "edits": [
                 { "op": "set_cell", "sheet": "S", "cell": "A1", "value": 1,
                   "number_format": null },
+                { "op": "format_cells", "sheet": "S", "range": "A1",
+                  "border": { "top": null, "left": true } },
             ]}),
         )
         .expect("valid xlsx edits");
         assert_eq!(
             xlsx,
-            json!([{ "op": "set_cell", "sheet": "S", "cell": "A1", "value": 1 }])
+            json!([
+                { "op": "set_cell", "sheet": "S", "cell": "A1", "value": 1 },
+                { "op": "format_cells", "sheet": "S", "range": "A1",
+                  "border": { "left": true } },
+            ])
         );
 
         let pptx = validate_edits(
@@ -5266,6 +5936,42 @@ mod tests {
                 "expected {expected:?}, got: {message}"
             );
         }
+    }
+
+    /// A key whose value is `null` is not stated — the boundary reads a `null` as
+    /// absent everywhere (see `edit_nulls_are_dropped_before_the_request_is_forwarded`)
+    /// — so a `format_cells` naming `row: null` beside its `range` is the range edit
+    /// it looks like: not a second target and not a key the range's op does not take.
+    /// A key that IS stated still has to be one the op takes.
+    #[test]
+    fn xlsx_edit_reads_a_null_key_as_absent_when_checking_its_op() {
+        let edits = validate_edits(
+            crate::ooxml::Family::Xlsx,
+            &json!({ "edits": [
+                { "op": "format_cells", "sheet": "S", "range": "A1", "row": null,
+                  "bold": true },
+            ]}),
+        )
+        .expect("a null key must not be read as a key the op does not take");
+        assert_eq!(
+            edits,
+            json!([{ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }]),
+            "the null key was not dropped"
+        );
+
+        let err = validate_edits(
+            crate::ooxml::Family::Xlsx,
+            &json!({ "edits": [
+                { "op": "format_cells", "sheet": "S", "range": "A1", "bold": true,
+                  "weight": 2 },
+            ]}),
+        )
+        .expect_err("a stated key the op does not take must still be refused");
+        assert!(
+            err.to_string()
+                .contains("edits[0].weight is not a field of xlsx \"format_cells\""),
+            "got: {err}"
+        );
     }
 
     /// Every shape a pptx `format_text` could be given that the kit cannot write
@@ -6010,6 +6716,60 @@ mod tests {
         );
     }
 
+    /// The whitespace XML allows before a close tag's `>` is read by every op that
+    /// takes a position from one: a paragraph and a run whose close tags carry it
+    /// are found and their text replaced rather than reported as absent from the
+    /// body, and a paragraph added at the body's end goes before the body's own
+    /// close tag however that close is spelled.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_reads_a_close_tag_that_carries_whitespace() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let body = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>имя</w:t></w:r ></w:p ><w:sectPr/></w:body></w:document>"#;
+        let source = docx_body_fixture(&ws, "spaced-close", body).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "replace_text", "find": "имя", "replace": "фамилия" }],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains("фамилия"),
+            "the paragraph was not found past its close tag's whitespace: {edited}"
+        );
+
+        // A body whose own close tag carries the whitespace and which holds no
+        // body-level `<w:sectPr>`: a paragraph added at the end is the body's last
+        // element, written before that close and not one character short of it.
+        let body = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>имя</w:t></w:r></w:p></w:body ></w:document>"#;
+        let source = docx_body_fixture(&ws, "spaced-body", body).await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "add_paragraph", "text": "APPENDED" }],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.ends_with("</w:p></w:body ></w:document>"),
+            "the added paragraph did not go before the body's own close: {edited}"
+        );
+        assert!(
+            edited.contains(r#"<w:t xml:space="preserve">APPENDED</w:t>"#),
+            "the added paragraph is not in the body: {edited}"
+        );
+    }
+
     /// An xlsx edit rewrites only the sheets it names: the workbook's chart,
     /// pivot, table, comment and macro parts stay byte-identical, the cells read
     /// back at their new addresses, and the reply names the stale caches.
@@ -6347,6 +7107,171 @@ mod tests {
             inserted_sheet
                 .contains(r#"<c r="A1"><v>1</v></c><c r="C1"><v>2</v></c><c r="D1"><v>3</v></c>"#),
             "an addressless cell did not move for the insert: {inserted_sheet}"
+        );
+    }
+
+    /// A part that already states one row number twice is not healed and not
+    /// refused for its own repeat, but an edit that would carry that repeat onto a
+    /// number the part holds a single row at is refused: the written part would
+    /// state an address twice where the part it was built from did not, which the
+    /// reply would pass off as a success. The refusal names the address and no
+    /// output is written.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_refuses_a_part_it_would_state_an_address_twice_in() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let base = created_xlsx(&ws).await;
+
+        // The middle row states no `r`, so it stands for the position after its
+        // predecessor, and the last two rows both state `3`. Deleting the
+        // addressless line moves both `3`s up onto the `2` the sheet holds one
+        // row at.
+        let repeated = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row><c r="A2"><v>2</v></c></row><row r="3"><c r="A3"><v>3</v></c></row><row r="3"><c r="A4"><v>4</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "repeated.xlsx",
+            &with_parts(&base, &[("xl/worksheets/sheet1.xml", repeated.as_bytes())]),
+        );
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "file_name": "refused",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "delete_row", "sheet": "S", "row": 2 }],
+                }),
+            )
+            .await
+            .expect_err("a part the edit would state an address twice in must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("the row 2 would be stated twice"),
+            "the refusal did not name the address it would state twice: {message}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        // The same delete on a sheet whose rows each state their own number: no
+        // address is stated twice, the delete goes through, and the surviving row
+        // moves up onto the deleted row's number with its cell.
+        let addressed = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row r="3"><c r="A3"><v>3</v></c></row><row r="4"><c r="A4"><v>4</v></c></row></sheetData></worksheet>"#;
+        let addressed_source = write_fixture(
+            &ws,
+            "addressed.xlsx",
+            &with_parts(&base, &[("xl/worksheets/sheet1.xml", addressed.as_bytes())]),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": addressed_source.to_string_lossy(),
+                "edits": [{ "op": "delete_row", "sheet": "S", "row": 3 }],
+            }),
+        )
+        .await;
+        let sheet = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            sheet.contains(r#"<row r="3"><c r="A3"><v>4</v></c></row>"#),
+            "the row below the deleted one did not move up onto its number: {sheet}"
+        );
+        assert!(
+            !sheet.contains("<v>3</v>"),
+            "the deleted row's cell survived: {sheet}"
+        );
+    }
+
+    /// A row the writer left no `r` for stands for the position it holds, and the
+    /// delete of the line above moves that row and its cells up together: the
+    /// written part states the surviving row's own number and holds its cells at
+    /// that number, rather than leaving a row stating a number its cells are not
+    /// at, which a reader offers to repair.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_moves_a_surviving_row_with_the_cells_it_holds() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let base = created_xlsx(&ws).await;
+        let sheet_text = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="2"><c r="A2"><v>2</v></c></row><row><c r="A3"><v>3</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "survivor.xlsx",
+            &with_parts(
+                &base,
+                &[("xl/worksheets/sheet1.xml", sheet_text.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "delete_row", "sheet": "S", "row": 2 }],
+            }),
+        )
+        .await;
+        let sheet = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            sheet.contains(r#"<row r="2"><c r="A2"><v>3</v></c></row>"#),
+            "the surviving row was left stating a number its cell is not at: {sheet}"
+        );
+    }
+
+    /// A cell whose own `r` is an address this kit cannot place — `$A$1` is a cell
+    /// reference the format allows, and the reader places the plain form — keeps
+    /// its bytes: an edit that makes a writer's implicit addresses explicit must
+    /// not write a second `r` beside the one the cell already states, which no
+    /// reader accepts.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_leaves_a_cell_address_it_cannot_place_alone() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let base = created_xlsx(&ws).await;
+        let sheet_text = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="$A$1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "unplaceable.xlsx",
+            &with_parts(
+                &base,
+                &[("xl/worksheets/sheet1.xml", sheet_text.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        let sheet = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        for cell in sheet.split("<c ").skip(1) {
+            let open = &cell[..cell.find('>').expect("a cell's open tag")];
+            assert_eq!(
+                open.matches("r=\"").count(),
+                1,
+                "a cell states its address more than once: <c {open}>"
+            );
+        }
+        assert!(
+            sheet.contains(r#"<c r="$A$1"><v>1</v></c>"#),
+            "the cell's own spelling was rewritten: {sheet}"
+        );
+        assert!(
+            sheet.contains(r#"<c r="B2"><v>2</v></c>"#),
+            "the cell beside it did not move with its row: {sheet}"
         );
     }
 
@@ -7485,6 +8410,62 @@ mod tests {
         );
     }
 
+    /// The `<xm:sqref>` and `<xm:f>` an extended rule names its range and writes
+    /// its formula in are read as the elements' own text, not by subtracting a
+    /// close tag spelled out again: close tags carrying the whitespace XML allows
+    /// before the `>` move both like any other, where measuring the text off a
+    /// literal `</xm:sqref>` writes a part no reader may hold and leaves the
+    /// formula naming a cell the shift moved.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_moves_an_extended_rule_whose_close_tags_carry_whitespace() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [{ "name": "S", "rows": [["one"], ["two"]] }],
+                }),
+            )
+            .await,
+        );
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>v1</t></is></c><c r="B1"><v>1</v></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>v2</t></is></c><c r="B2"><v>2</v></c></row></sheetData><extLst><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}"><x14:conditionalFormattings xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:conditionalFormatting><x14:cfRule type="expression" priority="1" id="{AAAA}"><xm:f>B1&gt;0</xm:f ></x14:cfRule><xm:sqref>B1:B2</xm:sqref ></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "spaced-sqref.xlsx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "insert_row", "sheet": "S", "row": 1 }],
+            }),
+        )
+        .await;
+        let output = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            output.contains("<xm:sqref>B2:B3</xm:sqref>"),
+            "the extended rule's range did not move with the shift: {output}"
+        );
+        assert!(
+            output.contains("<xm:f>B2&gt;0</xm:f>"),
+            "the extended rule's formula still names the old cell: {output}"
+        );
+        assert!(
+            !output.contains("B1:B2<"),
+            "the range was cut short by the close tag's whitespace: {output}"
+        );
+    }
+
     /// A sheet that holds an empty `<extLst>` keeps it through a shift that changes
     /// the sheet — in either spelling, because the pair `<extLst></extLst>` holds
     /// nothing just as a `<extLst/>` does, and an element that held nothing is not
@@ -8308,6 +9289,2601 @@ mod tests {
         assert!(
             !reply.contains("pointing at the old cells"),
             "a part the shift moved with its cells is named as stale: {reply}"
+        );
+    }
+
+    /// An Excel-shaped styles part whose second `<cellXfs>` entry is NOT the
+    /// default: a custom number format, a font that is not the workbook's first,
+    /// a solid fill, a bordered cell and an `<xf>` carrying its own `<alignment>`
+    /// and `<protection>` children. A format naming one property has to clone
+    /// this entry for exactly that property.
+    const FORMAT_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="0.00"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><i/><sz val="11"/><color rgb="FFFF0000"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="2"><border/><border><left style="thin"><color indexed="64"/></left><top style="thin"><color indexed="64"/></top></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="164" fontId="1" fillId="1" borderId="1" xfId="0" applyFont="1"><alignment horizontal="right" vertical="top" wrapText="1"/><protection locked="0"/></xf></cellXfs></styleSheet>"#;
+
+    /// The entry `A1` uses in [`FORMAT_STYLES`], so a format can be shown to
+    /// leave that entry in the part untouched.
+    const FORMAT_XF: &str = r#"<xf numFmtId="164" fontId="1" fillId="1" borderId="1" xfId="0" applyFont="1"><alignment horizontal="right" vertical="top" wrapText="1"/><protection locked="0"/></xf>"#;
+
+    /// A sheet whose `A1` uses [`FORMAT_STYLES`]'s second entry and whose `B1` is
+    /// an ordinary cell beside it.
+    const FORMAT_SHEET: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B1"/><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>KEEP</t></is></c><c r="B1" s="0"><v>7</v></c></row></sheetData></worksheet>"#;
+
+    /// A format names one property and the cell's own `<xf>` is cloned for it: the
+    /// number format, the fill, the borders and the `xfId` stay the old entry's,
+    /// the font is a new entry built from the cell's own, the old `<xf>`'s
+    /// child-bearing children (`<alignment>`, `<protection>`) are kept byte for
+    /// byte, and the entry the cell came with is still in the part. A repeat of the
+    /// same format in one call reuses the entries it made rather than appending
+    /// them twice.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    #[expect(clippy::too_many_lines)] // reason: one format's clone, its repeats and the entries it left, one case each
+    async fn xlsx_edit_format_cells_changes_only_the_property_it_names() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(
+            &ws,
+            "styled.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[
+                    ("xl/styles.xml", FORMAT_STYLES.as_bytes()),
+                    ("xl/worksheets/sheet1.xml", FORMAT_SHEET.as_bytes()),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let styles = part_text(&output, "xl/styles.xml");
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+
+        // A1 keeps its own value bytes and moves to the appended entry.
+        assert!(
+            sheet.contains(r#"<c r="A1" s="2" t="inlineStr"><is><t>KEEP</t></is></c>"#),
+            "the cell did not keep its value and take the new entry: {sheet}"
+        );
+        assert!(
+            sheet.contains(r#"<c r="B1" s="0"><v>7</v></c>"#),
+            "a cell outside the format changed: {sheet}"
+        );
+
+        let xfs = element_children(&styles, "cellXfs", "xf");
+        assert_eq!(
+            xfs.len(),
+            3,
+            "expected one entry beside the two the cell came with: {styles}"
+        );
+        let (before, after) = (xfs[1], xfs[2]);
+        // Everything the request did not name is the cell's own entry's.
+        for name in ["numFmtId", "fillId", "borderId", "xfId"] {
+            assert_eq!(
+                attribute_of(after, name),
+                attribute_of(before, name),
+                "the new entry changed {name}: {after}"
+            );
+        }
+        assert_ne!(
+            attribute_of(after, "fontId"),
+            attribute_of(before, "fontId"),
+            "the new entry reused the cell's font id: {after}"
+        );
+        assert_eq!(attribute_of(after, "applyFont"), "1", "{after}");
+        // The children of the cell's own entry are its own bytes.
+        assert!(
+            after.contains(
+                r#"<alignment horizontal="right" vertical="top" wrapText="1"/><protection locked="0"/>"#
+            ),
+            "a child of the cell's own entry was not kept: {after}"
+        );
+        // The font it points at is the cell's own with `<b/>` written in EG_Font order.
+        let fonts = element_children(&styles, "fonts", "font");
+        let font = fonts[attribute_of(after, "fontId")
+            .parse::<usize>()
+            .expect("a font index")];
+        assert_eq!(
+            font,
+            r#"<font><b/><i/><sz val="11"/><color rgb="FFFF0000"/><name val="Calibri"/></font>"#,
+            "the new font is not the cell's own plus <b/>: {font}"
+        );
+        // The entries the cell came with are still there, unchanged.
+        assert_eq!(
+            xfs[1], FORMAT_XF,
+            "the cell's own entry was rewritten: {styles}"
+        );
+        assert!(
+            styles.contains(r#"<numFmt numFmtId="164" formatCode="0.00"/>"#),
+            "the existing number format was rewritten: {styles}"
+        );
+        assert!(
+            styles.contains(
+                r#"<font><i/><sz val="11"/><color rgb="FFFF0000"/><name val="Calibri"/></font>"#
+            ),
+            "the cell's own font was rewritten: {styles}"
+        );
+
+        // A second format naming the same property in the SAME call is a repeat:
+        // the entries are reused, so `<cellXfs>` gained exactly what one call needs.
+        let twice = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "twice",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_cells", "sheet": "S", "range": "A1", "bold": true },
+                    { "op": "format_cells", "sheet": "S", "range": "A1", "bold": true },
+                ],
+            }),
+        )
+        .await;
+        let twice_styles = part_text(&single(&twice), "xl/styles.xml");
+        assert_eq!(
+            element_children(&twice_styles, "cellXfs", "xf").len(),
+            3,
+            "a repeated format appended its entry twice: {twice_styles}"
+        );
+        assert_eq!(
+            element_children(&twice_styles, "fonts", "font").len(),
+            3,
+            "a repeated format appended its font twice: {twice_styles}"
+        );
+    }
+
+    /// A cell that names no `s=` renders as the FIRST `<cellXfs>` entry — the base
+    /// style a workbook states — so a format naming one property must clone THAT
+    /// entry: a hard-coded default would take away the font (or fill, or
+    /// alignment) the entry states and move the cell off the look it already had.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_keeps_the_base_style_a_cell_with_no_s_inherits() {
+        // Entry 0 is the base a cell with no `s=` renders as and states a bold
+        // red font; entry 1 is the neutral stock entry a hard-coded default
+        // would reach for.
+        const STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFF0000"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>"#;
+        const SHEET: &str = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1"/><sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData></worksheet>"#;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(
+            &ws,
+            "base-style.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[
+                    ("xl/styles.xml", STYLES.as_bytes()),
+                    ("xl/worksheets/sheet1.xml", SHEET.as_bytes()),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "aligned",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1",
+                            "align": "center" }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let styles = part_text(&output, "xl/styles.xml");
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+        let cell = cell_element(&sheet, "A1");
+        assert!(
+            cell.contains("<v>7</v>"),
+            "the format did not leave the value alone: {cell}"
+        );
+        let xfs = element_children(&styles, "cellXfs", "xf");
+        let index: usize = attribute_of(cell, "s")
+            .parse()
+            .expect("the cell did not take a style index");
+        let xf = xfs
+            .get(index)
+            .unwrap_or_else(|| panic!("no entry at {index}: {styles}"));
+        // The font entry 0 states is the cell's own, and the alignment is the one
+        // property the request named.
+        assert_eq!(
+            attribute_of(xf, "fontId"),
+            "1",
+            "the base font the cell already rendered as was dropped: {xf}"
+        );
+        assert_eq!(attribute_of(xf, "applyFont"), "1", "{xf}");
+        assert_eq!(attribute_of(xf, "applyAlignment"), "1", "{xf}");
+        assert!(
+            xf.contains(r#"<alignment horizontal="center"/>"#),
+            "the alignment was not written: {xf}"
+        );
+    }
+
+    /// A `<cellXfs>` entry that omits `fontId` takes it from the named style its
+    /// `xfId` points at, so a format naming one property must base the new entry on
+    /// that style's font: resolving the omitted id to 0 would give the cell the
+    /// default font and take away the one it renders as.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_keeps_the_look_a_named_style_gives_a_cell() {
+        // The cell xf states no `fontId`; its `xfId` points at a `<cellStyleXfs>`
+        // entry whose font is a 20-point blue Georgia — the look the cell renders
+        // as — while font 0 is the neutral Calibri 11 a hard-coded default takes.
+        const STYLES: &str = r#"<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><sz val="20"/><color rgb="FF0000FF"/><name val="Georgia"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="1" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>"#;
+        const SHEET: &str = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1"/><sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData></worksheet>"#;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(
+            &ws,
+            "named-style.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[
+                    ("xl/styles.xml", STYLES.as_bytes()),
+                    ("xl/worksheets/sheet1.xml", SHEET.as_bytes()),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "emboldened",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let styles = part_text(&output, "xl/styles.xml");
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+        let cell = cell_element(&sheet, "A1");
+        assert!(
+            cell.contains("<v>7</v>"),
+            "the format did not leave the value alone: {cell}"
+        );
+        let xfs = element_children(&styles, "cellXfs", "xf");
+        let index: usize = attribute_of(cell, "s")
+            .parse()
+            .expect("the cell did not take a style index");
+        let xf = xfs
+            .get(index)
+            .unwrap_or_else(|| panic!("no entry at {index}: {styles}"));
+        let font_id: usize = attribute_of(xf, "fontId")
+            .parse()
+            .expect("the new entry states no font index");
+        let font = element_children(&styles, "fonts", "font")[font_id];
+        // The named style's font, made bold — not the neutral font 0.
+        assert!(
+            font.contains(r#"<name val="Georgia"/>"#),
+            "the named style's font was dropped: {font}"
+        );
+        assert!(
+            font.contains(r#"<sz val="20"/>"#),
+            "the named style's size was dropped: {font}"
+        );
+        assert!(
+            font.contains(r#"<color rgb="FF0000FF"/>"#),
+            "the named style's color was dropped: {font}"
+        );
+        assert!(font.contains("<b/>"), "the bold flag was not added: {font}");
+    }
+
+    /// A cell that names no `s=` of its own takes the style its `<row>` or its
+    /// covering `<col>` states, so a format naming one property must materialize
+    /// that style on the cell: the row wins over the column, as a reader applies
+    /// them, and neither the row's nor the column's font is dropped beside the
+    /// fill the request named.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_keeps_the_look_a_cell_inherits_from_its_row_or_column() {
+        // Entry 1 is a bold red font (the row's), entry 2 an italic blue one (the
+        // column's); entry 0 is the neutral base neither cell names.
+        const STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="3"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFF0000"/><name val="Calibri"/></font><font><i/><sz val="11"/><color rgb="FF0000FF"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs></styleSheet>"#;
+        // Row 2 states a style for its cells; column B states one for a cell whose
+        // row states none; C2 is outside the edit and must come through untouched.
+        const SHEET: &str = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:C3"/><cols><col min="2" max="2" width="12" style="2" customWidth="1"/></cols><sheetData><row r="2" s="1" customFormat="1"><c r="A2"><v>7</v></c><c r="B2"><v>8</v></c><c r="C2" s="0"><v>11</v></c></row><row r="3"><c r="B3"><v>9</v></c></row></sheetData></worksheet>"#;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(
+            &ws,
+            "inherited.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[
+                    ("xl/styles.xml", STYLES.as_bytes()),
+                    ("xl/worksheets/sheet1.xml", SHEET.as_bytes()),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "filled",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_cells", "sheet": "S", "range": "A2:B2", "fill": "FFF2CC" },
+                    { "op": "format_cells", "sheet": "S", "range": "B3", "fill": "FFF2CC" },
+                ],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let styles = part_text(&output, "xl/styles.xml");
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+        let xfs = element_children(&styles, "cellXfs", "xf");
+        let xf_at = |address: &str| -> usize {
+            attribute_of(cell_element(&sheet, address), "s")
+                .parse()
+                .expect("a style index")
+        };
+
+        // Both cells the row covers take the row's font, not the column's.
+        for address in ["A2", "B2"] {
+            let xf = xfs[xf_at(address)];
+            assert_eq!(
+                attribute_of(xf, "fontId"),
+                "1",
+                "{address} lost the font its row states: {xf}"
+            );
+            assert_eq!(attribute_of(xf, "applyFill"), "1", "{address}: {xf}");
+        }
+        // B3's row states none, so it takes the style its covering column states.
+        let b3 = xfs[xf_at("B3")];
+        assert_eq!(
+            attribute_of(b3, "fontId"),
+            "2",
+            "B3 lost the font its column states: {b3}"
+        );
+        assert_eq!(attribute_of(b3, "applyFill"), "1", "{b3}");
+        assert!(
+            styles.contains(r#"<fgColor rgb="FFFFF2CC"/>"#),
+            "the fill was not written: {styles}"
+        );
+        // A cell the edit does not name is byte-identical.
+        assert!(
+            sheet.contains(r#"<c r="C2" s="0"><v>11</v></c>"#),
+            "a cell outside the edit changed: {sheet}"
+        );
+    }
+
+    /// A `set_cell` that names only a number format must materialize the style the
+    /// cell already renders by — its row's, or its covering column's when the row
+    /// states none — exactly as `format_cells` does: deriving the new `<cellXfs>`
+    /// entry from the cell's own absent `s=` would base it on the default entry and
+    /// drop the font, fill or alignment the cell already had.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_set_cell_number_format_keeps_the_look_a_cell_inherits_from_its_row_or_column()
+     {
+        // Entry 1 is a bold red font (the style row 2 states), entry 2 a yellow
+        // fill (the style the covering `<col>` states); entry 0 is the neutral base
+        // neither row states.
+        const STYLES: &str = r#"<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFF0000"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="0" fillId="1" borderId="0" xfId="0" applyFill="1"/></cellXfs></styleSheet>"#;
+        // B1's row states `customFormat="1"` with no `s=`, the row's own default
+        // entry 0, which wins over the covering `<col style="2">`; A2's row states
+        // entry 1; C3's row states none, so the covering column's entry 2 applies.
+        const SHEET: &str = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:C3"/><cols><col min="2" max="3" style="2" width="9" customWidth="1"/></cols><sheetData><row r="1" customFormat="1"><c r="B1"><v>2</v></c></row><row r="2" s="1" customFormat="1"><c r="A2"><v>3</v></c></row><row r="3"><c r="C3"><v>4</v></c></row></sheetData></worksheet>"#;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(
+            &ws,
+            "set-cell-inherited.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[
+                    ("xl/styles.xml", STYLES.as_bytes()),
+                    ("xl/worksheets/sheet1.xml", SHEET.as_bytes()),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "numbered",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "set_cell", "sheet": "S", "cell": "B1", "value": 21,
+                      "number_format": "0.00" },
+                    { "op": "set_cell", "sheet": "S", "cell": "A2", "value": 22,
+                      "number_format": "0.00" },
+                    { "op": "set_cell", "sheet": "S", "cell": "C3", "value": 23,
+                      "number_format": "0.00" },
+                ],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let styles = part_text(&output, "xl/styles.xml");
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+        let xfs = element_children(&styles, "cellXfs", "xf");
+        let num_fmts = element_children(&styles, "numFmts", "numFmt");
+        let xf_at = |address: &str| -> usize {
+            attribute_of(cell_element(&sheet, address), "s")
+                .parse()
+                .expect("a style index")
+        };
+
+        // B1's row states a format of its own but no readable `s=`, so its base is
+        // the entry 0 the row still wins with over the covering column.
+        let b1 = xfs[xf_at("B1")];
+        assert_eq!(
+            attribute_of(b1, "fontId"),
+            "0",
+            "B1 lost the neutral font its row's default entry states: {b1}"
+        );
+        assert_eq!(
+            attribute_of(b1, "fillId"),
+            "0",
+            "B1 took the covering column's fill over its row's default: {b1}"
+        );
+        // A2's row states entry 1 (the bold red font) and keeps it.
+        let a2 = xfs[xf_at("A2")];
+        assert_eq!(
+            attribute_of(a2, "fontId"),
+            "1",
+            "A2 lost the bold red font its row states: {a2}"
+        );
+        // C3's row states none, so the covering column's entry 2 (the yellow fill)
+        // is the base.
+        let c3 = xfs[xf_at("C3")];
+        assert_eq!(
+            attribute_of(c3, "fillId"),
+            "1",
+            "C3 lost the yellow fill its covering column states: {c3}"
+        );
+
+        // Each cell kept the value it was written, and every new entry names the
+        // 0.00 code the call asked for.
+        for (address, value) in [("B1", "21"), ("A2", "22"), ("C3", "23")] {
+            assert!(
+                cell_element(&sheet, address).contains(&format!("<v>{value}</v>")),
+                "{address} did not keep the value it was written: {sheet}"
+            );
+            let xf = xfs[xf_at(address)];
+            assert_eq!(
+                attribute_of(xf, "applyNumberFormat"),
+                "1",
+                "{address}: {xf}"
+            );
+            let id = attribute_of(xf, "numFmtId");
+            let code = num_fmts
+                .iter()
+                .find(|entry| attribute_of(entry, "numFmtId") == id)
+                .map(|entry| attribute_of(entry, "formatCode"));
+            assert_eq!(
+                code,
+                Some("0.00"),
+                "{address} did not take the 0.00 format it asked for: {xf}"
+            );
+        }
+    }
+
+    /// A styled part whose second entry's font is bold, so a `bold:false` has a
+    /// `<b/>` to take away.
+    const AWAY_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><i/><sz val="11"/><color rgb="FFFF0000"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="2"><border/><border><left style="thin"><color indexed="64"/></left><right style="thin"><color indexed="64"/></right><top style="thin"><color indexed="64"/></top><bottom style="thin"><color indexed="64"/></bottom></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="1" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="bottom" wrapText="1"/></xf></cellXfs></styleSheet>"#;
+
+    /// Four cells sharing [`AWAY_STYLES`]'s styled entry: one format apiece can
+    /// take one named property away on each.
+    const AWAY_SHEET: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:D1"/><sheetData><row r="1"><c r="A1" s="1"><v>1</v></c><c r="B1" s="1"><v>2</v></c><c r="C1" s="1"><v>3</v></c><c r="D1" s="1"><v>4</v></c></row></sheetData></worksheet>"#;
+
+    /// A named property can be taken away as well as set: `bold:false` drops the
+    /// cell's `<b/>`, `fill:false` points it at the "none" fill, a border side
+    /// named false is left as an empty side while its siblings keep their own
+    /// bytes, and `wrap:false` removes `wrapText` without touching the cell's
+    /// other alignment values.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_takes_a_named_property_away() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(
+            &ws,
+            "away.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[
+                    ("xl/styles.xml", AWAY_STYLES.as_bytes()),
+                    ("xl/worksheets/sheet1.xml", AWAY_SHEET.as_bytes()),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "away-edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_cells", "sheet": "S", "range": "A1", "bold": false },
+                    { "op": "format_cells", "sheet": "S", "range": "B1", "fill": false },
+                    { "op": "format_cells", "sheet": "S", "range": "C1", "border": { "top": false } },
+                    { "op": "format_cells", "sheet": "S", "range": "D1", "wrap": false },
+                ],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let styles = part_text(&output, "xl/styles.xml");
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+        let xfs = element_children(&styles, "cellXfs", "xf");
+        let fonts = element_children(&styles, "fonts", "font");
+        let fills = element_children(&styles, "fills", "fill");
+        let borders = element_children(&styles, "borders", "border");
+        let xf_at = |address: &str| -> usize {
+            attribute_of(cell_element(&sheet, address), "s")
+                .parse()
+                .expect("a style index")
+        };
+
+        // `bold:false` drops the `<b/>`, off a clone of the cell's own font.
+        let font = fonts[attribute_of(xfs[xf_at("A1")], "fontId")
+            .parse::<usize>()
+            .expect("a font index")];
+        assert!(
+            !font.contains("<b/>") && font.contains("<i/>"),
+            "the font was not un-bolded: {font}"
+        );
+        assert!(
+            fonts[1].contains("<b/>"),
+            "the cell's own font was rewritten: {}",
+            fonts[1]
+        );
+
+        // `fill:false` points the cell at the "none" fill.
+        let fill = fills[attribute_of(xfs[xf_at("B1")], "fillId")
+            .parse::<usize>()
+            .expect("a fill index")];
+        assert!(
+            fill.contains(r#"patternType="none""#),
+            "the fill was not taken away: {fill}"
+        );
+
+        // `border.top:false` leaves an empty `<top/>` while its siblings keep their bytes.
+        let border = borders[attribute_of(xfs[xf_at("C1")], "borderId")
+            .parse::<usize>()
+            .expect("a border index")];
+        assert!(
+            border.contains("<top/>"),
+            "the top side was not taken away: {border}"
+        );
+        for side in ["left", "right", "bottom"] {
+            assert!(
+                border.contains(&format!(
+                    r#"<{side} style="thin"><color indexed="64"/></{side}>"#
+                )),
+                "the {side} side lost its own bytes: {border}"
+            );
+        }
+        assert!(
+            borders[1].contains(r#"<top style="thin"><color indexed="64"/></top>"#),
+            "the cell's own border was rewritten: {}",
+            borders[1]
+        );
+
+        // `wrap:false` removes wrapText while the cell's other alignment values stay.
+        let wrapped = xfs[xf_at("D1")];
+        assert!(
+            wrapped.contains(r#"<alignment horizontal="center" vertical="bottom"/>"#),
+            "the alignment was not reduced: {wrapped}"
+        );
+        assert!(
+            !wrapped.contains("wrapText"),
+            "wrapText was not removed: {wrapped}"
+        );
+    }
+
+    /// One format over `A1:C1` names three cells: the two the sheet already holds
+    /// and the one the rectangle creates. All three take the same new entry, the
+    /// existing cells keep their values, a cell outside the rectangle does not
+    /// change, the dimension covers the rectangle, and no widening is reported.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_a_range_writes_every_named_cell_and_no_other() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B2"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "range.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "filled",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1:C1", "fill": "FFFF00" }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let filled = part_text(&output, "xl/worksheets/sheet1.xml");
+        let styles = part_text(&output, "xl/styles.xml");
+        for address in ["A1", "B1", "C1"] {
+            assert_eq!(
+                attribute_of(cell_element(&filled, address), "s"),
+                "1",
+                "{address} did not take the range's entry: {filled}"
+            );
+        }
+        assert!(
+            filled.contains(r#"<c r="A1" s="1"><v>1</v></c>"#),
+            "A1 lost its value: {filled}"
+        );
+        assert!(
+            filled.contains(r#"<c r="B1" s="1"><v>2</v></c>"#),
+            "B1 lost its value: {filled}"
+        );
+        assert!(
+            filled.contains(r#"<c r="C1" s="1"/>"#),
+            "the created C1 did not take the style: {filled}"
+        );
+        assert!(
+            filled.contains(r#"<c r="A2"><v>3</v></c>"#),
+            "a cell outside the range changed: {filled}"
+        );
+        assert!(
+            filled.contains(r#"<dimension ref="A1:C2"/>"#),
+            "the dimension does not cover the formatted range: {filled}"
+        );
+        assert!(
+            styles.contains(r#"<fgColor rgb="FFFFFF00"/>"#),
+            "the fill was not written: {styles}"
+        );
+        assert!(
+            !reply.contains("widened"),
+            "an unmerged range was reported widened: {reply}"
+        );
+    }
+
+    /// A number format moves only `s=`: a `format_cells` naming one leaves the
+    /// cell's `<f>` and `<v>` byte-identical. A `set_cell` that names a value
+    /// still writes that value.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_number_format_leaves_the_value_and_the_formula_alone() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B1"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1" s="0"><f>A1*2</f><v>2</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "formula.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "formatted",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "B1", "number_format": "0.00" }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        assert!(
+            part_text(&output, "xl/worksheets/sheet1.xml")
+                .contains(r#"<c r="B1" s="1"><f>A1*2</f><v>2</v></c>"#),
+            "the format did not leave the formula and value alone: {}",
+            part_text(&output, "xl/worksheets/sheet1.xml")
+        );
+        assert!(
+            part_text(&output, "xl/styles.xml")
+                .contains(r#"<numFmt numFmtId="164" formatCode="0.00"/>"#),
+            "the number format was not written"
+        );
+
+        // A `set_cell` that DOES name a value still writes that value.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "rewritten",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "set_cell", "sheet": "S", "cell": "B1", "value": 9 }],
+            }),
+        )
+        .await;
+        let rewritten = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            rewritten.contains(r#"<c r="B1" s="0"><v>9</v></c>"#),
+            "a value write did not replace the formula: {rewritten}"
+        );
+    }
+
+    /// Clearing a styled, filled cell empties it but keeps its own `s=`: the
+    /// value children and their `t` go, the style index stays. A cell that
+    /// carried no address of its own is emptied where it stands and stays
+    /// addressless, so nothing the caller did not name gains an attribute.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_clear_cell_keeps_the_cells_own_style() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:B2"/><sheetData><row r="1"><c r="A1" s="1"><v>5</v></c><c r="B1" s="1" t="inlineStr"><is><t>x</t></is></c></row><row r="2"><c><v>9</v></c></row></sheetData></worksheet>"#;
+        let base = created_xlsx(&ws).await;
+        let source = write_fixture(
+            &ws,
+            "cleared.xlsx",
+            &with_parts(&base, &[("xl/worksheets/sheet1.xml", sheet.as_bytes())]),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "cleared-edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "clear_cell", "sheet": "S", "cell": "A1" },
+                    { "op": "clear_cell", "sheet": "S", "cell": "B1" },
+                    { "op": "clear_cell", "sheet": "S", "cell": "A2" },
+                ],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let cleared = part_text(&output, "xl/worksheets/sheet1.xml");
+        assert!(
+            cleared.contains(r#"<c r="A1" s="1"/>"#) && cleared.contains(r#"<c r="B1" s="1"/>"#),
+            "a cleared cell lost its own style index: {cleared}"
+        );
+        assert!(
+            !cleared.contains("<v>") && !cleared.contains("<is>") && !cleared.contains("</t>"),
+            "a cleared cell kept its value: {cleared}"
+        );
+        assert!(
+            cleared.contains(r#"<row r="2"><c/></row>"#),
+            "the addressless cell was not emptied in place: {cleared}"
+        );
+        assert_eq!(
+            part_bytes(&source, "xl/styles.xml"),
+            part_bytes(&output, "xl/styles.xml"),
+            "clearing a cell rewrote the styles part"
+        );
+    }
+
+    /// A column format on `B` splits the `<col>` covering it: the spans on either
+    /// side keep every attribute they had, `B` takes the new width, a sheet with
+    /// no `<cols>` gains one directly before `<sheetData>`, and writing the same
+    /// width again round-trips byte-identically.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_column_width_splits_a_covering_entry() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let base = created_xlsx(&ws).await;
+        let covering = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols><col min="1" max="4" width="10" customWidth="1" style="2" hidden="1"/></cols><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "covered.xlsx",
+            &with_parts(&base, &[("xl/worksheets/sheet1.xml", covering.as_bytes())]),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "split",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "column": "B", "width": 20 }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+        assert!(
+            sheet.contains(concat!(
+                r#"<cols><col min="1" max="1" width="10" customWidth="1" style="2" hidden="1"/>"#,
+                r#"<col min="2" max="2" width="20" customWidth="1" style="2" hidden="1"/>"#,
+                r#"<col min="3" max="4" width="10" customWidth="1" style="2" hidden="1"/></cols>"#,
+            )),
+            "the covering entry was not split around B: {sheet}"
+        );
+
+        // A sheet with no <cols> gains one directly before <sheetData>.
+        let plain = write_fixture(&ws, "bare.xlsx", &base);
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "bare-width",
+                "path": plain.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "column": "B", "width": 20 }],
+            }),
+        )
+        .await;
+        let bare_sheet = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            bare_sheet.contains(
+                r#"<cols><col min="2" max="2" width="20" customWidth="1"/></cols><sheetData>"#
+            ),
+            "the created <cols> is not directly before <sheetData>: {bare_sheet}"
+        );
+
+        // The same width again is a no-op: a second call round-trips byte-identically.
+        let again = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "split-again",
+                "path": output.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "column": "B", "width": 20 }],
+            }),
+        )
+        .await;
+        assert_eq!(
+            sheet,
+            part_text(&single(&again), "xl/worksheets/sheet1.xml"),
+            "a repeated width changed the sheet"
+        );
+    }
+
+    /// A row format keeps the row element's own bytes (`spans`, `s`, its cells)
+    /// and adds only `ht`/`customHeight`; a row the sheet has none of is created
+    /// in order, and addressless rows are materialized before the insert so no
+    /// successor is renumbered.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_row_height_keeps_the_row_and_creates_a_missing_one() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let base = created_xlsx(&ws).await;
+        let rows = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row r="3" spans="1:2" s="1"><c r="A3"><v>3</v></c></row><row r="4"><c r="A4"><v>4</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "rows.xlsx",
+            &with_parts(&base, &[("xl/worksheets/sheet1.xml", rows.as_bytes())]),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "height",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "row": 3, "height": 30 }],
+            }),
+        )
+        .await;
+        let sheet = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            sheet.contains(r#"<row r="3" spans="1:2" s="1" ht="30" customHeight="1">"#),
+            "the row's own attributes were not kept beside the height: {sheet}"
+        );
+
+        // A missing row 3 is created between 2 and 4, and the rows below keep their addresses.
+        let gap = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row r="4"><c r="A4"><v>4</v></c></row></sheetData></worksheet>"#;
+        let gap_source = write_fixture(
+            &ws,
+            "gap.xlsx",
+            &with_parts(&base, &[("xl/worksheets/sheet1.xml", gap.as_bytes())]),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "gap-height",
+                "path": gap_source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "row": 3, "height": 30 }],
+            }),
+        )
+        .await;
+        let gap_sheet = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            gap_sheet.contains(concat!(
+                r#"<row r="2"><c r="A2"><v>2</v></c></row>"#,
+                r#"<row r="3" ht="30" customHeight="1"/>"#,
+                r#"<row r="4"><c r="A4"><v>4</v></c></row>"#,
+            )),
+            "the created row did not land between 2 and 4: {gap_sheet}"
+        );
+
+        // Addressless rows are materialized before the insert, so their successors
+        // still resolve to the numbers they held.
+        let addressless = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row><c><v>1</v></c></row><row><c><v>2</v></c></row></sheetData></worksheet>"#;
+        let addressless_source = write_fixture(
+            &ws,
+            "addressless.xlsx",
+            &with_parts(
+                &base,
+                &[("xl/worksheets/sheet1.xml", addressless.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "addressless-height",
+                "path": addressless_source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "row": 3, "height": 30 }],
+            }),
+        )
+        .await;
+        let addressless_sheet = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        assert!(
+            addressless_sheet.contains(concat!(
+                r#"<row r="1"><c r="A1"><v>1</v></c></row>"#,
+                r#"<row r="2"><c r="A2"><v>2</v></c></row>"#,
+                r#"<row r="3" ht="30" customHeight="1"/>"#,
+            )),
+            "the materialized successors were renumbered: {addressless_sheet}"
+        );
+    }
+
+    /// A format aimed at part of a merged cell lands on the whole merge and says
+    /// so; a range that already covers the merge is left as it is, so no note is
+    /// owed and `<mergeCells>` is not rewritten.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_widens_a_merged_range_and_says_so() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:C1"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c><c r="C1"><v>3</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:C1"/></mergeCells></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "merged.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "widened",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }],
+            }),
+        )
+        .await;
+        let formatted = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        for (address, value) in [("A1", "1"), ("B1", "2"), ("C1", "3")] {
+            assert!(
+                formatted.contains(&format!(r#"<c r="{address}" s="1"><v>{value}</v></c>"#)),
+                "{address} did not take the style of the widened range: {formatted}"
+            );
+        }
+        assert!(
+            reply.contains("the range A1 was widened to A1:C1"),
+            "the widening was not named: {reply}"
+        );
+        assert!(
+            formatted.contains(r#"<mergeCells count="1"><mergeCell ref="A1:C1"/></mergeCells>"#),
+            "the merge range was rewritten: {formatted}"
+        );
+
+        // The paired `<mergeCell ref="A1:C1"></mergeCell>` spelling is the same
+        // merge: it must widen the format and raise the same note, not be skipped
+        // so the cell is styled alone.
+        let paired_sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:C1"/><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c><c r="C1"><v>3</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:C1"></mergeCell></mergeCells></worksheet>"#;
+        let paired_source = write_fixture(
+            &ws,
+            "merged-paired.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/worksheets/sheet1.xml", paired_sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "widened-paired",
+                "path": paired_source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }],
+            }),
+        )
+        .await;
+        let formatted = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        for (address, value) in [("A1", "1"), ("B1", "2"), ("C1", "3")] {
+            assert!(
+                formatted.contains(&format!(r#"<c r="{address}" s="1"><v>{value}</v></c>"#)),
+                "{address} did not take the style of the paired merge's widening: {formatted}"
+            );
+        }
+        assert!(
+            reply.contains("the range A1 was widened to A1:C1"),
+            "the paired merge's widening was not named: {reply}"
+        );
+        assert!(
+            formatted.contains(r#"<mergeCell ref="A1:C1"></mergeCell>"#),
+            "the paired merge element was rewritten: {formatted}"
+        );
+
+        // A range that already covers the merge moves nothing, so no note is owed.
+        let covered = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "covered",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1:C1", "bold": true }],
+            }),
+        )
+        .await;
+        assert!(
+            !covered.contains("widened"),
+            "a range covering the merge was reported widened: {covered}"
+        );
+    }
+
+    /// A format aimed at one cell of two merges stacked through a shared cell
+    /// grows through both — the second reached only by the first widening — and
+    /// the note names the range it reached and counts both merges, so the reply
+    /// never reads as if a single merge covered the styled range.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_names_every_merge_a_widening_covers() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row></sheetData><mergeCells count="2"><mergeCell ref="A1:B1"/><mergeCell ref="B1:B2"/></mergeCells></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "stacked-merges.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "widened",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }],
+            }),
+        )
+        .await;
+        assert!(
+            reply.contains("the range A1 was widened to A1:B2"),
+            "the widening was not named: {reply}"
+        );
+        assert!(
+            reply.contains("covered by 2 merged cells"),
+            "the note did not count both merges: {reply}"
+        );
+        assert!(
+            !reply.contains("one merged cell"),
+            "a two-merge widening was reported as a single merge: {reply}"
+        );
+        let formatted = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+        for address in ["A1", "B1", "A2", "B2"] {
+            assert_eq!(
+                attribute_of(cell_element(&formatted, address), "s"),
+                "1",
+                "{address} did not take the widened range's entry: {formatted}"
+            );
+        }
+        assert!(
+            formatted.contains(
+                r#"<mergeCells count="2"><mergeCell ref="A1:B1"/><mergeCell ref="B1:B2"/></mergeCells>"#
+            ),
+            "the merge block was rewritten: {formatted}"
+        );
+    }
+
+    /// A `<mergeCell>` may cover more cells than the caller's own range names, and
+    /// the widening that lands on the whole merge is held to the same cap: a merge
+    /// the widening takes past `format_cells_max` is refused before a cell is
+    /// written, naming the range the widening reached.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_refuses_a_merge_that_widens_past_the_cell_cap() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        // Three rows by the grid's full 16384 columns — 49152 cells, well past the
+        // `format_cells_max` one format may name. The caller's own `A1` is one
+        // cell, so only the widening reaches the cap.
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:XFD3"/><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:XFD3"/></mergeCells></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "wide-merge.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "file_name": "refused",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1",
+                                "bold": true }],
+                }),
+            )
+            .await
+            .expect_err("a merge past the cell cap must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("A1:XFD3"),
+            "the refusal did not name the range the widening reached: {message}"
+        );
+        assert!(
+            message.contains("more than"),
+            "the refusal did not name the cap it passed: {message}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A format brings styling to a workbook that never saved styles: the part is
+    /// written, declared in `[Content_Types].xml` and named by the workbook's
+    /// relationships, and the cell points at a real entry. A styles part that is
+    /// there but degenerate is grown rather than refused.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_writes_the_styles_a_stripped_workbook_lacks() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let base = created_xlsx(&ws).await;
+
+        // The same workbook with its styles part dropped, the shape a package
+        // that never saved styles has.
+        let stripped = write_fixture(
+            &ws,
+            "stripped.xlsx",
+            &repacked(&base, &["xl/styles.xml"], &[]),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "restyled",
+                "path": stripped.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        assert_parts(&output, &["xl/styles.xml"]);
+        let types = part_text(&output, "[Content_Types].xml");
+        assert!(
+            types.contains(
+                r#"PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml""#
+            ),
+            "the styles part was not declared: {types}"
+        );
+        let rels = part_text(&output, "xl/_rels/workbook.xml.rels");
+        assert!(
+            rels.contains(
+                r#"Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml""#
+            ),
+            "the workbook does not name the styles part: {rels}"
+        );
+        let styles = part_text(&output, "xl/styles.xml");
+        assert!(
+            styles.contains(r#"<font><b/><sz val="11"/><name val="Calibri"/></font>"#),
+            "the bold font was not written: {styles}"
+        );
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+        let xfs = element_children(&styles, "cellXfs", "xf");
+        let index: usize = attribute_of(cell_element(&sheet, "A1"), "s")
+            .parse()
+            .expect("a style index");
+        assert!(
+            index < xfs.len(),
+            "the cell points past the styles part: {sheet} vs {styles}"
+        );
+
+        // A styles part that is there but degenerate — every block empty — must be
+        // grown, not refused.
+        let degenerate = write_fixture(
+            &ws,
+            "degenerate.xlsx",
+            &with_parts(
+                &base,
+                &[(
+                    "xl/styles.xml",
+                    br#"<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="0"/><fills count="0"/><borders count="0"/><cellXfs count="0"/></styleSheet>"#
+                        .as_slice(),
+                )],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "grown",
+                "path": degenerate.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let styles = part_text(&output, "xl/styles.xml");
+        // The grown blocks hold their schema-default entry 0 first — the font
+        // block's is the Calibri 11 default rather than a bare <font/>: entry 0
+        // stays the neutral default every cell that names no style resolves to, so
+        // the new bold entry lands at index 1 rather than restyling those cells.
+        // That entry bases on the same font the block states first, so a part whose
+        // own font 0 is missing does not leave the cell with a size-less face.
+        assert!(
+            styles.contains(
+                r#"<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>"#
+            ),
+            "the fonts block was not created: {styles}"
+        );
+        // Every id the entry names resolves: fill 0 and border 0 come with the
+        // block's first entry, grown here because the part stated them empty.
+        assert!(
+            styles.contains(
+                r#"<fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders>"#
+            ),
+            "the blocks the entry's fill and border ids name were not grown: {styles}"
+        );
+        assert!(
+            styles.contains(
+                r#"<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>"#
+            ),
+            "the cellXfs block was not created: {styles}"
+        );
+        assert_eq!(
+            attribute_of(
+                cell_element(&part_text(&output, "xl/worksheets/sheet1.xml"), "A1"),
+                "s"
+            ),
+            "1",
+            "the cell does not point at the created entry"
+        );
+        // The grown part is one a reader can open: every block its entries' ids
+        // resolve into is stated, each with its entry 0, in the schema's order.
+        assert_styles_part_is_openable(&styles);
+    }
+
+    /// A styles part that is there but whose root is not the ordinary shape — a
+    /// self-closing one holding no block, or an empty one whose close tag XML
+    /// spells `</styleSheet >` — has to take the blocks an edit writes INSIDE it:
+    /// a `<numFmts>` written after the root's close would leave two top-level
+    /// elements in the part, a workbook Excel offers to repair. Both the number
+    /// formats a `format_cells` and a `set_cell` write grow the same part.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_grows_a_styles_part_whose_root_is_not_the_ordinary_one() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let base = created_xlsx(&ws).await;
+        let roots = [
+            r#"<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#,
+            r#"<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"></styleSheet >"#,
+        ];
+        let edits = [
+            json!({ "op": "format_cells", "sheet": "S", "range": "A1", "number_format": "0.00" }),
+            json!({ "op": "set_cell", "sheet": "S", "cell": "A1", "value": 1,
+                    "number_format": "0.00" }),
+        ];
+        for (root_index, root) in roots.iter().enumerate() {
+            for (edit_index, edit) in edits.iter().enumerate() {
+                let name = format!("rooted-{root_index}-{edit_index}");
+                let source = write_fixture(
+                    &ws,
+                    &format!("{name}.xlsx"),
+                    &with_parts(&base, &[("xl/styles.xml", root.as_bytes())]),
+                );
+                let reply = run(
+                    &ws,
+                    json!({
+                        "action": "xlsx_edit", "file_name": name,
+                        "path": source.to_string_lossy(),
+                        "edits": [edit.clone()],
+                    }),
+                )
+                .await;
+                let output = single(&reply);
+                let styles = part_text(&output, "xl/styles.xml");
+                let at = format!("root {root_index}, edit {edit_index}");
+                assert_eq!(
+                    styles.matches("<styleSheet").count(),
+                    1,
+                    "{at}: the part holds more than one <styleSheet>: {styles}"
+                );
+                assert_eq!(
+                    styles.matches("</styleSheet").count(),
+                    1,
+                    "{at}: the part states a second close tag beside the root's: {styles}"
+                );
+                let num_fmts_at = styles
+                    .find("<numFmts")
+                    .unwrap_or_else(|| panic!("{at}: no <numFmts>: {styles}"));
+                let cell_xfs_at = styles
+                    .find("<cellXfs")
+                    .unwrap_or_else(|| panic!("{at}: no <cellXfs>: {styles}"));
+                assert!(
+                    num_fmts_at < cell_xfs_at,
+                    "{at}: <numFmts> was written after <cellXfs>: {styles}"
+                );
+                assert!(
+                    styles.contains(r#"<numFmt numFmtId="164" formatCode="0.00"/>"#),
+                    "{at}: the number format was not written: {styles}"
+                );
+                assert_styles_part_is_openable(&styles);
+                let xfs = element_children(&styles, "cellXfs", "xf");
+                let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+                let index: usize = attribute_of(cell_element(&sheet, "A1"), "s")
+                    .parse()
+                    .expect("a style index");
+                assert_eq!(
+                    attribute_of(
+                        xfs.get(index)
+                            .expect("the cell points past the styles part"),
+                        "numFmtId"
+                    ),
+                    "164",
+                    "{at}: the cell does not point at the written format: {styles}"
+                );
+            }
+        }
+    }
+
+    /// The formatting an edit writes goes to the part the workbook's own
+    /// relationships NAME, not the conventional `xl/styles.xml`: a workbook saved
+    /// with its styles elsewhere has its cells' `s=` resolve in the part a reader
+    /// reads, so the edit must write there — and an edit that writes no style must
+    /// not invent the conventional part beside it.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_writes_the_styles_part_the_workbook_names() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let base = created_xlsx(&ws).await;
+        let styles = part_text_bytes(&base, "xl/styles.xml");
+        let rels = part_text_bytes(&base, "xl/_rels/workbook.xml.rels")
+            .replace("Target=\"styles.xml\"", "Target=\"styles2.xml\"");
+        let types = part_text_bytes(&base, "[Content_Types].xml").replace(
+            "PartName=\"/xl/styles.xml\"",
+            "PartName=\"/xl/styles2.xml\"",
+        );
+        let source = write_fixture(
+            &ws,
+            "named-elsewhere.xlsx",
+            &repacked(
+                &base,
+                &["xl/styles.xml"],
+                &[
+                    ("xl/styles2.xml", styles.as_bytes()),
+                    ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+                    ("[Content_Types].xml", types.as_bytes()),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "named-bold",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let names = zip_names(&output);
+        assert!(
+            names.iter().any(|name| name == "xl/styles2.xml"),
+            "the formatting did not go to the part the relationships name: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "xl/styles.xml"),
+            "the edit invented the conventional styles part: {names:?}"
+        );
+        let styles2 = part_text(&output, "xl/styles2.xml");
+        assert!(
+            styles2.contains("<b/>"),
+            "the bold was not written: {styles2}"
+        );
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+        let index: usize = attribute_of(cell_element(&sheet, "A1"), "s")
+            .parse()
+            .expect("a style index");
+        let xfs = element_children(&styles2, "cellXfs", "xf");
+        assert!(
+            index < xfs.len(),
+            "the cell points past the entries the named part holds: {styles2}"
+        );
+        let rels_out = part_text(&output, "xl/_rels/workbook.xml.rels");
+        assert!(
+            rels_out.contains("Target=\"styles2.xml\""),
+            "the relationships no longer name the part the styles live in: {rels_out}"
+        );
+
+        // An edit that writes no style leaves the conventional part uncreated too.
+        let cleared = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "file_name": "named-clear",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "clear_cell", "sheet": "S", "cell": "A1" }],
+                }),
+            )
+            .await,
+        );
+        let cleared_names = zip_names(&cleared);
+        assert!(
+            !cleared_names.iter().any(|name| name == "xl/styles.xml"),
+            "an edit that writes no style created the conventional styles part: {cleared_names:?}"
+        );
+    }
+
+    /// An element a part opens and never closes is refused rather than written
+    /// beside: a second `<sheetData>`, `<cols>`, `<dimension>` or styles block is
+    /// a part a reader offers to repair, which no edit may report as a success.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_refuses_an_element_a_part_leaves_open() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let base = created_xlsx(&ws).await;
+        let sheet = part_text_bytes(&base, "xl/worksheets/sheet1.xml");
+        let styles = part_text_bytes(&base, "xl/styles.xml");
+        let cases = [
+            (
+                "sheetData-open.xlsx",
+                "xl/worksheets/sheet1.xml",
+                with_first(&sheet, "</sheetData>", ""),
+                json!({ "op": "set_cell", "sheet": "S", "cell": "A2", "value": 2 }),
+                "<sheetData>",
+            ),
+            (
+                "cols-open.xlsx",
+                "xl/worksheets/sheet1.xml",
+                with_first(
+                    &sheet,
+                    "<sheetData>",
+                    r#"<cols><col min="1" max="1" width="9"/><sheetData>"#,
+                ),
+                json!({ "op": "format_cells", "sheet": "S", "column": "B", "width": 12 }),
+                "<cols>",
+            ),
+            (
+                "dimension-open.xlsx",
+                "xl/worksheets/sheet1.xml",
+                with_first(
+                    &sheet,
+                    "<sheetData>",
+                    r#"<dimension ref="A1:Z9"><sheetData>"#,
+                ),
+                json!({ "op": "set_cell", "sheet": "S", "cell": "B2", "value": 3 }),
+                "<dimension>",
+            ),
+            (
+                "styles-open.xlsx",
+                "xl/styles.xml",
+                with_first(&styles, "</fonts>", ""),
+                json!({ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }),
+                "<fonts>",
+            ),
+        ];
+        let before = generated_count(&ws);
+        for (name, part, body, edit, element) in cases {
+            let source = write_fixture(&ws, name, &with_parts(&base, &[(part, body.as_bytes())]));
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "xlsx_edit", "file_name": name,
+                        "path": source.to_string_lossy(),
+                        "edits": [edit],
+                    }),
+                )
+                .await
+                .expect_err("an element left open must be refused");
+            let message = err.to_string();
+            assert!(
+                message.contains("opened and never closed") && message.contains(element),
+                "the refusal for {name} does not name the element left open: {message}"
+            );
+        }
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A worksheet states its rows in ONE `<sheetData>` (`CT_Worksheet` says so),
+    /// so a part that states a second one, or a `<row>` outside the one it states,
+    /// is refused by the edits that write into the body — a row created in it, the
+    /// body rebuilt — since a rebuilt body would otherwise duplicate the rows the
+    /// walk found outside the region it writes. An edit that only rewrites the cells
+    /// it found, or places a block beside the body (a column width's `<cols>`),
+    /// still goes through: the part comes out as healthy as it arrived.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_refuses_a_sheet_whose_rows_are_not_in_one_body() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let base = created_xlsx(&ws).await;
+        let row = r#"<row r="1"><c r="A1"><v>1</v></c></row>"#;
+        let shapes = [
+            (
+                "two-bodies.xlsx",
+                format!(
+                    r#"<sheetData>{row}</sheetData><sheetData><row r="2"><c r="A2"><v>2</v></c></row></sheetData>"#
+                ),
+                2,
+            ),
+            (
+                "stray-row.xlsx",
+                format!(r#"<sheetData>{row}</sheetData><row r="2"><c r="A2"><v>2</v></c></row>"#),
+                1,
+            ),
+        ];
+        let before = generated_count(&ws);
+        for (name, body, bodies) in &shapes {
+            let sheet = format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">{body}</worksheet>"#
+            );
+            let source = write_fixture(
+                &ws,
+                name,
+                &with_parts(&base, &[("xl/worksheets/sheet1.xml", sheet.as_bytes())]),
+            );
+            for edit in [
+                json!({ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }),
+                json!({ "op": "set_cell", "sheet": "S", "cell": "A3", "value": 3 }),
+            ] {
+                let err = DocumentTool
+                    .execute(
+                        &ws,
+                        json!({
+                            "action": "xlsx_edit", "file_name": name,
+                            "path": source.to_string_lossy(),
+                            "edits": [edit],
+                        }),
+                    )
+                    .await
+                    .expect_err("a part whose rows are not in one body must be refused");
+                let message = err.to_string();
+                assert!(
+                    message.contains("<sheetData>"),
+                    "{name} was not refused for the shape of its body: {message}"
+                );
+            }
+            // The cell an edit finds is rewritten where it stands: the two bodies the
+            // part states are the file's own, and what the edit wrote is one value.
+            let reply = run(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "file_name": "rewritten",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "set_cell", "sheet": "S", "cell": "A1", "value": 8 }],
+                }),
+            )
+            .await;
+            let written = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+            assert!(
+                written.matches("<sheetData").count() == *bodies
+                    && written.matches(r#"<row r="2">"#).count() == 1,
+                "{name} gained, lost or duplicated a body: {written}"
+            );
+            assert!(
+                written.contains(r#"<c r="A1"><v>8</v></c>"#),
+                "{name} did not take the value: {written}"
+            );
+            // A column width never writes into the body — its `<cols>` goes beside it —
+            // so a part whose rows are not in one body is no reason to refuse it. The
+            // part still holds exactly the bodies it arrived with, and the block stands
+            // before the first of them.
+            let reply = run(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "file_name": "width",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "format_cells", "sheet": "S", "column": "B", "width": 12 }],
+                }),
+            )
+            .await;
+            let written = part_text(&single(&reply), "xl/worksheets/sheet1.xml");
+            assert!(
+                written.matches("<sheetData").count() == *bodies
+                    && written.contains(r#"<col min="2" max="2" width="12" customWidth="1"/>"#)
+                    && written.find("<cols>") < written.find("<sheetData"),
+                "{name} did not take the width beside its body: {written}"
+            );
+        }
+        assert_eq!(
+            generated_count(&ws),
+            before + shapes.len() * 2,
+            "a refused call left an output"
+        );
+    }
+
+    /// A `<font>` that names a THEME face (`<scheme val="minor"/>` beside its
+    /// `<name>`, as Excel states it) has to leave the scheme when an edit names a
+    /// `font` face: the theme's face would render instead of the requested one and
+    /// be rewritten by a theme change. An edit that names no face — a `size` —
+    /// keeps the scheme.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_takes_a_named_face_out_of_the_theme_scheme() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><color theme="1"/><name val="Calibri"/><family val="2"/><scheme val="minor"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>"#;
+        let source = write_fixture(
+            &ws,
+            "themed-font.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/styles.xml", styles.as_bytes())],
+            ),
+        );
+        // The `<font>` the cell's own `s=` resolves to: its entry's `fontId` into
+        // the `<fonts>` block.
+        let font_of_cell = |styles: &str, sheet: &str| -> String {
+            let index: usize = attribute_of(cell_element(sheet, "A1"), "s")
+                .parse()
+                .expect("a style index");
+            let xfs = element_children(styles, "cellXfs", "xf");
+            let xf = xfs
+                .get(index)
+                .expect("the cell points past the styles part");
+            let font_id: usize = attribute_of(xf, "fontId").parse().expect("a font index");
+            element_children(styles, "fonts", "font")
+                .get(font_id)
+                .expect("the entry points past the fonts block")
+                .to_string()
+        };
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "georgia",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1", "font": "Georgia" }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let written = part_text(&output, "xl/styles.xml");
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+        let font = font_of_cell(&written, &sheet);
+        assert!(
+            font.contains(r#"<name val="Georgia"/>"#),
+            "the requested face was not written: {font}"
+        );
+        assert!(
+            font.contains(r#"<family val="2"/>"#),
+            "a child the request did not name was dropped: {font}"
+        );
+        assert!(
+            !font.contains("<scheme"),
+            "the requested face stayed in the theme's scheme, so the theme would render: {font}"
+        );
+
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "sized",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1", "size": 14 }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let written = part_text(&output, "xl/styles.xml");
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+        let font = font_of_cell(&written, &sheet);
+        assert!(
+            font.contains(r#"<scheme val="minor"/>"#),
+            "a size names no face, so the theme's scheme stays: {font}"
+        );
+    }
+
+    /// A styles part whose root never closes has nothing for an edit to write
+    /// into: the kit refuses it whichever property the edit names — a style or
+    /// no style at all — and no output file is left behind.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_refuses_a_styles_part_with_no_closed_root() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let unclosed = r#"<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>"#;
+        let source = write_fixture(
+            &ws,
+            "unclosed-styles.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/styles.xml", unclosed.as_bytes())],
+            ),
+        );
+        let edits = [
+            json!({ "op": "format_cells", "sheet": "S", "range": "A1", "align": "center" }),
+            json!({ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }),
+            json!({ "op": "format_cells", "sheet": "S", "column": "A", "width": 12 }),
+            json!({ "op": "set_cell", "sheet": "S", "cell": "A1", "value": 1,
+                    "number_format": "0.00" }),
+            json!({ "op": "set_cell", "sheet": "S", "cell": "A1", "value": 1 }),
+        ];
+        let before = generated_count(&ws);
+        for (index, edit) in edits.into_iter().enumerate() {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "xlsx_edit", "file_name": "refused",
+                        "path": source.to_string_lossy(),
+                        "edits": [edit],
+                    }),
+                )
+                .await
+                .expect_err("a styles part with no closed root must be refused");
+            let message = err.to_string();
+            assert!(
+                message.contains("its <styleSheet> root is missing or never closed"),
+                "edit {index} was not refused for the part's shape: {message}"
+            );
+        }
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// The named cell styles a workbook states, which an edit that grows the
+    /// styles part must leave byte for byte.
+    const CELL_STYLES: &str = r#"<cellStyles count="3"><cellStyle name="Normal" xfId="0" builtinId="0"/><cellStyle name="Comma" xfId="1"/><cellStyle name="My Header" xfId="2"/></cellStyles>"#;
+
+    /// A workbook that states named cell styles — the `Normal` default beside
+    /// `Comma` and `My Header` — keeps every one of them through an edit that
+    /// names only a `fill` and through one that names only a `number_format`: the
+    /// `cellStyles` block is not the edit's to replace, and the cell's `s=` still
+    /// resolves inside `<cellXfs>`.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_keeps_the_named_cell_styles_a_workbook_states() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let styles = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>{CELL_STYLES}</styleSheet>"#
+        );
+        let source = write_fixture(
+            &ws,
+            "named-styles.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/styles.xml", styles.as_bytes())],
+            ),
+        );
+        let edits = [
+            json!({ "op": "format_cells", "sheet": "S", "range": "A1", "fill": "FFEEDD" }),
+            json!({ "op": "set_cell", "sheet": "S", "cell": "A1", "value": 1,
+                    "number_format": "0.00" }),
+        ];
+        for (index, edit) in edits.into_iter().enumerate() {
+            let reply = run(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "file_name": format!("styled-{index}"),
+                    "path": source.to_string_lossy(),
+                    "edits": [edit],
+                }),
+            )
+            .await;
+            let output = single(&reply);
+            let written = part_text(&output, "xl/styles.xml");
+            assert!(
+                written.contains(CELL_STYLES),
+                "edit {index} replaced the workbook's named cell styles: {written}"
+            );
+            let names: Vec<&str> = element_children(&written, "cellStyles", "cellStyle")
+                .iter()
+                .map(|entry| attribute_of(entry, "name"))
+                .collect();
+            assert_eq!(
+                names,
+                ["Normal", "Comma", "My Header"],
+                "edit {index} changed the named cell styles: {written}"
+            );
+            assert_styles_part_is_openable(&written);
+            let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+            let style_index: usize = attribute_of(cell_element(&sheet, "A1"), "s")
+                .parse()
+                .expect("a style index");
+            let xfs = element_children(&written, "cellXfs", "xf");
+            assert!(
+                style_index < xfs.len(),
+                "the cell points past the styles part: {sheet} vs {written}"
+            );
+        }
+    }
+
+    /// A workbook that holds its styles part but whose relationships name an
+    /// unrelated type instead of the styles one: an edit writes the relationship
+    /// list so the workbook names the part it holds, while the unrelated
+    /// relationship the file already had keeps its own bytes. The naming happens
+    /// before any edit runs, so an edit that writes no style at all names it too —
+    /// a styles part nothing points at is one no reader reads.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_names_a_styles_part_the_workbook_holds_but_does_not_name() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let base = created_xlsx(&ws).await;
+        let rels = part_text_bytes(&base, "xl/_rels/workbook.xml.rels").replace(
+            r#"Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles""#,
+            r#"Type="urn:unrelated""#,
+        );
+        let source = write_fixture(
+            &ws,
+            "unrelated-styles.xlsx",
+            &with_parts(&base, &[("xl/_rels/workbook.xml.rels", rels.as_bytes())]),
+        );
+        let edits = [
+            json!({ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }),
+            json!({ "op": "clear_cell", "sheet": "S", "cell": "A1" }),
+        ];
+        for (index, edit) in edits.into_iter().enumerate() {
+            let reply = run(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "file_name": "named",
+                    "path": source.to_string_lossy(),
+                    "edits": [edit],
+                }),
+            )
+            .await;
+            let written = part_text(&single(&reply), "xl/_rels/workbook.xml.rels");
+            assert!(
+                written.contains(
+                    r#"<Relationship Id="rId2" Type="urn:unrelated" Target="styles.xml"/>"#
+                ),
+                "edit {index} rewrote the unrelated relationship: {written}"
+            );
+            // A target relative to `xl/workbook.xml` resolves to `xl/styles.xml`.
+            assert!(
+                written.contains(
+                    r#"Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml""#
+                ),
+                "edit {index} left the styles part the workbook holds unnamed: {written}"
+            );
+        }
+    }
+
+    /// A workbook with no `xl/_rels/workbook.xml.rels` at all: the kit works with
+    /// the part names a reader falls back to, so an edit that writes no style goes
+    /// through — while one that writes styles is refused, since a styles part the
+    /// workbook's relationships cannot name would be a part no reader reads, and
+    /// writing the relationship list alone would leave the workbook's own
+    /// `<sheet r:id="rId1"/>` unresolvable.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_refuses_styles_a_workbook_with_no_relationships_part_cannot_name() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(
+            &ws,
+            "no-rels.xlsx",
+            &without_part(&created_xlsx(&ws).await, "xl/_rels/workbook.xml.rels"),
+        );
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "file_name": "refused",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }],
+                }),
+            )
+            .await
+            .expect_err("a workbook whose relationships cannot name a styles part must be refused");
+        assert!(
+            err.to_string().contains("cannot name a styles part"),
+            "the refusal does not name the shape it rejects: {err}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+        // An edit that writes no style has nothing to name and goes through.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "cleared",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "clear_cell", "sheet": "S", "cell": "A1" }],
+            }),
+        )
+        .await;
+        assert!(
+            !zip_names(&single(&reply)).contains(&"xl/_rels/workbook.xml.rels".to_string()),
+            "a style-less edit invented a relationships part"
+        );
+    }
+
+    /// A row whose own cells are stated out of address order — which a writer this
+    /// kit did not produce may do — is written back with its cells in address
+    /// order, each stated once: a format over the rect adds only the cells the row
+    /// really lacks and puts every cell where a reader expects it (a duplicate or
+    /// misplaced address is a workbook Excel offers to repair), and every cell of
+    /// the rect takes a style index the written part holds.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_writes_a_row_that_states_its_cells_out_of_address_order() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:D2"/><sheetData><row r="1"><c r="D1"><v>4</v></c><c r="A1" t="inlineStr"><is><t>имя</t></is></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "unordered-row.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "ordered",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1:D1",
+                            "bold": true }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let formatted = part_text(&output, "xl/worksheets/sheet1.xml");
+        for address in ["A1", "B1", "C1", "D1"] {
+            assert_eq!(
+                formatted.matches(&format!(r#"r="{address}""#)).count(),
+                1,
+                "{address} is stated more than once in the row: {formatted}"
+            );
+        }
+        // The cells come back in address order: `D1` was stated first, and a reader
+        // reaching each position finds the cell its address names.
+        let stated: Vec<usize> = ["A1", "B1", "C1", "D1"]
+            .iter()
+            .map(|address| {
+                formatted
+                    .find(&format!(r#"r="{address}""#))
+                    .expect("a stated cell")
+            })
+            .collect();
+        assert!(
+            stated.windows(2).all(|pair| pair[0] < pair[1]),
+            "the cells were not written in address order: {formatted}"
+        );
+        let styles = part_text(&output, "xl/styles.xml");
+        let xfs = element_children(&styles, "cellXfs", "xf");
+        for address in ["A1", "B1", "C1", "D1"] {
+            let index: usize = attribute_of(cell_element(&formatted, address), "s")
+                .parse()
+                .expect("a style index");
+            assert!(
+                index < xfs.len(),
+                "{address} points past the styles part: {formatted} vs {styles}"
+            );
+        }
+    }
+
+    /// A row that states a label cell, then a gap, then the cells a range names — so
+    /// the range's own left edge lies past the first cell the row holds — leaves every
+    /// column it does not name alone: no cell is created for one of them and the cells
+    /// outside the range keep their exact bytes.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_leaves_the_columns_before_the_range_alone() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:D1"/><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>label</t></is></c><c r="C1"><v>3</v></c><c r="D1"><v>4</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "offset-range.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "offset",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "C1:D1",
+                            "fill": "FFF2CC" }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let formatted = part_text(&output, "xl/worksheets/sheet1.xml");
+        assert!(
+            !formatted.contains(r#"<c r="B1""#),
+            "a cell was created for a column the range does not name: {formatted}"
+        );
+        assert!(
+            formatted.contains(r#"<c r="A1" t="inlineStr"><is><t>label</t></is></c>"#),
+            "a cell outside the range changed: {formatted}"
+        );
+        let styles = part_text(&output, "xl/styles.xml");
+        let xfs = element_children(&styles, "cellXfs", "xf");
+        for address in ["C1", "D1"] {
+            let index: usize = attribute_of(cell_element(&formatted, address), "s")
+                .parse()
+                .expect("a style index");
+            assert!(
+                index < xfs.len(),
+                "{address} points past the styles part: {formatted} vs {styles}"
+            );
+        }
+    }
+
+    /// A sheet part that opens a `<row>` or a `<c>` and never closes it is a shape the
+    /// readers cannot see — `elementPattern` matches the closed shapes alone — so a
+    /// writer would place its content beside or inside the element it read as absent:
+    /// a second `<row>` for the same number, a `<c>` nested in the one it missed. No
+    /// writer produces such a part, so it is refused (never answered with a success
+    /// over a file the edit made worse), and no output is written.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_refuses_a_row_or_cell_a_sheet_leaves_open() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let base = created_xlsx(&ws).await;
+        let open_row = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></sheetData>"#;
+        let open_cell = r#"<sheetData><row r="1"><c r="A1"><v>1</v></row></sheetData>"#;
+        let cases = [
+            (
+                "row-open.xlsx",
+                open_row,
+                json!({ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }),
+                "<row>",
+            ),
+            (
+                "row-open-set.xlsx",
+                open_row,
+                json!({ "op": "set_cell", "sheet": "S", "cell": "A2", "value": 2 }),
+                "<row>",
+            ),
+            (
+                "cell-open.xlsx",
+                open_cell,
+                json!({ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }),
+                "<c>",
+            ),
+            (
+                "cell-open-set.xlsx",
+                open_cell,
+                json!({ "op": "set_cell", "sheet": "S", "cell": "B1", "value": 2 }),
+                "<c>",
+            ),
+        ];
+        let before = generated_count(&ws);
+        for (name, body, edit, element) in cases {
+            let sheet = format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">{body}</worksheet>"#
+            );
+            let source = write_fixture(
+                &ws,
+                name,
+                &with_parts(&base, &[("xl/worksheets/sheet1.xml", sheet.as_bytes())]),
+            );
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "xlsx_edit", "file_name": name,
+                        "path": source.to_string_lossy(),
+                        "edits": [edit],
+                    }),
+                )
+                .await
+                .expect_err("an element left open must be refused");
+            let message = err.to_string();
+            assert!(
+                message.contains("opened and never closed") && message.contains(element),
+                "the refusal for {name} does not name the element left open: {message}"
+            );
+        }
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A body whose rows are not in address order is written back in address order, but
+    /// a row that states no number of its own stands for the position it sits in:
+    /// reordering such a body would move the value the row holds, so the edit is
+    /// refused rather than answered with a silent relocation.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_refuses_to_reorder_a_row_that_states_no_number() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="3"><c r="A3"><v>3</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row><c><v>99</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "implicit-row.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "file_name": "implicit",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "format_cells", "sheet": "S", "range": "A2:A3",
+                                "bold": true }],
+                }),
+            )
+            .await
+            .expect_err("a row stating no number must not be reordered");
+        let message = err.to_string();
+        assert!(
+            message.contains("address order"),
+            "the refusal does not name the shape it rejects: {message}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A sheet whose `<row>` elements are not in ascending order — `<row r="5">`
+    /// stated before `<row r="2">`, each holding a value — is formatted over
+    /// `A2:A5`: the rect's missing rows are created in address order, each of its
+    /// row numbers is stated exactly once, no duplicate row is left for a reader to
+    /// repair, and the values stay with the rows that held them.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_keeps_a_row_number_stated_once_when_rows_are_out_of_order() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A2:A5"/><sheetData><row r="5"><c r="A5"><v>5</v></c></row><row r="2"><c r="A2"><v>2</v></c></row></sheetData></worksheet>"#;
+        let source = write_fixture(
+            &ws,
+            "unordered-rows.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "ordered",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A2:A5",
+                            "bold": true }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let formatted = part_text(&output, "xl/worksheets/sheet1.xml");
+        for number in ["2", "3", "4", "5"] {
+            assert_eq!(
+                formatted.matches(&format!(r#"<row r="{number}""#)).count(),
+                1,
+                "row {number} is stated more than once: {formatted}"
+            );
+        }
+        // The rows go back in address order, and each keeps the value it held.
+        let stated: Vec<usize> = ["2", "3", "4", "5"]
+            .iter()
+            .map(|number| {
+                formatted
+                    .find(&format!(r#"<row r="{number}""#))
+                    .expect("a stated row")
+            })
+            .collect();
+        assert!(
+            stated.windows(2).all(|pair| pair[0] < pair[1]),
+            "the rows were not written in address order: {formatted}"
+        );
+        assert!(
+            formatted.contains(r#"<c r="A5" s="1"><v>5</v></c>"#)
+                && formatted.contains(r#"<c r="A2" s="1"><v>2</v></c>"#),
+            "a value left its row: {formatted}"
+        );
+    }
+
+    /// A format writes no value and moves no address, so only the sheet it names
+    /// and the styles part it grows change: every other part — a chart, a table, a
+    /// comment, a macro — keeps its exact bytes, nothing is added, and no stale
+    /// chart or pivot caveat is owed.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_names_no_part_it_did_not_touch() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        // Two sheets, so the loop below proves the sheet the edit did not name is
+        // carried through byte for byte beside the chart, the table, the comment
+        // and the macro.
+        let base = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "book",
+                    "sheets": [
+                        { "name": "S", "rows": [["seed"]] },
+                        { "name": "Other", "rows": [["kept", 1]] },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let package = with_parts(
+            &std::fs::read(&base).expect("read base package"),
+            &[
+                ("xl/charts/chart1.xml", EDIT_CHART.as_bytes()),
+                ("xl/tables/table1.xml", EDIT_TABLE.as_bytes()),
+                ("xl/comments1.xml", EDIT_COMMENTS.as_bytes()),
+                ("xl/vbaProject.bin", b"macro-bytes"),
+            ],
+        );
+        let source = write_fixture(&ws, "annotated.xlsx", &package);
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "formatted",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let touched = ["xl/worksheets/sheet1.xml", "xl/styles.xml"];
+        let names = zip_names(&source);
+        assert!(
+            names.iter().any(|name| name == "xl/worksheets/sheet2.xml"),
+            "the fixture holds two sheets: {names:?}"
+        );
+        for name in &names {
+            assert!(
+                zip_names(&output).contains(name),
+                "{name} vanished from the formatted workbook"
+            );
+            if touched.contains(&name.as_str()) {
+                continue;
+            }
+            assert_eq!(
+                part_bytes(&source, name),
+                part_bytes(&output, name),
+                "{name} changed"
+            );
+        }
+        assert_eq!(
+            names.len(),
+            zip_names(&output).len(),
+            "a part was added to the formatted workbook"
+        );
+        assert!(
+            !reply.contains("copied unchanged"),
+            "a format raised a stale-object caveat: {reply}"
+        );
+    }
+
+    /// The text of a presentation's own `<p:sldIdLst>`, read up to the list's close
+    /// tag however that close is spelled: what an entry appended at the list's end
+    /// must land inside.
+    fn slide_list(presentation: &str) -> &str {
+        let open = presentation.find("<p:sldIdLst").expect("a slide list");
+        let rest = &presentation[open..];
+        let body = rest.find('>').expect("the list's open tag") + 1;
+        let close = rest[body..].find("</p:sldIdLst").expect("the list's close") + body;
+        &rest[body..close]
+    }
+
+    /// A deck whose slide list, relationships and content types all close with the
+    /// whitespace XML allows before the `>` is edited like any other: the added
+    /// slide's entry goes inside the list, its part is named by a relationship and
+    /// declared in the content types, and a move lands inside the list too.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_registers_a_slide_in_a_list_spelled_with_whitespace() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "Один" },
+                        { "type": "heading", "level": 1, "text": "Два" },
+                        { "type": "heading", "level": 1, "text": "Три" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let package = std::fs::read(&created).expect("read base package");
+        let presentation = with_first(
+            &part_text_bytes(&package, "ppt/presentation.xml"),
+            "</p:sldIdLst>",
+            "</p:sldIdLst >",
+        );
+        let relationships = with_first(
+            &part_text_bytes(&package, "ppt/_rels/presentation.xml.rels"),
+            "</Relationships>",
+            "</Relationships >",
+        );
+        let types = with_first(
+            &part_text_bytes(&package, "[Content_Types].xml"),
+            "</Types>",
+            "</Types >",
+        );
+        let source = write_fixture(
+            &ws,
+            "deck.pptx",
+            &with_parts(
+                &package,
+                &[
+                    ("ppt/presentation.xml", presentation.as_bytes()),
+                    ("ppt/_rels/presentation.xml.rels", relationships.as_bytes()),
+                    ("[Content_Types].xml", types.as_bytes()),
+                ],
+            ),
+        );
+
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "appended",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "add_slide", "title": "APPENDED" }],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let presentation = part_text(&output, "ppt/presentation.xml");
+        assert_eq!(
+            slide_list(&presentation).matches("<p:sldId ").count(),
+            4,
+            "the added slide is not registered inside the list: {presentation}"
+        );
+        let relationships = part_text(&output, "ppt/_rels/presentation.xml.rels");
+        assert!(
+            relationships.contains("slides/slide4.xml")
+                && relationships.contains("</Relationships >"),
+            "the added slide's part is not named by a relationship: {relationships}"
+        );
+        let types = part_text(&output, "[Content_Types].xml");
+        assert!(
+            types.contains(r#"PartName="/ppt/slides/slide4.xml""#) && types.contains("</Types >"),
+            "the added slide's part is not declared in the content types: {types}"
+        );
+
+        let moved = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "file_name": "moved",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "move_slide", "slide": 1, "to": 3 }],
+                }),
+            )
+            .await,
+        );
+        let presentation = part_text(&moved, "ppt/presentation.xml");
+        assert_eq!(
+            slide_list(&presentation).matches("<p:sldId ").count(),
+            3,
+            "the moved slide's entry left the list: {presentation}"
+        );
+    }
+
+    /// The whitespace before a close tag's `>` reaches the other parts a slide edit
+    /// writes into: a paragraph added to notes whose body closes `</p:txBody >`
+    /// lands inside the body, and a picture lands inside a shape tree closing
+    /// `</p:spTree >`.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_writes_beside_a_close_tag_that_carries_whitespace() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "Слайд" },
+                        { "type": "paragraph", "text": "Тело" },
+                        { "type": "notes", "text": "Заметка" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let package = std::fs::read(&created).expect("read base package");
+        let notes = zip_names(&created)
+            .into_iter()
+            .find(|name| name.starts_with("ppt/notesSlides/notesSlide"))
+            .expect("the deck's notes part");
+        let body = with_first(
+            &part_text_bytes(&package, &notes),
+            "</p:txBody>",
+            "</p:txBody >",
+        );
+        let spaced = write_fixture(
+            &ws,
+            "noted.pptx",
+            &with_parts(&package, &[(&notes, body.as_bytes())]),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "noted",
+                "path": spaced.to_string_lossy(),
+                "edits": [{ "op": "add_notes", "slide": 1, "text": "ДОБАВЛЕНО" }],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), &notes);
+        assert!(
+            edited.contains("</a:p></p:txBody >"),
+            "the added notes paragraph did not land inside the notes body: {edited}"
+        );
+        assert!(
+            edited.contains("ДОБАВЛЕНО"),
+            "the notes text was not written: {edited}"
+        );
+
+        let slide = "ppt/slides/slide1.xml";
+        let tree = with_first(
+            &part_text_bytes(&package, slide),
+            "</p:spTree>",
+            "</p:spTree >",
+        );
+        let spaced = write_fixture(
+            &ws,
+            "pictured.pptx",
+            &with_parts(&package, &[(slide, tree.as_bytes())]),
+        );
+        let picture = write_fixture(&ws, "pic.png", &noisy_png(40, 20));
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "pictured",
+                "path": spaced.to_string_lossy(),
+                "edits": [{ "op": "add_image", "slide": 1, "path": picture.to_string_lossy(),
+                            "x": 0.1, "y": 0.1, "width": 0.4 }],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), slide);
+        let placed = edited.find("<p:pic>").expect("the placed picture");
+        let close = edited
+            .find("</p:spTree >")
+            .expect("the shape tree's close tag");
+        assert!(
+            placed < close,
+            "the picture fell outside the shape tree: {edited}"
+        );
+    }
+
+    /// A run property and the run-properties element around it, each closed with
+    /// the whitespace XML allows before the `>` (`<a:rPr …>…</a:rPr >`), are read as
+    /// the elements they are: a request naming the run's colour rebuilds the run's
+    /// properties from the run's own body — the outline's fill stays, the run's own
+    /// fill is written — rather than reading the outline's child as the run's and
+    /// taking it away.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_keeps_a_run_property_whose_close_tag_carries_whitespace() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [{ "type": "heading", "level": 1, "text": "Обводка" }],
+                }),
+            )
+            .await,
+        );
+        let package = std::fs::read(&created).expect("read base package");
+        // The addressed run's own properties close with the whitespace and gain an
+        // outline whose fill must survive the request.
+        let outline = r#"<a:ln><a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></a:ln >"#;
+        let slide = with_first(
+            &part_text_bytes(&package, "ppt/slides/slide1.xml"),
+            "</a:rPr>",
+            "</a:rPr >",
+        );
+        let text = slide.find("Обводка").expect("the heading's text");
+        let properties = slide[..text].rfind("<a:rPr").expect("the run's properties");
+        let open = slide[properties..].find('>').expect("its open tag") + properties + 1;
+        let patched = format!("{}{outline}{}", &slide[..open], &slide[open..]);
+        let source = write_fixture(
+            &ws,
+            "outlined.pptx",
+            &with_parts(&package, &[("ppt/slides/slide1.xml", patched.as_bytes())]),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_text", "slide": 1, "find": "Обводка",
+                            "color": "#3366CC" }],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "ppt/slides/slide1.xml");
+        assert!(
+            edited.contains(outline),
+            "the run's outline fill was taken away: {edited}"
+        );
+        // The element the request rewrote holds the outline and the run's own fill,
+        // in that order, and nothing the outline's close tag left behind.
+        assert!(
+            edited.contains(&format!(
+                r#"{outline}<a:solidFill><a:srgbClr val="3366CC"/></a:solidFill></a:rPr>"#
+            )),
+            "the properties were rebuilt from something other than the run's own body: {edited}"
         );
     }
 
@@ -9840,6 +13416,11 @@ mod tests {
         );
         assert!(!rules.scalar_kinds.is_empty(), "no scalar kinds");
         assert!(!rules.image_extensions.is_empty(), "no image extensions");
+        // Each of these is a closed vocabulary an edit is refused against, so an
+        // empty one would refuse every value the model is told to pass.
+        assert!(!rules.cell_alignments.is_empty(), "no cell alignments");
+        assert!(!rules.cell_verticals.is_empty(), "no cell verticals");
+        assert!(!rules.cell_border_sides.is_empty(), "no cell border sides");
         assert!(
             rules.image_side_px.min < rules.image_side_px.max,
             "an empty image-side range"
@@ -9863,6 +13444,18 @@ mod tests {
         assert!(
             rules.slide_text_size_points.min < rules.slide_text_size_points.max,
             "an empty slide-text-size range"
+        );
+        assert!(
+            rules.cell_font_points.min < rules.cell_font_points.max,
+            "an empty cell-font-size range"
+        );
+        assert!(
+            rules.column_width_chars.min < rules.column_width_chars.max,
+            "an empty column-width range"
+        );
+        assert!(
+            rules.row_height_points.min < rules.row_height_points.max,
+            "an empty row-height range"
         );
         assert!(
             rules.color_digits > 0 && rules.color_digits.is_multiple_of(3),
@@ -9890,6 +13483,8 @@ mod tests {
             ("sheet_row_max", rules.sheet_row_max as usize),
             ("sheet_column_max", rules.sheet_column_max as usize),
             ("number_format_max", rules.number_format_max),
+            ("font_name_max", rules.font_name_max),
+            ("format_cells_max", rules.format_cells_max),
         ] {
             assert!(cap > 0, "{name} refuses every value");
         }
@@ -9900,6 +13495,10 @@ mod tests {
     /// be satisfied by the `1048576` of the row cap, so a placeholder that
     /// moved or went stale would still pass.
     fn states_whole_token(text: &str, value: &str) -> bool {
+        // An empty value is found everywhere, so it would pass this test vacuously.
+        if value.is_empty() {
+            return false;
+        }
         let mut from = 0;
         while let Some(at) = text[from..].find(value) {
             let start = from + at;
@@ -9940,12 +13539,13 @@ mod tests {
             RULES.pdf_size_points.bounds(),
             RULES.text_size_points.bounds(),
             RULES.slide_text_size_points.bounds(),
-            RULES
-                .slide_alignments
-                .iter()
-                .map(|(word, _)| format!("\"{word}\""))
-                .collect::<Vec<_>>()
-                .join("|"),
+            RULES.cell_font_points.bounds(),
+            RULES.column_width_chars.bounds(),
+            RULES.row_height_points.bounds(),
+            quoted_words(&align_words()),
+            quoted_words(&RULES.cell_alignments),
+            quoted_words(&RULES.cell_verticals),
+            quoted_words(&RULES.cell_border_sides),
             RULES.color_digits.to_string(),
             RULES.degrees_step.to_string(),
             RULES.sheet_name_max.to_string(),
@@ -9957,6 +13557,8 @@ mod tests {
             RULES.sheet_row_max.to_string(),
             RULES.sheet_column_max.to_string(),
             RULES.number_format_max.to_string(),
+            RULES.font_name_max.to_string(),
+            RULES.format_cells_max.to_string(),
             megabytes(crate::util::FILE_MAX_BYTES).to_string(),
         ] {
             assert!(

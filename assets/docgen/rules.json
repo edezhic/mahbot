@@ -6,9 +6,15 @@
   "pdf_size_points": { "min": 0, "max": 20000, "min_exclusive": true },
   "text_size_points": { "min": 0.5, "max": 819, "min_exclusive": false },
   "slide_text_size_points": { "min": 1, "max": 4000, "min_exclusive": false },
+  "cell_font_points": { "min": 1, "max": 409, "min_exclusive": false },
+  "column_width_chars": { "min": 0, "max": 255, "min_exclusive": false },
+  "row_height_points": { "min": 0, "max": 409, "min_exclusive": false },
   "pdf_point_abs_max": 20000,
   "color_digits": 6,
   "slide_alignments": [["left", "l"], ["center", "ctr"], ["right", "r"], ["justify", "just"]],
+  "cell_alignments": ["general", "left", "center", "right", "justify", "distributed", "centerContinuous"],
+  "cell_verticals": ["top", "center", "bottom", "justify", "distributed"],
+  "cell_border_sides": ["top", "bottom", "left", "right"],
   "degrees_step": 90,
   "sheet_name_max": 31,
   "sheet_name_forbidden": "[]:*?/\\",
@@ -20,5 +26,7 @@
   "paragraph_level_max": 8,
   "sheet_row_max": 1048576,
   "sheet_column_max": 16384,
-  "number_format_max": 200
+  "number_format_max": 200,
+  "font_name_max": 31,
+  "format_cells_max": 10000
 }
