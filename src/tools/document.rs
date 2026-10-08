@@ -384,6 +384,18 @@ impl Tool for DocumentTool {
         // bare `\` before the closing quote reads as an escaped quote.
         let sheet_name_forbidden = format!("{:?}", RULES.sheet_name_forbidden);
         let ppt_marks = crate::docgen::ppt_marks();
+        // The Word marks the description names are quoted from the shared list:
+        // the ones a reading prints in brackets and the labels and annotations it
+        // adds without them (see `spelled_docx_marks`).
+        let docx_inline_marks = spelled_docx_marks(true);
+        let docx_label_marks = spelled_docx_marks(false);
+        // The two headers a reading prints a slide's own block and its notes
+        // under, from the same statement the reader and the kit's refusals use —
+        // rendered with `<n>` where the reader prints the slide's number, the way
+        // the rest of the description spells a place a real value fills.
+        let ppt_labels = crate::docgen::ppt_slide_labels();
+        let ppt_slide_label = crate::reader_output::slide_label(&ppt_labels.slide, "<n>");
+        let ppt_notes_label = crate::reader_output::slide_label(&ppt_labels.notes, "<n>");
         crate::prompt::substitute(
             &crate::prompt::load_prompt("tool/document.md"),
             &[
@@ -425,6 +437,10 @@ impl Tool for DocumentTool {
                 ("{{number_format_max}}", &number_format_max),
                 ("{{font_name_max}}", &font_name_max),
                 ("{{format_cells_max}}", &format_cells_max),
+                ("{{docx_label_marks}}", docx_label_marks.as_str()),
+                ("{{docx_inline_marks}}", docx_inline_marks.as_str()),
+                ("{{ppt_slide_label}}", ppt_slide_label.as_str()),
+                ("{{ppt_notes_label}}", ppt_notes_label.as_str()),
                 ("{{ppt_title_mark}}", ppt_marks.title.as_str()),
                 ("{{ppt_hidden_slide_mark}}", ppt_marks.hidden_slide.as_str()),
                 ("{{ppt_diagram_text_mark}}", ppt_marks.diagram_text.as_str()),
@@ -2021,13 +2037,13 @@ fn validate_xlsx_edit(
 /// 16384), or `None` when they are not one to three ASCII uppercase letters.
 /// The letters' shape is checked here and nowhere else, so the `cell` and the
 /// `column` fields cannot disagree about what a column address is, and the
-/// number is the shared reader's own (`ooxml::column_index`).
+/// number is the shared reader's own (`reader_output::column_index`).
 fn column_number(letters: &str) -> Option<u32> {
     if !((1..=3).contains(&letters.len()) && letters.bytes().all(|byte| byte.is_ascii_uppercase()))
     {
         return None;
     }
-    crate::ooxml::column_index(letters).map(|index| index + 1)
+    crate::reader_output::column_index(letters).map(|index| index + 1)
 }
 
 /// The row and column an A1 address (`"B7"`) names, or `None` when the text is
@@ -2065,7 +2081,7 @@ fn check_cell_address(cell: &str, what: &str) -> Result<(u32, u32)> {
     if column > RULES.sheet_column_max {
         anyhow::bail!(
             "usage: {what} \"{cell}\": the column must be between A and {}",
-            crate::ooxml::column_letters(RULES.sheet_column_max - 1)
+            crate::reader_output::column_letters(RULES.sheet_column_max - 1)
         );
     }
     Ok((row, column))
@@ -2121,7 +2137,7 @@ fn require_column(object: &serde_json::Map<String, Value>, at: &str) -> Result<(
         Some(number) if number <= RULES.sheet_column_max => Ok(()),
         _ => anyhow::bail!(
             "usage: {at}.column must be column letters between A and {}, got \"{column}\"",
-            crate::ooxml::column_letters(RULES.sheet_column_max - 1)
+            crate::reader_output::column_letters(RULES.sheet_column_max - 1)
         ),
     }
 }
@@ -2298,6 +2314,21 @@ fn quoted_words<S: AsRef<str>>(words: &[S]) -> String {
         .map(|word| format!("\"{}\"", word.as_ref()))
         .collect::<Vec<_>>()
         .join("|")
+}
+
+/// The examples of the shared Word marks a reading prints in brackets, and the
+/// labels and annotations it adds without them — quoted and comma-separated for
+/// the prompt, which names every one of them from this one statement (see
+/// [`crate::docgen::docx_marks`]). The group a mark falls in is the shape it is
+/// *printed* as, which its own example states — a pattern is a regex source and
+/// says only how a mark is matched.
+fn spelled_docx_marks(bracketed: bool) -> String {
+    crate::docgen::docx_marks()
+        .iter()
+        .filter(|mark| mark.example.starts_with('[') == bracketed)
+        .map(|mark| format!("`{}`", mark.example))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Require a pptx `format_text` to name at least one property, and each to be
@@ -7362,6 +7393,465 @@ mod tests {
             generated_count(&ws),
             before,
             "a refused call left an output"
+        );
+    }
+
+    /// A docx miss names the reason the fragment was not found rather than
+    /// passing it off as text the body lacks: a fragment reaching across two
+    /// paragraphs is a paragraph boundary, the reader's labels are its own
+    /// printing, and a fragment whose leading whitespace the file's text does not
+    /// hold is refused as that — with the reader's own indentation named as one of
+    /// the two cases, since only a block's lines are printed indented — and each
+    /// reason verified, so text the reader shows under a mark the list names is
+    /// still refused for what it really is. Only a fragment the document really
+    /// does not hold gets the fallback, which stays honest about the parts that
+    /// were searched.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_names_the_reason_a_find_is_not_in_the_body() {
+        // Two paragraphs beside a table cell whose one paragraph draws a text box:
+        // the box's text is real, the reader prints it indented under its
+        // `[text box]` label, and a fragment copied with that indentation is not
+        // what the file holds.
+        const BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Alpha</w:t></w:r></w:p><w:p><w:r><w:t>Beta</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:tcPr/><w:p><w:r><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml"><v:textbox><w:txbxContent><w:p><w:r><w:t>BOXED</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/></w:body></w:document>"#;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(&ws, "reasons", BODY).await;
+
+        let before = generated_count(&ws);
+        for (find, expected) in [
+            ("Alpha\nBeta", "reaches across a paragraph boundary"),
+            ("Table 1: row", "is a label the reader prints"),
+            // The reader prints a table row two-space indented, and the marks
+            // that row's own cells carry are its labels wherever they sit in the
+            // copied line.
+            (
+                "  R1: C1: Merged | C2: Plain",
+                "is a label the reader prints",
+            ),
+            ("C2 (spans C2-C4): Two", "is a label the reader prints"),
+            ("C2 (part of R1C2):", "is a label the reader prints"),
+            // The box's own line is printed two-space indented under its
+            // `[text box]` label, and a body paragraph is printed without
+            // indentation: the one fragment's whitespace is the reader's own
+            // printing, the other's is whitespace the file's text does not hold,
+            // and the refusal names both possibilities rather than only the first.
+            (
+                "  BOXED",
+                "either the indentation the reader prints under a block",
+            ),
+            ("  Alpha", "or whitespace the file's text does not hold"),
+            (
+                "NOWHERE-AT-ALL",
+                "is not in the document's body, its headers",
+            ),
+        ] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "docx_edit", "path": source.to_string_lossy(),
+                        "edits": [{ "op": "replace_text", "find": find, "replace": "X" }],
+                    }),
+                )
+                .await
+                .expect_err("a find the body does not hold must be refused");
+            assert!(
+                err.to_string().contains(expected),
+                "find {find:?} got: {err}"
+            );
+        }
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A docx miss names the header that really holds the fragment rather than a
+    /// label or a bare line break. A header has no conventional part name — a
+    /// package reaches one through a relationship alone — so the fixture names it
+    /// the way a document does, and two lines of one header are still that
+    /// header's.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_names_a_header_that_holds_a_find() {
+        const BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Alpha</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        const HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>HEADER-ONLY</w:t></w:r></w:p><w:p><w:r><w:t>HEADER-SECOND</w:t></w:r></w:p><w:p><w:del w:id="1" w:author="Anna"><w:r><w:delText>HEADER-GONE</w:delText></w:r></w:del></w:p></w:hdr>"#;
+        const HEADER_REL: &str =
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header";
+        const HEADER_TYPE: &str =
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml";
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = created_docx(&ws, "header").await;
+        // The part is named by a relationship of its own and declared in the
+        // package's content types, the way a document holding a header states it;
+        // the package's own relationships and types are kept, so this one is added
+        // under a free relationship id rather than replacing what the writer did.
+        let rels = with_first(
+            &part_text(&created, "word/_rels/document.xml.rels"),
+            "</Relationships>",
+            &format!(
+                r#"<Relationship Id="rId98" Type="{HEADER_REL}" Target="header1.xml"/></Relationships>"#
+            ),
+        );
+        let types = with_first(
+            &part_text(&created, "[Content_Types].xml"),
+            "</Types>",
+            &format!(
+                r#"<Override PartName="/word/header1.xml" ContentType="{HEADER_TYPE}"/></Types>"#
+            ),
+        );
+        let source = assembled_docx_fixture(
+            &ws,
+            "header",
+            &created,
+            BODY,
+            &[
+                ("word/header1.xml", HEADER.as_bytes()),
+                ("word/_rels/document.xml.rels", rels.as_bytes()),
+                ("[Content_Types].xml", types.as_bytes()),
+            ],
+            &[],
+        );
+        let before = generated_count(&ws);
+        for find in ["HEADER-ONLY", "HEADER-ONLY\nHEADER-SECOND"] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "docx_edit", "path": source.to_string_lossy(),
+                        "edits": [{ "op": "replace_text", "find": find, "replace": "X" }],
+                    }),
+                )
+                .await
+                .expect_err("a header's text must not be searched by a body edit");
+            assert!(
+                err.to_string().contains("is in a header of this document"),
+                "find {find:?} got: {err}"
+            );
+        }
+        // Text a tracked revision of the header holds is that header's too: the
+        // reading prints it as deleted rather than as live text, so the miss names
+        // the part with the revision instead of denying the document holds it.
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "find": "HEADER-GONE", "replace": "X" }],
+                }),
+            )
+            .await
+            .expect_err("a header's revision text must not be searched by a body edit");
+        assert!(
+            err.to_string()
+                .contains("is text a tracked revision holds in a header of this document")
+                && !err
+                    .to_string()
+                    .contains("is not in the document's body, its headers"),
+            "a header's own deletion is the header's: {err}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A fragment carrying a mark the body itself spells is not denied as the
+    /// reader's label: a paragraph whose own text really carries `R1: ` means the
+    /// reading never printed that mark, so a miss spanning it and a field's cached
+    /// result — text no edit addresses — gets the honest fallback. A fragment of
+    /// the cached result alone is no label either: the file holds it, and what an
+    /// edit cannot address is the field's own text.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_names_a_true_reason_over_a_label_the_body_spells() {
+        // A body paragraph literally holding `R1: ` beside a `w:fldSimple` whose
+        // cached result `C1: real` is not addressed by an edit.
+        const BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>R1: </w:t></w:r></w:p><w:p><w:fldSimple w:instr=" REF LBL "><w:r><w:t>C1: real</w:t></w:r></w:fldSimple></w:p><w:sectPr/></w:body></w:document>"#;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(&ws, "spelled-label", BODY).await;
+        let before = generated_count(&ws);
+        for find in ["R1: C1: real", "C1: real"] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "docx_edit", "path": source.to_string_lossy(),
+                        "edits": [{ "op": "replace_text", "find": find, "replace": "X" }],
+                    }),
+                )
+                .await
+                .expect_err("a field's cached result must not be addressed by an edit");
+            assert!(
+                err.to_string().contains("a field's cached result is not")
+                    && !err.to_string().contains("is a label the reader prints"),
+                "the file spells {find:?}, so the fragment is no label: {err}"
+            );
+        }
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A footnote written at the conventional part its relationships do not name
+    /// is still read as that footnote's: the reader falls back to
+    /// `word/footnotes.xml`, so a find on its text is refused as the footnote's
+    /// rather than as text the body lacks — a footnote really holding a spelling
+    /// the reader's own label list carries is named as the footnote's, not as a
+    /// label, since the verified reason wins — and text a tracked revision of that
+    /// footnote holds is named as the footnote's with the revision, so the miss
+    /// never denies that the document holds it.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_names_a_footnote_the_relationships_do_not_declare() {
+        const BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Alpha</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        const FOOTNOTES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="1"><w:p><w:r><w:t>FOOTNOTE-ONLY</w:t></w:r></w:p></w:footnote><w:footnote w:id="2"><w:p><w:r><w:t>Table 1: results</w:t></w:r></w:p></w:footnote><w:footnote w:id="3"><w:p><w:del w:id="1" w:author="Anna"><w:r><w:delText>FOOTNOTE-GONE</w:delText></w:r></w:del></w:p></w:footnote></w:footnotes>"#;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "undeclared",
+            BODY,
+            &[("word/footnotes.xml", FOOTNOTES)],
+            &[],
+        )
+        .await;
+        let before = generated_count(&ws);
+        for find in ["FOOTNOTE-ONLY", "Table 1: results"] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "docx_edit", "path": source.to_string_lossy(),
+                        "edits": [{ "op": "replace_text", "find": find, "replace": "X" }],
+                    }),
+                )
+                .await
+                .expect_err("a footnote's text must not be searched by a body edit");
+            assert!(
+                err.to_string()
+                    .contains("is in a footnote of this document")
+                    && !err.to_string().contains("is not in the document's body"),
+                "the reader falls back to the conventional part for {find:?}: {err}"
+            );
+        }
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "find": "FOOTNOTE-GONE", "replace": "X" }],
+                }),
+            )
+            .await
+            .expect_err("a footnote's revision text must not be searched by a body edit");
+        assert!(
+            err.to_string()
+                .contains("is text a tracked revision holds in a footnote of this document")
+                && !err
+                    .to_string()
+                    .contains("is not in the document's body, its headers"),
+            "the footnote's own deletion is the footnote's: {err}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A fragment the body holds only inside a tracked deletion is refused for
+    /// what it is: the reading prints that text as a revision holds it, an edit
+    /// addresses the runs the body holds today, and the miss says so rather than
+    /// answering that the document does not hold the text at all.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_names_a_tracked_deletion_that_holds_a_find() {
+        const BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">Kept </w:t></w:r><w:del w:id="1" w:author="Anna"><w:r><w:delText>The old sentence</w:delText></w:r></w:del></w:p><w:sectPr/></w:body></w:document>"#;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(&ws, "deleted", BODY).await;
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "find": "The old sentence", "replace": "X" }],
+                }),
+            )
+            .await
+            .expect_err("a revision's own text must not be addressed by an edit");
+        assert!(
+            err.to_string().contains("is text a tracked revision holds")
+                && !err
+                    .to_string()
+                    .contains("is not in the document's body, its headers"),
+            "the body holds the text inside a revision: {err}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        // The live text beside the revision is still edited: the reason names the
+        // revision's own text, never the paragraph that carries it.
+        let body = part_text(
+            &single(
+                &run(
+                    &ws,
+                    json!({
+                        "action": "docx_edit", "file_name": "edited",
+                        "path": source.to_string_lossy(),
+                        "edits": [{ "op": "replace_text", "find": "Kept", "replace": "Kept on" }],
+                    }),
+                )
+                .await,
+            ),
+            "word/document.xml",
+        );
+        assert!(
+            body.contains("Kept on") && body.contains("The old sentence"),
+            "live text must still edit and the revision must stay: {body}"
+        );
+    }
+
+    /// Every mark the shared list names is refused and named as the reader's
+    /// label: `assets/docgen/rules.json`'s `docx_marks` is the one statement a
+    /// reading's labels and the kit's refusals both read, so an entry whose
+    /// pattern no find matches would leave the kit refusing text a reader really
+    /// shows without saying why. The find is the entry's own `example`, run
+    /// against a body that does not hold it.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_refuses_every_mark_the_shared_list_names() {
+        const BODY: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Alpha</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let marks = crate::docgen::docx_marks();
+        assert!(!marks.is_empty(), "the shared list of docx marks is empty");
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(&ws, "marks", BODY).await;
+        let before = generated_count(&ws);
+        for entry in marks {
+            let example = entry.example.as_str();
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "docx_edit", "path": source.to_string_lossy(),
+                        "edits": [{ "op": "replace_text", "find": example, "replace": "X" }],
+                    }),
+                )
+                .await
+                .expect_err("a label the reader prints must be refused");
+            assert!(
+                err.to_string().contains("is a label the reader prints"),
+                "mark {example:?} got: {err}"
+            );
+        }
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
+    /// A text rewrite whose match reaches across a `<w:tab/>` is refused — the
+    /// tab is markup of its own the rewrite would leave with nothing to belong
+    /// to — and the document is not written. An occurrence on either side of the
+    /// tab is one slot's own text and is rewritten, the tab kept in place.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_refuses_a_find_across_a_tab_and_writes_nothing() {
+        const TABBED: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello</w:t><w:tab/><w:t>World</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(&ws, "tabbed", TABBED).await;
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "find": "HelloWorld", "replace": "X" }],
+                }),
+            )
+            .await
+            .expect_err("a rewrite must not reach across a tab");
+        assert!(
+            err.to_string().contains("reaches across a tab"),
+            "got: {err}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        for (find, replace) in [("Hello", "Hi"), ("World", "Earth")] {
+            let body = part_text(
+                &single(
+                    &run(
+                        &ws,
+                        json!({
+                            "action": "docx_edit", "file_name": "edited",
+                            "path": source.to_string_lossy(),
+                            "edits": [{ "op": "replace_text", "find": find, "replace": replace }],
+                        }),
+                    )
+                    .await,
+                ),
+                "word/document.xml",
+            );
+            assert!(
+                body.contains(&format!(r#"<w:t xml:space="preserve">{replace}</w:t>"#))
+                    && body.contains("<w:tab/>"),
+                "a side of the tab must still be rewritten: {body}"
+            );
+        }
+
+        // A REWRITE is what must not reach across the tab: `format_text` changes
+        // no text, so a fragment it names may cover both sides of the tab, which
+        // stays where it is (see `src/prompt/tool/document.md`).
+        let formatted = part_text(
+            &single(
+                &run(
+                    &ws,
+                    json!({
+                        "action": "docx_edit", "file_name": "formatted",
+                        "path": source.to_string_lossy(),
+                        "edits": [{ "op": "format_text", "find": "HelloWorld", "bold": true }],
+                    }),
+                )
+                .await,
+            ),
+            "word/document.xml",
+        );
+        assert!(
+            formatted.contains("<w:tab/>") && formatted.contains("<w:b/>"),
+            "a formatting-only edit must reach both sides of the tab: {formatted}"
         );
     }
 
@@ -14724,6 +15214,64 @@ mod tests {
         assert!(err.to_string().contains("inside a table"), "got: {err}");
     }
 
+    /// A slide whose own text literally spells the reader's label is not denied as
+    /// a label — the file holds those words, so the plain miss is what the refusal
+    /// states — while a label naming another slide's number is the reader's
+    /// printing, since this slide does not spell that one.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_names_a_label_only_when_the_slide_does_not_spell_it() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "spelled",
+                    "content": [{ "type": "paragraph", "text": "Slide 1: intro to" }],
+                }),
+            )
+            .await,
+        );
+        let before = generated_count(&ws);
+        for (find, expected, labelled) in [
+            ("Slide 1: intro to the project", "is not on slide 1", false),
+            (
+                "Slide 2: intro to",
+                "is a label the reader prints, not text on the slide",
+                true,
+            ),
+        ] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "pptx_edit", "file_name": "refused",
+                        "path": source.to_string_lossy(),
+                        "edits": [{ "op": "replace_text", "slide": 1, "find": find, "replace": "x" }],
+                    }),
+                )
+                .await
+                .expect_err("a find the slide does not hold must be refused");
+            assert!(
+                err.to_string().contains(expected),
+                "find {find:?} got: {err}"
+            );
+            assert_eq!(
+                err.to_string().contains("is a label the reader prints"),
+                labelled,
+                "find {find:?} got: {err}"
+            );
+        }
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+    }
+
     /// A `find` the reader showed but no slide text op changes is refused for what
     /// it really is: a diagram's own text, a label the reader prints and a slide's
     /// speaker notes all read in a reading, so none may be passed off as text the
@@ -14945,6 +15493,40 @@ mod tests {
             "replace_notes did not rewrite the notes it owns"
         );
 
+        // A find copied out of a reading carries the reader's indentation: the
+        // reader prints a slide's own text lines and the notes' lines two-space
+        // indented under their labels, so the file does not hold the leading
+        // whitespace and the refusal names that — with the reader's indentation as
+        // one of the two possible sources, since whitespace the file's text does
+        // not hold is the other — rather than passing it off as text the part does
+        // not have.
+        for (edits, expected) in [
+            (
+                json!([{ "op": "replace_text", "slide": 1, "find": "  Real slide text", "replace": "x" }]),
+                "is not on slide 1: the fragment's leading whitespace is either the indentation the reader prints under a block or whitespace the file's text does not hold",
+            ),
+            (
+                json!([{ "op": "replace_notes", "slide": 1, "find": "  Note A", "replace": "x" }]),
+                "is not in the speaker notes of slide 1: the fragment's leading whitespace is either the indentation the reader prints under a block or whitespace the file's text does not hold",
+            ),
+        ] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "pptx_edit", "file_name": "refused",
+                        "path": source.to_string_lossy(),
+                        "edits": edits,
+                    }),
+                )
+                .await
+                .expect_err("a find the part does not hold must be refused");
+            assert!(
+                err.to_string().contains(expected),
+                "edits {edits} got: {err}"
+            );
+        }
+
         // The honest path is not narrowed: real slide text still edits.
         let output = single(
             &run(
@@ -14994,6 +15576,173 @@ mod tests {
         assert!(
             err.to_string().contains("is not on slide 1"),
             "a lost diagram's text must not be named a diagram's: {err}"
+        );
+    }
+
+    /// A pptx rewrite whose match reaches across an `<a:br/>` is refused — the
+    /// line break is markup of its own the rewrite would leave with nothing to
+    /// belong to — and the presentation is not written.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_refuses_a_find_across_a_line_break() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [{ "type": "paragraph", "text": "HelloWorld" }],
+                }),
+            )
+            .await,
+        );
+        // The slide's one paragraph holds two runs with an `<a:br/>` between them
+        // — a line break the create action cannot write.
+        let slide = with_first(
+            &part_text(&created, "ppt/slides/slide1.xml"),
+            "<a:t>HelloWorld</a:t></a:r>",
+            r#"<a:t>Hello</a:t></a:r><a:br/><a:r><a:rPr lang="en-US" sz="1600" dirty="0"/><a:t>World</a:t></a:r>"#,
+        );
+        let source = write_fixture(
+            &ws,
+            "broken.pptx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[("ppt/slides/slide1.xml", slide.as_bytes())],
+            ),
+        );
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "slide": 1, "find": "HelloWorld", "replace": "X" }],
+                }),
+            )
+            .await
+            .expect_err("a rewrite must not reach across a line break");
+        assert!(
+            err.to_string().contains("reaches across a line break"),
+            "got: {err}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
+        );
+
+        // A fragment holding the line break the reading shows is refused with that
+        // reason too, rather than passed off as text the slide does not hold.
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "slide": 1, "find": "Hello\nWorld", "replace": "X" }],
+                }),
+            )
+            .await
+            .expect_err("a fragment holding a line break must be refused");
+        assert!(
+            err.to_string()
+                .contains("the fragment holds a tab or a line break"),
+            "got: {err}"
+        );
+    }
+
+    /// A pptx miss names a paragraph boundary rather than a line break: the reader
+    /// prints one paragraph per line, so a fragment reaching from one paragraph
+    /// into the next holds a newline the file has no `<a:br/>` for, and the
+    /// boundary is what both a slide text op and a notes op say — never a line
+    /// break.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_names_a_paragraph_boundary_before_a_line_break() {
+        // The notes part the slide declares through its own relationships, shaped
+        // as the kit writes one (`createNotesPart`): a `<p:notes>` holding the
+        // body placeholder the reader draws notes from, carrying two note
+        // paragraphs.
+        const NOTES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:notes xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder 2"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" dirty="0"/><a:t>NoteA</a:t></a:r></a:p><a:p><a:r><a:rPr lang="en-US" dirty="0"/><a:t>NoteB</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"#;
+        const NOTES_REL: &str = r#"<Relationship Id="rId98" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>"#;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        // Two paragraphs and no `<a:br/>` anywhere: the reader prints them on two
+        // lines, so a fragment copied across them reaches a paragraph boundary.
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "paragraphs",
+                    "content": [
+                        { "type": "paragraph", "text": "Alpha" },
+                        { "type": "paragraph", "text": "Beta" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let rels = with_first(
+            &part_text(&created, "ppt/slides/_rels/slide1.xml.rels"),
+            "</Relationships>",
+            &format!("{NOTES_REL}</Relationships>"),
+        );
+        let source = write_fixture(
+            &ws,
+            "paragraphs.pptx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[
+                    ("ppt/slides/_rels/slide1.xml.rels", rels.as_bytes()),
+                    ("ppt/notesSlides/notesSlide1.xml", NOTES.as_bytes()),
+                ],
+            ),
+        );
+        let before = generated_count(&ws);
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "slide": 1, "find": "Alpha\nBeta", "replace": "X" }],
+                }),
+            )
+            .await
+            .expect_err("a rewrite must not reach across a paragraph boundary");
+        assert!(
+            err.to_string()
+                .contains("reaches across a paragraph boundary")
+                && !err.to_string().contains("line break"),
+            "a slide boundary must not be named a line break: {err}"
+        );
+
+        // The notes hold two paragraphs of their own, and `replace_notes` names
+        // the same boundary rather than the line break.
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "path": source.to_string_lossy(),
+                    "edits": [{ "op": "replace_notes", "slide": 1, "find": "NoteA\nNoteB", "replace": "X" }],
+                }),
+            )
+            .await
+            .expect_err("a notes rewrite must not reach across a paragraph boundary");
+        assert!(
+            err.to_string()
+                .contains("reaches across a paragraph boundary")
+                && !err.to_string().contains("line break"),
+            "a notes boundary must not be named a line break: {err}"
+        );
+        assert_eq!(
+            generated_count(&ws),
+            before,
+            "a refused call left an output"
         );
     }
 
@@ -16370,18 +17119,33 @@ mod tests {
         }
         // A slide mark is not a number, so the whole-number guard above would
         // assert nothing for it: what the description owes the model is to name
-        // the mark the reader prints.
+        // the mark the reader prints — every one of them, for either family, from
+        // the shared lists themselves. A label's `{n}` is the reader's own
+        // placeholder, so the description states the label with `<n>` where a real
+        // number goes.
         let marks = crate::docgen::ppt_marks();
+        let labels = crate::docgen::ppt_slide_labels();
+        let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
+        let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
         for mark in [
             &marks.title,
             &marks.hidden_slide,
             &marks.diagram_text,
             &marks.diagram_text_lost,
             &marks.no_text,
+            &slide_label,
+            &notes_label,
         ] {
             assert!(
                 description.contains(mark.as_str()),
                 "the description does not name the slide mark {mark:?}"
+            );
+        }
+        for mark in crate::docgen::docx_marks() {
+            assert!(
+                description.contains(mark.example.as_str()),
+                "the description does not name the Word mark {:?}",
+                mark.example
             );
         }
     }

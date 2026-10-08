@@ -24,6 +24,7 @@
 
 use crate::docgen::ppt_marks;
 use crate::document::{DocOutcome, SkipReason, SkippedImages, ensure_out_dir};
+use crate::reader_output::{slide_header, slide_notes_header, text_block, text_lines};
 use quick_xml::Reader;
 use quick_xml::events::{BytesRef, BytesStart, Event};
 use std::collections::{HashMap, HashSet};
@@ -175,7 +176,7 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         blocks.push(slide_block(number, slide_hidden(&xml), &content, &shown));
         match slide_notes(&mut archive, base, &rels) {
             SlideNotes::Text(lines) if !lines.is_empty() => {
-                blocks.push(text_lines(&format!("Slide {number} notes:"), &lines));
+                blocks.push(text_lines(&slide_notes_header(number), &lines));
             }
             // The slide declares a notes part, so the text it holds is lost —
             // which is said rather than reported as a slide with no notes.
@@ -779,11 +780,7 @@ fn slide_block(
     diagrams: &[DiagramRead],
 ) -> String {
     let marks = ppt_marks();
-    let mut header = format!("Slide {number}:");
-    if hidden {
-        header.push(' ');
-        header.push_str(&marks.hidden_slide);
-    }
+    let header = slide_header(number, hidden);
     let mut lines: Vec<String> = content
         .title
         .iter()
@@ -803,65 +800,6 @@ fn slide_block(
 }
 
 // ── Shared package plumbing ─────────────────────────────────────
-
-/// `header` then one indented line per entry. Shared with [`crate::legacy`] and
-/// the Word reader, so the text shapes stay one implementation.
-pub(crate) fn text_lines(header: &str, lines: &[String]) -> String {
-    let indented = lines
-        .iter()
-        .map(|line| format!("  {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("{header}\n{indented}")
-}
-
-/// [`text_lines`], or `header (marker)` when there is nothing to list. Shared
-/// with [`crate::legacy`] for the same reason.
-pub(crate) fn text_block(header: &str, empty_marker: &str, lines: &[String]) -> String {
-    if lines.is_empty() {
-        return format!("{header} {empty_marker}");
-    }
-    text_lines(header, lines)
-}
-
-/// The spreadsheet column letters for a zero-based column index (`0` is `A`).
-/// Shared with [`crate::legacy`], so a cell address is written by one
-/// implementation.
-pub(crate) fn column_letters(mut index: u32) -> String {
-    let mut letters: Vec<char> = Vec::new();
-    loop {
-        let digit = u32::from(b'A') + index % 26;
-        letters.push(char::from_u32(digit).unwrap_or('A'));
-        if index < 26 {
-            break;
-        }
-        index = index / 26 - 1;
-    }
-    letters.reverse();
-    letters.into_iter().collect()
-}
-
-/// The zero-based column index of a cell reference (`"B12"` -> `1`), or `None`
-/// when it does not start with a column letter. Shared with
-/// [`crate::tools::document`], so a cell reference is read by one
-/// implementation.
-pub(crate) fn column_index(reference: &str) -> Option<u32> {
-    let mut index = 0u32;
-    let mut seen = false;
-    for byte in reference.bytes() {
-        if !byte.is_ascii_alphabetic() {
-            break;
-        }
-        // An address past `u32` is clamped rather than worth a panic.
-        index = index
-            .saturating_mul(26)
-            .saturating_add(u32::from(byte.to_ascii_uppercase() - b'A') + 1);
-        seen = true;
-    }
-    // `then_some` would evaluate the subtraction even when no letter was seen,
-    // which is a panic on a reference that starts with anything else (`1`, `$A1`).
-    seen.then(|| index - 1)
-}
 
 /// Write every entry under `prefix` that names a raster file into `out_dir`,
 /// counting the rest into `skipped`. An entry under a nested path (`media/a.png`

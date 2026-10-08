@@ -31,7 +31,12 @@
 //!   each one twice, as an `mc:Choice` and as the `mc:Fallback` beside it.
 //!
 //! The notation the model reads, every marker spelled out, is documented in
-//! `src/prompt/tool/read.md` and `read_strict.md`.
+//! `src/prompt/tool/read.md` and `read_strict.md`, and every marker this walk
+//! prints is listed once in `assets/docgen/rules.json` (`docx_marks`) — the list
+//! the document kit refuses a `find` carrying one by, and the list the test
+//! `every_docx_mark_the_shared_list_names_is_a_mark_the_reader_prints` checks
+//! this reader's own output against, so a marker renamed here cannot leave the
+//! kit naming one the reader no longer prints.
 //!
 //! # Invariants
 //!
@@ -58,7 +63,11 @@
 
 use super::{
     DocOutcome, Relationship, SkippedImages, append_entity, attr, ensure_out_dir, read_zip_entry,
-    relationships, resolve_part, scan_elements, text_lines, unreadable, write_media_parts,
+    relationships, resolve_part, scan_elements, unreadable, write_media_parts,
+};
+use crate::reader_output::{
+    TEXT_BOX, WORD_COMMENT, WORD_ENDNOTE, WORD_FOOTER, WORD_FOOTNOTE, WORD_HEADER, labeled_block,
+    lines_of, text_lines,
 };
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -97,11 +106,6 @@ const DOCX_BASE: &str = "word/";
 /// A field instruction is reported up to this many characters — a runaway
 /// instruction must not dominate the text.
 const MAX_FIELD_INSTRUCTION_CHARS: usize = 80;
-
-/// The conventional part names, used when the relationship list names none.
-const FOOTNOTES_PART: &str = "word/footnotes.xml";
-const ENDNOTES_PART: &str = "word/endnotes.xml";
-const COMMENTS_PART: &str = "word/comments.xml";
 
 // ── Events ──────────────────────────────────────────────────────
 
@@ -1140,7 +1144,7 @@ impl Word {
         if inner.trim().is_empty() {
             return Ok(());
         }
-        self.block(&text_lines("[text box]", &lines_of(&inner)));
+        self.block(&text_lines(TEXT_BOX, &lines_of(&inner)));
         Ok(())
     }
 
@@ -1291,7 +1295,7 @@ impl Word {
                 _ => self.revisions.rollback(mark),
             }
         }
-        let name = if header { "Header" } else { "Footer" };
+        let name = if header { WORD_HEADER } else { WORD_FOOTER };
         let numbered = rendered.len() > 1;
         rendered
             .into_iter()
@@ -1646,34 +1650,21 @@ impl NoteKind {
         }
     }
 
-    /// The relationship type suffix the part is named by.
-    fn rel_kind(self) -> &'static str {
-        match self {
-            Self::Footnote => "/footnotes",
-            Self::Endnote => "/endnotes",
-            Self::Comment => "/comments",
-        }
-    }
-
-    /// The conventional part name, used when the relationship list names none.
-    fn fallback(self) -> &'static str {
-        match self {
-            Self::Footnote => FOOTNOTES_PART,
-            Self::Endnote => ENDNOTES_PART,
-            Self::Comment => COMMENTS_PART,
-        }
-    }
-
     /// The label a definition block is headed with.
     fn label(self) -> &'static str {
         match self {
-            Self::Footnote => "Footnote",
-            Self::Endnote => "Endnote",
-            Self::Comment => "Comment",
+            Self::Footnote => WORD_FOOTNOTE,
+            Self::Endnote => WORD_ENDNOTE,
+            Self::Comment => WORD_COMMENT,
         }
     }
 
-    /// The word inside a reference marker: `[footnote 1]`, `[comment 2 ends]`.
+    /// The kind's own word: the one inside a reference marker (`[footnote 1]`,
+    /// `[comment 2 ends]`), and the name its shared entry is keyed by — the entry
+    /// states the relationship type its part is named by and the conventional part
+    /// name used when the relationship list names none (see
+    /// [`crate::docgen::docx_peripheral_part`]), which the document kit's refusals
+    /// read for the same parts.
     fn marker(self) -> &'static str {
         match self {
             Self::Footnote => "footnote",
@@ -1684,12 +1675,18 @@ impl NoteKind {
 }
 
 /// The part holding one kind of notes: the one the relationship list names by
-/// type, or the conventional name.
+/// type, or the conventional name the kind's shared entry carries.
 fn notes_part(rels: &[Relationship], kind: NoteKind) -> String {
+    let entry = crate::docgen::docx_peripheral_part(kind.marker());
     rels.iter()
-        .find(|rel| rel.kind.ends_with(kind.rel_kind()))
+        .find(|rel| rel.kind.ends_with(&entry.rel))
         .map_or_else(
-            || kind.fallback().to_owned(),
+            || {
+                entry
+                    .part
+                    .clone()
+                    .expect("a note kind's shared entry names its conventional part")
+            },
             |rel| resolve_part(DOCX_BASE, &rel.target),
         )
 }
@@ -1994,17 +1991,6 @@ impl Revisions {
 }
 
 // ── Assembly helpers ────────────────────────────────────────────
-
-/// `Label:` then each line of `text` indented by two spaces — the shape
-/// [`super::text_lines`] gives the other two families.
-fn labeled_block(label: &str, text: &str) -> String {
-    text_lines(&format!("{label}:"), &lines_of(text))
-}
-
-/// The lines of `text`, as [`super::text_lines`] takes them.
-fn lines_of(text: &str) -> Vec<String> {
-    text.lines().map(str::to_owned).collect()
-}
 
 /// `[footnote 1]`, `[comment 2 ends]`, `[comment ?]`: the kind, the numbered
 /// reference (or `?` for a reference the part does not define) and a suffix.
@@ -3002,5 +2988,233 @@ mod tests {
             ],
         );
         assert_eq!(text_of(&bytes), "Body[footnote ?]");
+    }
+
+    // ── The shared mark list ────────────────────────────────────
+
+    /// Every mark the shared list names is a spelling this reader really prints:
+    /// `assets/docgen/rules.json`'s `docx_marks` is the one statement the kit's
+    /// refusals and this reader both read, so an entry whose spelling no reading
+    /// ever shows would have the kit name a label that is not there. The fixtures
+    /// below are rich enough to raise every one of them, and each entry's
+    /// `example` must appear in the joined readings.
+    #[test]
+    fn every_docx_mark_the_shared_list_names_is_a_mark_the_reader_prints() {
+        // A body whose one paragraph carries the run-level and paragraph-mark
+        // revisions, a field, a comment range and a text box, beside two headers
+        // (a part per variant, so both are numbered) and a footnote nothing
+        // references.
+        let revised = concat!(
+            r#"<w:p><w:pPr><w:pPrChange w:author="Anna"/>"#,
+            r#"<w:sectPr><w:sectPrChange w:author="Anna"/></w:sectPr></w:pPr>"#,
+            r#"<w:commentRangeStart w:id="2"/>"#,
+            r#"<w:r><w:rPr><w:rPrChange w:author="Anna"/></w:rPr><w:t>kept</w:t></w:r>"#,
+            r#"<w:ins w:author="Anna"><w:r><w:t xml:space="preserve"> added</w:t></w:r></w:ins>"#,
+            r#"<w:del w:author="Anna"><w:r><w:delText xml:space="preserve"> gone</w:delText></w:r></w:del>"#,
+            r#"<w:moveFrom w:author="Anna"><w:r><w:t xml:space="preserve"> away</w:t></w:r></w:moveFrom>"#,
+            r#"<w:moveTo w:author="Anna"><w:r><w:t xml:space="preserve"> here</w:t></w:r></w:moveTo>"#,
+            r#"<w:r><w:fldSimple w:instr="PAGE \* MERGEFORMAT"><w:t>1</w:t></w:fldSimple></w:r>"#,
+            r#"<w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>boxed</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>"#,
+            r#"</w:p>"#,
+            r#"<w:sectPr><w:headerReference w:type="first" r:id="rId1"/><w:headerReference w:type="default" r:id="rId2"/></w:sectPr>"#,
+        );
+        let revised = package(
+            revised,
+            &[
+                (
+                    "word/_rels/document.xml.rels",
+                    &rels(&format!(
+                        "{}{}{}",
+                        rel("rId1", "header", "header1.xml"),
+                        rel("rId2", "header", "header2.xml"),
+                        rel("rId5", "footnotes", "footnotes.xml"),
+                    )),
+                ),
+                (
+                    "word/header1.xml",
+                    r"<w:hdr><w:p><w:r><w:t>FirstHead</w:t></w:r></w:p></w:hdr>",
+                ),
+                (
+                    "word/header2.xml",
+                    r"<w:hdr><w:p><w:r><w:t>DefaultHead</w:t></w:r></w:p></w:hdr>",
+                ),
+                (
+                    "word/footnotes.xml",
+                    r#"<w:footnotes><w:footnote w:id="1"><w:p><w:r><w:t>orphan note</w:t></w:r></w:p></w:footnote></w:footnotes>"#,
+                ),
+                // The conventional comments part, which the body's
+                // `commentRangeStart` is numbered from: `[comment 1 starts]`.
+                (
+                    "word/comments.xml",
+                    r#"<w:comments><w:comment w:id="2" w:author="Ivan Petrov"><w:p><w:r><w:t>needs a citation</w:t></w:r></w:p></w:comment></w:comments>"#,
+                ),
+            ],
+        );
+        // A paragraph whose own mark carries all four paragraph-mark revisions.
+        let paragraph_marks = r#"<w:p><w:pPr><w:rPr><w:ins w:author="Anna"/><w:del w:author="Anna"/><w:moveTo w:author="Anna"/><w:moveFrom w:author="Anna"/></w:rPr></w:pPr><w:r><w:t>P</w:t></w:r></w:p>"#;
+        // A revised table: row 1 spans C2-C4, row 2 has a merge-revised cell, and
+        // row 4 continues a vertical merge that started at R3C2.
+        let tables = concat!(
+            r#"<w:tbl><w:tblPr><w:tblPrChange w:author="Anna"/></w:tblPr>"#,
+            r#"<w:tblGrid><w:gridCol/><w:gridCol/><w:gridCol/><w:gridCol/></w:tblGrid>"#,
+            r#"<w:tr><w:tc><w:p><w:r><w:t>One</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:tcPr><w:gridSpan w:val="3"/></w:tcPr><w:p><w:r><w:t>Wide</w:t></w:r></w:p></w:tc></w:tr>"#,
+            r#"<w:tr><w:tc><w:tcPr><w:cellMerge/></w:tcPr><w:p><w:r><w:t>M</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t>Two</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t>Three</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t>Four</w:t></w:r></w:p></w:tc></w:tr>"#,
+            r#"<w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Origin</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t>D</w:t></w:r></w:p></w:tc></w:tr>"#,
+            r#"<w:tr><w:tc><w:p><w:r><w:t>E</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t>G</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t>H</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        );
+
+        let corpus = format!(
+            "{}\n{}\n{}",
+            text_of(&revised),
+            text_of(&package(paragraph_marks, &[])),
+            text_of(&package(tables, &[])),
+        );
+
+        let marks = crate::docgen::docx_marks();
+        assert!(!marks.is_empty(), "the shared list of docx marks is empty");
+        for mark in marks {
+            let example = mark.example.as_str();
+            assert!(
+                corpus.contains(example),
+                "the reader never prints {example:?} (entry {})",
+                mark.pattern
+            );
+        }
+    }
+
+    /// The literals of `source` that are shaped like a mark a reading prints: the
+    /// ones it carries a character an ordinary sentence of prose does not — a
+    /// bracket, a parenthesis or the `¶` a paragraph mark states. This is the
+    /// narrowing the scan below rests on, so it is stated once and pinned on prose
+    /// by [`the_mark_scan_leaves_a_sentence_of_prose_alone`].
+    fn mark_literals(source: &str) -> Vec<String> {
+        let literal = regex::Regex::new(r#""((?:[^"\\]|\\.)*)""#).expect("the literal pattern");
+        literal
+            .captures_iter(source)
+            .map(|found| found[1].to_owned())
+            .filter(|text| text.contains(['[', ']', '(', ')', '¶']))
+            .collect()
+    }
+
+    /// The list's other direction: every mark the Word reader's own module writes
+    /// is named by `docx_marks`, so a mark added to the walk without the shared
+    /// list fails here rather than being a spelling the kit can refuse no fragment
+    /// for. The source read is this reader's own code — the test module and a line
+    /// comment are left out, so a mark asserted on in a test or quoted in prose is
+    /// no mark the reader writes. The shared vocabulary module
+    /// ([`crate::reader_output`]) is deliberately not read: it states the Excel and
+    /// PowerPoint families' marks too, which no `docx_marks` entry names, and its
+    /// Word names are pinned by [`every_docx_mark_the_shared_list_names_is_a_mark_the_reader_prints`],
+    /// which requires the reading to print every entry the list holds. Only a
+    /// mark-shaped literal is read at all ([`mark_literals`]), which is what reaches
+    /// the marks a `format!` template builds (`Table {} (formatting revised)`,
+    /// `[field {capped}]`): such a literal must match a pattern of the list or spell
+    /// only the words the list spells. A mark written with none of those characters
+    /// — a bare label such as `Table {}` — is out of this scan's reach, and a rename
+    /// of one is caught by the test that reads a reading, since the list's own
+    /// example stops being printed.
+    #[test]
+    fn every_docx_mark_the_reader_writes_is_in_the_shared_list() {
+        /// The runs of three or more ASCII letters in `text` — the words a mark's
+        /// pattern or the example it prints spells.
+        fn words_in(text: &str) -> Vec<String> {
+            text.split(|c: char| !c.is_ascii_alphabetic())
+                .filter(|word| word.len() >= 3)
+                .map(str::to_owned)
+                .collect()
+        }
+
+        let marks = crate::docgen::docx_marks();
+        let patterns: Vec<regex::Regex> = marks
+            .iter()
+            .map(|mark| regex::Regex::new(&mark.pattern).expect("a docx mark's pattern is a regex"))
+            .collect();
+        // Every word the list spells, in a pattern or in the example it prints.
+        let words: Vec<String> = marks
+            .iter()
+            .flat_map(|mark| words_in(&format!("{} {}", mark.pattern, mark.example)))
+            .collect();
+        // A word the list spells, in the form it spells it: its own, or the plural
+        // of it — the one form the two spell differently, the reader's tally line
+        // saying `1 formatting change` where the examples state the plural.
+        let spelled = |word: &str| {
+            words
+                .iter()
+                .any(|known| known == word || known.strip_suffix('s') == Some(word))
+        };
+        let placeholder = regex::Regex::new(r"\{[^{}]*\}").expect("the placeholder pattern");
+        let code = include_str!("docx.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the reader's own code precedes its tests")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let candidates = mark_literals(&code);
+        assert!(
+            candidates.len() > 10,
+            "the scan must see this reader's marks, saw {}",
+            candidates.len()
+        );
+        for text in &candidates {
+            let written = placeholder.replace_all(text, " ");
+            if patterns.iter().any(|pattern| pattern.is_match(&written)) {
+                continue;
+            }
+            for word in words_in(&written) {
+                assert!(
+                    spelled(&word),
+                    "{text:?} is a literal this reader writes with the word {word:?}, which no \
+                     entry of the shared list spells — a mark a reading prints belongs in \
+                     assets/docgen/rules.json's docx_marks"
+                );
+            }
+        }
+    }
+
+    /// The scan above must not read a sentence of prose for a mark: a reader's own
+    /// error message that happened to spell a mark word would otherwise send its
+    /// author to `rules.json` for a spelling no reading prints. The sample holds the
+    /// messages that did exactly that under the shape check this replaces.
+    #[test]
+    fn the_mark_scan_leaves_a_sentence_of_prose_alone() {
+        let prose = r#"
+            let a = "text is not in the body";
+            let b = "Comment range is unclosed";
+            let c = "part of the document";
+            let d = "the field instruction is reported up to this many characters";
+        "#;
+        assert!(
+            mark_literals(prose).is_empty(),
+            "prose read as a mark: {:?}",
+            mark_literals(prose)
+        );
+        // And a literal that IS a mark the list does not name is still read: a
+        // template-built bracket mark, a parenthesis mark, and one written as a
+        // raw string (the scan sees the quoted run wherever it sits).
+        let marks = r#"
+            let e = format!("[revision {}]", n);
+            let f = "(revision started)";
+            let g = r"[revision note]";
+        "#;
+        assert_eq!(
+            mark_literals(marks),
+            [
+                r"[revision {}]".to_owned(),
+                "(revision started)".to_owned(),
+                "[revision note]".to_owned(),
+            ]
+        );
     }
 }

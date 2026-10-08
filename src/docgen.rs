@@ -61,10 +61,11 @@ const KIT_SCRIPT: &[u8] = include_bytes!("../assets/docgen/document-kit.js");
 /// or annotates (see `assets/docgen/NotoSans-LICENSE.txt`).
 const KIT_PDF_FONT: &[u8] = include_bytes!("../assets/docgen/NotoSans-Regular.ttf");
 
-/// The shared statement of the input rules, the bounds and the slide marks the
-/// document kit, the `document` tool and the presentation reader all read — one
-/// file rather than a copy per side (see the file for what each entry governs).
-/// The kit imports it, and bun inlines it into the committed bundle.
+/// The shared statement of the input rules, the bounds and the marks the document
+/// readers print: one file rather than a copy per side, read by the document kit,
+/// the `document` tool and the document readers alike (see the file for what each
+/// entry governs). The kit imports it, and bun inlines it into the committed
+/// bundle.
 const RULES_JSON: &str = include_str!("../assets/docgen/rules.json");
 
 /// [`RULES_JSON`] parsed once: the file is read as JSON in this one place, and
@@ -101,6 +102,90 @@ pub(crate) fn ppt_marks() -> &'static PptMarks {
         serde::Deserialize::deserialize(&rules()["ppt_marks"])
             .expect("assets/docgen/rules.json must carry the ppt_marks the reader prints")
     })
+}
+
+/// The two headers a presentation reader prints a slide's own block and its
+/// speaker-notes block under, each with `{n}` for the slide's number. The
+/// editing side names the same headers in its refusals, so one statement of
+/// them lives in [`RULES_JSON`] rather than being spelled twice and drifting.
+#[derive(serde::Deserialize)]
+pub(crate) struct PptSlideLabels {
+    /// The header one slide's block is printed under.
+    pub(crate) slide: String,
+    /// The header a slide's speaker notes are printed under.
+    pub(crate) notes: String,
+}
+
+/// [`PptSlideLabels`] out of [`rules`], as [`ppt_marks`] reads its own.
+pub(crate) fn ppt_slide_labels() -> &'static PptSlideLabels {
+    static LABELS: OnceLock<PptSlideLabels> = OnceLock::new();
+    LABELS.get_or_init(|| {
+        serde::Deserialize::deserialize(&rules()["ppt_slide_labels"])
+            .expect("assets/docgen/rules.json must carry the ppt_slide_labels a reader prints")
+    })
+}
+
+/// The marks a Word reading prints that are labels rather than text: the pattern
+/// each is matched by and the spelling the reader prints it as. The editing side
+/// names the same marks in its refusals, so one statement of them lives in
+/// [`RULES_JSON`] rather than being spelled twice and drifting.
+#[derive(serde::Deserialize)]
+pub(crate) struct DocxMark {
+    /// The pattern the mark is matched by — by the kit in JavaScript and by this
+    /// crate's own [`docx_marks`], which compiles each one.
+    pub(crate) pattern: String,
+    /// The spelling the reader prints the mark as.
+    pub(crate) example: String,
+}
+
+/// [`DocxMark`]s out of [`rules`], as [`ppt_marks`] reads its own. Each pattern is
+/// compiled here: the kit matches fragments against them in JavaScript and this
+/// crate matches a reader's own spelling against them, so a pattern only one of
+/// the two accepts is a build fault, named at the first read rather than by a
+/// call.
+pub(crate) fn docx_marks() -> &'static [DocxMark] {
+    static MARKS: OnceLock<Vec<DocxMark>> = OnceLock::new();
+    MARKS.get_or_init(|| {
+        let marks: Vec<DocxMark> = serde::Deserialize::deserialize(&rules()["docx_marks"])
+            .expect("assets/docgen/rules.json must carry the docx_marks a reader prints");
+        for mark in &marks {
+            regex::Regex::new(&mark.pattern)
+                .expect("a docx mark's pattern must be a regex the kit and this crate both accept");
+        }
+        marks
+    })
+}
+
+/// One of the parts a docx edit does not change — a header, a footer, a note or
+/// a comment: the relationship type `word/document.xml` names it by, and the
+/// conventional part a package that names none of that kind is read from. The
+/// document kit reads the same entry for the same part, with the phrase its
+/// refusals call the part by, so the two sides cannot name one part two ways.
+#[derive(serde::Deserialize)]
+pub(crate) struct DocxPeripheralPart {
+    /// The kind's own name, the key a reader resolves one by.
+    pub(crate) kind: String,
+    /// The relationship-type tail the part is named by.
+    pub(crate) rel: String,
+    /// The conventional part name, absent for a kind a package reaches through
+    /// a relationship alone (a header, a footer).
+    #[serde(default)]
+    pub(crate) part: Option<String>,
+}
+
+/// The shared entry for one peripheral kind, by the name it carries. A kind the
+/// file lost is a build fault, caught where the entry is resolved.
+pub(crate) fn docx_peripheral_part(kind: &str) -> &'static DocxPeripheralPart {
+    static PARTS: OnceLock<Vec<DocxPeripheralPart>> = OnceLock::new();
+    PARTS
+        .get_or_init(|| {
+            serde::Deserialize::deserialize(&rules()["docx_peripheral_parts"]).expect(
+                "assets/docgen/rules.json must carry the docx_peripheral_parts an edit leaves alone",
+            )
+        })
+        .iter()
+        .find(|part| part.kind == kind)
+        .expect("assets/docgen/rules.json must name every peripheral part a docx edit leaves alone")
 }
 
 /// The materialized-kit directory name under the product's storage root. The

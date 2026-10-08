@@ -317,8 +317,17 @@ impl Tool for ReadTool {
     fn description(&self) -> String {
         // The slide marks this description names are rendered from the same
         // statement the reader prints them from, so renaming one cannot leave a
-        // model-facing sentence stale (see `crate::docgen::ppt_marks`).
+        // model-facing sentence stale (see `crate::docgen::ppt_marks`); the two
+        // labels a reading prints a slide's own block and its notes under come
+        // from the same place, and the legacy `.doc` story names and the text-box
+        // mark from `crate::reader_output`, which states each once.
         let marks = crate::docgen::ppt_marks();
+        // The reader prints a slide's number where these spell `<n>`, so the
+        // description names the label the reader prints without reading like a
+        // substitution of its own.
+        let labels = crate::docgen::ppt_slide_labels();
+        let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
+        let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
         crate::prompt::substitute(
             &crate::prompt::load_prompt(if self.strict {
                 "tool/read_strict.md"
@@ -330,6 +339,16 @@ impl Tool for ReadTool {
                 ("{{ppt_hidden_slide_mark}}", &marks.hidden_slide),
                 ("{{ppt_diagram_text_mark}}", &marks.diagram_text),
                 ("{{ppt_diagram_text_lost_mark}}", &marks.diagram_text_lost),
+                ("{{ppt_slide_label}}", &slide_label),
+                ("{{ppt_notes_label}}", &notes_label),
+                (
+                    "{{doc_headers_footers}}",
+                    crate::reader_output::DOC_HEADERS_FOOTERS,
+                ),
+                ("{{doc_footnotes}}", crate::reader_output::DOC_FOOTNOTES),
+                ("{{doc_endnotes}}", crate::reader_output::DOC_ENDNOTES),
+                ("{{doc_comments}}", crate::reader_output::DOC_COMMENTS),
+                ("{{text_box_mark}}", crate::reader_output::TEXT_BOX),
             ],
         )
     }
@@ -1328,13 +1347,20 @@ mod tests {
         }
     }
 
-    /// The read description names the slide marks the reader prints, rendered
-    /// from their single statement ([`crate::docgen::ppt_marks`]): a mark renamed
-    /// there cannot leave this model-facing sentence stale, and a placeholder the
-    /// call does not fill would reach the model as its own literal spelling.
+    /// The read description names the slide marks and labels the reader prints,
+    /// rendered from their single statement ([`crate::docgen::ppt_marks`],
+    /// [`crate::docgen::ppt_slide_labels`], [`crate::reader_output`] for the legacy
+    /// story names and the text-box mark): a mark renamed there cannot leave this
+    /// model-facing sentence stale, and a placeholder the call does not fill would
+    /// reach the model as its own literal spelling.
     #[test]
-    fn the_description_states_the_slide_marks() {
+    fn the_description_states_the_marks_the_reader_prints() {
         let marks = crate::docgen::ppt_marks();
+        let labels = crate::docgen::ppt_slide_labels();
+        // A label's `{n}` is the reader's own placeholder, so the description
+        // states the label with `<n>` where a real number goes.
+        let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
+        let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
         for tool in [ReadTool::general(), ReadTool::workspace_only()] {
             let description = tool.description();
             assert!(
@@ -1346,9 +1372,16 @@ mod tests {
                 &marks.hidden_slide,
                 &marks.diagram_text,
                 &marks.diagram_text_lost,
+                &slide_label,
+                &notes_label,
+                crate::reader_output::DOC_HEADERS_FOOTERS,
+                crate::reader_output::DOC_FOOTNOTES,
+                crate::reader_output::DOC_ENDNOTES,
+                crate::reader_output::DOC_COMMENTS,
+                crate::reader_output::TEXT_BOX,
             ] {
                 assert!(
-                    description.contains(mark.as_str()),
+                    description.contains(mark),
                     "the description does not name {mark:?}:\n{description}"
                 );
             }

@@ -42,11 +42,14 @@
 //!   belongs there too.
 
 use super::{
-    Part, Relationship, ZipEntry, append_entity, attr, blank, column_index, column_letters,
-    count_chart_parts, read_zip_entry, rel_id, relationship_targets, relationships_and_whole,
-    resolve_part, scan_elements, text_block, text_lines, unreadable, write_media_parts,
+    Part, Relationship, ZipEntry, append_entity, attr, blank, count_chart_parts, read_zip_entry,
+    rel_id, relationship_targets, relationships_and_whole, resolve_part, scan_elements, unreadable,
+    write_media_parts,
 };
 use crate::document::{DocOutcome, SkippedImages, ensure_out_dir};
+use crate::reader_output::{
+    NO_VALUES, column_index, column_letters, sheet_header, text_block, text_lines,
+};
 use crate::util::one_line;
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -198,7 +201,7 @@ pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
                 lines.extend(comment_lines(comments, name, &mut notes));
                 blocks.push(text_block(
                     &sheet_header(name, state.as_deref()),
-                    "(no values)",
+                    NO_VALUES,
                     &lines,
                 ));
             }
@@ -410,17 +413,6 @@ fn sheet_entry(event: &BytesStart<'_>) -> (String, String, Option<String>) {
 /// Whether an XML boolean attribute is true: `1` or `true`, as Excel writes it.
 fn is_true(value: &str) -> bool {
     value == "1" || value.eq_ignore_ascii_case("true")
-}
-
-/// A sheet's block header, marked when the workbook hides the sheet. The state a
-/// workbook writes is one of two words, and a producer's own casing is no reason to
-/// pass a hidden sheet off as an ordinary one.
-fn sheet_header(name: &str, state: Option<&str>) -> String {
-    match state.map(str::to_ascii_lowercase).as_deref() {
-        Some("veryhidden") => format!("Sheet \"{name}\" (very hidden):"),
-        Some("hidden") => format!("Sheet \"{name}\" (hidden):"),
-        _ => format!("Sheet \"{name}\":"),
-    }
 }
 
 // ── Defined names ───────────────────────────────────────────────

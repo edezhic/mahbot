@@ -585,7 +585,7 @@ function declarePptxTitles(xml) {
 }
 
 // How many of the deck's slides really hold speaker notes: a slide's notes are the
-// text of the notes part its own relationship names (the text `notesLines` reads a
+// text of the notes part its own relationship names (the text `paragraphLines` reads a
 // reading by), and the empty part the library writes for a slide is not notes. The
 // empty parts hold no text at all — the slide number a notes page draws is a
 // field, which no reader shows — so a deck with no notes at all counts none.
@@ -593,7 +593,7 @@ function notedSlides(zip) {
   return slideParts(zip).filter((part) => {
     const notes = slideNotesPart(zip, part);
     const file = notes === null ? null : zip.file(notes);
-    return file !== null && notesLines(file.asText()).trim() !== "";
+    return file !== null && paragraphLines(file.asText()).trim() !== "";
   }).length;
 }
 
@@ -616,7 +616,7 @@ function dropPptxNotesPages(zip) {
     const page = pages[at];
     if (page === null || pages.some((other, index) => index !== at && other === page)) continue;
     const file = zip.file(page);
-    if (file !== null && notesLines(file.asText()).trim() !== "") continue;
+    if (file !== null && paragraphLines(file.asText()).trim() !== "") continue;
     // The page's own relationships part goes with it; `zip.remove` takes a name
     // the package does not hold as nothing at all.
     zip.remove(page);
@@ -647,7 +647,7 @@ const SLIDE_TITLES_GROUP = "Slide Titles";
 // The text a slide declares as its title, or null when it declares none: the
 // paragraphs of the shape whose `<p:ph>` names the title placeholder — the shape a
 // reading marks and the one both sides that write a title declare — joined the way
-// a part's own text is (see `notesLines`). A title blank once trimmed is one a
+// a part's own text is (see `paragraphLines`). A title blank once trimmed is one a
 // reading shows nothing for, so it is no title here either.
 function slideTitleText(zip, slidePart) {
   const file = zip.file(slidePart);
@@ -1472,10 +1472,142 @@ const DOCX_NUMBERING = "word/numbering.xml";
 const NUMBERING_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
 const WORD_RELATIONSHIPS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const STRICT_RELATIONSHIPS = "http://purl.oclc.org/ooxml/officeDocument/relationships";
-// The refusal every op that searched and found nothing states: the parts a body
-// edit does not look at are named, because the text there is real and the
-// caller may well expect it found.
-const missingFind = (find) => `the text ${JSON.stringify(find)} is not in the document's body (headers, footers, footnotes and fields are not searched)`;
+// The marks the Word reader prints that are labels rather than text: one
+// statement of them lives in `assets/docgen/rules.json` (`docx_marks`), which
+// also carries the spelling the reader prints each one as. The kit reads the
+// list from the bundle it is built with, and `src/ooxml/docx.rs`'s tests check
+// the reader's own output against the same list, so neither side can move
+// without the other. A mark is looked for anywhere in a `find` — `[ins]` wraps
+// its content, a field marker and a merge annotation sit inside a line — and a
+// refusal names the longest mark a find carries (a find of the whole `[comment 1
+// starts]` names that rather than the shorter `[comment 1]` written inside it).
+// Built once and matched with `matchAll`, which clones a global pattern, so the
+// global flag carries no `lastIndex` from one `find` to the next.
+const DOCX_MARKS = RULES.docx_marks.map(({ pattern }) => new RegExp(pattern, "g"));
+
+// A `find` copied out of a reading carries the reader's indentation — a table
+// row sits two spaces under its `Table N:` head, a diagram's node lines under
+// theirs, a slide's notes under their label — so a find is compared with it
+// trimmed away by both families' refusals. The text a lookup is compared against
+// needs no such trimming: the reader's indent is its own printing, not the
+// package's.
+const withoutIndent = (text) => text.split("\n").map((line) => line.trimStart()).join("\n");
+
+// The longest mark `text` carries — the reader's label a miss names, or
+// undefined when it names none. `text` is the find with the reader's
+// indentation trimmed away (see `docxFindRefusal`): a table row is printed
+// two-space indented, and a mark is the reader's printing wherever it sits.
+function namedDocxMark(text) {
+  let longest;
+  for (const mark of DOCX_MARKS) {
+    for (const match of text.matchAll(mark)) {
+      if (longest === undefined || match[0].length > longest.length) longest = match[0];
+    }
+  }
+  return longest;
+}
+
+// The peripheral parts a docx edit does not change, from the shared statement of
+// them (`assets/docgen/rules.json`, read by the Word reader for the same parts):
+// the relationship-type suffix `word/document.xml` names each by, the phrase a
+// refusal calls it and the conventional part name a package that declares none is
+// read from — a header and a footer have none, since a package reaches those
+// through a relationship alone.
+const DOCX_PERIPHERAL_PARTS = RULES.docx_peripheral_parts;
+
+// The peripheral parts that hold `needle`, each as the phrase a refusal calls the
+// part and whether the part's addressed text holds it — `[]` when none does. A
+// part is read where the package really put it (see `documentParts`); a part a
+// document names several of (a header per section) is read for each, and each is
+// read with `read`, so the walk over it is charged. A part the package does not
+// hold costs only itself.
+//
+// A part whose addressed text does not hold the fragment may still hold it as
+// text a tracked revision of the part's own does — a deletion's `w:delText` runs,
+// which a reading prints as deleted rather than as live text — so that text is
+// read too, and such a part is reported with `revised: true`. A part whose
+// addressed text holds the fragment is never also reported as a revision's.
+function docxPeripheralHolds(editor, needle) {
+  const found = [];
+  for (const { rel, phrase, part } of DOCX_PERIPHERAL_PARTS) {
+    let revised = false;
+    const holds = documentParts(editor, rel, part).some((at) => {
+      const text = editor.read(at);
+      if (text === undefined) return false;
+      // The part's paragraphs joined the way the reader prints them, so a
+      // fragment copied across two lines of a header or a footnote reaches the
+      // part that holds both and that part is what the refusal names.
+      if (
+        docxParagraphTexts(text)
+          .map((paragraph) => paragraph.text)
+          .join("\n")
+          .includes(needle)
+      ) {
+        return true;
+      }
+      if (docxDeletedTexts(text).some((line) => line.includes(needle))) revised = true;
+      return false;
+    });
+    if (holds) found.push({ phrase, revised: false });
+    else if (revised) found.push({ phrase, revised: true });
+  }
+  return found;
+}
+
+// The refusal every docx op that searched and found nothing states. A miss has
+// several causes and the caller can act on each differently, so the reason is
+// named rather than passed over as "not in the body": a fragment that reaches
+// across a paragraph boundary, text a part a docx edit does not change holds
+// (whether the part's addressed text holds it or a tracked revision of the part's
+// own does), text the body's own tracked revision holds, one carrying leading
+// whitespace the file does not hold, one carrying the reader's own label, and one
+// holding a tab or a line break. Each check VERIFIES the reason it states — a
+// boundary against the paragraphs really joined, an indentation and a label
+// against the paragraph that really holds the trimmed fragment, a peripheral part
+// read for the text an edit addresses and for the text a revision of its own
+// holds, the body's own deletions read for their text — and they are asked
+// most-specific first, so a message never claims a reason that is not true: text a
+// footnote really holds is named as the footnote's rather than as a label that
+// happens to spell the same words, and a label the part's own text spells is not
+// called the reader's printing. The fallback stays honest about what was searched
+// and about what a body edit addresses.
+function docxFindRefusal(editor, xml, find) {
+  const paragraphs = docxParagraphTexts(xml);
+  // A paragraph's address is the joined text of its runs and the reader prints
+  // one paragraph per line, so a fragment that reaches from one paragraph into
+  // the next is a concatenation of consecutive paragraphs joined by a newline —
+  // while no one paragraph holds it. Only a fragment holding a newline can be
+  // one: a newline sits between the paragraphs of the join, never inside one.
+  const trimmed = withoutIndent(find);
+  if (/\n/.test(trimmed) && paragraphs.map((paragraph) => paragraph.text).join("\n").includes(trimmed)) return `the text ${JSON.stringify(find)} is not in the document's body: the fragment reaches across a paragraph boundary, and an edit addresses one paragraph at a time`;
+  if (trimmed && trimmed !== find && paragraphs.some((paragraph) => paragraph.text.includes(trimmed))) return `the text ${JSON.stringify(find)} is not in the document's body: the fragment's leading whitespace is either the indentation the reader prints under a block or whitespace the file's text does not hold — search for ${JSON.stringify(trimmed)}`;
+  if (trimmed) {
+    const peripheral = docxPeripheralHolds(editor, trimmed);
+    const held = peripheral.filter(({ revised }) => !revised);
+    if (held.length) return `the text ${JSON.stringify(find)} is in ${conjoined(held.map(({ phrase }) => phrase))} of this document, which a docx edit does not change — it edits the body's own text, a text box's and a table cell's included, and not that part`;
+    // The parts left hold it as text a tracked revision of their own does, which
+    // a reading prints as deleted rather than as live text: the part is named
+    // with that, so the miss is not passed off as text the document lacks.
+    if (peripheral.length) return `the text ${JSON.stringify(find)} is not in the document's body: it is text a tracked revision holds in ${conjoined(peripheral.map(({ phrase }) => phrase))} of this document, which the reading prints as revised rather than as live text, and an edit addresses the text the body's runs hold today`;
+  }
+  // A tracked revision of the body holds text of its own: a deletion's runs are
+  // `w:delText`, which a reading prints as deleted rather than as live text, and an
+  // edit addresses the runs the body holds today. Said rather than passed off as
+  // text the body does not have — a revision inside a peripheral part is named by
+  // the part above, which no edit reaches either way.
+  if (trimmed && docxDeletedTexts(xml).some((text) => text.includes(trimmed))) {
+    return `the text ${JSON.stringify(find)} is not in the document's body: it is text a tracked revision holds, which the reading prints as revised rather than as live text, and an edit addresses the text the body's runs hold today`;
+  }
+  // The label is named only when the part's own text does not spell the mark
+  // itself: a paragraph whose own text carries `R1: `, or a field whose cached
+  // result does, is a document that really says so, and then the honest reason is
+  // the fallback's (a field's cached result is addressed by nothing), not a label
+  // the reading printed.
+  const mark = namedDocxMark(trimmed);
+  if (mark !== undefined && !spelledText(xml).includes(mark)) return `the text ${JSON.stringify(find)} is not in the document's body: ${JSON.stringify(mark)} is a label the reader prints, not text in the file`;
+  if (/[\t\n\r]/.test(find)) return `the text ${JSON.stringify(find)} is not in the document's body: ${holdsBreakReason("w:", "<w:p>")}`;
+  return `the text ${JSON.stringify(find)} is not in the document's body, its headers, its footers, its footnotes, its endnotes or its comments — a text box's own text and a table cell's are addressed, a field's cached result is not`;
+}
 
 // The one balanced scan every "walk the elements of one tag family" caller here
 // is built on. It returns one entry per COMPLETE element of `pattern`'s family:
@@ -1567,6 +1699,40 @@ const clipSpans = (spans, start, end) => spans
 function addressedText(fragment, excluded = []) {
   return docxRuns(fragment, excluded).slots.map((slot) => xmlUnescape(slot.raw)).join("");
 }
+
+// The addressed text of every paragraph of a part, in document order — the
+// `docxParagraphs` spans sorted by start (the scan finishes a nested one before
+// its ancestor), each with the text a text edit addresses in it. `addParagraph`
+// anchors on these texts, and a miss's refusal reads them to tell a fragment
+// that reaches from one paragraph into the next from one no paragraph holds.
+function docxParagraphTexts(xml) {
+  const regions = fieldRegions(xml);
+  return docxParagraphs(xml)
+    .sort((left, right) => left.start - right.start)
+    .map((span) => ({
+      start: span.start,
+      end: span.end,
+      text: addressedText(xml.slice(span.start, span.end), clipSpans(regions, span.start, span.end)),
+    }));
+}
+
+// The deleted-text element of a Word part: a revision's own runs, which a reading
+// prints as deleted rather than as live text (`runPattern` spells the `<…:t>`
+// families).
+const DOCX_DELETED_TEXT = new RegExp(`${openTag("w:delText")}([\\s\\S]*?)${closeTag("w:delText")}`, "g");
+
+// The text a tracked deletion holds, one entry per paragraph — the `w:delText`
+// runs a reading prints as deleted. An edit addresses the runs a paragraph holds
+// today, so this text is what a miss states rather than passing it off as text
+// the body does not have.
+function docxDeletedTexts(xml) {
+  return docxParagraphs(xml).map((span) => runText(xml.slice(span.start, span.end), DOCX_DELETED_TEXT));
+}
+
+// Every run's text of a part, joined — what the part's own markup spells, whether
+// or not an edit addresses it (a field's cached result is one such run). Read to
+// tell a mark the READER printed from one the file itself holds.
+const spelledText = (xml) => runText(xml, DOCX_TEXT);
 
 // The text containers that must keep at least one block-level child — ECMA-376
 // requires one in `CT_Tc` and in `CT_TxbxContent` — with the name the refusal
@@ -1838,6 +2004,38 @@ function replaceOccurrences(xml, runs, slots, offsets, replacement, note, prefix
   return { xml: out, spans: [...edits.keys()].map((index) => slots[index]) };
 }
 
+// The elements a family keeps as markup of its own between the text slots a
+// fragment's joined text is drawn from, with what a refusal calls each. A tab and
+// a line break are drawn, not written: the slot text around one joins across it,
+// so a fragment matching across it is not text the file really holds as such.
+const BRIDGED_MARKUP = {
+  "w:": [["w:tab", "tab"], ["w:br", "line break"], ["w:cr", "line break"]],
+  "a:": [["a:tab", "tab"], ["a:br", "line break"]],
+};
+
+// Refuse a text rewrite whose match reaches across one of `parts` — the elements
+// a family keeps as markup of its own between the text slots a fragment's joined
+// text is drawn from. A paragraph's address is the joined text of its slots, so a
+// tab or a line break between two of them is not in that text; a match reaching
+// across one would be written around it and leave the tab or the break with
+// nothing to belong to. `paragraph` is the paragraph element the slots belong to.
+// The slice checked is the paragraph from the first covered
+// slot's start to the last covered slot's end — an occurrence inside one slot
+// covers no element between slots, so it can never reach one. `parts` are
+// `[name, noun]` pairs (the element as the file spells it and the word the
+// refusal calls it), and their patterns are built per call through
+// `elementPattern` (both shapes a file may write an element in), so no global
+// `lastIndex` is carried from one check to the next.
+function requireNoBridgedMarkup(paragraph, slots, offsets, find, parts) {
+  for (const { start, end } of offsets) {
+    const first = locateSlot(slots, start);
+    const last = locateSlot(slots, end, true);
+    const covered = paragraph.slice(slots[first.index].start, slots[last.index].end);
+    const bridged = parts.find(([name]) => elementPattern(name).test(covered));
+    if (bridged) throw new UsageError(`the text ${JSON.stringify(find)} reaches across a ${bridged[1]} in the file: a ${bridged[1]} is markup of its own, not text an edit addresses, so writing across it would leave it with nothing to belong to — name a fragment on one side of it`);
+  }
+}
+
 // The pattern of an element of `name` in BOTH shapes a file may write it: a file
 // may spell it `<name/>` or `<name>…</name>`, and a pattern keeping only one
 // shape drops the other — the defect every hand-spelled copy of this rule has
@@ -2057,20 +2255,27 @@ const BUILTIN_STYLES = new Map([
   ["heading 3", "Heading3"], ["heading3", "Heading3"], ["заголовок 3", "Heading3"], ["заголовок3", "Heading3"],
 ]);
 
-// The part a docx edit's own relationships name for the relationship type whose tail
-// is `suffix` (`/styles`, `/numbering`, `/settings`), resolved against
-// `word/document.xml`'s directory the way `resolvePart` resolves every target, with
-// the conventional name as the fallback for a package that names none. The type is
+// The parts a docx edit's own relationships name for the relationship type whose
+// tail is `suffix` (`/styles`, `/numbering`, `/settings`, `/header`), resolved
+// against `word/document.xml`'s directory the way `resolvePart` resolves every
+// target, with the conventional name as the fallback for a package that names
+// none — so `[]` for a kind that has no conventional name. The type is
 // matched by its TAIL, where the xlsx arm's `stylesPart` matches its whole string:
 // the transitional and the strict OOXML namespaces spell the head differently
 // (`schemas.openxmlformats.org/officeDocument/2006/relationships` against
 // `purl.oclc.org/ooxml/officeDocument/relationships`) while every kind keeps its own
 // local name, so a full-string match would leave a strict-namespace document's own
-// parts unresolved.
-function documentPart(editor, suffix, conventional) {
-  const named = relationships(editor.read(relsPartFor(DOCX_DOCUMENT)) ?? "").find((rel) => rel.type.endsWith(suffix));
-  return named ? resolvePart(partDirectory(DOCX_DOCUMENT), named.target) : conventional;
+// parts unresolved. Every named part is returned, since a document declares one
+// header per section and a refusal names each part an edit leaves alone.
+function documentParts(editor, suffix, conventional) {
+  const named = relationships(editor.read(relsPartFor(DOCX_DOCUMENT)) ?? "")
+    .filter((rel) => rel.type.endsWith(suffix))
+    .map((rel) => resolvePart(partDirectory(DOCX_DOCUMENT), rel.target));
+  return named.length ? named : conventional === undefined ? [] : [conventional];
 }
+
+// The one part of that kind a styles, numbering or settings lookup reads.
+const documentPart = (editor, suffix, conventional) => documentParts(editor, suffix, conventional)[0];
 
 // The `[start, end]` span of a paragraph's OWN `<w:pPr>` — its first child element
 // — or `undefined` when it has none or its first child is not one, found the way
@@ -2666,7 +2871,7 @@ function formatParagraph(xml, edit, find, editor) {
     noteUnnamed(element, written.spans, editor.note);
     return written.xml;
   });
-  if (!matched) throw new UsageError(missingFind(find));
+  if (!matched) throw new UsageError(docxFindRefusal(editor, xml, find));
   if (matched > 1) editor.note(`[the fragment matched ${matched} paragraphs — every one was formatted]`);
   return out;
 }
@@ -2710,7 +2915,8 @@ function bodyEnd(xml) {
 // and the run formatting of its first run, so a line added to a list stays a list
 // item and one added after a heading is a heading. With no `after`, a bare
 // paragraph goes at the end of the body, exactly as before.
-function addParagraph(xml, edit, note) {
+function addParagraph(xml, edit, editor) {
+  const note = editor.note;
   const text = editText(edit.text, "text");
   if (edit.after === undefined) {
     const at = bodyEnd(xml);
@@ -2718,20 +2924,17 @@ function addParagraph(xml, edit, note) {
   }
   const after = editText(edit.after, "after");
   if (!after) throw new UsageError("after must not be empty");
-  const regions = fieldRegions(xml);
-  const textOf = (candidate) => {
-    const { slots } = docxRuns(xml.slice(candidate.start, candidate.end), clipSpans(regions, candidate.start, candidate.end));
-    return slots.map((slot) => xmlUnescape(slot.raw)).join("");
-  };
-  const span = topParagraphs(xml).find((candidate) => textOf(candidate).includes(after));
+  const paragraphs = docxParagraphTexts(xml);
+  const own = new Set(topParagraphs(xml).map((span) => span.start));
+  const span = paragraphs.find((paragraph) => own.has(paragraph.start) && paragraph.text.includes(after));
   if (!span) {
     // The fragment may still be text this document holds and the text ops can
     // edit — a text box's own paragraph — so the refusal says where it is
     // instead of the body's "not searched" wording, which reads as "not in the
     // file".
-    const buried = docxParagraphs(xml).find((candidate) => textOf(candidate).includes(after));
+    const buried = paragraphs.find((paragraph) => paragraph.text.includes(after));
     if (buried) throw new UsageError(`the text ${JSON.stringify(after)} is inside a text box: an add_paragraph after anchors in the document's own paragraphs (a table cell's counts), and a text box's paragraph is a nested one`);
-    throw new UsageError(missingFind(after));
+    throw new UsageError(docxFindRefusal(editor, xml, after));
   }
   return xml.slice(0, span.end) + inheritedParagraph(xml.slice(span.start, span.end), text, note) + xml.slice(span.end);
 }
@@ -2915,6 +3118,16 @@ const writtenParts = (start, end, markers) => {
 // several things an edit did at once.
 const conjoined = (phrases) => (phrases.length < 2 ? String(phrases[0] ?? "") : `${phrases.slice(0, -1).join(", ")} and ${phrases.at(-1)}`);
 
+// The sentence a miss states for a fragment holding a tab or a line break the
+// reading shows: the elements are written from the same pairs a rewrite is refused
+// across (`BRIDGED_MARKUP`), so the markup the check names and the markup the
+// message prints cannot drift apart, and only the paragraph element is named per
+// family (`<w:p>` against `<a:p>`).
+const holdsBreakReason = (prefix, paragraph) => {
+  const markup = BRIDGED_MARKUP[prefix].map(([name]) => `<${name}/>`).join(", ");
+  return `the fragment holds a tab or a line break, and the file keeps it as markup of its own (${markup}) or as a paragraph of its own (${paragraph}), not as text — name a fragment on one side of it`;
+};
+
 // The one note an edit owes about the markup it reached beyond what the caller
 // named. `fragment` is the paragraph XML the edit worked on and `spans` are the
 // parts of it the edit rewrote, so a kind that merely sits elsewhere in the
@@ -2935,13 +3148,13 @@ function noteUnnamed(fragment, spans, note) {
 // the numbering part a list needs — and withholds its notes.
 function applyDocxEdit(xml, edit, editor) {
   const op = edit && edit.op;
-  if (op === "add_paragraph") return addParagraph(xml, edit, editor.note);
+  if (op === "add_paragraph") return addParagraph(xml, edit, editor);
   const find = editText(edit && edit.find, "find");
   if (!find) throw new UsageError("find must not be empty");
   if (op === "remove_paragraph") {
     const found = { value: false };
     const out = removeParagraphs(xml, find, found, editor.note);
-    if (!found.value) throw new UsageError(missingFind(find));
+    if (!found.value) throw new UsageError(docxFindRefusal(editor, xml, find));
     return out;
   }
   if (op === "format_paragraph") return formatParagraph(xml, edit, find, editor);
@@ -3007,12 +3220,15 @@ function applyDocxEdit(xml, edit, editor) {
       return formatted.xml;
     }
     // Every occurrence is written in one pass over the same runs and slots, so
-    // no occurrence's offsets can go stale against another's.
+    // no occurrence's offsets can go stale against another's. A rewrite must not
+    // bridge a tab or a line break the joined text skips over (see
+    // `requireNoBridgedMarkup`).
+    requireNoBridgedMarkup(element, slots, offsets, find, BRIDGED_MARKUP["w:"]);
     const written = replaceOccurrences(element, runs, slots, offsets, replacement, editor.note, "w:");
     noteUnnamed(element, written.spans, editor.note);
     return written.xml;
   });
-  if (!inserted) throw new UsageError(missingFind(find));
+  if (!inserted) throw new UsageError(docxFindRefusal(editor, xml, find));
   if (op === "format_text" && matched > 1) editor.note(`[the fragment matched ${matched} times — every one was formatted]`);
   if (spilled) editor.note("[the fragment covers only part of a run, and a run is the smallest unit formatting is stated on — the rest of that run's text took the formatting too]");
   return out;
@@ -5698,35 +5914,82 @@ function mapSlideParagraphs(xml, change) {
 }
 
 // The labels the reader prints for a slide — its number and its marks — which are
-// not the slide's own text, the way `src/ooxml.rs` writes them.
-const slideLabels = (slide) => [`Slide ${slide}:`, `Slide ${slide} notes:`, ...Object.values(RULES.ppt_marks)];
+// not the slide's own text. The two label templates are the reader's own
+// (`src/reader_output.rs` builds them from the same `rules.json` entries) and the
+// marks come from the kit's own list, so a refusal names the words the reader
+// really printed.
+const slideLabels = (slide) => [
+  RULES.ppt_slide_labels.slide.replace("{n}", slide),
+  RULES.ppt_slide_labels.notes.replace("{n}", slide),
+  ...Object.values(RULES.ppt_marks),
+];
+
+// The reader's two slide-label templates with any slide's number in them, so a
+// label naming a number other than the addressed slide's is recognised too.
+const SLIDE_LABEL_PATTERNS = Object.values(RULES.ppt_slide_labels)
+  .map((template) => new RegExp(`^${escapeRegExp(template).replace(escapeRegExp("{n}"), "\\d+")}`));
 
 // The reader label `find` names, or undefined when it names none. The longest
 // label that fits wins: a find of the whole `(diagram text could not be read)`
 // mark names that mark rather than the shorter `(diagram text)` heading written
 // inside it.
-const namedSlideLabel = (find, slide) => slideLabels(slide)
-  .filter((candidate) => find.includes(candidate))
-  .sort((left, right) => right.length - left.length)[0];
+const namedSlideLabel = (find, slide) => {
+  // The addressed slide's own labels and marks, sitting anywhere in the find (a
+  // mark may follow the slide's heading).
+  const own = slideLabels(slide).filter((candidate) => find.includes(candidate));
+  // And a label naming ANOTHER slide's number, which is only ever at the start of
+  // one: a fragment copied from a reading of slide 2 is not text slide 1 holds.
+  const other = SLIDE_LABEL_PATTERNS.map((pattern) => (find.match(pattern) || [])[0]).filter(Boolean);
+  return [...own, ...other].sort((left, right) => right.length - left.length)[0];
+};
 
-// A `find` copied out of a reading carries the reader's indentation — a diagram's
-// node lines sit under their heading and a slide's notes under their label — so a
-// find is compared with it trimmed away. The text a lookup is compared against
-// needs no such trimming: the reader's indent is its own printing, not the
-// package's.
-const withoutIndent = (text) => text.split("\n").map((line) => line.trimStart()).join("\n");
-
-// A notes part's text as a reading prints it: one line per paragraph, so a find
-// copied across note lines matches the notes it names.
-const notesLines = (xml) => slideParagraphs(xml)
+// A part's text as a reading prints it: one line per paragraph, so a find copied
+// across paragraphs matches the part that holds it. The reader prints a slide's
+// paragraphs and a notes part's the same way, so the one join serves both the
+// notes check and the paragraph-boundary check.
+const paragraphLines = (xml) => slideParagraphs(xml)
   .map(({ start, end }) => slideParagraphText(xml.slice(start, end)))
   .join("\n");
 
-// The refusal a slide text op states when its `find` is not on the slide: the
-// reader's own labels, a diagram's text and a slide's speaker notes are all text
-// a reading showed but no slide text op changes, so naming them is what the
-// refusal says rather than passing them off as text the slide does not have. A
-// label comes first, since a find naming one is a label whatever else it holds.
+// The reasons one part's own text gives for a miss, or undefined when none holds:
+// a fragment reaching from one paragraph into the next, a leading whitespace the
+// reader printed rather than the file holding it, a reader's label the part's own
+// text does not spell, and a tab or a line break the reading shows. Each is
+// VERIFIED — the boundary against the paragraphs really joined, the indentation
+// and the label against the part's own text (a slide whose text literally begins
+// with `Slide 1: ` really says so, and then the label is no reason at all), the
+// break against the fragment itself — so the sentence names a cause that is true,
+// and a caller adds only the reasons of its own (`slideFindRefusal` reads the
+// diagrams and the notes first). The checks are asked most-specific first: what a
+// fragment copied across lines is, then the reader's own printing of it, then the
+// break it holds. `miss` is the part's wording — what a fragment is said not to be
+// in, what a label is said to be instead of text, the op that addresses one
+// paragraph at a time, and the slide the labels are read for — which the two
+// callers build where a slide's own text and its speaker notes state it
+// differently; the checks and the rest of every sentence are shared here.
+function partMissReason(miss, xml, find) {
+  const needle = withoutIndent(find);
+  // Only a fragment holding a newline can reach from one paragraph into the next:
+  // a newline sits between the paragraphs of the join, never inside one, and an
+  // `<a:br/>` inside a paragraph is not in a paragraph's addressed text at all.
+  if (/\n/.test(needle) && paragraphLines(xml).includes(needle)) return `the text ${JSON.stringify(find)} is not ${miss.where}: the fragment reaches across a paragraph boundary, and ${miss.what} addresses one paragraph at a time`;
+  if (needle !== find && needle && paragraphLines(xml).includes(needle)) return `the text ${JSON.stringify(find)} is not ${miss.where}: the fragment's leading whitespace is either the indentation the reader prints under a block or whitespace the file's text does not hold — search for ${JSON.stringify(needle)}`;
+  const label = namedSlideLabel(needle, miss.slide);
+  if (label !== undefined && !paragraphLines(xml).includes(label)) return `the text ${JSON.stringify(find)} is not ${miss.where}: ${JSON.stringify(label)} is a label the reader prints, not ${miss.notText}`;
+  if (/[\t\n\r]/.test(find)) return `the text ${JSON.stringify(find)} is not ${miss.where}: ${holdsBreakReason("a:", "<a:p>")}`;
+  return undefined;
+}
+
+// The refusal a slide text op states when its `find` is not on the slide: a
+// diagram's text, a slide's speaker notes, the fragment's own paragraph boundary,
+// the indentation the reader printed under a block, the reader's own labels, and a
+// tab or a line break it holds are all things a reading showed but no slide text op
+// changes, so naming them is what the refusal says rather than passing them off as
+// text the slide does not have. A miss names the reason it VERIFIES — a diagram's
+// text against what the reader reported for this part, the notes against the notes
+// part's own text, the rest against the slide part itself (see `partMissReason`) —
+// and the verified reasons are asked before the remaining one, so a find the notes
+// really hold is named as the notes' rather than as a label spelling the same words.
 //
 // The diagram text is not read here: the request carries what a reading showed
 // per slide part, computed by the reader itself (see
@@ -5736,9 +5999,18 @@ const notesLines = (xml) => slideParagraphs(xml)
 //
 // A lookup naming no text never reaches a refusal: the tool refuses one before
 // the kit runs (see `require_pptx_lookup`), so a find here always names text.
-function slideFindRefusal(editor, part, find, slide) {
-  const label = namedSlideLabel(find, slide);
-  if (label !== undefined) return `the text ${JSON.stringify(find)} is not on slide ${slide}: ${JSON.stringify(label)} is a label the reader prints, not text on the slide`;
+//
+// A tab or a line break the reading shows is markup of its own in the file, not
+// text a slide text op addresses: a fragment holding one was copied out of the
+// reading, where a paragraph is a line and an `<a:br/>` inside one is a line end,
+// so it names that rather than passing it off as text the slide lacks. The notes,
+// the boundary, the indentation and the labels are asked first: the notes really
+// hold a find copied across their own lines, a fragment reaching from one paragraph
+// into the next holds a newline the file has no `<a:br/>` for (see
+// `paragraphLines`), and a fragment copied with a label line or the reader's
+// indentation holds what the reader printed rather than what the slide says. `xml`
+// is the slide part as this edit found it.
+function slideFindRefusal(editor, xml, part, find, slide) {
   const needle = withoutIndent(find);
   const diagrams = editor.diagramText[part] ?? [];
   if (diagrams.some((text) => text.includes(needle))) return `the text ${JSON.stringify(find)} is inside a diagram on slide ${slide}, whose text a presentation edit does not change`;
@@ -5747,14 +6019,21 @@ function slideFindRefusal(editor, part, find, slide) {
   // off as text the slide lacks.
   const notes = slideNotesPart(editor.zip, part);
   const notesFile = notes === null ? null : editor.zip.file(notes);
-  if (notesFile && notesLines(notesFile.asText()).includes(needle)) return `the text ${JSON.stringify(find)} is in the speaker notes of slide ${slide}, which a slide text op does not edit (replace_notes and remove_notes do)`;
-  return `the text ${JSON.stringify(find)} is not on slide ${slide}`;
+  if (notesFile && paragraphLines(notesFile.asText()).includes(needle)) return `the text ${JSON.stringify(find)} is in the speaker notes of slide ${slide}, which a slide text op does not edit (replace_notes and remove_notes do)`;
+  const miss = {
+    where: `on slide ${slide}`,
+    notText: "text on the slide",
+    what: "a slide text op",
+    slide,
+  };
+  return partMissReason(miss, xml, find) ?? `the text ${JSON.stringify(find)} is not ${miss.where}`;
 }
 
 // The pptx text ops over one part: every occurrence of `find` in a matching
 // paragraph's joined text is rewritten, the replacement taking the formatting of
 // the run it starts in. `replacing` is what tells a replace op from a remove one,
-// and `missing` words the refusal a search that found nothing states.
+// and `missing` words the refusal a search that found nothing states, handed the
+// part's text as this edit found it.
 function editPartText(editor, part, edit, replacing, missing) {
   const find = editText(edit && edit.find, "find");
   if (!find) throw new UsageError("find must not be empty");
@@ -5766,9 +6045,12 @@ function editPartText(editor, part, edit, replacing, missing) {
       const offsets = occurrences(slots.map((slot) => xmlUnescape(slot.raw)).join(""), find);
       if (!offsets.length) return undefined;
       found = true;
+      // A rewrite must not bridge a tab or a line break the joined text skips
+      // over (see `requireNoBridgedMarkup`).
+      requireNoBridgedMarkup(paragraph, slots, offsets, find, BRIDGED_MARKUP["a:"]);
       return replaceOccurrences(paragraph, runs, slots, offsets, replacement, editor.note, "a:").xml;
     });
-    if (!found) throw new UsageError(missing(find));
+    if (!found) throw new UsageError(missing(find, xml));
     return out;
   });
 }
@@ -5778,7 +6060,7 @@ function editPartText(editor, part, edit, replacing, missing) {
 // diagram's text give it (see `slideFindRefusal`).
 function editSlideText(editor, edit, op) {
   const part = addressedSlide(editor.zip, edit.slide);
-  editPartText(editor, part, edit, op === "replace_text", (find) => slideFindRefusal(editor, part, find, edit.slide));
+  editPartText(editor, part, edit, op === "replace_text", (find, xml) => slideFindRefusal(editor, xml, part, find, edit.slide));
 }
 
 // The run markup a new paragraph takes: the anchor's own first-run properties,
@@ -5829,7 +6111,7 @@ function addSlideParagraph(editor, edit) {
         const frames = tagSpans(xml, SLIDE_FRAME);
         const buried = slideParagraphs(xml).find((candidate) => frames.some((frame) => frame.start < candidate.start && candidate.end < frame.end) && slideParagraphText(xml.slice(candidate.start, candidate.end)).includes(after));
         if (buried) throw new UsageError(`the text ${JSON.stringify(after)} is inside a table on slide ${edit.slide}: add_paragraph writes into the slide's own text, not into a table`);
-        throw new UsageError(slideFindRefusal(editor, part, after, edit.slide));
+        throw new UsageError(slideFindRefusal(editor, xml, part, after, edit.slide));
       }
       anchor = xml.slice(span.start, span.end);
       at = span.end;
@@ -5865,7 +6147,7 @@ function removeSlideParagraphs(editor, edit) {
   editor.part(part, (xml) => {
     const spans = slideParagraphs(xml);
     const matched = new Set(spans.filter((span) => slideParagraphText(xml.slice(span.start, span.end)).includes(find)).map((span) => span.start));
-    if (!matched.size) throw new UsageError(slideFindRefusal(editor, part, find, edit.slide));
+    if (!matched.size) throw new UsageError(slideFindRefusal(editor, xml, part, find, edit.slide));
     // The paragraphs of each text body, so a body whose every paragraph goes is
     // caught before any of them is dropped. Both lists are in part order and
     // neither kind nests, so the body holding a paragraph is the first one that
@@ -6326,12 +6608,18 @@ function addSlideNotes(editor, edit) {
 }
 
 // The refusal a notes edit that searched and found nothing states. Notes hold no
-// diagram, so a reader's label is the only false lead the notes can hold: a
-// `find` naming one says so rather than passing it off as text the notes lack.
-const missingNotesFind = (find, slide) => {
-  const label = namedSlideLabel(find, slide);
-  if (label !== undefined) return `the text ${JSON.stringify(find)} is not in the speaker notes of slide ${slide}: ${JSON.stringify(label)} is a label the reader prints, not text in the notes`;
-  return `the text ${JSON.stringify(find)} is not in the speaker notes of slide ${slide}`;
+// diagram, so the reasons are the ones every part gives (see `partMissReason`) —
+// each verified against the notes part's own text — and a `find` naming one says
+// so rather than passing it off as text the notes lack. `xml` is the notes part as
+// this edit found it.
+const missingNotesFind = (find, xml, slide) => {
+  const miss = {
+    where: `in the speaker notes of slide ${slide}`,
+    notText: "text in the notes",
+    what: "a notes edit",
+    slide,
+  };
+  return partMissReason(miss, xml, find) ?? `the text ${JSON.stringify(find)} is not ${miss.where}`;
 };
 
 // `pptx_edit`'s `replace_notes`/`remove_notes`: the notes are plain text, so a
@@ -6344,7 +6632,7 @@ function editSlideNotes(editor, edit, op) {
   if (!notes || !editor.zip.file(notes)) {
     throw new UsageError(`slide ${edit.slide} has no speaker notes to ${op === "replace_notes" ? "replace text in" : "remove text from"}`);
   }
-  editPartText(editor, notes, edit, op === "replace_notes", (find) => missingNotesFind(find, edit.slide));
+  editPartText(editor, notes, edit, op === "replace_notes", (find, xml) => missingNotesFind(find, xml, edit.slide));
 }
 
 // The children of a run-properties body at its own level: `<a:ln>` holds a
@@ -6568,7 +6856,7 @@ function formatSlideText(editor, edit) {
       }
       return element;
     });
-    if (!found) throw new UsageError(slideFindRefusal(editor, part, find, edit.slide));
+    if (!found) throw new UsageError(slideFindRefusal(editor, xml, part, find, edit.slide));
     return out;
   });
 }

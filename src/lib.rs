@@ -57,6 +57,9 @@ pub(crate) mod pdf_marks;
 pub mod pipeline;
 pub(crate) mod prompt;
 pub mod providers;
+/// The marks every document reader prints: the block headers, the unit marks
+/// and the story names shared by the OOXML readers and the legacy one.
+pub(crate) mod reader_output;
 pub(crate) mod research_cancel;
 pub mod research_cleanup;
 pub(crate) mod retry;
