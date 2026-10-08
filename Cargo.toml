@@ -203,8 +203,9 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 #                 panic is contained to that page.
 #   hayro       — PDF structure walk, filter chain and page rasterizer
 #                 (Apache-2.0 OR MIT); supplies the page list, reports an
-#                 encrypted document and decodes both rasterized pages and the
-#                 embedded images of text pages.
+#                 encrypted document, decodes both rasterized pages and the
+#                 embedded images of text pages, and carries the annotation and
+#                 AcroForm dictionaries a document's marks are read from.
 #   quick-xml   — XML reader for every OOXML package part: the .docx body,
 #                 .xlsx sheets/shared strings and .pptx slides/notes (MIT).
 #   office_oxide — readers for the legacy binary Word/Excel/PowerPoint formats

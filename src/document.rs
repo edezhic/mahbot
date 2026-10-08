@@ -8,9 +8,10 @@
 //! whether a file is one of the containers this module extracts from.
 //!
 //! Format detection and the PDF arm live here; the ZIP-container OOXML formats
-//! (Word, Excel, PowerPoint) live in [`crate::ooxml`], and their pre-OOXML
-//! binary ancestors (`.doc`/`.xls`/`.ppt`, a CFB container) in
-//! [`crate::legacy`].
+//! (Word, Excel, PowerPoint) live in [`crate::ooxml`], their pre-OOXML binary
+//! ancestors (`.doc`/`.xls`/`.ppt`, a CFB container) in [`crate::legacy`], and the
+//! marks a PDF's pages carry (annotations and filled form fields) in
+//! [`crate::pdf_marks`].
 //!
 //! # Invariants
 //!
@@ -32,10 +33,11 @@
 //!   only contained at the caller's blocking boundary (as
 //!   [`DocOutcome::Unreadable`], losing the text pass with it). The bounds this
 //!   module declares are its own (see `embedded_image_jpeg`), not the decoders'.
-//! - **One page never costs another.** Text comes from every page the reader can
-//!   produce it for; the pages it cannot are rasterized so the document is still
-//!   delivered, and named in a note, because a page whose text could not be read
-//!   is not a page that has none.
+//! - **One page never costs another.** Every page that produced any text
+//!   contributes it, however short, and a page whose text could not be read is
+//!   named in a note; the pages without a usable text layer are rasterized so the
+//!   document is still delivered, because a page whose text could not be read is
+//!   not a page that has none.
 //! - **Content-first detection.** Magic bytes decide the format; the extension
 //!   only disambiguates formats that share a container (a ZIP is a
 //!   `.docx`/`.xlsx`/`.pptx`, and a CFB is an encrypted OOXML package or a
@@ -66,9 +68,10 @@ use std::path::{Path, PathBuf};
 /// Maximum extracted-text length (Unicode chars) inlined into the message.
 pub(crate) const INLINE_TEXT_MAX_CHARS: usize = 5000;
 
-/// Minimum trimmed text-layer length for a page to count as having real text.
-/// Shorter than this is page-number/decoration noise or whitespace, so the page
-/// is treated as imageless-of-text and rendered instead.
+/// Minimum text-layer length for a page to need no image of itself: at least this
+/// many characters. Shorter than this is page-number/decoration noise or
+/// whitespace, so such a page is rasterized as well — its text is delivered
+/// either way (see [`is_usable_page_text`]).
 const MIN_PAGE_TEXT_CHARS: usize = 16;
 
 /// Target pixel size of the long side of a rasterized page.
@@ -324,11 +327,15 @@ pub(crate) async fn convert_document_file(
     }
 }
 
-/// Extract text, page rasters and embedded images from a PDF: a page whose text
-/// layer the reader can produce is inlined together with every image XObject
-/// that can be decoded from it — and every inline image its content stream
-/// paints — while every other page is rasterized at the scale bounded by
-/// [`RASTER_LONG_SIDE_PX`] instead, which already carries its embedded images.
+/// Extract text, page rasters and embedded images from a PDF: every page that
+/// produced any text comes back as a `Page <n>:` block, in page order, however
+/// short. A page whose text layer the reader can produce also has every image
+/// XObject that can be decoded from it inlined — and every inline image its
+/// content stream paints — while a page without a usable text layer is
+/// rasterized at the scale bounded by [`RASTER_LONG_SIDE_PX`] instead, which
+/// already carries its embedded images. The document's annotations and filled
+/// form fields follow the pages as `Annotations:`/`Form fields:` sections, read
+/// by [`crate::pdf_marks`].
 ///
 /// The text pass is per page ([`PdfTextReader`]), so a page the reader cannot
 /// read costs that page and nothing else: the pages around it keep their text,
@@ -368,7 +375,7 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
 
     ensure_out_dir(out_dir);
 
-    let mut text_pages: Vec<String> = Vec::new();
+    let mut blocks: Vec<String> = Vec::new();
     let mut images: Vec<PathBuf> = Vec::new();
     // Embedded images left out of the conversion on text pages: such a page is
     // never rasterized, so without one aggregated note per cause they would
@@ -405,21 +412,23 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         };
         // Trim so the "\n\n" join does not double up with the extractor's own
         // trailing whitespace.
-        let kept = is_usable_page_text(&text).then(|| text.trim().to_string());
+        let text = text.trim();
+        let has_text = !text.is_empty();
+        // Any text the page produced is content, however short and however the
+        // page ended: it is kept under the page's own label in every branch.
+        if has_text {
+            blocks.push(page_block(page_number, text));
+        }
         if failed {
-            // The page is named, and delivered as an image too, because its text
-            // stops where the reader did — but what it produced first is still
-            // the document's to keep.
-            match kept {
-                Some(text) => {
-                    text_pages.push(text);
-                    unread.partial.push(page_number);
-                }
-                None => unread.lost.push(page_number),
+            // The page's text stops where the reader did, so an image carries the
+            // rest, and the page is named as one that could not be read.
+            if has_text {
+                unread.partial.push(page_number);
+            } else {
+                unread.lost.push(page_number);
             }
             rasterize_page(page, page_number, out_dir, &mut images, &mut unrendered);
-        } else if let Some(text) = kept {
-            text_pages.push(text);
+        } else if is_usable_page_text(text) {
             if let Some(page) = page {
                 write_embedded_images(
                     page,
@@ -431,8 +440,8 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
                 );
             }
         } else {
-            // No usable text — no text layer at all, or a page the reader does
-            // not know: delivered as a page image, exactly as before.
+            // No usable text layer, so the page is rendered exactly as before —
+            // and the text it does have is kept beside it.
             rasterize_page(page, page_number, out_dir, &mut images, &mut unrendered);
         }
     }
@@ -444,11 +453,19 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
             "document: pages with no page-tree entry could not be delivered as images"
         );
     }
-    // The unread pages lead: they qualify the text and the pages below them.
+    // The marks the pages carry (comments, filled form fields) are document
+    // content too: they follow the pages, each naming its own page, and are
+    // never gated on what happened to the page text. A document whose page
+    // structure could not be parsed at all has no marks to read.
+    let marks = pdf.as_ref().map(crate::pdf_marks::read).unwrap_or_default();
+    // The unread pages lead: they qualify the text and the notes below them.
     let mut notes = unread.notes();
+    notes.extend(marks.notes);
     notes.extend(skipped.notes());
+    blocks.extend(marks.annotations);
+    blocks.extend(marks.fields);
     DocOutcome::Text {
-        text: text_pages.join("\n\n"),
+        text: blocks.join("\n\n"),
         images,
         notes,
         all_page_text_lost: unread.lost_all_page_text(),
@@ -1398,11 +1415,24 @@ pub(crate) fn ensure_out_dir(out_dir: &Path) {
     }
 }
 
-/// A page's text layer counts only when trimming leaves at least
-/// [`MIN_PAGE_TEXT_CHARS`] characters — the same rule that decides what a page
-/// which failed mid-way still contributes (see [`convert_pdf`]).
+/// Whether a page's text layer is long enough that the page needs no image of
+/// itself: at least [`MIN_PAGE_TEXT_CHARS`] characters of `text`, as the caller
+/// trimmed it. This is only the *rasterization* trigger — a page it rejects is
+/// delivered as an image, and the text that page produced is delivered beside it
+/// (see [`convert_pdf`]).
 fn is_usable_page_text(text: &str) -> bool {
-    text.trim().chars().count() >= MIN_PAGE_TEXT_CHARS
+    text.chars().count() >= MIN_PAGE_TEXT_CHARS
+}
+
+/// One page's block: the page's own physical number — the numbering the raster
+/// file names and the notes use — and the page's text. The text stays verbatim
+/// rather than indented under the label (as the OOXML arms' blocks indent
+/// theirs), because it is the document's own text and is copied out of the
+/// answer as often as it is read. Only a page that produced text gets a block: a
+/// page that produced none is delivered as an image and named by the notes, and
+/// a label for it would make a document without text look like one with some.
+fn page_block(page_number: usize, text: &str) -> String {
+    format!("Page {page_number}:\n{text}")
 }
 
 /// Whether `bytes` are text-like with no container magic: valid UTF-8 and no
@@ -1491,6 +1521,119 @@ pub(crate) mod test_fixtures {
     pub(crate) fn pdf_with_all_pages_failing_midway() -> Vec<u8> {
         let page = ("/MediaBox [0 0 612 792]", PAGE_THAT_FAILS_MIDWAY);
         multi_page_pdf(&[page, page])
+    }
+
+    /// A PDF under construction, assembled by [`assemble_pdf`] (which numbers
+    /// objects from 1, so a body can reference any other by its number). Object 1
+    /// is reserved for the catalog [`build`](PdfFixture::build) writes last,
+    /// because the trailer's `/Root` must point at object 1 while the entries it
+    /// carries (a page tree, a form) are only known once the objects they name
+    /// exist.
+    ///
+    /// A fixture neither validates PDF syntax nor the references a body writes:
+    /// it only refuses a body set twice or left missing, so a typo in a test is
+    /// loud instead of a silently different PDF.
+    pub(crate) struct PdfFixture {
+        /// One slot per object, index 0 holding object 1; `None` is reserved
+        /// but not yet written.
+        bodies: Vec<Option<Vec<u8>>>,
+    }
+
+    impl PdfFixture {
+        #[must_use]
+        pub(crate) fn new() -> Self {
+            // Slot 0 is object 1, the catalog, which `build` writes.
+            Self { bodies: vec![None] }
+        }
+
+        /// Reserve the next object number and return its `"{n} 0 R"` reference.
+        pub(crate) fn reserve(&mut self) -> String {
+            self.bodies.push(None);
+            format!("{} 0 R", self.bodies.len())
+        }
+
+        /// Write `body` as the body of the object `reference` names (which must
+        /// not already have one), so a page can name a page tree written after it.
+        pub(crate) fn set(&mut self, reference: &str, body: String) {
+            let number = reference
+                .split(' ')
+                .next()
+                .and_then(|number| number.parse::<usize>().ok())
+                .filter(|number| (2..=self.bodies.len()).contains(number))
+                .unwrap_or_else(|| panic!("PDF fixture reference {reference} was never reserved"));
+            let slot = &mut self.bodies[number - 1];
+            assert!(
+                slot.is_none(),
+                "PDF fixture object {number} already has a body"
+            );
+            *slot = Some(body.into_bytes());
+        }
+
+        /// Reserve, write and return a reference — [`reserve`](Self::reserve) +
+        /// [`set`](Self::set) in one.
+        pub(crate) fn push(&mut self, body: String) -> String {
+            let reference = self.reserve();
+            self.set(&reference, body);
+            reference
+        }
+
+        /// Write the catalog as object 1 with `entries` (beside `/Type /Catalog`)
+        /// and assemble the PDF.
+        pub(crate) fn build(mut self, entries: &str) -> Vec<u8> {
+            assert!(
+                self.bodies[0].is_none(),
+                "PDF fixture object 1 is the catalog"
+            );
+            self.bodies[0] = Some(format!("<< /Type /Catalog {entries} >>").into_bytes());
+            let objects = self
+                .bodies
+                .into_iter()
+                .map(|body| body.unwrap_or_else(|| panic!("PDF fixture object body missing")))
+                .collect::<Vec<_>>();
+            assemble_pdf(&objects)
+        }
+    }
+
+    /// A one-page PDF on `fixture` — whose already-pushed objects `page_entries`
+    /// and `catalog_extra` can name — with a Helvetica font resource, `content` as
+    /// the page's content stream, `page_entries` merged into the page dictionary
+    /// and `catalog_extra` into the catalog beside the page tree. The `/MediaBox`
+    /// is the caller's: a fixture whose page must fail the reader leaves it out.
+    pub(crate) fn one_page_pdf(
+        mut fixture: PdfFixture,
+        content: &[u8],
+        page_entries: &str,
+        catalog_extra: &str,
+    ) -> Vec<u8> {
+        let font =
+            fixture.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+        let contents = fixture.push(format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            String::from_utf8_lossy(content)
+        ));
+        let page = fixture.reserve();
+        let pages = fixture.push(format!("<< /Type /Pages /Kids [{page}] /Count 1 >>"));
+        fixture.set(
+            &page,
+            format!(
+                "<< /Type /Page /Parent {pages} /Resources << /Font << /F1 {font} >> >> \
+                 /Contents {contents}{page_entries} >>"
+            ),
+        );
+        fixture.build(&format!("/Pages {pages}{catalog_extra}"))
+    }
+
+    /// A PDF literal string holding `text`: hex-encoded UTF-16BE with a BOM,
+    /// which is how a producer writes text a reader must not have to guess the
+    /// encoding of — the shape every non-ASCII annotation and form value in the
+    /// tests takes.
+    pub(crate) fn pdf_text_string(text: &str) -> String {
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        format!("<{}>", crate::util::hex_string(&bytes))
     }
 }
 
@@ -2070,15 +2213,25 @@ mod tests {
         else {
             panic!("expected Text outcome for a PDF whose pages partly read");
         };
-        assert!(text.contains("Page one text long enough"), "{text:?}");
-        assert!(text.contains("Page three text long enough"), "{text:?}");
         assert!(
-            text.contains("Kept page text long enough"),
-            "what a page produced before it failed is kept: {text:?}"
+            text.contains("Page 1:\nPage one text long enough"),
+            "page 1 carries its own label: {text:?}"
+        );
+        assert!(
+            text.contains("Page 3:\nPage three text long enough"),
+            "page 3 carries its own label: {text:?}"
+        );
+        assert!(
+            text.contains("Page 4:\nKept page text long enough"),
+            "what a page produced before it failed is kept under its label: {text:?}"
         );
         assert!(
             !text.contains("Page two text long enough"),
             "the reader panics on page 2 before reading it: {text:?}"
+        );
+        assert!(
+            !text.contains("Page 2:"),
+            "the page whose text was lost gets no label: {text:?}"
         );
         assert_eq!(
             images,
@@ -2288,6 +2441,132 @@ mod tests {
         assert!(
             long_side <= target && long_side > target - 5.0,
             "long side {long_side} must be the RASTER_LONG_SIDE_PX target"
+        );
+    }
+
+    /// Every page that produced text is labeled with its own physical number,
+    /// however short the text: a page below [`MIN_PAGE_TEXT_CHARS`] is still
+    /// rasterized exactly as before, and its text is kept beside the image.
+    #[test]
+    fn pdf_labels_each_page_that_produced_text_and_keeps_the_short_ones() {
+        let bytes = multi_page_pdf(&[
+            (
+                "/MediaBox [0 0 612 792]",
+                b"BT /F1 24 Tf 72 700 Td (Page one text long enough) Tj ET",
+            ),
+            (
+                "/MediaBox [0 0 612 792]",
+                b"0.1 0.5 0.9 rg 0 0 612 792 re f",
+            ),
+            (
+                "/MediaBox [0 0 612 792]",
+                b"BT /F1 24 Tf 72 700 Td (Hi) Tj ET",
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = convert_document(&bytes, "report.pdf", dir.path());
+        let DocOutcome::Text {
+            text,
+            images,
+            notes,
+            all_page_text_lost,
+        } = outcome
+        else {
+            panic!("expected Text outcome for a report with a short text page");
+        };
+        assert_eq!(
+            text, "Page 1:\nPage one text long enough\n\nPage 3:\nHi",
+            "each page that produced text is labeled with its own number, and the \
+             text-free page gets none"
+        );
+        assert_eq!(
+            images,
+            vec![dir.path().join("page_2.jpg"), dir.path().join("page_3.jpg")],
+            "the text-free page and the short page are both rasterized"
+        );
+        assert!(notes.is_empty(), "nothing failed: {notes:?}");
+        assert!(!all_page_text_lost);
+    }
+
+    /// The marks a PDF carries are document content too: the annotations and the
+    /// filled form values follow the page blocks, each naming its own page.
+    #[test]
+    fn pdf_delivers_annotations_and_form_values_as_document_text() {
+        const CONTENT: &[u8] = b"BT /F1 24 Tf 72 700 Td (Page one text long enough) Tj ET";
+        let mut fixture = PdfFixture::new();
+        let highlight = fixture.push(format!(
+            "<< /Subtype /Highlight /T {} /Contents {} >>",
+            pdf_text_string("Иван Петров"),
+            pdf_text_string("проверьте третью фигуру")
+        ));
+        let field = fixture.push(
+            "<< /Subtype /Widget /FT /Tx /T (Name) /V (value) /Rect [0 0 0 0] >>".to_string(),
+        );
+        let acroform = fixture.push(format!("<< /Fields [{field}] >>"));
+        let bytes = one_page_pdf(
+            fixture,
+            CONTENT,
+            &format!("/MediaBox [0 0 612 792] /Annots [{highlight} {field}]"),
+            &format!(" /AcroForm {acroform}"),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = convert_document(&bytes, "form.pdf", dir.path());
+        let DocOutcome::Text {
+            text,
+            images,
+            notes,
+            ..
+        } = outcome
+        else {
+            panic!("expected Text outcome for a PDF with marks");
+        };
+        assert_eq!(
+            text,
+            "Page 1:\nPage one text long enough\n\nAnnotations:\n\
+             highlight (Иван Петров) on page 1:\n  проверьте третью фигуру\n\n\
+             Form fields:\nName on page 1: value"
+        );
+        assert!(
+            images.is_empty(),
+            "the text page is delivered as text, not rasterized: {images:?}"
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// A page whose text layer is absent still delivers the form values it
+    /// carries: the marks are never gated on the page text, and nothing counts
+    /// as lost — the page simply has no text.
+    #[test]
+    fn pdf_whose_pages_have_no_text_still_delivers_its_form_values() {
+        const CONTENT: &[u8] = b"0.1 0.5 0.9 rg 0 0 612 792 re f";
+        let mut fixture = PdfFixture::new();
+        let field = fixture.push(
+            "<< /Subtype /Widget /FT /Tx /T (Name) /V (value) /Rect [0 0 0 0] >>".to_string(),
+        );
+        let acroform = fixture.push(format!("<< /Fields [{field}] >>"));
+        let bytes = one_page_pdf(
+            fixture,
+            CONTENT,
+            &format!("/MediaBox [0 0 612 792] /Annots [{field}]"),
+            &format!(" /AcroForm {acroform}"),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = convert_document(&bytes, "scan.pdf", dir.path());
+        let DocOutcome::Text {
+            text,
+            images,
+            notes,
+            all_page_text_lost,
+        } = outcome
+        else {
+            panic!("expected Text outcome for a scan with a form");
+        };
+        assert_eq!(text, "Form fields:\nName on page 1: value");
+        assert_eq!(images, vec![dir.path().join("page_1.jpg")]);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(
+            !all_page_text_lost,
+            "the page has no text, so none was lost"
         );
     }
 }

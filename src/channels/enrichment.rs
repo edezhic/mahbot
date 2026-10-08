@@ -565,11 +565,14 @@ async fn handle_file(
             notes,
             all_page_text_lost,
         } => {
-            // The reader failed on every page it was asked for, so the document
-            // delivered no text at all: the notes below name those pages, and the
+            // The reader failed on every page it was asked for, so the pages
+            // carry no text of their own: the notes below name them, and the
             // "no text could be extracted" sentence — which would report a reader
-            // failure as a document without a text layer — is left out.
-            if !all_page_text_lost {
+            // failure as an absence — is left out. Anything else the conversion
+            // read (a comment, a filled field value) is content and is delivered
+            // whatever happened to the page text, so the gate is about what the
+            // conversion actually produced.
+            if !all_page_text_lost || !text.trim().is_empty() {
                 batch.annotations.push(
                     extracted_text_annotation(uploads_dir, name, &text, !images.is_empty()).await,
                 );
@@ -1766,6 +1769,79 @@ mod tests {
         assert!(
             !msg.content.contains(crate::document::NO_TEXT_NOTE),
             "delivered text must never be reported as a document without one, got: {}",
+            msg.content
+        );
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
+    }
+
+    /// A one-page PDF whose page has no `/MediaBox` — the shape the text reader
+    /// panics on, so every page's text is lost — but which carries a highlight
+    /// with a Russian comment and author, and one filled form field whose widget
+    /// is on that page.
+    fn pdf_marks_with_every_page_text_lost() -> Vec<u8> {
+        use crate::document::test_fixtures::{PdfFixture, one_page_pdf, pdf_text_string};
+        const CONTENT: &[u8] = b"0.1 0.5 0.9 rg 0 0 612 792 re f";
+        let mut fixture = PdfFixture::new();
+        let highlight = fixture.push(format!(
+            "<< /Subtype /Highlight /T {} /Contents {} >>",
+            pdf_text_string("Иван Петров"),
+            pdf_text_string("проверьте третью фигуру")
+        ));
+        let field = fixture.push(format!(
+            "<< /Subtype /Widget /FT /Tx /T (Name) /V {} /Rect [0 0 0 0] >>",
+            pdf_text_string("Иван Петров")
+        ));
+        let acroform = fixture.push(format!("<< /Fields [{field}] >>"));
+        // No `/MediaBox` in the page dictionary: the reader panics on this page.
+        one_page_pdf(
+            fixture,
+            CONTENT,
+            &format!("/Annots [{highlight} {field}]"),
+            &format!(" /AcroForm {acroform}"),
+        )
+    }
+
+    /// Every page's text lost, yet the document carries marks: the marks are
+    /// content, so the attachment path must deliver them — dropping the only
+    /// text the document has is exactly the loss this covers — while the page
+    /// itself still comes back as an image.
+    #[tokio::test]
+    async fn enrich_file_delivers_marks_when_every_page_text_was_lost() {
+        let (tmp_root, ws_path, _msg_dir, attachment) = inbound_ingest_fixture(
+            "test_enrich_file_marks_only_pdf",
+            7023,
+            "marked.pdf",
+            &pdf_marks_with_every_page_text_lost(),
+        )
+        .await;
+        let marker = format!("Read [FILE:{}] please", attachment.display());
+
+        let mut msg = inbound_msg(7023, &marker);
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
+
+        assert!(
+            msg.content
+                .contains("highlight (Иван Петров) on page 1:\n  проверьте третью фигуру"),
+            "the annotation must survive the lost page text, got: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("Name on page 1: Иван Петров"),
+            "the filled field must survive the lost page text, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains(crate::document::NO_TEXT_NOTE),
+            "delivered marks are text, not a document without one, got: {}",
+            msg.content
+        );
+        assert_eq!(
+            msg.content
+                .matches("[IMAGE:data:image/jpeg;base64,")
+                .count(),
+            1,
+            "the page whose text was lost still comes back as an image, got: {}",
             msg.content
         );
         // Cleanup

@@ -321,7 +321,9 @@ async fn spill_text(dir: &Path, display: &str, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::test_fixtures::multi_page_pdf;
+    use crate::document::test_fixtures::{
+        PdfFixture, multi_page_pdf, one_page_pdf, pdf_text_string,
+    };
     use crate::ooxml::test_fixtures::{DOCX_BODY, zip_fixture};
     use tempfile::TempDir;
 
@@ -404,6 +406,25 @@ mod tests {
     fn pdf_with_no_media_box() -> Vec<u8> {
         // An empty entry list is what leaves the page without a `/MediaBox`.
         multi_page_pdf(&[("", b"BT /F1 24 Tf 72 700 Td (Page text long enough) Tj ET")])
+    }
+
+    /// A one-page PDF with a painted rectangle, no text layer, and an AcroForm
+    /// carrying one filled text field whose widget is on that page: the page is
+    /// text-free, so its only readable content is the field value.
+    fn pdf_scan_with_only_a_form_value() -> Vec<u8> {
+        const CONTENT: &[u8] = b"0.1 0.5 0.9 rg 0 0 612 792 re f";
+        let mut fixture = PdfFixture::new();
+        let field = fixture.push(format!(
+            "<< /Subtype /Widget /FT /Tx /T (Name) /V {} /Rect [0 0 0 0] >>",
+            pdf_text_string("Иван Петров")
+        ));
+        let acroform = fixture.push(format!("<< /Fields [{field}] >>"));
+        one_page_pdf(
+            fixture,
+            CONTENT,
+            &format!("/MediaBox [0 0 612 792] /Annots [{field}]"),
+            &format!(" /AcroForm {acroform}"),
+        )
     }
 
     /// The path a spilled-text line points at.
@@ -513,6 +534,41 @@ mod tests {
             out.image_payloads.len(),
             1,
             "the page that could not be read comes back as an image: {}",
+            out.text
+        );
+    }
+
+    /// A scan whose page has no text layer but whose form carries a value is not
+    /// an empty document: the value is text, delivered as the `Form fields:`
+    /// section, so neither "no text" sentence applies.
+    #[tokio::test]
+    async fn a_scan_that_carries_only_form_values_is_not_an_empty_document() {
+        let owner = SpillOwner::new();
+        let (_dir, ws) = temp_workspace(&[("filled.pdf", &pdf_scan_with_only_a_form_value())]);
+
+        let out = convert(&owner, &ws, "filled.pdf", false)
+            .await
+            .expect("a .pdf is a document");
+        assert_eq!(
+            out.image_payloads.len(),
+            1,
+            "the text-free page is rasterized: {}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("Form fields:\nName on page 1: Иван Петров"),
+            "the filled value is the document's text: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains(crate::document::NO_TEXT_NOTE),
+            "a document that delivered a field value is not one without text: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains(crate::document::NO_TEXT_LAYER_NOTE),
+            "the value is text, not a raster-only document: {}",
             out.text
         );
     }

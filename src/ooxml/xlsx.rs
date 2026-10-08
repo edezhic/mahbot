@@ -47,7 +47,7 @@ use super::{
     resolve_part, scan_elements, text_block, text_lines, unreadable, write_media_parts,
 };
 use crate::document::{DocOutcome, SkippedImages, ensure_out_dir};
-use crate::util::is_line_break;
+use crate::util::one_line;
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use std::cmp::Reverse;
@@ -904,31 +904,6 @@ impl Comment {
 /// A text as one line: every run of whitespace becomes one space.
 fn flatten(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// A cell's text as the one line its cell gets: a line break a value carries would
-/// otherwise stand as a break in the answer, breaking the one-line-per-cell shape
-/// this reading promises and letting a document's text stand where this reader's
-/// lines do. Every break a text stack may take is escaped as `\n`, which a value
-/// carrying a backslash and an `n` of its own reads the same as — one line per cell
-/// leaves no other spelling.
-fn one_line(text: String) -> String {
-    if !text.chars().any(is_line_break) {
-        return text;
-    }
-    let mut out = String::with_capacity(text.len() + 4);
-    let mut characters = text.chars().peekable();
-    while let Some(character) = characters.next() {
-        match character {
-            '\r' => {
-                characters.next_if_eq(&'\n');
-                out.push_str("\\n");
-            }
-            _ if is_line_break(character) => out.push_str("\\n"),
-            _ => out.push(character),
-        }
-    }
-    out
 }
 
 /// The comments in a legacy `xl/comments<N>.xml` part: its `commentList` entries,

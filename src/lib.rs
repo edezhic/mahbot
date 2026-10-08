@@ -51,6 +51,9 @@ pub(crate) mod onnx;
 /// OOXML package reading (Word/Excel/PowerPoint): the ZIP-container arm of the
 /// shared document converter ([`crate::document`]).
 pub(crate) mod ooxml;
+/// PDF marks (annotations and filled form fields): the annotation/form arm of
+/// the shared document converter ([`crate::document`]).
+pub(crate) mod pdf_marks;
 pub mod pipeline;
 pub(crate) mod prompt;
 pub mod providers;

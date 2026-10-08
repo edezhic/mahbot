@@ -1256,6 +1256,31 @@ pub(crate) fn is_line_break(character: char) -> bool {
     )
 }
 
+/// `text` as one line, for a value or a name taken from an untrusted document:
+/// every break a text stack may take ([`is_line_break`]) becomes `\n`, so a
+/// document's own text cannot stand where this reader's lines do. A value carrying
+/// a backslash and an `n` of its own reads the same as an escaped break — one line
+/// leaves no other spelling.
+#[must_use]
+pub(crate) fn one_line(text: String) -> String {
+    if !text.chars().any(is_line_break) {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len() + 4);
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                characters.next_if_eq(&'\n');
+                out.push_str("\\n");
+            }
+            _ if is_line_break(character) => out.push_str("\\n"),
+            _ => out.push(character),
+        }
+    }
+    out
+}
+
 /// Neutralize a name taken from an untrusted source before reuse: every control
 /// character, every break a text stack may take ([`is_line_break`], whose two line
 /// separators are no control characters), both path separators, and the `[`/`]` a
