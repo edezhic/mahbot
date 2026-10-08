@@ -3354,10 +3354,14 @@ mod tests {
             .expect("a readable package")
     }
 
+    /// The package's PARTS, folder entries apart: a folder states itself by a
+    /// name ending in `/`, which a zip may carry, and a folder's own entry is not
+    /// a part — nothing is looked up by that name and it holds no bytes.
     fn zip_names(path: &Path) -> Vec<String> {
         let mut archive = open_zip(path);
         let mut names: Vec<String> = (0..archive.len())
             .map(|index| archive.by_index(index).expect("entry").name().to_string())
+            .filter(|name| !name.ends_with('/'))
             .collect();
         names.sort();
         names
@@ -4062,6 +4066,428 @@ mod tests {
         assert!(
             slides.contains("Slide 1 notes:") && slides.contains("Заметка"),
             "the presenter notes must be delivered separately: {slides}"
+        );
+    }
+
+    /// The `<p:sp>` shape named `name` in a slide part, taken whole — the shape a
+    /// title is declared in, read out so its own frame and formatting can be
+    /// asserted on.
+    fn named_shape<'a>(xml: &'a str, name: &str) -> &'a str {
+        let needle = format!("name=\"{name}\"");
+        let at = xml
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no shape named {name} in: {xml}"));
+        let start = xml[..at].rfind("<p:sp>").expect("a shape open tag");
+        let close = at + xml[at..].find("</p:sp>").expect("a shape close tag") + "</p:sp>".len();
+        &xml[start..close]
+    }
+
+    /// The whole `name` element in `xml`, its body with it, or the self-closing
+    /// tag on its own when it has none.
+    fn element_named<'a>(xml: &'a str, name: &str) -> &'a str {
+        let at = xml
+            .find(&format!("<{name}"))
+            .unwrap_or_else(|| panic!("no <{name}> in: {xml}"));
+        let element = &xml[at..];
+        let open_end = element.find('>').expect("an element open tag");
+        if element.as_bytes()[open_end - 1] == b'/' {
+            return &element[..=open_end];
+        }
+        let close = format!("</{name}>");
+        let end = element.find(&close).expect("an element close tag") + close.len();
+        &element[..end]
+    }
+
+    /// `name`'s open tag in `xml`, a self-closing slash dropped, so an element one
+    /// writer opens and closes (`<x></x>`) and one the other self-closes (`<x/>`)
+    /// read alike.
+    fn open_tag(xml: &str, name: &str) -> String {
+        let at = xml
+            .find(&format!("<{name}"))
+            .unwrap_or_else(|| panic!("no <{name}> in: {xml}"));
+        let open_end = at + xml[at..].find('>').expect("an element open tag");
+        let tag = &xml[at..=open_end];
+        tag.strip_suffix("/>")
+            .map_or_else(|| tag.to_string(), |head| format!("{head}>"))
+    }
+
+    /// The formatting a slide's title shape states, as one string both writers
+    /// spell alike: the frame, the body properties, the paragraph's and the run's
+    /// — the fonts the run states among them.
+    fn title_shape_formatting(shape: &str) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            element_named(shape, "a:xfrm"),
+            open_tag(shape, "a:bodyPr"),
+            element_named(shape, "a:pPr"),
+            element_named(shape, "a:rPr"),
+        )
+    }
+
+    /// The frame, the declaration and the formatting a declared title states: the
+    /// placeholder, the frame in EMU, the vertical centring, the left alignment,
+    /// and the run's size, weight and three fonts.
+    fn assert_declared_title(shape: &str) {
+        assert!(
+            shape.contains(r#"<p:ph type="title"/>"#),
+            "the title shape declares no title placeholder: {shape}"
+        );
+        for fragment in [
+            r#"<a:off x="365760" y="274320"/>"#,
+            r#"<a:ext cx="8412480" cy="731520"/>"#,
+            r#"anchor="ctr""#,
+            r#"algn="l""#,
+            r#"sz="2800""#,
+            r#"b="1""#,
+            r#"<a:latin typeface="+mn-lt"/>"#,
+            r#"<a:ea typeface="+mn-ea"/>"#,
+            r#"<a:cs typeface="+mn-cs"/>"#,
+        ] {
+            assert!(
+                shape.contains(fragment),
+                "the title shape states no {fragment}: {shape}"
+            );
+        }
+    }
+
+    /// Where a relationship's `Target` points: resolved against the directory that
+    /// owns the `.rels` part — `_rels/.rels` against the package root — with `.`
+    /// and `..` applied.
+    fn resolve_relationship_target(rels_part: &str, target: &str) -> String {
+        if let Some(absolute) = target.strip_prefix('/') {
+            return absolute.to_string();
+        }
+        let owner = rels_part
+            .split("_rels/")
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/');
+        let mut parts: Vec<&str> = owner.split('/').filter(|part| !part.is_empty()).collect();
+        for component in target.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        parts.join("/")
+    }
+
+    /// The note count `docProps/app.xml` declares as `<Notes>`.
+    fn notes_count(app: &str) -> u32 {
+        app.split("<Notes>")
+            .nth(1)
+            .and_then(|rest| rest.split("</Notes>").next())
+            .and_then(|value| value.parse().ok())
+            .expect("a <Notes> count in the application properties")
+    }
+
+    /// Whether a part is a relationships part — the one the package states at its
+    /// root (`_rels/.rels`) or one beside a part, always in a `_rels` folder. Read
+    /// off the name rather than `Path::extension`, which reads a name that IS the
+    /// extension (`.rels`) as no extension at all.
+    fn is_relationships_part(name: &str) -> bool {
+        name.split('/').any(|part| part == "_rels") && name.rsplit('.').next() == Some("rels")
+    }
+
+    /// The `ppt/slides/slideN.xml` part whose text holds `needle`.
+    fn slide_part_holding(path: &Path, needle: &str) -> String {
+        zip_names(path)
+            .into_iter()
+            .find(|name| {
+                name.starts_with("ppt/slides/slide")
+                    && Path::new(name).extension().is_some_and(|ext| ext == "xml")
+                    && part_text(path, name).contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no slide part holds {needle}"))
+    }
+
+    /// A created deck's package is sound: every part an `<Override>` declares is
+    /// in the archive and every part has a type — its own `<Override>` or a
+    /// `<Default>` for its extension — every relationship in every `.rels` part
+    /// resolves to a part that exists, and the archive states no folder entry.
+    fn assert_created_deck_parts_resolve(path: &Path) {
+        let mut archive = open_zip(path);
+        let mut names: Vec<String> = Vec::new();
+        let mut text: Vec<(String, String)> = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).expect("entry");
+            let name = entry.name().to_string();
+            assert!(
+                !name.ends_with('/'),
+                "the archive states a folder entry: {name}"
+            );
+            let mut body = String::new();
+            entry.read_to_string(&mut body).expect("read part");
+            names.push(name.clone());
+            text.push((name, body));
+        }
+        let types = text
+            .iter()
+            .find(|(name, _)| name == "[Content_Types].xml")
+            .map(|(_, body)| body.as_str())
+            .expect("the package's content types");
+        let defaults: Vec<&str> = element_children(types, "Types", "Default")
+            .iter()
+            .map(|element| attribute_of(element, "Extension"))
+            .collect();
+        let declared: Vec<String> = element_children(types, "Types", "Override")
+            .iter()
+            .map(|element| {
+                attribute_of(element, "PartName")
+                    .trim_start_matches('/')
+                    .to_string()
+            })
+            .collect();
+        for part in &declared {
+            assert!(
+                names.contains(part),
+                "an <Override> declares the missing part {part}"
+            );
+        }
+        for name in &names {
+            if name == "[Content_Types].xml" {
+                continue;
+            }
+            let extension = name.rsplit('.').next().unwrap_or("");
+            assert!(
+                declared.contains(name)
+                    || defaults
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(extension)),
+                "no <Override> and no <Default> gives {name} a type"
+            );
+        }
+        for (rels, body) in &text {
+            if !is_relationships_part(rels) {
+                continue;
+            }
+            for element in element_children(body, "Relationships", "Relationship") {
+                if attribute_value(element, "TargetMode")
+                    .is_some_and(|mode| mode.eq_ignore_ascii_case("External"))
+                {
+                    continue;
+                }
+                let target = attribute_of(element, "Target");
+                let resolved = resolve_relationship_target(rels, target);
+                assert!(
+                    names.contains(&resolved),
+                    "{rels} names {target}, which resolves to the missing part {resolved}"
+                );
+            }
+        }
+    }
+
+    /// A created deck declares the block that opens a slide as the slide's real
+    /// title — a shape stating the `title` placeholder, its frame and its
+    /// formatting — which the reader shows as a title; a slide a paragraph opens
+    /// is declared nothing of the sort. The package it comes in is sound, and the
+    /// presentation's children follow the format's sequence.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn created_pptx_declares_its_slides_titles() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let path = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "titled",
+                    "content": [
+                        { "type": "paragraph", "text": "Только текст" },
+                        { "type": "heading", "level": 1, "text": "Заголовок" },
+                    ],
+                }),
+            )
+            .await,
+        );
+
+        // A slide a paragraph opens is no title at all.
+        let untitled = part_text(&path, "ppt/slides/slide1.xml");
+        assert!(
+            !untitled.contains("<p:ph"),
+            "the title-less slide declares a placeholder: {untitled}"
+        );
+        // A slide a level-1 heading opens is the slide's title: the placeholder,
+        // the frame in EMU and the formatting the declaration adds.
+        assert_declared_title(named_shape(
+            &part_text(&path, "ppt/slides/slide2.xml"),
+            "Title",
+        ));
+
+        // The reader shows the declared title as its mark, and the title-less
+        // slide carries none.
+        let text = converted_text(&ws, &path).await;
+        assert!(
+            text.contains("(title) Заголовок"),
+            "the reader did not show the declared title: {text}"
+        );
+        assert_eq!(
+            text.matches("(title)").count(),
+            1,
+            "only the declared title is a title: {text}"
+        );
+
+        // The package is sound, and the presentation's children are in the order
+        // the format's sequence asks for.
+        assert_created_deck_parts_resolve(&path);
+        let presentation = part_text(&path, "ppt/presentation.xml");
+        let offsets: Vec<usize> = [
+            "<p:sldMasterIdLst",
+            "<p:notesMasterIdLst",
+            "<p:sldIdLst",
+            "<p:sldSz",
+            "<p:notesSz",
+        ]
+        .iter()
+        .map(|child| {
+            presentation
+                .find(child)
+                .unwrap_or_else(|| panic!("the presentation holds no {child}: {presentation}"))
+        })
+        .collect();
+        for pair in offsets.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "the presentation's children are out of sequence: {presentation}"
+            );
+        }
+    }
+
+    /// A created deck holds a notes page only for a slide that has notes: one
+    /// created without any declares no notes part, no slide relationship to one
+    /// and no note count; one created with a notes block keeps its page and counts
+    /// it.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn created_pptx_holds_notes_pages_only_for_noted_slides() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let plain = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "plain",
+                    "content": [{ "type": "paragraph", "text": "Только текст" }],
+                }),
+            )
+            .await,
+        );
+        let parts = zip_names(&plain);
+        assert!(
+            !parts
+                .iter()
+                .any(|name| name.starts_with("ppt/notesSlides/")),
+            "a deck with no notes holds a notes page: {parts:?}"
+        );
+        for rels in parts.iter().filter(|name| is_relationships_part(name)) {
+            assert!(
+                !part_text(&plain, rels).contains("notesSlide"),
+                "{rels} still declares a notes page"
+            );
+        }
+        let app = part_text(&plain, "docProps/app.xml");
+        assert_eq!(
+            notes_count(&app),
+            0,
+            "a deck with no notes counts some: {app}"
+        );
+
+        let noted = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "noted",
+                    "content": [
+                        { "type": "paragraph", "text": "Только текст" },
+                        { "type": "notes", "text": "Заметка" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let parts = zip_names(&noted);
+        assert!(
+            parts
+                .iter()
+                .any(|name| name.starts_with("ppt/notesSlides/notesSlide")),
+            "a deck with notes holds no notes page: {parts:?}"
+        );
+        assert_ne!(
+            notes_count(&part_text(&noted, "docProps/app.xml")),
+            0,
+            "a deck with notes counts none"
+        );
+    }
+
+    /// A slide `add_slide` writes declares the same title a created slide opens
+    /// with: the same frame, centring, alignment and run formatting, written by
+    /// the slide arm's own title builder rather than the create arm's.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_added_slide_declares_a_title_like_a_created_one() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "Заголовок" },
+                        { "type": "paragraph", "text": "Тело" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let created_xml = part_text(&created, "ppt/slides/slide1.xml");
+        let created_title = named_shape(&created_xml, "Title");
+        assert_declared_title(created_title);
+
+        let output = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "file_name": "edited",
+                    "path": created.to_string_lossy(),
+                    "edits": [
+                        { "op": "add_slide", "after": 1, "title": "Добавленный",
+                          "bullets": ["раз", "два"] },
+                        { "op": "add_slide", "bullets": ["Без заголовка"] },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let added_part = slide_part_holding(&output, "Добавленный");
+        let added_xml = part_text(&output, &added_part);
+        let added_title = named_shape(&added_xml, "Title");
+        assert_declared_title(added_title);
+        assert_eq!(
+            title_shape_formatting(created_title),
+            title_shape_formatting(added_title),
+            "the added slide's title does not state the created one's formatting"
+        );
+
+        // A slide added with no title declares none: its bullets are a body
+        // placeholder and nothing else.
+        let untitled = part_text(&output, &slide_part_holding(&output, "Без заголовка"));
+        assert!(
+            untitled.contains(r#"<p:ph type="body" idx="1"/>"#),
+            "the added slide's bullets are not a body placeholder: {untitled}"
+        );
+        assert!(
+            !untitled.contains(r#"<p:ph type="title"/>"#),
+            "a slide added with no title declares one: {untitled}"
         );
     }
 
@@ -13776,10 +14202,12 @@ mod tests {
             "the run's outline fill was taken away: {edited}"
         );
         // The element the request rewrote holds the outline and the run's own fill,
-        // in that order, and nothing the outline's close tag left behind.
+        // in that order, and nothing the outline's close tag left behind. The run's
+        // own body carries more than those two — the fonts a declared title states
+        // among it — so the two are asserted, not the element's end.
         assert!(
             edited.contains(&format!(
-                r#"{outline}<a:solidFill><a:srgbClr val="3366CC"/></a:solidFill></a:rPr>"#
+                r#"{outline}<a:solidFill><a:srgbClr val="3366CC"/></a:solidFill>"#
             )),
             "the properties were rebuilt from something other than the run's own body: {edited}"
         );
@@ -14637,10 +15065,10 @@ mod tests {
     }
 
     /// A media part `add_image` writes is declared with the content type the kit
-    /// read the image as. A deck the tool created declares its `.jpg` parts
-    /// through the writer's own `<Default Extension="jpg" …>`, which is not the
-    /// type of the part that was added, so the part's own declaration is what the
-    /// bytes of a JPEG added to such a deck are checked against.
+    /// read the image as. A deck the tool created declares no `<Default>` for a
+    /// media extension it holds no part for, so a JPEG added to such a deck has no
+    /// `jpg` default to fall back on: its content type can only come from the
+    /// part's own `<Override>`, which is what the bytes are checked against.
     #[tokio::test]
     #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
     async fn pptx_edit_declares_an_added_images_own_content_type() {

@@ -431,6 +431,35 @@ function createXlsx(req) {
   return zip.generate({ type: "nodebuffer", compression: "DEFLATE" });
 }
 
+// ── slide titles ───────────────────────────────────────────────
+// The block that opens a slide is the slide's TITLE, and a title is a real one: a
+// shape declaring the `title` placeholder, which is what a reading marks and what
+// an office package calls a slide title, rather than the plain text box the same
+// words would be. A declared title takes the master's title style wherever it says
+// nothing itself — it is centred and drawn in the theme's major font, where the
+// text box it was took the presentation's default text style — so the alignment and
+// the fonts are stated outright, and everything else stays what the block always
+// was: its frame, size, weight, colour and vertical centring. The two sides that
+// write a title — the create arm's opening block and the slide `add_slide` adds —
+// state the same ones, and the frame is stated in inches here and in the EMU those
+// inches are, so the two cannot drift.
+const TITLE_SHAPE = "Title";
+const TITLE_INCHES = { x: 0.4, y: 0.3, w: 9.2, h: 0.8 };
+const TITLE_POINTS = 28;
+// The colour both sides draw the title in; the library's own text colour is the
+// same one, so the create arm states it only through the declaration.
+const TITLE_COLOR = "000000";
+// The alignment a title states: the `algn` value a slide writes for the left
+// alignment (see `rules.json`'s own slide alignments). A declared title would be
+// centred otherwise, which is what the master's title style asks for.
+const TITLE_ALIGNMENT = "l";
+// The fonts a title states: the theme's minor ones, one per script, which is what
+// the presentation's own default text style gives the block it would otherwise
+// take them from.
+const TITLE_FONTS = `<a:latin typeface="+mn-lt"/><a:ea typeface="+mn-ea"/><a:cs typeface="+mn-cs"/>`;
+const TITLE_PLACEHOLDER = `<p:ph type="title"/>`;
+const EMU_PER_INCH = 914400;
+
 // ── create: pptx ───────────────────────────────────────────────
 function createPptx(req) {
   const pptx = new PptxGenJS();
@@ -443,7 +472,14 @@ function createPptx(req) {
     if (block.type === "heading") {
       if (headingLevelNumber(block.level) === 1 || !slide) {
         fresh();
-        slide.addText(textOf(block.text, "a heading's text"), { x: 0.4, y: 0.3, w: 9.2, h: 0.8, fontSize: 28, bold: true });
+        const text = textOf(block.text, "a heading's text");
+        // A blank heading opens a slide without a title — it is drawn as the text
+        // box it always was, and left undeclared (see `declarePptxTitles`).
+        const titled = text.trim() !== "";
+        slide.addText(text, {
+          x: TITLE_INCHES.x, y: TITLE_INCHES.y, w: TITLE_INCHES.w, h: TITLE_INCHES.h, fontSize: TITLE_POINTS, bold: true,
+          objectName: titled ? TITLE_SHAPE : undefined,
+        });
       } else {
         room(0.7);
         slide.addText(textOf(block.text, "a heading's text"), { x: 0.4, y, w: 9.2, h: 0.5, fontSize: 20, bold: true });
@@ -491,7 +527,161 @@ function createPptx(req) {
     }
   }
   if (!slide) pptx.addSlide();
-  return pptx.write({ outputType: "nodebuffer" });
+  return pptx.write({ outputType: "nodebuffer" }).then(completePptx);
+}
+
+// ── create: the package the library writes ─────────────────────
+// pptxgenjs draws the deck's content, and what it writes around that content is
+// not what an office package writes: the block that opens a slide is a plain text
+// box rather than the slide's title, content types are declared for parts it never
+// wrote (a slide master per slide, where a deck has one) and for media types no
+// part of the deck uses (jpeg, svg, gif, mp4, vml, an embedded workbook), a notes
+// page is written for every slide even when the deck holds no notes at all, the
+// note count in the file's own properties claims one per slide, every folder in
+// the archive is given an entry of its own, and the presentation's children are
+// ordered against the sequence the format asks for. A deck this tool creates is
+// handed through `completePptx` once, which declares its titles and removes what
+// nothing needs — never leaving behind a declaration, a relationship or a
+// reference that resolves to nothing.
+
+// The parts a package holds, folder entries apart: a folder's own entry is not a
+// part, and neither the format nor a reader looks one up by name.
+const packageParts = (zip) => Object.keys(zip.files).filter((name) => !name.endsWith("/"));
+
+// `xml` with the shape that opens a slide declared the slide's real title: the
+// placeholder (`TITLE_PLACEHOLDER`), the alignment and the fonts the declaration
+// would otherwise take from the master's title style, and nothing else — the
+// frame, size, weight, colour and vertical centring the block already carries stay
+// as they are. The shape is the one `createPptx` named for this (`TITLE_SHAPE`),
+// so a slide whose opening block is not a title — including one whose heading was
+// blank — holds no such shape and is handed back unchanged.
+function declarePptxTitles(xml) {
+  const shape = slideShapeSpans(xml).find((span) => shapeName(xml, span) === TITLE_SHAPE);
+  if (!shape) return xml;
+  const declared = xml.slice(shape.start, shape.end)
+    .replace(/<p:nvPr\s*\/>|<p:nvPr\s*>\s*<\/p:nvPr>/, `<p:nvPr>${TITLE_PLACEHOLDER}</p:nvPr>`)
+    .replace(/<a:pPr\b/g, `<a:pPr algn="${TITLE_ALIGNMENT}"`)
+    .replace(/<\/a:rPr>/g, `${TITLE_FONTS}</a:rPr>`);
+  return xml.slice(0, shape.start) + declared + xml.slice(shape.end);
+}
+
+// How many of the deck's slides really hold speaker notes: a slide's notes are the
+// text of the notes part its own relationship names (the text `notesLines` reads a
+// reading by), and the empty part the library writes for a slide is not notes. The
+// empty parts hold no text at all — the slide number a notes page draws is a
+// field, which no reader shows — so a deck with no notes at all counts none.
+function notedSlides(zip) {
+  return slideParts(zip).filter((part) => {
+    const notes = slideNotesPart(zip, part);
+    const file = notes === null ? null : zip.file(notes);
+    return file !== null && notesLines(file.asText()).trim() !== "";
+  }).length;
+}
+
+// `xml` without the relationship whose type is `type` — the notes-slide one a slide
+// declares, which is written once and self-closing, and which must not stay behind
+// when the part it names is gone.
+const withoutRelationship = (xml, type) => xml.replace(new RegExp(`<Relationship\\b[^>]*Type="${escapeRegExp(type)}"[^>]*/>`), "");
+
+// The deck's notes pages, dropped when the deck holds no notes at all: the library
+// writes one per slide whatever the content, and a slide a notes page was never
+// written for says nothing about the deck. The notes MASTER stays — it is the part
+// a notes page is drawn through, office writes one whether or not it holds notes,
+// and a deck without it can never be given notes at all.
+function dropPptxNotesPages(zip) {
+  for (const part of packageParts(zip)) {
+    if (part.startsWith(PPT_NOTES_SLIDES)) zip.remove(part);
+  }
+  for (const part of slideParts(zip)) {
+    const rels = zip.file(relsPartFor(part));
+    if (!rels) continue;
+    const without = withoutRelationship(rels.asText(), NOTES_REL);
+    if (without !== rels.asText()) zip.file(relsPartFor(part), without);
+  }
+}
+
+// The deck's own application properties with the note count set to the slides that
+// really hold notes: the library writes the slide count there, one per slide
+// whether or not it wrote any notes, which is a file claiming notes it does not
+// hold.
+function setPptxNoteCount(zip, noted) {
+  const file = zip.file("docProps/app.xml");
+  if (!file) return;
+  const xml = file.asText();
+  const counted = xml.replace(/<Notes>\d+<\/Notes>/, `<Notes>${noted}</Notes>`);
+  if (counted !== xml) zip.file("docProps/app.xml", counted);
+}
+
+// The deck's `[Content_Types].xml` with every declaration the package has no part
+// for removed: an `<Override>` whose part is not in the archive, and a `<Default>`
+// whose extension no part carries. `xml` and `rels` are the package's own and stay
+// — office writes both, and both extensions are in use here — and a part that IS
+// in the archive keeps its type, the ones this writes itself included.
+function prunePptxContentTypes(zip) {
+  const file = zip.file("[Content_Types].xml");
+  if (!file) return;
+  const xml = file.asText();
+  const parts = packageParts(zip);
+  const extensions = new Set(parts.map((part) => (part.split(".").pop() || "").toLowerCase()));
+  const pruned = xml.replace(/<(Default|Override)\b[^>]*\/>/g, (element) => {
+    if (element.startsWith("<Default")) {
+      return extensions.has((xmlAttribute(element, "Extension") || "").toLowerCase()) ? element : "";
+    }
+    return parts.includes((xmlAttribute(element, "PartName") || "").replace(/^\//, "")) ? element : "";
+  });
+  if (pruned !== xml) zip.file("[Content_Types].xml", pruned);
+}
+
+// The presentation part with its `<p:notesMasterIdLst>` moved where the format's
+// own sequence puts it: `p:presentation`'s children are a sequence, and the library
+// writes the notes master list after `<p:sldIdLst>`, where office writes it ahead
+// of it (the master lists, then the slide list, then the sizes). Nothing else about
+// the part changes, and one already in that order is left alone.
+function orderPptxPresentation(zip) {
+  const file = zip.file(PPT_PRESENTATION);
+  if (!file) return;
+  const xml = file.asText();
+  const notes = xml.match(/<p:notesMasterIdLst>[\s\S]*?<\/p:notesMasterIdLst>/);
+  const slides = xml.search(/<p:sldIdLst\b/);
+  if (!notes || slides < 0 || notes.index < slides) return;
+  const moved = xml.slice(0, notes.index) + xml.slice(notes.index + notes[0].length);
+  const masters = moved.match(/<p:sldMasterIdLst\b[^>]*>[\s\S]*?<\/p:sldMasterIdLst>/);
+  if (!masters) return;
+  const at = masters.index + masters[0].length;
+  zip.file(PPT_PRESENTATION, moved.slice(0, at) + notes[0] + moved.slice(at));
+}
+
+// The archive's folder entries, removed: a zip may state a directory of its own,
+// and this one states one for every folder the library made — the empty ones (the
+// charts, embeddings and media folders a deck with none of those holds) and the
+// folders the parts already imply. Office writes none and no reader looks one up,
+// and `zip.remove` is not what takes one: a folder name given to it takes the
+// folder's whole subtree with it, so the entry goes the way the library's own
+// removal removes one.
+function dropPptxFolderEntries(zip) {
+  for (const name of Object.keys(zip.files)) {
+    if (name.endsWith("/")) delete zip.files[name];
+  }
+}
+
+// The package a created deck is delivered as: the library's bytes with the titles
+// declared and the junk above gone.
+function completePptx(bytes) {
+  const zip = new PizZip(bytes);
+  for (const part of slideParts(zip)) {
+    const file = zip.file(part);
+    if (!file) continue;
+    const xml = file.asText();
+    const declared = declarePptxTitles(xml);
+    if (declared !== xml) zip.file(part, declared);
+  }
+  const noted = notedSlides(zip);
+  if (noted === 0) dropPptxNotesPages(zip);
+  setPptxNoteCount(zip, noted);
+  prunePptxContentTypes(zip);
+  orderPptxPresentation(zip);
+  dropPptxFolderEntries(zip);
+  return zip.generate({ type: "nodebuffer", compression: "DEFLATE" });
 }
 
 // ── create: pdf ────────────────────────────────────────────────
@@ -5311,6 +5501,23 @@ function shapeTextBody(xml, shape) {
   return { start, end, closeAt: end - body[2].length };
 }
 
+// The slide's own top-level `<p:sp>` shapes, in part order: the shape tree's
+// direct children that are not inside a table's frame or a group. This is the set
+// the slide's own text lives in (see `slideTextBodies`), and the set the shape a
+// slide declares its title in is looked for among (see `declarePptxTitles`).
+function slideShapeSpans(xml) {
+  const tree = tagSpans(xml, SLIDE_SHAPE_TREE).find((span) => !span.selfClosing);
+  if (!tree) return [];
+  const excluded = [...tagSpans(xml, SLIDE_FRAME), ...tagSpans(xml, SLIDE_GROUP)];
+  const inside = (span) => excluded.some((other) => other.start < span.start && span.end < other.end);
+  return tagSpans(xml, SLIDE_SHAPE)
+    .filter((span) => !span.selfClosing && span.depth === 1 && tree.start < span.start && span.end < tree.end && !inside(span));
+}
+
+// The `name` a shape states for itself. The `<p:cNvPr>` a `<p:sp>` opens with is
+// its own, so the first one in the shape names it.
+const shapeName = (xml, shape) => xmlAttribute((xml.slice(shape.start, shape.end).match(/<p:cNvPr\b[^>]*>/) || [""])[0], "name");
+
 // The slide's OWN text: the `<p:txBody>` bodies of its top-level `<p:sp>` shapes
 // and the paragraphs inside them. A table's cells, a chart's frame and a group
 // shape's children are not the slide's text, so a paragraph added here never
@@ -5318,12 +5525,7 @@ function shapeTextBody(xml, shape) {
 // `slideParagraphs`, which numbers every paragraph (tables included) for the
 // text ops that address the same text the reader shows.
 function slideTextBodies(xml) {
-  const tree = tagSpans(xml, SLIDE_SHAPE_TREE).find((span) => !span.selfClosing);
-  if (!tree) return { bodies: [], paragraphs: [] };
-  const excluded = [...tagSpans(xml, SLIDE_FRAME), ...tagSpans(xml, SLIDE_GROUP)];
-  const inside = (span) => excluded.some((other) => other.start < span.start && span.end < other.end);
-  const bodies = tagSpans(xml, SLIDE_SHAPE)
-    .filter((span) => !span.selfClosing && span.depth === 1 && tree.start < span.start && span.end < tree.end && !inside(span))
+  const bodies = slideShapeSpans(xml)
     .map((shape) => shapeTextBody(xml, shape))
     .filter(Boolean);
   const paragraphs = slideParagraphs(xml).filter((span) => bodies.some((body) => body.start < span.start && span.end < body.end));
@@ -5563,14 +5765,14 @@ function removeSlideParagraphs(editor, edit) {
   });
 }
 
-// The minimal slide part a new slide is built from: the group shape properties,
-// a title placeholder when a title was given and a body placeholder holding one
-// paragraph per bullet, then the colour-map override. The slide deliberately
-// carries no notes and no animation, and nothing layout-specific beyond its
-// placeholders — the layout supplies their geometry.
+// The minimal slide part a new slide is built from: the group shape properties, a
+// title when a title was given and a body placeholder holding one paragraph per
+// bullet, then the colour-map override. The slide deliberately carries no notes and
+// no animation, and nothing layout-specific beyond its placeholders — the layout
+// supplies the body's geometry. The title's is stated (see `titleShape`).
 function newSlideXml(title, bullets) {
   const shapes = [];
-  if (title !== undefined) shapes.push(placeholderShape(2, "Title", `<p:ph type="title"/>`, [title]));
+  if (title !== undefined) shapes.push(titleShape(title));
   if (bullets.length) shapes.push(placeholderShape(3, "Body", `<p:ph type="body" idx="1"/>`, bullets));
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
     `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="${REL_NS}" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">` +
@@ -5579,6 +5781,23 @@ function newSlideXml(title, bullets) {
     `<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>` +
     shapes.join("") +
     `</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>`;
+}
+
+// The title a generated slide opens with: the shape `createPptx`'s opening block
+// is declared in, written out in full — the frame, the vertical centring, the left
+// alignment and the run's size, weight, colour and fonts (see the title block). The
+// block a created slide opens with gets them from the create arm; a slide named
+// into an existing deck has no layout of this kit's to inherit them from, and a
+// title that states neither its frame nor its formatting is drawn as a broken one.
+function titleShape(text) {
+  const emu = (inches) => Math.round(inches * EMU_PER_INCH);
+  return `<p:sp><p:nvSpPr><p:cNvPr id="2" name="${TITLE_SHAPE}"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr>${TITLE_PLACEHOLDER}</p:nvPr></p:nvSpPr>` +
+    `<p:spPr><a:xfrm><a:off x="${emu(TITLE_INCHES.x)}" y="${emu(TITLE_INCHES.y)}"/><a:ext cx="${emu(TITLE_INCHES.w)}" cy="${emu(TITLE_INCHES.h)}"/></a:xfrm>` +
+    `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln/></p:spPr>` +
+    `<p:txBody><a:bodyPr wrap="square" rtlCol="0" anchor="ctr"/><a:lstStyle/>` +
+    `<a:p><a:pPr algn="${TITLE_ALIGNMENT}" indent="0" marL="0"><a:buNone/></a:pPr>` +
+    `<a:r><a:rPr lang="${SLIDE_LANG}" sz="${TITLE_POINTS * 100}" b="1" dirty="0"><a:solidFill><a:srgbClr val="${TITLE_COLOR}"/></a:solidFill>${TITLE_FONTS}</a:rPr>${textElement("a:", xmlEscape(text))}</a:r>` +
+    `<a:endParaRPr lang="${SLIDE_LANG}" sz="${TITLE_POINTS * 100}" dirty="0"/></a:p></p:txBody></p:sp>`;
 }
 
 // A placeholder shape holding one paragraph per text, each run stating only the
