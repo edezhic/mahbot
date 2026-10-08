@@ -62,7 +62,7 @@ use hayro::{RenderCache, RenderSettings};
 use image::codecs::jpeg::JpegEncoder;
 use image::{RgbImage, RgbaImage};
 use pdf_extract::{Document, PlainTextOutput, output_doc_page};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// Maximum extracted-text length (Unicode chars) inlined into the message.
@@ -102,9 +102,11 @@ const PLAIN_TEXT_EXTENSIONS: &[&str] = &[
 /// Reason reported for a document whose bytes could not be read or whose
 /// conversion panicked.
 const UNREADABLE_REASON: &str = "could not be read";
-/// Bound on concurrently converting documents: each conversion holds the whole
-/// document plus its decoded rasters, and every caller runs on its own task, so
-/// a burst would otherwise multiply peak memory.
+/// Bound on the concurrent heavy document reads — converting a document, and the
+/// deck walk a `pptx_edit` refusal's diagram text needs (see
+/// [`read_pptx_diagram_text`]): each holds the whole document (plus, for a
+/// conversion, its decoded rasters), and every caller runs on its own task, so a
+/// burst would otherwise multiply peak memory.
 static DOCUMENT_CONVERSIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 // ── Delivery notes shared by both callers ───────────────────────
@@ -287,10 +289,10 @@ fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome
 /// blocking thread and its panic is contained at that boundary: a
 /// [`tokio::task::JoinError`] degrades to an unreadable document instead of
 /// taking the caller's turn down with it. The conversion semaphore is
-/// deliberately shared by both callers, so peak conversion concurrency stays at
-/// two daemon-wide and a local read can queue behind a busy inbound
-/// conversion — the accepted trade-off, since both hold whole documents plus
-/// their decoded rasters in memory.
+/// deliberately shared by every caller, so peak concurrency stays at two
+/// daemon-wide and a local read can queue behind a busy inbound conversion —
+/// the accepted trade-off, since each holds a whole document plus its decoded
+/// rasters in memory.
 pub(crate) async fn convert_document_file(
     path: &Path,
     file_name: &str,
@@ -325,6 +327,25 @@ pub(crate) async fn convert_document_file(
             }
         }
     }
+}
+
+/// The diagram text a presentation's slides show, keyed by slide part (see
+/// [`crate::ooxml::pptx_diagram_text`]), read the way every other heavy document
+/// operation is: the walk reads a whole package and parses its slide, layout and
+/// diagram parts, so it runs on a blocking thread — a synchronous parse never
+/// stalls an async task — and holds [`DOCUMENT_CONVERSIONS`], so an edit cannot
+/// multiply peak memory or starve the document work the daemon is already doing.
+///
+/// Best effort by design: a file that cannot be read yields an empty map, and the
+/// caller's refusal keeps its generic wording.
+pub(crate) async fn read_pptx_diagram_text(path: &Path) -> HashMap<String, Vec<String>> {
+    let _permit = DOCUMENT_CONVERSIONS.acquire().await;
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return HashMap::new();
+    };
+    tokio::task::spawn_blocking(move || crate::ooxml::pptx_diagram_text(&bytes))
+        .await
+        .unwrap_or_default()
 }
 
 /// Extract text, page rasters and embedded images from a PDF: every page that

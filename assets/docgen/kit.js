@@ -13,9 +13,10 @@ import {
 } from "docx";
 import { PDFDocument, rgb, degrees } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
-// rules.json is the single statement of the input rules both the `document`
-// tool and this kit enforce — a set or a bound is written there once and read
-// from both sides; bun inlines it into the committed bundle.
+// rules.json is the single statement of the input rules the `document` tool,
+// this kit and the presentation reader share — a set, a bound or a slide mark
+// is written there once and read from every side; bun inlines it into the
+// committed bundle.
 import RULES from "./rules.json";
 
 const A4 = [595.28, 841.89];
@@ -56,7 +57,8 @@ const readInput = (p) => {
 // is reported as a product fault.
 // The tool checks every one of those shapes at its own boundary and refuses
 // before the kit is spawned, so these are the last line rather than the only
-// one — and what the two sides share is stated once, in rules.json.
+// one — and what the tool, this kit and the presentation reader share is stated
+// once, in rules.json.
 class UsageError extends Error {}
 
 // ── images ─────────────────────────────────────────────────────
@@ -978,6 +980,13 @@ function openEdit(req, family) {
     // The path the input was opened from, for a refusal that has to name the file
     // it could not edit (see `missingContentTypes`).
     input: req.input,
+    // The diagram text a reading showed, keyed by slide part. Only a
+    // presentation has any, and the Rust reader owns what a diagram shows
+    // (`src/ooxml.rs::pptx_diagram_text`), so it is passed in the request rather
+    // than read here: a refusal names text the reading really showed (see
+    // `slideFindRefusal`). A slide whose diagrams the reader reported as
+    // unreadable is absent, so nothing is named for it.
+    diagramText: req.diagram_text ?? {},
     charge,
     // A user-facing note, already bracketed: the Rust side appends it verbatim.
     // Kept once each, in the order the edits first raised it.
@@ -1089,8 +1098,11 @@ function editText(value, what) {
 // Every span `find` occurs at in `text`, left to right and non-overlapping. The
 // offsets are code points, the unit `locateSlot` counts in: a raw `indexOf`
 // offset is a UTF-16 code unit, so a supplementary character before a match
-// would shift it by one and make the edit rewrite the wrong slot.
+// would shift it by one and make the edit rewrite the wrong slot. An empty
+// needle matches nothing: `indexOf` would report the same position forever, so
+// no caller's search may depend on one being refused beforehand.
 function occurrences(text, find) {
+  if (!find) return [];
   const spans = [];
   const width = [...find].length;
   let from = 0;
@@ -5217,20 +5229,23 @@ function addressedSlide(zip, number) {
 }
 
 // The notes part a slide declares through its own relationships, the way
-// `src/ooxml.rs::slide_notes` resolves them, or null when it declares none.
+// `src/ooxml.rs::slide_notes` resolves them, or null when it declares none. A
+// target is resolved against the directory the package actually put the slide
+// part in (see `src/ooxml.rs::part_dir`), not the conventional `ppt/slides/`.
 function slideNotesPart(zip, slidePart) {
   const rels = zip.file(relsPartFor(slidePart));
   if (!rels) return null;
   const rel = relationships(rels.asText()).find((candidate) => candidate.type.endsWith("/notesSlide"));
-  return rel ? resolvePart(PPT_SLIDES, rel.target) : null;
+  return rel ? resolvePart(partDirectory(slidePart), rel.target) : null;
 }
 
-// The layout part a slide's relationship names, or null when it has none.
+// The layout part a slide's relationship names, or null when it has none. Like
+// `slideNotesPart`, the target resolves against the slide part's own directory.
 function slideLayoutPart(zip, slidePart) {
   const rels = zip.file(relsPartFor(slidePart));
   if (!rels) return null;
   const rel = relationships(rels.asText()).find((candidate) => candidate.type.endsWith("/slideLayout"));
-  return rel ? resolvePart(PPT_SLIDES, rel.target) : null;
+  return rel ? resolvePart(partDirectory(slidePart), rel.target) : null;
 }
 
 // The layout the new slide is inserted after uses, the deck's last slide's, or
@@ -5355,8 +5370,59 @@ function mapSlideParagraphs(xml, change) {
   return out;
 }
 
-// The refusal a slide edit that searched and found nothing states.
-const missingSlideFind = (find, slide) => `the text ${JSON.stringify(find)} is not on slide ${slide}`;
+// The labels the reader prints for a slide — its number and its marks — which are
+// not the slide's own text, the way `src/ooxml.rs` writes them.
+const slideLabels = (slide) => [`Slide ${slide}:`, `Slide ${slide} notes:`, ...Object.values(RULES.ppt_marks)];
+
+// The reader label `find` names, or undefined when it names none. The longest
+// label that fits wins: a find of the whole `(diagram text could not be read)`
+// mark names that mark rather than the shorter `(diagram text)` heading written
+// inside it.
+const namedSlideLabel = (find, slide) => slideLabels(slide)
+  .filter((candidate) => find.includes(candidate))
+  .sort((left, right) => right.length - left.length)[0];
+
+// A `find` copied out of a reading carries the reader's indentation — a diagram's
+// node lines sit under their heading and a slide's notes under their label — so a
+// find is compared with it trimmed away. The text a lookup is compared against
+// needs no such trimming: the reader's indent is its own printing, not the
+// package's.
+const withoutIndent = (text) => text.split("\n").map((line) => line.trimStart()).join("\n");
+
+// A notes part's text as a reading prints it: one line per paragraph, so a find
+// copied across note lines matches the notes it names.
+const notesLines = (xml) => slideParagraphs(xml)
+  .map(({ start, end }) => slideParagraphText(xml.slice(start, end)))
+  .join("\n");
+
+// The refusal a slide text op states when its `find` is not on the slide: the
+// reader's own labels, a diagram's text and a slide's speaker notes are all text
+// a reading showed but no slide text op changes, so naming them is what the
+// refusal says rather than passing them off as text the slide does not have. A
+// label comes first, since a find naming one is a label whatever else it holds.
+//
+// The diagram text is not read here: the request carries what a reading showed
+// per slide part, computed by the reader itself (see
+// `src/ooxml.rs::pptx_diagram_text`), so a refusal can only name text a reading
+// really showed — a diagram the reader reported as unreadable is absent from the
+// request, and thus names nothing.
+//
+// A lookup naming no text never reaches a refusal: the tool refuses one before
+// the kit runs (see `require_pptx_lookup`), so a find here always names text.
+function slideFindRefusal(editor, part, find, slide) {
+  const label = namedSlideLabel(find, slide);
+  if (label !== undefined) return `the text ${JSON.stringify(find)} is not on slide ${slide}: ${JSON.stringify(label)} is a label the reader prints, not text on the slide`;
+  const needle = withoutIndent(find);
+  const diagrams = editor.diagramText[part] ?? [];
+  if (diagrams.some((text) => text.includes(needle))) return `the text ${JSON.stringify(find)} is inside a diagram on slide ${slide}, whose text a presentation edit does not change`;
+  // The notes are read under the reader's notes label and edited by the notes
+  // ops, so a find the slide's own notes hold names them rather than passing it
+  // off as text the slide lacks.
+  const notes = slideNotesPart(editor.zip, part);
+  const notesFile = notes === null ? null : editor.zip.file(notes);
+  if (notesFile && notesLines(notesFile.asText()).includes(needle)) return `the text ${JSON.stringify(find)} is in the speaker notes of slide ${slide}, which a slide text op does not edit (replace_notes and remove_notes do)`;
+  return `the text ${JSON.stringify(find)} is not on slide ${slide}`;
+}
 
 // The pptx text ops over one part: every occurrence of `find` in a matching
 // paragraph's joined text is rewritten, the replacement taking the formatting of
@@ -5380,8 +5446,13 @@ function editPartText(editor, part, edit, replacing, missing) {
   });
 }
 
-// `pptx_edit`'s `replace_text`/`remove_text` on a slide's own text.
-const editSlideText = (editor, edit, op) => editPartText(editor, addressedSlide(editor.zip, edit.slide), edit, op === "replace_text", (find) => missingSlideFind(find, edit.slide));
+// `pptx_edit`'s `replace_text`/`remove_text` on a slide's own text: a fragment
+// the slide does not hold is refused with the reason the reader's labels and any
+// diagram's text give it (see `slideFindRefusal`).
+function editSlideText(editor, edit, op) {
+  const part = addressedSlide(editor.zip, edit.slide);
+  editPartText(editor, part, edit, op === "replace_text", (find) => slideFindRefusal(editor, part, find, edit.slide));
+}
 
 // The run markup a new paragraph takes: the anchor's own first-run properties,
 // or a bare run when there is no anchor to copy.
@@ -5406,8 +5477,9 @@ function slideParagraphProperties(anchor, level) {
 // shapes — the title and body placeholders (see `slideTextBodies`) — because a
 // table's cells hold paragraphs too and a new one added there lands where the
 // caller did not ask. An `after` that names text only inside such a frame is
-// refused rather than placed silently, and a slide with no text body at all has
-// nowhere for one to go.
+// refused rather than placed silently, and one naming a reader label or a
+// diagram's text is refused for what it really is (see `slideFindRefusal`); a
+// slide with no text body at all has nowhere for one to go.
 function addSlideParagraph(editor, edit) {
   const part = addressedSlide(editor.zip, edit.slide);
   const text = editText(edit.text, "text");
@@ -5430,7 +5502,7 @@ function addSlideParagraph(editor, edit) {
         const frames = tagSpans(xml, SLIDE_FRAME);
         const buried = slideParagraphs(xml).find((candidate) => frames.some((frame) => frame.start < candidate.start && candidate.end < frame.end) && slideParagraphText(xml.slice(candidate.start, candidate.end)).includes(after));
         if (buried) throw new UsageError(`the text ${JSON.stringify(after)} is inside a table on slide ${edit.slide}: add_paragraph writes into the slide's own text, not into a table`);
-        throw new UsageError(missingSlideFind(after, edit.slide));
+        throw new UsageError(slideFindRefusal(editor, part, after, edit.slide));
       }
       anchor = xml.slice(span.start, span.end);
       at = span.end;
@@ -5457,7 +5529,8 @@ const SLIDE_TEXT_BODIES = new RegExp(`${openTag("p:txBody")}[\\s\\S]*?${closeTag
 // `find` is dropped whole, so a fragment matching several paragraphs removes
 // each of them. A slide part has no paragraph nesting to pick an innermost one
 // from. A removal that would leave a text body with no paragraph is refused,
-// since that body would be one no reader may hold.
+// since that body would be one no reader may hold, and a `find` the slide does
+// not hold is refused for what it really is (see `slideFindRefusal`).
 function removeSlideParagraphs(editor, edit) {
   const part = addressedSlide(editor.zip, edit.slide);
   const find = editText(edit && edit.find, "find");
@@ -5465,7 +5538,7 @@ function removeSlideParagraphs(editor, edit) {
   editor.part(part, (xml) => {
     const spans = slideParagraphs(xml);
     const matched = new Set(spans.filter((span) => slideParagraphText(xml.slice(span.start, span.end)).includes(find)).map((span) => span.start));
-    if (!matched.size) throw new UsageError(missingSlideFind(find, edit.slide));
+    if (!matched.size) throw new UsageError(slideFindRefusal(editor, part, find, edit.slide));
     // The paragraphs of each text body, so a body whose every paragraph goes is
     // caught before any of them is dropped. Both lists are in part order and
     // neither kind nests, so the body holding a paragraph is the first one that
@@ -5905,8 +5978,14 @@ function addSlideNotes(editor, edit) {
   createNotesPart(editor, part, text);
 }
 
-// The refusal a notes edit that searched and found nothing states.
-const missingNotesFind = (find, slide) => `the text ${JSON.stringify(find)} is not in the speaker notes of slide ${slide}`;
+// The refusal a notes edit that searched and found nothing states. Notes hold no
+// diagram, so a reader's label is the only false lead the notes can hold: a
+// `find` naming one says so rather than passing it off as text the notes lack.
+const missingNotesFind = (find, slide) => {
+  const label = namedSlideLabel(find, slide);
+  if (label !== undefined) return `the text ${JSON.stringify(find)} is not in the speaker notes of slide ${slide}: ${JSON.stringify(label)} is a label the reader prints, not text in the notes`;
+  return `the text ${JSON.stringify(find)} is not in the speaker notes of slide ${slide}`;
+};
 
 // `pptx_edit`'s `replace_notes`/`remove_notes`: the notes are plain text, so a
 // fragment is matched in one notes paragraph's joined run text exactly as it is
@@ -6089,7 +6168,9 @@ function slideFormat(edit) {
 // fragment covers, and its alignment on the paragraph holding it. Two things the
 // caller is owed a note about: run properties live on the run, so a fragment
 // covering part of one formats all of it, and `algn` is a paragraph's, so it
-// applies to the paragraph's whole text.
+// applies to the paragraph's whole text. A `find` no run covers is refused with
+// the reason the reader's labels and any diagram's text give it (see
+// `slideFindRefusal`).
 function formatSlideText(editor, edit) {
   const part = addressedSlide(editor.zip, edit.slide);
   const find = editText(edit.find, "find");
@@ -6140,7 +6221,7 @@ function formatSlideText(editor, edit) {
       }
       return element;
     });
-    if (!found) throw new UsageError(missingSlideFind(find, edit.slide));
+    if (!found) throw new UsageError(slideFindRefusal(editor, part, find, edit.slide));
     return out;
   });
 }

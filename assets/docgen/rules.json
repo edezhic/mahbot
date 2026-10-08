@@ -26,6 +26,13 @@
   "sheet_name_forbidden": "[]:*?/\\",
   "slide_position_fraction": { "min": 0, "max": 1, "min_exclusive": false },
   "slide_size_fraction": { "min": 0, "max": 1, "min_exclusive": true },
+  "ppt_marks": {
+    "title": "(title)",
+    "hidden_slide": "(hidden slide)",
+    "diagram_text": "(diagram text)",
+    "diagram_text_lost": "(diagram text could not be read)",
+    "no_text": "(no text)"
+  },
   "edit_text_max": 20000,
   "edits_max": 200,
   "bullets_max": 100,

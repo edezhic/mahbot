@@ -284,7 +284,7 @@ fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
             "mode": {
                 "type": "string",
                 "enum": ["content", "symbols", "zoom"],
-                "description": "Read mode. 'content' (default): line-numbered file read — large outputs are truncated to a ~5 KB budget — or, for a raster image (PNG, JPEG, WebP), attaches it to the conversation as a native image instead; a PDF or Office document (Word, Excel, PowerPoint) is converted the way an inbound chat attachment is — extracted text (for a PDF, `Page <n>:` blocks by page number plus its `Annotations:` and `Form fields:` sections), plus text-free or unreadable pages and embedded images attached as native images; over 5 of them, all are reported as paths instead (or, if that listing would not fit, as the folder holding them). 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name. 'symbols'/'zoom' work for supported code formats only.",
+                "description": "Read mode. 'content' (default): line-numbered file read — large outputs are truncated to a ~5 KB budget — or, for a raster image (PNG, JPEG, WebP), attaches it to the conversation as a native image instead; a PDF or Office document (Word, Excel, PowerPoint) is converted the way an inbound chat attachment is — extracted text (for a PDF, `Page <n>:` blocks by page number plus its `Annotations:` and `Form fields:` sections; for a `.pptx`/`.pptm` presentation, `Slide <n>:` blocks marking the slide's own title, a hidden slide and a diagram's text), plus text-free or unreadable pages and embedded images attached as native images; over 5 of them, all are reported as paths instead (or, if that listing would not fit, as the folder holding them). 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name. 'symbols'/'zoom' work for supported code formats only.",
                 "default": "content"
             },
             "symbol": {
@@ -315,11 +315,23 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> String {
-        crate::prompt::load_prompt(if self.strict {
-            "tool/read_strict.md"
-        } else {
-            "tool/read.md"
-        })
+        // The slide marks this description names are rendered from the same
+        // statement the reader prints them from, so renaming one cannot leave a
+        // model-facing sentence stale (see `crate::docgen::ppt_marks`).
+        let marks = crate::docgen::ppt_marks();
+        crate::prompt::substitute(
+            &crate::prompt::load_prompt(if self.strict {
+                "tool/read_strict.md"
+            } else {
+                "tool/read.md"
+            }),
+            &[
+                ("{{ppt_title_mark}}", &marks.title),
+                ("{{ppt_hidden_slide_mark}}", &marks.hidden_slide),
+                ("{{ppt_diagram_text_mark}}", &marks.diagram_text),
+                ("{{ppt_diagram_text_lost_mark}}", &marks.diagram_text_lost),
+            ],
+        )
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1313,6 +1325,33 @@ mod tests {
                 language_support(ext).is_some(),
                 "expected language support for .{ext}"
             );
+        }
+    }
+
+    /// The read description names the slide marks the reader prints, rendered
+    /// from their single statement ([`crate::docgen::ppt_marks`]): a mark renamed
+    /// there cannot leave this model-facing sentence stale, and a placeholder the
+    /// call does not fill would reach the model as its own literal spelling.
+    #[test]
+    fn the_description_states_the_slide_marks() {
+        let marks = crate::docgen::ppt_marks();
+        for tool in [ReadTool::general(), ReadTool::workspace_only()] {
+            let description = tool.description();
+            assert!(
+                !description.contains("{{"),
+                "the description left a placeholder unreplaced:\n{description}"
+            );
+            for mark in [
+                &marks.title,
+                &marks.hidden_slide,
+                &marks.diagram_text,
+                &marks.diagram_text_lost,
+            ] {
+                assert!(
+                    description.contains(mark.as_str()),
+                    "the description does not name {mark:?}:\n{description}"
+                );
+            }
         }
     }
 

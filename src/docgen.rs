@@ -11,22 +11,25 @@
 //!
 //! # Protocol
 //!
-//! A request is a JSON object naming the operation (`op`) and the paths that
-//! operation reads and writes. The runner always writes that object to a
-//! `request-<nonce>.json` file, always points the kit at a `result-<nonce>.json`
-//! file, and always reads the RESULT FILE — never stdout, which is only the
-//! run's diagnostics. Both files live in the kit's `scratch/` directory, which
-//! is emptied when the kit is prepared. A result is `{"ok": bool, "outputs":
-//! [...], "missing": [...], "placeholders": N, "unsupported": [...], "notes":
-//! [...], "class": "...", "error": "..."}`, where `placeholders` is a
-//! `fill_template` result only, `unsupported` lists the distinct characters the
-//! embedded PDF font could not draw for a PDF-writing operation, `notes` are the
-//! caveats an editing operation discovered at run time — already-bracketed,
-//! user-facing sentences the reply appends verbatim — and `class` is present only
-//! on a failure the kit blamed on the request ("usage": the caller can fix it,
-//! see [`read_result`]). A failure of the run itself (a timeout, a kill, a spawn
-//! failure) never reaches the result file and is reported by the runner, with
-//! its own class token.
+//! A request is a JSON object naming the operation (`op`), the paths that
+//! operation reads and writes, and any data the operation's own refusals need
+//! (`pptx_edit` carries the diagram text a reading showed per slide, so the kit
+//! names text the reader really showed rather than restating how a diagram is
+//! read — see [`crate::ooxml::pptx_diagram_text`]). The runner always writes
+//! that object to a `request-<nonce>.json` file, always points the kit at a
+//! `result-<nonce>.json` file, and always reads the RESULT FILE — never stdout,
+//! which is only the run's diagnostics. Both files live in the kit's `scratch/`
+//! directory, which is emptied when the kit is prepared. A result is
+//! `{"ok": bool, "outputs": [...], "missing": [...], "placeholders": N,
+//! "unsupported": [...], "notes": [...], "class": "...", "error": "..."}`, where
+//! `placeholders` is a `fill_template` result only, `unsupported` lists the
+//! distinct characters the embedded PDF font could not draw for a PDF-writing
+//! operation, `notes` are the caveats an editing operation discovered at run time
+//! — already-bracketed, user-facing sentences the reply appends verbatim — and
+//! `class` is present only on a failure the kit blamed on the request ("usage":
+//! the caller can fix it, see [`read_result`]). A failure of the run itself (a
+//! timeout, a kill, a spawn failure) never reaches the result file and is
+//! reported by the runner, with its own class token.
 //!
 //! # Containment
 //!
@@ -57,6 +60,48 @@ const KIT_SCRIPT: &[u8] = include_bytes!("../assets/docgen/document-kit.js");
 /// The Cyrillic-covering PDF text font the kit embeds into the PDFs it writes
 /// or annotates (see `assets/docgen/NotoSans-LICENSE.txt`).
 const KIT_PDF_FONT: &[u8] = include_bytes!("../assets/docgen/NotoSans-Regular.ttf");
+
+/// The shared statement of the input rules, the bounds and the slide marks the
+/// document kit, the `document` tool and the presentation reader all read — one
+/// file rather than a copy per side (see the file for what each entry governs).
+/// The kit imports it, and bun inlines it into the committed bundle.
+const RULES_JSON: &str = include_str!("../assets/docgen/rules.json");
+
+/// [`RULES_JSON`] parsed once: the file is read as JSON in this one place, and
+/// each consumer deserializes the shape it needs out of the result.
+pub(crate) fn rules() -> &'static Value {
+    static RULES: OnceLock<Value> = OnceLock::new();
+    RULES.get_or_init(|| {
+        serde_json::from_str(RULES_JSON).expect("assets/docgen/rules.json must be valid JSON")
+    })
+}
+
+/// The marks a slide carries in what a presentation reader prints. The editing
+/// side names the same words in its refusals, so one statement of them lives in
+/// [`RULES_JSON`] rather than being spelled twice and drifting.
+#[derive(serde::Deserialize)]
+pub(crate) struct PptMarks {
+    /// Prefix of a line carrying the slide's own title.
+    pub(crate) title: String,
+    /// Beside a slide's number, for one the presentation does not show.
+    pub(crate) hidden_slide: String,
+    /// Heading of the visible text a diagram holds.
+    pub(crate) diagram_text: String,
+    /// Stands where a diagram's own text could not be read.
+    pub(crate) diagram_text_lost: String,
+    /// Stands for a slide with nothing to read.
+    pub(crate) no_text: String,
+}
+
+/// [`PptMarks`] out of [`rules`]. An entry the file lost is a build fault,
+/// caught by the tests that read a slide rather than by a call.
+pub(crate) fn ppt_marks() -> &'static PptMarks {
+    static MARKS: OnceLock<PptMarks> = OnceLock::new();
+    MARKS.get_or_init(|| {
+        serde::Deserialize::deserialize(&rules()["ppt_marks"])
+            .expect("assets/docgen/rules.json must carry the ppt_marks the reader prints")
+    })
+}
 
 /// The materialized-kit directory name under the product's storage root. The
 /// per-content subdirectory keeps a new binary from ever reusing an older
@@ -431,7 +476,7 @@ mod tests {
     /// `assets/docgen/build.sh` hashes them.
     const KIT_SOURCES: [&[u8]; 4] = [
         include_bytes!("../assets/docgen/kit.js"),
-        include_bytes!("../assets/docgen/rules.json"),
+        RULES_JSON.as_bytes(),
         include_bytes!("../assets/docgen/package.json"),
         include_bytes!("../assets/docgen/bun.lock"),
     ];

@@ -17,9 +17,10 @@
 //! # Input rules
 //!
 //! Every shape the kit's writers cannot render is refused here, before the
-//! runtime is spawned. The bounds and enumerations the tool and the kit share
-//! are stated once — in `assets/docgen/rules.json` ([`RULES_JSON`]), which both
-//! sides read — so a rule cannot drift between them.
+//! runtime is spawned. The bounds and enumerations the tool, the kit and the
+//! presentation reader share are stated once — in `assets/docgen/rules.json`,
+//! compiled in and parsed in one place by [`crate::docgen::rules`] — so a rule
+//! cannot drift between them.
 //!
 //! # Editing
 //!
@@ -49,7 +50,7 @@ use crate::{Tool, Workspace};
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -141,6 +142,19 @@ const PPTX_EDIT_OPS: [&str; 13] = [
     "add_notes",
 ];
 
+/// The pptx edits that look text up on the slide itself, and so are the only
+/// ones whose refusal can name a diagram's text (the kit's `slideFindRefusal`):
+/// `add_paragraph` looks up its `after` anchor, the others a `find`. A notes op
+/// searches the notes part instead, where no diagram is, so no diagram text is
+/// read for one.
+const PPTX_SLIDE_TEXT_OPS: [&str; 5] = [
+    "replace_text",
+    "remove_text",
+    "format_text",
+    "add_paragraph",
+    "remove_paragraph",
+];
+
 /// The formats `create` understands: the three OOXML families (whose names the
 /// kit's `format` field also uses) plus PDF; the value doubles as the extension.
 const SUPPORTED_FORMATS: [&str; 4] = [
@@ -149,13 +163,6 @@ const SUPPORTED_FORMATS: [&str; 4] = [
     crate::ooxml::Family::Pptx.name(),
     "pdf",
 ];
-
-/// The shared input rules both this tool and the kit enforce: the single
-/// statement of the sets and bounds below lives in `assets/docgen/rules.json`,
-/// which the kit imports and bun inlines into the committed bundle. The tool
-/// reads the same file, so a rule its call is checked against twice has one
-/// owner rather than two copies.
-const RULES_JSON: &str = include_str!("../../assets/docgen/rules.json");
 
 /// A closed numeric range from [`RULES`]. `min_exclusive` marks a low end the
 /// value has to exceed rather than reach.
@@ -189,7 +196,8 @@ impl Span {
     }
 }
 
-/// The parsed [`RULES_JSON`] (see the file for what each entry governs).
+/// The parsed [`crate::docgen::rules`] (see the file for what each entry
+/// governs).
 #[derive(serde::Deserialize)]
 struct Rules {
     heading_levels: Vec<f64>,
@@ -287,10 +295,13 @@ struct Rules {
     number_format_max: usize,
 }
 
-/// [`RULES_JSON`] parsed once. A malformed file is a build fault, caught by the
+/// [`crate::docgen::rules`] parsed into this tool's own shape: the shared file's
+/// one JSON read is there, and each consumer deserializes what it needs out of
+/// it. A file this shape cannot be taken from is a build fault, caught by the
 /// test below rather than by a call.
 static RULES: LazyLock<Rules> = LazyLock::new(|| {
-    serde_json::from_str(RULES_JSON).expect("assets/docgen/rules.json must be valid JSON")
+    serde::Deserialize::deserialize(crate::docgen::rules())
+        .expect("assets/docgen/rules.json must state the rules the document tool enforces")
 });
 
 /// Create and edit office documents and PDFs. See the module docs.
@@ -326,9 +337,9 @@ impl Tool for DocumentTool {
     }
 
     /// The prompt asset with the shared rules rendered in: the tool's prompt
-    /// states the rules it enforces, and [`RULES_JSON`] is their one owner, so
-    /// the two cannot drift — an asset bound that the rules moved past would
-    /// otherwise be told to the model as a stale number.
+    /// states the rules it enforces, and `assets/docgen/rules.json` is their
+    /// one owner, so the two cannot drift — an asset bound that the rules moved
+    /// past would otherwise be told to the model as a stale number.
     fn description(&self) -> String {
         let degrees_step = RULES.degrees_step.to_string();
         let heading_levels = listed(&RULES.heading_levels);
@@ -372,6 +383,7 @@ impl Tool for DocumentTool {
         // The set with its backslash escaped, as a quoted string spells one: a
         // bare `\` before the closing quote reads as an escaped quote.
         let sheet_name_forbidden = format!("{:?}", RULES.sheet_name_forbidden);
+        let ppt_marks = crate::docgen::ppt_marks();
         crate::prompt::substitute(
             &crate::prompt::load_prompt("tool/document.md"),
             &[
@@ -413,6 +425,14 @@ impl Tool for DocumentTool {
                 ("{{number_format_max}}", &number_format_max),
                 ("{{font_name_max}}", &font_name_max),
                 ("{{format_cells_max}}", &format_cells_max),
+                ("{{ppt_title_mark}}", ppt_marks.title.as_str()),
+                ("{{ppt_hidden_slide_mark}}", ppt_marks.hidden_slide.as_str()),
+                ("{{ppt_diagram_text_mark}}", ppt_marks.diagram_text.as_str()),
+                (
+                    "{{ppt_diagram_text_lost_mark}}",
+                    ppt_marks.diagram_text_lost.as_str(),
+                ),
+                ("{{ppt_no_text_mark}}", ppt_marks.no_text.as_str()),
             ],
         )
     }
@@ -692,10 +712,19 @@ impl DocumentTool {
         require_edit_family(&input, &head, family)?;
         ensure_input_readable(&input, &head)?;
         let mut edits = validate_edits(family, args)?;
-        // Only a presentation places an image the kit must be handed a resolved
-        // path for; the other families' edits carry no path to resolve.
+        // Only a presentation needs either of these: a resolved path for the
+        // image an edit places, and the diagram text a refusal about the slide's
+        // own text may name. What a slide's diagrams show is the reader's rule,
+        // so the text is read from the input — under the conversion bound, since
+        // it walks a whole deck — and the kit looks it up rather than restating
+        // how a diagram is read. An edit that never looks text up on the slide (a
+        // notes edit, a slide reshape) reads no diagram text at all.
+        let mut diagram_text = HashMap::new();
         if family == crate::ooxml::Family::Pptx {
             resolve_edit_images(ws, &mut edits).await?;
+            if edits_search_slide_text(&edits) {
+                diagram_text = crate::document::read_pptx_diagram_text(&input).await;
+            }
         }
         // The OUTPUT keeps the input's own extension — a `.docm` copy stays a
         // `.docm` one, macros and all — which a matched family guarantees it has.
@@ -708,12 +737,17 @@ impl DocumentTool {
             &input_base(&input, "edited"),
         );
         let outputs = reserve(generated, std::slice::from_ref(&base), &extension).await?;
-        let request = json!({
+        let mut request = json!({
             "op": format!("{}_edit", family.name()),
             "input": input.to_string_lossy(),
             "edits": edits,
             "output": outputs[0].to_string_lossy(),
         });
+        // A deck whose slides show no diagram text sends no field: there is
+        // nothing a refusal could name.
+        if !diagram_text.is_empty() {
+            request["diagram_text"] = json!(diagram_text);
+        }
         self.deliver(request, &outputs, "edited").await
     }
 
@@ -2101,13 +2135,13 @@ fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &st
         "replace_text" | "replace_notes" => {
             keys(&["slide", "find", "replace"])?;
             require_slide(object, at)?;
-            edit_string_non_empty(object, "find", at)?;
+            require_pptx_lookup(edit_string_non_empty(object, "find", at)?, "find", at)?;
             edit_string_present(object, "replace", at)?;
         }
         "remove_text" | "remove_paragraph" | "remove_notes" => {
             keys(&["slide", "find"])?;
             require_slide(object, at)?;
-            edit_string_non_empty(object, "find", at)?;
+            require_pptx_lookup(edit_string_non_empty(object, "find", at)?, "find", at)?;
         }
         "format_text" => {
             keys(&[
@@ -2121,14 +2155,18 @@ fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &st
                 "align",
             ])?;
             require_slide(object, at)?;
-            edit_string_non_empty(object, "find", at)?;
+            require_pptx_lookup(edit_string_non_empty(object, "find", at)?, "find", at)?;
             require_pptx_format(object, at)?;
         }
         "add_paragraph" => {
             keys(&["slide", "text", "after", "level"])?;
             require_slide(object, at)?;
             edit_string_present(object, "text", at)?;
-            require_optional_text(object, "after", at)?;
+            // An absent anchor places the paragraph last; a blank one is refused
+            // like a blank `find`.
+            if let Some(after) = edit_string(object, "after", at)? {
+                require_pptx_lookup(after, "after", at)?;
+            }
             require_optional_level(object, at)?;
         }
         "add_image" => {
@@ -2160,6 +2198,20 @@ fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &st
             edit_string_present(object, "text", at)?;
         }
         _ => unreachable!("the op was checked against the family's vocabulary"),
+    }
+    Ok(())
+}
+
+/// Require a lookup a pptx edit makes — the `find` a text op searches for, or
+/// the `after` anchor an inserted paragraph is placed by — to name text. A value
+/// that is empty once whitespace is trimmed names nothing a reading showed (the
+/// reader prints no blank line), so it is refused here, before the deck is read,
+/// rather than searched for.
+fn require_pptx_lookup(text: &str, key: &str, at: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        anyhow::bail!(
+            "usage: {at}.{key} must name text — whitespace alone names nothing to search for"
+        );
     }
     Ok(())
 }
@@ -2415,6 +2467,24 @@ async fn resolve_edit_images(ws: &Workspace, edits: &mut Value) -> Result<()> {
         object.insert("path".to_owned(), json!(image.to_string_lossy()));
     }
     Ok(())
+}
+
+/// Whether one of `edits` looks text up on the slide itself: an edit whose op is
+/// a slide text op (see [`PPTX_SLIDE_TEXT_OPS`]) and that names what to look up —
+/// the `find` a text op matches, or the `after` anchor an inserted paragraph is
+/// placed by. Only such an edit can be refused for naming a diagram's text, so
+/// only they need the slides' diagram text read.
+fn edits_search_slide_text(edits: &Value) -> bool {
+    edits.as_array().is_some_and(|edits| {
+        edits.iter().any(|edit| {
+            let names_a_lookup = edit.get("find").is_some() || edit.get("after").is_some();
+            names_a_lookup
+                && edit
+                    .get("op")
+                    .and_then(Value::as_str)
+                    .is_some_and(|op| PPTX_SLIDE_TEXT_OPS.contains(&op))
+        })
+    })
 }
 
 /// Resolve and validate the `sheets` argument: every sheet is an object with a
@@ -5237,10 +5307,10 @@ mod tests {
     /// runtime is spawned, the kit refuses before a writer is called — so every
     /// such shape is driven through BOTH here: the tool must refuse the call as
     /// the caller's own, and the kit must refuse the same shape when it is handed
-    /// it directly. The value SETS and BOUNDS the two share now have one
-    /// statement in `assets/docgen/rules.json`, read by both sides; this test
-    /// still covers the structural shapes and the refusal classification, so a
-    /// shape widened on one side alone fails it.
+    /// it directly. The value SETS and BOUNDS they share have one
+    /// statement in `assets/docgen/rules.json`, read by the tool, the kit and the
+    /// presentation reader; this test still covers the structural shapes and the
+    /// refusal classification, so a shape widened on one side alone fails it.
     #[tokio::test]
     #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
     #[expect(clippy::too_many_lines)] // reason: one paired case per shared rule
@@ -5765,6 +5835,22 @@ mod tests {
                 json!({ "action": "pptx_edit", "path": "deck.pptx",
                         "edits": [{ "op": "nope", "slide": 1 }] }),
                 "unknown pptx edit",
+            ),
+            // A lookup of nothing but whitespace — a `find` for a text op and the
+            // `after` anchor an inserted paragraph is placed by — names no text a
+            // slide holds, so it is refused before the deck is read rather than
+            // searched for.
+            (
+                json!({ "action": "pptx_edit", "path": "deck.pptx",
+                        "edits": [{ "op": "replace_text", "slide": 1, "find": "  ",
+                                    "replace": "x" }] }),
+                "must name text",
+            ),
+            (
+                json!({ "action": "pptx_edit", "path": "deck.pptx",
+                        "edits": [{ "op": "add_paragraph", "slide": 1, "text": "X",
+                                    "after": "\t" }] }),
+                "must name text",
             ),
             // A `find` an op needs, a `format_text` with nothing to set, and an
             // `insert_text` in the wrong position.
@@ -14019,6 +14105,279 @@ mod tests {
         assert!(err.to_string().contains("inside a table"), "got: {err}");
     }
 
+    /// A `find` the reader showed but no slide text op changes is refused for what
+    /// it really is: a diagram's own text, a label the reader prints and a slide's
+    /// speaker notes all read in a reading, so none may be passed off as text the
+    /// slide lacks, while real slide text still edits. What a diagram shows is
+    /// decided by the reader alone — the tool hands the kit each slide's diagram
+    /// text, read with the reader's own rule (its part account and the point's own
+    /// `prSet`) — so the kit can only name text a reading really showed.
+    /// A find copied out of a reading carries the reader's indentation, the
+    /// longest reader label a find names is the one refused, and a diagram the
+    /// reader reported as lost is named nothing.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    #[expect(clippy::too_many_lines)] // reason: one case per diagram and label rule
+    async fn pptx_edit_names_a_reader_label_and_a_diagrams_text_as_the_reason_it_refuses() {
+        // A `dgm:relIds` graphic frame as a reader shows it, its relationship
+        // naming the data part that holds the diagram's visible text.
+        const DIAGRAM: &str = r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="9" name="Diagram"/><p:cNvGraphicFramePr/></p:nvGraphicFramePr><p:xfrm/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" r:dm="rId99" r:lo="rId100" r:qs="rId101" r:cs="rId102"/></a:graphicData></a:graphic></p:graphicFrame>"#;
+        const DIAGRAM_REL: &str = r#"<Relationship Id="rId99" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/>"#;
+        const DIAGRAM_DATA: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>Diagram node</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt><dgm:prSet phldrT="[Text]"/><dgm:t><a:p><a:r><a:t>Hinted node</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt><dgm:prSet phldr="1" phldrT="[Text]"/><dgm:t><a:p><a:r><a:t>Placeholder node</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt><dgm:prSet phldr="1"></dgm:prSet><dgm:t><a:p><a:r><a:t>Element placeholder</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt><dgm:prSet phldr="1"/><dgm:prSet></dgm:prSet><dgm:t><a:p><a:r><a:t>Kept node</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>"#;
+        // The notes part the slide declares through its own relationships, shaped
+        // as the kit writes one (`createNotesPart`): a `<p:notes>` holding the
+        // body placeholder the reader draws notes from, carrying two note
+        // paragraphs.
+        const NOTES_REL: &str = r#"<Relationship Id="rId98" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>"#;
+        const NOTES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:notes xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder 2"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" dirty="0"/><a:t>Note A</a:t></a:r></a:p><a:p><a:r><a:rPr lang="en-US" dirty="0"/><a:t>Note B</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"#;
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "Slide title" },
+                        { "type": "paragraph", "text": "Real slide text" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let slide = with_first(
+            &part_text(&created, "ppt/slides/slide1.xml"),
+            "<p:spTree>",
+            &format!("<p:spTree>{DIAGRAM}"),
+        );
+        let rels = with_first(
+            &part_text(&created, "ppt/slides/_rels/slide1.xml.rels"),
+            "</Relationships>",
+            &format!("{DIAGRAM_REL}{NOTES_REL}</Relationships>"),
+        );
+        let source = write_fixture(
+            &ws,
+            "diagram.pptx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[
+                    ("ppt/slides/slide1.xml", slide.as_bytes()),
+                    ("ppt/slides/_rels/slide1.xml.rels", rels.as_bytes()),
+                    ("ppt/diagrams/data1.xml", DIAGRAM_DATA.as_bytes()),
+                    ("ppt/notesSlides/notesSlide1.xml", NOTES.as_bytes()),
+                ],
+            ),
+        );
+
+        for (find, expected) in [
+            ("Diagram node", "is inside a diagram on slide 1"),
+            ("    Diagram node", "is inside a diagram on slide 1"),
+            ("Hinted node", "is inside a diagram on slide 1"),
+            ("Placeholder node", "is not on slide 1"),
+            // A paired `<dgm:prSet phldr="1"></dgm:prSet>` is the point's own
+            // `prSet`, so the point is a placeholder a reader shows no text of.
+            ("Element placeholder", "is not on slide 1"),
+            // A later `prSet` without the flag clears it, so the reader shows the
+            // text the point holds.
+            ("Kept node", "is inside a diagram on slide 1"),
+        ] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "pptx_edit", "file_name": "refused",
+                        "path": source.to_string_lossy(),
+                        "edits": [{ "op": "replace_text", "slide": 1, "find": find, "replace": "x" }],
+                    }),
+                )
+                .await
+                .expect_err("a find the slide does not hold must be refused");
+            assert!(
+                err.to_string().contains(expected),
+                "find {find:?} got: {err}"
+            );
+        }
+
+        // Every slide text op looks its text up on the slide, so each is handed the
+        // slide's diagram text and each refuses a lookup that names one: the
+        // pairing between the ops the tool reads diagram text for and the ops whose
+        // refusal the kit words is exercised for the whole vocabulary, not for
+        // `replace_text` alone.
+        for edits in [
+            json!([{ "op": "remove_text", "slide": 1, "find": "Diagram node" }]),
+            json!([{ "op": "format_text", "slide": 1, "find": "Diagram node", "bold": true }]),
+            json!([{ "op": "remove_paragraph", "slide": 1, "find": "Diagram node" }]),
+            json!([{ "op": "add_paragraph", "slide": 1, "text": "X", "after": "Diagram node" }]),
+        ] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "pptx_edit", "file_name": "refused",
+                        "path": source.to_string_lossy(),
+                        "edits": edits,
+                    }),
+                )
+                .await
+                .expect_err("a lookup the slide does not hold must be refused");
+            assert!(
+                err.to_string().contains("is inside a diagram on slide 1"),
+                "edits {edits} got: {err}"
+            );
+        }
+
+        // A lookup of nothing but whitespace names no text a reading showed, so it
+        // is refused before the deck is read — not answered as text the slide does
+        // not hold, and never searched for: a search would match every space the
+        // slide holds.
+        for find in ["  ", "\t", " \n "] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "pptx_edit", "file_name": "refused",
+                        "path": source.to_string_lossy(),
+                        "edits": [{ "op": "replace_text", "slide": 1, "find": find, "replace": "x" }],
+                    }),
+                )
+                .await
+                .expect_err("a find that names no text must be refused");
+            assert!(
+                err.to_string().contains("must name text"),
+                "find {find:?} got: {err}"
+            );
+        }
+
+        // Every mark the reader prints is refused as the label it is — the
+        // longest label the find carries wins, so the lost-diagram mark is not
+        // answered with the shorter `(diagram text)` heading written inside it.
+        for mark in [
+            crate::docgen::ppt_marks().title.as_str(),
+            crate::docgen::ppt_marks().hidden_slide.as_str(),
+            crate::docgen::ppt_marks().diagram_text.as_str(),
+            crate::docgen::ppt_marks().diagram_text_lost.as_str(),
+            crate::docgen::ppt_marks().no_text.as_str(),
+        ] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "pptx_edit", "file_name": "refused",
+                        "path": source.to_string_lossy(),
+                        "edits": [{ "op": "replace_text", "slide": 1, "find": mark, "replace": "x" }],
+                    }),
+                )
+                .await
+                .expect_err("a find the slide does not hold must be refused");
+            assert!(
+                err.to_string()
+                    .contains(&format!("{mark:?} is a label the reader prints")),
+                "find {mark:?} got: {err}"
+            );
+        }
+
+        // A fragment the slide's notes hold is refused as the notes it is: it
+        // reads under the reader's `Slide 1 notes:` label, and the notes ops are
+        // the ones that edit it. The reader indents a notes line under that
+        // label, so a find copied out of a reading is matched with the
+        // indentation trimmed away — and a find copied across the notes' lines
+        // matches them, since the reader prints one line per note paragraph.
+        for find in [
+            "Note A",
+            "  Note A",
+            "\tNote A",
+            "Note A\nNote B",
+            "  Note A\n  Note B",
+        ] {
+            let err = DocumentTool
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "pptx_edit", "file_name": "refused",
+                        "path": source.to_string_lossy(),
+                        "edits": [{ "op": "replace_text", "slide": 1, "find": find, "replace": "x" }],
+                    }),
+                )
+                .await
+                .expect_err("a find the slide's notes hold must be refused");
+            assert!(
+                err.to_string()
+                    .contains("is in the speaker notes of slide 1"),
+                "find {find:?} got: {err}"
+            );
+        }
+        // The notes ops do edit it, so the refusal names the right op rather than
+        // a slide that lacks the text.
+        let noted = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "file_name": "noted",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "replace_notes", "slide": 1, "find": "Note A", "replace": "Changed note" }],
+                }),
+            )
+            .await,
+        );
+        assert!(
+            part_text(&noted, "ppt/notesSlides/notesSlide1.xml").contains("Changed note"),
+            "replace_notes did not rewrite the notes it owns"
+        );
+
+        // The honest path is not narrowed: real slide text still edits.
+        let output = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "file_name": "edited",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "slide": 1, "find": "Real slide text", "replace": "Changed slide text" }],
+                }),
+            )
+            .await,
+        );
+        assert!(
+            part_text(&output, "ppt/slides/slide1.xml").contains("Changed slide text"),
+            "the replacement was lost"
+        );
+
+        // A diagram part the package cut short is one the reader reports as lost,
+        // so its bytes hold no text a reading showed and the kit names nothing a
+        // diagram's: the same find falls through to the ordinary refusal.
+        let cut_source = write_fixture(
+            &ws,
+            "cut-diagram.pptx",
+            &with_parts(
+                &std::fs::read(&created).expect("read base package"),
+                &[
+                    ("ppt/slides/slide1.xml", slide.as_bytes()),
+                    ("ppt/slides/_rels/slide1.xml.rels", rels.as_bytes()),
+                    (
+                        "ppt/diagrams/data1.xml",
+                        br#"<?xml version="1.0"?><dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>Diagram node"#,
+                    ),
+                ],
+            ),
+        );
+        let err = DocumentTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "file_name": "refused",
+                    "path": cut_source.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "slide": 1, "find": "Diagram node", "replace": "x" }],
+                }),
+            )
+            .await
+            .expect_err("a find the slide does not hold must be refused");
+        assert!(
+            err.to_string().contains("is not on slide 1"),
+            "a lost diagram's text must not be named a diagram's: {err}"
+        );
+    }
+
     /// A package whose parts are not the ones a plain number spells — the layout it
     /// holds is `slideLayout01.xml`, and the notes master it declares is the second
     /// of the two it holds — is named by the parts it really has: a relationship
@@ -15320,11 +15679,11 @@ mod tests {
         }
     }
 
-    /// Whether `text` states `value` as a whole token rather than as a slice of
+    /// Whether `text` states `value` as a whole number rather than as a slice of
     /// a longer number: a bare `contains` would let the paragraph-level cap `8`
-    /// be satisfied by the `1048576` of the row cap, so a placeholder that
-    /// moved or went stale would still pass.
-    fn states_whole_token(text: &str, value: &str) -> bool {
+    /// be satisfied by the `1048576` of the row cap, so a placeholder that moved
+    /// or went stale would still pass.
+    fn states_whole_number(text: &str, value: &str) -> bool {
         // An empty value is found everywhere, so it would pass this test vacuously.
         if value.is_empty() {
             return false;
@@ -15398,8 +15757,24 @@ mod tests {
             megabytes(crate::util::FILE_MAX_BYTES).to_string(),
         ] {
             assert!(
-                states_whole_token(&description, &value),
+                states_whole_number(&description, &value),
                 "the description does not state the rule it names — {value:?} is missing as a whole number from:\n{description}"
+            );
+        }
+        // A slide mark is not a number, so the whole-number guard above would
+        // assert nothing for it: what the description owes the model is to name
+        // the mark the reader prints.
+        let marks = crate::docgen::ppt_marks();
+        for mark in [
+            &marks.title,
+            &marks.hidden_slide,
+            &marks.diagram_text,
+            &marks.diagram_text_lost,
+            &marks.no_text,
+        ] {
+            assert!(
+                description.contains(mark.as_str()),
+                "the description does not name the slide mark {mark:?}"
             );
         }
     }

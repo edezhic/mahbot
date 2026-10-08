@@ -7,8 +7,10 @@
 //! address is written, and where the embedded media live — and in how much of a
 //! walk the format needs: Word's is the only one that carries tables, tracked
 //! changes and content beyond the body part, so its reader is the module
-//! [`docx`]; Excel's is the module [`xlsx`]; and PowerPoint's, which needs no
-//! more than a slide walk, still lives in this module.
+//! [`docx`]; Excel's is the module [`xlsx`]; and PowerPoint's is a slide walk
+//! that reaches one part further for the two things a slide only points at —
+//! its layout, whose title placeholders it borrows, and the data model of each
+//! SmartArt diagram it shows — so it still lives in this module.
 //!
 //! # Invariants
 //!
@@ -20,10 +22,11 @@
 //!   named from the entry's base name alone, so a crafted `../` entry path can
 //!   never escape `out_dir`.
 
+use crate::docgen::ppt_marks;
 use crate::document::{DocOutcome, SkipReason, SkippedImages, ensure_out_dir};
 use quick_xml::Reader;
 use quick_xml::events::{BytesRef, BytesStart, Event};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
@@ -48,8 +51,6 @@ const PPT_PRESENTATION_RELS_PART: &str = "ppt/_rels/presentation.xml.rels";
 const PPT_BASE: &str = "ppt/";
 /// Prefix of the slide parts.
 const PPT_SLIDES_PREFIX: &str = "ppt/slides/";
-/// Prefix of the per-slide relationship parts.
-const PPT_SLIDES_RELS_PREFIX: &str = "ppt/slides/_rels/";
 /// Prefix of the embedded-media parts in a PowerPoint package.
 const PPT_MEDIA_PREFIX: &str = "ppt/media/";
 /// Charts in a PowerPoint package: `ppt/charts/chart<N>.xml`.
@@ -128,6 +129,12 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     let images = write_media_parts(&mut archive, PPT_MEDIA_PREFIX, out_dir, &mut skipped);
 
     let mut blocks = Vec::new();
+    // A deck's slides share a handful of layouts, so a layout's title indices are
+    // read once for the whole presentation rather than once per slide; a diagram
+    // a slide shows and another shows too is parsed once here for the same
+    // reason.
+    let mut layouts: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut diagrams = DiagramCache::default();
     for (index, part) in parts.iter().enumerate() {
         let number = index + 1;
         // A slide the presentation declares but the package does not resolve
@@ -137,15 +144,36 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
             notes.push(format!("slide {number} could not be read"));
             continue;
         };
-        let Some(lines) = read_zip_entry(&mut archive, part)
-            .bytes()
-            .and_then(|xml| slide_text_lines(&xml))
-        else {
+        // Everything the slide owns — its relationships, and the notes, layout
+        // and diagram parts they name — resolves against the directory the
+        // package actually put the slide part in, never the conventional
+        // `ppt/slides/`.
+        let base = part_dir(part);
+        let Some(xml) = read_zip_entry(&mut archive, part).bytes() else {
             notes.push(format!("slide {number} could not be read"));
             continue;
         };
-        blocks.push(text_block(&format!("Slide {number}:"), "(no text)", &lines));
-        match slide_notes(&mut archive, part) {
+        let rels = slide_rels(&mut archive, part);
+        // The layout is consulted for its title placeholders — and for nothing
+        // else: its text never enters the answer.
+        let layout_titles = layout_title_indices(&mut archive, base, &rels, &mut layouts);
+        // A title placeholder names its type on the slide, or leaves it to the
+        // layout; a placeholder that names neither takes the schema's defaults
+        // (`obj` and idx 0), so the layout is consulted for those too.
+        let is_title = |kind: Option<&str>, idx: Option<&str>| match kind {
+            Some("title" | "ctrTitle") => true,
+            Some("obj") | None => {
+                layout_titles.is_some_and(|titles| titles.contains(idx.unwrap_or("0")))
+            }
+            Some(_) => false,
+        };
+        let Some(content) = slide_text(&xml, is_title) else {
+            notes.push(format!("slide {number} could not be read"));
+            continue;
+        };
+        let shown = slide_diagrams(&mut archive, base, &xml, &rels, &mut diagrams);
+        blocks.push(slide_block(number, slide_hidden(&xml), &content, &shown));
+        match slide_notes(&mut archive, base, &rels) {
             SlideNotes::Text(lines) if !lines.is_empty() => {
                 blocks.push(text_lines(&format!("Slide {number} notes:"), &lines));
             }
@@ -164,6 +192,52 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         notes,
         all_page_text_lost: false,
     }
+}
+
+/// The diagram text a reading shows for each slide of a presentation package,
+/// keyed by the slide part the reading numbers (`ppt/slides/slide1.xml`): the
+/// text a slide's diagrams show — text the reader prints and the editor does not
+/// change.
+///
+/// Read here rather than by the document kit's own refusals, so what a diagram
+/// shows is decided by the reader's rule alone (see [`slide_diagrams`] and
+/// [`diagram_text_lines`]). A slide whose diagrams read as lost, one whose
+/// diagrams show no text, and one whose part cannot be read at all are absent
+/// from the map: nothing here names text a reading did not show.
+///
+/// Best effort by design: a package that is not a presentation, or one whose
+/// bytes do not open, yields an empty map, and a refusal then keeps its generic
+/// wording.
+pub(crate) fn pptx_diagram_text(bytes: &[u8]) -> HashMap<String, Vec<String>> {
+    let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
+        return HashMap::new();
+    };
+    let Some(parts) = resolve_slide_parts(&mut archive) else {
+        return HashMap::new();
+    };
+    let mut cache = DiagramCache::default();
+    let mut text = HashMap::new();
+    for part in parts.into_iter().flatten() {
+        let Some(xml) = read_zip_entry(&mut archive, &part).bytes() else {
+            continue;
+        };
+        let rels = slide_rels(&mut archive, &part);
+        let shown: Vec<String> =
+            slide_diagrams(&mut archive, part_dir(&part), &xml, &rels, &mut cache)
+                .into_iter()
+                .filter_map(|diagram| match diagram {
+                    // One entry per diagram that shows text: a diagram shows its
+                    // points' lines joined, the way a reading prints them, and a
+                    // diagram with nothing to show names nothing.
+                    DiagramRead::Text(lines) if !lines.is_empty() => Some(lines.join("\n")),
+                    _ => None,
+                })
+                .collect();
+        if !shown.is_empty() {
+            text.insert(part, shown);
+        }
+    }
+    text
 }
 
 /// The slide parts in presentation order, one slot per slide the presentation
@@ -223,7 +297,35 @@ fn fallback_slide_parts<R: Read + Seek>(archive: &ZipArchive<R>) -> Vec<Option<S
     slides.into_iter().map(|(_, name)| Some(name)).collect()
 }
 
-/// A slide's speaker notes, as resolved through the slide's own relationships.
+/// The relationships a slide part declares through the `.rels` part beside it.
+enum SlideRels {
+    /// The slide declares no relationships at all (no `.rels` part).
+    None,
+    /// The `.rels` part is there but could not be read.
+    Unreadable,
+    /// The relationships it declares, in document order.
+    List(Vec<Relationship>),
+}
+
+/// The relationships of the slide part `slide_part`, read from the `.rels` part
+/// beside it ([`rels_part_of`]). A slide with no relationships part declares
+/// none — but one that IS there and could not be read may name a title layout,
+/// diagrams or notes, and the two are kept apart rather than rescanned per
+/// caller.
+fn slide_rels<R: Read + Seek>(archive: &mut ZipArchive<R>, slide_part: &str) -> SlideRels {
+    match read_zip_entry(archive, &rels_part_of(slide_part)) {
+        ZipEntry::Missing => SlideRels::None,
+        ZipEntry::Unreadable => SlideRels::Unreadable,
+        // The part is there, but its XML could not be read: it may name parts.
+        ZipEntry::Bytes(rels) => match relationships(&rels) {
+            Some(list) => SlideRels::List(list),
+            None => SlideRels::Unreadable,
+        },
+    }
+}
+
+/// A slide's speaker notes, as resolved through the relationships beside the
+/// slide part.
 enum SlideNotes {
     /// The slide declares no notes part — the usual case.
     None,
@@ -233,83 +335,182 @@ enum SlideNotes {
     Unreadable,
 }
 
-/// The speaker notes of the slide part `slide_part`, resolved through its own
-/// relationships (never by slide index), as their non-empty text lines.
-fn slide_notes<R: Read + Seek>(archive: &mut ZipArchive<R>, slide_part: &str) -> SlideNotes {
-    let file_name = Path::new(slide_part)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let rels_part = format!("{PPT_SLIDES_RELS_PREFIX}{file_name}.rels");
-    // Relationships are how a slide declares notes at all, so a slide with no
-    // relationships part has none — but one that IS there and could not be read
-    // may name them, and that is said rather than passed off as a slide with no
-    // notes. The reader keeps the two apart rather than rescanning the names.
-    let rels = match read_zip_entry(archive, &rels_part) {
-        ZipEntry::Missing => return SlideNotes::None,
-        ZipEntry::Unreadable => return SlideNotes::Unreadable,
-        ZipEntry::Bytes(rels) => rels,
+/// The speaker notes a slide declares through `rels` — their targets resolved
+/// against the slide part's own directory (`base`) — as their non-empty text
+/// lines: never by slide index, and never a note of another slide's.
+fn slide_notes<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    base: &str,
+    rels: &SlideRels,
+) -> SlideNotes {
+    let rels = match rels {
+        SlideRels::None => return SlideNotes::None,
+        SlideRels::Unreadable => return SlideNotes::Unreadable,
+        SlideRels::List(rels) => rels,
     };
-    let Some(relations) = relationships(&rels) else {
-        // The part is there, but its XML could not be read: it may name notes.
-        return SlideNotes::Unreadable;
-    };
-    let Some(target) = relations
-        .into_iter()
+    let Some(target) = rels
+        .iter()
         .find(|rel| rel.kind.ends_with("/notesSlide"))
-        .map(|rel| rel.target)
+        .map(|rel| rel.target.as_str())
     else {
         return SlideNotes::None;
     };
-    match read_zip_entry(archive, &resolve_part(PPT_SLIDES_PREFIX, &target)) {
-        ZipEntry::Bytes(xml) => {
-            slide_text_lines(&xml).map_or(SlideNotes::Unreadable, SlideNotes::Text)
-        }
+    match read_zip_entry(archive, &resolve_part(base, target)) {
+        ZipEntry::Bytes(xml) => slide_text(&xml, |_, _| false)
+            .map_or(SlideNotes::Unreadable, |text| SlideNotes::Text(text.lines)),
         ZipEntry::Missing | ZipEntry::Unreadable => SlideNotes::Unreadable,
     }
 }
 
-/// The text lines of an `<a:t>`-bearing part (a slide or a notes slide), in
-/// document order: a newline at `<a:br/>` and at each `<a:p>` end, and nothing
-/// from an `<a:fld>` (the slide-number/date field). Empty paragraphs are
-/// dropped; `None` on any XML error.
-fn slide_text_lines(xml: &[u8]) -> Option<Vec<String>> {
-    let mut reader = Reader::from_reader(xml);
-    let mut buffer = Vec::new();
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut in_text = false;
-    let mut field_depth = 0usize;
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(event)) => match event.local_name().as_ref() {
-                b"t" => in_text = true,
-                b"br" => current.push('\n'),
-                b"fld" => field_depth += 1,
+/// A part's `<a:t>` text, split by whether it belongs to the slide's title
+/// placeholder.
+struct SlideText {
+    /// The title placeholder's lines, in part order (empty when the slide
+    /// declares no title or the title is empty).
+    title: Vec<String>,
+    /// Every other line the part holds, unchanged from what the reader showed
+    /// before.
+    lines: Vec<String>,
+}
+
+/// The text runs one OOXML part's walk accumulates: every `<a:t>`'s text
+/// joined into the paragraph being read, `<a:br/>` breaking it into lines, and
+/// the text of an `<a:fld>` (the slide-number/date field) left out. One
+/// implementation, so the slide walk and the diagram walk read a run alike.
+#[derive(Default)]
+struct TextRuns {
+    /// The paragraph being read right now: the `<a:t>` text seen since its
+    /// `<a:p>` opened, until a paragraph end moves it out.
+    paragraph: String,
+    /// Whether an `<a:t>` is open: its text is run text, and no other element's
+    /// is.
+    in_text: bool,
+    /// How many `<a:fld>` elements are open: their text is the field's, not the
+    /// run's.
+    fields: usize,
+}
+
+impl TextRuns {
+    /// Note one event of the part's walk, accumulating the run text, and return
+    /// `true` when the event is the `</a:p>` that ends a paragraph — so the
+    /// caller can read the paragraph where it belongs before the next one opens.
+    fn note(&mut self, event: &Event<'_>) -> bool {
+        match event {
+            Event::Start(event) => match event.local_name().as_ref() {
+                b"t" => self.in_text = true,
+                b"br" => self.paragraph.push('\n'),
+                b"fld" => self.fields += 1,
                 _ => {}
             },
-            Ok(Event::Empty(event)) if event.local_name().as_ref() == b"br" => current.push('\n'),
-            Ok(Event::Text(event)) if in_text && field_depth == 0 => {
-                if let Ok(chunk) = event.xml10_content() {
-                    current.push_str(&chunk);
+            Event::Empty(event) => {
+                if event.local_name().as_ref() == b"br" {
+                    self.paragraph.push('\n');
                 }
             }
-            Ok(Event::GeneralRef(event)) if in_text && field_depth == 0 => {
-                append_entity(&mut current, &event);
+            Event::Text(event) if self.in_text && self.fields == 0 => {
+                if let Ok(chunk) = event.xml10_content() {
+                    self.paragraph.push_str(&chunk);
+                }
             }
-            Ok(Event::End(event)) => match event.local_name().as_ref() {
-                b"t" => in_text = false,
-                b"fld" => field_depth = field_depth.saturating_sub(1),
-                b"p" => push_lines(&mut lines, &mut current),
+            Event::GeneralRef(event) if self.in_text && self.fields == 0 => {
+                append_entity(&mut self.paragraph, event);
+            }
+            Event::End(event) => match event.local_name().as_ref() {
+                b"t" => self.in_text = false,
+                b"fld" => self.fields = self.fields.saturating_sub(1),
+                b"p" => return true,
                 _ => {}
             },
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return None,
+            _ => {}
+        }
+        false
+    }
+
+    /// Clear the paragraph being read: the caller read it where it belongs to
+    /// no block of the part, so it must not leak into a later one.
+    fn discard(&mut self) {
+        self.paragraph.clear();
+    }
+
+    /// Move the paragraph being read into `lines` ([`push_lines`]), one line per
+    /// `<a:br/>` break.
+    fn lines(&mut self, lines: &mut Vec<String>) {
+        push_lines(lines, &mut self.paragraph);
+    }
+}
+
+/// A part's `<a:t>` text, in document order: a newline at `<a:br/>` and at each
+/// `<a:p>` end, and nothing from an `<a:fld>` (the slide-number/date field).
+/// Text of a `<p:sp>` whose `<p:ph>` declares the slide's title goes to
+/// [`SlideText::title`]; every other line — a table cell's, a group's children's,
+/// anything outside a shape — goes to [`SlideText::lines`]. `is_title` receives
+/// each `<p:ph>`'s `type` and `idx`. Empty paragraphs are dropped; `None` on any
+/// XML error. The runs themselves are read by [`TextRuns`].
+fn slide_text(
+    xml: &[u8],
+    is_title: impl Fn(Option<&str>, Option<&str>) -> bool,
+) -> Option<SlideText> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buffer = Vec::new();
+    // One entry per open `<p:sp>`: whether that shape is the title. `<p:ph>`
+    // sets the innermost entry, and a run with no shape open is body text.
+    let mut shapes: Vec<bool> = Vec::new();
+    let mut runs = TextRuns::default();
+    let mut title = Vec::new();
+    let mut lines = Vec::new();
+    loop {
+        let Ok(event) = reader.read_event_into(&mut buffer) else {
+            return None;
+        };
+        // Note the runs first, so a paragraph accumulates whichever event is
+        // the one that ends it.
+        let ended = runs.note(&event);
+        match event {
+            Event::Start(event) => match event.local_name().as_ref() {
+                b"sp" => shapes.push(false),
+                b"ph" => mark_title(&mut shapes, &event, &is_title),
+                _ => {}
+            },
+            Event::Empty(event) => {
+                if event.local_name().as_ref() == b"ph" {
+                    mark_title(&mut shapes, &event, &is_title);
+                }
+            }
+            Event::End(event) => {
+                if event.local_name().as_ref() == b"sp" {
+                    shapes.pop();
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        if ended {
+            // The shape a paragraph sits in is still open here, so its title
+            // flag is the paragraph's own.
+            if shapes.last() == Some(&true) {
+                runs.lines(&mut title);
+            } else {
+                runs.lines(&mut lines);
+            }
         }
         buffer.clear();
     }
-    Some(lines)
+    Some(SlideText { title, lines })
+}
+
+/// Set the innermost open `<p:sp>`'s title flag from a `<p:ph>`: does nothing
+/// when no shape is open.
+fn mark_title(
+    shapes: &mut [bool],
+    event: &BytesStart<'_>,
+    is_title: &impl Fn(Option<&str>, Option<&str>) -> bool,
+) {
+    if let Some(shape) = shapes.last_mut() {
+        *shape = is_title(
+            attr(event, b"type").as_deref(),
+            attr(event, b"idx").as_deref(),
+        );
+    }
 }
 
 /// Move the paragraph in `current` into `lines`, one trimmed line per `<a:br/>`
@@ -321,6 +522,284 @@ fn push_lines(lines: &mut Vec<String>, current: &mut String) {
             lines.push(line.to_owned());
         }
     }
+}
+
+/// Whether the presentation hides the slide: `<p:sld ... show="0">`. Matching
+/// the attribute by local name is what keeps `showMasterSp` and
+/// `showMasterPhAnim` — `show`-prefixed but not the slide's own show flag — from
+/// being mistaken for it.
+fn slide_hidden(xml: &[u8]) -> bool {
+    scan_elements(xml, b"sld", |event| attr(event, b"show"))
+        .and_then(|values| values.into_iter().next())
+        .is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
+}
+
+/// The `idx` values of the title placeholders the slide's own layout declares,
+/// memoized in `cache` by layout part; the layout's own target resolves against
+/// the slide part's directory (`base`).
+///
+/// A slide's title placeholder sometimes carries its type on the layout rather
+/// than on the slide, so the layout is consulted for its title indices — and for
+/// nothing else: its text never enters the answer. `None` when the slide
+/// declares no layout relationship at all; a layout that is missing, unreadable
+/// or unparsable reads as one declaring nothing.
+fn layout_title_indices<'a, R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    base: &str,
+    rels: &SlideRels,
+    cache: &'a mut HashMap<String, HashSet<String>>,
+) -> Option<&'a HashSet<String>> {
+    let SlideRels::List(rels) = rels else {
+        return None;
+    };
+    let target = rels
+        .iter()
+        .find(|rel| rel.kind.ends_with("/slideLayout"))
+        .map(|rel| rel.target.as_str())?;
+    let part = resolve_part(base, target);
+    Some(
+        cache
+            .entry(part.clone())
+            .or_insert_with(|| read_layout_title_indices(archive, &part)),
+    )
+}
+
+/// [`layout_title_indices`] for one layout part, read from the package.
+fn read_layout_title_indices<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    part: &str,
+) -> HashSet<String> {
+    let Some(xml) = read_zip_entry(archive, part).bytes() else {
+        return HashSet::new();
+    };
+    scan_elements(&xml, b"ph", |event| {
+        matches!(attr(event, b"type").as_deref(), Some("title" | "ctrTitle"))
+            .then(|| attr(event, b"idx").unwrap_or_else(|| "0".to_owned()))
+    })
+    .unwrap_or_default()
+    .into_iter()
+    .collect()
+}
+
+/// What reading one diagram on a slide produced.
+#[derive(Clone)]
+enum DiagramRead {
+    /// The visible text of the diagram's data model, in the model's own order.
+    Text(Vec<String>),
+    /// The diagram's data could not be read: its text is lost, and the slide
+    /// says so rather than reading as one without a diagram.
+    Lost,
+}
+
+/// The text a deck's diagram data parts were read as, keyed by part: a deck that
+/// shows one diagram on several slides reads its part once, the way its layouts
+/// are read once for the whole presentation.
+#[derive(Default)]
+struct DiagramCache(HashMap<String, DiagramRead>);
+
+impl DiagramCache {
+    /// The text of one diagram's data part, read on first use: `Lost` for a part
+    /// the package does not hold or one [`diagram_text_lines`] cannot read.
+    fn read<R: Read + Seek>(&mut self, archive: &mut ZipArchive<R>, part: &str) -> DiagramRead {
+        if let Some(read) = self.0.get(part) {
+            return read.clone();
+        }
+        let read = read_zip_entry(archive, part)
+            .bytes()
+            .and_then(|xml| diagram_text_lines(&xml))
+            .map_or(DiagramRead::Lost, DiagramRead::Text);
+        self.0.insert(part.to_owned(), read.clone());
+        read
+    }
+}
+
+/// The diagrams a slide shows, in the order its shapes present them, read from
+/// their data parts through the relationships the slide part declares, their
+/// targets resolved against its own directory (`base`) and their text taken from
+/// `cache`, so a part a deck shows on several slides is parsed once.
+///
+/// Every diagram is read once per slide: a data part a slide refers to several
+/// times yields one section. A slide with no diagram reference, and a slide
+/// whose own XML cannot be read, present nothing.
+fn slide_diagrams<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    base: &str,
+    xml: &[u8],
+    rels: &SlideRels,
+    cache: &mut DiagramCache,
+) -> Vec<DiagramRead> {
+    // A `dgm:relIds` carries `r:dm`, `r:lo`, `r:qs` and `r:cs`; `attr` matches by
+    // local name, so this is the data-model reference. Every `relIds` a slide
+    // holds is collected, the attribute or not: a frame whose `relIds` names no
+    // data model (a package that breaks the schema, which requires all four)
+    // still shows a diagram, and one read as no diagram at all would be dropped
+    // in silence.
+    let Some(ids) = scan_elements(xml, b"relIds", |event| Some(attr(event, b"dm"))) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut diagrams = Vec::new();
+    for id in ids {
+        // No reference to resolve and nothing to dedupe on: the frame keeps its
+        // own section, and its text reads as lost.
+        let Some(id) = id else {
+            diagrams.push(DiagramRead::Lost);
+            continue;
+        };
+        let part = match rels {
+            SlideRels::List(rels) => rels
+                .iter()
+                .find(|rel| rel.id == id)
+                .map(|rel| resolve_part(base, &rel.target)),
+            SlideRels::None | SlideRels::Unreadable => None,
+        };
+        // Dedupe on the resolved part (never across slides, which read the same
+        // diagram with their own block); an id nothing resolves keeps its own
+        // section, so it is not merged with an unrelated lost diagram.
+        let key = part.clone().unwrap_or_else(|| format!("#{id}"));
+        if !seen.insert(key) {
+            continue;
+        }
+        let read = match part {
+            Some(part) => cache.read(archive, &part),
+            None => DiagramRead::Lost,
+        };
+        diagrams.push(read);
+    }
+    diagrams
+}
+
+/// One open `<dgm:pt>` of a diagram's data model: whether it is an editor
+/// placeholder, and the text read from it so far.
+struct DiagramPoint {
+    placeholder: bool,
+    lines: Vec<String>,
+}
+
+/// The text a person sees in a diagram's data model: the `<dgm:t>` text of
+/// every `<dgm:pt>` (a point) the diagram does not flag as an editor
+/// placeholder, flat, in `dgm:ptLst` document order. The structure (the
+/// `dgm:cxn` tree) is not reproduced, and every point type is read (`node`,
+/// `asst`, `pres`, ...; an absent `type` is the schema's `node`) — only a
+/// flagged placeholder is skipped, and a point's text is kept only once the
+/// whole point has been walked, so a producer that writes its `<dgm:prSet>`
+/// after its `<dgm:t>` cannot leak a hint.
+///
+/// `None` for a part that is not a diagram's data model, one the package cut
+/// short, or one the package left empty (bytes that are only whitespace, see
+/// [`blank`]): a diagram's text is lost in every case, which the slide states
+/// rather than reading as one with no diagram. The empty case overrides
+/// [`Part::unreadable`]'s rule that a blank entry declares nothing — for a
+/// diagram an entry that declares no data model holds no text either, which is
+/// data absent, not a section with nothing under it.
+fn diagram_text_lines(xml: &[u8]) -> Option<Vec<String>> {
+    let mut part = Part::new(xml);
+    let mut reader = Reader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut points: Vec<DiagramPoint> = Vec::new();
+    let mut runs = TextRuns::default();
+    let mut lines = Vec::new();
+    loop {
+        let Ok(event) = reader.read_event_into(&mut buffer) else {
+            return None;
+        };
+        part.note(&event);
+        let ended = runs.note(&event);
+        match event {
+            Event::Start(event) => match event.local_name().as_ref() {
+                b"dataModel" => part.kind_seen(),
+                b"pt" => {
+                    // Text read before the point opened belongs to no node: it
+                    // is discarded here rather than leaking into this point.
+                    runs.discard();
+                    points.push(DiagramPoint {
+                        placeholder: false,
+                        lines: Vec::new(),
+                    });
+                }
+                b"prSet" => mark_placeholder(&mut points, &event),
+                _ => {}
+            },
+            Event::Empty(event) => match event.local_name().as_ref() {
+                // A self-closing `<dgm:dataModel/>` is a data model too.
+                b"dataModel" => part.kind_seen(),
+                b"prSet" => mark_placeholder(&mut points, &event),
+                _ => {}
+            },
+            Event::End(event) => {
+                if event.local_name().as_ref() == b"pt"
+                    && let Some(point) = points.pop()
+                    && !point.placeholder
+                {
+                    lines.extend(point.lines);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        if ended {
+            // A paragraph read with no point open belongs to no node, and must
+            // not leak into the next one.
+            match points.last_mut() {
+                Some(point) => runs.lines(&mut point.lines),
+                None => runs.discard(),
+            }
+        }
+        buffer.clear();
+    }
+    (!part.unreadable() && !blank(xml)).then_some(lines)
+}
+
+/// Mark the innermost open `<dgm:pt>` a placeholder from the `<dgm:prSet>` it
+/// holds: the point's last `prSet` decides (one without a `phldr` clears the
+/// flag), and PowerPoint writes one. A placeholder's carries `phldr` of
+/// `"1"`/`"true"` (case-insensitive), and PowerPoint draws its hint instead of
+/// the text the point holds. A `phldrT` alone is not that flag — ECMA-376 gives
+/// a point carrying its own text both the hint and the flag, and the text is
+/// what a person sees.
+fn mark_placeholder(points: &mut [DiagramPoint], event: &BytesStart<'_>) {
+    let Some(point) = points.last_mut() else {
+        return;
+    };
+    point.placeholder = attr(event, b"phldr")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+}
+
+/// One slide block: `Slide {n}:`, ` (hidden slide)` when the presentation hides
+/// it, then the title lines, the body lines, and one section per diagram — a
+/// diagram section being the `(diagram text)` heading over its indented node
+/// lines (none, for a diagram that shows no text), or the
+/// `(diagram text could not be read)` mark. A slide holding a diagram thus never
+/// reads `(no text)`, which [`text_block`] supplies only for a slide holding
+/// nothing at all.
+fn slide_block(
+    number: usize,
+    hidden: bool,
+    content: &SlideText,
+    diagrams: &[DiagramRead],
+) -> String {
+    let marks = ppt_marks();
+    let mut header = format!("Slide {number}:");
+    if hidden {
+        header.push(' ');
+        header.push_str(&marks.hidden_slide);
+    }
+    let mut lines: Vec<String> = content
+        .title
+        .iter()
+        .map(|line| format!("{} {line}", marks.title))
+        .collect();
+    lines.extend(content.lines.iter().cloned());
+    for diagram in diagrams {
+        match diagram {
+            DiagramRead::Lost => lines.push(marks.diagram_text_lost.clone()),
+            DiagramRead::Text(nodes) => {
+                lines.push(marks.diagram_text.clone());
+                lines.extend(nodes.iter().map(|node| format!("  {node}")));
+            }
+        }
+    }
+    text_block(&header, &marks.no_text, &lines)
 }
 
 // ── Shared package plumbing ─────────────────────────────────────
@@ -540,6 +1019,22 @@ fn resolve_part(base: &str, target: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// The directory a part's own relationship targets resolve against
+/// (`ppt/slides/slide1.xml` -> `ppt/slides/`): a package may put a part
+/// anywhere the relationship that names it points.
+fn part_dir(part: &str) -> &str {
+    part.rfind('/').map_or("", |slash| &part[..=slash])
+}
+
+/// The relationships part of `part` (`ppt/slides/slide1.xml` ->
+/// `ppt/slides/_rels/slide1.xml.rels`), by the OPC convention the document
+/// kit's `relsPartFor` follows: wherever the package put the part, its
+/// relationships are beside it.
+fn rels_part_of(part: &str) -> String {
+    let name = part.rsplit_once('/').map_or(part, |(_, name)| name);
+    format!("{}_rels/{name}.rels", part_dir(part))
 }
 
 /// The relationship-id attribute of an element that refers to a part
@@ -919,6 +1414,51 @@ mod tests {
         );
     }
 
+    /// A slide part may live anywhere the presentation's relationship points,
+    /// not just `ppt/slides/`: its own `.rels` sits beside it, and the notes and
+    /// diagram parts those relationships name resolve against its own directory.
+    /// Read from the conventional prefix instead, the notes would be lost in
+    /// silence and the diagram falsely reported as unreadable.
+    #[test]
+    fn pptx_reads_a_slide_outside_the_conventional_slides_directory() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides2/slide1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides2/slide1.xml",
+                br#"<p:sld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Out-of-tree text</a:t></a:r></a:p></p:txBody></p:sp><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId2"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides2/_rels/slide1.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/notesSlides/notesSlide1.xml",
+                br"<p:notes><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Notes for the out-of-tree slide</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>",
+            ),
+            (
+                "ppt/diagrams/data1.xml",
+                br#"<dgm:dataModel><dgm:ptLst><dgm:pt type="node"><dgm:t><a:p><a:r><a:t>North</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>"#,
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, notes, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a readable presentation");
+        };
+        assert_eq!(
+            text,
+            "Slide 1:\n  Out-of-tree text\n  (diagram text)\n    North\n\n\
+             Slide 1 notes:\n  Notes for the out-of-tree slide"
+        );
+        assert!(notes.is_empty(), "no part may be reported lost: {notes:?}");
+    }
+
     /// A slide's notes are announced rather than dropped in silence, however
     /// they are lost: a relationship that resolves to a part the package does
     /// not have, and a slide whose relationships part cannot be read at all
@@ -954,6 +1494,534 @@ mod tests {
             assert_eq!(text, "Slide 1:\n  Slide text");
             assert_eq!(notes, ["slide 1 notes could not be read"]);
         }
+    }
+
+    /// A slide's own title placeholder is marked and its text appears exactly
+    /// once; a shape without a `<p:ph>` is ordinary text, an empty title adds no
+    /// mark, and a slide holding only its title does not read as one with no
+    /// text.
+    #[test]
+    fn pptx_marks_the_title_placeholder_the_slide_declares() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/><p:sldId r:id="rId3"/><p:sldId r:id="rId4"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/><Relationship Id="rId3" Target="slides/slide3.xml"/><Relationship Id="rId4" Target="slides/slide4.xml"/></Relationships>"#,
+            ),
+            // An own `type="title"` marks the placeholder; a shape with no
+            // `<p:ph>` (a heading written as a plain text box) is ordinary text.
+            (
+                "ppt/slides/slide1.xml",
+                br#"<p:sld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Quarterly review</a:t></a:r></a:p></p:txBody></p:sp><p:sp><p:txBody><a:p><a:r><a:t>Heading as a text box</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
+            ),
+            // `ctrTitle` is a title too.
+            (
+                "ppt/slides/slide2.xml",
+                br#"<p:sld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="ctrTitle"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Centred title</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
+            ),
+            // An empty title placeholder adds no mark; the body still reads.
+            (
+                "ppt/slides/slide3.xml",
+                br#"<p:sld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p/></p:txBody></p:sp><p:sp><p:txBody><a:p><a:r><a:t>Only body</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
+            ),
+            // A slide that holds only its title must not read `(no text)`.
+            (
+                "ppt/slides/slide4.xml",
+                br#"<p:sld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Title only</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a readable presentation");
+        };
+        assert_eq!(
+            text,
+            "Slide 1:\n  (title) Quarterly review\n  Heading as a text box\n\n\
+             Slide 2:\n  (title) Centred title\n\n\
+             Slide 3:\n  Only body\n\n\
+             Slide 4:\n  (title) Title only"
+        );
+    }
+
+    /// A title the slide leaves to its layout: the slide's `<p:ph idx="10"/>`
+    /// carries no type, and the layout part its own relationship names declares
+    /// that `idx` a title. The layout's text never enters the answer, the
+    /// layout's body placeholder stays body text, and the answer is the layout's
+    /// alone — a slide of another layout, whose title sits at another `idx`, is
+    /// left unmarked even though its own placeholder carries the same `idx`. A
+    /// placeholder naming neither type nor `idx` takes the schema's defaults,
+    /// which the layout is consulted for like any other `idx`.
+    #[test]
+    fn pptx_marks_a_title_inherited_from_the_layout() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/><p:sldId r:id="rId3"/><p:sldId r:id="rId4"/><p:sldId r:id="rId5"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/><Relationship Id="rId3" Target="slides/slide3.xml"/><Relationship Id="rId4" Target="slides/slide4.xml"/><Relationship Id="rId5" Target="slides/slide5.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                br#"<p:sld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph idx="10"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Inherited title</a:t></a:r></a:p></p:txBody></p:sp><p:sp><p:nvSpPr><p:nvPr><p:ph idx="11"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Body</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
+            ),
+            // The same `idx` under a layout that declares its title elsewhere.
+            (
+                "ppt/slides/slide2.xml",
+                br#"<p:sld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph idx="10"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Not a title here</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
+            ),
+            // A second slide of the layout the first one uses.
+            (
+                "ppt/slides/slide3.xml",
+                br#"<p:sld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph idx="10"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Shared layout title</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
+            ),
+            // A placeholder naming neither type nor `idx`: the schema defaults
+            // it to the layout's `idx` 0, which that layout declares a title.
+            (
+                "ppt/slides/slide4.xml",
+                br"<p:sld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Defaulted title</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>",
+            ),
+            // ...but the same layout's `idx` 1 is its body, whatever the type
+            // defaults to.
+            (
+                "ppt/slides/slide5.xml",
+                br#"<p:sld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="obj" idx="1"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Defaulted body</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide2.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout2.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide3.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide4.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout3.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide5.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout3.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slideLayouts/slideLayout1.xml",
+                br#"<p:sldLayout><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title" idx="10"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>LAYOUT TITLE</a:t></a:r></a:p></p:txBody></p:sp><p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="11"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>LAYOUT BODY</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sldLayout>"#,
+            ),
+            (
+                "ppt/slideLayouts/slideLayout2.xml",
+                br#"<p:sldLayout><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title" idx="20"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>OTHER LAYOUT TITLE</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sldLayout>"#,
+            ),
+            // Its title carries no `idx`, which the schema defaults to 0.
+            (
+                "ppt/slideLayouts/slideLayout3.xml",
+                br#"<p:sldLayout><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>DEFAULTED LAYOUT TITLE</a:t></a:r></a:p></p:txBody></p:sp><p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>LAYOUT BODY</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sldLayout>"#,
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a readable presentation");
+        };
+        assert_eq!(
+            text,
+            "Slide 1:\n  (title) Inherited title\n  Body\n\n\
+             Slide 2:\n  Not a title here\n\n\
+             Slide 3:\n  (title) Shared layout title\n\n\
+             Slide 4:\n  (title) Defaulted title\n\n\
+             Slide 5:\n  Defaulted body"
+        );
+    }
+
+    /// A hidden slide is marked, keeps its number, and still says it is hidden
+    /// when it holds nothing; `showMasterSp` is not the slide's own show flag.
+    #[test]
+    fn pptx_marks_a_hidden_slide_and_keeps_its_number() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/><p:sldId r:id="rId3"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/><Relationship Id="rId3" Target="slides/slide3.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                br#"<p:sld show="0"><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Hidden</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/slide2.xml",
+                br#"<p:sld showMasterSp="0"><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Shown</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/slide3.xml",
+                br#"<p:sld show="0"><p:spTree/></p:sld>"#,
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a readable presentation");
+        };
+        assert_eq!(
+            text,
+            "Slide 1: (hidden slide)\n  Hidden\n\n\
+             Slide 2:\n  Shown\n\n\
+             Slide 3: (hidden slide) (no text)"
+        );
+    }
+
+    /// A `dgm:relIds` shape reads its data part's point text under a
+    /// `(diagram text)` line, every point type read but the points the diagram
+    /// flags as its own editor placeholders, and the slide does not read as one
+    /// with no text — a diagram that carries none included.
+    #[test]
+    fn pptx_reads_diagram_text_from_the_data_model() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/></Relationships>"#,
+            ),
+            // An editor's hint (`phldrT`) rides on points that carry text of
+            // their own, so only a `phldr` flag hides a point; `node`, `asst`
+            // and an absent type are all read. A point's second paragraph holds
+            // a slide-number field: its `<a:t>` is not the point's run text.
+            (
+                "ppt/diagrams/data1.xml",
+                br#"<dgm:dataModel><dgm:ptLst><dgm:pt type="node"><dgm:prSet phldrT="[Text]"/><dgm:t><a:p><a:r><a:t>North</a:t></a:r></a:p><a:p><a:fld id="1" type="slidenum"><a:t>7</a:t></a:fld></a:p></dgm:t></dgm:pt><dgm:pt type="node"><dgm:prSet phldr="1" phldrT="[Text]"/><dgm:t><a:p><a:r><a:t>Placeholder</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt type="asst"><dgm:t><a:p><a:r><a:t>Assistant</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt><dgm:t><a:p><a:r><a:t>South</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>"#,
+            ),
+            // A slide whose only diagram is read but shows no text still holds
+            // its diagram: it must not read as a slide with no text at all.
+            (
+                "ppt/slides/slide2.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide2.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data2.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/diagrams/data2.xml",
+                br#"<dgm:dataModel><dgm:ptLst><dgm:pt type="doc"><dgm:prSet phldr="1"/><dgm:t><a:p><a:r><a:t>Hint</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>"#,
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a readable presentation");
+        };
+        assert_eq!(
+            text,
+            "Slide 1:\n  (diagram text)\n    North\n    Assistant\n    South\n\n\
+             Slide 2:\n  (diagram text)"
+        );
+    }
+
+    /// Diagrams read in the order the slide's shapes present them, each data
+    /// part read once on a slide however often it is referenced, and again on
+    /// every other slide that shows it.
+    #[test]
+    fn pptx_reads_each_diagram_once_per_slide() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/></Relationships>"#,
+            ),
+            // `rId1` twice, in shapes either side of `rId2`: two sections, not
+            // three, and in shape order.
+            (
+                "ppt/slides/slide1.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId2"/></a:graphicData></a:graphic></p:graphicFrame><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            // The same data part reads again on its own slide.
+            (
+                "ppt/slides/slide2.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data2.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide2.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/diagrams/data1.xml",
+                br#"<dgm:dataModel><dgm:ptLst><dgm:pt type="node"><dgm:t><a:p><a:r><a:t>North</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt type="node"><dgm:t><a:p><a:r><a:t>South</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>"#,
+            ),
+            (
+                "ppt/diagrams/data2.xml",
+                br#"<dgm:dataModel><dgm:ptLst><dgm:pt type="node"><dgm:t><a:p><a:r><a:t>Alpha</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>"#,
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a readable presentation");
+        };
+        assert_eq!(
+            text,
+            "Slide 1:\n  (diagram text)\n    North\n    South\n  (diagram text)\n    Alpha\n\n\
+             Slide 2:\n  (diagram text)\n    North\n    South"
+        );
+    }
+
+    /// A diagram whose data cannot be read says so rather than letting the slide
+    /// read as one without a diagram: a part the package does not hold, an id
+    /// nothing resolves, a part the package cut short, a part that is no data
+    /// model at all, and a frame naming no data model. A slide with no diagram
+    /// carries no such mark.
+    #[test]
+    fn pptx_reports_a_diagram_whose_data_cannot_be_read() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/><p:sldId r:id="rId3"/><p:sldId r:id="rId4"/><p:sldId r:id="rId5"/><p:sldId r:id="rId6"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/><Relationship Id="rId3" Target="slides/slide3.xml"/><Relationship Id="rId4" Target="slides/slide4.xml"/><Relationship Id="rId5" Target="slides/slide5.xml"/><Relationship Id="rId6" Target="slides/slide6.xml"/></Relationships>"#,
+            ),
+            // The data part the relationship names is not in the package.
+            (
+                "ppt/slides/slide1.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/></Relationships>"#,
+            ),
+            // No relationship resolves the id at all.
+            (
+                "ppt/slides/slide2.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            // The data model is there but the package cut it short: the text
+            // after the cut is not passed off as everything it held.
+            (
+                "ppt/slides/slide3.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide3.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data3.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/diagrams/data3.xml",
+                br#"<dgm:dataModel><dgm:ptLst><dgm:pt type="node"><dgm:t><a:p><a:r><a:t>Cut off</a:t>"#,
+            ),
+            // A part that parses as XML but is no diagram data model (an error
+            // page a producer left in its place) is named as lost too.
+            (
+                "ppt/slides/slide4.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide4.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data4.xml"/></Relationships>"#,
+            ),
+            ("ppt/diagrams/data4.xml", br"<html>404 Not Found</html>"),
+            // No diagram at all.
+            (
+                "ppt/slides/slide5.xml",
+                br"<p:sld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Plain</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>",
+            ),
+            // A frame whose `relIds` names no data model at all (a package that
+            // breaks the schema, which requires all four attributes) shows a
+            // diagram whose text cannot be read, rather than none.
+            (
+                "ppt/slides/slide6.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:lo="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a readable presentation");
+        };
+        assert_eq!(
+            text,
+            "Slide 1:\n  (diagram text could not be read)\n\n\
+             Slide 2:\n  (diagram text could not be read)\n\n\
+             Slide 3:\n  (diagram text could not be read)\n\n\
+             Slide 4:\n  (diagram text could not be read)\n\n\
+             Slide 5:\n  Plain\n\n\
+             Slide 6:\n  (diagram text could not be read)"
+        );
+    }
+
+    /// A self-closing `<dgm:dataModel/>` is a data model that shows no text, so
+    /// its slide reads `(diagram text)`; a data part the package left with zero
+    /// bytes declares no data model, so its slide reads
+    /// `(diagram text could not be read)`.
+    #[test]
+    fn pptx_reads_a_self_closing_data_model_and_reports_an_empty_one() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/></Relationships>"#,
+            ),
+            ("ppt/diagrams/data1.xml", br"<dgm:dataModel/>"),
+            (
+                "ppt/slides/slide2.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide2.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data2.xml"/></Relationships>"#,
+            ),
+            // Zero bytes: an entry the package left empty, which a diagram
+            // reads as data absent rather than as a data model with no text.
+            ("ppt/diagrams/data2.xml", b""),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a readable presentation");
+        };
+        assert_eq!(
+            text,
+            "Slide 1:\n  (diagram text)\n\nSlide 2:\n  (diagram text could not be read)"
+        );
+    }
+
+    /// The diagram text the editing side is handed, keyed by slide part: one
+    /// entry per diagram that shows text, in the reading's own order and read by
+    /// the reading's own rule, and nothing at all for a slide whose diagram was
+    /// lost or shows no text — a refusal must never name text no reading showed.
+    #[test]
+    fn pptx_diagram_text_is_the_text_a_reading_showed_per_slide() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/><p:sldId r:id="rId3"/><p:sldId r:id="rId4"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/><Relationship Id="rId3" Target="slides/slide3.xml"/><Relationship Id="rId4" Target="slides/slide4.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId2"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data2.xml"/></Relationships>"#,
+            ),
+            // A placeholder point is skipped and a hint alone is not: the same
+            // rule the reading marks its diagram text by.
+            (
+                "ppt/diagrams/data1.xml",
+                br#"<dgm:dataModel><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>North</a:t></a:r></a:p><a:p><a:r><a:t>Second line</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt><dgm:prSet phldr="1"/><dgm:t><a:p><a:r><a:t>Placeholder</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt><dgm:prSet phldrT="[Text]"/><dgm:t><a:p><a:r><a:t>Hinted</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>"#,
+            ),
+            (
+                "ppt/diagrams/data2.xml",
+                br"<dgm:dataModel><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>South</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>",
+            ),
+            // A diagram the package cut short: its text is lost, so the slide is
+            // absent rather than holding text a refusal could quote.
+            (
+                "ppt/slides/slide2.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide2.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data3.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/diagrams/data3.xml",
+                br"<dgm:dataModel><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>Cut off</a:t>",
+            ),
+            // A slide with no diagram at all, and one whose diagram is only
+            // placeholders, both contribute nothing.
+            (
+                "ppt/slides/slide3.xml",
+                br"<p:sld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Plain</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>",
+            ),
+            (
+                "ppt/slides/slide4.xml",
+                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide4.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data4.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/diagrams/data4.xml",
+                br#"<dgm:dataModel><dgm:ptLst><dgm:pt><dgm:prSet phldr="1"/><dgm:t><a:p><a:r><a:t>Placeholder</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>"#,
+            ),
+        ]);
+        let text = pptx_diagram_text(&bytes);
+        assert_eq!(text.len(), 1, "only slide 1 shows text: {text:?}");
+        assert_eq!(
+            text.get("ppt/slides/slide1.xml"),
+            Some(&vec![
+                "North\nSecond line\nHinted".to_owned(),
+                "South".to_owned()
+            ]),
+            "one entry per diagram that shows text, in shape order: {text:?}"
+        );
+
+        // A package that is not a presentation holds no diagram text, and one
+        // whose bytes are not a package at all neither.
+        assert!(pptx_diagram_text(b"not a package").is_empty());
+        assert!(pptx_diagram_text(&zip_fixture(&[("word/document.xml", DOCX_BODY)])).is_empty());
+    }
+
+    /// A table cell's `<a:t>` is body text: the slide walk reads it like any
+    /// other run, not as a diagram's.
+    #[test]
+    fn pptx_reads_table_cells_as_body_text() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                br"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>Cell one</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>Cell two</a:t></a:r></a:p></a:txBody></a:tc></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>",
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a readable presentation");
+        };
+        assert_eq!(text, "Slide 1:\n  Cell one\n  Cell two");
     }
 
     // ── Word ────────────────────────────────────────────────────

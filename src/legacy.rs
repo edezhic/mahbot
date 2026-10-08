@@ -190,8 +190,11 @@ fn sheet_lines(sheet: &Sheet) -> Vec<String> {
     lines
 }
 
-/// Each slide's text plus its speaker notes, rendered exactly as
-/// [`crate::ooxml::convert_pptx`] renders a `.pptx` slide.
+/// Each slide's text plus its speaker notes, in the shapes
+/// [`crate::ooxml::convert_pptx`] renders — without its marks: a title run
+/// ([`TextType::Title`]/[`TextType::CenterTitle`]) reads here as ordinary text
+/// and a hidden slide ([`SlideText::hidden`]) is not flagged, though the IR
+/// holds both, while a SmartArt diagram's text has no counterpart in it at all.
 fn convert_ppt(bytes: &[u8]) -> DocOutcome {
     match PptDocument::from_reader(Cursor::new(bytes)) {
         Ok(doc) => {
