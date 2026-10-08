@@ -4,8 +4,11 @@
 //! ZIP-container OOXML packages. This module reads the older, pre-OOXML Word,
 //! Excel and PowerPoint files — the `.doc`/`.xls`/`.ppt` whose container is a
 //! CFB (compound file) rather than a ZIP — through the `office_oxide` crate,
-//! and renders them into the *same* text shapes the OOXML arms produce, so a
-//! model reading an old file and a new one sees the same vocabulary.
+//! and renders them into the same text shapes the OOXML arms use, so a model
+//! reading an old file and a new one reads both the same way. How far each arm
+//! reaches into the newer arms' vocabulary is that arm's own business and is
+//! documented where it is written: hidden geometry, merged ranges, cell
+//! comments, hyperlinks and defined names are marked by the `.xlsx` arm alone.
 //!
 //! # Invariants
 //!
@@ -122,11 +125,12 @@ fn convert_doc(bytes: &[u8]) -> DocOutcome {
     }
 }
 
-/// Every sheet in workbook order, rendered exactly as [`crate::ooxml::convert_xlsx`]
-/// renders a `.xlsx` sheet: a `Sheet "<name>":` block and one indented
-/// `{address}: {value}` line per valued cell, with the value the way Excel
-/// displays it. A cell whose formula the reader cannot recover shows the value
-/// Excel cached for it.
+/// Every sheet in workbook order, rendered in the shape
+/// [`crate::ooxml::convert_xlsx`] gives a `.xlsx` sheet: a `Sheet "<name>":`
+/// block and one indented `{address}: {value}` line per valued cell, with the
+/// value the way Excel displays it. Hidden geometry, merged ranges, cell comments,
+/// hyperlinks and defined names are marked by the `.xlsx` arm alone. A cell whose
+/// formula the reader cannot recover shows the value Excel cached for it.
 fn convert_xls(bytes: &[u8]) -> DocOutcome {
     match XlsDocument::from_reader(Cursor::new(bytes)) {
         Ok(doc) => {

@@ -266,12 +266,12 @@ struct Word {
 impl Word {
     /// A walker over the package whose parts `rels` names, with the notes parts
     /// already located and read.
-    fn new<R: Read + Seek>(rels: Vec<Relationship>, archive: &mut ZipArchive<R>) -> Self {
+    fn new<R: Read + Seek>(rels: &[Relationship], archive: &mut ZipArchive<R>) -> Self {
         // The notes parts are named by relationship kind, so each is resolved
         // from the list before the list becomes the id lookup the walk needs.
-        let footnotes_part = notes_part(&rels, NoteKind::Footnote);
-        let endnotes_part = notes_part(&rels, NoteKind::Endnote);
-        let comments_part = notes_part(&rels, NoteKind::Comment);
+        let footnotes_part = notes_part(rels, NoteKind::Footnote);
+        let endnotes_part = notes_part(rels, NoteKind::Endnote);
+        let comments_part = notes_part(rels, NoteKind::Comment);
         Self {
             rel_targets: super::relationship_targets(rels),
             footnotes: Notes::load(NoteKind::Footnote, &footnotes_part, archive),
@@ -2059,7 +2059,7 @@ pub(crate) fn convert_docx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         .and_then(|xml| relationships(&xml))
         .unwrap_or_default();
 
-    let mut word = Word::new(rels, &mut archive);
+    let mut word = Word::new(&rels, &mut archive);
     let Some(body) = word.body(&body_xml) else {
         return unreadable(".docx");
     };

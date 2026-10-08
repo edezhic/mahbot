@@ -3118,16 +3118,15 @@ fn describe(prefix: &str, names: &[String], sizes: &[u64]) -> String {
     format!("{prefix} {} files: {list}", names.len())
 }
 
-/// Strip a string down to one safe file-name component: no directory part,
-/// control characters, `[`/`]` (the marker's own punctuation) or reserved
-/// filesystem punctuation, trimmed of dots/spaces and length-capped.
+/// Strip a string down to one safe file-name component: the directory part dropped,
+/// what [`crate::util::neutralized_name`] rewrites neutralized, the reserved
+/// filesystem punctuation removed, and the result trimmed of dots/spaces and
+/// length-capped.
 #[must_use]
 fn clean_component(raw: &str) -> String {
     // Any directory part is dropped: the tool chooses the directory, and a name
     // that tried to steer it (a separator, `..`) must not be able to.
     let last = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
-    // `neutralized_name` turns the control characters and the `[`/`]` a
-    // `[FILE:…]` marker is built from into `_`.
     let cleaned: String = crate::util::neutralized_name(last)
         .chars()
         .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
@@ -8683,7 +8682,7 @@ mod tests {
             "C2: added",
             "D2: TRUE",
             "E2: =SUM(B2:B3)",
-            "F2: 1.5",
+            "F2: 1.50",
             "A3: two",
             "C1: three",
         ] {

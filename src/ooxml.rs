@@ -7,7 +7,8 @@
 //! address is written, and where the embedded media live — and in how much of a
 //! walk the format needs: Word's is the only one that carries tables, tracked
 //! changes and content beyond the body part, so its reader is the module
-//! [`docx`], built on this module's package helpers.
+//! [`docx`]; Excel's is the module [`xlsx`]; and PowerPoint's, which needs no
+//! more than a slide walk, still lives in this module.
 //!
 //! # Invariants
 //!
@@ -29,6 +30,8 @@ use zip::ZipArchive;
 
 mod docx;
 pub(crate) use docx::convert_docx;
+mod xlsx;
+pub(crate) use xlsx::convert_xlsx;
 
 // ── Package parts and bounds ────────────────────────────────────
 
@@ -36,17 +39,6 @@ pub(crate) use docx::convert_docx;
 /// cannot inflate the temp dir. Deliberately not an aggregate bound: the entry
 /// count is unbounded.
 const MAX_ZIP_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Part holding the workbook's sheet names and their relationship ids.
-const WORKBOOK_PART: &str = "xl/workbook.xml";
-/// Relationships of the workbook part: sheet relationship id -> sheet part.
-const WORKBOOK_RELS_PART: &str = "xl/_rels/workbook.xml.rels";
-/// Part holding the strings the `t="s"` cells index into.
-const SHARED_STRINGS_PART: &str = "xl/sharedStrings.xml";
-/// Prefix of the embedded-media parts in an Excel package.
-const XLSX_MEDIA_PREFIX: &str = "xl/media/";
-/// Charts in an Excel package: `xl/charts/chart<N>.xml`.
-const XLSX_CHARTS_PREFIX: &str = "xl/charts/chart";
 
 /// Part listing the presentation's slides in slide order.
 const PPT_PRESENTATION_PART: &str = "ppt/presentation.xml";
@@ -108,413 +100,6 @@ pub(crate) fn family_of(path: &Path) -> Option<Family> {
     } else {
         None
     }
-}
-
-// ── Excel ───────────────────────────────────────────────────────
-
-/// Extract sheet text and embedded images from an `.xlsx`/`.xlsm` package.
-///
-/// Every sheet the workbook names is walked in workbook order and rendered as
-/// `Sheet "<name>":` plus one indented line per valued cell. A sheet whose part
-/// is missing costs only itself and a note.
-#[must_use]
-pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
-    let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
-        return unreadable(".xlsx");
-    };
-    let Some(workbook) = read_zip_entry(&mut archive, WORKBOOK_PART).bytes() else {
-        return unreadable(".xlsx");
-    };
-    let Some(sheets) = workbook_sheets(&workbook) else {
-        return unreadable(".xlsx");
-    };
-    let shared = read_zip_entry(&mut archive, SHARED_STRINGS_PART)
-        .bytes()
-        .map(|xml| shared_strings(&xml));
-    let shared = shared.as_deref().unwrap_or_default();
-    let rels = read_zip_entry(&mut archive, WORKBOOK_RELS_PART)
-        .bytes()
-        .map(|xml| relationship_map(&xml))
-        .unwrap_or_default();
-
-    ensure_out_dir(out_dir);
-
-    let mut notes = Vec::new();
-    let charts = count_chart_parts(&archive, XLSX_CHARTS_PREFIX);
-    if charts > 0 {
-        notes.push(format!(
-            "the table has {charts} chart(s), which are not extracted"
-        ));
-    }
-    let mut skipped = SkippedImages::default();
-    let images = write_media_parts(&mut archive, XLSX_MEDIA_PREFIX, out_dir, &mut skipped);
-
-    let mut blocks = Vec::new();
-    let mut lost = 0usize;
-    for (index, (name, id)) in sheets.iter().enumerate() {
-        // A relationship the package does not declare falls back to the
-        // conventional part name for that position, so a workbook whose rels
-        // cannot be read still yields its sheets instead of nothing.
-        let part = rels.get(id).map_or_else(
-            || format!("xl/worksheets/sheet{}.xml", index + 1),
-            |target| resolve_part("xl/", target),
-        );
-        let rows = read_zip_entry(&mut archive, &part)
-            .bytes()
-            .and_then(|xml| sheet_rows(&xml, shared));
-        match rows {
-            Some((rows, missing_strings)) => {
-                lost += missing_strings;
-                blocks.push(text_block(
-                    &format!("Sheet \"{name}\":"),
-                    "(no values)",
-                    &rows,
-                ));
-            }
-            None => notes.push(format!("sheet \"{name}\" could not be read")),
-        }
-    }
-    // A workbook whose string table is absent, truncated or partly unreadable
-    // leaves every cell that indexes into it empty — for an Excel/Sheets/
-    // LibreOffice-authored file that is all of its text, so it is said out loud
-    // rather than read as a workbook with blank cells.
-    if lost > 0 {
-        notes.push(format!(
-            "{lost} cell(s) left out: the shared string table does not provide their text"
-        ));
-    }
-    notes.extend(skipped.notes());
-    DocOutcome::Text {
-        text: blocks.join("\n\n").trim_end().to_string(),
-        images,
-        notes,
-        all_page_text_lost: false,
-    }
-}
-
-/// The workbook's sheets in document order as `(name, relationship id)`.
-/// `None` when the workbook part cannot be read as XML.
-fn workbook_sheets(xml: &[u8]) -> Option<Vec<(String, String)>> {
-    scan_elements(xml, b"sheet", |event| {
-        match (attr(event, b"name"), rel_id(event)) {
-            (Some(name), Some(id)) => Some((name, id)),
-            _ => None,
-        }
-    })
-}
-
-/// Read `xl/sharedStrings.xml` into the strings a `t="s"` cell's index refers
-/// to: each `<si>` is the concatenation of its `<t>` texts, rich-text runs
-/// included.
-fn shared_strings(xml: &[u8]) -> Vec<String> {
-    let mut reader = Reader::from_reader(xml);
-    let mut buffer = Vec::new();
-    let mut strings = Vec::new();
-    let mut current = String::new();
-    let mut in_text = false;
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(event)) => match event.local_name().as_ref() {
-                b"si" => current.clear(),
-                b"t" => in_text = true,
-                _ => {}
-            },
-            Ok(Event::Text(event)) if in_text => {
-                if let Ok(chunk) = event.xml10_content() {
-                    current.push_str(&chunk);
-                }
-            }
-            Ok(Event::GeneralRef(event)) if in_text => append_entity(&mut current, &event),
-            Ok(Event::End(event)) => match event.local_name().as_ref() {
-                b"t" => in_text = false,
-                b"si" => strings.push(std::mem::take(&mut current)),
-                _ => {}
-            },
-            // A self-closed `<si/>` is still a shared string, so it must occupy
-            // its index rather than shift every later one.
-            Ok(Event::Empty(event)) if event.local_name().as_ref() == b"si" => {
-                strings.push(std::mem::take(&mut current));
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            Ok(_) => {}
-        }
-        buffer.clear();
-    }
-    strings
-}
-
-/// The cell lines of one worksheet in row order: `{ref}: {value}`, or
-/// `{ref}: ={formula}` / `{ref}: {value} (={formula})` for a formula cell — plus
-/// how many cells held a `t="s"` string the table does not provide, which the
-/// caller reports as a note.
-///
-/// `None` on any XML error — a sheet part that cannot be read as XML is
-/// reported like a missing one.
-fn sheet_rows(xml: &[u8], shared: &[String]) -> Option<(Vec<String>, usize)> {
-    let mut reader = Reader::from_reader(xml);
-    let mut buffer = Vec::new();
-    let mut rows = Vec::new();
-    let mut lost = 0usize;
-    let mut row_number = 0u32;
-    // Column of the next cell that carries no `r`: real files omit `r` on
-    // cells that follow one another, and the addresses still count distance.
-    let mut next_column = 0u32;
-    let mut cell: Option<Cell> = None;
-    let mut shared_formulas: HashMap<String, String> = HashMap::new();
-    let (mut in_value, mut in_text, mut in_formula) = (false, false, false);
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(event)) => match event.local_name().as_ref() {
-                b"row" => {
-                    row_number = attr(&event, b"r")
-                        .and_then(|r| r.parse().ok())
-                        .unwrap_or(row_number.saturating_add(1));
-                    next_column = 0;
-                }
-                b"c" => cell = Some(Cell::start(&event, row_number, &mut next_column)),
-                b"v" => in_value = true,
-                b"t" => in_text = true,
-                b"f" => {
-                    in_formula = true;
-                    if let Some(cell) = &mut cell {
-                        cell.start_formula(&event);
-                    }
-                }
-                _ => {}
-            },
-            Ok(Event::Empty(event)) => match event.local_name().as_ref() {
-                // A valueless cell still occupies its column, so the counter
-                // advances even though there is nothing to emit for it.
-                b"c" => {
-                    let _ = cell_reference(&event, row_number, &mut next_column);
-                }
-                b"f" => {
-                    if let Some(cell) = &mut cell {
-                        cell.resolve_shared_formula(&event, &shared_formulas);
-                    }
-                }
-                _ => {}
-            },
-            Ok(Event::Text(event)) => {
-                if let Some(cell) = &mut cell
-                    && let Ok(chunk) = event.xml10_content()
-                {
-                    if in_formula {
-                        cell.formula.push_str(&chunk);
-                    } else if in_value || in_text {
-                        cell.value.push_str(&chunk);
-                    }
-                }
-            }
-            Ok(Event::GeneralRef(event)) => {
-                if let Some(cell) = &mut cell {
-                    if in_formula {
-                        append_entity(&mut cell.formula, &event);
-                    } else if in_value || in_text {
-                        append_entity(&mut cell.value, &event);
-                    }
-                }
-            }
-            Ok(Event::End(event)) => match event.local_name().as_ref() {
-                b"v" => in_value = false,
-                b"t" => in_text = false,
-                b"f" => {
-                    in_formula = false;
-                    if let Some(cell) = &mut cell {
-                        cell.end_formula(&mut shared_formulas);
-                    }
-                }
-                b"c" => {
-                    if let Some(mut cell) = cell.take() {
-                        let line = cell.line(shared);
-                        if cell.shared_lost {
-                            lost += 1;
-                        }
-                        if let Some(line) = line {
-                            rows.push(line);
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return None,
-        }
-        buffer.clear();
-    }
-    Some((rows, lost))
-}
-
-/// A cell's address: its own `r` attribute, or one synthesised from `row` and
-/// the running column counter. Either way the counter is left on the column
-/// after this cell — a cell with no address still occupies its column.
-fn cell_reference(event: &BytesStart<'_>, row: u32, next_column: &mut u32) -> String {
-    let Some(reference) = attr(event, b"r") else {
-        let reference = format!("{}{}", column_letters(*next_column), row);
-        *next_column = next_column.saturating_add(1);
-        return reference;
-    };
-    if let Some(index) = column_index(&reference) {
-        *next_column = index.saturating_add(1);
-    }
-    reference
-}
-
-/// One `<c>` cell being read.
-#[derive(Default)]
-struct Cell {
-    /// The cell address, from `r` or synthesised from its row and column.
-    reference: String,
-    /// The `t` attribute: how `value` is interpreted.
-    kind: Option<String>,
-    /// The `<v>`/inline `<t>` text, raw.
-    value: String,
-    /// The `<f>` text.
-    formula: String,
-    /// Whether a `<f>` element was seen.
-    has_formula: bool,
-    /// `si` of a shared formula definition/reference.
-    formula_si: Option<String>,
-    /// Whether the `<f>` was `t="shared"`.
-    formula_shared: bool,
-    /// The cell is a `t="s"` one whose string the shared-string table does not
-    /// hold, so its text is lost — reported as a note, never as content.
-    shared_lost: bool,
-}
-
-impl Cell {
-    /// Start a cell from its `<c>` element.
-    fn start(event: &BytesStart<'_>, row: u32, next_column: &mut u32) -> Self {
-        Self {
-            reference: cell_reference(event, row, next_column),
-            kind: attr(event, b"t"),
-            ..Self::default()
-        }
-    }
-
-    fn start_formula(&mut self, event: &BytesStart<'_>) {
-        self.has_formula = true;
-        self.formula_si = attr(event, b"si");
-        self.formula_shared = attr(event, b"t").as_deref() == Some("shared");
-    }
-
-    /// On `</f>`: a shared definition with text teaches the later references of
-    /// the same sheet; a shared reference with none borrows the definition's.
-    fn end_formula(&mut self, shared: &mut HashMap<String, String>) {
-        if !self.formula_shared {
-            return;
-        }
-        let Some(si) = self.formula_si.take() else {
-            return;
-        };
-        if self.formula.is_empty() {
-            if let Some(text) = shared.get(&si) {
-                self.formula.clone_from(text);
-            }
-        } else {
-            shared.insert(si, self.formula.clone());
-        }
-    }
-
-    /// A `<f .../>` shared reference: it carries no text of its own.
-    fn resolve_shared_formula(&mut self, event: &BytesStart<'_>, shared: &HashMap<String, String>) {
-        self.has_formula = true;
-        if attr(event, b"t").as_deref() == Some("shared")
-            && let Some(si) = attr(event, b"si")
-            && let Some(text) = shared.get(&si)
-        {
-            self.formula.clone_from(text);
-        }
-    }
-
-    /// The cell's line, or `None` when it holds neither a value nor a formula.
-    fn line(&mut self, shared: &[String]) -> Option<String> {
-        let value = self.value(shared);
-        if self.has_formula {
-            let formula = self.formula.trim();
-            return if value.is_empty() {
-                Some(format!("{}: ={formula}", self.reference))
-            } else {
-                Some(format!("{}: {value} (={formula})", self.reference))
-            };
-        }
-        (!value.is_empty()).then(|| format!("{}: {value}", self.reference))
-    }
-
-    /// The displayed cell value, resolved by the `t` attribute. A shared-string
-    /// or inline string keeps its own spacing; every other type is trimmed of
-    /// the indentation a pretty-printed part puts inside `<v>`.
-    fn value(&mut self, shared: &[String]) -> String {
-        match self.kind.as_deref() {
-            // A `t="s"` cell holds an index into the shared-string table, so one
-            // the table does not hold is text that was lost (a table that could
-            // not be read at all, or a truncated one, leaves every such cell
-            // here). The cell then reads empty and the loss is reported through
-            // the notes — the channel this module reports every unreadable part
-            // on — rather than as text that cannot be told from the workbook's
-            // own content.
-            Some("s") => {
-                let text = self
-                    .value
-                    .trim()
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|index| shared.get(index))
-                    .cloned();
-                if let Some(text) = text {
-                    text
-                } else {
-                    self.shared_lost = true;
-                    String::new()
-                }
-            }
-            Some("b") => match self.value.trim() {
-                "1" => "TRUE".to_owned(),
-                "0" => "FALSE".to_owned(),
-                other => other.to_owned(),
-            },
-            Some("inlineStr") => self.value.clone(),
-            _ => self.value.trim().to_owned(),
-        }
-    }
-}
-
-/// The spreadsheet column letters for a zero-based column index (`0` is `A`).
-/// Shared with [`crate::legacy`], so a cell address is written by one
-/// implementation.
-pub(crate) fn column_letters(mut index: u32) -> String {
-    let mut letters: Vec<char> = Vec::new();
-    loop {
-        let digit = u32::from(b'A') + index % 26;
-        letters.push(char::from_u32(digit).unwrap_or('A'));
-        if index < 26 {
-            break;
-        }
-        index = index / 26 - 1;
-    }
-    letters.reverse();
-    letters.into_iter().collect()
-}
-
-/// The zero-based column index of a cell reference (`"B12"` -> `1`), or `None`
-/// when it does not start with a column letter. Shared with
-/// [`crate::tools::document`], so a cell reference is read by one
-/// implementation.
-pub(crate) fn column_index(reference: &str) -> Option<u32> {
-    let mut index = 0u32;
-    let mut seen = false;
-    for byte in reference.bytes() {
-        if !byte.is_ascii_alphabetic() {
-            break;
-        }
-        // An address past `u32` is clamped rather than worth a panic.
-        index = index
-            .saturating_mul(26)
-            .saturating_add(u32::from(byte.to_ascii_uppercase() - b'A') + 1);
-        seen = true;
-    }
-    seen.then_some(index - 1)
 }
 
 // ── PowerPoint ──────────────────────────────────────────────────
@@ -760,6 +345,45 @@ pub(crate) fn text_block(header: &str, empty_marker: &str, lines: &[String]) -> 
     text_lines(header, lines)
 }
 
+/// The spreadsheet column letters for a zero-based column index (`0` is `A`).
+/// Shared with [`crate::legacy`], so a cell address is written by one
+/// implementation.
+pub(crate) fn column_letters(mut index: u32) -> String {
+    let mut letters: Vec<char> = Vec::new();
+    loop {
+        let digit = u32::from(b'A') + index % 26;
+        letters.push(char::from_u32(digit).unwrap_or('A'));
+        if index < 26 {
+            break;
+        }
+        index = index / 26 - 1;
+    }
+    letters.reverse();
+    letters.into_iter().collect()
+}
+
+/// The zero-based column index of a cell reference (`"B12"` -> `1`), or `None`
+/// when it does not start with a column letter. Shared with
+/// [`crate::tools::document`], so a cell reference is read by one
+/// implementation.
+pub(crate) fn column_index(reference: &str) -> Option<u32> {
+    let mut index = 0u32;
+    let mut seen = false;
+    for byte in reference.bytes() {
+        if !byte.is_ascii_alphabetic() {
+            break;
+        }
+        // An address past `u32` is clamped rather than worth a panic.
+        index = index
+            .saturating_mul(26)
+            .saturating_add(u32::from(byte.to_ascii_uppercase() - b'A') + 1);
+        seen = true;
+    }
+    // `then_some` would evaluate the subtraction even when no letter was seen,
+    // which is a panic on a reference that starts with anything else (`1`, `$A1`).
+    seen.then(|| index - 1)
+}
+
 /// Write every entry under `prefix` that names a raster file into `out_dir`,
 /// counting the rest into `skipped`. An entry under a nested path (`media/a.png`
 /// and `media/sub/a.png`) takes a suffixed output name rather than overwriting
@@ -829,31 +453,70 @@ struct Relationship {
     target: String,
 }
 
-/// Every relationship declared in a `.rels` part. `None` when the part cannot
-/// be read as XML — reported like a missing part, never as an empty one.
-fn relationships(xml: &[u8]) -> Option<Vec<Relationship>> {
-    scan_elements(xml, b"Relationship", |event| {
-        let (Some(id), Some(target)) = (attr(event, b"Id"), attr(event, b"Target")) else {
-            return None;
+/// The relationships a rels part declares, in document order, and whether the part
+/// is whole: the walk that reads the list also says whether it ended inside an
+/// element, so a caller whose relationships part the package cut short reports the
+/// loss rather than reading the shortened list as everything the part declared —
+/// without a pass of its own, which is what tells the two apart at all.
+fn relationships_and_whole(xml: &[u8]) -> (Option<Vec<Relationship>>, bool) {
+    let mut part = Part::new(xml);
+    let mut reader = Reader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut entries = Vec::new();
+    let mut document = false;
+    loop {
+        let Ok(event) = reader.read_event_into(&mut buffer) else {
+            return (None, false);
         };
-        Some(Relationship {
-            id,
-            kind: attr(event, b"Type").unwrap_or_default(),
-            target,
-        })
+        part.note(&event);
+        match event {
+            Event::Start(event) | Event::Empty(event) => match event.local_name().as_ref() {
+                b"Relationships" => document = true,
+                b"Relationship" => entries.extend(relationship_entry(&event)),
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    (document.then_some(entries), !part.cut())
+}
+
+/// The relationships a rels part declares, in document order. `None` when the part
+/// cannot be read as XML, or is no relationships document at all: a part that is
+/// something else (an error page a producer left in its place) parses as XML just as
+/// happily, and reading it as a list with no entries would pass it off as one that
+/// names none of its parts.
+fn relationships(xml: &[u8]) -> Option<Vec<Relationship>> {
+    relationships_and_whole(xml).0
+}
+
+/// One `<Relationship Id Type Target/>` entry, or `None` when it names no id or no
+/// target.
+fn relationship_entry(event: &BytesStart<'_>) -> Option<Relationship> {
+    let (Some(id), Some(target)) = (attr(event, b"Id"), attr(event, b"Target")) else {
+        return None;
+    };
+    Some(Relationship {
+        id,
+        kind: attr(event, b"Type").unwrap_or_default(),
+        target,
     })
 }
 
 /// Relationship id -> target, for the parts a rId alone names.
 fn relationship_map(xml: &[u8]) -> HashMap<String, String> {
-    relationship_targets(relationships(xml).unwrap_or_default())
+    relationship_targets(&relationships(xml).unwrap_or_default())
 }
 
-/// [`relationship_map`] over an already-read relationship list. The Word reader
-/// reads the list itself — the notes parts are named there by kind, before the
-/// list becomes this lookup — and shares the mapping.
-fn relationship_targets(rels: Vec<Relationship>) -> HashMap<String, String> {
-    rels.into_iter().map(|rel| (rel.id, rel.target)).collect()
+/// [`relationship_map`] over an already-read relationship list. The Word and
+/// Excel readers read the list themselves — the notes parts are named there by
+/// kind, before the list is turned into this lookup — and share the mapping.
+fn relationship_targets(rels: &[Relationship]) -> HashMap<String, String> {
+    rels.iter()
+        .map(|rel| (rel.id.clone(), rel.target.clone()))
+        .collect()
 }
 
 /// Resolve a relationship target against the part that owns it: a relative
@@ -923,7 +586,7 @@ fn attr(event: &BytesStart<'_>, name: &[u8]) -> Option<String> {
 ///
 /// `None` when the part cannot be read as XML at all, which is the one
 /// distinction a caller needs: a broken part is reported like a missing one,
-/// never as "no such element" ([`workbook_sheets`], [`relationships`]).
+/// never as "no such element" ([`relationships`]).
 fn scan_elements<T>(
     xml: &[u8],
     element: &[u8],
@@ -948,6 +611,76 @@ fn scan_elements<T>(
         buffer.clear();
     }
     Some(found)
+}
+
+/// Whether a part's bytes carry nothing but whitespace — a byte-order mark included,
+/// which says how a document is encoded rather than carrying any of it: an entry the
+/// package left empty, which declares nothing rather than holding something unread.
+fn blank(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    bytes.iter().all(u8::is_ascii_whitespace)
+}
+
+/// What a part's own walk says about the part. Every reader that reads a part from
+/// its first event to its last notes each event here, so the part's account of
+/// itself — whole, or cut at an element boundary, or no document at all — comes out
+/// of the walk that reads its content, rather than out of a pass of its own.
+struct Part<'a> {
+    /// The part's bytes: what tells an entry the package left empty from one whose
+    /// bytes are no document.
+    bytes: &'a [u8],
+    /// Elements open right now: what a part cut at an element boundary leaves behind.
+    open: usize,
+    /// Whether the walk found an element of the kind the reader reads the part for.
+    kind: bool,
+}
+
+impl<'a> Part<'a> {
+    /// A part's walk over its own bytes.
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            open: 0,
+            kind: false,
+        }
+    }
+
+    /// Note one event of the part's walk: the part's own elements are what the
+    /// account is built from, so only their start and end events are noted.
+    fn note(&mut self, event: &Event<'_>) {
+        match event {
+            Event::Start(_) => self.open += 1,
+            Event::End(_) => self.open = self.open.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    /// Note that the walk found an element of the kind the reader reads the part
+    /// for, wherever it stands in the part: what tells a part holding what this
+    /// reader came for from one holding something else entirely.
+    fn kind_seen(&mut self) {
+        self.kind = true;
+    }
+
+    /// Whether the part stopped with an element still open: quick-xml reports a part
+    /// cut at an element boundary as a document that simply ends, so only the
+    /// reader's own walk can tell a half-written part from a finished one, and the
+    /// content after the cut must not be passed off as content the part never had.
+    fn cut(&self) -> bool {
+        self.open > 0
+    }
+
+    /// Whether the part is not the document it is read as: cut short, or holding no
+    /// element of its own kind ([`Self::kind_seen`]) — whether it holds elements of
+    /// another kind (an error page a producer left in the part's place,
+    /// `<html>404</html>`) or none at all in bytes that are no document (`Not
+    /// Found`), either of which parses or reads as happily as the real thing. A
+    /// reader that got nothing out of such a part reports the loss; an entry the
+    /// package left empty — bytes that are nothing but whitespace ([`blank`]) —
+    /// declares nothing instead, so its walk has no element to miss.
+    fn unreadable(&self) -> bool {
+        self.cut() || (!self.kind && !blank(self.bytes))
+    }
 }
 
 /// Resolve one XML entity reference (`&amp;`, `&#x41;`) in run text. An
@@ -1087,209 +820,6 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::test_fixtures::*;
     use super::*;
-
-    // ── Excel ───────────────────────────────────────────────────
-
-    const WORKBOOK: &[u8] = br#"<workbook><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="More" sheetId="2" r:id="rId2"/></sheets></workbook>"#;
-
-    const WORKBOOK_RELS: &[u8] = br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="/xl/worksheets/sheet2.xml"/></Relationships>"#;
-    /// One plain string, one rich-text one split across runs, and one written
-    /// as numeric character references — the shape a producer that escapes
-    /// non-ASCII writes (every Cyrillic letter becomes `&#NNNN;`).
-    const SHARED_STRINGS: &[u8] = br"<sst><si><t>hello</t></si><si><r><t>rich</t></r><r><t> text</t></r></si><si><t>&#1046;&#1091;&#1082;</t></si></sst>";
-
-    const SHEET_WITH_CELLS: &[u8] = br#"<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>42</v></c></row><row r="2"><c r="A2"><f>SUM(B1:B2)</f></c><c r="B2" t="b"><v>1</v></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>inline</t></is></c><c><v>7</v></c><c t="str"><f>B1&amp;1</f><v>jog</v></c></row><row r="4"><c r="A4" t="s"><v>1</v></c></row><row r="5"><c r="A5" t="s"><v>2</v></c><c r="B5" t="inlineStr"><is><t>&#1054;&#1090;&#1095;&#1105;&#1090;</t></is></c></row></sheetData></worksheet>"#;
-
-    #[test]
-    fn xlsx_reads_cells_in_workbook_order() {
-        let bytes = zip_fixture(&[
-            ("xl/workbook.xml", WORKBOOK),
-            ("xl/_rels/workbook.xml.rels", WORKBOOK_RELS),
-            ("xl/sharedStrings.xml", SHARED_STRINGS),
-            ("xl/worksheets/sheet1.xml", SHEET_WITH_CELLS),
-            (
-                "xl/worksheets/sheet2.xml",
-                b"<worksheet><sheetData/></worksheet>",
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            ..
-        } = convert_xlsx(&bytes, dir.path())
-        else {
-            panic!("expected Text outcome for a well-formed xlsx");
-        };
-        assert_eq!(
-            text,
-            "Sheet \"Data\":\n  A1: hello\n  B1: 42\n  A2: =SUM(B1:B2)\n  B2: TRUE\n  A3: inline\n  B3: 7\n  C3: jog (=B1&1)\n  A4: rich text\n  A5: Жук\n  B5: Отчёт\n\nSheet \"More\": (no values)"
-        );
-        assert!(images.is_empty(), "a workbook with no media writes none");
-        assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
-    }
-
-    /// A workbook whose relationship list cannot be read still yields its
-    /// sheets: the parts are conventionally numbered, so their names are the
-    /// order.
-    #[test]
-    fn xlsx_falls_back_to_conventional_sheet_parts() {
-        let bytes = zip_fixture(&[
-            ("xl/workbook.xml", WORKBOOK),
-            (
-                "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#,
-            ),
-            (
-                "xl/worksheets/sheet2.xml",
-                br#"<worksheet><sheetData><row r="1"><c r="B1"><v>2</v></c></row></sheetData></worksheet>"#,
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, notes, .. } = convert_xlsx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed xlsx");
-        };
-        assert_eq!(text, "Sheet \"Data\":\n  A1: 1\n\nSheet \"More\":\n  B1: 2");
-        assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
-    }
-
-    /// A sheet whose part is absent costs only itself and a note — the sheets
-    /// around it are still delivered.
-    #[test]
-    fn xlsx_keeps_sheets_whose_part_is_missing() {
-        let bytes = zip_fixture(&[
-            ("xl/workbook.xml", WORKBOOK),
-            ("xl/_rels/workbook.xml.rels", WORKBOOK_RELS),
-            (
-                "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#,
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, notes, .. } = convert_xlsx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed xlsx");
-        };
-        assert_eq!(text, "Sheet \"Data\":\n  A1: 1");
-        assert_eq!(notes, ["sheet \"More\" could not be read"]);
-    }
-
-    /// Shared formulas: a definition teaches the references that come after it,
-    /// so a reference with no text of its own still reads back as its formula.
-    #[test]
-    fn xlsx_resolves_shared_formulas() {
-        let bytes = zip_fixture(&[
-            (
-                "xl/workbook.xml",
-                br#"<workbook><sheets><sheet name="S" r:id="rId1"/></sheets></workbook>"#,
-            ),
-            (
-                "xl/_rels/workbook.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
-            ),
-            (
-                "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData><row r="1"><c r="A1"><f t="shared" ref="A1:A2" si="0">B1*2</f><v>2</v></c></row><row r="2"><c r="A2"><f t="shared" si="0"/><v>4</v></c></row></sheetData></worksheet>"#,
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, .. } = convert_xlsx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed xlsx");
-        };
-        assert_eq!(text, "Sheet \"S\":\n  A1: 2 (=B1*2)\n  A2: 4 (=B1*2)");
-    }
-
-    /// Media and charts are reported the same way the Word path reports its
-    /// media: a raster is written through, an undecodable entry is counted, and
-    /// a chart is named rather than silently dropped.
-    #[test]
-    fn xlsx_extracts_media_and_notes_charts_it_cannot_draw() {
-        let bytes = zip_fixture(&[
-            (
-                "xl/workbook.xml",
-                br#"<workbook><sheets><sheet name="S" r:id="rId1"/></sheets></workbook>"#,
-            ),
-            (
-                "xl/_rels/workbook.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
-            ),
-            (
-                "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#,
-            ),
-            ("xl/media/pic.png", b"\x89PNG\r\n\x1a\nfake image bytes"),
-            ("xl/media/diagram.emf", b"EMF bytes this stack cannot decode"),
-            ("xl/charts/chart1.xml", b"<chart/>"),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { images, notes, .. } = convert_xlsx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed xlsx");
-        };
-        assert_eq!(images, vec![dir.path().join("pic.png")]);
-        assert_eq!(
-            notes,
-            [
-                "the table has 1 chart(s), which are not extracted",
-                "skipped 1 embedded image(s) in a format this pipeline cannot convert",
-            ]
-        );
-    }
-
-    /// A `t="s"` cell holds an index into the shared-string table, so one the
-    /// table does not hold is text that was lost — a table that is truncated or
-    /// partly unreadable, or an index past its end. The cell reads empty and the
-    /// loss is reported as a note (the channel every unreadable part in this
-    /// module uses), never as text the reader cannot tell from the workbook's own
-    /// content.
-    #[test]
-    fn xlsx_reports_shared_string_cells_the_table_does_not_hold() {
-        let bytes = zip_fixture(&[
-            (
-                "xl/workbook.xml",
-                br#"<workbook><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
-            ),
-            // A declared table that stops mid-`<si>`: its first entry is readable
-            // and everything after it is not, which is what a truncated part
-            // looks like.
-            (
-                "xl/sharedStrings.xml",
-                br"<sst><si><t>First</t></si><si><t>Sec",
-            ),
-            (
-                "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>7</v></c></row></sheetData></worksheet>"#,
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, notes, .. } = convert_xlsx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a readable workbook");
-        };
-        assert_eq!(text, "Sheet \"Sheet1\":\n  A1: First");
-        assert_eq!(
-            notes,
-            ["2 cell(s) left out: the shared string table does not provide their text"]
-        );
-
-        // The same for a workbook that carries no table at all.
-        let bytes = zip_fixture(&[
-            (
-                "xl/workbook.xml",
-                br#"<workbook><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
-            ),
-            (
-                "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData></worksheet>"#,
-            ),
-        ]);
-        let DocOutcome::Text { text, notes, .. } = convert_xlsx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a readable workbook");
-        };
-        assert_eq!(text, "Sheet \"Sheet1\": (no values)");
-        assert_eq!(
-            notes,
-            ["1 cell(s) left out: the shared string table does not provide their text"]
-        );
-    }
 
     /// A presentation that declares a slide whose own relationship cannot be
     /// resolved keeps that slide's number: dropping it would renumber the slides

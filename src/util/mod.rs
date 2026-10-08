@@ -1244,15 +1244,28 @@ pub(crate) fn file_name_or_path(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// Whether `character` is a break a text stack may start a line at: the mandatory
+/// breaks of UAX #14. A rendered answer's lines are built from text an untrusted
+/// document carries, so both the escaping one line is made of and the names taken
+/// from such a document have to account for every one of them.
+#[must_use]
+pub(crate) fn is_line_break(character: char) -> bool {
+    matches!(
+        character,
+        '\n' | '\r' | '\u{0B}' | '\u{0C}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
 /// Neutralize a name taken from an untrusted source before reuse: every control
-/// character, both path separators, and the `[`/`]` a media marker is built from
-/// become `_`. The result is safe both as a single path component and inside a
-/// `[KIND:...]` marker.
+/// character, every break a text stack may take ([`is_line_break`], whose two line
+/// separators are no control characters), both path separators, and the `[`/`]` a
+/// media marker is built from become `_`. The result is safe both as a single path
+/// component and inside a `[KIND:...]` marker.
 #[must_use]
 pub(crate) fn neutralized_name(name: &str) -> String {
     name.chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | '[' | ']') {
+            if c.is_control() || is_line_break(c) || matches!(c, '/' | '\\' | '[' | ']') {
                 '_'
             } else {
                 c
