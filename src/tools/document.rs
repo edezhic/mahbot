@@ -3589,25 +3589,6 @@ mod tests {
         &after[..after.find('"').expect("a closing quote")]
     }
 
-    /// `xml` with every `<Relationship …/>` whose element text names `needle`
-    /// dropped: a part a caller needs to lack a relationship it would otherwise
-    /// declare.
-    fn without_relationship(xml: &str, needle: &str) -> String {
-        let mut out = String::new();
-        let mut rest = xml;
-        while let Some(at) = rest.find("<Relationship") {
-            out.push_str(&rest[..at]);
-            let element = &rest[at..];
-            let end = element.find("/>").expect("a self-closing relationship") + "/>".len();
-            if !element[..end].contains(needle) {
-                out.push_str(&element[..end]);
-            }
-            rest = &element[end..];
-        }
-        out.push_str(rest);
-        out
-    }
-
     /// Add one part to an in-progress package.
     fn add_part(zip: &mut zip::ZipWriter<Cursor<Vec<u8>>>, name: &str, body: &str) {
         add_bytes(zip, name, body.as_bytes());
@@ -4184,6 +4165,59 @@ mod tests {
             .expect("a <Notes> count in the application properties")
     }
 
+    /// The content of `element`'s own `<vt:…>` child of `tag` — the element a
+    /// properties variant states its name, count or entry in.
+    fn vector_text(element: &str, tag: &str) -> String {
+        let (open, close) = (format!("<vt:{tag}>"), format!("</vt:{tag}>"));
+        let at = element
+            .find(&open)
+            .unwrap_or_else(|| panic!("no <vt:{tag}> in: {element}"));
+        let rest = &element[at + open.len()..];
+        rest[..rest.find(&close).expect("a closing tag")].to_string()
+    }
+
+    /// The slide titles a created deck's `docProps/app.xml` lists, with the count
+    /// its heading pairs give them: the titles vector holds one entry per part and
+    /// the counts say how many of them each group owns, in order — so the title
+    /// group's entries are the slice the groups ahead of it place it at, read the
+    /// way a consumer walks the two, and a count disagreeing with the entries under
+    /// it fails here. `None` for the count when the properties state no title group
+    /// at all, which is what a deck declaring no title lists.
+    fn app_slide_titles(app: &str) -> (Option<usize>, Vec<String>) {
+        let vector = element_children(app, "TitlesOfParts", "vt:vector")
+            .into_iter()
+            .next()
+            .expect("the titles vector");
+        let entries: Vec<String> = element_children(vector, "vt:vector", "vt:lpstr")
+            .iter()
+            .map(|entry| vector_text(entry, "lpstr"))
+            .collect();
+        assert_eq!(
+            attribute_of(vector, "size")
+                .parse::<usize>()
+                .expect("a vector size"),
+            entries.len(),
+            "the titles vector's size is not its entries: {app}"
+        );
+        let variants = element_children(app, "HeadingPairs", "vt:variant");
+        assert_eq!(variants.len() % 2, 0, "a group states no count: {app}");
+        let (mut count, mut titles, mut at): (Option<usize>, Vec<String>, usize) =
+            (None, Vec::new(), 0);
+        for pair in variants.chunks(2) {
+            let name = vector_text(pair[0], "lpstr");
+            let held: usize = vector_text(pair[1], "i4").parse().expect("a group count");
+            let slice = entries.get(at..at + held).unwrap_or_else(|| {
+                panic!("the {name} group names more entries than the vector holds: {app}")
+            });
+            if name == "Slide Titles" {
+                count = Some(held);
+                titles = slice.to_vec();
+            }
+            at += held;
+        }
+        (count, titles)
+    }
+
     /// Whether a part is a relationships part — the one the package states at its
     /// root (`_rels/.rels`) or one beside a part, always in a `_rels` folder. Read
     /// off the name rather than `Path::extension`, which reads a name that IS the
@@ -4359,9 +4393,9 @@ mod tests {
     }
 
     /// A created deck holds a notes page only for a slide that has notes: one
-    /// created without any declares no notes part, no slide relationship to one
-    /// and no note count; one created with a notes block keeps its page and counts
-    /// it.
+    /// created without any declares no notes part, no slide relationship to one and
+    /// no note count, while one whose slides hold notes keeps their pages and
+    /// counts them.
     #[tokio::test]
     #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
     async fn created_pptx_holds_notes_pages_only_for_noted_slides() {
@@ -4426,9 +4460,146 @@ mod tests {
         );
     }
 
+    /// A deck holding notes on some slides only keeps no trace of the pages the
+    /// others were written with: an unnoted slide's empty page, its own
+    /// relationships and its slide's relationship to it are gone, its content type
+    /// with them, while the noted slide's page and the notes master stay — and the
+    /// parts left still resolve into one another.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn created_pptx_drops_the_empty_notes_page_a_deck_with_notes_does_not_need() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let mixed = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "mixed",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "С заметкой" },
+                        { "type": "notes", "text": "Заметка" },
+                        { "type": "heading", "level": 1, "text": "Без заметки" },
+                        { "type": "paragraph", "text": "Только текст" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let parts = zip_names(&mixed);
+        let pages: Vec<&String> = parts
+            .iter()
+            .filter(|name| name.starts_with("ppt/notesSlides/notesSlide"))
+            .collect();
+        assert_eq!(
+            pages.len(),
+            1,
+            "an unnoted slide kept its empty notes page: {parts:?}"
+        );
+        assert!(
+            pages
+                .iter()
+                .all(|page| part_text(&mixed, page).contains("Заметка")),
+            "the page left is not the noted slide's: {pages:?}"
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|name| name.starts_with("ppt/notesSlides/_rels/"))
+                .count(),
+            1,
+            "a dropped page left its relationships behind: {parts:?}"
+        );
+        assert!(
+            part_text(&mixed, "ppt/slides/_rels/slide1.xml.rels").contains("notesSlide"),
+            "the noted slide lost its relationship to its page"
+        );
+        assert!(
+            !part_text(&mixed, "ppt/slides/_rels/slide2.xml.rels").contains("notesSlide"),
+            "an unnoted slide still declares a notes page"
+        );
+        assert_eq!(
+            notes_count(&part_text(&mixed, "docProps/app.xml")),
+            1,
+            "a deck holding one slide's notes counts another number"
+        );
+        // No content type names a dropped page and no relationship resolves to
+        // nothing.
+        assert_created_deck_parts_resolve(&mixed);
+    }
+
+    /// A created deck's own application properties list the titles its slides
+    /// really declare, and no others: the entries are the titles themselves — the
+    /// library's number-per-slide names are gone — a slide declaring no title
+    /// contributes none, and a deck declaring none states no title group at all.
+    /// The group's count and the vector's size keep step with the entries either
+    /// way, and a title the XML has to escape is written escaped.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn created_pptx_lists_the_titles_its_slides_declare() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let with_titles = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "titled",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "Первый заголовок" },
+                        { "type": "paragraph", "text": "Тело" },
+                        { "type": "heading", "level": 1, "text": "   " },
+                        { "type": "paragraph", "text": "Только текст" },
+                        { "type": "heading", "level": 1, "text": "Второй & <заголовок>" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let app = part_text(&with_titles, "docProps/app.xml");
+        let (count, titles) = app_slide_titles(&app);
+        assert_eq!(
+            count,
+            Some(2),
+            "the properties do not count the titles they list: {app}"
+        );
+        assert_eq!(
+            titles,
+            ["Первый заголовок", "Второй &amp; &lt;заголовок&gt;"],
+            "the properties do not list the slides' real titles: {app}"
+        );
+
+        // A deck whose slides declare no title lists no title at all.
+        let plain = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "plain",
+                    "content": [{ "type": "paragraph", "text": "Только текст" }],
+                }),
+            )
+            .await,
+        );
+        let app = part_text(&plain, "docProps/app.xml");
+        let (count, titles) = app_slide_titles(&app);
+        assert_eq!(
+            count, None,
+            "a deck with no titles keeps a group for them: {app}"
+        );
+        assert!(
+            titles.is_empty(),
+            "a deck with no titles lists some: {titles:?}"
+        );
+    }
+
     /// A slide `add_slide` writes declares the same title a created slide opens
     /// with: the same frame, centring, alignment and run formatting, written by
-    /// the slide arm's own title builder rather than the create arm's.
+    /// the slide arm's own title builder rather than the create arm's. A title that
+    /// is blank once trimmed is no title — the rule the create arm's opening block
+    /// follows — so such a slide is written with no title shape at all and no trace
+    /// of one.
     #[tokio::test]
     #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
     async fn pptx_edit_added_slide_declares_a_title_like_a_created_one() {
@@ -4463,6 +4634,7 @@ mod tests {
                         { "op": "add_slide", "after": 1, "title": "Добавленный",
                           "bullets": ["раз", "два"] },
                         { "op": "add_slide", "bullets": ["Без заголовка"] },
+                        { "op": "add_slide", "title": "   ", "bullets": ["Пробельный заголовок"] },
                     ],
                 }),
             )
@@ -4489,6 +4661,25 @@ mod tests {
             !untitled.contains(r#"<p:ph type="title"/>"#),
             "a slide added with no title declares one: {untitled}"
         );
+
+        // A title of whitespace alone is no title either: nothing is declared for
+        // it and nothing of it is drawn — the frame, the shape name and the
+        // placeholder are all absent, which the create arm's opening block states
+        // the same way.
+        let blank = part_text(
+            &output,
+            &slide_part_holding(&output, "Пробельный заголовок"),
+        );
+        assert!(
+            blank.contains(r#"<p:ph type="body" idx="1"/>"#),
+            "the blank-titled slide's bullets are not a body placeholder: {blank}"
+        );
+        for trace in [r#"<p:ph type="title"/>"#, r#"name="Title""#] {
+            assert!(
+                !blank.contains(trace),
+                "a blank title left {trace} behind: {blank}"
+            );
+        }
     }
 
     /// A PDF is created and read back: the magic is there, and the round trip
@@ -15327,10 +15518,12 @@ mod tests {
         );
     }
 
-    /// A slide whose package holds no notes part is given one: `add_notes` writes
-    /// a fresh notes slide whose body placeholder carries the text, wires a
-    /// notes-master relationship into it, declares it in the content types and
-    /// gives the slide a relationship to it — which is what the reader shows.
+    /// A slide holding no notes is given one: `add_notes` writes a fresh notes
+    /// slide whose body placeholder carries the text, wires a notes-master
+    /// relationship into it, declares it in the content types and gives the slide a
+    /// relationship to it — which is what the reader shows. A slide of a created
+    /// deck that holds no notes is exactly that case: the deck states no page for
+    /// it at all.
     #[tokio::test]
     #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
     async fn pptx_edit_add_notes_creates_the_notes_part_a_slide_lacks() {
@@ -15338,7 +15531,7 @@ mod tests {
             return;
         }
         let (_dir, ws) = workspace();
-        let created = single(
+        let source = single(
             &run(
                 &ws,
                 json!({
@@ -15351,20 +15544,6 @@ mod tests {
                 }),
             )
             .await,
-        );
-        // pptxgenjs writes an empty notes slide for every slide it makes, so the
-        // second slide is cooked into one whose package holds no notes at all:
-        // its only relationship to them is what a reader goes by.
-        let bytes = std::fs::read(&created).expect("read base package");
-        let rels = part_text(&created, "ppt/slides/_rels/slide2.xml.rels");
-        let without_notes = without_relationship(&rels, "notesSlide");
-        let source = write_fixture(
-            &ws,
-            "deck.pptx",
-            &with_parts(
-                &bytes,
-                &[("ppt/slides/_rels/slide2.xml.rels", without_notes.as_bytes())],
-            ),
         );
 
         let output = single(

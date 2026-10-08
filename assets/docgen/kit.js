@@ -457,6 +457,12 @@ const TITLE_ALIGNMENT = "l";
 // the presentation's own default text style gives the block it would otherwise
 // take them from.
 const TITLE_FONTS = `<a:latin typeface="+mn-lt"/><a:ea typeface="+mn-ea"/><a:cs typeface="+mn-cs"/>`;
+// The title a caller gave, or `undefined` when it is blank — empty, or whitespace
+// alone. A blank title is no title a reading shows anything for, so neither side
+// that writes one declares it: the create arm leaves its blank heading the
+// undeclared text box it always drew, and the slide arm draws no title shape at
+// all. One rule, read by both writers.
+const titledText = (text) => (text !== undefined && text.trim() !== "" ? text : undefined);
 const TITLE_PLACEHOLDER = `<p:ph type="title"/>`;
 const EMU_PER_INCH = 914400;
 
@@ -473,12 +479,11 @@ function createPptx(req) {
       if (headingLevelNumber(block.level) === 1 || !slide) {
         fresh();
         const text = textOf(block.text, "a heading's text");
-        // A blank heading opens a slide without a title — it is drawn as the text
-        // box it always was, and left undeclared (see `declarePptxTitles`).
-        const titled = text.trim() !== "";
+        // A blank heading opens a slide without a title: the block is drawn as
+        // the text box it always was and left undeclared (see `declarePptxTitles`).
         slide.addText(text, {
           x: TITLE_INCHES.x, y: TITLE_INCHES.y, w: TITLE_INCHES.w, h: TITLE_INCHES.h, fontSize: TITLE_POINTS, bold: true,
-          objectName: titled ? TITLE_SHAPE : undefined,
+          objectName: titledText(text) === undefined ? undefined : TITLE_SHAPE,
         });
       } else {
         room(0.7);
@@ -537,16 +542,28 @@ function createPptx(req) {
 // wrote (a slide master per slide, where a deck has one) and for media types no
 // part of the deck uses (jpeg, svg, gif, mp4, vml, an embedded workbook), a notes
 // page is written for every slide even when the deck holds no notes at all, the
-// note count in the file's own properties claims one per slide, every folder in
-// the archive is given an entry of its own, and the presentation's children are
-// ordered against the sequence the format asks for. A deck this tool creates is
-// handed through `completePptx` once, which declares its titles and removes what
-// nothing needs — never leaving behind a declaration, a relationship or a
-// reference that resolves to nothing.
+// note count in the file's own properties claims one per slide and the titles it
+// lists name each slide by its number, every folder in the archive is given an
+// entry of its own, and the presentation's children are ordered against the
+// sequence the format asks for. A deck this tool creates is handed through
+// `completePptx` once, which declares its titles and removes what nothing needs —
+// never leaving behind a declaration, a relationship or a reference that resolves
+// to nothing.
 
 // The parts a package holds, folder entries apart: a folder's own entry is not a
 // part, and neither the format nor a reader looks one up by name.
 const packageParts = (zip) => Object.keys(zip.files).filter((name) => !name.endsWith("/"));
+
+// The alignment a slide's title paragraph is given, written right after the
+// element's name: the alignment an `<a:pPr>` already states is its own and stays,
+// and one stating none is given the title alignment — so a second pass over the
+// same shape changes nothing.
+const withTitleAlignment = (tag) => (xmlAttribute(tag, "algn") === undefined ? tag.replace(/^<a:pPr/, `<a:pPr algn="${TITLE_ALIGNMENT}"`) : tag);
+
+// A title run's `<a:rPr>` body with the title fonts appended: the place the
+// format's sequence puts them, after the run's own fill. One already stating a
+// Latin font — a pass of this very rule included — keeps what it states.
+const withTitleFonts = (props) => (props.includes("<a:latin ") ? props : props.replace(/<\/a:rPr>$/, `${TITLE_FONTS}</a:rPr>`));
 
 // `xml` with the shape that opens a slide declared the slide's real title: the
 // placeholder (`TITLE_PLACEHOLDER`), the alignment and the fonts the declaration
@@ -554,14 +571,16 @@ const packageParts = (zip) => Object.keys(zip.files).filter((name) => !name.ends
 // frame, size, weight, colour and vertical centring the block already carries stay
 // as they are. The shape is the one `createPptx` named for this (`TITLE_SHAPE`),
 // so a slide whose opening block is not a title — including one whose heading was
-// blank — holds no such shape and is handed back unchanged.
+// blank — holds no such shape and is handed back unchanged. Every part of the
+// declaration is stated only where the shape states none of it, so running this
+// over an already-declared shape leaves it as it is.
 function declarePptxTitles(xml) {
   const shape = slideShapeSpans(xml).find((span) => shapeName(xml, span) === TITLE_SHAPE);
   if (!shape) return xml;
   const declared = xml.slice(shape.start, shape.end)
     .replace(/<p:nvPr\s*\/>|<p:nvPr\s*>\s*<\/p:nvPr>/, `<p:nvPr>${TITLE_PLACEHOLDER}</p:nvPr>`)
-    .replace(/<a:pPr\b/g, `<a:pPr algn="${TITLE_ALIGNMENT}"`)
-    .replace(/<\/a:rPr>/g, `${TITLE_FONTS}</a:rPr>`);
+    .replace(/<a:pPr\b[^>]*>/g, withTitleAlignment)
+    .replace(/<a:rPr(?:[^>]*[^/])?>[\s\S]*?<\/a:rPr>/g, withTitleFonts);
   return xml.slice(0, shape.start) + declared + xml.slice(shape.end);
 }
 
@@ -583,20 +602,29 @@ function notedSlides(zip) {
 // when the part it names is gone.
 const withoutRelationship = (xml, type) => xml.replace(new RegExp(`<Relationship\\b[^>]*Type="${escapeRegExp(type)}"[^>]*/>`), "");
 
-// The deck's notes pages, dropped when the deck holds no notes at all: the library
-// writes one per slide whatever the content, and a slide a notes page was never
-// written for says nothing about the deck. The notes MASTER stays — it is the part
-// a notes page is drawn through, office writes one whether or not it holds notes,
-// and a deck without it can never be given notes at all.
+// The deck's notes pages, dropped for every slide that holds no notes: the library
+// writes one per slide whatever the content, and a page holding no text is one a
+// reading shows nothing for, so a deck that holds some notes keeps none of the
+// empty pages — exactly as a deck holding none keeps no pages at all. A page
+// another slide still names is that slide's own and stays. The notes MASTER stays —
+// it is the part a notes page is drawn through, office writes one whether or not it
+// holds notes, and a deck without it can never be given notes at all.
 function dropPptxNotesPages(zip) {
-  for (const part of packageParts(zip)) {
-    if (part.startsWith(PPT_NOTES_SLIDES)) zip.remove(part);
-  }
-  for (const part of slideParts(zip)) {
-    const rels = zip.file(relsPartFor(part));
+  const slides = slideParts(zip);
+  const pages = slides.map((slide) => slideNotesPart(zip, slide));
+  for (const [at, slide] of slides.entries()) {
+    const page = pages[at];
+    if (page === null || pages.some((other, index) => index !== at && other === page)) continue;
+    const file = zip.file(page);
+    if (file !== null && notesLines(file.asText()).trim() !== "") continue;
+    // The page's own relationships part goes with it; `zip.remove` takes a name
+    // the package does not hold as nothing at all.
+    zip.remove(page);
+    zip.remove(relsPartFor(page));
+    const rels = zip.file(relsPartFor(slide));
     if (!rels) continue;
     const without = withoutRelationship(rels.asText(), NOTES_REL);
-    if (without !== rels.asText()) zip.file(relsPartFor(part), without);
+    if (without !== rels.asText()) zip.file(relsPartFor(slide), without);
   }
 }
 
@@ -610,6 +638,101 @@ function setPptxNoteCount(zip, noted) {
   const xml = file.asText();
   const counted = xml.replace(/<Notes>\d+<\/Notes>/, `<Notes>${noted}</Notes>`);
   if (counted !== xml) zip.file("docProps/app.xml", counted);
+}
+
+// The name the writer gives the group of slide titles in the application
+// properties, whose count and entries `withSlideTitles` keep together.
+const SLIDE_TITLES_GROUP = "Slide Titles";
+
+// The text a slide declares as its title, or null when it declares none: the
+// paragraphs of the shape whose `<p:ph>` names the title placeholder — the shape a
+// reading marks and the one both sides that write a title declare — joined the way
+// a part's own text is (see `notesLines`). A title blank once trimmed is one a
+// reading shows nothing for, so it is no title here either.
+function slideTitleText(zip, slidePart) {
+  const file = zip.file(slidePart);
+  if (file === null) return null;
+  const xml = file.asText();
+  const shape = slideShapeSpans(xml).find((span) => {
+    const placeholder = xml.slice(span.start, span.end).match(/<p:ph\b[^>]*>/) || [""];
+    return xmlAttribute(placeholder[0], "type") === "title";
+  });
+  const body = shape === undefined ? null : shapeTextBody(xml, shape);
+  if (body === null) return null;
+  const text = slideParagraphs(xml.slice(body.start, body.end))
+    .map((paragraph) => slideParagraphText(xml.slice(body.start + paragraph.start, body.start + paragraph.end)))
+    .join("\n")
+    .trim();
+  return text === "" ? null : text;
+}
+
+// The `(name, count)` pairs a `HeadingPairs` element states, in its own order: the
+// writer gives every group a `<vt:lpstr>` naming it and a `<vt:i4>` counting it, one
+// variant each and always in that order. A `null` when the element is not the shape
+// the writer gives it, so a part this does not understand is left alone.
+function headingPairs(block) {
+  const entries = [...block.matchAll(/<vt:(lpstr|i4)>([\s\S]*?)<\/vt:\1>/g)].map((match) => ({ kind: match[1], value: xmlUnescape(match[2]) }));
+  const pairs = [];
+  for (let at = 0; at + 1 < entries.length; at += 2) {
+    if (entries[at].kind !== "lpstr" || entries[at + 1].kind !== "i4") return null;
+    pairs.push({ name: entries[at].value, count: Number(entries[at + 1].value) });
+  }
+  return pairs;
+}
+
+// The entries a `TitlesOfParts` element lists, in its own order.
+const titledParts = (block) => [...block.matchAll(/<vt:lpstr>([\s\S]*?)<\/vt:lpstr>/g)].map((match) => xmlUnescape(match[1]));
+
+// A `HeadingPairs` element holding `pairs`, the vector's size the number of
+// variants that make them up.
+const headingPairsBlock = (pairs) => `<HeadingPairs><vt:vector size="${pairs.length * 2}" baseType="variant">` +
+  pairs.map((pair) => `<vt:variant><vt:lpstr>${xmlEscape(pair.name)}</vt:lpstr></vt:variant><vt:variant><vt:i4>${pair.count}</vt:i4></vt:variant>`).join("") +
+  `</vt:vector></HeadingPairs>`;
+
+// A `TitlesOfParts` element listing `entries`, the vector's size the number of
+// them.
+const titlesOfPartsBlock = (entries) => `<TitlesOfParts><vt:vector size="${entries.length}" baseType="lpstr">` +
+  entries.map((entry) => `<vt:lpstr>${xmlEscape(entry)}</vt:lpstr>`).join("") +
+  `</vt:vector></TitlesOfParts>`;
+
+// The deck's own application properties with the slide titles they list set to the
+// titles the slides really declare: the library writes one entry per slide, naming
+// each by its number, which is not a title any slide holds.
+function setPptxSlideTitles(zip) {
+  const file = zip.file("docProps/app.xml");
+  if (!file) return;
+  const xml = file.asText();
+  const titles = slideParts(zip).map((part) => slideTitleText(zip, part)).filter((title) => title !== null);
+  const rewritten = withSlideTitles(xml, titles);
+  if (rewritten !== xml) zip.file("docProps/app.xml", rewritten);
+}
+
+// `xml` — the deck's application properties — with the group of slide titles
+// listing `titles`: the group `SLIDE_TITLES_GROUP` names, whose entries are the
+// tail of the titles vector that follows the groups ahead of it (their counts are
+// what says where it begins). A deck declaring no title loses the group along with
+// its entries rather than keeping a count of zero, and the group's count, the
+// vectors' sizes and the entries are rewritten together, so the properties never
+// contradict each other. A part whose groups name more entries than its vector
+// holds is one this does not understand, and is handed back unchanged.
+function withSlideTitles(xml, titles) {
+  const heads = xml.match(/<HeadingPairs>[\s\S]*?<\/HeadingPairs>/);
+  const parts = xml.match(/<TitlesOfParts>[\s\S]*?<\/TitlesOfParts>/);
+  if (!heads || !parts) return xml;
+  const pairs = headingPairs(heads[0]);
+  const group = pairs === null ? -1 : pairs.findIndex((pair) => pair.name === SLIDE_TITLES_GROUP);
+  if (group < 0) return xml;
+  const before = pairs.slice(0, group).reduce((count, pair) => count + pair.count, 0);
+  const entries = titledParts(parts[0]);
+  if (entries.length < before) return xml;
+  const kept = entries.slice(0, before);
+  return titles.length === 0
+    ? xml
+        .replace(heads[0], () => headingPairsBlock(pairs.filter((_, at) => at !== group)))
+        .replace(parts[0], () => titlesOfPartsBlock(kept))
+    : xml
+        .replace(heads[0], () => headingPairsBlock(pairs.map((pair, at) => (at === group ? { name: pair.name, count: titles.length } : pair))))
+        .replace(parts[0], () => titlesOfPartsBlock([...kept, ...titles]));
 }
 
 // The deck's `[Content_Types].xml` with every declaration the package has no part
@@ -676,8 +799,11 @@ function completePptx(bytes) {
     if (declared !== xml) zip.file(part, declared);
   }
   const noted = notedSlides(zip);
-  if (noted === 0) dropPptxNotesPages(zip);
+  // Before the content types are pruned, so a page dropped here takes its own
+  // declaration with it.
+  dropPptxNotesPages(zip);
   setPptxNoteCount(zip, noted);
+  setPptxSlideTitles(zip);
   prunePptxContentTypes(zip);
   orderPptxPresentation(zip);
   dropPptxFolderEntries(zip);
@@ -1140,10 +1266,9 @@ function openEdit(req, family) {
   // absence of one — is refused here rather than left to a no-op. The sentence
   // names what the file lacks, since a caller can act on that.
   if (!packageFamily(zip)) throw new UsageError(`cannot edit ${nodePath.basename(req.input)}: it holds no document, workbook or presentation part, so it is not a .${family} package`);
-  // The parts the input held, for the signature check below. A folder entry ends
-  // with `/` and `zip.file` does not resolve one, so the names kept are the
-  // parts.
-  const baseline = Object.keys(zip.files).filter((name) => !name.endsWith("/"));
+  // The parts the input held, for the signature check below — the set
+  // `packageParts` reads, a folder entry left out by the same rule.
+  const baseline = packageParts(zip);
   // A package that carries a digital signature part cannot be edited into a file
   // the signature still matches: the parts it signs change while the signature
   // does not, so a changed package says so in one note rather than staying
@@ -5769,10 +5894,13 @@ function removeSlideParagraphs(editor, edit) {
 // title when a title was given and a body placeholder holding one paragraph per
 // bullet, then the colour-map override. The slide deliberately carries no notes and
 // no animation, and nothing layout-specific beyond its placeholders — the layout
-// supplies the body's geometry. The title's is stated (see `titleShape`).
+// supplies the body's geometry. The title's is stated (see `titleShape`), and a
+// blank title is no title at all (`titledText`): the slide is built without a
+// title shape rather than with an empty title frame standing in for one.
 function newSlideXml(title, bullets) {
   const shapes = [];
-  if (title !== undefined) shapes.push(titleShape(title));
+  const titled = titledText(title);
+  if (titled !== undefined) shapes.push(titleShape(titled));
   if (bullets.length) shapes.push(placeholderShape(3, "Body", `<p:ph type="body" idx="1"/>`, bullets));
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
     `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="${REL_NS}" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">` +
