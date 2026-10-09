@@ -47,6 +47,7 @@
 //!   written, with names taken from the source/entry file name — never from a
 //!   full ZIP entry path, so a crafted archive cannot write outside it.
 
+use crate::reader_output::{Unshown, UnshownKind};
 use crate::util::media_target::{RASTER_DECODE_MAX_ALLOC_BYTES, RASTER_DECODE_MAX_DIMENSION_PX};
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::content::TypedIter;
@@ -113,7 +114,9 @@ static DOCUMENT_CONVERSIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::co
 //
 // The inbound attachment path and the read tool each wrap these bodies in their
 // own `[<source>: ...]` prefix (a file name and a path respectively), so the
-// sentence a model reads for the same situation cannot drift between them.
+// sentence a model reads for the same situation cannot drift between them. The
+// report of what a reading found and did not show
+// ([`crate::reader_output::Unshown`]) leads them on both paths.
 
 /// Body of the note shown when a document produced images but no text.
 pub(crate) const NO_TEXT_LAYER_NOTE: &str =
@@ -139,11 +142,14 @@ pub(crate) enum DocOutcome {
     /// layer; `images` are files written into `out_dir`, ready for the existing
     /// inbound IMAGE pipeline; `notes` are non-fatal, already user-facing notes
     /// (e.g. skipped undecodable embedded media, pages the reader could not
-    /// read).
+    /// read); `unshown` is the report of the content the reading found and did
+    /// not show, which both callers deliver in the same place and the same words
+    /// ([`crate::reader_output::Unshown`]).
     Text {
         text: String,
         images: Vec<PathBuf>,
         notes: Vec<String>,
+        unshown: Unshown,
         /// The reader failed on every page it was asked for, producing no text at
         /// all: the document's text was lost, not absent, so a caller must not
         /// report it as one that has no text. A page whose text survived — even
@@ -275,6 +281,7 @@ fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome
             text: String::from_utf8_lossy(bytes).into_owned(),
             images: Vec::new(),
             notes: Vec::new(),
+            unshown: Unshown::default(),
             all_page_text_lost: false,
         },
         DocumentKind::Unsupported => DocOutcome::Unsupported,
@@ -402,9 +409,9 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     // never rasterized, so without one aggregated note per cause they would
     // vanish silently.
     let mut skipped = SkippedImages::default();
-    // Pages the page tree has no entry for, so they could not be delivered as
-    // images (a page that produced text before failing still keeps that text).
-    let mut unrendered = 0usize;
+    // What the reading found and does not show: the pages it could not deliver,
+    // and the content the pages' annotations carry.
+    let mut unshown = Unshown::default();
     // The images already written for the document, shared across pages (see
     // [`write_embedded_images`]).
     let mut written = WrittenImages::default();
@@ -448,7 +455,9 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
             } else {
                 unread.lost.push(page_number);
             }
-            rasterize_page(page, page_number, out_dir, &mut images, &mut unrendered);
+            if !rasterize_page(page, page_number, out_dir, &mut images) {
+                unshown.add(UnshownKind::Page, 1);
+            }
         } else if is_usable_page_text(text) {
             if let Some(page) = page {
                 write_embedded_images(
@@ -463,22 +472,28 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         } else {
             // No usable text layer, so the page is rendered exactly as before —
             // and the text it does have is kept beside it.
-            rasterize_page(page, page_number, out_dir, &mut images, &mut unrendered);
+            if !rasterize_page(page, page_number, out_dir, &mut images) {
+                unshown.add(UnshownKind::Page, 1);
+            }
         }
-    }
-    // Aggregated: pages the page tree does not hold are one degradation, not one
-    // log line per page of a long scanned document.
-    if unrendered > 0 {
-        tracing::warn!(
-            pages = unrendered,
-            "document: pages with no page-tree entry could not be delivered as images"
-        );
     }
     // The marks the pages carry (comments, filled form fields) are document
     // content too: they follow the pages, each naming its own page, and are
     // never gated on what happened to the page text. A document whose page
     // structure could not be parsed at all has no marks to read.
     let marks = pdf.as_ref().map(crate::pdf_marks::read).unwrap_or_default();
+    unshown.merge(&marks.unshown);
+    // Aggregated into one log line rather than one per page: a page the page tree
+    // does not hold, or one whose raster could not be built or written, is one
+    // degradation, and a long scanned document has many of them. The report is
+    // what the model is told; this is what a log reader is.
+    let undelivered = unshown.count(UnshownKind::Page);
+    if undelivered > 0 {
+        tracing::warn!(
+            pages = undelivered,
+            "document: pages could not be delivered as images"
+        );
+    }
     // The unread pages lead: they qualify the text and the notes below them.
     let mut notes = unread.notes();
     notes.extend(marks.notes);
@@ -489,6 +504,7 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         text: blocks.join("\n\n"),
         images,
         notes,
+        unshown,
         all_page_text_lost: unread.lost_all_page_text(),
     }
 }
@@ -682,7 +698,13 @@ fn page_ranges(pages: &[usize]) -> String {
     ranges.join(", ")
 }
 
-/// Embedded images left out of the conversion, by cause.
+/// Embedded images left out of the conversion, by cause: a picture this pipeline
+/// does not convert, one whose image could not be read or written, and one over
+/// the shared raster envelope. Content of a kind a reading does not show *at all*
+/// — a video, a drawing, an embedded object — is counted for the report instead
+/// ([`crate::reader_output::Unshown`]), which names the kind and nothing else;
+/// these notes are what tell the reason an image the pipeline meant to deliver is
+/// not there.
 #[derive(Default, Clone, Copy)]
 pub(crate) struct SkippedImages {
     /// Format, colour space or bit depth this module does not convert.
@@ -1366,19 +1388,18 @@ fn encode_jpeg(image: &RgbImage) -> Result<Vec<u8>, ()> {
 }
 
 /// Rasterize `page` (1-based `page_number`) to `<out_dir>/page_<n>.jpg` and push
-/// the path onto `images`; a page that cannot be rendered or encoded is skipped.
-/// A `None` page — one the page tree has no entry for — has nothing to render
-/// and is counted onto `unrendered` instead.
+/// the path onto `images`, saying whether the page ended up among them: `false`
+/// for a page the page tree has no entry for, and for one whose raster could not
+/// be built or written. A page that could not be delivered is one the report
+/// names, so it is never silently absent from the answer.
 fn rasterize_page(
     page: Option<&Page<'_>>,
     page_number: usize,
     out_dir: &Path,
     images: &mut Vec<PathBuf>,
-    unrendered: &mut usize,
-) {
+) -> bool {
     let Some(page) = page else {
-        *unrendered += 1;
-        return;
+        return false;
     };
     // `render_dimensions` clamps zero-area pages, so `long_side >= 1.0` and the
     // scale stays finite; the cap keeps a tiny page from being blown up.
@@ -1409,21 +1430,26 @@ fn rasterize_page(
             page = page_number,
             "document: rasterized page has no pixels"
         );
-        return;
+        return false;
     };
     let path = out_dir.join(format!("page_{page_number}.jpg"));
     match std::fs::File::create(&path) {
         Ok(file) => {
             let mut encoder = JpegEncoder::new_with_quality(file, RASTER_JPEG_QUALITY);
             match encoder.encode_image(&image) {
-                Ok(()) => images.push(path),
+                Ok(()) => {
+                    images.push(path);
+                    true
+                }
                 Err(e) => {
                     tracing::warn!(page = page_number, error = %e, "document: JPEG encoding failed for rasterized page");
+                    false
                 }
             }
         }
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "document: failed to create rasterized page file");
+            false
         }
     }
 }
@@ -2230,6 +2256,7 @@ mod tests {
             images,
             notes,
             all_page_text_lost,
+            ..
         } = outcome
         else {
             panic!("expected Text outcome for a PDF whose pages partly read");
@@ -2269,6 +2296,32 @@ mod tests {
         assert!(!all_page_text_lost);
     }
 
+    /// A page that could not be delivered at all is not silently absent from the
+    /// answer: the report names it, so a reading whose pages could not be written
+    /// is never taken for one that delivered them.
+    #[test]
+    fn a_page_that_cannot_be_written_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A file where the artifact directory should be: no raster can be written,
+        // and the page is one the reading could not deliver.
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, b"").expect("write the file standing in for the directory");
+        // A text-free page, so the reading has to deliver it as a raster.
+        let bytes = multi_page_pdf(&[(
+            "/MediaBox [0 0 612 792]",
+            b"0.1 0.5 0.9 rg 0 0 612 792 re f",
+        )]);
+        let outcome = convert_document(&bytes, "scan.pdf", &blocked);
+        let DocOutcome::Text {
+            images, unshown, ..
+        } = outcome
+        else {
+            panic!("expected Text outcome for a PDF whose page could not be written");
+        };
+        assert!(images.is_empty(), "nothing was written: {images:?}");
+        assert_eq!(unshown.lines(), ["1 page(s) not shown"]);
+    }
+
     /// Every page yields text and then fails the reader part-way: all of it is
     /// kept and every page is rasterized, but a page that delivered text is not a
     /// loss — the flag must clear even though the reader failed on each page.
@@ -2282,6 +2335,7 @@ mod tests {
             images,
             notes,
             all_page_text_lost,
+            ..
         } = outcome
         else {
             panic!("expected Text outcome for a PDF whose every page failed part-way");
@@ -2323,6 +2377,7 @@ mod tests {
             images,
             notes,
             all_page_text_lost,
+            ..
         } = outcome
         else {
             panic!("expected Text outcome for a PDF whose pages parse");
@@ -2360,6 +2415,7 @@ mod tests {
             images,
             notes,
             all_page_text_lost,
+            ..
         } = outcome
         else {
             panic!("expected Text outcome for a scan with one unreadable page");
@@ -2491,6 +2547,7 @@ mod tests {
             images,
             notes,
             all_page_text_lost,
+            ..
         } = outcome
         else {
             panic!("expected Text outcome for a report with a short text page");
@@ -2578,6 +2635,7 @@ mod tests {
             images,
             notes,
             all_page_text_lost,
+            ..
         } = outcome
         else {
             panic!("expected Text outcome for a scan with a form");

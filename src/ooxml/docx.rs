@@ -63,7 +63,7 @@
 
 use super::{
     DocOutcome, Relationship, SkippedImages, append_entity, attr, ensure_out_dir, read_zip_entry,
-    relationships, resolve_part, scan_elements, unreadable, write_media_parts,
+    relationships, resolve_part, scan_elements, unopened_parts, unreadable, write_media_parts,
 };
 use crate::reader_output::{
     TEXT_BOX, WORD_COMMENT, WORD_ENDNOTE, WORD_FOOTER, WORD_FOOTNOTE, WORD_HEADER, labeled_block,
@@ -95,6 +95,15 @@ const MAX_TABLE_COLUMNS: usize = 256;
 const DOCX_BODY_PART: &str = "word/document.xml";
 /// Prefix of the embedded-media parts in a Word package.
 const DOCX_MEDIA_PREFIX: &str = "word/media/";
+/// Charts in a Word package: `word/charts/chart<N>.xml`.
+const DOCX_CHARTS_PREFIX: &str = "word/charts/";
+/// The data part of each SmartArt diagram a Word package holds
+/// (`word/diagrams/data<N>.xml`): Word's reading does not reach them, where the
+/// PowerPoint one reads a slide's diagram through its data.
+const DOCX_DIAGRAMS_PREFIX: &str = "word/diagrams/";
+/// The objects a Word package embeds (`word/embeddings/`) — an object's own
+/// bytes, which the reading never opens.
+const DOCX_EMBEDDINGS_PREFIX: &str = "word/embeddings/";
 
 /// Part holding the body's relationships: the notes parts and the header/footer
 /// parts are named there, never in the body itself.
@@ -2070,12 +2079,26 @@ pub(crate) fn convert_docx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
 
     ensure_out_dir(out_dir);
 
+    let mut unshown = unopened_parts(
+        &mut archive,
+        DOCX_CHARTS_PREFIX,
+        Some(DOCX_DIAGRAMS_PREFIX),
+        DOCX_EMBEDDINGS_PREFIX,
+        None, // a Word package has no chart sheets
+    );
     let mut skipped = SkippedImages::default();
-    let images = write_media_parts(&mut archive, DOCX_MEDIA_PREFIX, out_dir, &mut skipped);
+    let images = write_media_parts(
+        &mut archive,
+        DOCX_MEDIA_PREFIX,
+        out_dir,
+        &mut skipped,
+        &mut unshown,
+    );
     DocOutcome::Text {
         text,
         images,
         notes: skipped.notes(),
+        unshown,
         all_page_text_lost: false,
     }
 }
@@ -2158,8 +2181,10 @@ mod tests {
         );
     }
 
+    /// A media entry a package embeds that this pipeline cannot produce an image
+    /// from is named as what it is, never as an unconvertible image.
     #[test]
-    fn docx_notes_media_entries_it_cannot_convert() {
+    fn docx_reports_media_it_cannot_convert() {
         let bytes = zip_fixture(&[
             ("word/document.xml", DOCX_BODY),
             (
@@ -2172,13 +2197,62 @@ mod tests {
             ),
         ]);
         let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { images, notes, .. } = convert_docx(&bytes, dir.path()) else {
+        let DocOutcome::Text {
+            images,
+            notes,
+            unshown,
+            ..
+        } = convert_docx(&bytes, dir.path())
+        else {
             panic!("expected Text outcome for a well-formed docx");
         };
         assert!(images.is_empty(), "an undecodable entry yields no image");
+        // A metafile is a drawing, not an image this pipeline cannot convert:
+        // the report names what it is rather than what it is not.
+        assert_eq!(unshown.lines(), ["2 embedded drawing(s) not shown"]);
+        assert!(notes.is_empty(), "the report carries the whole loss");
+    }
+
+    /// The parts a reading opens nothing in are named by count rather than passing
+    /// unseen: the charts it cannot draw, the diagrams whose data parts it does not
+    /// reach, and the objects a package embeds. A part of the same directory that
+    /// is not one of them (`layout1.xml` beside `data1.xml`) is not a diagram and
+    /// must not be counted, and the data workbook a chart keeps beside the objects
+    /// is the chart's own, not a second embedded object — while a relationship
+    /// naming a workbook that is not there costs no object its line either.
+    #[test]
+    fn docx_reports_the_parts_its_reading_does_not_open() {
+        let bytes = zip_fixture(&[
+            ("word/document.xml", DOCX_BODY),
+            ("word/diagrams/data1.xml", b"<dgm:dataModel/>"),
+            ("word/diagrams/layout1.xml", b"<dgm:layoutDef/>"),
+            ("word/embeddings/oleObject1.bin", b"OLE bytes"),
+            (
+                "word/embeddings/Microsoft_Excel_Worksheet1.xlsx",
+                b"chart data workbook",
+            ),
+            ("word/charts/chart1.xml", b"<chart/>"),
+            ("word/charts/chartEx1.xml", b"<chartEx/>"),
+            (
+                "word/charts/_rels/chart1.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="../embeddings/Microsoft_Excel_Worksheet1.xlsx"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="../embeddings/Microsoft_Excel_Worksheet9.xlsx"/></Relationships>"#,
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { notes, unshown, .. } = convert_docx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a well-formed docx");
+        };
         assert_eq!(
-            notes,
-            ["skipped 2 embedded image(s) in a format this pipeline cannot convert"]
+            unshown.lines(),
+            [
+                "2 chart(s) not shown",
+                "1 diagram(s) not shown",
+                "1 embedded object part(s) not shown",
+            ]
+        );
+        assert!(
+            notes.is_empty(),
+            "the report carries the whole loss: {notes:?}"
         );
     }
 

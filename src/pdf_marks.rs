@@ -27,6 +27,7 @@
 //!   directly into one array stay two, and a form is walked with the same
 //!   `/T`-based field test the filler uses, so the two agree on its fields.
 
+use crate::reader_output::{Unshown, UnshownKind};
 use crate::util::html::decode_html_entities;
 use crate::util::one_line;
 use hayro::hayro_syntax::Pdf;
@@ -95,6 +96,11 @@ pub(crate) struct Marks {
     pub(crate) fields: Option<String>,
     /// Non-fatal notes, in `crate::document`'s user-facing note shape.
     pub(crate) notes: Vec<String>,
+    /// The content the marks themselves carry and the reading does not show: the
+    /// files a document attaches and the media its annotations hold, counted for
+    /// the document's report (see [`crate::reader_output::Unshown`]) rather than
+    /// passing unseen.
+    pub(crate) unshown: Unshown,
 }
 
 /// Read `pdf`'s annotations and form values.
@@ -113,6 +119,7 @@ fn read_inner(pdf: &Pdf) -> Marks {
     if !walk.lines.is_empty() {
         marks.annotations = Some(format!("Annotations:\n{}", walk.lines.join("\n")));
     }
+    marks.unshown = walk.unshown;
     if walk.truncated {
         marks
             .notes
@@ -160,6 +167,9 @@ struct AnnotationWalk {
     widget_pages: HashMap<DictId, usize>,
     /// Whether [`MAX_MARKS`] cut the walk short.
     truncated: bool,
+    /// The annotations that are no mark but still hold content — an attached
+    /// file, a sound, a movie — counted for the document's report.
+    unshown: Unshown,
 }
 
 /// Walk every page's `/Annots` once: the mark lines, the pages its `/Widget`
@@ -179,16 +189,26 @@ fn read_annotations(pdf: &Pdf) -> AnnotationWalk {
             if is_widget(&dict) {
                 walk.widget_pages.entry(dict_id(&dict)).or_insert(index + 1);
             }
-            let Some(mark) = mark_of(&dict, index + 1) else {
-                continue;
-            };
-            // One object, one note: a mark listed on another page (or twice on
-            // this one) is already in the section, and identity is the object,
-            // not the bytes of its text — identical marks on two pages stay two
-            // marks.
+            // One object, one finding: an annotation listed on another page (or
+            // twice on this one) is one thing the document holds, and identity is
+            // the object, not the bytes of its text — identical marks on two pages
+            // stay two marks, and one attachment listed twice stays one file.
             if !reported.insert(dict_id(&dict)) {
                 continue;
             }
+            let Some(mark) = mark_of(&dict, index + 1) else {
+                // An annotation that is no mark can still carry content a reading
+                // never shows — an attached file, or the media a sound, a movie
+                // or a screen recording holds — and its subtype is in hand here,
+                // so the document's report names it instead of the annotation
+                // passing unseen.
+                if !hidden(&dict)
+                    && let Some(kind) = annotation_content(&dict)
+                {
+                    walk.unshown.add(kind, 1);
+                }
+                continue;
+            };
             if walk.lines.len() == MAX_MARKS {
                 walk.truncated = true;
                 break 'pages;
@@ -245,6 +265,82 @@ fn mark_kind(dict: &Dict<'_>) -> Option<&'static str> {
         "Stamp" => Some("stamp"),
         "Widget" if is_signature(dict) => Some("signature"),
         _ => None,
+    }
+}
+
+/// The document content an annotation carries that is not a mark in the text, or
+/// `None` when the annotation holds none: a `/FileAttachment` holds a file, and a
+/// `/Sound`, `/Movie`, `/Screen`, `/RichMedia` or `/3D` annotation holds media the
+/// reading never shows. A screen annotation counts only when it really plays
+/// media: one whose actions only navigate holds nothing to show. The subtypes that
+/// mark nothing and hold nothing — a `/Link`, a `/Popup`, a `/Redact`, a
+/// `/PrinterMark` — are none of them content a model is missing. The entry that
+/// holds the content is asked for as well, so an annotation that names a media
+/// subtype without carrying any is not counted: what is reported is content the
+/// file really holds.
+fn annotation_content(dict: &Dict<'_>) -> Option<UnshownKind> {
+    let (content, kind) = match dict.get::<Name<'_>>(b"Subtype")?.as_str() {
+        "FileAttachment" => (b"FS".as_slice(), UnshownKind::Attachment),
+        "Sound" => (b"Sound".as_slice(), UnshownKind::MediaAnnotation),
+        "Movie" => (b"Movie".as_slice(), UnshownKind::MediaAnnotation),
+        "RichMedia" => (b"RichMediaContent".as_slice(), UnshownKind::MediaAnnotation),
+        "3D" => (b"3DD".as_slice(), UnshownKind::MediaAnnotation),
+        "Screen" => return plays_media(dict).then_some(UnshownKind::MediaAnnotation),
+        _ => return None,
+    };
+    dict.contains_key(content).then_some(kind)
+}
+
+/// Whether a screen annotation plays media rather than doing something else with
+/// the annotation: it holds the movie itself (`/Movie`), or one of its actions —
+/// `/A`, or any action of `/AA` — is a media action. A screen annotation whose
+/// actions only navigate (a `/GoTo`, a `/URI`) holds no media, so it is not named
+/// as content the file does not hold.
+fn plays_media(dict: &Dict<'_>) -> bool {
+    if dict.contains_key(b"Movie") {
+        return true;
+    }
+    if dict
+        .get::<Object<'_>>(b"A")
+        .is_some_and(|action| plays_media_action(&action))
+    {
+        return true;
+    }
+    dict.get::<Dict<'_>>(b"AA").is_some_and(|actions| {
+        actions.keys().any(|trigger| {
+            actions
+                .get::<Object<'_>>(trigger)
+                .is_some_and(|action| plays_media_action(&action))
+        })
+    })
+}
+
+/// Whether one action — or an array of them — plays media: a `/Rendition` or a
+/// `/Movie` action, or one carrying the clip (`/R`) or the movie (`/Movie`)
+/// itself. `/Next` chains another action to this one, so a chain is followed.
+fn plays_media_action(object: &Object<'_>) -> bool {
+    match object {
+        Object::Array(array) => {
+            let mut actions = array.flex_iter();
+            while let Some(action) = actions.next::<Object<'_>>() {
+                if plays_media_action(&action) {
+                    return true;
+                }
+            }
+            false
+        }
+        Object::Dict(action) => {
+            let plays = action
+                .get::<Name<'_>>(b"S")
+                .is_some_and(|kind| matches!(kind.as_str(), "Rendition" | "Movie"));
+            plays
+                || action.contains_key(b"R")
+                || action.contains_key(b"Movie")
+                || action
+                    .get::<Object<'_>>(b"Next")
+                    .is_some_and(|next| plays_media_action(&next))
+        }
+        _ => false,
     }
 }
 
@@ -831,6 +927,58 @@ mod tests {
             marks.annotations.as_deref(),
             Some("Annotations:\nnote on page 1:\n  visible")
         );
+    }
+
+    /// The annotations that are no mark but still hold content are named for the
+    /// document's report rather than passing unseen: an attached file and the media
+    /// a sound or a movie holds. A hidden one is content the reader is not shown,
+    /// so it is not counted either — an annotation listed twice is one file, and
+    /// one naming a media subtype while carrying no media at all (a `/Screen` with
+    /// no action, or one whose action only navigates) is not content the file
+    /// holds.
+    #[test]
+    fn marks_report_attachments_and_media_they_do_not_show() {
+        let marks = read_pdf(pdf_with(|fixture| {
+            let attachment = fixture.push(
+                "<< /Subtype /FileAttachment /FS << /Type /Filespec /F (notes.txt) >> >>"
+                    .to_string(),
+            );
+            let sound = fixture.push("<< /Subtype /Sound /Sound << >> >>".to_string());
+            let empty_screen = fixture.push("<< /Subtype /Screen >>".to_string());
+            let screen = fixture.push("<< /Subtype /Screen /A << /S /Rendition >> >>".to_string());
+            let navigating =
+                fixture.push("<< /Subtype /Screen /A << /S /GoTo /D [0 0 0 0] >> >>".to_string());
+            let playing =
+                fixture.push("<< /Subtype /Screen /AA << /PO << /S /Movie >> >> >>".to_string());
+            let note = fixture.push("<< /Subtype /Text /Contents (please verify) >>".to_string());
+            let hidden_movie = fixture.push("<< /Subtype /Movie /F 2 /Movie << >> >>".to_string());
+            (
+                vec![vec![
+                    attachment.clone(),
+                    attachment,
+                    sound,
+                    empty_screen,
+                    screen,
+                    navigating,
+                    playing,
+                    note,
+                    hidden_movie,
+                ]],
+                String::new(),
+            )
+        }));
+        assert_eq!(
+            marks.unshown.lines(),
+            [
+                "1 attached file(s) not shown",
+                "3 media annotation(s) not shown",
+            ]
+        );
+        assert_eq!(
+            marks.annotations.as_deref(),
+            Some("Annotations:\nnote on page 1:\n  please verify")
+        );
+        assert!(marks.notes.is_empty());
     }
 
     #[test]

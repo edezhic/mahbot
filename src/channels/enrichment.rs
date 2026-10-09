@@ -563,6 +563,7 @@ async fn handle_file(
             text,
             images,
             notes,
+            unshown,
             all_page_text_lost,
         } => {
             // The reader failed on every page it was asked for, so the pages
@@ -576,6 +577,12 @@ async fn handle_file(
                 batch.annotations.push(
                     extracted_text_annotation(uploads_dir, name, &text, !images.is_empty()).await,
                 );
+            }
+            // The report of what the reading did not show leads the notes, the
+            // same way round as the read tool's answer: a kind and its count,
+            // ahead of the detail of each loss.
+            for line in unshown.lines() {
+                batch.annotations.push(format!("[File {name}: {line}]"));
             }
             for note in notes {
                 batch.annotations.push(format!("[File {name}: {note}]"));
@@ -1769,6 +1776,34 @@ mod tests {
         assert!(
             !msg.content.contains(crate::document::NO_TEXT_NOTE),
             "delivered text must never be reported as a document without one, got: {}",
+            msg.content
+        );
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
+    }
+
+    /// A document the reading found things in but did not show: the attachment
+    /// path names the kinds in the same words the read tool's answer does, so an
+    /// agent knows what it is working without whichever way the file arrived.
+    #[tokio::test]
+    async fn enrich_file_names_what_the_reading_did_not_show() {
+        use crate::ooxml::test_fixtures::{DOCX_BODY, zip_fixture};
+        let package = zip_fixture(&[
+            ("word/document.xml", DOCX_BODY),
+            ("word/media/clip.mp4", b"not a picture at all"),
+        ]);
+        let (tmp_root, ws_path, _msg_dir, attachment) =
+            inbound_ingest_fixture("test_enrich_document_report", 7040, "clip.docx", &package)
+                .await;
+        let marker = format!("Read [FILE:{}] please", attachment.display());
+
+        let mut msg = inbound_msg(7040, &marker);
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
+
+        assert!(
+            msg.content
+                .contains("[File clip.docx: 1 embedded video(s) not shown]"),
+            "the report must reach the inbound answer too, got: {}",
             msg.content
         );
         // Cleanup

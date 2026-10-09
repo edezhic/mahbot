@@ -319,8 +319,9 @@ impl Tool for ReadTool {
         // statement the reader prints them from, so renaming one cannot leave a
         // model-facing sentence stale (see `crate::docgen::ppt_marks`); the two
         // labels a reading prints a slide's own block and its notes under come
-        // from the same place, and the legacy `.doc` story names and the text-box
-        // mark from `crate::reader_output`, which states each once.
+        // from the same place, and the legacy `.doc` story names, the text-box
+        // mark and the report of what a reading did not show from
+        // `crate::reader_output`, which states each once.
         let marks = crate::docgen::ppt_marks();
         // The reader prints a slide's number where these spell `<n>`, so the
         // description names the label the reader prints without reading like a
@@ -349,6 +350,11 @@ impl Tool for ReadTool {
                 ("{{doc_endnotes}}", crate::reader_output::DOC_ENDNOTES),
                 ("{{doc_comments}}", crate::reader_output::DOC_COMMENTS),
                 ("{{text_box_mark}}", crate::reader_output::TEXT_BOX),
+                ("{{chart_sheet_mark}}", crate::reader_output::CHART_SHEET),
+                (
+                    "{{unshown_report}}",
+                    &crate::reader_output::unshown_report_examples(),
+                ),
             ],
         )
     }
@@ -1350,9 +1356,10 @@ mod tests {
     /// The read description names the slide marks and labels the reader prints,
     /// rendered from their single statement ([`crate::docgen::ppt_marks`],
     /// [`crate::docgen::ppt_slide_labels`], [`crate::reader_output`] for the legacy
-    /// story names and the text-box mark): a mark renamed there cannot leave this
-    /// model-facing sentence stale, and a placeholder the call does not fill would
-    /// reach the model as its own literal spelling.
+    /// story names, the text-box mark, the chart-sheet mark and the lines of the
+    /// report of what a reading did not show): a mark renamed there cannot leave
+    /// this model-facing sentence stale, and a placeholder the call does not fill
+    /// would reach the model as its own literal spelling.
     #[test]
     fn the_description_states_the_marks_the_reader_prints() {
         let marks = crate::docgen::ppt_marks();
@@ -1361,6 +1368,8 @@ mod tests {
         // states the label with `<n>` where a real number goes.
         let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
         let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
+        // Two of the report's lines, as the reader that prints them spells them.
+        let report = crate::reader_output::unshown_report_examples();
         for tool in [ReadTool::general(), ReadTool::workspace_only()] {
             let description = tool.description();
             assert!(
@@ -1379,6 +1388,8 @@ mod tests {
                 crate::reader_output::DOC_ENDNOTES,
                 crate::reader_output::DOC_COMMENTS,
                 crate::reader_output::TEXT_BOX,
+                crate::reader_output::CHART_SHEET,
+                &report,
             ] {
                 assert!(
                     description.contains(mark),

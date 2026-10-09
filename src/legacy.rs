@@ -8,12 +8,19 @@
 //! reading an old file and a new one reads both the same way: the Word
 //! subdocument stories are labelled blocks, one per story and in the order a
 //! `.docx` reading prints them, and every value or name is kept to one line.
-//! Each arm also names the embedded images it does not extract — the `.xls` arm
-//! the text its reader recovers from charts, and the `.ppt` arm the objects its
-//! reader resolves per slide — so no image, chart or embedded object the crate
-//! hands over vanishes silently. What the arms deliberately do not adopt is the
-//! newer arms' vocabulary: hidden geometry, hidden sheets, hidden slides, merged
-//! ranges, cell comments, hyperlinks, defined names, per-note splitting and
+//! Each arm also fills the shared report of what a reading did not show
+//! ([`crate::reader_output::Unshown`]): its pictures counted by kind — a vector
+//! metafile as a drawing, every other BLIP as an image — a `.ppt`'s objects
+//! counted by what they are (a video or a sound, otherwise an embedded object; an
+//! OLE object the deck only links is counted not at all, since the file holds the
+//! link and not what it points at), and each `.xls` chart sheet, so no image,
+//! chart or embedded object the crate hands over vanishes silently; the `.xls`
+//! arm names the chart text its reader recovers in a note of its own. A media
+//! object is named by its kind whether the deck holds it or links it: the reader
+//! tells the two apart for OLE objects alone, and the file holds the object's own
+//! record either way. What the arms deliberately do not adopt
+//! is the newer arms' vocabulary: hidden geometry, hidden sheets, hidden slides,
+//! merged ranges, cell comments, hyperlinks, defined names, per-note splitting and
 //! formula text stay out, as does any mark the reader gives no way to place.
 //!
 //! # Invariants
@@ -36,12 +43,15 @@
 
 use crate::document::DocOutcome;
 use crate::reader_output::{
-    DOC_COMMENTS, DOC_ENDNOTES, DOC_FOOTNOTES, DOC_HEADERS_FOOTERS, NO_VALUES, TEXT_BOX,
-    column_letters, sheet_header, slide_header, slide_notes_header, text_block, text_lines,
+    DOC_COMMENTS, DOC_ENDNOTES, DOC_FOOTNOTES, DOC_HEADERS_FOOTERS, NO_VALUES, TEXT_BOX, Unshown,
+    UnshownKind, column_letters, sheet_header, slide_header, slide_notes_header, text_block,
+    text_lines,
 };
 use crate::util::one_line;
+use office_oxide::cfb::blip::{BlipFormat, BlipImage};
 use office_oxide::doc::{DocDocument, DocError, SubDocumentKind};
-use office_oxide::ppt::{PptDocument, PptError, SlideText, TextType};
+use office_oxide::ir::SheetKind;
+use office_oxide::ppt::{OleObjectInfo, PptDocument, PptError, SlideText, TextType};
 use office_oxide::xls::{CellValue, Sheet, XlsDocument, XlsError};
 use std::io::Cursor;
 use std::path::Path;
@@ -52,6 +62,12 @@ const DOC_EXTENSIONS: &[&str] = &["doc"];
 const XLS_EXTENSIONS: &[&str] = &["xls"];
 /// Extensions accepted as legacy PowerPoint presentations.
 const PPT_EXTENSIONS: &[&str] = &["ppt"];
+
+/// `OleObjectInfo::kind` of an OLE object a deck links rather than holds: the
+/// file keeps the link, and the content it points at is somewhere else, so the
+/// report names nothing for it. The media kinds carry no such distinction, so a
+/// linked sound or video is named like an embedded one.
+const OLE_LINKED: u32 = 1;
 
 /// The legacy family a file name belongs to. The CFB magic is shared by all
 /// three (and by an encrypted OOXML package), so only the name can tell them
@@ -168,14 +184,14 @@ fn convert_doc(bytes: &[u8]) -> DocOutcome {
                 );
             }
             // A `.doc` reads for its text only; the object names above are the
-            // reader's own, so only its images are left to name here.
-            if let Some(note) = loss_note(doc.images().len(), 0) {
-                notes.push(note);
-            }
+            // reader's own, so only its pictures are left to report.
+            let mut unshown = Unshown::default();
+            count_pictures(&mut unshown, doc.images());
             DocOutcome::Text {
                 text: sections.join("\n").trim_end().to_string(),
                 images: Vec::new(),
                 notes,
+                unshown,
                 all_page_text_lost: false,
             }
         }
@@ -253,17 +269,25 @@ fn convert_xls(bytes: &[u8]) -> DocOutcome {
                     "the workbook holds text from its charts (chart titles, series and trendline names, and axis titles), which is not extracted".to_string(),
                 );
             }
-            // The images are the only loss left to name: the reader's chart text
-            // is named above, and the cell comments, hyperlinks and defined names
-            // it also hands over are not printed for an old format by choice (see
-            // the module docs).
-            if let Some(note) = loss_note(doc.images().len(), 0) {
-                notes.push(note);
-            }
+            // The report holds the rest of the loss: the pictures by kind, and each
+            // chart sheet as the kind of sheet it is — a sheet the workbook prints
+            // as one with no valued cell, whose whole content is the chart. The cell
+            // comments, hyperlinks and defined names the reader also hands over are
+            // not printed for an old format by choice (see the module docs).
+            let mut unshown = Unshown::default();
+            count_pictures(&mut unshown, doc.images());
+            unshown.add(
+                UnshownKind::ChartSheet,
+                doc.sheets
+                    .iter()
+                    .filter(|sheet| sheet.kind == SheetKind::Chart)
+                    .count(),
+            );
             DocOutcome::Text {
                 text: blocks.join("\n\n").trim_end().to_string(),
                 images: Vec::new(),
                 notes,
+                unshown,
                 all_page_text_lost: false,
             }
         }
@@ -337,19 +361,32 @@ fn convert_ppt(bytes: &[u8]) -> DocOutcome {
                         .to_string(),
                 );
             }
-            // The objects the reader resolves per slide, plus the deck's images.
-            let objects: usize = doc
-                .slides
-                .iter()
-                .map(|slide| slide.ole_object_refs.len())
-                .sum();
-            if let Some(note) = loss_note(doc.images().len(), objects) {
-                notes.push(note);
+            // The deck's pictures by kind, plus the objects the reader resolves
+            // per slide, counted by what the object is: a media object is named as
+            // the video or the sound it holds, an embedded object or an ActiveX
+            // control as an object the reading does not open. An OLE object the
+            // deck only links is skipped: the file holds the link, not the content
+            // it points at.
+            let mut unshown = Unshown::default();
+            count_pictures(&mut unshown, doc.images());
+            for object in doc.slides.iter().flat_map(|slide| &slide.ole_object_refs) {
+                if object.kind == OLE_LINKED {
+                    continue;
+                }
+                unshown.add(
+                    match object.kind {
+                        OleObjectInfo::KIND_MEDIA_VIDEO => UnshownKind::Video,
+                        OleObjectInfo::KIND_MEDIA_AUDIO => UnshownKind::Audio,
+                        _ => UnshownKind::Object,
+                    },
+                    1,
+                );
             }
             DocOutcome::Text {
                 text: blocks.join("\n\n").trim_end().to_string(),
                 images: Vec::new(),
                 notes,
+                unshown,
                 all_page_text_lost: false,
             }
         }
@@ -357,24 +394,25 @@ fn convert_ppt(bytes: &[u8]) -> DocOutcome {
     }
 }
 
-/// The note naming the images and objects an arm leaves unextracted, or `None`
-/// when it leaves neither. The image count comes from the reader's lazy list —
-/// the crate extracts the images on the first `images()` call, so naming the
-/// loss is what costs that read.
-fn loss_note(images: usize, objects: usize) -> Option<String> {
-    let mut held = Vec::new();
-    if images > 0 {
-        held.push(format!("{images} embedded image(s)"));
+/// The report kind one of an old arm's pictures belongs to: a vector metafile
+/// (EMF, WMF, PICT) is a drawing the reading does not render, every other BLIP
+/// an embedded image. Both are named rather than extracted, since an old format
+/// is read for its text alone.
+fn picture_kind(format: BlipFormat) -> UnshownKind {
+    match format {
+        BlipFormat::Emf | BlipFormat::Wmf | BlipFormat::Pict => UnshownKind::Drawing,
+        _ => UnshownKind::Image,
     }
-    if objects > 0 {
-        held.push(format!("{objects} embedded object(s)"));
+}
+
+/// Note every picture in `images` by its kind — the picture loss all three arms
+/// share. The count comes from the reader's lazy list: the crate extracts the
+/// images on the first `images()` call, so naming the loss is what costs that
+/// read.
+fn count_pictures(unshown: &mut Unshown, images: &[BlipImage]) {
+    for image in images {
+        unshown.add(picture_kind(image.format), 1);
     }
-    (!held.is_empty()).then(|| {
-        format!(
-            "the file holds {}, which are not extracted — an old format is read for its text only",
-            held.join(" and ")
-        )
-    })
 }
 
 /// A slide's own text lines — every run that is not speaker notes, in shape
@@ -638,11 +676,12 @@ mod tests {
         buf
     }
 
-    /// The exact note an arm appends for one embedded image, and for one
-    /// embedded object — pinned as literals so a wording drift in
-    /// [`loss_note`] fails a test instead of sliding through.
-    const ONE_IMAGE_NOTE: &str = "the file holds 1 embedded image(s), which are not extracted — an old format is read for its text only";
-    const ONE_OBJECT_NOTE: &str = "the file holds 1 embedded object(s), which are not extracted — an old format is read for its text only";
+    /// The report line an arm gives one embedded image, and one embedded
+    /// object — pinned as literals so a wording drift in
+    /// [`crate::reader_output::Unshown`] fails a test instead of sliding
+    /// through.
+    const UNSHOWN_IMAGE: &str = "1 embedded image(s) not shown";
+    const UNSHOWN_OBJECT: &str = "1 embedded object part(s) not shown";
 
     // ── Word (.doc) ─────────────────────────────────────────────────────
 
@@ -777,14 +816,15 @@ mod tests {
     }
 
     #[test]
-    fn doc_embedded_image_is_named_as_left_out() {
+    fn doc_embedded_image_is_reported_as_not_shown() {
         // A `.doc` reads for its text only; the picture in its `Data` stream
-        // is not extracted, so the reading names it.
+        // is not extracted, so the reading reports it.
         let bytes = doc_image_fixture("Body text");
         let DocOutcome::Text {
             text,
             images,
             notes,
+            unshown,
             ..
         } = convert(&bytes, Family::Doc)
         else {
@@ -792,11 +832,8 @@ mod tests {
         };
         assert_eq!(text, "Body text");
         assert!(images.is_empty());
-        assert!(
-            notes.iter().any(|note| note.contains("embedded image")),
-            "got: {notes:?}"
-        );
-        assert_eq!(notes, [ONE_IMAGE_NOTE]);
+        assert!(notes.is_empty());
+        assert_eq!(unshown.lines(), [UNSHOWN_IMAGE]);
     }
 
     #[test]
@@ -1015,10 +1052,17 @@ mod tests {
     #[test]
     fn xls_chart_text_is_named_as_left_out() {
         // A chart sheet's content is its chart's text, which this reading does
-        // not print: the sheet still shows as one with no valued cell, so the
-        // text is named rather than left to pass as an empty sheet.
+        // not print: the sheet still shows as one with no valued cell, the text
+        // is named in a note rather than left to pass as an empty sheet, and the
+        // sheet itself is reported as the chart sheet it is.
         let bytes = xls_chart_fixture();
-        let DocOutcome::Text { text, notes, .. } = convert(&bytes, Family::Xls) else {
+        let DocOutcome::Text {
+            text,
+            notes,
+            unshown,
+            ..
+        } = convert(&bytes, Family::Xls)
+        else {
             panic!("expected text");
         };
         assert_eq!(
@@ -1031,6 +1075,7 @@ mod tests {
                 .any(|note| note.contains("text from its charts")),
             "got: {notes:?}"
         );
+        assert_eq!(unshown.lines(), ["1 chart sheet(s) not shown"]);
     }
 
     #[test]
@@ -1044,14 +1089,15 @@ mod tests {
     }
 
     #[test]
-    fn xls_embedded_image_is_named_as_left_out() {
+    fn xls_embedded_image_is_reported_as_not_shown() {
         // The pictures in the workbook's drawing records are not extracted, so
-        // the reading names them alongside the cells it prints.
+        // the reading reports them alongside the cells it prints.
         let bytes = xls_image_fixture();
         let DocOutcome::Text {
             text,
             images,
             notes,
+            unshown,
             ..
         } = convert(&bytes, Family::Xls)
         else {
@@ -1059,11 +1105,8 @@ mod tests {
         };
         assert_eq!(text, "Sheet \"Данные\":\n  A1: Привет\n  B2: 3.5");
         assert!(images.is_empty());
-        assert!(
-            notes.iter().any(|note| note.contains("embedded image")),
-            "got: {notes:?}"
-        );
-        assert_eq!(notes, [ONE_IMAGE_NOTE]);
+        assert!(notes.is_empty());
+        assert_eq!(unshown.lines(), [UNSHOWN_IMAGE]);
     }
 
     #[test]
@@ -1123,6 +1166,46 @@ mod tests {
     /// `ExObjRefAtom` — a shape's reference to an external object, inside its
     /// `ClientData`.
     const RT_EXTERNAL_OBJECT_REF_ATOM: u16 = 0x0BC1;
+    /// `ExMediaAtom` — a media object's id inside its container.
+    const RT_EX_MEDIA_ATOM: u16 = 0x1004;
+    /// `ExVideoContainer` — the video an `ExAviMovieContainer` holds.
+    const RT_EX_VIDEO: u16 = 0x1005;
+    /// `ExAviMovieContainer` — a video object, which has no `ExOleObjAtom`.
+    const RT_EX_AVI_MOVIE: u16 = 0x1006;
+    /// `ExWAVAudioEmbeddedContainer` — a sound object, which has none either.
+    const RT_EX_WAV_AUDIO_EMBEDDED: u16 = 0x100F;
+
+    /// The one external object a fixture deck's slide references. An embedded OLE
+    /// object and the media objects are resolved from different records, and which
+    /// record a media one is in is what tells the report a video or a sound from
+    /// an embedded object; a linked OLE object is the same record as an embedded
+    /// one with the kind a deck links by.
+    #[derive(Clone, Copy)]
+    enum OleFixture {
+        Embedded(u32),
+        Linked(u32),
+        Video(u32),
+        Audio(u32),
+    }
+
+    impl OleFixture {
+        /// The id the slide's shape references.
+        const fn obj_id(self) -> u32 {
+            match self {
+                Self::Embedded(id) | Self::Linked(id) | Self::Video(id) | Self::Audio(id) => id,
+            }
+        }
+
+        /// The `ExOleObjAtom.type` the object is written with: a media object has
+        /// no such atom — [`ex_obj_list`] writes one through this only for an OLE
+        /// object.
+        const fn kind(self) -> u32 {
+            match self {
+                Self::Linked(_) => super::OLE_LINKED,
+                _ => 0,
+            }
+        }
+    }
 
     fn atom(rec_type: u16, instance: u16, data: &[u8]) -> Vec<u8> {
         let mut buf = (instance << 4).to_le_bytes().to_vec();
@@ -1188,21 +1271,42 @@ mod tests {
         container(RT_SHAPE, 0, &client_data)
     }
 
-    /// The document-wide embedded-object table: an `ExObjListContainer` →
-    /// `ExEmbed` → `ExOleObjAtom` naming one object. The atom's 16-byte body
-    /// is the parse-relevant prefix `drawAspect`(4) + kind(4) + `objID`(4) +
-    /// `subType`(4) ([MS-PPT] 2.10.20); kind 0 is an embedded object.
-    fn ex_obj_list(obj_id: u32) -> Vec<u8> {
-        let mut body = vec![0u8; 16];
-        body[8..12].copy_from_slice(&obj_id.to_le_bytes());
-        let ole_atom = atom(RT_EXTERNAL_OLE_OBJECT_ATOM, 0, &body);
-        let embed = container(RT_EXTERNAL_OLE_EMBED, 0, &ole_atom);
-        container(RT_EXTERNAL_OBJECT_LIST, 0, &embed)
+    /// The document-wide external-object table: an `ExObjListContainer` holding
+    /// the one object a fixture deck names. An embedded or linked object is an
+    /// `ExEmbed` → `ExOleObjAtom` whose 16-byte body is the parse-relevant prefix
+    /// `drawAspect`(4) + kind(4) + `objID`(4) + `subType`(4) ([MS-PPT] 2.10.20); a
+    /// media object is its own container — a movie holding the video, or a sound
+    /// container holding the atom directly — whose `ExMediaAtom` carries the id a
+    /// shape references, and it has no OLE atom at all.
+    fn ex_obj_list(ole: OleFixture) -> Vec<u8> {
+        match ole {
+            OleFixture::Embedded(_) | OleFixture::Linked(_) => {
+                let mut body = vec![0u8; 16];
+                body[4..8].copy_from_slice(&ole.kind().to_le_bytes());
+                body[8..12].copy_from_slice(&ole.obj_id().to_le_bytes());
+                let ole_atom = atom(RT_EXTERNAL_OLE_OBJECT_ATOM, 0, &body);
+                let embed = container(RT_EXTERNAL_OLE_EMBED, 0, &ole_atom);
+                container(RT_EXTERNAL_OBJECT_LIST, 0, &embed)
+            }
+            OleFixture::Video(obj_id) | OleFixture::Audio(obj_id) => {
+                let mut body = obj_id.to_le_bytes().to_vec();
+                body.extend([0u8; 4]); // mediaType(4) + mediaId(4)
+                let media_atom = atom(RT_EX_MEDIA_ATOM, 0, &body);
+                let (container_type, children) = match ole {
+                    OleFixture::Video(_) => {
+                        (RT_EX_AVI_MOVIE, container(RT_EX_VIDEO, 0, &media_atom))
+                    }
+                    _ => (RT_EX_WAV_AUDIO_EMBEDDED, media_atom),
+                };
+                let media = container(container_type, 0, &children);
+                container(RT_EXTERNAL_OBJECT_LIST, 0, &media)
+            }
+        }
     }
 
     /// A `Slide` container with a `SlideAtom` naming its notes page, one title
     /// textbox and, when given, a reconstructed table shape and a shape
-    /// referencing embedded object `ole`.
+    /// referencing external object `ole`.
     fn slide_container(
         text: &str,
         notes_id: u32,
@@ -1281,13 +1385,13 @@ mod tests {
     /// The "PowerPoint Document" stream of a one-slide deck and the offset of
     /// its user edit. The slide (and its notes page, when `notes` is given)
     /// are resolved through the persist directory, the way a real PPT97 file
-    /// stores its current content. `ole` names an embedded object the slide's
+    /// stores its current content. `ole` names an external object the slide's
     /// shape references, declared in the document's own `ExObjListContainer`.
     fn ppt_document_stream(
         slide_text: &str,
         notes: Option<&str>,
         table: Option<[&str; 4]>,
-        ole: Option<u32>,
+        ole: Option<OleFixture>,
     ) -> (Vec<u8>, u32) {
         const SLIDE_ID: u32 = 256;
         const NOTES_ID: u32 = 257;
@@ -1309,10 +1413,10 @@ mod tests {
             );
             doc_children.extend(notes_list);
         }
-        // The document-wide embedded-object table the slide's shape resolves
+        // The document-wide external-object table the slide's shape resolves
         // its reference against.
-        if let Some(obj_id) = ole {
-            doc_children.extend(ex_obj_list(obj_id));
+        if let Some(ole) = ole {
+            doc_children.extend(ex_obj_list(ole));
         }
         let doc_offset = stream.len() as u32;
         stream.extend(container(RT_DOCUMENT, 0, &doc_children));
@@ -1321,7 +1425,12 @@ mod tests {
         // only through the persist directory.
         let slide_offset = stream.len() as u32;
         let notes_id = if notes.is_some() { NOTES_ID } else { 0 };
-        stream.extend(slide_container(slide_text, notes_id, table, ole));
+        stream.extend(slide_container(
+            slide_text,
+            notes_id,
+            table,
+            ole.map(OleFixture::obj_id),
+        ));
         let mut entries = vec![(1u32, doc_offset), (2, slide_offset)];
         if let Some(notes_text) = notes {
             let notes_offset = stream.len() as u32;
@@ -1374,14 +1483,24 @@ mod tests {
     /// which the document's `ExObjListContainer` names — the two halves a
     /// slide's embedded object is resolved from.
     fn ppt_ole_fixture(slide_text: &str, obj_id: u32) -> Vec<u8> {
-        let (stream, edit_offset) = ppt_document_stream(slide_text, None, None, Some(obj_id));
+        let (stream, edit_offset) =
+            ppt_document_stream(slide_text, None, None, Some(OleFixture::Embedded(obj_id)));
+        ppt_cfb(&stream, edit_offset, false, None)
+    }
+
+    /// A `.ppt` whose only slide references the media object `media` — a video or
+    /// a sound the deck holds, resolved from the `ExMediaAtom` of its own
+    /// container rather than from an `ExOleObjAtom`.
+    fn ppt_media_fixture(slide_text: &str, media: OleFixture) -> Vec<u8> {
+        let (stream, edit_offset) = ppt_document_stream(slide_text, None, None, Some(media));
         ppt_cfb(&stream, edit_offset, false, None)
     }
 
     /// [`ppt_ole_fixture`]'s deck plus a `Pictures` image, so one reading names
     /// both an image and an object.
     fn ppt_image_and_object_fixture(slide_text: &str, obj_id: u32) -> Vec<u8> {
-        let (stream, edit_offset) = ppt_document_stream(slide_text, None, None, Some(obj_id));
+        let (stream, edit_offset) =
+            ppt_document_stream(slide_text, None, None, Some(OleFixture::Embedded(obj_id)));
         let pictures = jpeg_blip();
         ppt_cfb(&stream, edit_offset, false, Some(&pictures))
     }
@@ -1434,14 +1553,15 @@ mod tests {
     }
 
     #[test]
-    fn ppt_embedded_image_is_named_as_left_out() {
-        // The deck's `Pictures` stream is not extracted, so the reading names
+    fn ppt_embedded_image_is_reported_as_not_shown() {
+        // The deck's `Pictures` stream is not extracted, so the reading reports
         // the images it holds.
         let bytes = ppt_image_fixture("Slide title");
         let DocOutcome::Text {
             text,
             images,
             notes,
+            unshown,
             ..
         } = convert(&bytes, Family::Ppt)
         else {
@@ -1449,23 +1569,21 @@ mod tests {
         };
         assert_eq!(text, "Slide 1:\n  Slide title");
         assert!(images.is_empty());
-        assert!(
-            notes.iter().any(|note| note.contains("embedded image")),
-            "got: {notes:?}"
-        );
-        assert_eq!(notes, [ONE_IMAGE_NOTE]);
+        assert!(notes.is_empty());
+        assert_eq!(unshown.lines(), [UNSHOWN_IMAGE]);
     }
 
     #[test]
-    fn ppt_embedded_object_is_named_as_left_out() {
+    fn ppt_embedded_object_is_reported_as_not_shown() {
         // A slide shape's `ExObjRefAtom` resolves, through the document's
         // `ExObjListContainer`, to one embedded object this reading does not
-        // extract — so it is named.
+        // extract — so it is reported.
         let bytes = ppt_ole_fixture("Slide title", 1);
         let DocOutcome::Text {
             text,
             images,
             notes,
+            unshown,
             ..
         } = convert(&bytes, Family::Ppt)
         else {
@@ -1473,31 +1591,53 @@ mod tests {
         };
         assert_eq!(text, "Slide 1:\n  Slide title");
         assert!(images.is_empty());
-        assert!(
-            notes.iter().any(|note| note.contains("embedded object")),
-            "got: {notes:?}"
-        );
-        assert_eq!(notes, [ONE_OBJECT_NOTE]);
+        assert!(notes.is_empty());
+        assert_eq!(unshown.lines(), [UNSHOWN_OBJECT]);
     }
 
+    /// A deck's media objects are named as the media they are rather than as
+    /// embedded objects: the container the `ExObjList` holds says which is which,
+    /// and the report names the loss by what the deck actually holds.
     #[test]
-    fn ppt_image_and_object_note_names_both() {
-        // When a deck holds both a picture and an embedded object, the one
-        // note names both losses, joined.
-        let bytes = ppt_image_and_object_fixture("Slide title", 1);
-        let DocOutcome::Text { notes, .. } = convert(&bytes, Family::Ppt) else {
+    fn ppt_media_objects_are_reported_by_their_kind() {
+        for (media, expected) in [
+            (OleFixture::Video(1), "1 embedded video(s) not shown"),
+            (OleFixture::Audio(1), "1 embedded audio(s) not shown"),
+        ] {
+            let bytes = ppt_media_fixture("Slide title", media);
+            let DocOutcome::Text { text, unshown, .. } = convert(&bytes, Family::Ppt) else {
+                panic!("expected text");
+            };
+            assert_eq!(text, "Slide 1:\n  Slide title");
+            assert_eq!(unshown.lines(), [expected]);
+        }
+    }
+
+    /// A linked OLE object is not content the deck holds — the file keeps the
+    /// link, not what it points at — so a deck whose only object is linked reports
+    /// nothing: the report names content that is really there.
+    #[test]
+    fn ppt_linked_object_is_not_reported_as_content() {
+        let (stream, edit_offset) =
+            ppt_document_stream("Slide title", None, None, Some(OleFixture::Linked(1)));
+        let bytes = ppt_cfb(&stream, edit_offset, false, None);
+        let DocOutcome::Text { text, unshown, .. } = convert(&bytes, Family::Ppt) else {
             panic!("expected text");
         };
-        assert!(
-            notes.iter().any(|note| note.contains("embedded image")),
-            "got: {notes:?}"
-        );
-        assert_eq!(
-            notes,
-            [
-                "the file holds 1 embedded image(s) and 1 embedded object(s), which are not extracted — an old format is read for its text only"
-            ]
-        );
+        assert_eq!(text, "Slide 1:\n  Slide title");
+        assert!(unshown.lines().is_empty());
+    }
+
+    /// A deck holding both a picture and an embedded object reports each loss by
+    /// its own kind rather than joined into one line.
+    #[test]
+    fn ppt_image_and_object_are_reported_separately() {
+        let bytes = ppt_image_and_object_fixture("Slide title", 1);
+        let DocOutcome::Text { notes, unshown, .. } = convert(&bytes, Family::Ppt) else {
+            panic!("expected text");
+        };
+        assert!(notes.is_empty());
+        assert_eq!(unshown.lines(), [UNSHOWN_OBJECT, UNSHOWN_IMAGE]);
     }
 
     #[test]

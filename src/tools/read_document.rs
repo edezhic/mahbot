@@ -17,6 +17,7 @@
 
 use crate::Workspace;
 use crate::document::DocOutcome;
+use crate::reader_output::Unshown;
 use crate::tools::{ImagePayload, ImagePayloadSource, ToolOutput};
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -90,8 +91,11 @@ pub(super) async fn read_document(
             text,
             images,
             notes,
+            unshown,
             all_page_text_lost,
-        } => Some(compose_output(res, &dir, text, images, notes, all_page_text_lost).await),
+        } => {
+            Some(compose_output(res, &dir, text, images, notes, unshown, all_page_text_lost).await)
+        }
     };
     // Empty-only removal (`remove_dir` refuses a non-empty directory): an answer
     // pointing at nothing leaves no directory behind, anything it points at keeps
@@ -156,13 +160,15 @@ async fn peek_head(path: &Path) -> Option<Vec<u8>> {
 }
 
 /// Turn a converted document's parts into the read tool's result: scrub the text,
-/// attach the rasters when there are few enough, and say what was delivered.
+/// attach the rasters when there are few enough, and say what was delivered and
+/// what the reading did not show.
 async fn compose_output(
     res: &super::read::ResolvedRead,
     dir: &Path,
     text: String,
     images: Vec<PathBuf>,
     notes: Vec<String>,
+    unshown: Unshown,
     all_page_text_lost: bool,
 ) -> ToolOutput {
     let display = res.path.display().to_string();
@@ -204,8 +210,6 @@ async fn compose_output(
         }
     }
 
-    let note = res.recovery_note.as_deref();
-
     let mut text_block = if text.is_empty() {
         // The reader failed on every page it was asked for: the notes below name
         // those pages, and the "no text" sentences would report a reader failure
@@ -226,7 +230,14 @@ async fn compose_output(
             answer_line(&display, "extracted text follows")
         )
     };
-    let mut trailing: Vec<String> = notes.iter().map(|n| answer_line(&display, n)).collect();
+    // The report of what the reading did not show leads the notes: a kind and its
+    // count, ahead of the detail of each loss.
+    let mut trailing: Vec<String> = unshown
+        .lines()
+        .iter()
+        .chain(&notes)
+        .map(|body| answer_line(&display, body))
+        .collect();
     if unattached > 0 {
         // Not the inbound sentence ("could not be read"): there the image
         // pipeline rejected an image it was handed, here the raster could not be
@@ -272,7 +283,7 @@ async fn compose_output(
         }
         lines.extend(trailing.iter().map(String::as_str));
         lines.extend(listing.iter().map(String::as_str));
-        crate::tools::with_recovery_note(note, lines.join("\n"))
+        crate::tools::with_recovery_note(res.recovery_note.as_deref(), lines.join("\n"))
     };
     let fits = |text_block: &str, listing: &[String]| {
         compose(text_block, listing).len() <= crate::util::TOOL_OUTPUT_BUDGET_BYTES
@@ -505,6 +516,57 @@ mod tests {
         assert!(
             out.text_is_content,
             "the page images supplement, never replace, the answer"
+        );
+    }
+
+    /// What a reading found in the file and did not show is named in the answer —
+    /// the kinds the tool saw but never put in the text — and a reading that left
+    /// nothing out says nothing about it.
+    #[tokio::test]
+    async fn the_answer_names_what_the_reading_did_not_show() {
+        let owner = SpillOwner::new();
+        let with_media = zip_fixture(&[
+            ("word/document.xml", DOCX_BODY),
+            ("word/media/clip.mp4", b"not a picture at all"),
+            (
+                "word/media/scan.tiff",
+                b"a picture this pipeline does not convert",
+            ),
+            ("word/embeddings/oleObject1.bin", b"an object nothing reads"),
+        ]);
+        let (_dir, ws) = temp_workspace(&[("clip.docx", &with_media)]);
+
+        let out = convert(&owner, &ws, "clip.docx", false)
+            .await
+            .expect("a .docx is a document");
+        // The report leads the notes, one line per kind: the clip is a video,
+        // never "an image in a format this pipeline cannot convert".
+        assert!(
+            out.text.contains("1 embedded video(s) not shown]"),
+            "{:?}",
+            out.text
+        );
+        assert!(
+            out.text.contains("1 embedded object part(s) not shown]"),
+            "{:?}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("skipped 1 embedded image(s) in a format this pipeline cannot convert]"),
+            "the picture the pipeline cannot convert keeps its reason: {:?}",
+            out.text
+        );
+
+        let plain = zip_fixture(&[("word/document.xml", DOCX_BODY)]);
+        let (_dir, ws) = temp_workspace(&[("plain.docx", &plain)]);
+        let out = convert(&owner, &ws, "plain.docx", false)
+            .await
+            .expect("a .docx is a document");
+        assert!(
+            !out.text.contains("not shown]"),
+            "a reading with nothing left out reports nothing: {:?}",
+            out.text
         );
     }
 

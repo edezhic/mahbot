@@ -10,6 +10,11 @@
 //! Excel reader and the legacy one both print a sheet block, the Word reader and
 //! the legacy one both print the stories a Word file carries, and every reader
 //! that writes a spreadsheet cell address writes it through [`column_letters`].
+//! What a reading found in a file and did not show is stated here as well
+//! ([`Unshown`]): each kind's own words, one line per kind, so every reader's arm
+//! and both delivery layers report a loss the same way, and
+//! [`unshown_report_examples`] quotes a report line in the model-facing
+//! description of a reading.
 //! The names only the Word reader prints — the story names a `.docx` and a `.doc`
 //! reading share, and the block a text box prints as — sit beside them rather than
 //! inside one of the two files that print them: the marks the kit's refusals match
@@ -23,6 +28,8 @@
 //! in particular must be read from there by whoever prints it. [`slide_header`]
 //! composes the slide's number with that same hidden-slide mark, so it reads
 //! the mark from the kit rather than spelling it here.
+
+use strum::{EnumCount, EnumIter, IntoEnumIterator};
 
 // ── Shared text shapes ──────────────────────────────────────────
 
@@ -102,6 +109,11 @@ pub(crate) fn column_index(reference: &str) -> Option<u32> {
 
 /// The mark a sheet with no valued cell prints in place of its lines.
 pub(crate) const NO_VALUES: &str = "(no values)";
+
+/// The mark a workbook sheet that is a chart rather than a grid of cells prints
+/// in place of its lines: the tab is named for what it is, and the report names
+/// the chart it holds.
+pub(crate) const CHART_SHEET: &str = "(chart sheet)";
 
 /// A sheet's block header, marked when the workbook hides the sheet. The state a
 /// workbook writes is one of two words, and a producer's own casing is no reason
@@ -191,3 +203,142 @@ pub(crate) const DOC_FOOTNOTES: &str = "Footnotes";
 pub(crate) const DOC_ENDNOTES: &str = "Endnotes";
 /// The legacy `.doc` comment story's name.
 pub(crate) const DOC_COMMENTS: &str = "Comments";
+
+// ── The report of what a reading did not show ───────────────────
+
+/// One kind of content a reading found in a file and did not show. The variants'
+/// own order is the report's order: the document's structure first, the media a
+/// package embeds after it, and the pages a reading could not deliver last, so two
+/// documents holding the same kinds read the same way.
+#[derive(Clone, Copy, EnumCount, EnumIter)]
+pub(crate) enum UnshownKind {
+    /// A chart part the package holds (`charts/chart<N>.xml`, the modern
+    /// `chartEx<N>.xml` parts with it), which no reading draws.
+    Chart,
+    /// A sheet that is one chart over a whole tab rather than a grid of cells.
+    ChartSheet,
+    /// A SmartArt diagram, whose data parts no reading here reaches: the Word and
+    /// Excel readers name them by count, and the PowerPoint one reads a slide's
+    /// diagram text instead.
+    Diagram,
+    /// A part a package embeds as an object (an OLE object, an embedded
+    /// workbook): what it holds is not read. Counted by the part the reading met,
+    /// so an object a package stores as more than one part (an OLE object and the
+    /// workbook beside it) is named by each.
+    Object,
+    /// An embedded picture no reader extracts: an old format's pictures, which
+    /// its arms read for text alone.
+    Image,
+    /// An embedded vector drawing (EMF, WMF, SVG, PICT) among a package's media or
+    /// in an old format's picture list.
+    Drawing,
+    /// Embedded video among a package's media, or among an old presentation's
+    /// objects.
+    Video,
+    /// Embedded audio among a package's media, or among an old presentation's
+    /// objects.
+    Audio,
+    /// Embedded media of a kind the reading cannot name.
+    Media,
+    /// A file attached to a PDF.
+    Attachment,
+    /// A PDF annotation holding media rather than a note in the text (a sound, a
+    /// movie, a screen recording).
+    MediaAnnotation,
+    /// A page a reading could not deliver as an image — one its own page list
+    /// does not hold, or one whose raster could not be built or written — whether
+    /// or not the page's text was read; the text, where there was any, is
+    /// delivered without the page.
+    Page,
+}
+
+impl UnshownKind {
+    /// What the report names this kind by, without the count in front of it.
+    const fn what(self) -> &'static str {
+        match self {
+            Self::Chart => "chart(s)",
+            Self::ChartSheet => "chart sheet(s)",
+            Self::Diagram => "diagram(s)",
+            Self::Object => "embedded object part(s)",
+            Self::Image => "embedded image(s)",
+            Self::Drawing => "embedded drawing(s)",
+            Self::Video => "embedded video(s)",
+            Self::Audio => "embedded audio(s)",
+            Self::Media => "embedded media file(s)",
+            Self::Attachment => "attached file(s)",
+            Self::MediaAnnotation => "media annotation(s)",
+            Self::Page => "page(s)",
+        }
+    }
+}
+
+/// What a reading found in the file and did not show, counted per kind: the
+/// report a conversion returns beside its text and its notes, so a loss is named
+/// rather than left to be read as content that is not there.
+///
+/// A reader counts only what its own pass met and only what it really left out: a
+/// kind at zero prints nothing, so the report never names content the file does
+/// not hold. What no reader looks at — a PDF text page's vector drawings, or the
+/// parts of a package that hold nothing a model reads (its themes, its styles,
+/// its document properties) — is deliberately absent, and belongs in the
+/// model-facing description of the reading instead: a kind here is a promise the
+/// reading keeps.
+#[derive(Default)]
+pub(crate) struct Unshown {
+    counts: [usize; UnshownKind::COUNT],
+}
+
+impl std::fmt::Debug for Unshown {
+    /// The findings, not the counter array: what a reader put in the report is
+    /// what a failing test wants to see.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.lines()).finish()
+    }
+}
+
+impl Unshown {
+    /// Note `count` more of one kind. A count of zero is not a finding.
+    pub(crate) fn add(&mut self, kind: UnshownKind, count: usize) {
+        self.counts[kind as usize] += count;
+    }
+
+    /// Fold another reading's findings in: the parts of one document are read by
+    /// more than one pass (a PDF's pages by the arm, its annotations by
+    /// [`crate::pdf_marks`]), and they report into the document's one report.
+    pub(crate) fn merge(&mut self, other: &Self) {
+        for (slot, count) in self.counts.iter_mut().zip(other.counts.iter()) {
+            *slot += count;
+        }
+    }
+
+    /// How much of one kind the report names.
+    pub(crate) fn count(&self, kind: UnshownKind) -> usize {
+        self.counts[kind as usize]
+    }
+
+    /// One line per kind that happened — `{count} {what} not shown` — in the
+    /// kinds' own order rather than the order a reading met them, so two
+    /// documents holding the same kinds read the same way.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        UnshownKind::iter()
+            .map(|kind| (kind, self.counts[kind as usize]))
+            .filter(|(_, count)| *count > 0)
+            .map(|(kind, count)| format!("{count} {} not shown", kind.what()))
+            .collect()
+    }
+}
+
+/// Two of the report's lines, as the model-facing description of a reading spells
+/// them: built by the same code that prints a report, so a kind renamed here
+/// cannot leave the description quoting a line no reading prints.
+pub(crate) fn unshown_report_examples() -> String {
+    let mut unshown = Unshown::default();
+    unshown.add(UnshownKind::Chart, 1);
+    unshown.add(UnshownKind::Video, 2);
+    unshown
+        .lines()
+        .iter()
+        .map(|line| format!("`{line}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}

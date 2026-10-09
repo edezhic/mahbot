@@ -24,7 +24,9 @@
 
 use crate::docgen::ppt_marks;
 use crate::document::{DocOutcome, SkipReason, SkippedImages, ensure_out_dir};
-use crate::reader_output::{slide_header, slide_notes_header, text_block, text_lines};
+use crate::reader_output::{
+    Unshown, UnshownKind, slide_header, slide_notes_header, text_block, text_lines,
+};
 use quick_xml::Reader;
 use quick_xml::events::{BytesRef, BytesStart, Event};
 use std::collections::{HashMap, HashSet};
@@ -55,11 +57,31 @@ const PPT_SLIDES_PREFIX: &str = "ppt/slides/";
 /// Prefix of the embedded-media parts in a PowerPoint package.
 const PPT_MEDIA_PREFIX: &str = "ppt/media/";
 /// Charts in a PowerPoint package: `ppt/charts/chart<N>.xml`.
-const PPT_CHARTS_PREFIX: &str = "ppt/charts/chart";
+const PPT_CHARTS_PREFIX: &str = "ppt/charts/";
+/// The objects a PowerPoint package embeds (`ppt/embeddings/`).
+const PPT_EMBEDDINGS_PREFIX: &str = "ppt/embeddings/";
 
 /// Media extensions written through to `out_dir` verbatim. Everything else
 /// (emf/wmf/tiff/bmp/gif/svg/...) would need transcoding this module avoids.
 const EMBEDDED_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+
+/// Extensions of the picture formats a package embeds that this pipeline does not
+/// convert and the product's own picture list ([`crate::util::IMAGE_EXTENSIONS`])
+/// does not name: named as images, with the reason, because that is what they are.
+const EMBEDDED_EXTRA_IMAGE_EXTENSIONS: &[&str] =
+    &["gif", "bmp", "dib", "tif", "tiff", "ico", "jfif"];
+/// Extensions of the video a package embeds beyond the product's recognized video
+/// formats ([`crate::util::VIDEO_EXTENSIONS`]): only a document's media directory
+/// carries these.
+const EMBEDDED_EXTRA_VIDEO_EXTENSIONS: &[&str] = &["m4v", "wmv", "mpg", "mpeg"];
+/// Extensions of the embedded media that are vector drawings rather than
+/// pictures of pixels: the report names them as the drawings they are instead of
+/// as images the pipeline cannot convert.
+const EMBEDDED_DRAWING_EXTENSIONS: &[&str] = &["emf", "wmf", "svg", "pict"];
+/// Extensions of the audio a package embeds.
+const EMBEDDED_AUDIO_EXTENSIONS: &[&str] = &[
+    "mp3", "wav", "m4a", "aac", "ogg", "oga", "wma", "flac", "mid", "midi",
+];
 
 /// Extensions accepted as OOXML Word packages (`docm` is a macro-enabled docx).
 const DOCX_EXTENSIONS: &[&str] = &["docx", "docm"];
@@ -120,14 +142,21 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     ensure_out_dir(out_dir);
 
     let mut notes = Vec::new();
-    let charts = count_chart_parts(&archive, PPT_CHARTS_PREFIX);
-    if charts > 0 {
-        notes.push(format!(
-            "the presentation has {charts} chart(s), which are not extracted"
-        ));
-    }
+    let mut unshown = unopened_parts(
+        &mut archive,
+        PPT_CHARTS_PREFIX,
+        None, // a slide's diagrams are read: this arm prints their text
+        PPT_EMBEDDINGS_PREFIX,
+        None, // a PowerPoint package has no chart sheets
+    );
     let mut skipped = SkippedImages::default();
-    let images = write_media_parts(&mut archive, PPT_MEDIA_PREFIX, out_dir, &mut skipped);
+    let images = write_media_parts(
+        &mut archive,
+        PPT_MEDIA_PREFIX,
+        out_dir,
+        &mut skipped,
+        &mut unshown,
+    );
 
     let mut blocks = Vec::new();
     // A deck's slides share a handful of layouts, so a layout's title indices are
@@ -191,6 +220,7 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         text: blocks.join("\n\n").trim_end().to_string(),
         images,
         notes,
+        unshown,
         all_page_text_lost: false,
     }
 }
@@ -801,15 +831,54 @@ fn slide_block(
 
 // ── Shared package plumbing ─────────────────────────────────────
 
+/// What a package's media part is, as far as its file name says (the only thing
+/// a package states about a part no reader opens): a picture this pipeline
+/// converts or does not, or one of the kinds the report names. Naming a video or
+/// a drawing an image the pipeline cannot convert would report the loss as
+/// something the file does not hold.
+enum PackageMedia {
+    /// A picture this pipeline does not convert: counted with its reason in
+    /// [`SkippedImages`] rather than named by kind of its own, because that is what
+    /// it is. The formats the pipeline does convert never reach here —
+    /// [`write_media_parts`] writes those out first.
+    Image,
+    /// Content of a kind the report names as what it is.
+    Unshown(UnshownKind),
+}
+
+/// [`PackageMedia`] for one media part's file name. A name of no recognized kind
+/// is `Media` rather than an image: a package calling an unknown thing a media
+/// part says no more about it than that, and the report repeats no more.
+fn package_media(file_name: &str) -> PackageMedia {
+    let path = Path::new(file_name);
+    if crate::util::is_image_extension(path)
+        || crate::util::has_extension(path, EMBEDDED_EXTRA_IMAGE_EXTENSIONS)
+    {
+        PackageMedia::Image
+    } else if crate::util::has_extension(path, EMBEDDED_DRAWING_EXTENSIONS) {
+        PackageMedia::Unshown(UnshownKind::Drawing)
+    } else if crate::util::is_video_extension(path)
+        || crate::util::has_extension(path, EMBEDDED_EXTRA_VIDEO_EXTENSIONS)
+    {
+        PackageMedia::Unshown(UnshownKind::Video)
+    } else if crate::util::has_extension(path, EMBEDDED_AUDIO_EXTENSIONS) {
+        PackageMedia::Unshown(UnshownKind::Audio)
+    } else {
+        PackageMedia::Unshown(UnshownKind::Media)
+    }
+}
+
 /// Write every entry under `prefix` that names a raster file into `out_dir`,
-/// counting the rest into `skipped`. An entry under a nested path (`media/a.png`
-/// and `media/sub/a.png`) takes a suffixed output name rather than overwriting
-/// its predecessor, since only the base name survives.
+/// counting the rest into `skipped` and the media that is no picture into
+/// `unshown`. An entry under a nested path (`media/a.png` and
+/// `media/sub/a.png`) takes a suffixed output name rather than overwriting its
+/// predecessor, since only the base name survives.
 fn write_media_parts<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     prefix: &str,
     out_dir: &Path,
     skipped: &mut SkippedImages,
+    unshown: &mut Unshown,
 ) -> Vec<PathBuf> {
     let entries: Vec<String> = archive
         .file_names()
@@ -826,7 +895,10 @@ fn write_media_parts<R: Read + Seek>(
         // never escape `out_dir`.
         let file_name = crate::util::neutralized_name(crate::util::file_name_or_path(&entry));
         if !crate::util::has_extension(Path::new(&file_name), EMBEDDED_IMAGE_EXTENSIONS) {
-            skipped.add(SkipReason::Unsupported);
+            match package_media(&file_name) {
+                PackageMedia::Image => skipped.add(SkipReason::Unsupported),
+                PackageMedia::Unshown(kind) => unshown.add(kind, 1),
+            }
             continue;
         }
         let Some(content) = read_zip_entry(archive, &entry).bytes() else {
@@ -846,19 +918,132 @@ fn write_media_parts<R: Read + Seek>(
     images
 }
 
-/// Count the chart parts under `prefix` (`chart<N>.xml`, the number digits
-/// only) — charts are reported, not converted.
-fn count_chart_parts<R: Read + Seek>(archive: &ZipArchive<R>, prefix: &str) -> usize {
+/// Count the chart parts under `prefix` (`chart<N>.xml` with the modern
+/// `chartEx<N>.xml`) less the ones a chart sheet draws: the sheet is what names
+/// those, and naming one loss twice would overstate what the file holds.
+fn count_chart_parts<R: Read + Seek>(
+    archive: &ZipArchive<R>,
+    prefix: &str,
+    chart_sheets: Option<&HashSet<String>>,
+) -> usize {
     archive
         .file_names()
         .filter(|name| {
-            name.strip_prefix(prefix)
-                .and_then(|rest| rest.strip_suffix(".xml"))
-                .is_some_and(|number| {
-                    !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
-                })
+            is_chart_part(name, prefix)
+                && !chart_sheets.is_some_and(|sheets| sheets.contains(*name))
         })
         .count()
+}
+
+/// Whether `name` is one of a package's chart parts (`chart<N>.xml` or the modern
+/// `chartEx<N>.xml`). One predicate for the census and for the scan that finds the
+/// parts a chart keeps beside itself, so the two cannot disagree on what a chart
+/// part is.
+fn is_chart_part(name: &str, prefix: &str) -> bool {
+    is_numbered_part(name, prefix, "chart") || is_numbered_part(name, prefix, "chartEx")
+}
+
+/// Whether `name` is a part of a package directory named `<stem><N>.xml` — the
+/// numbered parts a reading names by count rather than by reading them. A name
+/// whose remainder is not a plain number is a part of another kind
+/// (`charts/colors1.xml`) and is not one.
+fn is_numbered_part(name: &str, prefix: &str, stem: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(".xml"))
+        .and_then(|rest| rest.strip_prefix(stem))
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Count the `<stem><N>.xml` parts under `prefix`.
+fn count_numbered_parts<R: Read + Seek>(
+    archive: &ZipArchive<R>,
+    prefix: &str,
+    stem: &str,
+) -> usize {
+    archive
+        .file_names()
+        .filter(|name| is_numbered_part(name, prefix, stem))
+        .count()
+}
+
+/// The parts a package keeps in one of its directories (`embeddings/`) and that
+/// are a part of their own: a directory entry and a relationships part
+/// (`_rels/oleObject1.bin.rels`) name no object, they only place one.
+fn parts_under<R: Read + Seek>(archive: &ZipArchive<R>, prefix: &str) -> Vec<String> {
+    archive
+        .file_names()
+        .filter(|name| {
+            name.starts_with(prefix) && !name.ends_with('/') && !name.contains("/_rels/")
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// How many of a package's `embedded` parts a chart keeps beside itself rather than
+/// being parts of their own, read from the chart's own relationships
+/// (`charts/_rels/chart1.xml.rels` names the data workbook the chart carries —
+/// what Word and PowerPoint write by default) and never supposed from a name. Only
+/// a part the census counted is taken as one, so a relationship naming a part the
+/// package does not carry takes nothing out of it.
+fn chart_data_parts<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    charts: &str,
+    embedded: &[String],
+) -> usize {
+    let chart_parts: Vec<String> = archive
+        .file_names()
+        .filter(|name| is_chart_part(name, charts))
+        .map(str::to_owned)
+        .collect();
+    let counted: HashSet<&str> = embedded.iter().map(String::as_str).collect();
+    let mut data_parts: HashSet<String> = HashSet::new();
+    for part in chart_parts {
+        let rels = read_zip_entry(archive, &rels_part_of(&part))
+            .bytes()
+            .and_then(|xml| relationships(&xml))
+            .unwrap_or_default();
+        for rel in rels {
+            let target = resolve_part(part_dir(&part), &rel.target);
+            if counted.contains(target.as_str()) {
+                data_parts.insert(target);
+            }
+        }
+    }
+    data_parts.len()
+}
+
+/// The parts of one OOXML package that no reading of it opens, counted for the
+/// report: the charts under `charts/` that no chart sheet draws (`chart_sheets`
+/// names the ones a sheet is, which the sheet's own kind already reports, and is
+/// `None` for a family that has no chart sheets), the diagrams whose data parts sit
+/// under `diagrams/` (`None` for a family whose own reading reaches a diagram — the
+/// PowerPoint one prints a slide's diagram text), and the parts under `embeddings/`
+/// that are no other part's companion. Each family passes its own directories, so
+/// the three arms cannot count one kind two ways.
+fn unopened_parts<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    charts: &str,
+    diagrams: Option<&str>,
+    embeddings: &str,
+    chart_sheets: Option<&HashSet<String>>,
+) -> Unshown {
+    let mut unshown = Unshown::default();
+    unshown.add(
+        UnshownKind::Chart,
+        count_chart_parts(archive, charts, chart_sheets),
+    );
+    if let Some(diagrams) = diagrams {
+        unshown.add(
+            UnshownKind::Diagram,
+            count_numbered_parts(archive, diagrams, "data"),
+        );
+    }
+    let embedded = parts_under(archive, embeddings);
+    // A chart's own data workbook is the chart's, not a part of its own: what is
+    // left of the counted parts is what the document embeds.
+    let data_parts = chart_data_parts(archive, charts, &embedded);
+    unshown.add(UnshownKind::Object, embedded.len() - data_parts);
+    unshown
 }
 
 /// One OOXML relationship: the `Id` a part refers to, its `Type` (empty when
@@ -1336,6 +1521,7 @@ mod tests {
             text,
             images,
             notes,
+            unshown,
             ..
         } = convert_pptx(&bytes, dir.path())
         else {
@@ -1346,10 +1532,62 @@ mod tests {
             "Slide 1:\n  Second slide text\n\nSlide 1 notes:\n  Notes for the second slide\n\nSlide 2:\n  First slide\n  continued\n\nSlide 3: (no text)"
         );
         assert_eq!(images, vec![dir.path().join("pic.png")]);
+        assert_eq!(unshown.lines(), ["1 chart(s) not shown"]);
+        assert!(notes.is_empty(), "the report carries the chart loss");
+    }
+
+    /// A deck's media is named by what each part is: a vector drawing, a video and
+    /// an audio file are reported as themselves rather than as images the pipeline
+    /// cannot convert, and the one raster it does convert comes back among the
+    /// images.
+    #[test]
+    fn pptx_reports_a_deck_s_media_by_kind() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                br"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Only slide</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>",
+            ),
+            ("ppt/media/video1.mp4", b"video bytes"),
+            ("ppt/media/sound.m4a", b"audio bytes"),
+            ("ppt/media/image1.emf", b"EMF bytes this stack cannot decode"),
+            ("ppt/media/scan.tiff", b"TIFF bytes this stack does not convert"),
+            ("ppt/media/pic.png", b"\x89PNG\r\n\x1a\nfake image bytes"),
+            ("ppt/embeddings/oleObject1.bin", b"OLE bytes"),
+            ("ppt/charts/chart1.xml", b"<chart/>"),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text {
+            images,
+            notes,
+            unshown,
+            ..
+        } = convert_pptx(&bytes, dir.path())
+        else {
+            panic!("expected Text outcome for a well-formed pptx");
+        };
+        assert_eq!(
+            unshown.lines(),
+            [
+                "1 chart(s) not shown",
+                "1 embedded object part(s) not shown",
+                "1 embedded drawing(s) not shown",
+                "1 embedded video(s) not shown",
+                "1 embedded audio(s) not shown",
+            ]
+        );
         assert_eq!(
             notes,
-            ["the presentation has 1 chart(s), which are not extracted"]
+            ["skipped 1 embedded image(s) in a format this pipeline cannot convert"]
         );
+        assert_eq!(images, vec![dir.path().join("pic.png")]);
     }
 
     /// A slide part may live anywhere the presentation's relationship points,
