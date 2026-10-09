@@ -1178,9 +1178,8 @@ impl BoardState {
             }
             BoardMessage::ArchiveAllCompleted => Task::perform(
                 async move {
-                    let board = crate::pipeline::board::store();
-                    board
-                        .archive_all_done_and_cancelled(None)
+                    crate::pipeline::board::store()
+                        .archive_all_done_and_cancelled()
                         .await
                         .map_err(|e| e.to_string())
                 },

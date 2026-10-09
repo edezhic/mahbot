@@ -25,30 +25,49 @@ const GET_TICKET_LAST_N_FULL: usize = 3;
 /// prefixed form for the bound workspace. Prefixed IDs from any other
 /// workspace are rejected with a clear error.
 fn resolve_ticket_id(ws_name: &str, raw: &str) -> Result<String> {
+    let (prefix, id) = parse_ticket_id(raw)?;
+    match prefix {
+        None => Ok(format!("{ws_name}-{id}")),
+        Some(p) if p == ws_name => Ok(id.to_string()),
+        Some(_) => anyhow::bail!(
+            "Ticket '{id}' belongs to a different workspace — ticket tools only manage \
+             tickets from workspace '{ws_name}'"
+        ),
+    }
+}
+
+/// Like [`resolve_ticket_id`], but a well-formed prefixed ID from any
+/// workspace is taken as written. Used by the read-only [`GetTicketTool`]:
+/// the archive search spans the installation, and a hit is useless if the
+/// ticket cannot be opened wherever it was filed.
+fn resolve_any_ticket_id(ws_name: &str, raw: &str) -> Result<String> {
+    let (prefix, id) = parse_ticket_id(raw)?;
+    match prefix {
+        None => Ok(format!("{ws_name}-{id}")),
+        Some(_) => Ok(id.to_string()),
+    }
+}
+
+/// Split `raw` into `(workspace prefix, id)`: the prefix is `None` for a bare
+/// number — which the caller resolves against its bound workspace — and
+/// `Some(prefix)` for a well-formed `{prefix}-{seq}` argument, in which case
+/// `id` is `raw` trimmed, i.e. the full prefixed ticket ID. The prefix shape
+/// mirrors `workspace::validate_name` ([a-zA-Z_]+ starting with a letter).
+fn parse_ticket_id(raw: &str) -> Result<(Option<&str>, &str)> {
     let id = raw.trim();
     anyhow::ensure!(!id.is_empty(), "Ticket ID must not be empty");
     let seq_ok = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    // Bare number → bound workspace ticket.
     if seq_ok(id) {
-        return Ok(format!("{ws_name}-{id}"));
+        return Ok((None, id));
     }
-    // Prefixed form `{workspace}-{seq}` — only the bound workspace is accepted.
-    // The prefix shape mirrors workspace::validate_name ([a-zA-Z_]+ starting with
-    // a letter); keep the two grammars in sync.
     if let Some((prefix, seq)) = id.rsplit_once('-') {
         let prefix_ok = prefix.starts_with(|c: char| c.is_ascii_alphabetic())
             && prefix.chars().all(|c| c.is_ascii_alphabetic() || c == '_');
         if prefix_ok && seq_ok(seq) {
-            if prefix == ws_name {
-                return Ok(id.to_string());
-            }
-            anyhow::bail!(
-                "Ticket '{id}' belongs to a different workspace — ticket tools only manage \
-                 tickets from workspace '{ws_name}'"
-            );
+            return Ok((Some(prefix), id));
         }
     }
-    anyhow::bail!("Invalid ticket ID '{id}' — expected a bare number or '{ws_name}-<number>'");
+    anyhow::bail!("Invalid ticket ID '{id}' — expected a bare number or '<workspace>-<number>'")
 }
 
 // ── CreateTicketTool ─────────────────────────────────────────────
@@ -376,6 +395,12 @@ impl Tool for ListTicketsTool {
 
 // ── GetTicketTool ───────────────────────────────────────────────
 
+/// Read one ticket by ID. Unlike the write tools it is not confined to its
+/// bound workspace: a fully prefixed ID from any workspace is accepted, while a
+/// bare number still resolves against the bound workspace.
+///
+/// The archive search spans the installation, so `get_ticket` must be able to
+/// open its hits wherever they were filed.
 pub struct GetTicketTool {
     reporter: String,
     ws_name: String,
@@ -423,7 +448,7 @@ impl Tool for GetTicketTool {
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        let ticket_id = resolve_ticket_id(&self.ws_name, super::get_str(&args, "ticket_id")?)?;
+        let ticket_id = resolve_any_ticket_id(&self.ws_name, super::get_str(&args, "ticket_id")?)?;
         let full = super::get_bool(&args, "full", false)?;
 
         let store = board_store();
@@ -990,10 +1015,21 @@ mod tests {
                 "malformed ID '{bad}' should be rejected"
             );
         }
+
+        // `resolve_any_ticket_id` binds a bare number to the bound workspace
+        // but takes any well-formed prefix verbatim; malformed IDs are the
+        // shared parser's business, already pinned above.
+        assert_eq!(resolve_any_ticket_id("ws", "123").unwrap(), "ws-123");
+        assert_eq!(resolve_any_ticket_id("ws", "  7 ").unwrap(), "ws-7");
+        assert_eq!(
+            resolve_any_ticket_id("ws", "other-123").unwrap(),
+            "other-123"
+        );
+        assert_eq!(resolve_any_ticket_id("ws", "my_ws-42").unwrap(), "my_ws-42");
     }
 
     #[tokio::test]
-    async fn test_get_ticket_workspace_binding() {
+    async fn test_get_ticket_id_resolution() {
         crate::util::test::init_test_stores().await;
 
         let store = board_store();
@@ -1016,16 +1052,14 @@ mod tests {
             .expect("bare number should resolve");
         assert_eq!(result, expected);
 
-        // A tool bound to another workspace rejects the foreign ticket.
+        // A fully prefixed ID is accepted even from another workspace — the
+        // archive search spans the installation, so its hits must open here.
         let foreign = test_ws("/other");
-        let err = GetTicketTool::new("manager", &foreign)
-            .execute(&foreign, json!({"ticket_id": id}))
+        let result = GetTicketTool::new("manager", &foreign)
+            .execute(&foreign, json!({"ticket_id": id, "full": true}))
             .await
-            .unwrap_err();
-        assert!(
-            format!("{err}").contains("different workspace"),
-            "foreign ticket should be rejected: {err}"
-        );
+            .expect("a prefixed ID from any workspace is accepted");
+        assert_eq!(result, expected);
     }
 
     #[tokio::test]

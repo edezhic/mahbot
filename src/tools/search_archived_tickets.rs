@@ -1,8 +1,9 @@
 //! Search archived tickets via hybrid FTS + semantic vector search.
 //!
-//! Available only to the Manager role. Searches the `is_archived = 1` subset
-//! of the tickets table. Returns up to 10 matches as `[phase] id: title`
-//! lines, sorted by RRF score. The Manager then uses [`crate::tools::ticket::GetTicketTool`] on the
+//! Available only to the Manager role. Searches the whole installation's
+//! `is_archived = 1` subset of the tickets table — every workspace. Returns up
+//! to 10 matches as `[workspace] [phase] id: title` lines, sorted by RRF score.
+//! The Manager then uses [`crate::tools::ticket::GetTicketTool`] on the
 //! returned IDs for full details.
 
 use crate::Workspace;
@@ -17,19 +18,9 @@ use tracing::debug;
 ///
 /// Uses the board's FTS index (`BoardStore::search_archived_by_fts`) and local
 /// embeddings (`embedder::embed_query()`) with RRF merge (`vector::hybrid_merge`).
-/// Bound to a single workspace at construction time — search never crosses
-/// workspace boundaries.
-pub struct SearchArchivedTicketsTool {
-    ws_name: String,
-}
-
-impl SearchArchivedTicketsTool {
-    pub fn new(ws: &Workspace) -> Self {
-        Self {
-            ws_name: ws.name.clone(),
-        }
-    }
-}
+/// Installation-wide — the search spans every workspace, and each result names
+/// its workspace so a hit can be read wherever it was filed.
+pub struct SearchArchivedTicketsTool;
 
 #[async_trait]
 impl Tool for SearchArchivedTicketsTool {
@@ -58,8 +49,8 @@ impl Tool for SearchArchivedTicketsTool {
         let board = crate::pipeline::board::store();
 
         let (fts_results, vector_results) = tokio::join!(
-            Self::fts_search(board, &self.ws_name, query),
-            Self::vector_search(board, &self.ws_name, query),
+            Self::fts_search(board, query),
+            Self::vector_search(board, query),
         );
         let fts_results = fts_results?;
         let vector_results = vector_results?;
@@ -82,12 +73,9 @@ impl SearchArchivedTicketsTool {
     /// empty vec (fall through to vector search).
     async fn fts_search(
         board: &crate::pipeline::board::BoardStore,
-        workspace_name: &str,
         query: &str,
     ) -> Result<Vec<(String, f32)>> {
-        let results = board
-            .search_archived_by_fts(query, 50, workspace_name)
-            .await?;
+        let results = board.search_archived_by_fts(query, 50).await?;
         Ok(results
             .into_iter()
             .map(|(id, score)| {
@@ -101,7 +89,6 @@ impl SearchArchivedTicketsTool {
     /// embeddings by cosine similarity.
     async fn vector_search(
         board: &crate::pipeline::board::BoardStore,
-        workspace_name: &str,
         query: &str,
     ) -> Result<Vec<(String, f32)>> {
         let Some(q_emb) = crate::embedder::embed_query(query) else {
@@ -109,7 +96,7 @@ impl SearchArchivedTicketsTool {
             return Ok(Vec::new());
         };
 
-        let candidates = board.list_archived_with_embeddings(workspace_name).await?;
+        let candidates = board.list_archived_with_embeddings().await?;
 
         if candidates.is_empty() {
             debug!("All archived tickets have NULL embeddings — vector search skipped");
@@ -130,8 +117,10 @@ impl SearchArchivedTicketsTool {
 
     /// Format the top-N results for display.
     ///
-    /// Fetches id/title/phase via [`crate::pipeline::board::BoardStore::get_tickets_by_ids`]
-    /// and formats them in rank order. At N ≤ 10 a linear scan suffices.
+    /// Fetches id/title/phase/workspace via
+    /// [`crate::pipeline::board::BoardStore::get_tickets_by_ids`] and formats
+    /// them in rank order, each line naming the workspace the hit was filed in.
+    /// At N ≤ 10 a linear scan suffices.
     async fn format_results(
         board: &crate::pipeline::board::BoardStore,
         top_ids: &[String],
@@ -143,7 +132,11 @@ impl SearchArchivedTicketsTool {
         let mut output = String::from("Search results (top 10, highest score first):\n");
         for id in top_ids {
             if let Some(ticket) = tickets.iter().find(|t| t.id == *id) {
-                let _ = writeln!(output, "  [{}] {}: {}", ticket.phase, id, ticket.title);
+                let _ = writeln!(
+                    output,
+                    "  [{}] [{}] {}: {}",
+                    ticket.workspace_name, ticket.phase, id, ticket.title
+                );
             }
         }
 
@@ -173,10 +166,9 @@ mod tests {
         .await;
         store.set_archived(&id).await.expect("archive");
 
-        let results =
-            super::SearchArchivedTicketsTool::fts_search(&store, "ws", "UniqueSearchable")
-                .await
-                .expect("fts_search");
+        let results = super::SearchArchivedTicketsTool::fts_search(&store, "UniqueSearchable")
+            .await
+            .expect("fts_search");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, id);
         // f64→f32 conversion should succeed without precision loss for scores
@@ -212,11 +204,11 @@ mod tests {
         let expected_header = "Search results (top 10, highest score first):\n";
         assert!(result.starts_with(expected_header));
         assert!(
-            result.contains(&format!("[done] {id_a}: Alpha ticket")),
+            result.contains(&format!("[ws] [done] {id_a}: Alpha ticket")),
             "should contain first ticket line"
         );
         assert!(
-            result.contains(&format!("[cancelled] {id_b}: Beta ticket")),
+            result.contains(&format!("[ws] [cancelled] {id_b}: Beta ticket")),
             "should contain second ticket line"
         );
     }

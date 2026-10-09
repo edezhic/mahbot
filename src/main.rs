@@ -966,11 +966,11 @@ async fn handle_bot_command(msg: &ChannelMessage, cmd: BotCommand) {
         // which requires a selected shared workspace). The handler applies its
         // own admin gate + availability pre-check.
         BotCommand::Update => mahbot::self_update::handle_update_command(msg).await,
-        // Admin-gated commands: denial for guests. `/workspace` and `/board`
-        // share the gate but not the body: `handle_admin_command` requires an
-        // already-active shared workspace — the very choice `/workspace` exists
-        // to make — while `/board` spans every workspace and must neither read
-        // nor depend on that choice.
+        // Admin-gated commands: denial for guests. `/workspace`, `/board` and
+        // `/archive` share the gate but not the body: `handle_admin_command`
+        // requires an already-active shared workspace — the very choice
+        // `/workspace` exists to make — while `/board` and `/archive` span every
+        // workspace and must neither read nor depend on that choice.
         BotCommand::Board
         | BotCommand::Archive
         | BotCommand::Pause
@@ -983,6 +983,7 @@ async fn handle_bot_command(msg: &ChannelMessage, cmd: BotCommand) {
                 match cmd {
                     BotCommand::Workspace => handle_workspace_command(msg).await,
                     BotCommand::Board => handle_board_listing(msg).await,
+                    BotCommand::Archive => handle_archive_command(msg).await,
                     _ => handle_admin_command(msg, cmd).await,
                 }
             } else {
@@ -1249,9 +1250,10 @@ async fn resolve_admin_workspace(msg: &ChannelMessage) -> Result<Option<Workspac
 }
 
 /// Handle the admin-gated commands that act on the active workspace
-/// (`/archive`, `/pause`, `/unpause`, `/maintenance`). All reuse the same store
-/// methods the GUI calls, so the two surfaces can never diverge. `/board` and
-/// `/workspace` are dispatched in [`handle_bot_command`] and never reach here.
+/// (`/pause`, `/unpause`, `/maintenance`). All reuse the same store
+/// methods the GUI calls, so the two surfaces can never diverge. `/board`,
+/// `/workspace` and `/archive` are dispatched in [`handle_bot_command`] and
+/// never reach here.
 async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
     // The pause/resume pair reports trailing text rather than dropping it:
     // `/pause <name>` used to act on the active workspace while reading as if it
@@ -1299,27 +1301,6 @@ async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
     };
 
     match (cmd, maintenance_arg) {
-        (BotCommand::Archive, _) => {
-            let count = mahbot::pipeline::board::store()
-                .archive_all_done_and_cancelled(Some(&ws.name))
-                .await;
-            match count {
-                Ok(n) => {
-                    send_telegram_reply(
-                        msg,
-                        format!("Archived {n} tickets in {}.", ws.display_name()),
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    send_telegram_reply(
-                        msg,
-                        format!("Failed to archive tickets in {}: {e}", ws.display_name()),
-                    )
-                    .await;
-                }
-            }
-        }
         (BotCommand::Pause, _) => toggle_workspace_state(msg, &ws, true, false).await,
         (BotCommand::Unpause, _) => toggle_workspace_state(msg, &ws, false, false).await,
         (BotCommand::Maintenance, Some(enable)) => {
@@ -1328,18 +1309,19 @@ async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
         (BotCommand::MaintenanceOn, _) => toggle_workspace_state(msg, &ws, true, true).await,
         (BotCommand::MaintenanceOff, _) => toggle_workspace_state(msg, &ws, false, true).await,
         // Impossible: an invalid `/maintenance` argument returned early above,
-        // and `/board` / `/workspace` — the other admin-gated commands — are
-        // dispatched in `handle_bot_command` and never reach this handler.
+        // and `/board`, `/workspace` and `/archive` — the other admin-gated
+        // commands — are dispatched in `handle_bot_command` and never reach this
+        // handler.
         _ => unreachable!(),
     }
 }
 
-/// The refusal for text typed after `/pause`, `/unpause` or `/workspace` — the
-/// three commands that report trailing text rather than dropping it (`/pause
-/// <name>` once acted on the active workspace while reading as if it targeted
-/// the named one) — or `None` when there is none. So the caller can use it as
-/// the guard, and join its own tail with [`with_tail`]. The command word is
-/// echoed as typed so the admin can locate it in the chat.
+/// The refusal for text typed after `/archive`, `/pause`, `/unpause` or
+/// `/workspace` — the four commands that report trailing text rather than
+/// dropping it (`/pause <name>` once acted on the active workspace while
+/// reading as if it targeted the named one) — or `None` when there is none. So
+/// the caller can use it as the guard, and join its own tail with [`with_tail`].
+/// The command word is echoed as typed so the admin can locate it in the chat.
 fn stray_text_refusal(content: &str) -> Option<String> {
     let mut words = content.split_whitespace();
     let cmd_word = words.next().unwrap_or_default();
@@ -1402,6 +1384,43 @@ async fn handle_board_listing(msg: &ChannelMessage) {
         mahbot::channels::telegram::board_listing_text(&ordered),
     )
     .await;
+}
+
+/// Handle `/archive` — archive every done and cancelled ticket in the
+/// installation, from every workspace. Like `/board` it is
+/// workspace-independent: the scope is the whole installation, and the admin's
+/// active workspace is neither read nor required.
+async fn handle_archive_command(msg: &ChannelMessage) {
+    // `/archive foo` used to be read as a workspace-scoped archive with a
+    // stray argument. The command has no target at all, so the refusal says
+    // so instead of pointing at the workspace switcher.
+    if let Some(refusal) = stray_text_refusal(&msg.content) {
+        send_telegram_reply(
+            msg,
+            with_tail(
+                refusal,
+                Some("It has no target — it archives done and cancelled tickets across all workspaces."),
+            ),
+        )
+        .await;
+        return;
+    }
+    match mahbot::pipeline::board::store()
+        .archive_all_done_and_cancelled()
+        .await
+    {
+        Ok(n) => {
+            send_telegram_reply(
+                msg,
+                format!(
+                    "Archived {n} ticket{} across all workspaces.",
+                    if n == 1 { "" } else { "s" }
+                ),
+            )
+            .await;
+        }
+        Err(e) => send_telegram_reply(msg, format!("Failed to archive tickets: {e}")).await,
+    }
 }
 
 /// Handle an action callback (`__act__` prefix).

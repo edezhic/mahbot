@@ -45,7 +45,7 @@ const VIDEO_MODELS_COMMAND_DESC: &str = "Select video model";
 /// Description for the `/board` command (admin).
 const BOARD_COMMAND_DESC: &str = "List tickets from all workspaces";
 /// Description for the `/archive` command (admin).
-const ARCHIVE_COMMAND_DESC: &str = "Archive done & cancelled tickets";
+const ARCHIVE_COMMAND_DESC: &str = "Archive done & cancelled tickets (all workspaces)";
 /// Description for the `/pause` command (admin).
 const PAUSE_COMMAND_DESC: &str = "Pause the workspace pipeline";
 /// Description for the `/unpause` command (admin).
@@ -3387,9 +3387,9 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
     if crate::users::is_admin(user_name).await {
         // The workspace switcher heads the admin menu: it picks the active
         // workspace that the commands under it act on — all of them except
-        // `/board`, which spans every workspace. It is shown only while there
-        // is something to switch between, so a single-workspace install never
-        // carries a one-item picker.
+        // `/board` and `/archive`, which span every workspace. It is shown only
+        // while there is something to switch between, so a single-workspace
+        // install never carries a one-item picker.
         if crate::users::workspace_switcher_available().await {
             entries.push(("workspace".to_string(), WORKSPACE_COMMAND_DESC.to_string()));
         }

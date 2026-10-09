@@ -419,7 +419,7 @@ pub enum BotCommand {
     Workspace,
     /// `/board` — list every workspace's tickets (admin).
     Board,
-    /// `/archive` — archive done & cancelled tickets (admin).
+    /// `/archive` — archive done & cancelled tickets from every workspace (admin).
     Archive,
     /// `/pause` — pause the active workspace's pipeline (admin).
     Pause,

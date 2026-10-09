@@ -342,7 +342,7 @@ impl Ticket {
     ///   `<current-ticket>` block for system messages — intentionally different
     ///   format and should not be unified.
     /// - `search_archived_tickets` format omits the reporter field
-    ///   (`"  [{phase}] {id}: {title}"`) — intentionally different.
+    ///   (`"  [{workspace}] [{phase}] {id}: {title}"`) — intentionally different.
     #[must_use]
     pub fn short_display(&self) -> String {
         format!(
@@ -1963,20 +1963,20 @@ impl BoardStore {
         Ok(updated)
     }
 
-    pub async fn archive_all_done_and_cancelled(
-        &self,
-        workspace_name: Option<&str>,
-    ) -> Result<u64> {
+    /// Archive every non-archived done/cancelled ticket in the installation —
+    /// every ticket row, including those whose workspace is gone or was never
+    /// registered. The Telegram `/archive` command and the GUI bulk action both
+    /// come through here, so the two surfaces cannot diverge.
+    pub async fn archive_all_done_and_cancelled(&self) -> Result<u64> {
         let now = db::now();
         let sql = format!(
             "UPDATE tickets SET is_archived = 1, updated_at = ?1 \
-             WHERE phase IN ({}) AND is_archived = 0 \
-             AND (?2 IS NULL OR workspace_name = ?2)",
+             WHERE phase IN ({}) AND is_archived = 0",
             phase_list_sql_fragment(UNBLOCKING_PHASES),
         );
         let updated = self
             .conn
-            .execute(&sql, db::params![now, workspace_name])
+            .execute(&sql, db::params![now])
             .await
             .context("Failed to archive done/cancelled tickets")?;
         Ok(updated)
@@ -2085,16 +2085,17 @@ impl BoardStore {
 
     // ── Ticket FTS/embedding search methods ───────────────────────────────
     //
-    // The archived-search methods contain the FTS and embedding SQL used by
-    // [`SearchArchivedTicketsTool`](crate::tools::search_archived_tickets);
-    // [`search_by_fts`] backs the GUI sidebar search. The board owns the
-    // schema (`ngram` tokenizer, FTS index name, blob format) and the tool
-    // layer owns the hybrid RRF merge logic.
+    // The installation-wide archived-search methods contain the FTS and
+    // embedding SQL used by [`SearchArchivedTicketsTool`](crate::tools::search_archived_tickets);
+    // [`search_by_fts`] backs the GUI sidebar search. The board owns the schema
+    // (`ngram` tokenizer, FTS index name, blob format) and the tool layer owns
+    // the hybrid RRF merge logic.
 
-    /// Search archived tickets by FTS keyword match, scoped to a workspace.
+    /// Search archived tickets by FTS keyword match, installation-wide.
     ///
     /// Sanitizes the input query (strips non-alphanumeric characters) before
-    /// matching against the `ngram`-tokenized FTS index on `title`.
+    /// matching against the `ngram`-tokenized FTS index on `title`. Every
+    /// workspace's archived tickets are candidates.
     ///
     /// Returns up to `limit` `(id, fts_score)` pairs, highest score first.
     /// On SQL error (e.g. corrupt FTS index), logs a warning and returns an
@@ -2104,33 +2105,25 @@ impl BoardStore {
         &self,
         query: &str,
         limit: usize,
-        workspace_name: &str,
     ) -> Result<Vec<(String, f64)>> {
         let sanitized = crate::db::sanitize_fts_query(query);
         if sanitized.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Param order: ?1 = workspace, ?2 = query.
         let sql = format!(
-            "SELECT t.id, fts_score(t.title, ?2) AS score \
+            "SELECT t.id, fts_score(t.title, ?1) AS score \
              FROM tickets t \
-             WHERE t.is_archived = 1 \
-               AND t.workspace_name = ?1 \
-               AND t.title MATCH ?2 \
+             WHERE t.is_archived = 1 AND t.title MATCH ?1 \
              ORDER BY score DESC LIMIT {limit}"
         );
         match self
             .conn
-            .query_map(
-                &sql,
-                db::params![workspace_name, sanitized.clone()],
-                |row| {
-                    let id: String = row.get(0)?;
-                    let score: f64 = row.get(1)?;
-                    Ok::<_, anyhow::Error>((id, score))
-                },
-            )
+            .query_map(&sql, db::params![sanitized.clone()], |row| {
+                let id: String = row.get(0)?;
+                let score: f64 = row.get(1)?;
+                Ok::<_, anyhow::Error>((id, score))
+            })
             .await
         {
             Ok(items) => Ok(items
@@ -2194,8 +2187,8 @@ impl BoardStore {
         Ok(tickets)
     }
 
-    /// List archived tickets with non-NULL embeddings, deserialized, scoped to
-    /// a workspace.
+    /// List archived tickets with non-NULL embeddings, deserialized,
+    /// installation-wide.
     ///
     /// Returns `(id, embedding)` pairs for all archived tickets that have
     /// a stored embedding blob. Embeddings are deserialized from the
@@ -2206,16 +2199,13 @@ impl BoardStore {
     /// LIMIT because the caller (the tool layer) needs all candidates for
     /// cosine-similarity ranking, and the archive size is bounded in practice
     /// by the total ticket volume of the installation.
-    pub async fn list_archived_with_embeddings(
-        &self,
-        workspace_name: &str,
-    ) -> Result<Vec<(String, Vec<f32>)>> {
+    pub async fn list_archived_with_embeddings(&self) -> Result<Vec<(String, Vec<f32>)>> {
         let rows = self
             .conn
             .query(
                 "SELECT id, embedding FROM tickets \
-                 WHERE is_archived = 1 AND workspace_name = ?1 AND embedding IS NOT NULL",
-                db::params![workspace_name],
+                 WHERE is_archived = 1 AND embedding IS NOT NULL",
+                db::params![],
             )
             .await?;
 

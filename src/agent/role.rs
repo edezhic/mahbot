@@ -308,7 +308,9 @@ impl Role {
     /// Build the tool set for this role.
     ///
     /// Ticket tools are bound to `ws` at construction time — all their
-    /// operations are confined to that workspace.
+    /// operations are confined to that workspace, except that the archive
+    /// search spans the installation and `get_ticket` opens a prefixed ID
+    /// from any workspace.
     ///
     /// `is_admin` says whether the triggering account is the admin. It only
     /// widens the Assistant's toolset: `shell`, `implement`, `research`,
@@ -349,7 +351,7 @@ impl Role {
                     Box::new(ListTicketsTool::new(ws)),
                     Box::new(GetTicketTool::new(reporter, ws)),
                     Box::new(AddCommentTool::new(ws)),
-                    Box::new(SearchArchivedTicketsTool::new(ws)),
+                    Box::new(SearchArchivedTicketsTool),
                     Box::new(AnalyzeTool::new(DispatchMode::Async, Role::Manager)),
                     // The Manager often has nothing to say until a ticket
                     // advances or an async analysis lands — sleep
