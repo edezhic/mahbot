@@ -4,30 +4,30 @@
 
 # MahBot
 
-Mahbot(i.e. __my bot__) is an agentic system that automates coding while also providing built-in tools for everyday automations, research, as well as media editing and generation.
+Mahbot(i.e. __my bot__) is an agentic system that automates coding, office work, research, media editing and generation, while also providing generic agentic tools for your custom workflows.
 
-Mahbot treats software development as a managed pipeline, not a chat session: you drop a request to your assistant about any of the projects while it orchestrates other agents to clarify the details and only escalates real product decisions to you.
+Batteries included:
+- __Tightly optimized__ LLM cache and device resources usage for lower costs and wider support
+- __Telegram bot__ integration that allows you to easily manage the work from your smartphone
+- __Voice control__ (currently macOS only) using local speech-to-text model with wake-word detection
+- __Smooth native GUI__ for the core pipeline management as well as code editor, diff viewer and shell
+- __Modern agentic dev__ process with analysis before and adversarial verification after every change
+- __Background maintenance__ agentic process to clean up the usual videcoding bloat and other code quality issues
+- __Full change history__ of the previous work in the tickets with efficient hybrid search over it
+- __Out-of-the-box__ workspace discovery for per-role contexts, auto-detected diagnostics commands. No need for plugins, AGENTS/CLAUDE/other.md files or custom configurations. Just add the API key, select the workspace and state your wishes
+- __One to rule them all__ adaptive agent for automations, Q&A, research, prototyping, image & video generation/editing and other purposes
+
+OpenRouter is the default provider, and DeepSeek V4.1 Flash is the default model. A custom self-hosted OpenAI-compatible endpoint (llama.cpp, vLLM, or alike) can be configured in Settings for chat requests. Note that media generation/editing tools are currently tied to OpenRouter — so its key is still needed for them even when a custom endpoint is used for the agents. Also, should work quite well with smaller models like Qwen 3.8 27b, and local + open-source mode is the primary long-term focus.
+
+## Software development
+
+Mahbot treats software engineering as a managed pipeline, not a chat session: you drop a request to your assistant about any of the projects while it orchestrates other agents to clarify the details and only escalates real product decisions to you.
 
 **Reliability** comes from orchestration and process, not based on the expectation that the current frontier model will one-shot any task. 
 
 **Autonomy** is achieved using the pipeline - you can request a large amount of work and agents in the pipeline will ensure that every piece is analyzed, implemented, verified and commited.
 
-Batteries included:
-- __Smooth native GUI__ for the core pipeline management as well as code editor, diff viewer and shell
-- __Telegram bot__ integration that allows you to easily manage the work from your smartphone
-- __Voice control__ (macOS only) using a CPU-optimized local speech-to-text model that turns babble into features (passive wake-word detection wip)
-- __Modern agentic__ adversarial analysis before dev, verification after dev
-- __Good old deterministic__ CI-style diagnostics (format, lint, build, test) in the same round as the verification agents
-- __Background maintenance__ agentic process to clean up the usual videcoding bloat and other code quality issues
-- __Full history__ of the previous work in the tickets with efficient hybrid search over it
-- __Out-of-the-box__ workspace discovery for per-role contexts, auto-detected diagnostics commands. No need for plugins, AGENTS/CLAUDE/other.md files or custom configurations. Just add the API key, select the workspace and state your wishes
-- __One to rule them all__ adaptive agent for automations, Q&A, research, prototyping, image & video generation/editing and other purposes
-
-OpenRouter is the default provider; manager-side and worker-side roles default to DeepSeek V4.1 Flash. A custom self-hosted OpenAI-compatible endpoint (llama.cpp, vLLM, or alike) can be configured in Settings for chat requests. Note that media tools are currently tied to OpenRouter — so its key is still needed for those even when a custom endpoint handles dev agents. Also, should work quite well with smaller models like Qwen 3.8 27b, and local + open-source mode is the primary long-term focus.
-
-## The Pipeline
-
-Every ticket has a lifecycle with **redundant checks**:
+Every request/ticket has a lifecycle with **redundant checks**:
 
 | Phase | What happens |
 |-------|----------------|
@@ -35,7 +35,7 @@ Every ticket has a lifecycle with **redundant checks**:
 | **→ Planning** | Manager sees the analysis and refines/cancels/approved or escalates |
 | **→ Queued** | Awaits in the engineer's queue according to it's priority |
 | **→ Development** | Engineer implements the ticket (or the required fixes) |
-| **→ Verification** | One round: the workspace's deterministic checks (format, lint, build, test) plus code reviewers and one functional tester, all run together |
+| **→ Verification** | Deterministic checks with code reviewers and a tester |
 | **→ Sanitation** | Audit untracked/new files in the working tree |
 | **→ Done** | Auto git commit with the ticket's title if the tree is dirty |
 
@@ -45,19 +45,17 @@ Circuit breaker pauses the work if a ticket goes through too many bounces, escal
 
 Install and start it with one command. On unix-like systems:
 
-```bash
+```sh
 curl -fsSL https://raw.githubusercontent.com/edezhic/mahbot/main/install.sh | sh
 ```
 
 On Windows (PowerShell):
 
-```powershell
+```sh
 irm https://raw.githubusercontent.com/edezhic/mahbot/main/install.ps1 | iex
 ```
 
-That fetches the newest published release, puts it in the standard per-user location, adds that location to your search path only when it is missing, and starts the product. From then on mahbot updates itself from those same published releases, so there is nothing to do by hand. `install.sh <version>` installs one particular release instead of the newest; with the piped form above, set `MAHBOT_INSTALL_VERSION` to that version instead, because a piped script takes no argument of its own — that is how a release is installed by hand, since the newest-release lookup never names a test release.
-
-If you would rather build it yourself, the toolchain way is the alternative:
+This script will install the latest release and start it for you. Further updates will be installed & restarted automatically, with very little downtime for your agents. If you would rather build it yourself, the toolchain way is the alternative:
 
 ```bash
 cargo install mahbot
@@ -68,5 +66,3 @@ Either way the product's window opens and asks you to provide one of:
 - a custom OpenAI-compatible endpoint
 
 The rest of the setup will be explained and done through the agent. It will help you add a workspace, other users, connect the Telegram bot, add the search providers & browser tooling for your agents.
-
-Mahbot supports macOS 12.3 and newer (Intel and Apple silicon), Linux on x86_64 and ARM against glibc 2.35 or newer, Windows 10 1809 and newer on x86_64, and Windows 11 on ARM. A system with no published file for it is refused plainly by the install command — musl Linux, older macOS and older glibc, and Windows 7, 8 and 10 on ARM among them. The Windows files are built and published like the others, but they have not been run by this project, so they ship what compiles rather than what has been exercised.

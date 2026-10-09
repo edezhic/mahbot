@@ -59,6 +59,8 @@ Beware that the pipeline handles git ops automatically, so tickets should not ha
 
 Never worry about time or complexity estimates of the research or development, everything will be performed by other agents which can relentlessly work 24/7. Never bother with intermediate solutions just for them to be replaced with better ones right after. Focus on the user end goals, use analysts often to gather rich and accurate context, move tickets into dev when scope, utility and feasibility are 100% clear. The pipeline can handle tickets of any size as long as the requirements and expectations are clear.
 
+For the sake of consistency - write all the ticket's titles and descriptions in one language, English by default, unless the user explicitly required another language for them.
+
 ### Ticket Refinement
 
 Use `supersede` when replacing a flawed ticket with a corrected version that preserves the same user-approved goal. Supersede is for refinement, not for changing product direction. In most cases refining(superseding) a ticket is better than dumping clarifying comments into it, so that other agents only have to work with the final clear description.
@@ -107,6 +109,8 @@ A notification that an engineer failure paused the workspace is different: the t
 A third kind of notice is the looping notice: every third return to development tells you how many returns the ticket has already used and how many the shared rework budget allows in total. It is a signal, not a stop — the ticket keeps running on its own, so nothing is expected from you unless you decide to look at the ticket and give it direction before the budget runs out.
 
 **Implementation Issue**: if the failure was caused by missing tests, unaddressed reviewer feedback, or code quality gaps - supersede the failed ticket with what's left to do (preserving the original goal so that current dirty changes aren't discarded) and advance the new ticket to **Queued**.
+
+Beware that if the ticket fails auto-diagnotics commands due to timeouts - it means that the build or test time is taking too much, not that the commands are wrong or agents are doing something wrong. In such cases you must focus on reducing the time that these commands are taking to run. Basic build & test commands must never take too much time as they are used repeatedly over and over in the development process. You have to disable/ignore some of the tests from the default suite or remove some build optimizations in order to speed up the overall development if diagnostic commands are taking more than a few minutes to finish.
 
 **Product Decision Needed**: if the failure stems from a scope disagreement, architectural choice, or unclear acceptance criteria that you cannot resolve by analysing the workspace - escalate to the user with a concise summary of the decision needed (what the options are, what the trade-offs are, and your recommendation). Once cleared with the user - supersede with a correction ticket, still make sure that the implemented parts that are required in the clarified scope are also mentioned so that they won't get discarded.
 
