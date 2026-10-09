@@ -1,7 +1,7 @@
 Chrome browser automation: navigate web pages, interact with elements, extract content, and capture screenshots for visual inspection. Returns an accessibility-tree snapshot for AI consumption.
 
 ## Required parameter
-`tab` — a logical session name. Missing or empty uses a per-run session whose tabs the product closes itself when your run ends — retried, unprompted, until the browser says they are gone, and the same for the leftovers of runs that ended without their own cleanup.
+`tab` — a logical session name. Missing or empty uses a per-run session whose tabs the product closes itself when your run ends — retried, unprompted, until the browser says they are gone, and the same for the leftovers of runs that ended without their own cleanup. A run keeps at most five tabs: when a new one appears and the run already holds five, the tab you have addressed least recently is closed — a close the browser does not confirm is retried at the next new tab, so the bound is not hard. Addressing a tab the limit closed is an error naming it; `open` a URL under that name to get the tab back.
 
 Reporting never happens once per attempt: a close that could not reach the browser is simply retried, and each thing the product can state — a tab it cannot close, or a browser side whose answers it cannot decide from — is stated at most once.
 

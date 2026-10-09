@@ -1,4 +1,5 @@
-//! Ended-run chrome session releases.
+//! Chrome sessions and tab records runs leave behind: the ended-run releases, the live run's own
+//! tab cap, and the per-agent tab record that cap counts from.
 //!
 //! chrome-use ≥1.5.101 preserves external Chrome tabs across daemon idle recycling, so the
 //! sessions an agent run opened must be closed explicitly — a run cannot do it in its own
@@ -93,6 +94,13 @@
 //! reporting them would blame the owner's own tabs. A browser side with no ownership door is
 //! reported once as a fact about the host, with no run and no session names
 //! ([`NO_OWNERSHIP_DOOR_REASON`]).
+//!
+//! Two more of this path's members serve a run that is still going: [`evict_agent_tab`] closes the
+//! one tab the agent tool's per-agent cap picked when a new tab appeared — the live run asking for
+//! its own tab, counted from [`crate::tools::chrome_tab_ledger`], off the agent's path — and
+//! [`prune_tab_records`], run once per boot by [`release_queue`], drops the tab records no live
+//! run, no held release record and no resumable job claims, since nothing of theirs is left to
+//! count.
 //!
 
 use super::chrome_daemon::cli_path;
@@ -580,6 +588,20 @@ fn restore_pending_releases() {
     }
 }
 
+/// Drop the per-agent tab records no live run, no held release record and no resumable job
+/// claims any more — their tabs are the reclaim sweep's business from here
+/// (see [`crate::tools::chrome_tab_ledger`]). One durable read, once per boot, and fail-closed:
+/// a durable read that could not be made prunes nothing, because deleting a record is not a step
+/// a missing answer may authorize (the tabs of such a run would start counting from zero).
+async fn prune_tab_records() {
+    let Some(durable) = durable_resume_namespaces_checked().await else {
+        return;
+    };
+    let protected = ProtectedNamespaces::snapshot(&durable);
+    // A namespace is its own prefix, so `contains` answers whether anything still claims it.
+    crate::tools::chrome_tab_ledger::prune(|namespace| protected.contains(namespace));
+}
+
 /// Write the whole queue — plus what the passes in flight hold ([`PARKED_RELEASES`]) — to the
 /// record file (compact JSON, atomic tmp+rename): fail-open, a no-op with no storage root, and a
 /// record with no names is never written. Both locks are held across the write as well as the
@@ -627,16 +649,8 @@ fn persist_pending_releases() {
             return;
         }
     };
-    let tmp = path.with_extension("json.tmp");
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(err) = std::fs::write(&tmp, json) {
-        warn!(error = %err, "agent-run chrome release record not written");
-        return;
-    }
-    if let Err(err) = std::fs::rename(&tmp, &path) {
-        warn!(error = %err, "agent-run chrome release record not published");
+    if let Err(err) = crate::util::write_json_record(&path, &json) {
+        warn!(error = %err, path = %path.display(), "agent-run chrome release record not written");
     }
 }
 
@@ -685,6 +699,9 @@ pub async fn run_session_release_queue() {
 /// ended, so there is nothing a drain needs to protect from it.
 async fn release_queue(shutdown: CancellationToken) {
     restore_pending_releases();
+    // The restored records are in the queue above, so their namespaces count as protected here:
+    // the boot prune must not drop the tab record of a release still waiting on the browser.
+    prune_tab_records().await;
     loop {
         tokio::select! {
             () = wait_for_release_work() => {}
@@ -1017,6 +1034,72 @@ async fn close_unprotected(
         .await
         .into_iter()
         .collect()
+}
+
+/// Close one tab of a LIVE agent run because the run went over its per-agent tab cap, and say
+/// whether the browser confirmed the group is gone.
+///
+/// Only the single name handed in (`session`) is asked for, and [`chrome_tabs::close_sessions`]
+/// matches it exactly against the live tab-group titles, so no other run's tabs and no tab of the
+/// owner's can be touched. The namespace the caller names is exempt from the live-run guard: that
+/// guard exists to keep a FINISHED run's release off a live run's tabs, and this close is the live
+/// run itself asking for one of its own — without the exemption every eviction would be a no-op
+/// (`plan_removal` retries a name the live map protects).
+///
+/// `read_session` is where the close's own reads run: a session whose page is live right now (the
+/// tab that just appeared), so a name the browser has already lost mints no scratch group of its
+/// own while it is being closed.
+///
+/// Runs off the calling agent's path (the tool spawns it), so the same budget a release pass gets
+/// ([`ATTEMPT_TIMEOUT`], narrowed for a test) bounds the browser side, not the agent.
+pub(crate) async fn evict_agent_tab(namespace: &str, session: &str, read_session: &str) -> bool {
+    let Some(cli) = release_cli() else {
+        return false;
+    };
+    let deadline = Instant::now() + release_settings().attempt_timeout;
+    // The run's own namespace is ours to close; every other live run's and every held record's
+    // stays protected.
+    let owned_again = |name: &str| {
+        !names_a_namespace(namespace, name) && ProtectedNamespaces::protects_live_or_held(name)
+    };
+    let name = session.to_string();
+    let outcomes = chrome_tabs::close_sessions(
+        &cli,
+        std::slice::from_ref(&name),
+        read_session,
+        deadline,
+        &owned_again,
+    )
+    .await;
+    let gone = outcomes
+        .first()
+        .is_some_and(|(_, outcome)| matches!(outcome, chrome_tabs::TabOutcome::Gone));
+    if gone {
+        // The group is gone, but chrome-use's own session record still pins the tab it created,
+        // and the name must stay good for a new page: retire the record (a later call on the same
+        // name then starts a fresh session with its own scratch page instead of failing on a
+        // target the relay no longer holds). A stop that does not settle is asked once more: this
+        // runs off the agent's path, so the retry costs the agent nothing, while a name left pinned
+        // breaks the very `open` the cap's refusal tells the agent to use. Past that, the run's own
+        // release retires the record — the let-go queue cannot, because its driver never stops a
+        // live run's session.
+        for _ in 0..2 {
+            let outcome = chrome_tabs::forget_settled_sessions(
+                &cli,
+                std::slice::from_ref(&name),
+                // The eviction's own deadline, not a fresh one: a stop is only spawned with the
+                // whole bound when the budget still holds it, so a verdict of `tried` keeps meaning
+                // the helper really answered and `deferred` that nothing was heard.
+                deadline,
+                &|_: &str| false,
+            )
+            .await;
+            if outcome.tried.is_empty() && outcome.deferred.is_empty() {
+                break;
+            }
+        }
+    }
+    gone
 }
 
 /// Let go of the sessions earlier passes closed but had no budget to forget, plus `just_settled`,
@@ -1423,6 +1506,17 @@ async fn report_unreadable_answers() {
     .await;
 }
 
+/// Drop the tab record of a release that concluded with every name confirmed gone — unless the run
+/// came alive again while the pass ran, whose fresh record must outlive this pass's conclusion. A
+/// release with unclosable leftovers never reaches this: its tabs may still stand, so its entry
+/// stays.
+fn conclude_released_record(namespace: &str) {
+    if ProtectedNamespaces::protects_live_or_held(namespace) {
+        return;
+    }
+    crate::tools::chrome_tab_ledger::forget_namespace(namespace);
+}
+
 /// One pass over the records a [`ReleasePass`] took, plus the names the reclaim sweep
 /// found: every name the pass is about goes to the browser in one batched call, the
 /// browser's own answers decide each record's fate, and the reports the Issues view is
@@ -1528,6 +1622,7 @@ async fn attempt_pass(
             }
             if disposition.retry.is_empty() {
                 if unclosable == 0 {
+                    conclude_released_record(&entry.namespace);
                     info!(
                         namespace = %entry.namespace,
                         run = %entry.run,
@@ -1911,20 +2006,29 @@ fn reclaim_unfinished() {
 /// Fail-open: a store that is not up yields no protection beyond the in-memory registry and the
 /// held records, and a read that fails is a `debug!` — the sweep then runs on what it does know.
 async fn durable_resume_namespaces() -> Vec<String> {
-    let Some(store) = crate::session::SESSIONS.get() else {
-        return Vec::new();
-    };
+    durable_resume_namespaces_checked()
+        .await
+        .unwrap_or_default()
+}
+
+/// The same read as [`durable_resume_namespaces`], but `None` when no answer could be made: a
+/// caller that DELETES durable state must not read a failed read as "nothing claims this" (see
+/// [`prune_tab_records`]).
+async fn durable_resume_namespaces_checked() -> Option<Vec<String>> {
+    let store = crate::session::SESSIONS.get()?;
     match crate::jobs::resumable_roster_agent_ids(&store.conn).await {
-        Ok(agent_ids) => agent_ids
-            .iter()
-            .map(|agent_id| crate::tools::chrome::run_session_namespace(agent_id))
-            .collect(),
+        Ok(agent_ids) => Some(
+            agent_ids
+                .iter()
+                .map(|agent_id| crate::tools::chrome::run_session_namespace(agent_id))
+                .collect(),
+        ),
         Err(error) => {
             debug!(
                 %error,
                 "could not read the resumable runs' agent ids — reclaiming without them"
             );
-            Vec::new()
+            None
         }
     }
 }
@@ -2025,8 +2129,9 @@ impl ProtectedNamespaces {
         self.namespaces.extend(Self::live_and_held().namespaces);
     }
 
-    /// Whether `name` belongs to a namespace some run may still own. Namespaces are
-    /// matched as prefixes (they all end in `-`), never re-derived from the agent id.
+    /// Whether `name` belongs to a namespace some run may still own — asked both about a session
+    /// name and (by the boot prune) about a namespace itself, which is its own prefix. Namespaces
+    /// are matched as prefixes (they all end in `-`), never re-derived from the agent id.
     fn contains(&self, name: &str) -> bool {
         self.namespaces
             .iter()
@@ -2262,14 +2367,14 @@ fn mark_reported(reason: &str) {
 #[cfg(test)]
 type CapturedIssues = std::sync::Arc<Mutex<Vec<(String, String, serde_json::Value)>>>;
 
-/// One pass's whole budget: the two phases of browser reads ([`READ_PHASE_RESERVE`] each — the
-/// planning reads that decide what the close is about, and the confirmation's own deciding
-/// reads) and one `session stop` ([`crate::chrome::SESSION_STOP_TIMEOUT`]) in between. The
-/// removal call and its verification reads have no reserve of their own — they spend what the
-/// planning share left over — so on a slow pass they are what pushes the confirmation's stop
-/// out: the names that stop would have covered then stay retries, settled by no read of that
-/// pass, and a later pass whose budget holds a whole stop concludes them (see `chrome_tabs`'
-/// own reserve).
+/// The whole budget of one close attempt — a release pass, or one cap eviction: the two phases of
+/// browser reads ([`READ_PHASE_RESERVE`] each — the planning reads that decide what the close is
+/// about, and the confirmation's own deciding reads) and one `session stop`
+/// ([`crate::chrome::SESSION_STOP_TIMEOUT`]) in between. The removal call and its verification
+/// reads have no reserve of their own — they spend what the planning share left over — so on a
+/// slow pass they are what pushes the confirmation's stop out: the names that stop would have
+/// covered then stay retries, settled by no read of that pass, and a later pass whose budget holds
+/// a whole stop concludes them (see `chrome_tabs`' own reserve).
 ///
 /// [`READ_PHASE_RESERVE`]: crate::tools::chrome_tabs::READ_PHASE_RESERVE
 const ATTEMPT_TIMEOUT: Duration = crate::tools::chrome_tabs::READ_PHASE_RESERVE
@@ -2455,6 +2560,7 @@ impl Drop for NoReleaseStore {
 mod tests {
     use super::*;
     use crate::tools::chrome::{AGENT_TAB_PREFIX, ChromeRunSessions};
+    use crate::tools::chrome_tab_ledger;
     use crate::tools::chrome_tabs::OWN_SESSION;
     use std::fs;
     use std::path::Path;
@@ -2764,6 +2870,17 @@ exit 0
         /// when one of a record's names is unclosable and another is closeable.
         fn write_state_each(&self, owned: &[(&str, bool)]) {
             write_browser_state_each(&self.state, owned);
+        }
+
+        /// The titles of the tab groups the stub's browser still holds (`group <id> <title>`
+        /// lines), so a test can assert what an eviction left open.
+        fn group_titles(&self) -> Vec<String> {
+            fs::read_to_string(&self.state)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.strip_prefix("group "))
+                .filter_map(|rest| rest.split_once(' ').map(|(_, title)| title.to_string()))
+                .collect()
         }
 
         /// Put the release path in the window a managed self-update swap creates:
@@ -5381,5 +5498,167 @@ exit 0
             "the hold is measured from this boot, not from the expired deadline: {:?}",
             delays[0]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-agent tab cap: eviction, and the boot prune of the run record
+    // -----------------------------------------------------------------------
+
+    /// The cap's eviction closes exactly the named tab of the live run it is asked for, leaves
+    /// another live run's tab standing, and retires the settled session's chrome-use record.
+    #[tokio::test]
+    #[serial_test::serial(chrome_release)]
+    async fn an_over_cap_eviction_closes_the_named_tab_and_leaves_others_alone() {
+        let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
+        // Both runs are live: the victim's own namespace is exempt from the live-run guard (it is
+        // the run asking for its own tab), while every other live namespace stays protected.
+        let ours = ChromeRunSessions::for_run("evict-ours");
+        let ours_session = format!("{}victim", ours.namespace());
+        let other = ChromeRunSessions::for_run("evict-other");
+        let other_session = format!("{}bystander", other.namespace());
+        guard.write_state(&[ours_session.clone(), other_session.clone()], true);
+
+        let gone = evict_agent_tab(ours.namespace(), &ours_session, &other_session).await;
+
+        assert!(gone, "the browser confirmed the victim's group gone");
+        assert!(
+            !guard.group_titles().contains(&ours_session),
+            "the victim's group is gone: {:?}",
+            guard.group_titles()
+        );
+        assert!(
+            guard.group_titles().contains(&other_session),
+            "another live run's group — the close's own read session — is untouched: {:?}",
+            guard.group_titles()
+        );
+        assert!(
+            guard.invoked("session stop --force"),
+            "the settled session's chrome-use record was retired: {:?}",
+            guard.log_lines()
+        );
+    }
+
+    /// An eviction the browser answers for but does not perform is not confirmed: the group is
+    /// still standing and the caller is told so.
+    #[tokio::test]
+    #[serial_test::serial(chrome_release)]
+    async fn an_eviction_the_browser_leaves_open_is_not_confirmed() {
+        let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
+        guard.set_mode("keep");
+        let ours = ChromeRunSessions::for_run("evict-kept");
+        let ours_session = format!("{}victim", ours.namespace());
+        guard.write_state(std::slice::from_ref(&ours_session), true);
+
+        let gone = evict_agent_tab(ours.namespace(), &ours_session, &ours_session).await;
+
+        assert!(
+            !gone,
+            "the browser answered and left the group standing: {:?}",
+            guard.log_lines()
+        );
+        assert!(
+            guard.group_titles().contains(&ours_session),
+            "the group is still in the browser"
+        );
+    }
+
+    /// A confirmed eviction whose `session stop` does not settle is asked again, because the name
+    /// chrome-use still pins is one an `open` under it would fail on — and the retry runs off the
+    /// agent's path, so it costs the agent nothing.
+    #[tokio::test]
+    #[serial_test::serial(chrome_release)]
+    async fn an_eviction_whose_session_stop_fails_is_retried() {
+        let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
+        guard.set_mode("stop-refused");
+        let ours = ChromeRunSessions::for_run("evict-stop-refused");
+        let ours_session = format!("{}victim", ours.namespace());
+        guard.write_state(std::slice::from_ref(&ours_session), true);
+
+        let gone = evict_agent_tab(ours.namespace(), &ours_session, &ours_session).await;
+
+        assert!(gone, "the group itself was closed: {:?}", guard.log_lines());
+        let stops = guard
+            .log_lines()
+            .iter()
+            .filter(|line| line.starts_with("session stop"))
+            .count();
+        assert_eq!(stops, 2, "the stop that did not settle was asked again");
+    }
+
+    /// The tool's cap wiring end to end, minus only the browser dispatch the tool itself would
+    /// make: the sixth appearance names the least recently addressed tab on the record, the close
+    /// the tool spawns off its own path really takes that group out of the browser (the stub
+    /// stands in for chrome-use), and the confirmed close comes back to the record as a closed tab.
+    #[tokio::test]
+    #[serial_test::serial(chrome_release, chrome_tabs)]
+    async fn the_tools_sixth_appearance_closes_the_least_recently_addressed_tab() {
+        let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
+        let _ledger = chrome_tab_ledger::TestLedgerGuard::install();
+        let sessions = ChromeRunSessions::for_run("cap-tool-wiring");
+        let tool = crate::tools::chrome::ChromeTool::new(Arc::clone(&sessions));
+        let namespace = sessions.namespace().to_string();
+        let victim_session = format!("{namespace}a");
+        guard.write_state(std::slice::from_ref(&victim_session), true);
+
+        for tab in ["a", "b", "c", "d", "e"] {
+            tool.record_addressed(tab, None);
+        }
+        assert!(
+            !chrome_tab_ledger::is_closed(&namespace, "a"),
+            "the fifth tab is inside the cap"
+        );
+        tool.record_addressed("f", None);
+
+        // The close runs off the agent's path, so wait for it to land.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !chrome_tab_ledger::is_closed(&namespace, "a") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            chrome_tab_ledger::is_closed(&namespace, "a"),
+            "the run's least recently addressed tab is the one the cap closed"
+        );
+        assert!(
+            !guard.group_titles().contains(&victim_session),
+            "the confirmed close took the tab out of the browser: {:?}",
+            guard.group_titles()
+        );
+    }
+
+    /// The boot prune drops a namespace no live run, no held release record and no resumable job
+    /// claims, and keeps one a live run holds.
+    #[tokio::test]
+    #[serial_test::serial(chrome_release, chrome_tabs)]
+    async fn a_namespace_no_run_claims_is_dropped_at_boot() {
+        crate::util::test::init_test_stores().await;
+        let ledger = chrome_tab_ledger::TestLedgerGuard::install();
+        // A real run namespace, registered only for the call that minted the name (dropping the
+        // tracker deregisters it): none of the claims the prune protects applies to it.
+        let namespace = ChromeRunSessions::for_run("prune-orphan")
+            .namespace()
+            .to_string();
+        assert!(
+            chrome_tab_ledger::note_addressed(&namespace, "tab", true).is_none(),
+            "one tab is inside the cap"
+        );
+
+        prune_tab_records().await;
+        assert!(
+            !ledger.holds(&namespace),
+            "no run claims the namespace: its record is dropped"
+        );
+
+        // With the run live again the record survives the same prune.
+        let live = ChromeRunSessions::for_run("prune-orphan");
+        assert!(
+            chrome_tab_ledger::note_addressed(&namespace, "tab", true).is_none(),
+            "one tab is inside the cap"
+        );
+        prune_tab_records().await;
+        assert!(
+            ledger.holds(&namespace),
+            "a live run's record survives the boot prune"
+        );
+        drop(live);
     }
 }

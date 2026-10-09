@@ -126,6 +126,11 @@ pub(crate) fn self_launched_browser_note(resp: &ChromeResponse) -> Option<String
         .then_some(text)
 }
 
+/// Opening sentence of [`self_launched_browser_error`] — a const so a caller that must recognize
+/// that failure ([`is_self_launched_browser_error`]) never re-spells the sentence itself.
+const SELF_LAUNCHED_BROWSER_PREFIX: &str =
+    "chrome-use launched a browser of its own for this command";
+
 /// The failure text for a call whose envelope carried
 /// [`self_launched_browser_note`]: the tool's own note, what it means, and what
 /// to do next. Shared by both frontends so the two surfaces cannot drift.
@@ -137,7 +142,7 @@ pub(crate) fn self_launched_browser_note(resp: &ChromeResponse) -> Option<String
 #[must_use]
 pub(crate) fn self_launched_browser_error(note: &str) -> String {
     format!(
-        "chrome-use launched a browser of its own for this command ({note}). The work ended up in \
+        "{SELF_LAUNCHED_BROWSER_PREFIX} ({note}). The work ended up in \
          a browser chrome-use started itself, not the owner's real logged-in Chrome — the tool \
          could not resolve the connection to the real browser, so the page state this action \
          assumed is not there and nothing read or written here happened in the owner's session. \
@@ -145,6 +150,13 @@ pub(crate) fn self_launched_browser_error(note: &str) -> String {
          problem rather than the page — the chrome daemon itself is healthy, so check the \
          extension at chrome://extensions and the relay, then retry."
     )
+}
+
+/// Whether `message` is the failure [`self_launched_browser_error`] built: the call ran in a
+/// browser chrome-use launched itself, so no page of the owner's exists for it.
+#[must_use]
+pub(crate) fn is_self_launched_browser_error(message: &str) -> bool {
+    message.starts_with(SELF_LAUNCHED_BROWSER_PREFIX)
 }
 
 /// The failure text for output the product had to cut off, either at the bytes

@@ -132,13 +132,9 @@ impl DraftStore {
             let _ = std::fs::remove_file(path);
             return;
         }
-        let json = serde_json::to_string(&*draft).unwrap_or_default();
-        let tmp = path.with_extension("json.tmp");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Ok(json) = serde_json::to_string(&*draft) {
+            let _ = crate::util::write_json_record(path, &json);
         }
-        let _ = std::fs::write(&tmp, json);
-        let _ = std::fs::rename(&tmp, path);
     }
 
     /// Spawn the sync write on the blocking pool. Holding the std mutex

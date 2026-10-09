@@ -489,6 +489,20 @@ pub(crate) fn models_dir() -> Option<PathBuf> {
         .map(|root| root.join("models"))
 }
 
+/// Write a JSON record to `path` atomically: the whole payload to a sibling `json.tmp`, then a
+/// rename. A reader never sees a torn file, and a crash — a self-update kill included — leaves
+/// the previous record in place rather than half of a new one. The caller owns the payload and
+/// whatever lock serializes its writers: two writers sharing the one `.tmp` could publish a torn
+/// file. The failure is returned rather than logged — each record decides how loudly to say it.
+pub(crate) fn write_json_record(path: &Path, json: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(tmp, path)
+}
+
 /// Run a blocking I/O operation with awareness of the current Tokio runtime.
 ///
 /// - **Multi-threaded runtime:** wraps the call in

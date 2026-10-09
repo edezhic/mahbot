@@ -4,10 +4,11 @@ use crate::chrome::contract::{
     ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, chrome_leftover_pipe_note,
     chrome_session_stop_command, chrome_use_warning, classify_call_failure, eval_count,
     expect_outcome, extract_output, extract_snapshot_text, is_daemon_unavailable_code,
-    is_daemon_unavailable_error, is_session_unresponsive_error, is_unreachable_tab_error,
-    net_error_phrase, parse_error_page_probe, parse_first, sanitize_timeout_message,
-    self_launched_browser_error, self_launched_browser_note, truncated_output_error,
-    unreachable_tab_message, with_condition_timeout_note,
+    is_daemon_unavailable_error, is_self_launched_browser_error, is_session_unresponsive_error,
+    is_unreachable_tab_error, net_error_phrase, parse_error_page_probe, parse_first,
+    sanitize_timeout_message, self_launched_browser_error, self_launched_browser_note,
+    truncated_output_error, unreachable_tab_message, unreached_browser_error,
+    with_condition_timeout_note,
 };
 use crate::chrome::escape_js_single_quoted;
 use crate::chrome::forms::{
@@ -186,6 +187,14 @@ pub(crate) const AGENT_TAB_PREFIX: &str = "agent-tab-";
 
 /// Logical name of the per-run default session.
 const DEFAULT_TAB: &str = "default";
+
+/// The failure texts this module itself mints for a call that never left mahbot: no CLI
+/// ([`ChromeTool::ensure_available`] and the dispatch's own context), a CLI that could not be
+/// spawned, and the call cut off at mahbot's own bound. Consts so the per-agent tab record's
+/// classifier ([`ChromeTool::left_no_page`]) cannot drift from what the dispatch fails with.
+const CLI_UNAVAILABLE: &str = "chrome-use CLI is not available";
+const CLI_SPAWN_FAILED: &str = "Failed to execute chrome-use CLI";
+const CLI_BOUND_EXCEEDED: &str = "chrome-use did not answer within";
 
 /// The workspace a chrome-use dispatch records when the surface driving it has
 /// none of its own: link enrichment summarizes a channel message, not a
@@ -543,7 +552,7 @@ impl ChromeTool {
             super::chrome_daemon::CliStatus::Available => {}
             super::chrome_daemon::CliStatus::Missing => {
                 anyhow::bail!(
-                    "chrome-use CLI is not available. {}",
+                    "{CLI_UNAVAILABLE}. {}",
                     super::chrome_daemon::CHROME_USE_INSTALL_HINT
                 );
             }
@@ -612,6 +621,136 @@ impl ChromeTool {
         }
     }
 
+    /// Run one chrome-use command and parse the JSON response, then record the call on this run's
+    /// per-agent tab record ([`Self::record_addressed`]) — the record counts what the browser
+    /// really answered for, which only this call's outcome says, so the recording comes after it.
+    async fn run_command(
+        &self,
+        args: &[&str],
+        tab: &str,
+        workspace: &str,
+    ) -> anyhow::Result<ActionOutput<ChromeResponse>> {
+        let outcome = self.dispatch_command(args, tab, workspace).await;
+        self.record_addressed(tab, outcome.as_ref().err());
+        outcome
+    }
+
+    /// Note one dispatched call on this run's tab record: the tab's recency — the agent's OWN
+    /// addresses, never the browser's own last-activity stamp, which does not move while the agent
+    /// works in a background tab — and, when the browser really answered for the page, its
+    /// appearance. An appearance that puts the record over the cap names the tab to close; the
+    /// close runs off this call's path, and the tab keeps counting as open until the browser
+    /// confirms it is gone.
+    ///
+    /// A call the browser answered for is a real call even when it failed: it counts as an address
+    /// to a tab the record already holds (the run was there, rather than neglecting it), as an
+    /// appearance for a name the record does not hold (the session's page exists from the moment the
+    /// relay answered it), and as a revival for a name the cap closed. A call that left no page at
+    /// all — never got past the CLI, the daemon or the relay, went to a browser chrome-use launched
+    /// itself, found no page of the session's to drive, or was cut off at mahbot's own bound with
+    /// nothing to attribute it (see [`Self::left_no_page`]) — moves nothing: no tab, no recency, no
+    /// revival, so no live tab is spent on a phantom and none is kept off the cap's list by one.
+    pub(crate) fn record_addressed(&self, tab: &str, error: Option<&anyhow::Error>) {
+        // The shared non-agent instance (link enrichment) keeps no record: it has no agent
+        // run, and its own sessions are the product's ephemeral sweep family.
+        if self.session_prefix.is_empty() {
+            return;
+        }
+        let reached = error.is_none_or(|error| !Self::left_no_page(error));
+        let Some(eviction) = super::chrome_tab_ledger::note_addressed(
+            &self.session_prefix,
+            self.logical_tab(tab),
+            reached,
+        ) else {
+            return;
+        };
+        self.evict_over_cap_tab(&eviction, tab);
+    }
+
+    /// The record's own name for `tab`: the run's namespace is a transport detail of the session,
+    /// not part of the logical name the agent uses, so a name that already carries it (an
+    /// echoed-back physical name, which [`Self::resolve_session`] accepts) counts as the same tab
+    /// rather than as a second one.
+    ///
+    /// A name the sanitizer had to change does not round-trip through this: its physical spelling
+    /// carries the hasher suffix, and the two spellings are then two logical names — the price of
+    /// keying the record by the names the agent uses.
+    fn logical_tab<'a>(&'a self, tab: &'a str) -> &'a str {
+        tab.strip_prefix(&self.session_prefix).unwrap_or(tab)
+    }
+
+    /// Whether a failed dispatch left the page it was asked for nowhere in the browser — the one
+    /// class of failure that must not create a tab, refresh a tab's recency, or bring a name the
+    /// cap closed back. Every failure that answers for a page — a missing element, a failed
+    /// navigation, a chrome-use timeout on a page that is there — is a page the session really
+    /// has, and counts.
+    fn left_no_page(error: &anyhow::Error) -> bool {
+        let message = error.to_string();
+        // Nothing carried the call: the CLI is missing or could not be spawned, the daemon or the
+        // relay never took it, or it was cut off at mahbot's own bound with nothing to attribute.
+        unreached_browser_error(&message)
+            || message.contains(CLI_UNAVAILABLE)
+            || message.contains(CLI_SPAWN_FAILED)
+            || message.contains(CLI_BOUND_EXCEEDED)
+            // The work went to a browser chrome-use started itself, so no page of the owner's
+            // exists for it.
+            || is_self_launched_browser_error(&message)
+            // The browser answered that the session has no page under this name at all (its tab
+            // is gone or unreachable) — nothing to count, and nothing to bring back.
+            || is_unreachable_tab_error(&message)
+    }
+
+    /// Close the tab the cap picked, off the agent's path: the call that went over the cap
+    /// answers without waiting for a browser close (a close is several reads), and the tab
+    /// keeps counting as open until the browser itself confirms it is gone — an unconfirmed
+    /// close is simply attempted again at the next appearance over the cap.
+    ///
+    /// `current` is the tab this call addressed; the close's own reads run in its session —
+    /// one the browser answered a moment ago — so they mint no page, which the victim's own
+    /// session cannot promise (a record entry the browser has already lost would otherwise
+    /// get a fresh scratch group).
+    ///
+    /// The pick is re-checked against the record right before the close (`take_eviction`): a run
+    /// that has come back to the tab meanwhile keeps it, and the eviction is dropped rather than
+    /// run under the call that just addressed it. A call already in flight when the close starts is
+    /// knowingly not seen — it records its address only once it returns — so the close can land
+    /// under it and that call answers with the unreachable-tab failure; the record still ends up
+    /// right, and the run takes another name.
+    fn evict_over_cap_tab(&self, eviction: &super::chrome_tab_ledger::Eviction, current: &str) {
+        let namespace = self.session_prefix.clone();
+        let session = self.resolve_session(&eviction.name);
+        let read_session = self.resolve_session(current);
+        let eviction = eviction.clone();
+        tokio::spawn(async move {
+            if !super::chrome_tab_ledger::take_eviction(&namespace, &eviction) {
+                return;
+            }
+            let gone =
+                super::chrome_release::evict_agent_tab(&namespace, &session, &read_session).await;
+            super::chrome_tab_ledger::settle_eviction(&namespace, &eviction, gone);
+        });
+    }
+
+    /// Whether the per-agent tab record holds this tab as closed by the cap: the page is
+    /// gone, and addressing the name is an error until an `open` mints one again.
+    fn tab_was_closed_by_cap(&self, tab: &str) -> bool {
+        !self.session_prefix.is_empty()
+            && super::chrome_tab_ledger::is_closed(&self.session_prefix, self.logical_tab(tab))
+    }
+
+    /// The refusal for a tab the cap closed: the name is gone until an `open` with an
+    /// address mints a page under it again. Deliberately never phrased as a browser or
+    /// extension problem — the tool's own record decides it, and the browser is not asked.
+    fn cap_closed_tab_message(tab: &str) -> String {
+        format!(
+            "Tab \"{tab}\" no longer exists: the tab limit closed it — a run keeps at most {} \
+             tabs open, and the one it has addressed least recently is closed when a new one \
+             appears. Use another `tab` name, or `open` a URL under this name to create the tab \
+             again.",
+            super::chrome_tab_ledger::MAX_AGENT_TABS
+        )
+    }
+
     /// Run an chrome-use command and parse the JSON response.
     ///
     /// The child's own EXIT decides the call ([`crate::chrome::spawn`]); a process
@@ -621,7 +760,7 @@ impl ChromeTool {
     /// while holding such a leftover keeps its own failure — the helper is named
     /// in the failure text and gets the leftover's one durable record
     /// ([`Self::record_leftover`]).
-    async fn run_command(
+    async fn dispatch_command(
         &self,
         args: &[&str],
         tab: &str,
@@ -629,7 +768,7 @@ impl ChromeTool {
     ) -> anyhow::Result<ActionOutput<ChromeResponse>> {
         let cli = super::chrome_daemon::cli_path().with_context(|| {
             format!(
-                "chrome-use CLI is not available. {}",
+                "{CLI_UNAVAILABLE}. {}",
                 super::chrome_daemon::CHROME_USE_INSTALL_HINT
             )
         })?;
@@ -752,7 +891,7 @@ impl ChromeTool {
         .await
         {
             CliRun::Output(output) => Ok(output),
-            CliRun::SpawnFailure => anyhow::bail!("Failed to execute chrome-use CLI"),
+            CliRun::SpawnFailure => anyhow::bail!("{CLI_SPAWN_FAILED}"),
             CliRun::TimedOut => {
                 // Distinguish "daemon down/wedged" (fail fast with daemon
                 // guidance; wakes the watchdog) from "daemon healthy, that
@@ -764,7 +903,7 @@ impl ChromeTool {
                     anyhow::bail!("{down_message}");
                 }
                 anyhow::bail!(
-                    "chrome-use did not answer within {}s for `{}` — that is mahbot's own bound, \
+                    "{CLI_BOUND_EXCEEDED} {}s for `{}` — that is mahbot's own bound, \
                      which rides above the {}s deadline chrome-use itself was working to (plus its \
                      relay self-heal window), so the call was aborted before chrome-use could \
                      report its own reason. The daemon looked healthy, so this is usually a slow \
@@ -1370,6 +1509,14 @@ impl Tool for ChromeTool {
         let (tab, action, normalized_notes) = Self::normalize_call(&args)?;
 
         debug!(tab, action = ?action, "chrome action");
+
+        // A tab the per-agent cap closed is gone: only an `open` with an address mints a
+        // page under that name again. Decided from the tool's own record, before the
+        // browser is probed at all, so the refusal can never be replaced by an
+        // "unreachable browser" error (see [`Self::cap_closed_tab_message`]).
+        if self.tab_was_closed_by_cap(&tab) && !matches!(action, ChromeAction::Open { .. }) {
+            anyhow::bail!("{}", Self::cap_closed_tab_message(&tab));
+        }
 
         Self::ensure_available().await?;
 
@@ -3962,5 +4109,92 @@ mod tests {
         );
         assert!(parse_session_list(&serde_json::json!(null)).is_empty());
         assert!(parse_session_list(&serde_json::json!({"ok": true, "data": {}})).is_empty());
+    }
+
+    // ── the per-agent tab cap: what counts as a tab, and what a closed tab says ─────
+
+    /// The one failure that must not count as a tab: a call that left no page in the browser at
+    /// all. Everything the page itself answered — a missing element, a failed navigation, a
+    /// chrome-use timeout on a page that is there — is a page the session has.
+    #[test]
+    fn a_call_that_left_no_page_creates_no_tab() {
+        for message in [
+            "relay isn't connected to the extension",
+            "daemon may be busy or unresponsive",
+            "chrome-use CLI is not available. install it",
+            "Failed to execute chrome-use CLI",
+            "chrome-use did not answer within 45s for `open`",
+            self_launched_browser_error(
+                "This session's previous browser is gone; a fresh one was launched instead.",
+            )
+            .as_str(),
+            // The browser answered that the session owns no page under this name — a tab it
+            // cannot drive is no tab of the record's, whichever way it was lost.
+            "session owns no resolvable tab. The chrome-use extension lost its debugger attach",
+        ] {
+            assert!(
+                ChromeTool::left_no_page(&anyhow::anyhow!("{message}")),
+                "no page can exist for: {message}"
+            );
+        }
+        for message in [
+            "element not found: #missing",
+            "Navigation to https://example.com failed — Chrome rendered its error page: \
+             ERR_NAME_NOT_RESOLVED (name not resolved). Verify the URL and network.",
+            "Wait timed out after 10000ms",
+            "Navigation failed: the tab is still on a blank page after opening https://x",
+        ] {
+            assert!(
+                !ChromeTool::left_no_page(&anyhow::anyhow!("{message}")),
+                "the session really has this page: {message}"
+            );
+        }
+    }
+
+    /// A tab the cap closed is refused from the tool's own record, before the browser is asked
+    /// anything: the agent reads that the tab is gone and how to get it back — never an
+    /// unreachable browser, never a lost extension attach.
+    #[tokio::test]
+    #[serial_test::serial(chrome_tabs)]
+    async fn a_tab_the_cap_closed_is_refused_before_the_browser_is_asked() {
+        let _ledger = crate::tools::chrome_tab_ledger::TestLedgerGuard::install();
+        let tool = ChromeTool::new(ChromeRunSessions::for_run("run-cap-refusal"));
+        let namespace = tool.session_prefix.clone();
+        // Fill the cap, then let one more tab appear: the tab the run has addressed least
+        // recently ("docs", addressed first) is the one the record closes.
+        for tab in ["docs", "a", "b", "c", "d"] {
+            assert!(
+                crate::tools::chrome_tab_ledger::note_addressed(&namespace, tab, true).is_none()
+            );
+        }
+        let eviction = crate::tools::chrome_tab_ledger::note_addressed(&namespace, "e", true)
+            .expect("the cap was crossed");
+        assert_eq!(eviction.name, "docs");
+        crate::tools::chrome_tab_ledger::settle_eviction(&namespace, &eviction, true);
+        assert!(crate::tools::chrome_tab_ledger::is_closed(
+            &namespace, "docs"
+        ));
+
+        let error = tool
+            .execute(
+                &crate::Workspace::default(),
+                json!({"action": "snapshot", "tab": "docs"}),
+            )
+            .await
+            .expect_err("a tab the cap closed is refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("docs") && message.contains("no longer exists"),
+            "the refusal names the tab and says it is gone: {message}"
+        );
+        assert!(
+            !message.contains("extension") && !message.contains("debugger"),
+            "the refusal is the tool's own record, never a lost extension attach: {message}"
+        );
+        // Only the tab the cap closed is refused; the run's other tabs are ordinary.
+        assert!(!tool.tab_was_closed_by_cap("a"));
+        // The record is keyed by the logical name, so the same tab spelled as its physical
+        // session name is the same refusal rather than a second tab.
+        assert!(tool.tab_was_closed_by_cap(&format!("{namespace}docs")));
     }
 }
