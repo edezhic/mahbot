@@ -129,13 +129,15 @@ const OLD_DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-vision-exp";
 // targets OpenRouter.
 pub(crate) const VIDEO_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.8-flash";
 
-pub(crate) const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image";
+/// Image-generation model used by every account that has no explicit pick.
+/// The retired predecessor (`google/gemini-3.1-flash-image`) is rewritten out
+/// of the stored picker list and of every account's pick by catalog entry `50`.
+pub(crate) const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-nano-banana-2.1";
 pub(crate) const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
 
 /// Fresh-install seeded image-generation model list (newline-separated, in
 /// picker order). Mirrors the curated set the live install ships.
-const FRESH_INSTALL_IMAGE_GEN_MODELS: &str =
-    "google/gemini-3.1-flash-image\nmicrosoft/mai-image-2.5\nqwen/qwen-image-3-pro";
+const FRESH_INSTALL_IMAGE_GEN_MODELS: &str = "google/gemini-nano-banana-2.1\nmicrosoft/mai-image-2.6\nopenai/gpt-image-2.5-sunburst\nqwen/qwen-image-3-pro";
 
 /// Fresh-install seeded video-generation model list (newline-separated, in
 /// picker order). Mirrors the curated set the live install ships.
@@ -2067,7 +2069,7 @@ mod tests {
                 ),
                 (
                     "image_gen_models".to_string(),
-                    "google/gemini-3.1-flash-image\nmicrosoft/mai-image-2.5\nqwen/qwen-image-3-pro"
+                    "google/gemini-nano-banana-2.1\nmicrosoft/mai-image-2.6\nopenai/gpt-image-2.5-sunburst\nqwen/qwen-image-3-pro"
                         .to_string()
                 ),
                 (

@@ -47,9 +47,14 @@
 //! that still name a retired stage. The tail's index rebuild is `46`, which
 //! drops and recreates the ticket-title FTS index in the engine's 0.8.0
 //! on-disk layout (see [`REBUILD_TICKET_TITLE_FTS_INDEX`]), and the tail's
-//! newest upfill is `47`, which adds the `jobs.exec_dir` column.
+//! newest upfill is `47`, which adds the `jobs.exec_dir` column. The tail's
+//! newest entries are `48`, which merges the retired `in_diagnostics` stage
+//! into `verification`, `49`, which drops the stored workspace contexts that
+//! claim the project commands already ran before the round, and `50`, which
+//! rewrites the retired image-generation default to its successor in the
+//! picker list and in every account's pick.
 //!
-//! Future schema changes resume the chain at id `48` with monotonically
+//! Future schema changes resume the chain at id `51` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -671,6 +676,10 @@ UPDATE ticket_chronicle SET target_phase = 'verification' WHERE target_phase = '
 /// - `49` invalidates the stored per-workspace contexts in `workspace_contexts`
 ///   that still claim the workspace's project commands already ran before the
 ///   round, so no agent is handed the retired arrangement.
+/// - `50` rewrites the retired image-generation default to its successor in the
+///   stored `image_gen_models` picker list and in every account's
+///   `users.image_gen_model` pick, matched on the exact (trimmed) id, so a
+///   near-miss id and the owner's other picks survive.
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -801,6 +810,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "49",
         target: TargetDb::Core,
         body: MigrationBody::Rust(drop_retired_commands_claim_descriptions),
+    },
+    Migration {
+        id: "50",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(retire_old_image_gen_model),
     },
 ];
 
@@ -1417,6 +1431,103 @@ async fn run_drop_retired_commands_claim_descriptions(conn: &Connection) -> anyh
         )
         .await
         .context("Failed to drop a stale stored workspace context")?;
+    }
+    Ok(())
+}
+
+/// Catalog `50`: the image-generation default that the curated set retired.
+const RETIRED_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image";
+/// Catalog `50`: the model the retired one is replaced by.
+const SUCCESSOR_IMAGE_GEN_MODEL: &str = "google/gemini-nano-banana-2.1";
+/// Catalog `50`: the `config_kv` key holding the newline-separated picker list.
+const IMAGE_GEN_MODELS_KV_KEY: &str = "image_gen_models";
+
+fn retire_old_image_gen_model(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_retire_old_image_gen_model(conn))
+}
+
+/// Data migration (`50`): the retired image-generation default is replaced by
+/// its successor on both user-visible surfaces — the `image_gen_models`
+/// `config_kv` picker list and every account's `users.image_gen_model` pick.
+///
+/// The picker list is owner-edited free text, so only the exact id is replaced:
+/// repetition and order are the owner's, a duplicate the replacement produces is
+/// left alone, and a near-miss id (e.g. `…-preview`) survives. Matching is on
+/// the trimmed line, the same normalisation the read path applies, so a
+/// whitespace-padded pick is still recognised and becomes the bare successor;
+/// every other line is kept byte-identical. The list row is only written when it
+/// actually changed, so a second run is a strict no-op on it.
+///
+/// Runs once, ever: the guarantee comes from the `schema_migrations` ledger —
+/// a later deliberate re-add of the retired id by the owner is kept, which an
+/// every-boot rewrite could not honour.
+async fn run_retire_old_image_gen_model(conn: &Connection) -> anyhow::Result<()> {
+    let mut list_rewritten = false;
+
+    let rows = conn
+        .query(
+            "SELECT value FROM config_kv WHERE key = ?1",
+            params![IMAGE_GEN_MODELS_KV_KEY],
+        )
+        .await
+        .context("Failed to read the stored image-generation picker list")?;
+    if let Some(row) = rows.into_iter().next() {
+        let value = row
+            .get::<String>(0)
+            .context("Failed to read config_kv.value")?;
+        let rewritten = value
+            .split('\n')
+            .map(|line| {
+                if line.trim() == RETIRED_IMAGE_GEN_MODEL {
+                    SUCCESSOR_IMAGE_GEN_MODEL
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if rewritten != value {
+            conn.execute(
+                "UPDATE config_kv SET value = ?1 WHERE key = ?2",
+                params![rewritten, IMAGE_GEN_MODELS_KV_KEY],
+            )
+            .await
+            .context("Failed to rewrite the stored image-generation picker list")?;
+            list_rewritten = true;
+        }
+    }
+
+    let mut rewritten_accounts = 0usize;
+    let accounts = conn
+        .query(
+            "SELECT name, image_gen_model FROM users WHERE image_gen_model IS NOT NULL",
+            (),
+        )
+        .await
+        .context("Failed to read the stored per-account image-generation picks")?;
+    for row in accounts {
+        let name = row.get::<String>(0).context("Failed to read users.name")?;
+        let pick = row
+            .get::<String>(1)
+            .context("Failed to read users.image_gen_model")?;
+        if pick.trim() != RETIRED_IMAGE_GEN_MODEL {
+            continue;
+        }
+        conn.execute(
+            "UPDATE users SET image_gen_model = ?1 WHERE name = ?2",
+            params![SUCCESSOR_IMAGE_GEN_MODEL, name],
+        )
+        .await
+        .context("Failed to rewrite a stored per-account image-generation pick")?;
+        rewritten_accounts += 1;
+    }
+
+    if list_rewritten || rewritten_accounts > 0 {
+        tracing::info!(
+            list_rewritten,
+            accounts = rewritten_accounts,
+            "retired image-generation model rewritten to its successor",
+        );
     }
     Ok(())
 }
@@ -2726,7 +2837,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`49` tail, and converges to the exact current core
+    /// upfills and the `36`–`50` tail, and converges to the exact current core
     /// shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -2753,10 +2864,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             applied,
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-                "40", "41", "42", "43", "44", "45", "46", "47", "48", "49"
+                "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–49 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–50 tail exactly"
         );
     }
 
@@ -3022,7 +3133,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`49`) as a
+    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`50`) as a
     /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
     /// column upfill, the delta-28 `jobs.caller_agent_id` /
     /// `session_metadata.created_at` column upfills (plus the delta-28
@@ -3044,10 +3155,12 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// index when the baseline re-runs it and that dropping and recreating the
     /// index leaves the rest of the store alone.
     ///
-    /// The stage-merge and phase-retirement tail (`44`/`45`/`48`/`49`) is a
-    /// no-op here too: the seeded rows name none of the retired stages and claim
-    /// no earlier command run, so no job is deleted, no phase is rewritten and
-    /// the empty `workspace_contexts` stays empty.
+    /// The stage-merge and phase-retirement tail (`44`/`45`/`48`/`49`) and the
+    /// image-model retirement (`50`) are a no-op here too: the seeded rows name
+    /// none of the retired stages and claim no earlier command run, so no job is
+    /// deleted, no phase is rewritten and the empty `workspace_contexts` stays
+    /// empty, and the seeded `config_kv` row is an unrelated key while the
+    /// seeded account's pick is NULL.
     #[tokio::test]
     #[expect(clippy::too_many_lines)]
     async fn old_catalog_current_db_reopens_as_noop() {
@@ -3074,7 +3187,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40", "41", "42", "43", "44", "45", "46", "47", "48", "49",
+            "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3083,7 +3196,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..49"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..50"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -3281,11 +3394,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
     /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
     /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
-    /// entries `36`–`49`: the data migrations (detaching guests from
+    /// entries `36`–`50`: the data migrations (detaching guests from
     /// shared workspaces, rewriting the legacy `DeepSeek` routing slug,
     /// deleting the command-armed alarm rows, rewriting the retired
-    /// `in_review`/`in_qa` stages to `verification`, and invalidating the
-    /// stored workspace lifecycle descriptions that still name them), the `users.granted_tools`
+    /// `in_review`/`in_qa` stages to `verification`, invalidating the
+    /// stored workspace lifecycle descriptions that still name them, and
+    /// replacing the retired image-generation model in the picker list and in
+    /// the account picks), the `users.granted_tools`
     /// column, the drops of the account-kind `users.permissions` /
     /// `users.selected_role` columns, and the `alarms.trigger` upfill plus the
     /// `alarms.command` drop that retire the command-armed alarm feature.
@@ -3390,7 +3505,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40", "41", "42", "43", "44", "45", "46", "47", "48", "49",
+            "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3399,7 +3514,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..49"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..50"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -4343,5 +4458,156 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "a re-run must not rewrite another hop"
         );
         assert_eq!(workspace_context_rows(&conn).await, contexts);
+    }
+
+    /// The stored `config_kv.value` for the `image_gen_models` owner-editable
+    /// picker list, for the delta-50 behavioral pin.
+    async fn image_gen_models_list(conn: &Connection) -> String {
+        conn.query(
+            "SELECT value FROM config_kv WHERE key = ?1",
+            params![IMAGE_GEN_MODELS_KV_KEY],
+        )
+        .await
+        .expect("read config_kv")
+        .into_iter()
+        .next()
+        .expect("image_gen_models row")
+        .get::<String>(0)
+        .expect("value")
+    }
+
+    /// `name → users.image_gen_model` (including NULL) for the delta-50
+    /// behavioral pin.
+    async fn users_image_gen_models(
+        conn: &Connection,
+    ) -> std::collections::BTreeMap<String, Option<String>> {
+        conn.query("SELECT name, image_gen_model FROM users", ())
+            .await
+            .expect("read users")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String>(0).expect("user name"),
+                    row.get::<Option<String>>(1).expect("image_gen_model"),
+                )
+            })
+            .collect()
+    }
+
+    /// Behavioral pin for catalog entry `50`: the retired image-generation
+    /// default is replaced by its successor on both user-visible surfaces — the
+    /// owner-edited `image_gen_models` picker list and every account's
+    /// `users.image_gen_model` pick — while a near-miss id, the owner's other
+    /// picks and a NULL pick survive verbatim, and blank lines/repeats/order are
+    /// preserved. Matching is on the trimmed line, so the whitespace-padded pick
+    /// becomes the bare successor. A successor that was already in the list
+    /// stays beside the replacement — duplicates are the owner's business. The
+    /// `schema_migrations` ledger makes it one-shot: a later deliberate re-add
+    /// of the retired id is kept.
+    #[tokio::test]
+    async fn retire_old_image_gen_model_rewrites_both_picker_surfaces_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        // Apply the catalog through entry `49` so only `50` is left to run.
+        let entry_50 = MIGRATIONS
+            .iter()
+            .position(|m| m.id == "50")
+            .expect("entry 50 in the catalog");
+        run_catalog(&conn, TargetDb::Core, &MIGRATIONS[..entry_50])
+            .await
+            .expect("catalog through 49");
+
+        // A realistic-messy owner list: blank lines, a repeat, a near-miss id, a
+        // whitespace-padded pick and a trailing newline.
+        conn.execute(
+            "INSERT INTO config_kv (key, value) VALUES (?1, ?2)",
+            params![
+                IMAGE_GEN_MODELS_KV_KEY,
+                "bogus/keep-me\n\ngoogle/gemini-3.1-flash-image\n\
+                 google/gemini-3.1-flash-image-preview\n  google/gemini-3.1-flash-image  \n\
+                 microsoft/mai-image-2.6\ngoogle/gemini-nano-banana-2.1\ngoogle/gemini-3.1-flash-image\n"
+            ],
+        )
+        .await
+        .unwrap();
+        for (name, pick) in [
+            ("alice", Some(RETIRED_IMAGE_GEN_MODEL)),
+            ("bob", Some("microsoft/mai-image-2.6")),
+            ("carol", None),
+        ] {
+            conn.execute(
+                "INSERT INTO users (name, image_gen_model) VALUES (?1, ?2)",
+                params![name, pick],
+            )
+            .await
+            .unwrap();
+        }
+
+        run_migrations(&conn, TargetDb::Core)
+            .await
+            .expect("full catalog");
+
+        assert_eq!(
+            image_gen_models_list(&conn).await,
+            "bogus/keep-me\n\ngoogle/gemini-nano-banana-2.1\n\
+             google/gemini-3.1-flash-image-preview\ngoogle/gemini-nano-banana-2.1\n\
+             microsoft/mai-image-2.6\ngoogle/gemini-nano-banana-2.1\ngoogle/gemini-nano-banana-2.1\n",
+            "only the exact retired id may be replaced, on the trimmed line; the \
+             near-miss, the order, the blanks and the repeats must survive — and \
+             an already-present successor may end up duplicated (no dedupe)"
+        );
+        let picks = users_image_gen_models(&conn).await;
+        assert_eq!(
+            picks.get("alice"),
+            Some(&Some(SUCCESSOR_IMAGE_GEN_MODEL.to_string())),
+            "the account holding the retired id must be rewritten"
+        );
+        assert_eq!(
+            picks.get("bob"),
+            Some(&Some("microsoft/mai-image-2.6".to_string())),
+            "another model pick must be untouched"
+        );
+        assert_eq!(
+            picks.get("carol"),
+            Some(&None),
+            "a NULL pick must be untouched"
+        );
+
+        // The ledger recorded `50`, so a deliberate re-add by the owner must
+        // survive the next boot's catalog run.
+        conn.execute(
+            "UPDATE config_kv SET value = ?1 WHERE key = ?2",
+            params![
+                format!("{RETIRED_IMAGE_GEN_MODEL}\n{SUCCESSOR_IMAGE_GEN_MODEL}"),
+                IMAGE_GEN_MODELS_KV_KEY
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE users SET image_gen_model = ?1 WHERE name = 'alice'",
+            params![RETIRED_IMAGE_GEN_MODEL],
+        )
+        .await
+        .unwrap();
+        run_migrations(&conn, TargetDb::Core)
+            .await
+            .expect("second catalog run");
+        assert!(
+            image_gen_models_list(&conn)
+                .await
+                .starts_with(RETIRED_IMAGE_GEN_MODEL),
+            "a later deliberate re-add of the retired id must be kept: one-shot"
+        );
+        assert_eq!(
+            users_image_gen_models(&conn).await.get("alice"),
+            Some(&Some(RETIRED_IMAGE_GEN_MODEL.to_string())),
+            "a later deliberate re-add of the retired id must be kept: one-shot"
+        );
     }
 }

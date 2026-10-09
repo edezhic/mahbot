@@ -44,7 +44,7 @@ impl Tool for ImageGenTool {
                 },
                 "size": {
                     "type": "string",
-                    "description": "Image size (e.g. 1K, 2K)"
+                    "description": "Image size — a tier (e.g. 1K, 2K) or explicit pixels (e.g. 1024x1024); only a value the selected model supports is accepted"
                 }
             }),
             &["prompt"],
@@ -56,7 +56,7 @@ impl Tool for ImageGenTool {
         let user_name = crate::agent::tool_user_name();
         let model = crate::users::resolve_image_gen_model(&user_name).await;
         let aspect_ratio_arg = super::get_opt_str(&args, "aspect_ratio");
-        let size = super::get_opt_str(&args, "size");
+        let size_arg = super::get_opt_str(&args, "size");
         let images: Vec<String> = super::get_str_array(&args, "images")?;
 
         // Confine every reference before any other filesystem or provider
@@ -91,6 +91,11 @@ impl Tool for ImageGenTool {
                 reference_paths.len(),
             );
         }
+
+        // The size the selected model accepts is a catalog fact, so it is
+        // resolved and refused BEFORE any file is read — the request must not
+        // reach the provider with a value that model cannot express.
+        let size = resolve_size(&model, size_arg, info)?;
 
         // Combined-size pre-flight before loading any file: the per-image
         // ceilings don't bound the total, and a pathological multi-reference
@@ -462,7 +467,11 @@ fn describe_http_failure(status: u16, body: &str) -> String {
 /// available) the model's declared capabilities. `info` is `Some` exactly
 /// when the catalog is available and the model passed the capability check;
 /// `None` means the catalog is unavailable (fail-open) — only explicitly
-/// user-provided parameters are sent.
+/// user-provided parameters that need no capability check are sent, and a
+/// requested size is dropped (see [`resolve_size`], which then returns `None`).
+///
+/// `size` is the pre-validated [`resolve_size`] result: the request-body key
+/// to send it under, and the value.
 ///
 /// Reference-count validation happens in `execute`'s pre-flight guard before
 /// any file is loaded; this builder trusts the caller's count.
@@ -470,7 +479,7 @@ fn build_request_body(
     model: &str,
     prompt: &str,
     aspect_ratio: Option<&str>,
-    size: Option<&str>,
+    size: Option<(&'static str, String)>,
     references: &[crate::util::ReferenceImage],
     info: Option<&ImageModelInfo>,
 ) -> serde_json::Value {
@@ -493,39 +502,24 @@ fn build_request_body(
             body["aspect_ratio"] = json!(ratio);
         }
 
-        if let Some(s) = size {
-            if s.contains(['x', 'X', '×']) {
-                if info.declares("size") {
-                    body["size"] = json!(s);
-                } else {
-                    tracing::debug!("size `{s}` dropped — model `{model}` does not declare `size`");
-                }
-            } else if info.declares("resolution") {
-                // Catalog resolution enums are uppercase ("1K", "2K", "4K", "512").
-                body["resolution"] = json!(s.to_uppercase());
-            } else {
-                tracing::debug!(
-                    "size `{s}` dropped — model `{model}` does not declare `resolution`"
-                );
-            }
-        }
-
         if !references.is_empty() {
             body[super::INPUT_REFERENCES_KEY] = super::reference_json(references);
         }
     } else {
-        // Fail-open: send only what the user explicitly provided.
+        // Fail-open: send only what the user explicitly provided. The size is
+        // deliberately dropped by `resolve_size` (it returns `None`) — with no
+        // catalog data, guessing the model's size parameter is not an option.
         if let Some(ratio) = aspect_ratio {
             body["aspect_ratio"] = json!(ratio);
-        }
-        if let Some(s) = size {
-            tracing::debug!(
-                "size `{s}` dropped — catalog unavailable, only user-provided parameters are sent"
-            );
         }
         if !references.is_empty() {
             body[super::INPUT_REFERENCES_KEY] = super::reference_json(references);
         }
+    }
+
+    // The size is pre-validated by `resolve_size`, so apply it unconditionally.
+    if let Some((key, value)) = size {
+        body[key] = json!(value);
     }
 
     body
@@ -551,6 +545,81 @@ fn validate_reference_count(
         ),
     }
     Ok(())
+}
+
+/// Resolve the requested `size` against the selected model's declared
+/// capabilities, returning the request-body key and the normalised value the
+/// request must carry.
+///
+/// The model — not MahBot — decides which sizes exist, so a value it cannot
+/// express is refused with the values it does support (or an explicit "no
+/// adjustable size") instead of being dropped silently or bounced back by the
+/// provider as an opaque error. A tier (`2K`) is case-insensitive and goes
+/// through `resolution` when the model declares it, through `size` otherwise
+/// (OpenRouter's `size` takes a tier or explicit pixels); pixels
+/// (`1024x1024`) always go through `size`. With no catalog data nothing is
+/// known about the model, so the value is dropped exactly as before.
+fn resolve_size(
+    model: &str,
+    size: Option<&str>,
+    info: Option<&ImageModelInfo>,
+) -> anyhow::Result<Option<(&'static str, String)>> {
+    let Some(size) = size.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+
+    let Some(info) = info else {
+        tracing::debug!(
+            "size `{size}` dropped — catalog unavailable, so no model capability is known"
+        );
+        return Ok(None);
+    };
+
+    let (key, value) = if size.contains(['x', 'X', '×']) {
+        ("size", size.to_string())
+    } else if info.declares("resolution") {
+        ("resolution", size.to_uppercase())
+    } else {
+        ("size", size.to_uppercase())
+    };
+
+    if !info.declares(key) {
+        return Err(unsupported_size(model, size, info));
+    }
+    // A declared enum is the model's own list of what it takes; another
+    // constraint shape declares the parameter without enumerating values.
+    if let Some(values) = info.enum_values(key)
+        && !values.iter().any(|v| v.eq_ignore_ascii_case(&value))
+    {
+        return Err(unsupported_size(model, size, info));
+    }
+
+    Ok(Some((key, value)))
+}
+
+/// The refusal for a size the selected model cannot express: the values it
+/// accepts, or — when the model declares no size parameter at all — a
+/// statement that it has no adjustable size (an empty value list would be
+/// meaningless).
+fn unsupported_size(model: &str, size: &str, info: &ImageModelInfo) -> anyhow::Error {
+    let supported: Vec<&str> = ["resolution", "size"]
+        .iter()
+        .filter_map(|param| info.enum_values(param))
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    if supported.is_empty() {
+        anyhow::anyhow!(
+            "usage: model `{model}` has no adjustable image size — \
+             hint: omit the `size` argument"
+        )
+    } else {
+        anyhow::anyhow!(
+            "usage: model `{model}` does not support size `{size}` — \
+             hint: pass a size it supports: {}",
+            supported.join(", ")
+        )
+    }
 }
 
 /// All canonical aspect ratios supported by OpenRouter, mapped to their float
@@ -721,8 +790,8 @@ mod tests {
     use crate::tools::media_catalog::image::{ImageCatalog, parse_catalog};
 
     /// Fixture catalog covering a hybrid image model (resolution + reference
-    /// caps), a recraft-like model (aspect ratio only, declares "auto"), and a
-    /// text-only model.
+    /// caps), a recraft-like model (aspect ratio only, declares "auto"), a
+    /// model with explicit-pixel `size`, and a text-only model.
     fn fixture_catalog() -> ImageCatalog {
         parse_catalog(&json!({
             "data": [
@@ -741,6 +810,13 @@ mod tests {
                     "supported_parameters": {
                         "aspect_ratio": { "type": "enum", "values": ["1:1", "9:16", "auto"] },
                         "input_references": { "type": "range", "min": 0, "max": 1 }
+                    }
+                },
+                {
+                    "id": "acme/pixels",
+                    "architecture": { "output_modalities": ["image"] },
+                    "supported_parameters": {
+                        "size": { "type": "enum", "values": ["1024x1024", "2048x2048"] }
                     }
                 },
                 {
@@ -776,11 +852,13 @@ mod tests {
 
         // size "2k" → resolution "2K" (catalog case); 9:16; two references.
         let refs = refs(2).await;
+        let size = resolve_size("qwen/qwen-image-3-pro", Some("2k"), qwen).unwrap();
+        assert_eq!(size, Some(("resolution", "2K".to_string())));
         let body = build_request_body(
             "qwen/qwen-image-3-pro",
             "a cat",
             Some("9:16"),
-            Some("2k"),
+            size,
             &refs,
             qwen,
         );
@@ -805,31 +883,49 @@ mod tests {
         let catalog = fixture_catalog();
         let recraft = catalog.find("recraft/recraft-v4.1");
         let qwen = catalog.find("qwen/qwen-image-3-pro");
+        let acme = catalog.find("acme/pixels");
 
-        // No declared resolution → size dropped entirely.
-        let body = build_request_body(
-            "recraft/recraft-v4.1",
-            "p",
-            Some("9:16"),
-            Some("2K"),
-            &[],
-            recraft,
+        // recraft declares no size parameter at all → refused, not dropped.
+        let err = resolve_size("recraft/recraft-v4.1", Some("2K"), recraft).unwrap_err();
+        assert!(
+            err.to_string().contains("has no adjustable image size"),
+            "unexpected error: {err}"
         );
-        assert!(body.get("resolution").is_none());
-        assert_eq!(body["aspect_ratio"], "9:16");
 
-        // '1024X1024' (uppercase separator) with no declared `size` → dropped,
-        // never sent as a bogus resolution.
-        let body = build_request_body(
-            "qwen/qwen-image-3-pro",
-            "p",
-            None,
-            Some("1024X1024"),
-            &[],
-            qwen,
+        // qwen declares resolution ["1K", "2K"] → an unsupported tier names
+        // the values the model does support.
+        let err = resolve_size("qwen/qwen-image-3-pro", Some("512"), qwen).unwrap_err();
+        assert!(
+            err.to_string().contains("1K, 2K"),
+            "unexpected error: {err}"
         );
-        assert!(body.get("resolution").is_none());
-        assert!(body.get("size").is_none());
+
+        // '1024X1024' (uppercase separator) is pixels; qwen declares no `size`
+        // → refused with its resolution values, never sent as a bogus resolution.
+        let err = resolve_size("qwen/qwen-image-3-pro", Some("1024X1024"), qwen).unwrap_err();
+        assert!(
+            err.to_string().contains("1K, 2K"),
+            "unexpected error: {err}"
+        );
+
+        // A tier is case-insensitive: "1k" matches the declared "1K".
+        assert_eq!(
+            resolve_size("qwen/qwen-image-3-pro", Some("1k"), qwen).unwrap(),
+            Some(("resolution", "1K".to_string()))
+        );
+
+        // Explicit-pixel model: a supported pixel value is sent verbatim under
+        // `size`; an unsupported one is refused with the supported list.
+        let size = resolve_size("acme/pixels", Some("1024x1024"), acme).unwrap();
+        assert_eq!(size, Some(("size", "1024x1024".to_string())));
+        let body = build_request_body("acme/pixels", "p", None, size, &[], acme);
+        assert_eq!(body["size"], "1024x1024");
+
+        let err = resolve_size("acme/pixels", Some("512x512"), acme).unwrap_err();
+        assert!(
+            err.to_string().contains("1024x1024, 2048x2048"),
+            "unexpected error: {err}"
+        );
 
         // "auto" not declared by qwen → falls back to the 9:16 default.
         let body = build_request_body("qwen/qwen-image-3-pro", "p", Some("auto"), None, &[], qwen);
@@ -862,14 +958,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_request_body_fail_open_minimal() {
-        // info = None (catalog unavailable): only user-provided params are sent.
+        // info = None (catalog unavailable): only user-provided params are sent,
+        // and the size is dropped — no model capability is known.
         let refs = refs(1).await;
-        let body = build_request_body("any/model", "p", Some("16:9"), Some("2k"), &refs, None);
+        let size = resolve_size("any/model", Some("2k"), None).unwrap();
+        assert!(size.is_none());
+        let body = build_request_body("any/model", "p", Some("16:9"), size, &refs, None);
         assert_eq!(body["model"], "any/model");
         assert_eq!(body["prompt"], "p");
         assert_eq!(body["aspect_ratio"], "16:9");
         assert_eq!(body["input_references"].as_array().unwrap().len(), 1);
         assert!(body.get("resolution").is_none());
+        assert!(body.get("size").is_none());
 
         // No aspect ratio provided → not sent at all (no default in fail-open).
         let body = build_request_body("any/model", "p", None, None, &[], None);

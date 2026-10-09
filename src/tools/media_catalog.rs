@@ -74,13 +74,21 @@ pub mod image {
             self.supported_parameters.contains_key(param)
         }
 
+        /// The declared values of enum `param`; `None` when the catalog does not
+        /// declare `param` or declares it with another constraint shape.
+        #[must_use]
+        pub(crate) fn enum_values(&self, param: &str) -> Option<&[String]> {
+            match self.supported_parameters.get(param) {
+                Some(ParameterConstraint::Enum(values)) => Some(values),
+                _ => None,
+            }
+        }
+
         /// Whether `param` is a declared enum that includes `value`.
         #[must_use]
         pub(crate) fn enum_contains(&self, param: &str, value: &str) -> bool {
-            matches!(
-                self.supported_parameters.get(param),
-                Some(ParameterConstraint::Enum(values)) if values.iter().any(|v| v == value)
-            )
+            self.enum_values(param)
+                .is_some_and(|values| values.iter().any(|v| v == value))
         }
 
         /// The declared `param` range max (e.g. `input_references` cap).
