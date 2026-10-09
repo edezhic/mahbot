@@ -1,0 +1,1 @@
+This round runs no project commands — the workspace has none configured. Nothing here is covered for you, and the round's verdict rests on your own checks alone.

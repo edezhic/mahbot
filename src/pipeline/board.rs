@@ -126,12 +126,11 @@ crate::columns! {
 /// notifications.
 const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
-    TicketPhase::InDiagnostics,
     TicketPhase::Verification,
     TicketPhase::InSanitation,
 ];
 
-/// The five phases the poll loop drives with phase jobs, in dispatch order.
+/// The four phases the poll loop drives with phase jobs, in dispatch order.
 ///
 /// Note: this is deliberately NOT the [`TicketPhase`] declaration order —
 /// `InSanitation` is dispatched last, after verification. Both the dispatch
@@ -140,7 +139,6 @@ const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
 pub(crate) const WORKING_PHASES: &[TicketPhase] = &[
     TicketPhase::Analysis,
     TicketPhase::InDevelopment,
-    TicketPhase::InDiagnostics,
     TicketPhase::Verification,
     TicketPhase::InSanitation,
 ];
@@ -319,7 +317,7 @@ pub struct Ticket {
     /// ticket leaves Done. `None` for never-done or not-currently-done tickets.
     pub done_at: Option<String>,
     /// Number of times this ticket bounced back into development from a
-    /// validation-phase non-success (diagnostics/verification/sanitation).
+    /// validation-phase non-success (verification/sanitation).
     /// Drives the bounce-based circuit breaker (max 10). Engineer hard failures are
     /// pause-only (workspace pause, implementation frozen) and do not consume this
     /// budget.
@@ -526,11 +524,11 @@ pub enum TicketPhase {
     Planning,
     Queued,
     InDevelopment,
-    InDiagnostics,
     InSanitation,
     /// The merged code-review + functional-check stage: the code reviewers and
     /// the single functional tester run concurrently on one phase job and
-    /// produce one consolidated result.
+    /// produce one consolidated result. The round also runs the workspace's own
+    /// project commands alongside its participants.
     Verification,
     Done,
     Cancelled,
@@ -567,8 +565,8 @@ impl TicketPhase {
     ///
     /// Tickets in these phases occupy the dev/verification pipeline — only one
     /// ticket per workspace may be in the pipeline at a time. Each phase is
-    /// owned by its own short-lived phase job (development, diagnostics,
-    /// verification, sanitation). The automated
+    /// owned by its own short-lived phase job (development, verification,
+    /// sanitation). The automated
     /// create-ticket tool (when superseding an existing ticket) and the
     /// update-ticket tool refuse to modify tickets in any of these phases to
     /// prevent race conditions during phase transitions. `add_comment` is the
@@ -1505,8 +1503,8 @@ impl BoardStore {
     }
 
     /// Increment the ticket's shared return-to-development counter inside an
-    /// existing transaction. Every validation-phase non-success — diagnostics,
-    /// verification or sanitation — goes through this one counter.
+    /// existing transaction. Every validation-phase non-success — verification
+    /// or sanitation — goes through this one counter.
     ///
     /// Called atomically with the bounce-back transition so the counter can
     /// never drift from the transitions that produce it. Returns the

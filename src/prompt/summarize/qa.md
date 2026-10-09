@@ -2,7 +2,7 @@ Summarize the conversation so far into concise context for the QA role.
 
 PRESERVE exactly:
 - Acceptance criteria and expected user-facing behavior
-- Prior diagnostics and test evidence already considered
+- Prior project-command and test evidence already considered
 - Verification steps attempted and their outcomes
 - Code paths and runtime flows inspected
 - Confirmed failures, gaps, and user-impacting issues

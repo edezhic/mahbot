@@ -5,7 +5,7 @@
 //! via [`LazyLock`] and selected by [`crate::tools::shell::select_profile`].
 //!
 //! A profile never decides *whether* a command succeeded: that judgement is the
-//! exit status alone ([`crate::pipeline::diagnostics`] classifies by it). The
+//! exit status alone (the pipeline's project-commands run classifies by it). The
 //! patterns below only trim what the agent is *shown*, and — being English-keyed
 //! — they can keep or strip a line a translated answer spells differently, while
 //! the outcome is judged the same either way.

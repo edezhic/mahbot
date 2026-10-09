@@ -378,14 +378,14 @@ mod tests {
             Hop {
                 id: "mahbot-1736".into(),
                 source: "in_development".into(),
-                target: "in_diagnostics".into(),
+                target: "verification".into(),
                 at: "2026-08-17T08:11:34.225709+00:00".into(),
                 actor: "engineer".into(),
             },
             Hop {
                 id: "mahbot-1736".into(),
-                source: "in_diagnostics".into(),
-                target: "verification".into(),
+                source: "verification".into(),
+                target: "in_sanitation".into(),
                 at: "2026-08-17T08:21:19.225709+00:00".into(),
                 actor: "system".into(),
             },
@@ -395,10 +395,10 @@ mod tests {
         assert!(result.ends_with("</ticket-updates>\n"));
         assert_eq!(result.matches("• mahbot-1736:").count(), 1);
         assert!(result.contains(
-            "    in_development → in_diagnostics (2026-08-17T08:11:34.225709+00:00) [engineer]"
+            "    in_development → verification (2026-08-17T08:11:34.225709+00:00) [engineer]"
         ));
         assert!(result.contains(
-            "    in_diagnostics → verification (2026-08-17T08:21:19.225709+00:00) [system]"
+            "    verification → in_sanitation (2026-08-17T08:21:19.225709+00:00) [system]"
         ));
     }
 

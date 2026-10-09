@@ -360,8 +360,8 @@ fn markdown_settings_with(font: iced::Font, text_size: f32) -> iced::widget::mar
 #[must_use]
 pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
     use TicketPhase::{
-        Analysis, Backlog, Cancelled, Done, Failed, InDevelopment, InDiagnostics, InSanitation,
-        Planning, Queued, Verification,
+        Analysis, Backlog, Cancelled, Done, Failed, InDevelopment, InSanitation, Planning, Queued,
+        Verification,
     };
     match phase {
         // Early phases — cool/muted, neutral
@@ -386,11 +386,6 @@ pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
         InDevelopment => (
             Color::from_rgb(0.941, 0.878, 0.784),
             Color::from_rgb(0.380, 0.216, 0.078),
-        ),
-        // Diagnostic phases — amber/teal
-        InDiagnostics => (
-            Color::from_rgb(0.902, 0.863, 0.784),
-            Color::from_rgb(0.310, 0.224, 0.102),
         ),
         // Sanitation phases — neutral gray
         InSanitation => (

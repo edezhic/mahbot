@@ -1,6 +1,8 @@
-//! The `verification` stage: one phase job runs the read-only code reviewers and
-//! the single functional tester at the same time, and the round produces ONE
-//! consolidated joint comment and one advance/bounce decision.
+//! The `verification` stage runs the workspace's project commands, the read-only
+//! code reviewers and the single functional tester at the same time on one phase
+//! job, and the round produces ONE consolidated comment and one advance/bounce
+//! decision. The project commands are nobody's roster slot: they are the round's
+//! own work, run in parallel with the participants.
 //!
 //! The round's cohorts are told apart by their stored `agents.kind` labels, never
 //! by slot order, and a roster that is not the round's shape is never resumed as
@@ -8,16 +10,19 @@
 //! reviewed-base recording are reviewer-only: the tester is never skipped and
 //! never records a reviewed base.
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::agent::role::DIAGNOSTICS_ROLE;
 use crate::git::commands::{
     has_unstaged_changes, run_git_add_all, run_git_head, run_git_status, run_git_worktree_snapshot,
     run_git_write_tree,
 };
 use crate::pipeline::board::Ticket;
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
-use crate::{Role, Workspace};
+use crate::tools::shell::{ShellMode, ShellTool};
+use crate::{DiagnosticsCommands, Role, Workspace};
 
 use super::{
     AgentSlot, ExtractionMode, FinalizeOutcome, ParallelVerdict, TicketPhase, TransitionCtx,
@@ -87,11 +92,15 @@ const TESTER: Participant = Participant {
 };
 
 impl Participant {
-    /// The round's work prompt with the engineer's response baked in.
-    fn prompt(self, ticket: &Ticket) -> String {
+    /// The round's work prompt with the engineer's response and the round's own
+    /// project-commands brief baked in.
+    fn prompt(self, ticket: &Ticket, commands_brief: &str) -> String {
         substitute(
             &load_prompt(self.prompt_template),
-            &[("{{agent_response}}", engineer_response(ticket))],
+            &[
+                ("{{agent_response}}", engineer_response(ticket)),
+                ("{{project_commands}}", commands_brief),
+            ],
         )
     }
 
@@ -121,6 +130,32 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     if guard_job_phase(&ticket.id, ACTIVE_PHASE, &job_id).await {
         return;
     }
+    // The round's project-commands part — the workspace's discovered diagnostics
+    // commands — read once before anything is dispatched: not being able to read
+    // them is a technical failure (no bounce budget) — the round cannot be judged
+    // without knowing them.
+    let commands = match crate::workspace::store().get_diagnostics(&ws.name).await {
+        Ok(Some(cmds)) if !cmds.is_empty() => Some(cmds),
+        Ok(_) => None,
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to load the workspace's project commands — resetting for a fresh attempt",
+            );
+            reset_phase_attempt(
+                &ticket,
+                ACTIVE_PHASE,
+                &job_id,
+                "project commands load failure",
+                &format!(
+                    "Could not load the workspace's project commands due to a database error: {e}"
+                ),
+            )
+            .await;
+            return;
+        }
+    };
     let Some(roster) = read_roster_or_bail(&ticket.id, &job_id).await else {
         return;
     };
@@ -147,12 +182,12 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
         // A roster write failure leaves the job with no plan: bail and let the
         // poller re-drive it rather than run a round the resume path could
         // misread.
-        let Some(plan) = RoundPlan::fresh(&ticket, &ws, &job_id).await else {
+        let Some(plan) = RoundPlan::fresh(&ticket, &ws, &job_id, commands.as_ref()).await else {
             return;
         };
         plan
     };
-    execute_round(ticket, ws, job_id, plan, resume).await;
+    execute_round(ticket, ws, job_id, plan, resume, commands).await;
 }
 
 /// One verification round's dispatch plan: the two participant cohorts. The
@@ -165,8 +200,14 @@ struct RoundPlan {
 impl RoundPlan {
     /// Build a fresh round: calibrated reviewers (none when the content is
     /// already checked) plus the always-present functional tester.
-    async fn fresh(ticket: &Ticket, ws: &Workspace, job_id: &str) -> Option<Self> {
-        let tester_prompt = TESTER.prompt(ticket);
+    async fn fresh(
+        ticket: &Ticket,
+        ws: &Workspace,
+        job_id: &str,
+        commands: Option<&DiagnosticsCommands>,
+    ) -> Option<Self> {
+        let commands_brief = commands_brief(commands);
+        let tester_prompt = TESTER.prompt(ticket, &commands_brief);
         // The identical-content rule: content already checked on this ticket is
         // not checked again by the reviewers. It never skips the tester.
         let (reviewer_prompt, reviewers) = if skip_review_for_identical_content(ticket, ws).await {
@@ -176,7 +217,7 @@ impl RoundPlan {
             );
             (None, Vec::new())
         } else {
-            let prompt = REVIEWER.prompt(ticket);
+            let prompt = REVIEWER.prompt(ticket, &commands_brief);
             let slots = build_agent_slots(
                 &ticket.id,
                 REVIEWER.role,
@@ -256,6 +297,113 @@ struct ReviewBase {
     tree: String,
 }
 
+/// The round's project-commands brief for the participants' work prompts: the
+/// concrete list of the commands this round runs, in execution order, or the
+/// notice that it runs none.
+fn commands_brief(commands: Option<&DiagnosticsCommands>) -> String {
+    let Some(commands) = commands else {
+        return load_prompt("pipeline/round_commands_none.md");
+    };
+    let list = commands
+        .commands()
+        .iter()
+        .filter_map(|(label, cmd)| cmd.map(|cmd| format!("- {label}: `{cmd}`")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    substitute(
+        &load_prompt("pipeline/round_commands.md"),
+        &[("{{commands}}", &list)],
+    )
+}
+
+/// The round's project-commands result: the comment section that records the
+/// run (the commands in execution order, what passed, and the command the run
+/// stopped at) and whether every command passed — vacuously true for a
+/// workspace with no commands configured.
+struct ProjectCommands {
+    section: String,
+    passed: bool,
+}
+
+/// Run the workspace's project commands — in order, stopping at the first
+/// failure — on the phase body's own task, concurrently with the round's
+/// participant cohorts. A command that changes the tree (an auto-formatter, a
+/// lint auto-fix) is part of the round exactly like a check: no command is
+/// held back to a step of its own.
+///
+/// The judgement is the exit status and nothing else (`Some(0)` is a pass):
+/// what a command writes is kept for the comment — through the output
+/// profiles, which trim it for display — but never read to decide the outcome.
+/// A check command answering in another language is therefore judged exactly as
+/// it is in English (see `profiles`' own note).
+async fn run_project_commands(
+    commands: Option<&DiagnosticsCommands>,
+    ws: &Workspace,
+) -> ProjectCommands {
+    let Some(commands) = commands else {
+        return ProjectCommands {
+            section: format!(
+                "**Project commands**\n\n{}",
+                load_prompt("pipeline/commands_none.md")
+            ),
+            passed: true,
+        };
+    };
+
+    let mut lines = String::new();
+    let mut failed_at: Option<&str> = None;
+    for (label, cmd) in commands.commands() {
+        let Some(cmd) = cmd else {
+            continue;
+        };
+        let started = std::time::Instant::now();
+        let elapsed = || started.elapsed().as_secs_f64();
+        match ShellTool::new(ShellMode::Full)
+            .execute_with_status(ws, serde_json::json!({ "command": cmd }))
+            .await
+        {
+            Ok((_output, Some(0))) => {
+                let _ = writeln!(lines, "- {label} (`{cmd}`): PASSED in {:.1}s", elapsed());
+            }
+            Ok((output, _exit_code)) => {
+                let display = if output.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    output
+                };
+                let _ = writeln!(
+                    lines,
+                    "- {label} (`{cmd}`): FAILED in {:.1}s\n\n```\n{display}\n```",
+                    elapsed(),
+                );
+                failed_at = Some(label);
+                break;
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    lines,
+                    "- {label} (`{cmd}`): FAILED in {:.1}s\n\n```\n{e}\n```",
+                    elapsed(),
+                );
+                failed_at = Some(label);
+                break;
+            }
+        }
+    }
+
+    // The commands' shell spills are this round's own leftovers, not an
+    // agent's — the phase body runs them with no agent identity.
+    crate::tools::shell::cleanup_agent_spills(DIAGNOSTICS_ROLE);
+    let footer = match failed_at {
+        Some(label) => format!("{} `{label}`", load_prompt("pipeline/commands_failed.md")),
+        None => load_prompt("pipeline/commands_passed.md"),
+    };
+    ProjectCommands {
+        section: format!("**Project commands**\n\n{}\n\n{footer}", lines.trim_end()),
+        passed: failed_at.is_none(),
+    }
+}
+
 /// Run the plan's cohorts concurrently on the phase job and finalize the
 /// merged round.
 async fn execute_round(
@@ -264,6 +412,7 @@ async fn execute_round(
     job_id: String,
     plan: RoundPlan,
     resume: bool,
+    commands: Option<DiagnosticsCommands>,
 ) {
     if resume {
         // Re-arm the not-Done slots as launched so comment routing and the
@@ -284,11 +433,15 @@ async fn execute_round(
     }
     let reviewer_count = plan.reviewers.len();
     let tester_count = plan.testers.len();
+    let command_count = commands.as_ref().map_or(0, |c| {
+        c.commands().iter().filter(|(_, cmd)| cmd.is_some()).count()
+    });
     info!(
         ticket = %ticket.id,
         reviewers = reviewer_count,
         testers = tester_count,
-        "Dispatching {reviewer_count} reviewer(s) and {tester_count} tester(s) in parallel",
+        commands = command_count,
+        "Dispatching {reviewer_count} reviewer(s), {tester_count} tester(s) and {command_count} project command(s) in parallel",
     );
 
     // A skipped code review was never dispatched, so it has neither content to
@@ -311,11 +464,12 @@ async fn execute_round(
         }
     };
 
-    // One round, two participant cohorts, dispatched at the same time on the
-    // same phase job.
-    let ((reviewer_results, reviewer_paused), (tester_results, tester_paused)) = tokio::join!(
+    // One round: the two participant cohorts and the workspace's project
+    // commands, all started at the same time on the same phase job.
+    let ((reviewer_results, reviewer_paused), (tester_results, tester_paused), commands_outcome) = tokio::join!(
         dispatch_cohort(&ticket, &ws, REVIEWER, &plan.reviewers, &job_id, resume),
         dispatch_cohort(&ticket, &ws, TESTER, &plan.testers, &job_id, resume),
+        run_project_commands(commands.as_ref(), &ws),
     );
 
     if guard_job_phase(&ticket.id, ACTIVE_PHASE, &job_id).await {
@@ -337,6 +491,7 @@ async fn execute_round(
         base,
         review_skipped,
         &job_id,
+        &commands_outcome,
     )
     .await;
 }
@@ -371,6 +526,7 @@ async fn dispatch_cohort(
 
 /// Finalize the merged round and record the reviewed base when the code review
 /// ran.
+#[expect(clippy::too_many_arguments)]
 async fn finalize_round(
     ws: &Workspace,
     ticket: &Ticket,
@@ -379,13 +535,15 @@ async fn finalize_round(
     base: Option<ReviewBase>,
     review_skipped: bool,
     job_id: &str,
+    commands: &ProjectCommands,
 ) {
     let results: Vec<ParallelVerdict> = reviewer_results
         .iter()
         .chain(tester_results)
         .cloned()
         .collect();
-    let transitioned = process_round_verdicts(ws, ticket, &results, review_skipped, job_id).await;
+    let transitioned =
+        process_round_verdicts(ws, ticket, &results, review_skipped, job_id, commands).await;
     if !review_skipped {
         // Tied to the code review having actually run: the recording is what
         // makes the identical-content rule fire on a later round, and the
@@ -404,6 +562,7 @@ async fn process_round_verdicts(
     results: &[ParallelVerdict],
     review_skipped: bool,
     job_id: &str,
+    commands: &ProjectCommands,
 ) -> bool {
     // Distinguish the two failure classes: a participant that did NOT complete
     // (NoResponse/ParseFailed) is a HARD TECHNICAL failure — reset the attempt
@@ -411,11 +570,13 @@ async fn process_round_verdicts(
     // complete but found issues (a Verdict below threshold) is a rework verdict
     // — bounce to development, consuming bounce budget.
     let technical_failure = results.iter().any(ParallelVerdict::is_technical_failure);
+    // The round's rework condition is the participants' verdicts OR the project
+    // commands: either failing sends the ticket back once per round.
     let rework_failure = !technical_failure
-        && results.iter().any(|r| match r {
-            ParallelVerdict::Verdict(v) => !verdict_passes(v),
-            _ => false,
-        });
+        && (!commands.passed
+            || results
+                .iter()
+                .any(|r| matches!(r, ParallelVerdict::Verdict(v) if !verdict_passes(v))));
 
     if crate::shutdown::aborting() {
         info!(
@@ -459,14 +620,17 @@ async fn process_round_verdicts(
         &ticket.title,
     )
     .await;
-    let mut comment = render_joint_comment(
+    let mut verdict = render_joint_comment(
         &round,
         &outcome,
         &crate::consensus::ItemTable::new(&round.issues),
     );
     if review_skipped {
-        comment.insert_str(0, SKIPPED_REVIEW_NOTE);
+        verdict.insert_str(0, SKIPPED_REVIEW_NOTE);
     }
+    // The round's ONE comment, both halves of its result: the project commands
+    // that ran alongside it, then the participants' verdict.
+    let comment = format!("{}\n\n---\n\n{verdict}", commands.section);
 
     if !rework_failure {
         return apply_clean_round(ticket, &comment, job_id).await;
@@ -509,7 +673,7 @@ async fn apply_clean_round(ticket: &Ticket, comment: &str, job_id: &str) -> bool
     }
     info!(
         ticket = %ticket.id,
-        "{STAGE}: every participant passed (≥ {threshold}/10)",
+        "{STAGE}: the project commands and every participant passed (≥ {threshold}/10)",
         threshold = VERIFICATION_THRESHOLD,
     );
     // Delete the phase job; the puller creates the next phase job.

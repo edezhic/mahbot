@@ -2,8 +2,8 @@
 //!
 //! The poll loop ([`run_management`]) is the ONLY way a stage's work starts.
 //! Each pipeline phase owns a short-lived `jobs` row whose `kind` equals the
-//! ticket's current phase (`analysis`, `in_development`, `in_diagnostics`,
-//! `verification`, `in_sanitation`); the ticket's `phase` is the sole
+//! ticket's current phase (`analysis`, `in_development`, `verification`,
+//! `in_sanitation`); the ticket's `phase` is the sole
 //! durable running truth. The puller:
 //!
 //! 1. claims `Backlog -> Analysis` and `Queued -> InDevelopment`,
@@ -30,7 +30,6 @@ pub mod analysis;
 pub mod board;
 pub mod chronicle;
 pub mod development;
-pub mod diagnostics;
 pub mod sanitation;
 #[cfg(test)]
 mod tests;
@@ -46,7 +45,7 @@ use futures_util::future::join_all;
 use tracing::{debug, error, info, warn};
 
 use crate::agent::message_router;
-use crate::agent::role::{DIAGNOSTICS_ROLE, SYSTEM_ROLE};
+use crate::agent::role::SYSTEM_ROLE;
 use crate::agent::{RETRY_EXHAUSTION_MARKER, run_agent};
 use crate::db::TxGuard;
 use crate::git::commands::{list_new_or_untracked_files, run_git_status};
@@ -486,7 +485,6 @@ fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_
         let run: futures_util::future::BoxFuture<'static, ()> = match phase {
             TicketPhase::Analysis => Box::pin(analysis::run(ticket, ws, job_id)),
             TicketPhase::InDevelopment => Box::pin(development::run(ticket, ws, job_id)),
-            TicketPhase::InDiagnostics => Box::pin(diagnostics::run(ticket, ws, job_id)),
             TicketPhase::Verification => Box::pin(verification::run(ticket, ws, job_id)),
             TicketPhase::InSanitation => Box::pin(sanitation::run(ticket, ws, job_id)),
             _ => {

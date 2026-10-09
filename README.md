@@ -17,7 +17,7 @@ Batteries included:
 - __Telegram bot__ integration that allows you to easily manage the work from your smartphone
 - __Voice control__ (macOS only) using a CPU-optimized local speech-to-text model that turns babble into features (passive wake-word detection wip)
 - __Modern agentic__ adversarial analysis before dev, verification after dev
-- __Good old deterministic__ CI-style diagnostics after every dev round
+- __Good old deterministic__ CI-style diagnostics (format, lint, build, test) in the same round as the verification agents
 - __Background maintenance__ agentic process to clean up the usual videcoding bloat and other code quality issues
 - __Full history__ of the previous work in the tickets with efficient hybrid search over it
 - __Out-of-the-box__ workspace discovery for per-role contexts, auto-detected diagnostics commands. No need for plugins, AGENTS/CLAUDE/other.md files or custom configurations. Just add the API key, select the workspace and state your wishes
@@ -35,8 +35,7 @@ Every ticket has a lifecycle with **redundant checks**:
 | **→ Planning** | Manager sees the analysis and refines/cancels/approved or escalates |
 | **→ Queued** | Awaits in the engineer's queue according to it's priority |
 | **→ Development** | Engineer implements the ticket (or the required fixes) |
-| **→ Diagnostics** | Deterministic checks (format, lint, build, test) |
-| **→ Verification** | Code reviewers and one functional tester, run in parallel |
+| **→ Verification** | One round: the workspace's deterministic checks (format, lint, build, test) plus code reviewers and one functional tester, all run together |
 | **→ Sanitation** | Audit untracked/new files in the working tree |
 | **→ Done** | Auto git commit with the ticket's title if the tree is dirty |
 

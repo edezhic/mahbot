@@ -9,6 +9,7 @@ Cover:
 - Common risk areas: persistence, concurrency, provider integrations, shared utilities, etc.
 - Dependency and API caveats specific to this project
 - Areas where changes often create structural regressions or hidden coupling
+- Which checks run in the same round as this role (the workspace's own project commands, the functional tester) — never describe them as having run before it
 
 Search the web for official documentation where it helps clarify version-specific API behavior or framework constraints relevant to reviewing changes in this workspace.
 

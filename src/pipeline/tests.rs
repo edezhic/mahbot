@@ -3,7 +3,7 @@
 //!
 //! The deterministic store + orchestrator tests exercise claim/bounce/reset and
 //! phase classification without agent rounds. The end-to-end behavioral-oracle
-//! tests drive the real phase bodies (analysis / development / diagnostics /
+//! tests drive the real phase bodies (analysis / development /
 //! verification / sanitation) and the puller through a scripted
 //! [`FakeProvider`](crate::util::test::FakeProvider), so they are isolated from
 //! the live model. Global-DB tests are serialized behind [`TEST_LOCK`] because
@@ -955,6 +955,19 @@ fn fake_clean_participants(count: usize) -> crate::util::test::FakeProvider {
     fake
 }
 
+/// [`fake_clean_participants`] with a sub-threshold verdict carrying one issue:
+/// the round bounces regardless of which concurrent participant pops which
+/// response.
+fn fake_failing_participants(count: usize) -> crate::util::test::FakeProvider {
+    let mut fake = crate::util::test::FakeProvider::new();
+    for _ in 0..count {
+        fake = fake
+            .ok(r#"{"score":3,"issues":["not done"]}"#)
+            .ok(r#"{"score":3,"issues":["not done"]}"#);
+    }
+    fake
+}
+
 /// [`fake_clean_participants`] that also leaves a file in the repository on every
 /// call — a participant touching the workspace mid-round, made deterministic.
 /// Every call happens after the round read the reviewers' content identity, so
@@ -1078,8 +1091,7 @@ async fn probe_then_claim_queued(store: &BoardStore, ws: &Workspace) -> (bool, O
 
 /// Drive a Backlog→Done lifecycle through the real phase bodies and the
 /// per-phase puller claims: analysis → planning → queued → development →
-/// diagnostics (skipped) → verification (code review skipped, tester runs) →
-/// sanitation (dirty commit).
+/// verification (code review skipped, tester runs) → sanitation (dirty commit).
 
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -1155,7 +1167,7 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         TicketPhase::InDevelopment,
     );
 
-    // Engineer: 2 responses → InDevelopment → InDiagnostics.
+    // Engineer: 2 responses → InDevelopment → Verification.
     let job_id = crate::generate_id();
     spawn_phase_job(
         &job_id,
@@ -1180,28 +1192,6 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
     }
     assert_eq!(
         expect_ticket_phase(store, &id).await,
-        TicketPhase::InDiagnostics,
-    );
-
-    // Diagnostics: no commands configured → skipped, no provider calls.
-    let job_id = crate::generate_id();
-    spawn_phase_job(
-        &job_id,
-        &ws,
-        &id,
-        TicketPhase::InDiagnostics,
-        crate::Role::Engineer,
-        "diagnostics",
-    )
-    .await;
-    super::diagnostics::run(
-        std::sync::Arc::new(expect_ticket(store, &id).await),
-        ws.clone(),
-        job_id.clone(),
-    )
-    .await;
-    assert_eq!(
-        expect_ticket_phase(store, &id).await,
         TicketPhase::Verification,
     );
 
@@ -1221,7 +1211,7 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
     // Verification: ONE round. The content is identical to the reviewed base, so
     // only the functional tester is dispatched — the reviewers are skipped, the
     // round still advances the ticket, and the consolidated comment records the
-    // skipped code review.
+    // skipped code review and the workspace having no project commands.
     let job_id = crate::generate_id();
     spawn_phase_job(
         &job_id,
@@ -1259,14 +1249,21 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         "the consolidated round comment is authored under the stage name",
     );
     assert!(
-        round_comment.content.starts_with("**Code review skipped**"),
-        "the note heads the consolidated comment (no leading blank lines):\n{}",
+        round_comment.content.contains("**Code review skipped**"),
+        "the consolidated comment must carry the skipped-code-review note:\n{}",
         round_comment.content,
     );
     assert!(
         round_comment.content.contains("still ran.\n\n"),
         "the note must end with the blank line separating it from the round's \
          own sections:\n{}",
+        round_comment.content,
+    );
+    assert!(
+        round_comment
+            .content
+            .contains("no project commands configured"),
+        "a workspace with no commands must record that the round ran none:\n{}",
         round_comment.content,
     );
 
@@ -1507,6 +1504,143 @@ async fn passed_verification_round_records_the_reviewed_content() {
             .content
             .contains("Code review skipped"),
         "the skipped code review must still be recorded in the round's comment",
+    );
+
+    drop(repo_dir);
+}
+
+/// The round's project commands are the round's own work, merged into its ONE
+/// result: they run in parallel with the participants, both parts land in the
+/// same comment, and either failing sends the ticket back exactly once — a
+/// failed command is ONE bounce, never two.
+
+#[serial_test::serial(provider, drain)]
+#[tokio::test]
+async fn verification_round_merges_the_project_commands_into_one_result() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
+    let ws = create_test_workspace(repo_path.to_str().unwrap(), "merged_commands_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    // Two commands in execution order: the first passes, the second fails —
+    // the run must stop at it.
+    crate::workspace::store()
+        .set_diagnostics(
+            &ws.name,
+            &crate::DiagnosticsCommands {
+                format: Some("exit 0".into()),
+                unit_test: Some("exit 1".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "MergedCommands", TicketPhase::Verification).await;
+
+    // One reviewer + the single tester, all clean: the round fails on the
+    // project commands alone.
+    let fake = std::sync::Arc::new(fake_clean_participants(2));
+    run_verification_round(store, &ws, &id, fake.clone()).await;
+
+    let ticket = expect_ticket(store, &id).await;
+    assert_eq!(
+        ticket.phase,
+        TicketPhase::InDevelopment,
+        "a failing project command must send the ticket back to development",
+    );
+    assert_eq!(
+        ticket.bounce_count, 1,
+        "a part of the round failing is ONE bounce, never two",
+    );
+    let comments = store.get_comments(&id).await.unwrap();
+    let comment = comments.last().expect("the round must leave its comment");
+    assert!(
+        comment.content.contains("**Project commands**"),
+        "the round comment must record the commands' own result:\n{}",
+        comment.content,
+    );
+    assert!(
+        comment.content.contains("format (`exit 0`): PASSED"),
+        "the passing command must be recorded as passed:\n{}",
+        comment.content,
+    );
+    assert!(
+        comment.content.contains("unit-test (`exit 1`): FAILED"),
+        "the failing command must be recorded as failed:\n{}",
+        comment.content,
+    );
+    assert!(
+        comment
+            .content
+            .contains("❌ Project commands failed at `unit-test`"),
+        "the footer must name the command the run stopped at:\n{}",
+        comment.content,
+    );
+    assert!(
+        comment.content.contains("### Summary"),
+        "the participants' verdict is the same comment's other half:\n{}",
+        comment.content,
+    );
+    // The participants were handed the round's concrete command list.
+    assert!(
+        fake.request_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("unit-test: `exit 1`")),
+        "the round's command list must be part of the participants' brief",
+    );
+
+    // A passing command set does not save a failing verdict: flip the commands
+    // to all-passing, move the ticket back, and run a second round with
+    // sub-threshold participants.
+    crate::workspace::store()
+        .set_diagnostics(
+            &ws.name,
+            &crate::DiagnosticsCommands {
+                format: Some("exit 0".into()),
+                unit_test: Some("exit 0".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .transition_to(
+            &id,
+            Some(TicketPhase::InDevelopment),
+            TicketPhase::Verification,
+            "test",
+        )
+        .await
+        .unwrap();
+    run_verification_round(
+        store,
+        &ws,
+        &id,
+        std::sync::Arc::new(fake_failing_participants(2)),
+    )
+    .await;
+    let ticket = expect_ticket(store, &id).await;
+    assert_eq!(
+        ticket.bounce_count, 2,
+        "a passing command set must not save a sub-threshold verdict",
+    );
+    let comments = store.get_comments(&id).await.unwrap();
+    let comment = comments.last().expect("round 2 leaves its comment");
+    assert!(
+        comment.content.contains("✅ All project commands passed"),
+        "a passing command set must be recorded as passed:\n{}",
+        comment.content,
+    );
+    assert!(
+        comment.content.contains("not done"),
+        "the participants' issues belong in the same comment:\n{}",
+        comment.content,
     );
 
     drop(repo_dir);
@@ -2305,7 +2439,7 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
         // Let the re-created body consume the script and advance the phase.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if expect_ticket_phase(store, &eid).await == TicketPhase::InDiagnostics
+                if expect_ticket_phase(store, &eid).await == TicketPhase::Verification
                     && expect_phase_job(store, &eid, TicketPhase::InDevelopment)
                         .await
                         .is_none()
@@ -2316,7 +2450,7 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
             }
         })
         .await
-        .expect("the re-created development body must re-drive to InDiagnostics");
+        .expect("the re-created development body must re-drive to Verification");
     }
 }
 

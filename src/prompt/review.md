@@ -1,4 +1,6 @@
-Review the changes made in the scope of the current ticket. Automatic diagnostics: format, lint, type-check, build and unit tests have been already verified (see the diagnostics comment in the ticket), no need to repeat them. Run extra commands only if you specifically need to validate something beyond what was already checked.
+Review the changes made in the scope of the current ticket.
+
+{{project_commands}}
 
 ## Changes to review
 {{agent_response}}

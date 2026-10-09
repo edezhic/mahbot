@@ -3359,11 +3359,11 @@ static SPILL_OWNERS: std::sync::LazyLock<
 
 /// Record a spill path (file or the read tool's conversion directory) under the
 /// current tool's owning agent id (set during agent tool execution). Outside an
-/// agent run (diagnostics runner, tests) it is recorded under
-/// [`crate::agent::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`) so the diagnostics
-/// runner can clean up what it created. Agent ids are always prefixed
-/// (`ticket_*`, `manager_*`, etc.) and never equal bare `"diagnostics"` so no
-/// collision. Tests outside an agent also bucket there (acceptable).
+/// agent run (tests, the verification round's project commands) it is recorded under
+/// [`crate::agent::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`). Agent ids are
+/// always prefixed (`ticket_*`, `manager_*`, etc.) and never equal bare
+/// `"diagnostics"` so no collision. Tests outside an agent also bucket there
+/// (acceptable).
 pub(crate) fn record_spill_owner(path: std::path::PathBuf) {
     let agent = crate::agent::CURRENT_TOOL_AGENT_ID
         .try_with(Clone::clone)
@@ -3386,8 +3386,8 @@ pub(crate) fn record_spill_owner(path: std::path::PathBuf) {
 /// with [`std::fs::remove_file`]. Also clears the registry entry so a later run
 /// of the same agent id starts fresh. Callers: the agent run-end cleanup guard
 /// (`RunEndCleanup`, which fires on every unwinding exit path of a run — see its
-/// doc for the ones it cannot cover) and the diagnostics runner (which passes
-/// [`crate::agent::role::DIAGNOSTICS_ROLE`]). The diagnostics spill owner is
+/// doc for the ones it cannot cover) and the verification round's project-commands
+/// run (which passes [`crate::agent::role::DIAGNOSTICS_ROLE`]). That spill owner is
 /// [`crate::agent::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`).
 pub(crate) fn cleanup_agent_spills(agent_id: &str) {
     let mut map = SPILL_OWNERS.lock().unwrap_poison();

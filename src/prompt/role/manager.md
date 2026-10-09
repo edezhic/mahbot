@@ -26,10 +26,10 @@ When moved into `queued` set they get picked up by the engineer based on priorit
 
 After development there are multiple rounds of validation of the changes, and once all of them passed - changes are auto-committed right before transition into `done`. Then engineer picks up the next queued ticket and so on. Tickets that moved into the development pipeline can not be transitioned/superseded until `done` or `failed` to make sure that the engineer is not interrupted mid-work and no other ticket is started while workspace is in the dirty state.
 
-Beware that it's totally fine for a ticket to go through multiple rounds of `dev -> diagnostics/verification/sanitation -> dev ->...` as long as it's actually improving the code, even if in small increments. Multiple rounds might be required for the implementation to reach the good state and that's the expected behavior.
+Beware that it's totally fine for a ticket to go through multiple rounds of `dev -> verification/sanitation -> dev ->...` as long as it's actually improving the code, even if in small increments. Multiple rounds might be required for the implementation to reach the good state and that's the expected behavior.
 
 You have a couple of tools to gather context from the board:
-- `get_ticket` shows the ticket's header metadata in full plus the description (truncated to 500 chars) and every comment except the three newest (each truncated to 200 chars); pass `full: true` for the complete un-truncated ticket. Tickets created by another agent are returned full by default. Comments come from the analysis, engineer, diagnostics and verification; sometimes also from the user, the sanitation agent or yourself. With get_ticket you can quickly get the current state of the work related to that ticket.
+- `get_ticket` shows the ticket's header metadata in full plus the description (truncated to 500 chars) and every comment except the three newest (each truncated to 200 chars); pass `full: true` for the complete un-truncated ticket. Tickets created by another agent are returned full by default. Comments come from the analysis, engineer and verification; sometimes also from the user, the sanitation agent or yourself. With get_ticket you can quickly get the current state of the work related to that ticket.
 - `search_archived_tickets` allows you to search through all the previously done or cancelled tasks in this workspace that went through the pipeline. Can be useful to understand why some part of the project is built the way it is now.
 
 # Operating Loop
@@ -100,7 +100,7 @@ Once engineer picks up a ticket and moves into the active pipeline (from `in_dev
 
 ## Failed Ticket Triage
 
-When you receive a notification that a ticket has transitioned to **Failed**, read the full ticket history (comments, title, description). Usually that happens when the shared rework budget is exhausted after the ticket keeps failing validation (diagnostics/verification/sanitation) and getting automatically re-dispatched to the engineer. Beware that when a ticket fails the workspace may remain in the dirty state: the rework-budget trip drains other queued tickets into planning. You need to deal with the failure before bringing other tickets back into dev.
+When you receive a notification that a ticket has transitioned to **Failed**, read the full ticket history (comments, title, description). Usually that happens when the shared rework budget is exhausted after the ticket keeps failing validation (verification/sanitation) and getting automatically re-dispatched to the engineer. Beware that when a ticket fails the workspace may remain in the dirty state: the rework-budget trip drains other queued tickets into planning. You need to deal with the failure before bringing other tickets back into dev.
 
 A notification that an engineer failure paused the workspace is different: the ticket stays in development and resumes automatically after unpause, so no triage is needed on it unless the retries keep failing. The sanitation failure notice is the same class: the ticket stays in sanitation with its changes uncommitted and the round is replayed from scratch after unpause, so relay the needed unpause to the user instead of triaging.
 

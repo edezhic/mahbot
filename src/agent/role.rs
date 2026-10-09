@@ -11,12 +11,12 @@ use strum::IntoEnumIterator;
 
 use crate::Role;
 
-/// Role string for diagnostics comments — `"diagnostics"`.
+/// Role string for the workspace's project commands — `"diagnostics"`.
 ///
-/// Used when posting diagnostics success/failure comments (`diagnostics.rs`),
-/// as the diagnostics run's shell spill-owner key (`tools/shell/mod.rs`, via
-/// `cleanup_agent_spills`), as the sentinel that collapses diagnostics comments
-/// to a summary in the GUI board (`gui/board.rs`), and as the
+/// The value outlives the retired commands-only phase as a shared key: the
+/// shell spill-owner key of a run with no agent identity (`tools/shell/mod.rs`,
+/// via `cleanup_agent_spills`), the sentinel that collapses already-stored
+/// diagnostics comments to a summary in the GUI board (`gui/board.rs`), and the
 /// diagnostics-discovery agent id / stale-write log label (`workspace.rs`).
 ///
 /// The literal is a key: it's compared against `comment.role` (`gui/board.rs`)

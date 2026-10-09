@@ -557,6 +557,57 @@ const REBUILD_TICKET_TITLE_FTS_INDEX: &str = "\
 DROP INDEX IF EXISTS idx_tickets_title_fts; \
 CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets USING fts (title) WITH (tokenizer = 'ngram');";
 
+/// Catalog `48`: rewrite the retired `in_diagnostics` stage to the merged
+/// `verification` stage — a data migration; no schema change.
+///
+/// `tickets.phase`, `ticket_chronicle.source_phase` and
+/// `ticket_chronicle.target_phase` are untyped `TEXT` with no CHECK constraint,
+/// so only the stored strings move — a ticket's stage state is entirely its
+/// phase string, so nothing else about it has to change. Ticket comments are NOT
+/// touched: the retired stage label a past round's comment carries is history,
+/// it is displayed as written, and no read path parses it.
+///
+/// The retired `jobs` rows are DELETED, **never renamed**. `jobs.kind` for a
+/// ticket phase job equals the ticket's phase, and the partial unique index
+/// `idx_jobs_phase_ticket` on `jobs(kind, ticket_id)` WHERE
+/// `ticket_id IS NOT NULL` admits one row per (kind, ticket_id) pair: renaming
+/// an `in_diagnostics` row to `verification` would collide with a row already
+/// carrying the merged stage (the window between a stage's transition commit and
+/// its job deletion, and stale rows are purge-immune while their workspace is
+/// paused) and abort this entry's transaction, and a failed SQL migration is a
+/// HARD BOOT REFUSAL, which this change must never cause.
+///
+/// Deleting the retired rows also discards their roster (`agents.job_id`
+/// references `jobs(id)` `ON DELETE CASCADE`), which is exactly what the merge
+/// requires: the ticket moves to the `verification` phase and the puller creates
+/// a fresh `verification` job for it, so partial work from the retired phase is
+/// never mistaken for a completed check.
+///
+/// The `in_diagnostics → verification` hop is DELETED *before* the rewrite, not
+/// rewritten into a `verification → verification` self-transition: the two ends
+/// are one stage now, so the hop between them never happened. The remaining
+/// rewrites cannot collide on the unique `idx_ticket_chronicle_dedup`
+/// (`ticket_id, workspace_name, source_phase, target_phase, at`): `at` is the
+/// transition's own microsecond timestamp, so no two hops of one ticket share
+/// it.
+///
+/// `last_transition_actor` is deliberately left alone, unlike every service-side
+/// phase write (see `board::PIPELINE_ACTOR`'s invariant): that column records
+/// the actor of a transition, and this rewrite is not one — the ticket's last
+/// real transition still is. The invariant's misattribution hazard cannot arise
+/// here either: the catalog runs before CDC capture is enabled on the connection
+/// (see `db::open_consolidated_store`), so these UPDATEs are never captured and
+/// materialize no chronicle hop to attribute.
+///
+/// Idempotent: re-running matches no rows.
+const RETIRE_IN_DIAGNOSTICS_PHASE: &str = "\
+DELETE FROM jobs WHERE kind = 'in_diagnostics';\
+DELETE FROM ticket_chronicle WHERE source_phase = 'in_diagnostics' \
+  AND target_phase = 'verification';\
+UPDATE tickets SET phase = 'verification' WHERE phase = 'in_diagnostics';\
+UPDATE ticket_chronicle SET source_phase = 'verification' WHERE source_phase = 'in_diagnostics';\
+UPDATE ticket_chronicle SET target_phase = 'verification' WHERE target_phase = 'in_diagnostics';";
+
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
 /// Entries `24`–`26` are the consolidated current-shape baseline; entries
@@ -609,6 +660,17 @@ CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets USING fts (title) WI
 ///   handed the retired two-stage arrangement.
 /// - `46` rebuilds the ticket-title FTS index in the engine's 0.8.0 on-disk
 ///   layout (see [`REBUILD_TICKET_TITLE_FTS_INDEX`]).
+/// - `47` adds the nullable `jobs.exec_dir` column, the absolute directory a
+///   targeted delegation round runs in (a no-op on fresh installs, whose
+///   baseline already declares it).
+/// - `48` rewrites the retired `in_diagnostics` stage to the merged
+///   `verification` stage: the retired job rows are deleted (a rename could
+///   collide on `idx_jobs_phase_ticket`), the `in_diagnostics → verification`
+///   chronicle hop is deleted, and the remaining ticket/chronicle phase strings
+///   are rewritten (see [`RETIRE_IN_DIAGNOSTICS_PHASE`]).
+/// - `49` invalidates the stored per-workspace contexts in `workspace_contexts`
+///   that still claim the workspace's project commands already ran before the
+///   round, so no agent is handed the retired arrangement.
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -729,6 +791,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "47",
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_jobs_exec_dir),
+    },
+    Migration {
+        id: "48",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(RETIRE_IN_DIAGNOSTICS_PHASE),
+    },
+    Migration {
+        id: "49",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(drop_retired_commands_claim_descriptions),
     },
 ];
 
@@ -1254,6 +1326,86 @@ async fn run_drop_retired_lifecycle_descriptions(conn: &Connection) -> anyhow::R
             .get::<String>(1)
             .context("Failed to read workspace_contexts.content")?;
         if !describes_retired_lifecycle(&content) {
+            continue;
+        }
+        let rowid = row
+            .get::<i64>(0)
+            .context("Failed to read workspace_contexts.rowid")?;
+        conn.execute(
+            "DELETE FROM workspace_contexts WHERE rowid = ?1",
+            params![rowid],
+        )
+        .await
+        .context("Failed to drop a stale stored workspace context")?;
+    }
+    Ok(())
+}
+
+/// Markers of the retired claim that the workspace's project commands already
+/// ran before the round, matched as substrings of the case-folded content.
+const RETIRED_COMMANDS_CLAIM_MARKERS: &[&str] = &[
+    "already ran",
+    "already been run",
+    "already verified",
+    "already been verified",
+    "ran before",
+    "run before this round",
+    "diagnostics phase",
+    "diagnostics stage",
+    "no need to repeat",
+];
+
+/// Whether a stored workspace context claims the project commands ran before
+/// the round.
+///
+/// Deliberately phrase-level, never a bare `ran`: the content is case-folded
+/// and the markers cover the spellings the retired arrangement was actually
+/// written in, so prose that merely mentions a command running in this round
+/// survives.
+fn claims_commands_ran_before_the_round(content: &str) -> bool {
+    let folded = content.to_ascii_lowercase();
+    RETIRED_COMMANDS_CLAIM_MARKERS
+        .iter()
+        .any(|marker| folded.contains(marker))
+}
+
+fn drop_retired_commands_claim_descriptions(
+    conn: &Connection,
+) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_drop_retired_commands_claim_descriptions(conn))
+}
+
+/// Data migration (`49`): no stored workspace context may hand an agent the
+/// retired claim that the workspace's project commands already ran before the
+/// round.
+///
+/// `workspace_contexts` holds discovery-generated prose per
+/// (`workspace_name`, `role`). Since the merge the project commands run INSIDE
+/// the verification round, in parallel with the participants, and their result
+/// is the same round comment — so a row that claims they already ran (and tells
+/// the agent not to repeat them) describes the retired arrangement and
+/// contradicts the round's own brief. No partial rewrite can make such a claim
+/// true, so the row is DELETED: the value is a derived cache that the
+/// workspace's next re-analysis (the manual Re-analyze, or the nightly
+/// new-commit pass) regenerates from the current source, and a missing context
+/// degrades to the file-derived fallback rather than to an error.
+///
+/// The probe behind it is a heuristic in both directions: prose that describes
+/// the same thing without naming a marker phrase survives and waits for the next
+/// re-analysis, and the markers are deliberately phrase-level (never a bare
+/// `ran`), so a context that merely mentions a command running in this round is
+/// kept. Idempotent and non-transactional like every Rust body: a second run
+/// matches nothing.
+async fn run_drop_retired_commands_claim_descriptions(conn: &Connection) -> anyhow::Result<()> {
+    let rows = conn
+        .query("SELECT rowid, content FROM workspace_contexts", ())
+        .await
+        .context("Failed to read stored workspace contexts")?;
+    for row in rows {
+        let content = row
+            .get::<String>(1)
+            .context("Failed to read workspace_contexts.content")?;
+        if !claims_commands_ran_before_the_round(&content) {
             continue;
         }
         let rowid = row
@@ -2574,7 +2726,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`47` tail, and converges to the exact current core
+    /// upfills and the `36`–`49` tail, and converges to the exact current core
     /// shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -2601,10 +2753,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             applied,
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-                "40", "41", "42", "43", "44", "45", "46", "47"
+                "40", "41", "42", "43", "44", "45", "46", "47", "48", "49"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–47 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–49 tail exactly"
         );
     }
 
@@ -2870,7 +3022,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`46`) as a
+    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`49`) as a
     /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
     /// column upfill, the delta-28 `jobs.caller_agent_id` /
     /// `session_metadata.created_at` column upfills (plus the delta-28
@@ -2892,9 +3044,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// index when the baseline re-runs it and that dropping and recreating the
     /// index leaves the rest of the store alone.
     ///
-    /// The stage-merge tail (`44`/`45`) is a no-op here too: the seeded rows
-    /// name none of the retired stages, so no job is deleted, no phase is
-    /// rewritten and the empty `workspace_contexts` stays empty.
+    /// The stage-merge and phase-retirement tail (`44`/`45`/`48`/`49`) is a
+    /// no-op here too: the seeded rows name none of the retired stages and claim
+    /// no earlier command run, so no job is deleted, no phase is rewritten and
+    /// the empty `workspace_contexts` stays empty.
     #[tokio::test]
     #[expect(clippy::too_many_lines)]
     async fn old_catalog_current_db_reopens_as_noop() {
@@ -2921,7 +3074,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40", "41", "42", "43", "44", "45", "46", "47",
+            "40", "41", "42", "43", "44", "45", "46", "47", "48", "49",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -2930,7 +3083,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..47"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..49"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -3128,7 +3281,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
     /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
     /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
-    /// entries `36`–`45`: the data migrations (detaching guests from
+    /// entries `36`–`49`: the data migrations (detaching guests from
     /// shared workspaces, rewriting the legacy `DeepSeek` routing slug,
     /// deleting the command-armed alarm rows, rewriting the retired
     /// `in_review`/`in_qa` stages to `verification`, and invalidating the
@@ -3237,7 +3390,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40", "41", "42", "43", "44", "45", "46", "47",
+            "40", "41", "42", "43", "44", "45", "46", "47", "48", "49",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3246,7 +3399,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..47"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..49"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -3657,6 +3810,36 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         }
     }
 
+    /// The retired-commands-claim probe invalidates the stored shapes that tell
+    /// an agent the project commands already ran before the round, and leaves
+    /// verbatim both the same-round arrangement and prose that merely mentions a
+    /// command running in this round.
+    #[test]
+    fn retired_commands_claim_probe_handles_the_stored_shapes() {
+        for retired in [
+            "Diagnostics (format, lint, type-check, build, unit test) already ran and are reported in the ticket's diagnostics comment; do not repeat them",
+            "this is exactly what the Diagnostics phase ran before this round",
+            "format, lint and build have already been verified",
+            "the diagnostics stage passes before this one",
+        ] {
+            assert!(
+                claims_commands_ran_before_the_round(retired),
+                "must be invalidated: {retired:?}"
+            );
+        }
+        for kept in [
+            "the project commands run in the same round as the check",
+            "run `cargo test` if you need the unit suite",
+            "the local service is already running on port 3000",
+            "the reviewer and one functional tester run together",
+        ] {
+            assert!(
+                !claims_commands_ran_before_the_round(kept),
+                "must survive verbatim: {kept:?}"
+            );
+        }
+    }
+
     /// Role (empty for the NULL role) → content for every stored workspace
     /// context.
     async fn workspace_context_rows(
@@ -3898,6 +4081,267 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         run_drop_retired_lifecycle_descriptions(&conn)
             .await
             .expect("re-run entry 45 body");
+        assert_eq!(workspace_context_rows(&conn).await, contexts);
+    }
+
+    /// Behavioral pin for the phase-retirement tail: entry `48` rewrites the
+    /// retired `in_diagnostics` stage to `verification` on the ticket and on both
+    /// chronicle sides, DELETES the retired job row — renaming it could collide
+    /// on the unique `jobs(kind, ticket_id)` index and abort the migration —
+    /// taking its cascaded `agents` roster with it, and DELETES the
+    /// `in_diagnostics → verification` hop, which the merge turned into one
+    /// stage. Entry `49` deletes every stored workspace context that claims the
+    /// project commands already ran before the round and leaves a same-round
+    /// description verbatim. Idempotent: re-running both bodies matches no rows.
+    #[tokio::test]
+    #[expect(clippy::too_many_lines)] // large table-driven migration fixture
+    async fn retired_diagnostics_phase_is_merged_into_verification() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        // Catalog front entry 24 (baseline core schema) creates workspaces,
+        // tickets, jobs, agents, ticket_chronicle and workspace_contexts.
+        run_catalog(&conn, TargetDb::Core, &MIGRATIONS[..1])
+            .await
+            .expect("baseline catalog");
+        let now = crate::db::now();
+        conn.execute(
+            "INSERT INTO workspaces (name, path, created_at, updated_at) VALUES ('ws', '/ws', ?1, ?1)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        for (id, phase) in [
+            ("T1", "in_diagnostics"),
+            ("T2", "verification"),
+            ("T3", "backlog"),
+        ] {
+            conn.execute(
+                "INSERT INTO tickets \
+                 (id, title, description, phase, workspace_name, created_at, updated_at) \
+                 VALUES (?1, ?1, '', ?2, 'ws', ?3, ?3)",
+                params![id, phase, now.clone()],
+            )
+            .await
+            .unwrap();
+        }
+        // J1's ticket moves to `verification`; a rename of J1 would collide with
+        // the already-`verification` J2, which is why the retired row is deleted.
+        for (job, kind, ticket) in [
+            ("J1", "in_diagnostics", Some("T1")),
+            ("J2", "verification", Some("T2")),
+            ("J3", "analysis", Some("T3")),
+        ] {
+            conn.execute(
+                "INSERT INTO jobs \
+                 (id, kind, role, workspace_name, task, user_name, channel, retry_count, status, \
+                  created_at, updated_at, ticket_id) \
+                 VALUES (?1, ?2, 'verifier', 'ws', '', 'bob', '', 0, 'launched', ?3, ?3, ?4)",
+                params![job, kind, now.clone(), ticket],
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
+             VALUES ('J1', 'A1', 'verifier', 0, 'done', 'task')",
+            (),
+        )
+        .await
+        .unwrap();
+        for (ticket, source, target) in [
+            ("T1", "in_development", "in_diagnostics"),
+            ("T2", "backlog", "queued"),
+            ("T3", "in_diagnostics", "in_development"),
+            // The merge's own hop: `in_diagnostics` and `verification` are one
+            // stage now, so it must be dropped rather than rewritten into a
+            // `verification → verification` self-transition.
+            ("T1", "in_diagnostics", "verification"),
+        ] {
+            conn.execute(
+                "INSERT INTO ticket_chronicle \
+                 (ticket_id, workspace_name, source_phase, target_phase, at) VALUES (?1, 'ws', ?2, ?3, ?4)",
+                params![ticket, source, target, now.clone()],
+            )
+            .await
+            .unwrap();
+        }
+        let already_ran = "Diagnostics (format, lint, type-check, build, unit test) already ran \
+                           and are reported in the ticket's diagnostics comment; do not repeat them";
+        let diagnostics_phase = "this is exactly what the Diagnostics phase ran before this round";
+        let same_round = "the project commands run in the same round as the check";
+        let running_service = "the local service is already running on port 3000";
+        for (role, content) in [
+            ("engineer", already_ran),
+            ("qa", diagnostics_phase),
+            ("coder", same_round),
+            ("manager", running_service),
+        ] {
+            conn.execute(
+                "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
+                 VALUES ('ws', ?1, ?2, ?3)",
+                params![role, content, now.clone()],
+            )
+            .await
+            .unwrap();
+        }
+
+        let merge_entries: Vec<Migration> = MIGRATIONS
+            .iter()
+            .filter(|m| m.id == "48" || m.id == "49")
+            .copied()
+            .collect();
+        run_catalog(&conn, TargetDb::Core, &merge_entries)
+            .await
+            .expect("phase-retirement tail");
+
+        let phases: Vec<(String, String)> = conn
+            .query("SELECT id, phase FROM tickets ORDER BY id", ())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()))
+            .collect();
+        assert_eq!(
+            phases,
+            vec![
+                ("T1".to_string(), "verification".to_string()),
+                ("T2".to_string(), "verification".to_string()),
+                ("T3".to_string(), "backlog".to_string()),
+            ],
+            "the retired phase becomes verification; every other phase survives"
+        );
+
+        let remaining_jobs: Vec<String> = conn
+            .query("SELECT id FROM jobs ORDER BY id", ())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(
+            remaining_jobs,
+            vec!["J2".to_string(), "J3".to_string()],
+            "the retired job row must be deleted, never renamed"
+        );
+        let orphan_rosters: i64 = conn.query("SELECT COUNT(*) FROM agents", ()).await.unwrap()[0]
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(
+            orphan_rosters, 0,
+            "the deleted job must cascade its roster away"
+        );
+
+        let chronicle: Vec<(String, String, String)> = conn
+            .query(
+                "SELECT ticket_id, source_phase, target_phase FROM ticket_chronicle ORDER BY ticket_id",
+                (),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String>(0).unwrap(),
+                    row.get::<String>(1).unwrap(),
+                    row.get::<String>(2).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            chronicle,
+            vec![
+                (
+                    "T1".to_string(),
+                    "in_development".to_string(),
+                    "verification".to_string()
+                ),
+                (
+                    "T2".to_string(),
+                    "backlog".to_string(),
+                    "queued".to_string()
+                ),
+                (
+                    "T3".to_string(),
+                    "verification".to_string(),
+                    "in_development".to_string()
+                ),
+            ],
+            "both chronicle sides must be rewritten, the merge hop dropped, and \
+             unretired edges kept"
+        );
+
+        let contexts = workspace_context_rows(&conn).await;
+        assert!(
+            !contexts.contains_key("engineer"),
+            "a claim that the commands already ran describes the retired arrangement"
+        );
+        assert!(
+            !contexts.contains_key("qa"),
+            "naming the diagnostics phase as a prior stage describes the retired arrangement"
+        );
+        assert_eq!(
+            contexts.get("coder"),
+            Some(&same_round.to_string()),
+            "a same-round description must survive verbatim"
+        );
+        assert_eq!(
+            contexts.get("manager"),
+            Some(&running_service.to_string()),
+            "an unrelated already-running service must survive verbatim"
+        );
+
+        // The ledger records `48`/`49` after the first application, so re-run
+        // both bodies directly to pin that they match no rows a second time.
+        conn.execute_batch(RETIRE_IN_DIAGNOSTICS_PHASE)
+            .await
+            .expect("re-run entry 48 body");
+        run_drop_retired_commands_claim_descriptions(&conn)
+            .await
+            .expect("re-run entry 49 body");
+        let phases_after: Vec<(String, String)> = conn
+            .query("SELECT id, phase FROM tickets ORDER BY id", ())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()))
+            .collect();
+        assert_eq!(phases_after, phases, "a re-run must not move another phase");
+        let jobs_after: Vec<String> = conn
+            .query("SELECT id FROM jobs ORDER BY id", ())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(
+            jobs_after, remaining_jobs,
+            "a re-run must not delete another job"
+        );
+        let chronicle_after: Vec<(String, String, String)> = conn
+            .query(
+                "SELECT ticket_id, source_phase, target_phase FROM ticket_chronicle ORDER BY ticket_id",
+                (),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String>(0).unwrap(),
+                    row.get::<String>(1).unwrap(),
+                    row.get::<String>(2).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            chronicle_after, chronicle,
+            "a re-run must not rewrite another hop"
+        );
         assert_eq!(workspace_context_rows(&conn).await, contexts);
     }
 }

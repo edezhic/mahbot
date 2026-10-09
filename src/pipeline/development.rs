@@ -158,15 +158,15 @@ pub(crate) async fn finalize_engineer_stage(
         return;
     }
 
-    // Success path: engineer produced output — transition to InDiagnostics.
-    // The puller creates the InDiagnostics phase job on the next tick.
+    // Success path: engineer produced output — transition to Verification.
+    // The puller creates the Verification phase job on the next tick.
     if let Some(text) = response {
         let comment_text = engineer_comment_text(agent, text).await;
         comment_and_transition_or_bail(
             TransitionCtx::buffered(
                 ticket,
                 TicketPhase::InDevelopment,
-                TicketPhase::InDiagnostics,
+                TicketPhase::Verification,
                 "Engineer",
                 Role::Engineer.as_str(),
             ),

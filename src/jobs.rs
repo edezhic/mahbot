@@ -118,9 +118,6 @@ pub(crate) enum AgentKind {
     /// Single coder sub-agent for the durable async ImplementTool dispatch.
     Coder,
     Sanitation,
-    /// Synthetic in-flight marker for the shell-command diagnostics stage (not
-    /// an LLM agent — the roster row only drives the re-dispatch guard).
-    Diagnostics,
 }
 
 impl AgentKind {
@@ -133,7 +130,6 @@ impl AgentKind {
             Self::Engineer => "engineer",
             Self::Coder => "coder",
             Self::Sanitation => "sanitation",
-            Self::Diagnostics => "diagnostics",
         }
     }
 }
@@ -796,8 +792,8 @@ pub(crate) async fn find_owned_launched_jobs(
 // ── Ticket phase-job substrate ─────────────────────────────────────────
 //
 // A ticket phase job is a short-lived `jobs` row whose `kind` equals the
-// ticket's current phase (`analysis`, `in_development`, `in_diagnostics`,
-// `verification`, `in_sanitation`) and whose `ticket_id` — stored
+// ticket's current phase (`analysis`, `in_development`, `verification`,
+// `in_sanitation`) and whose `ticket_id` — stored
 // directly on the job — links it to the ticket. `tickets.phase` is the sole
 // durable running truth; the job is created by the single puller when a
 // ticket in a working phase has no job, and deleted when the phase completes

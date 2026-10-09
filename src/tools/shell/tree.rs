@@ -51,7 +51,7 @@
 //!
 //! [`RunOwner`] draws the boundary and it is the *only* thing the two owners
 //! differ in. [`RunOwner::Agent`] — the shell tool in both modes, which is also
-//! the path the pipeline's diagnostics stage takes, the `custom` tool's script
+//! the path the pipeline's project commands take, the `custom` tool's script
 //! run, and the document kit (the product's own work, through
 //! [`super::run_internal_program_with_timeout`], which gives it the reduced
 //! internal environment) — gets the job. [`RunOwner::Service`] — a

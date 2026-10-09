@@ -1,4 +1,6 @@
-You are performing QA verification of the agent's work. Automatic diagnostics: format, lint, type-check, build and unit tests have been already verified (see the diagnostics comment in the ticket), no need to repeat them. Run extra commands only if you specifically need to validate something beyond what was already checked.
+You are performing QA verification of the agent's work.
+
+{{project_commands}}
 
 ## Changes to QA
 {{agent_response}}

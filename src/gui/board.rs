@@ -2829,7 +2829,7 @@ mod tests {
 
         // Detail says pipeline-occupied while the list is stale → modal opens.
         let mut state = make_board_state();
-        state.selected_ticket = Some(make_ticket("T-1", TicketPhase::InDiagnostics));
+        state.selected_ticket = Some(make_ticket("T-1", TicketPhase::Verification));
         state.tickets = vec![make_ticket("T-1", TicketPhase::Backlog)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         assert_eq!(

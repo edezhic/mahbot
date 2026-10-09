@@ -154,8 +154,8 @@ impl DiagnosticsCommands {
     /// Number of command categories (must match the array length in [`Self::commands`]).
     pub const COMMAND_COUNT: usize = 7;
 
-    /// Label of the `unit-test` slot. Shared with the diagnostics runner so
-    /// its extended-timeout wiring can't silently drift from the label list.
+    /// Label of the `unit-test` slot. Spelled once so the label list and
+    /// [`Self::commands`] cannot drift.
     pub(crate) const UNIT_TEST_LABEL: &str = "unit-test";
 
     /// Static labels for the 7 command categories, matching the order in [`Self::commands`].
