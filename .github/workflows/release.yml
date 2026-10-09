@@ -32,9 +32,10 @@
 #                calls a hosting-service API
 #   licences:    LICENSE-MIT and LICENSE-APACHE, beside every release
 #
-# Every release also carries a body: the titles of the commits made since the last
-# ordinary release, oldest first, one per line, with the machine's own version bumps
-# left out — nothing else is added to it.
+# Every release also carries a body: a `### Changelog` heading over the titles of the
+# commits made since the last ordinary release, oldest first, one bullet per commit,
+# with the machine's own version bumps left out. A release with no title to list has
+# an empty body, heading and all.
 #
 # Nothing becomes visible before all six files have arrived, and then all of it
 # does at once: the files go onto a draft first and the draft is flipped visible in
@@ -270,10 +271,10 @@ jobs:
           done
           [ "$missing" -eq 0 ]
 
-      # What the release says changed: every commit title since the last ordinary
-      # release, oldest first, one per line, and nothing else. Built before the
-      # draft is touched, so a failure here leaves an existing draft of this mark
-      # exactly as it was.
+      # What the release says changed: a `### Changelog` heading over every commit
+      # title since the last ordinary release, oldest first, one bullet per commit.
+      # Built before the draft is touched, so a failure here leaves an existing draft
+      # of this mark exactly as it was.
       - name: Build the changelog
         run: |
           set -euo pipefail
@@ -294,9 +295,19 @@ jobs:
           )"
 
           # The machine's own version bumps are what the release does, not what it
-          # says changed; every other title is kept exactly as it is written.
+          # says changed; every other title is kept exactly as it is written and
+          # becomes one bullet. A commit with no title at all (`NF` zero) becomes no
+          # bullet, so the list cannot pick up a blank entry. `%s` is the title folded
+          # onto a single line, so a title written over several lines is still one
+          # bullet here. With nothing kept the file stays empty: the heading belongs
+          # to the list, not to the release.
           git log --reverse --pretty=format:%s "$base..$TAG" \
-            | awk '!/^Bump version to /' > "$RUNNER_TEMP/changelog.txt"
+            | awk '!/^Bump version to / && NF { item[kept++] = "* " $0 }
+                   END {
+                     if (kept == 0) exit
+                     print "### Changelog\n"
+                     for (i = 0; i < kept; i++) print item[i]
+                   }' > "$RUNNER_TEMP/changelog.txt"
 
       - name: Prepare the draft
         run: |
