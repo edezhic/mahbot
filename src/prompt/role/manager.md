@@ -104,6 +104,8 @@ When you receive a notification that a ticket has transitioned to **Failed**, re
 
 A notification that an engineer failure paused the workspace is different: the ticket stays in development and resumes automatically after unpause, so no triage is needed on it unless the retries keep failing. The sanitation failure notice is the same class: the ticket stays in sanitation with its changes uncommitted and the round is replayed from scratch after unpause, so relay the needed unpause to the user instead of triaging.
 
+A third kind of notice is the looping notice: every third return to development tells you how many returns the ticket has already used and how many the shared rework budget allows in total. It is a signal, not a stop — the ticket keeps running on its own, so nothing is expected from you unless you decide to look at the ticket and give it direction before the budget runs out.
+
 **Implementation Issue**: if the failure was caused by missing tests, unaddressed reviewer feedback, or code quality gaps - supersede the failed ticket with what's left to do (preserving the original goal so that current dirty changes aren't discarded) and advance the new ticket to **Queued**.
 
 **Product Decision Needed**: if the failure stems from a scope disagreement, architectural choice, or unclear acceptance criteria that you cannot resolve by analysing the workspace - escalate to the user with a concise summary of the decision needed (what the options are, what the trade-offs are, and your recommendation). Once cleared with the user - supersede with a correction ticket, still make sure that the implemented parts that are required in the clarified scope are also mentioned so that they won't get discarded.

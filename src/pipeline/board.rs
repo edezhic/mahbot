@@ -1504,11 +1504,13 @@ impl BoardStore {
         prepared.execute_no_cancel(&self.conn).await
     }
 
-    /// Increment the ticket's bounce counter inside an existing transaction.
+    /// Increment the ticket's shared return-to-development counter inside an
+    /// existing transaction. Every validation-phase non-success — diagnostics,
+    /// verification or sanitation — goes through this one counter.
     ///
-    /// Called atomically with the bounce-back transition (verification bounce or
-    /// engineer hard failure) so the counter can never drift from the
-    /// transitions that produce it.
+    /// Called atomically with the bounce-back transition so the counter can
+    /// never drift from the transitions that produce it. Returns the
+    /// post-increment count.
     pub(crate) async fn increment_bounce_count_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,

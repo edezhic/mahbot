@@ -579,13 +579,14 @@ pub const MAX_BOUNCES: usize = 10;
 
 /// GUI bounce-badge escalation threshold: at or below this many bounces the
 /// badge stays muted (the ticket id color); above it, the badge uses the
-/// prereq-indicator warning yellow. Halfway to the [`MAX_BOUNCES`] breaker cap.
+/// prereq-indicator warning yellow. The mid-point of the [`MAX_BOUNCES`] cap,
+/// deliberately independent of the Manager's notice grid.
 pub const BOUNCE_BADGE_WARNING_THRESHOLD: usize = 5;
 
-/// Half of the ticket's rework allowance — the last point at which the rounds
-/// still to come are enough for the ticket to land. See
-/// [`bounce_hits_halfway_mark`] for when the Manager's halfway notice fires.
-const BOUNCE_HALFWAY_MARK: usize = MAX_BOUNCES / 2;
+/// Every [`BOUNCE_NOTICE_INTERVAL`]-th return to development the Manager gets a
+/// looping notice — the 3rd, 6th and 9th at the current [`MAX_BOUNCES`]. See
+/// [`bounce_notice_mark`].
+const BOUNCE_NOTICE_INTERVAL: usize = 3;
 
 // ── Transition + notification helpers (shared by the phase modules) ─────
 
@@ -652,8 +653,10 @@ pub(crate) struct TransitionCtx<'t, 'l> {
     actor: &'l str,
     /// True when this Failed transition was a bounce-breaker drain.
     breaker_trip: bool,
-    /// Carries the halfway notice; set only with [`NotifyPolicy::Notify`].
-    halfway_mark: bool,
+    /// The return-to-development count to report in the Manager's looping
+    /// notice; `Some` only on a bounce that lands on the notice grid, which is
+    /// also what forces that bounce to notify immediately.
+    bounce_notice: Option<i64>,
 }
 
 impl<'t, 'l> TransitionCtx<'t, 'l> {
@@ -673,7 +676,7 @@ impl<'t, 'l> TransitionCtx<'t, 'l> {
             log_label,
             actor,
             breaker_trip: false,
-            halfway_mark: false,
+            bounce_notice: None,
         }
     }
     fn notifying(
@@ -712,8 +715,8 @@ impl<'t, 'l> TransitionCtx<'t, 'l> {
         self.breaker_trip = breaker_trip;
         self
     }
-    fn with_halfway_mark(mut self, halfway_mark: bool) -> Self {
-        self.halfway_mark = halfway_mark;
+    fn with_bounce_notice(mut self, bounce_notice: Option<i64>) -> Self {
+        self.bounce_notice = bounce_notice;
         self
     }
 }
@@ -987,8 +990,8 @@ async fn last_comment_as_failure_details(ticket_id: &str) -> String {
 
 /// Enqueue a notification for the Manager about a ticket transition, with the
 /// extra section the transition context calls for: the failure-triage block on
-/// a Failed transition, or the halfway notice on a bounce that lands on the
-/// halfway mark of the ticket's rework allowance.
+/// a Failed transition, or the looping notice on a bounce that lands on the
+/// ticket's return-to-development notice grid.
 async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
     let ticket = ctx.ticket;
     let Some(ws) = resolve_ticket_workspace(ticket, "skipping notification").await else {
@@ -1050,9 +1053,16 @@ async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
         message.push_str(&warning);
     }
 
-    if ctx.halfway_mark {
+    if let Some(bounce_count) = ctx.bounce_notice {
+        let notice = substitute(
+            &load_prompt("pipeline/bounce_notification.md"),
+            &[
+                ("{{bounce_count}}", &bounce_count.to_string()),
+                ("{{max_bounces}}", &MAX_BOUNCES.to_string()),
+            ],
+        );
         message.push_str("\n\n");
-        message.push_str(&load_prompt("pipeline/halfway_notification.md"));
+        message.push_str(&notice);
     }
 
     let agent_id = manager_agent_id(&ws.name);
@@ -1643,14 +1653,19 @@ fn bounce_exhausted(bounce_count: i64) -> bool {
     usize::try_from(bounce_count).unwrap_or(usize::MAX) >= MAX_BOUNCES
 }
 
-/// Returns true when the bounce being applied lands the counter exactly on
-/// [`BOUNCE_HALFWAY_MARK`] — the one point where the Manager gets the halfway
-/// notice. `bounce_count` is the count *before* the increment, so matching
-/// exactly (never `>=`) keeps the notice once-per-ticket and never backfills
-/// tickets already past the mark.
+/// The return-to-development count to report in the Manager's looping notice
+/// when the bounce being applied lands on the notice grid, or `None` when this
+/// bounce carries no notice. `bounce_count` is the count *before* the increment,
+/// so matching exactly (never `>=`) keeps each notice once-per-ticket and never
+/// backfills a ticket already past a grid point. A count at or above
+/// [`MAX_BOUNCES`] carries no notice, so the trip — whose failure notice stands
+/// alone — can never stack one on top, even if a future budget is itself a grid
+/// multiple.
 #[must_use]
-fn bounce_hits_halfway_mark(bounce_count: i64) -> bool {
-    usize::try_from(bounce_count).is_ok_and(|n| n + 1 == BOUNCE_HALFWAY_MARK)
+fn bounce_notice_mark(bounce_count: i64) -> Option<i64> {
+    let next = bounce_count.checked_add(1)?;
+    let n = usize::try_from(next).ok()?;
+    (n < MAX_BOUNCES && n % BOUNCE_NOTICE_INTERVAL == 0).then_some(next)
 }
 
 /// Move all other Queued tickets in the workspace to Planning after a breaker
@@ -1711,15 +1726,15 @@ async fn bounce_to_development(
     job_id: &str,
 ) -> FinalizeOutcome {
     let trip = bounce_exhausted(ticket.bounce_count);
-    let halfway = bounce_hits_halfway_mark(ticket.bounce_count);
+    let bounce_notice = bounce_notice_mark(ticket.bounce_count);
     let target = if trip {
         TicketPhase::Failed
     } else {
         TicketPhase::InDevelopment
     };
-    // A halfway bounce notifies immediately rather than buffering for the next
+    // A grid bounce notifies immediately rather than buffering for the next
     // drain — the notice only has value while the ticket still runs.
-    let notify = if trip || halfway {
+    let notify = if trip || bounce_notice.is_some() {
         NotifyPolicy::Notify
     } else {
         NotifyPolicy::Buffer
@@ -1727,7 +1742,7 @@ async fn bounce_to_development(
     let trip_comment = trip.then(bounce_breaker_trip_comment);
     let ctx = TransitionCtx::new(ticket, source, target, notify, log_label, actor)
         .with_breaker(trip)
-        .with_halfway_mark(halfway);
+        .with_bounce_notice(bounce_notice);
 
     let outcome = with_comment_and_transition(ctx, async |tx| {
         if let Some(comment) = &trip_comment {
