@@ -77,8 +77,8 @@ impl Tool for ImageGenTool {
 
         // Pre-flight reference-count validation BEFORE loading any files: a
         // too-many-refs error must not first read every reference into memory.
-        // The catalog declares the per-model cap; the fail-open path (catalog
-        // unavailable) falls back to the universal OpenRouter limit.
+        // The catalog declares the per-model cap, clamped to the provider's
+        // documented ceiling; with no catalog that ceiling is the cap.
         if let Some(info) = info
             && !reference_paths.is_empty()
         {
@@ -282,6 +282,10 @@ async fn generate_image_with_retries(
     body: &serde_json::Value,
     auth: &str,
 ) -> Result<serde_json::Value, String> {
+    // The refusal hint about the reference count may only appear when the
+    // request actually carried input images — the body carries the array
+    // exactly then.
+    let has_references = body.get(super::INPUT_REFERENCES_KEY).is_some();
     let mut failures: Vec<AttemptFailure> = Vec::new();
     for attempt in 1..=IMAGE_GEN_MAX_ATTEMPTS {
         match attempt_image_generation(url, body, auth).await {
@@ -290,7 +294,7 @@ async fn generate_image_with_retries(
                 let retryable = failure.retryable();
                 failures.push(failure);
                 if !retryable || attempt == IMAGE_GEN_MAX_ATTEMPTS {
-                    return Err(build_terminal_message(&failures));
+                    return Err(build_terminal_message(&failures, has_references));
                 }
                 let sleep_ms = failures
                     .last()
@@ -373,7 +377,9 @@ async fn attempt_image_generation(
 
 /// Build the user-visible terminal error from the failure trail, stating the
 /// actual cause (timeout vs HTTP status vs transport vs billable-ambiguous).
-fn build_terminal_message(failures: &[AttemptFailure]) -> String {
+/// `has_references` says whether the refused request carried input images, so
+/// a refusal can carry the reference-count hint only where it could apply.
+fn build_terminal_message(failures: &[AttemptFailure], has_references: bool) -> String {
     let last = failures.last().expect("at least one failure");
     let cause = match last {
         // Parse failures already carry a fully-formed message (error context
@@ -414,7 +420,9 @@ fn build_terminal_message(failures: &[AttemptFailure]) -> String {
                     .to_string()
             }
         }
-        AttemptFailure::Http { status, body, .. } => describe_http_failure(*status, body),
+        AttemptFailure::Http { status, body, .. } => {
+            describe_http_failure(*status, body, has_references)
+        }
         AttemptFailure::BodyRead => {
             "received a 2xx response but the body could not be read — the generation may \
              have completed and been billed server-side; verify before retrying"
@@ -442,9 +450,16 @@ fn build_terminal_message(failures: &[AttemptFailure]) -> String {
 /// nested-envelope fields — `metadata.raw`, `provider_error_code`, `code`,
 /// `type` — see [`crate::util::extract_provider_error_detail`]), so the full
 /// provider code/message reaches the model even when the detail is nested.
-fn describe_http_failure(status: u16, body: &str) -> String {
+///
+/// The refusal's cause is never invented: an HTTP 400 is reported as a
+/// refusal, and the provider's own explanation stays the verdict. When the
+/// request carried input images (`has_references`), the message additionally
+/// carries a conditional hint that the provider may accept fewer references
+/// than the catalog declares — the product does not parse the provider's
+/// wording to decide whether the count was the cause.
+fn describe_http_failure(status: u16, body: &str, has_references: bool) -> String {
     let typed = match status {
-        400 => "content policy violation or refusal (HTTP 400)".to_string(),
+        400 => "provider refused the request (HTTP 400)".to_string(),
         402 => "insufficient credits — add credits to the provider account and retry (HTTP 402)"
             .to_string(),
         429 => "rate limit exceeded (HTTP 429)".to_string(),
@@ -457,10 +472,17 @@ fn describe_http_failure(status: u16, body: &str) -> String {
     let provider_msg = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| crate::util::extract_provider_error_detail(&v));
-    match provider_msg {
+    let mut described = match provider_msg {
         Some(msg) => format!("{typed}: {msg}"),
         None => typed,
+    };
+    if status == 400 && has_references {
+        described.push_str(
+            " If the refusal is about the number of input images, the provider may \
+             accept fewer than the catalog declares — retry with fewer images.",
+        );
     }
+    described
 }
 
 /// Build the dedicated Image API request body from tool args and (when
@@ -526,13 +548,17 @@ fn build_request_body(
 }
 
 /// Validate the reference count against the catalog's `input_references`
-/// range. Runs in execute's pre-flight guard, before any file is loaded.
+/// range, clamped to the provider's documented ceiling. Runs in execute's
+/// pre-flight guard, before any file is loaded.
 fn validate_reference_count(
     model: &str,
     info: &ImageModelInfo,
     count: usize,
 ) -> anyhow::Result<()> {
-    match info.range_max("input_references") {
+    match info
+        .range_max("input_references")
+        .map(super::effective_reference_max)
+    {
         #[expect(clippy::cast_possible_wrap)]
         Some(max) if count as i64 > max => anyhow::bail!(
             "Model `{model}` supports at most {max} reference image(s), \
@@ -791,7 +817,8 @@ mod tests {
 
     /// Fixture catalog covering a hybrid image model (resolution + reference
     /// caps), a recraft-like model (aspect ratio only, declares "auto"), a
-    /// model with explicit-pixel `size`, and a text-only model.
+    /// model with explicit-pixel `size`, a model declaring more reference
+    /// images than the provider accepts, and a text-only model.
     fn fixture_catalog() -> ImageCatalog {
         parse_catalog(&json!({
             "data": [
@@ -817,6 +844,13 @@ mod tests {
                     "architecture": { "output_modalities": ["image"] },
                     "supported_parameters": {
                         "size": { "type": "enum", "values": ["1024x1024", "2048x2048"] }
+                    }
+                },
+                {
+                    "id": "huge/refs",
+                    "architecture": { "output_modalities": ["image"] },
+                    "supported_parameters": {
+                        "input_references": { "type": "range", "min": 0, "max": 20 }
                     }
                 },
                 {
@@ -954,6 +988,13 @@ mod tests {
             err.to_string()
                 .contains("does not support reference images")
         );
+
+        // A catalog declaring more than the provider accepts is clamped to the
+        // documented ceiling: 16 passes, 17 is refused with that same maximum.
+        let huge = catalog.find("huge/refs").unwrap();
+        validate_reference_count("huge/refs", huge, 16).expect("16 references accepted");
+        let err = validate_reference_count("huge/refs", huge, 17).unwrap_err();
+        assert!(err.to_string().contains("at most 16 reference image(s)"));
     }
 
     #[tokio::test]
@@ -1234,17 +1275,41 @@ mod tests {
 
     #[test]
     fn test_describe_http_failure_typed_codes() {
-        let msg = describe_http_failure(402, "{}");
+        let msg = describe_http_failure(402, "{}", false);
         assert!(msg.contains("insufficient credits"));
 
         // Provider body message is surfaced when the body is JSON.
-        let msg = describe_http_failure(503, r#"{"error":{"message":"upstream busy"}}"#);
+        let msg = describe_http_failure(503, r#"{"error":{"message":"upstream busy"}}"#, false);
         assert!(msg.contains("provider overloaded (HTTP 503)"));
         assert!(msg.contains("upstream busy"));
 
-        let msg = describe_http_failure(504, "plain text");
+        let msg = describe_http_failure(504, "plain text", false);
         assert!(msg.contains("provider timeout (HTTP 504)"));
-        assert_eq!(describe_http_failure(418, "{}"), "HTTP 418");
+        assert_eq!(describe_http_failure(418, "{}", false), "HTTP 418");
+    }
+
+    #[test]
+    fn test_describe_http_failure_refusal_hint_only_with_references() {
+        // The recorded incident: a provider refusing a request over its image
+        // count. The message states a refusal, keeps the provider's own
+        // explanation as the verdict, and never claims a content-policy cause.
+        let msg = describe_http_failure(
+            400,
+            r#"{"error":{"message":"Model qwen-image-3.0-pro supports 0~3 image content items. Got 4 image items."}}"#,
+            true,
+        );
+        assert!(msg.contains("provider refused the request (HTTP 400)"));
+        assert!(msg.contains("supports 0~3 image content items"));
+        assert!(msg.contains("retry with fewer images"));
+        assert!(!msg.contains("content policy"));
+
+        // No input images in the request → no hint about their count, and the
+        // refusal still attributes no cause of its own.
+        let msg = describe_http_failure(400, r#"{"error":{"message":"invalid size"}}"#, false);
+        assert!(msg.contains("provider refused the request (HTTP 400)"));
+        assert!(msg.contains("invalid size"));
+        assert!(!msg.contains("input images"));
+        assert!(!msg.contains("content policy"));
     }
 
     #[test]
@@ -1254,8 +1319,9 @@ mod tests {
         let msg = describe_http_failure(
             400,
             r#"{"error":{"code":"data_inspection_failed","metadata":{"raw":"Input image data may contain inappropriate content."}}}"#,
+            true,
         );
-        assert!(msg.contains("content policy violation or refusal (HTTP 400)"));
+        assert!(msg.contains("provider refused the request (HTTP 400)"));
         assert!(
             msg.contains("Input image data may contain inappropriate content."),
             "nested metadata.raw must surface: {msg}"
@@ -1265,6 +1331,7 @@ mod tests {
         let msg = describe_http_failure(
             400,
             r#"{"error":{"code":"data_inspection_failed","type":"invalid_request_error"}}"#,
+            false,
         );
         assert!(
             msg.contains("data_inspection_failed"),
@@ -1275,59 +1342,89 @@ mod tests {
     #[test]
     fn test_build_terminal_message_states_true_cause() {
         // Full-cap request timeout: explicitly not auto-retried.
-        let msg = build_terminal_message(&[AttemptFailure::Timeout {
-            elapsed_ms: 600_000,
-            connect: false,
-        }]);
+        let msg = build_terminal_message(
+            &[AttemptFailure::Timeout {
+                elapsed_ms: 600_000,
+                connect: false,
+            }],
+            false,
+        );
         assert!(msg.contains("timed out after 600 s"));
         assert!(msg.contains("not auto-retried"));
 
         // Retried quick failures: the attempt-count prefix carries the retry
         // context — the cause itself does not claim a retry.
-        let msg = build_terminal_message(&[
-            AttemptFailure::Timeout {
-                elapsed_ms: 30_000,
-                connect: true,
-            },
-            AttemptFailure::Timeout {
-                elapsed_ms: 45_000,
-                connect: true,
-            },
-        ]);
+        let msg = build_terminal_message(
+            &[
+                AttemptFailure::Timeout {
+                    elapsed_ms: 30_000,
+                    connect: true,
+                },
+                AttemptFailure::Timeout {
+                    elapsed_ms: 45_000,
+                    connect: true,
+                },
+            ],
+            false,
+        );
         assert!(msg.contains("failed after 2 attempt(s)"));
         assert!(msg.contains("connection timed out"));
 
         // A connect timeout is honest about never reaching the provider, and
         // never claims a retry it did not make.
-        let msg = build_terminal_message(&[AttemptFailure::Timeout {
-            elapsed_ms: 10_000,
-            connect: true,
-        }]);
+        let msg = build_terminal_message(
+            &[AttemptFailure::Timeout {
+                elapsed_ms: 10_000,
+                connect: true,
+            }],
+            false,
+        );
         assert!(msg.contains("never reached the provider"));
         assert!(!msg.contains("retried"));
 
         // HTTP cause with provider message.
-        let msg = build_terminal_message(&[AttemptFailure::Http {
-            status: 503,
-            body: r#"{"error":{"message":"down"}}"#.into(),
-            retry_after_ms: None,
-            elapsed_ms: 1_000,
-        }]);
+        let msg = build_terminal_message(
+            &[AttemptFailure::Http {
+                status: 503,
+                body: r#"{"error":{"message":"down"}}"#.into(),
+                retry_after_ms: None,
+                elapsed_ms: 1_000,
+            }],
+            false,
+        );
         assert!(msg.contains("provider overloaded (HTTP 503)"));
 
+        // A refused request that carried input images carries the hint; the
+        // same request without them does not.
+        let http_400 = AttemptFailure::Http {
+            status: 400,
+            body: r#"{"error":{"message":"too many images"}}"#.into(),
+            retry_after_ms: None,
+            elapsed_ms: 1_000,
+        };
+        let msg = build_terminal_message(&[http_400], true);
+        assert!(msg.contains("retry with fewer images"));
+        assert!(msg.contains("too many images"));
+
         // A long mid-flight transport failure warns about possible billing.
-        let msg = build_terminal_message(&[AttemptFailure::Transport {
-            elapsed_ms: 300_000,
-        }]);
+        let msg = build_terminal_message(
+            &[AttemptFailure::Transport {
+                elapsed_ms: 300_000,
+            }],
+            false,
+        );
         assert!(msg.contains("may have completed and been billed"));
 
         // A retry followed by a parse failure keeps the attempt context.
-        let msg = build_terminal_message(&[
-            AttemptFailure::Transport { elapsed_ms: 5_000 },
-            AttemptFailure::Parse {
-                message: "Image generation response parse error: bad".into(),
-            },
-        ]);
+        let msg = build_terminal_message(
+            &[
+                AttemptFailure::Transport { elapsed_ms: 5_000 },
+                AttemptFailure::Parse {
+                    message: "Image generation response parse error: bad".into(),
+                },
+            ],
+            false,
+        );
         assert!(msg.contains("failed after 2 attempt(s)"));
         assert!(msg.contains("parse error"));
     }

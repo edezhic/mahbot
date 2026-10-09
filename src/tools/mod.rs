@@ -72,12 +72,24 @@ const MAX_REFERENCE_IMAGE_BYTES: u64 = 1_500_000;
 /// documented OpenRouter number).
 const MAX_REQUEST_BODY_BYTES: usize = 2_000_000;
 
-/// Conservative cap on reference images per generation request, applied only
-/// when the model catalog is unavailable (fail-open). Per-model caps come from
-/// the catalog; provider acceptance of `input_references` varies, so this is a
-/// memory-bounding sanity limit — the aggregate body budget is the real
-/// backstop for what reaches the wire.
+/// The provider's documented maximum number of reference images in one
+/// generation request — the image API declares `input_references` with a
+/// maximum array length of 16. The live model catalog advertises more than
+/// this for some models (up to 20), so the ceiling also clamps the catalog's
+/// declared maximum: both for the reference count the tool sends and for the
+/// maximum rendered to the agent. It is also the cap when the catalog is
+/// unavailable; the aggregate body budget stays the backstop for what reaches
+/// the wire.
 pub(crate) const MAX_REFERENCE_IMAGES_PER_REQUEST: usize = 16;
+
+/// The effective reference-image maximum for a model whose catalog declares
+/// `catalog_max`: the declared maximum, never above the provider's documented
+/// ceiling ([`MAX_REFERENCE_IMAGES_PER_REQUEST`]).
+#[expect(clippy::cast_possible_wrap)] // small compile-time cap
+#[must_use]
+pub(crate) fn effective_reference_max(catalog_max: i64) -> i64 {
+    catalog_max.min(MAX_REFERENCE_IMAGES_PER_REQUEST as i64)
+}
 
 /// Canonical list of argument aliases for file path parameters.
 ///

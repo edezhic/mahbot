@@ -194,6 +194,13 @@ fn render_image_section(model: &str, info: &ImageModelInfo) -> Option<String> {
             }
             ParameterConstraint::Range { max } => {
                 rendered = true;
+                // A model may declare more reference images than the provider
+                // accepts — the advertised maximum is clamped to the ceiling.
+                let max = if name == "images" {
+                    super::effective_reference_max(*max)
+                } else {
+                    *max
+                };
                 let _ = writeln!(out, "- {name}: max {max}");
             }
             ParameterConstraint::Boolean => {
@@ -384,6 +391,21 @@ mod tests {
         assert!(!out.contains("n:"));
         assert!(!out.contains("seed"));
         assert!(!out.contains("future"));
+    }
+
+    #[test]
+    fn image_section_clamps_declared_reference_max() {
+        // A model declaring more reference images than the provider accepts
+        // (the live catalog has one at 20) shows the ceiling, not its own
+        // number; a model within the ceiling renders unchanged (see
+        // image_section_renders_tool_mapped_params_only, max 4).
+        let mut huge = ImageModelInfo::default();
+        huge.supported_parameters.insert(
+            "input_references".into(),
+            ParameterConstraint::Range { max: 20 },
+        );
+        let out = render_image_section("huge/refs", &huge).expect("envelope rendered");
+        assert!(out.contains("- images: max 16\n"), "{out}");
     }
 
     #[test]
