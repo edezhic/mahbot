@@ -47,9 +47,8 @@ pub(crate) mod workspace_control;
 /// (10 MB), and the read tool's cap for any read that is not a document container;
 /// a container it accepts up to `FILE_MAX_BYTES` (50 MB), like an inbound
 /// attachment. Guards against OOM when agents or the GUI attempt to read very large
-/// files. ReadTool/EditTool enforce it via `check_size_within()` (the read tool's
-/// FIFO arm bounds its own accumulation); SearchTool and the Iced Editor use it
-/// directly.
+/// files. ReadTool/EditTool enforce it via `check_size_within()`; SearchTool and
+/// the Iced Editor use it directly.
 pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Maximum size for a single reference image in bytes. The 2 MB figure is a
@@ -1658,7 +1657,7 @@ mod tests {
             Box::new(SearchTool),
             Box::new(ShellTool::new(ShellMode::Full)),
             Box::new(ReadTool::general()),
-            Box::new(EditTool),
+            Box::new(EditTool::confined()),
         ];
 
         // Each case: (alias, expected_tool_name or None).
@@ -1743,7 +1742,10 @@ mod tests {
             ("ImageGenTool", Box::new(ImageGenTool)),
             ("VideoGenTool", Box::new(VideoGenTool)),
             ("VideoEditTool", Box::new(VideoEditTool)),
-            ("DocumentTool", Box::new(DocumentTool)),
+            (
+                "DocumentTool",
+                Box::new(DocumentTool::new(path::PathAccess::Workspace)),
+            ),
         ];
         for (name, tool) in &tools {
             let marker = tool.media_marker();

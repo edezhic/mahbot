@@ -285,7 +285,7 @@ pub(crate) fn millis_i64(elapsed: std::time::Duration) -> i64 {
 
 /// Parse an env var as a whole number of seconds, falling back to `default_secs`.
 ///
-/// Shared by the bounded tool I/O waits (shell output drain, FIFO reads, round
+/// Shared by the bounded tool I/O waits (shell output drain, round
 /// consolidation) so their env-override pattern stays in one place.
 /// A value of `0` produces an immediate timeout — deliberate for tests;
 /// operators should set a positive value.
@@ -398,6 +398,24 @@ pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
 #[must_use]
 pub(crate) fn is_within(candidate: &Path, base: &Path) -> bool {
     strip_verbatim_prefix(candidate).starts_with(strip_verbatim_prefix(base))
+}
+
+/// `s` without a trailing `suffix`, compared without ASCII case — the volumes
+/// the service runs on compare file names that way, so a differently-cased
+/// suffix is the same suffix.
+#[must_use]
+pub(crate) fn strip_suffix_ignoring_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = s.len().checked_sub(suffix.len())?;
+    s.get(cut..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+        .then(|| &s[..cut])
+}
+
+/// `path` canonicalized when it resolves, and as given when it does not — the
+/// spelling a resolved path can be compared against.
+#[must_use]
+pub(crate) fn canonical_or_self(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]

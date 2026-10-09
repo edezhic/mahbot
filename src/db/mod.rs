@@ -2162,8 +2162,24 @@ pub(crate) fn store_db_path(root: &Path, name: &str) -> std::path::PathBuf {
     } else {
         CONSOLIDATED_DB_NAME
     };
-    root.join("db").join(format!("{stem}.db"))
+    store_dir(root).join(format!("{stem}.db"))
 }
+
+/// The store directory of a storage root — where both physical stores live,
+/// together with the recovery copies the service keeps of them. The one place
+/// the layout is spelled: a rule that decides anything by location (the
+/// live-store refusal, the forensic listing) asks here rather than joining
+/// `db` itself.
+#[must_use]
+pub(crate) fn store_dir(root: &Path) -> std::path::PathBuf {
+    root.join("db")
+}
+
+/// The marker a rebuild's own temp file carries — `{store}.db.rebuild-{stamp}`,
+/// written beside the store it is rebuilding. The tool guard recognises a
+/// rebuild temp as one of the service's own files by it, so it is spelled once,
+/// here, beside the writer.
+pub(crate) const REBUILD_TEMP_MARKER: &str = ".rebuild-";
 
 /// The `-wal` sidecar path of a store's database file. The WAL is the engine's
 /// own: it can hold committed-but-uncheckpointed frames, so it is moved aside
@@ -2805,8 +2821,11 @@ async fn migrate_overflow_aliased_store(
     }
 
     // ── Build the fresh store at a sibling temp path ──
-    let temp =
-        std::path::PathBuf::from(format!("{}.rebuild-{}", db_path.display(), family_stamp()));
+    let temp = std::path::PathBuf::from(format!(
+        "{}{REBUILD_TEMP_MARKER}{}",
+        db_path.display(),
+        family_stamp()
+    ));
     // Guard removes the temp family on every exit, including a turso panic
     // mid-copy (absorbed by open_store's catch_unwind).
     let _temp_guard = TempCleanup(&temp);

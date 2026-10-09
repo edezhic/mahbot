@@ -36,9 +36,14 @@
 //! The materialized kit directory is a subdirectory of the product's storage
 //! root. In the product's own layout (`$HOME` outside the temp roots) that is a
 //! place no workspace, no tool-accessible root and no OS temp root an agent may
-//! write covers — unlike the temp-root path it used to occupy. A sandbox launch
-//! that points `HOME` at a temp root puts the storage root there too, where a
-//! read-only agent may write, and the guarantee is only as good as the layout.
+//! write covers — unlike the temp-root path it used to occupy. It is out of
+//! reach of every pipeline role and of a guest, but not of the admin's Assistant,
+//! which reaches the machine by design (see [`crate::tools::path::PathAccess`]):
+//! that role could leave a file beside the kit, and its own full shell could
+//! reach the same file anyway, which is the accepted limit of a location rule.
+//! A sandbox launch that points `HOME` at a temp root puts the storage root
+//! there too, where a read-only agent may write, and the guarantee is only as
+//! good as the layout.
 //!
 //! The kit runs with that directory as its cwd, never the caller's workspace:
 //! bun auto-loads `$cwd/bunfig.toml` and runs its `preload` scripts (verified —
@@ -427,10 +432,11 @@ async fn kit_directory() -> Result<&'static Path> {
     // the ordering hold — every caller waits for it, so none of them can have a
     // file inside the directory it clears.
     static SWEPT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-    // The kit must not be materialized where an agent can write: a writable
-    // `bunfig.toml` beside it would run attacker-authored code (see the module
-    // docs). Boot resolves the storage root before any agent runs, so its
-    // absence here is a boot-order bug, not the caller's fault.
+    // The kit is materialized under the storage root rather than a temp root so
+    // that no tool-accessible root an agent may write reaches it — except the
+    // admin Assistant's own reach, which the module docs name as the accepted
+    // limit of a location rule. Boot resolves the storage root before any agent
+    // runs, so its absence here is a boot-order bug, not the caller's fault.
     let root = crate::config::CONFIG.try_storage_root().ok_or_else(|| {
         crate::tools::internal_fault(
             "the document kit cannot be prepared: the storage root is not resolved",

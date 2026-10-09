@@ -1,0 +1,1 @@
+Edits are confined to your workspace: a relative path resolves from it, and an absolute path outside it is refused.

@@ -1,5 +1,7 @@
 Read file contents with line numbers. Preferred over shell `cat` for reading files — it provides line numbers for reference, supports offset/limit for partial reads, and can list code structure via AST symbols.
 
+{{path_policy}}
+
 When the path is a directory, the tool lists its contents instead of returning an error. The directory listing groups subdirectories and files with sizes and an extension summary. Note that `mode`, `offset`, and `limit` parameters only apply to file reads — they are silently ignored when a directory is passed.
 
 Modes:
@@ -17,35 +19,6 @@ A Word `.docx`/`.docm` is read beyond its body. A table comes back as a `Table N
 
 Unaccepted tracked changes are never passed off as the final text — in the body, in a table, in a header, a footnote or a comment alike: `[ins]…[/ins]` was inserted, `[del]…[/del]` was deleted, `[moved-here]…[/moved-here]` and `[moved-away]…[/moved-away]` were moved, `[ins ¶]`, `[del ¶]`, `[moved-here ¶]` and `[moved-away ¶]` revise a paragraph mark; a row or a cell that was inserted or deleted says `(inserted)` / `(deleted)`, a whole row or cell added or removed rather than a formatting change; and `[fmt]`, `[fmt ¶]`, `[fmt section]`, `(merge revised)` and `(formatting revised)` on a table, a row or a cell revise formatting alone. A document carrying any of them opens with an `Unaccepted tracked changes: …` line counting them and naming their authors, so a document still under revision is never taken for an agreed one. Text a text box holds is shown once, as an indented `{{text_box_mark}}` block.
 
-Path restrictions: paths must be within the project workspace, or within common dependency source directories (see below). Absolute paths are allowed for temp files (e.g. spill files from shell output under `$TMPDIR` on unix, `%TMP%`/`%TEMP%` on Windows) and dependency sources. Files larger than 10 MB are rejected, except document containers, which are accepted up to 50 MB.
+Reading a credential-bearing file — `.env*`, a `.pem`/`.cer`/`.crt` certificate, `.key`/`.p12`/`.pfx`, or a known credential config (`.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, Maven `settings.xml`/`settings-security.xml`, Gradle `gradle.properties`/`init.gradle*`, cargo `credentials.toml`) — returns its content with the credential values masked. Every other file comes back as it is, and a secret stored under a name the masking does not recognise is returned whole.
 
-## Dependency source access
-
-The read tool can access dependency source code from common package manager cache directories, including:
-
-- **Rust**: `~/.cargo/registry/src/`, `~/.cargo/git/checkouts/`, rustup toolchains `~/.rustup/toolchains/` (std sources)
-- **Python**: `~/.local/lib/`, `~/Library/Python/`, `/usr/local/lib/`, `/usr/lib/`, conda, poetry, pipenv, uv, rye directories
-- **Java/JVM**: Maven `~/.m2/repository/`, Gradle `~/.gradle/caches/` (caches only — not the whole `~/.gradle`), JDK headers via `$JAVA_HOME/include` or the system JVM locations (headers only)
-- **JavaScript/TypeScript**: bun, pnpm, npm global caches, `~/.npm`, nvm/volta/yarn caches
-- **Go**: module cache `~/go/pkg/mod/` (or `$GOMODCACHE`/`$GOPATH`), GOROOT sources (`$GOROOT/src`, `/usr/local/go`, Homebrew)
-- **Ruby**: `~/.gem/`, `~/.bundle/`
-- **PHP**: `~/.composer/`
-- **C/C++**: `~/.conan/`, `~/.conan2/`, Homebrew Cellar, system + Homebrew headers (`/usr/include`, `/usr/local/include`, `include/`, `opt/`, `Frameworks/`), Chocolatey, MSYS2/MinGW, Windows SDK, MSVC, Xcode / Command Line Tools SDK roots
-- **Swift**: SwiftPM cache and Xcode DerivedData
-- **Dart/Flutter**: `~/.pub-cache/`
-- **Elixir/Erlang**: `~/.hex/`, `~/.mix/`
-- **Haskell**: cabal, stack directories
-- **Lua**: LuaRocks directories
-- **R**: macOS/Linux/Windows R package libraries
-- **OCaml**: `~/.opam/`
-- **Julia**: `~/.julia/`
-- **Nix**: `/nix/store/` (read-only)
-- **System**: MacPorts (`/opt/local/`), pipx (`~/.local/pipx/`)
-
-When `CARGO_HOME`, `RUSTUP_HOME`, `GOMODCACHE`, `GOPATH`, `GRADLE_USER_HOME`, `JAVA_HOME`, or `GOROOT` is set, the relocated root is honored alongside the HOME default. `XDG_CACHE_HOME`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME` are honored for the `~/.cache/`, `~/.config/`, `~/.local/share/`, `~/.local/state/` entries.
-
-To discover the exact path for a specific dependency, list the package directory with the read tool (the search tool is workspace-scoped and won't find packages in dependency caches). For example, read `~/.cargo/registry/src` to find the cached crate sources.
-
-## Protected credentials
-
-Some paths are denied even though they exist, with the distinct "Path is a protected credential location" error — `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and private-key files (`id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `*.ppk`) anywhere, including inside the workspace. Credential-bearing config files (`.env`, `.pem`/`.cer`/`.crt` certs, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, Maven `settings.xml`/`settings-security.xml`, Gradle `gradle.properties`/`init.gradle*`, cargo `credentials.toml`) are scrubbed for credentials rather than denied — where they are readable at all (workspace files or paths inside the allowlisted roots); e.g. `~/.m2/settings.xml` and `~/.gradle/gradle.properties` sit outside the read allowlist and are simply not readable.
+Files larger than 10 MB are rejected, except document containers, which are accepted up to 50 MB.

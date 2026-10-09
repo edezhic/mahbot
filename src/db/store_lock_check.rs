@@ -64,7 +64,7 @@ async fn verify() -> Result<String> {
     // directory is created by the first store open and by nothing else, so its
     // existence is what makes a root someone's install: refuse it rather than
     // touch it (path-based stats, like everything else here).
-    let store_dir = root.join("db");
+    let store_dir = super::store_dir(&root);
     ensure!(
         !store_dir.exists(),
         "refusing to run against an existing store root ({}) — this check writes to the \

@@ -38,8 +38,7 @@
 //!   is a marker the sheet's own declaration does not let this reader place (a
 //!   `<col>` range past the grid, a merged range or link naming no range).
 //! - **The notation the model reads is documented in
-//!   `src/prompt/tool/read.md` and `read_strict.md`** — a mark this module adds
-//!   belongs there too.
+//!   `src/prompt/tool/read.md`** — a mark this module adds belongs there too.
 
 use super::{
     Part, Relationship, ZipEntry, append_entity, attr, blank, part_dir, read_zip_entry, rel_id,

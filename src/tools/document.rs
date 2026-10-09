@@ -9,10 +9,11 @@
 //! # Path confinement
 //!
 //! Every path the model supplies — a template, a PDF to edit, an image to embed —
-//! is resolved with [`crate::tools::path::resolve_read_target`] in its strict
-//! workspace-only form, for owner and guest alike. The OUTPUT path is never the
-//! model's: the tool picks a name inside `<workspace>/generated/` and reserves it
-//! with a create-new write before the kit runs.
+//! is resolved with [`crate::tools::path::resolve_read_target`] under the
+//! caller's [`PathAccess`]: workspace-only for a guest's Assistant, anywhere the
+//! shell could name for the admin's. The OUTPUT path is never the model's: the
+//! tool picks a name inside `<workspace>/generated/` and reserves it with a
+//! create-new write before the kit runs.
 //!
 //! # Input rules
 //!
@@ -46,6 +47,7 @@
 //! one is not doubled.
 
 use crate::docgen;
+use crate::tools::path::PathAccess;
 use crate::{Tool, Workspace};
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
@@ -305,7 +307,35 @@ static RULES: LazyLock<Rules> = LazyLock::new(|| {
 });
 
 /// Create and edit office documents and PDFs. See the module docs.
-pub(crate) struct DocumentTool;
+///
+/// `access` is the caller's [`PathAccess`], fixed when the role's toolset is
+/// built: it decides where the tool's *inputs* may come from. Every produced
+/// file always lands in the caller's own workspace's `generated/` directory,
+/// whatever the access.
+pub(crate) struct DocumentTool {
+    access: PathAccess,
+}
+
+impl DocumentTool {
+    #[must_use]
+    pub(crate) const fn new(access: PathAccess) -> Self {
+        Self { access }
+    }
+
+    /// Where the model may read its inputs from, in its own access level's
+    /// wording: the admin's may be read from anywhere, a guest's stay inside its
+    /// workspace. Only those two levels reach this tool (it belongs to the
+    /// Assistant alone); the allowlisted level is worded as the workspace it
+    /// certainly covers.
+    const fn input_location(&self) -> &'static str {
+        match self.access {
+            PathAccess::Unrestricted => {
+                "readable from anywhere on this machine (the product's own live databases excepted)"
+            }
+            PathAccess::Workspace | PathAccess::Allowlisted => "confined to your workspace",
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for DocumentTool {
@@ -399,6 +429,7 @@ impl Tool for DocumentTool {
         crate::prompt::substitute(
             &crate::prompt::load_prompt("tool/document.md"),
             &[
+                ("{{input_location}}", self.input_location()),
                 ("{{degrees_step}}", &degrees_step),
                 ("{{heading_levels}}", &heading_levels),
                 ("{{image_side_px}}", &image_side_px),
@@ -483,7 +514,7 @@ impl Tool for DocumentTool {
                 },
                 "template": {
                     "type": "string",
-                    "description": "fill_template: workspace path of the user's own .docx/.pptx/.xlsx sample; {name} placeholders are replaced with values. The sample is never modified."
+                    "description": "fill_template: path of the user's own .docx/.pptx/.xlsx sample; {name} placeholders are replaced with values. The sample is never modified."
                 },
                 "values": {
                     "type": "object",
@@ -503,7 +534,7 @@ impl Tool for DocumentTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": format!(
-                        "pdf_merge: two or more workspace PDF paths, merged in order — at most {} \
+                        "pdf_merge: two or more PDF paths, merged in order — at most {} \
                          files, totalling at most {} MB, in one call.",
                         MAX_MERGE_INPUTS,
                         megabytes(MAX_MERGE_BYTES)
@@ -511,11 +542,11 @@ impl Tool for DocumentTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "PDF and edit actions: workspace path of the file."
+                    "description": "PDF and edit actions: path of the file."
                 },
                 "image": {
                     "type": "string",
-                    "description": "pdf_image: workspace path of the PNG or JPEG to place on the pages."
+                    "description": "pdf_image: path of the PNG or JPEG to place on the pages."
                 },
                 "ranges": {
                     "type": "array",
@@ -640,7 +671,7 @@ impl DocumentTool {
                      to write a {format} document"
                 );
             }
-            request["content"] = resolve_content(ws, args, format).await?;
+            request["content"] = resolve_content(ws, args, format, self.access).await?;
         }
         let base = sanitize_base(
             opt_string(args, "file_name")?,
@@ -659,7 +690,8 @@ impl DocumentTool {
         args: &Value,
         generated: &Path,
     ) -> Result<String> {
-        let (template, _) = resolve_input(ws, super::get_str(args, "template")?).await?;
+        let (template, _) =
+            resolve_input(ws, super::get_str(args, "template")?, self.access).await?;
         let values = super::get_object(args, "values")?;
         require_scalar_values(&values)?;
         let name = file_name_of(&template);
@@ -718,7 +750,7 @@ impl DocumentTool {
         generated: &Path,
         family: crate::ooxml::Family,
     ) -> Result<String> {
-        let (input, _) = resolve_input(ws, super::get_str(args, "path")?).await?;
+        let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         // The file's head is read once and answers both questions: the family its
         // name claims (its own family, never the name alone, is what this action
         // edits — a package of another family or a PDF is refused by name and an
@@ -737,7 +769,7 @@ impl DocumentTool {
         // notes edit, a slide reshape) reads no diagram text at all.
         let mut diagram_text = HashMap::new();
         if family == crate::ooxml::Family::Pptx {
-            resolve_edit_images(ws, &mut edits).await?;
+            resolve_edit_images(ws, &mut edits, self.access).await?;
             if edits_search_slide_text(&edits) {
                 diagram_text = crate::document::read_pptx_diagram_text(&input).await;
             }
@@ -773,7 +805,7 @@ impl DocumentTool {
         if files.len() < 2 {
             anyhow::bail!(
                 "usage: `files` needs at least 2 PDFs to merge, got {} — hint: pass two or \
-                 more workspace paths",
+                 more PDF paths",
                 files.len()
             );
         }
@@ -789,7 +821,7 @@ impl DocumentTool {
         // whole call is bounded, not just of one file.
         let mut total = 0u64;
         for file in &files {
-            let (path, size) = resolve_input(ws, file).await?;
+            let (path, size) = resolve_input(ws, file, self.access).await?;
             total += size;
             inputs.push(path);
         }
@@ -817,7 +849,7 @@ impl DocumentTool {
 
     /// `pdf_split` — one file per range.
     async fn pdf_split(&self, ws: &Workspace, args: &Value, generated: &Path) -> Result<String> {
-        let (input, _) = resolve_input(ws, super::get_str(args, "path")?).await?;
+        let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         let groups = split_groups(args)?;
         let base = sanitize_base(
             opt_string(args, "file_name")?,
@@ -838,7 +870,7 @@ impl DocumentTool {
 
     /// `pdf_rotate` — add a rotation to the selected pages.
     async fn pdf_rotate(&self, ws: &Workspace, args: &Value, generated: &Path) -> Result<String> {
-        let (input, _) = resolve_input(ws, super::get_str(args, "path")?).await?;
+        let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         let degrees = match super::get_opt_i64(args, "degrees")? {
             // Reduced here, so the request carries a value bounded by the turn
             // it is: a rotation IS its angle modulo 360, and a caller can send
@@ -880,7 +912,7 @@ impl DocumentTool {
 
     /// `pdf_text` — draw text (optionally stamped and rotated) on the pages.
     async fn pdf_text(&self, ws: &Workspace, args: &Value, generated: &Path) -> Result<String> {
-        let (input, _) = resolve_input(ws, super::get_str(args, "path")?).await?;
+        let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         let text = super::get_str(args, "text")?;
         let mut request = json!({
             "op": "pdf_text",
@@ -908,8 +940,8 @@ impl DocumentTool {
 
     /// `pdf_image` — place a PNG/JPEG on the pages.
     async fn pdf_image(&self, ws: &Workspace, args: &Value, generated: &Path) -> Result<String> {
-        let (input, _) = resolve_input(ws, super::get_str(args, "path")?).await?;
-        let (image, _) = resolve_input(ws, super::get_str(args, "image")?).await?;
+        let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
+        let (image, _) = resolve_input(ws, super::get_str(args, "image")?, self.access).await?;
         ensure_image(&image)?;
         let mut request = json!({
             "op": "pdf_image",
@@ -935,7 +967,7 @@ impl DocumentTool {
         args: &Value,
         generated: &Path,
     ) -> Result<String> {
-        let (input, _) = resolve_input(ws, super::get_str(args, "path")?).await?;
+        let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         let values = super::get_object(args, "values")?;
         // A form filled with nothing is a copy, not a fill: reporting that as
         // "filled the form" would name a success where nothing happened.
@@ -1095,18 +1127,17 @@ impl DocumentTool {
     }
 }
 
-/// Resolve a model-supplied input path inside the workspace (strict: no temp
-/// files, no dependency sources) and require it to be a regular file the kit can
-/// load whole. The file's length is returned alongside the path so a caller
-/// never stats the same file a second time.
-async fn resolve_input(ws: &Workspace, path: &str) -> Result<(PathBuf, u64)> {
-    let resolved = super::path::resolve_read_target(ws.as_path(), path, true).await?;
+/// Resolve a model-supplied input path under `access` and require it to be a
+/// regular file the kit can load whole. The file's length is returned alongside
+/// the path so a caller never stats the same file a second time.
+async fn resolve_input(ws: &Workspace, path: &str, access: PathAccess) -> Result<(PathBuf, u64)> {
+    let resolved = super::path::resolve_read_target(ws.as_path(), path, access).await?;
     let meta = tokio::fs::metadata(&resolved)
         .await
         .with_context(|| format!("cannot read {}", resolved.display()))?;
     if !meta.is_file() {
         anyhow::bail!(
-            "usage: {} is not a file — hint: pass a workspace path to a file",
+            "usage: {} is not a file — hint: pass the path of a file",
             resolved.display()
         );
     }
@@ -2373,10 +2404,15 @@ fn require_image_geometry(object: &serde_json::Map<String, Value>, at: &str) -> 
     Ok(())
 }
 
-/// Resolve and validate the `content` blocks, confining every embedded image
-/// path to the workspace. Shapes the kit would otherwise fail on are rejected
-/// here as usage errors.
-async fn resolve_content(ws: &Workspace, args: &Value, format: &str) -> Result<Value> {
+/// Resolve and validate the `content` blocks, resolving every embedded image
+/// path under the caller's [`PathAccess`]. Shapes the kit would otherwise fail
+/// on are rejected here as usage errors.
+async fn resolve_content(
+    ws: &Workspace,
+    args: &Value,
+    format: &str,
+    access: PathAccess,
+) -> Result<Value> {
     let blocks = match args.get("content") {
         Some(Value::Array(blocks)) if !blocks.is_empty() => blocks,
         Some(Value::Array(_)) => {
@@ -2452,10 +2488,10 @@ async fn resolve_content(ws: &Workspace, args: &Value, format: &str) -> Result<V
                 let Some(raw) = object.get("path").and_then(Value::as_str) else {
                     anyhow::bail!(
                         "usage: content[{index}] (image) has no \"path\" — hint: give the image's \
-                         workspace path"
+                         path"
                     );
                 };
-                let (image, _) = resolve_input(ws, raw).await?;
+                let (image, _) = resolve_input(ws, raw, access).await?;
                 ensure_image(&image)?;
                 let mut resolved = block.clone();
                 resolved["path"] = json!(image.to_string_lossy());
@@ -2471,13 +2507,13 @@ async fn resolve_content(ws: &Workspace, args: &Value, format: &str) -> Result<V
     Ok(Value::Array(out))
 }
 
-/// Resolve every `add_image` path in a validated pptx edit list against the
-/// workspace, the way `create`'s image block is: the kit is handed a path it can
-/// open, and the same strict read rule keeps an edit from embedding a file the
-/// caller did not name inside the workspace. The list's shape — an array of
+/// Resolve every `add_image` path in a validated pptx edit list under the
+/// caller's [`PathAccess`], the way `create`'s image block is: the kit is handed
+/// a path it can open, and the same read rule keeps an edit from embedding a
+/// file the caller did not name inside its own reach. The list's shape — an array of
 /// objects, each naming an `op`, an `add_image` also carrying a non-empty
 /// `path` — is the pptx validator's own contract.
-async fn resolve_edit_images(ws: &Workspace, edits: &mut Value) -> Result<()> {
+async fn resolve_edit_images(ws: &Workspace, edits: &mut Value, access: PathAccess) -> Result<()> {
     let list = edits
         .as_array_mut()
         .expect("validate_edits hands a pptx edit list back as an array");
@@ -2493,7 +2529,7 @@ async fn resolve_edit_images(ws: &Workspace, edits: &mut Value) -> Result<()> {
             .and_then(Value::as_str)
             .expect("the pptx validator requires an add_image path")
             .to_owned();
-        let (image, _) = resolve_input(ws, &raw).await?;
+        let (image, _) = resolve_input(ws, &raw, access).await?;
         ensure_image(&image)?;
         object.insert("path".to_owned(), json!(image.to_string_lossy()));
     }
@@ -3318,6 +3354,12 @@ mod tests {
     /// font (and a correct encoding round-trip) can carry.
     const CYRILLIC: &str = "Кириллический текст";
 
+    /// The workspace-confined document tool — what every Assistant but the
+    /// admin's gets, and the only access the tool's own rules depend on.
+    fn confined_document() -> DocumentTool {
+        DocumentTool::new(PathAccess::Workspace)
+    }
+
     /// A character outside the Basic Multilingual Plane: one code point, two
     /// UTF-16 code units. An edit that measured a match's offset in code units
     /// would land before it, rewriting the wrong part of the text.
@@ -3350,14 +3392,14 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         // The workspace path must be canonical, as a stored workspace's is: a
         // raw `/tmp` spelling diverges from the resolved `/private/tmp` on macOS
-        // and every strict read would be refused.
+        // and every read would be refused.
         let path = std::fs::canonicalize(dir.path()).expect("canonical workspace");
         let ws = test_ws_named(&path.to_string_lossy(), "document-test");
         (dir, ws)
     }
 
     async fn run(ws: &Workspace, args: Value) -> String {
-        DocumentTool
+        confined_document()
             .execute(ws, args)
             .await
             .expect("the document call must succeed")
@@ -5260,7 +5302,7 @@ mod tests {
         let (_dir, ws) = workspace();
         let source = pdf_with(&ws, "one-page", "Единственная страница").await;
 
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -5275,7 +5317,7 @@ mod tests {
         // the model can tell it apart from a mahbot-side kit fault.
         assert!(err.to_string().starts_with("usage:"), "got: {err}");
 
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -5308,7 +5350,7 @@ mod tests {
             (&broken, "do not form a PDF"),
             (&encrypted, "password-protected"),
         ] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -5327,6 +5369,72 @@ mod tests {
         }
     }
 
+    /// A document's input follows the caller's access: the admin's Assistant
+    /// reads a sample — and any other input — from anywhere, a guest's stays
+    /// inside its own workspace.
+    #[tokio::test]
+    async fn inputs_follow_the_callers_access() {
+        let (dir, ws) = workspace();
+        let outside = tempfile::TempDir::new().unwrap();
+        let sample = outside.path().join("sample.docx");
+        std::fs::write(&sample, b"a sample the kit would take").unwrap();
+        let path = sample.to_string_lossy().to_string();
+
+        let err = resolve_input(&ws, &path, PathAccess::Workspace)
+            .await
+            .expect_err("a guest's input must stay inside its workspace");
+        assert!(
+            err.to_string().contains("outside the workspace"),
+            "the refusal must name the boundary: {err}"
+        );
+        resolve_input(&ws, &path, PathAccess::Unrestricted)
+            .await
+            .expect("the admin's input may be read from anywhere");
+
+        drop((dir, outside));
+    }
+
+    /// The admin's input is read from outside the workspace end to end, not only
+    /// at the path layer: a document living outside is edited through the kit,
+    /// and the file the call produces still lands in the workspace.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn an_input_outside_the_workspace_is_edited_into_the_workspace() {
+        if runtime_missing() {
+            return;
+        }
+        let (dir, ws) = workspace();
+        let outside = tempfile::TempDir::new().unwrap();
+        let source = outside.path().join("outside.docx");
+        std::fs::rename(created_docx(&ws, "outside-seed").await, &source)
+            .expect("the fixture moves out of the workspace");
+
+        let reply = DocumentTool::new(PathAccess::Unrestricted)
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "file_name": "edited",
+                    "path": source.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "find": "seed", "replace": "ADMIN" }],
+                }),
+            )
+            .await
+            .expect("the admin's document tool reads its inputs from anywhere");
+
+        let edited = single(&reply);
+        assert!(
+            edited.starts_with(ws.as_path().join(GENERATED_DIR)),
+            "the produced file stays in the workspace: {}",
+            edited.display()
+        );
+        assert!(
+            part_text(&edited, "word/document.xml").contains("ADMIN"),
+            "the edit must reach the document read from outside"
+        );
+
+        drop((dir, outside));
+    }
+
     /// A sample the package reader cannot open at all — an encrypted (CFB)
     /// `.docx`, which has no ZIP central directory to read — is the request's own
     /// input, so the answer names the file as a usage error rather than reporting
@@ -5340,7 +5448,7 @@ mod tests {
         bytes.resize(512, 0);
         std::fs::write(&sample, bytes).expect("write fixture");
 
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -5383,7 +5491,7 @@ mod tests {
         ];
         for (name, bytes, expected) in cases {
             std::fs::write(ws.as_path().join(name), &bytes).expect("write sample");
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -5422,7 +5530,7 @@ mod tests {
         .await;
         let sample = single(&created);
 
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -5470,7 +5578,7 @@ mod tests {
         for (source, misnamed, expected) in cases {
             let misnamed = ws.as_path().join(misnamed);
             std::fs::copy(source, &misnamed).expect("copy the package under the other name");
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -5514,7 +5622,7 @@ mod tests {
         ] {
             let misnamed = ws.as_path().join(misnamed);
             std::fs::copy(source, &misnamed).expect("copy the package under the other name");
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -5550,7 +5658,7 @@ mod tests {
             } else {
                 "path"
             };
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -5573,7 +5681,7 @@ mod tests {
     async fn every_advertised_action_is_dispatched() {
         let (_dir, ws) = workspace();
         for action in ACTIONS {
-            let error = DocumentTool
+            let error = confined_document()
                 .execute(&ws, json!({ "action": action }))
                 .await
                 .expect_err("an action with no arguments cannot succeed");
@@ -5650,7 +5758,7 @@ mod tests {
             ),
         ];
         for (args, expected) in content {
-            let err = resolve_content(&ws, &args, "docx")
+            let err = resolve_content(&ws, &args, "docx", PathAccess::Workspace)
                 .await
                 .expect_err("a shape the writers cannot render");
             assert!(
@@ -5719,12 +5827,24 @@ mod tests {
         // `headers` stays optional, null counts as absent, and a well-formed
         // table and sheet pass.
         let good = json!({ "content": [{ "type": "table", "rows": [["a", "b"]] }] });
-        assert!(resolve_content(&ws, &good, "docx").await.is_ok());
+        assert!(
+            resolve_content(&ws, &good, "docx", PathAccess::Workspace)
+                .await
+                .is_ok()
+        );
         let good =
             json!({ "content": [{ "type": "table", "headers": null, "rows": [["a", "b"]] }] });
-        assert!(resolve_content(&ws, &good, "docx").await.is_ok());
+        assert!(
+            resolve_content(&ws, &good, "docx", PathAccess::Workspace)
+                .await
+                .is_ok()
+        );
         let headers_only = json!({ "content": [{ "type": "table", "headers": ["a"] }] });
-        assert!(resolve_content(&ws, &headers_only, "docx").await.is_ok());
+        assert!(
+            resolve_content(&ws, &headers_only, "docx", PathAccess::Workspace)
+                .await
+                .is_ok()
+        );
         let good = json!({ "sheets": [{ "name": "Лист", "rows": [["a", 1, true, { "formula": "=SUM(A1:A2)" }]] }] });
         let normalized = resolve_sheets(&good).expect("a well-formed sheet");
         assert_eq!(
@@ -5746,6 +5866,7 @@ mod tests {
             &ws,
             &json!({ "content": [{ "type": "table", "headers": [], "rows": [["a"]] }] }),
             "docx",
+            PathAccess::Workspace,
         )
         .await
         .expect("a table with rows is a table");
@@ -5758,6 +5879,7 @@ mod tests {
             &ws,
             &json!({ "content": [{ "type": "table", "rows": [[], ["a"]] }] }),
             "docx",
+            PathAccess::Workspace,
         )
         .await
         .expect("a table with one cell is a table");
@@ -5767,6 +5889,7 @@ mod tests {
             &ws,
             &json!({ "content": [{ "type": "table", "headers": [], "rows": [[], []] }] }),
             "docx",
+            PathAccess::Workspace,
         )
         .await
         .expect_err("a table of no cells must still be refused");
@@ -5913,7 +6036,7 @@ mod tests {
             ),
         ];
         for (args, expected) in calls {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(&ws, args)
                 .await
                 .expect_err("a call the tool cannot carry out");
@@ -6172,7 +6295,7 @@ mod tests {
             ),
         ];
         for (what, tool_args, kit_request) in cases {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(&ws, tool_args)
                 .await
                 .expect_err("a call the tool cannot carry out");
@@ -6248,7 +6371,7 @@ mod tests {
                     "image": fake.to_string_lossy() }),
         ];
         for args in calls {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(&ws, args)
                 .await
                 .expect_err("an image the writer cannot embed whole");
@@ -6295,7 +6418,7 @@ mod tests {
     async fn refuses_a_template_outside_the_workspace() {
         let (_dir, ws) = workspace();
         let outside = tempfile::NamedTempFile::new().expect("temp file");
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -6394,7 +6517,7 @@ mod tests {
         ];
         for (name, action, expected) in cases {
             std::fs::write(ws.as_path().join(name), b"fixture").expect("write input");
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -6419,7 +6542,7 @@ mod tests {
             b"PK\x03\x04the-rest-of-a-package",
         )
         .expect("write input");
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -6440,7 +6563,7 @@ mod tests {
             [crate::document::CFB_MAGIC, b"the rest of a container"].concat(),
         )
         .expect("write input");
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -6798,7 +6921,7 @@ mod tests {
             ),
         ];
         for (args, expected) in calls {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(&ws, args)
                 .await
                 .expect_err("a call the tool cannot carry out");
@@ -7375,7 +7498,7 @@ mod tests {
         let (_dir, ws) = workspace();
         let source = docx_body_fixture(&ws, "spanning-field", SPANNING_FIELD_BODY).await;
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -7448,7 +7571,7 @@ mod tests {
                 "is not in the document's body, its headers",
             ),
         ] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -7521,7 +7644,7 @@ mod tests {
         );
         let before = generated_count(&ws);
         for find in ["HEADER-ONLY", "HEADER-ONLY\nHEADER-SECOND"] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -7539,7 +7662,7 @@ mod tests {
         // Text a tracked revision of the header holds is that header's too: the
         // reading prints it as deleted rather than as live text, so the miss names
         // the part with the revision instead of denying the document holds it.
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -7583,7 +7706,7 @@ mod tests {
         let source = docx_body_fixture(&ws, "spelled-label", BODY).await;
         let before = generated_count(&ws);
         for find in ["R1: C1: real", "C1: real"] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -7633,7 +7756,7 @@ mod tests {
         .await;
         let before = generated_count(&ws);
         for find in ["FOOTNOTE-ONLY", "Table 1: results"] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -7650,7 +7773,7 @@ mod tests {
                 "the reader falls back to the conventional part for {find:?}: {err}"
             );
         }
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -7689,7 +7812,7 @@ mod tests {
         let (_dir, ws) = workspace();
         let source = docx_body_fixture(&ws, "deleted", BODY).await;
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -7754,7 +7877,7 @@ mod tests {
         let before = generated_count(&ws);
         for entry in marks {
             let example = entry.example.as_str();
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -7790,7 +7913,7 @@ mod tests {
         let (_dir, ws) = workspace();
         let source = docx_body_fixture(&ws, "tabbed", TABBED).await;
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -8030,7 +8153,7 @@ mod tests {
         // to a size the caller did not ask for.
         let below = docx_body_fixture(&ws, "size-below", NESTED_RPR_BODY).await;
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -8144,7 +8267,7 @@ mod tests {
 
         let text_box = docx_body_fixture(&ws, "text-box-only", TEXT_BOX_ONLY_BODY).await;
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -8162,7 +8285,7 @@ mod tests {
         );
 
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -8196,7 +8319,7 @@ mod tests {
         let (_dir, ws) = workspace();
         let source = docx_body_fixture(&ws, "cell-only", TABLE_CELL_BODY).await;
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -8215,7 +8338,7 @@ mod tests {
 
         let text_box = docx_body_fixture(&ws, "text-box-only", TEXT_BOX_ONLY_BODY).await;
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -8258,7 +8381,7 @@ mod tests {
         // paragraph is its container's when the token names it.
         let nested = docx_body_fixture(&ws, "nested-table", NESTED_TABLE_CELL_BODY).await;
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -8269,7 +8392,7 @@ mod tests {
             .await
             .expect_err("the cell would be left with no paragraph of its own");
         assert!(err.to_string().contains("table cell"), "got: {err}");
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -8527,7 +8650,7 @@ mod tests {
         )
         .await;
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -8539,7 +8662,7 @@ mod tests {
             .expect_err("a character style cannot format a paragraph");
         assert!(err.to_string().contains("character style"), "got: {err}");
 
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -8672,7 +8795,7 @@ mod tests {
         // write a bullet definition and the second refuses, so the call must leave
         // neither a definition nor an output behind.
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -8908,7 +9031,7 @@ mod tests {
             ("PAGE BREAK", "would delete the page break"),
             ("SECTION END", "would delete the section break"),
         ] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -9692,7 +9815,7 @@ mod tests {
         )
         .await;
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -10141,7 +10264,7 @@ mod tests {
             &with_parts(&base, &[("xl/worksheets/sheet1.xml", repeated.as_bytes())]),
         );
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -10324,7 +10447,7 @@ mod tests {
             output.contains(r#"<row r="4"><c r="A4"><v>5</v></c></row></sheetData>"#),
             "the row below the deleted line did not move up: {output}"
         );
-        let past = DocumentTool
+        let past = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -12044,7 +12167,7 @@ mod tests {
                     &[("xl/worksheets/sheet1.xml", sheet.as_bytes())],
                 ),
             );
-            let error = DocumentTool
+            let error = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -13411,7 +13534,7 @@ mod tests {
             ),
         );
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -13794,7 +13917,7 @@ mod tests {
         let before = generated_count(&ws);
         for (name, part, body, edit, element) in cases {
             let source = write_fixture(&ws, name, &with_parts(&base, &[(part, body.as_bytes())]));
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -13862,7 +13985,7 @@ mod tests {
                 json!({ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }),
                 json!({ "op": "set_cell", "sheet": "S", "cell": "A3", "value": 3 }),
             ] {
-                let err = DocumentTool
+                let err = confined_document()
                     .execute(
                         &ws,
                         json!({
@@ -14039,7 +14162,7 @@ mod tests {
         ];
         let before = generated_count(&ws);
         for (index, edit) in edits.into_iter().enumerate() {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -14206,7 +14329,7 @@ mod tests {
             &without_part(&created_xlsx(&ws).await, "xl/_rels/workbook.xml.rels"),
         );
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -14415,7 +14538,7 @@ mod tests {
                 name,
                 &with_parts(&base, &[("xl/worksheets/sheet1.xml", sheet.as_bytes())]),
             );
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -14460,7 +14583,7 @@ mod tests {
             ),
         );
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -15018,7 +15141,7 @@ mod tests {
             )
             .await,
         );
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -15135,7 +15258,7 @@ mod tests {
             noted_text.contains("Slide 1 notes:") && noted_text.contains("Заметка без типа"),
             "the notes text of a placeholder that names no type was not rewritten: {noted_text}"
         );
-        let added = DocumentTool
+        let added = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -15200,7 +15323,7 @@ mod tests {
         assert!(text.contains("r2c2"), "the table was damaged: {text}");
 
         // Text that lives only inside the table cannot anchor a new paragraph.
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -15244,7 +15367,7 @@ mod tests {
                 true,
             ),
         ] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -15350,7 +15473,7 @@ mod tests {
             // text the point holds.
             ("Kept node", "is inside a diagram on slide 1"),
         ] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -15378,7 +15501,7 @@ mod tests {
             json!([{ "op": "remove_paragraph", "slide": 1, "find": "Diagram node" }]),
             json!([{ "op": "add_paragraph", "slide": 1, "text": "X", "after": "Diagram node" }]),
         ] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -15400,7 +15523,7 @@ mod tests {
         // not hold, and never searched for: a search would match every space the
         // slide holds.
         for find in ["  ", "\t", " \n "] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -15427,7 +15550,7 @@ mod tests {
             crate::docgen::ppt_marks().diagram_text_lost.as_str(),
             crate::docgen::ppt_marks().no_text.as_str(),
         ] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -15458,7 +15581,7 @@ mod tests {
             "Note A\nNote B",
             "  Note A\n  Note B",
         ] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -15510,7 +15633,7 @@ mod tests {
                 "is not in the speaker notes of slide 1: the fragment's leading whitespace is either the indentation the reader prints under a block or whitespace the file's text does not hold",
             ),
         ] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -15562,7 +15685,7 @@ mod tests {
                 ],
             ),
         );
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -15615,7 +15738,7 @@ mod tests {
             ),
         );
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -15637,7 +15760,7 @@ mod tests {
 
         // A fragment holding the line break the reading shows is refused with that
         // reason too, rather than passed off as text the slide does not hold.
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -15704,7 +15827,7 @@ mod tests {
             ),
         );
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -15723,7 +15846,7 @@ mod tests {
 
         // The notes hold two paragraphs of their own, and `replace_notes` names
         // the same boundary rather than the line break.
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -15830,7 +15953,7 @@ mod tests {
             &with_parts(&base, &[("ppt/presentation.xml", presentation.as_bytes())]),
         );
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -15875,7 +15998,7 @@ mod tests {
             json!({ "op": "move_slide", "slide": 1, "to": 3 }),
             json!({ "op": "duplicate_slide", "slide": 2 }),
         ] {
-            let err = DocumentTool
+            let err = confined_document()
                 .execute(
                     &ws,
                     json!({
@@ -15982,7 +16105,7 @@ mod tests {
             "the fixture lost the notes declaration it is about"
         );
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -16449,7 +16572,7 @@ mod tests {
             .await,
         );
         let before = generated_count(&ws);
-        let shape = DocumentTool
+        let shape = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -16469,7 +16592,7 @@ mod tests {
             "a refused call left an output"
         );
 
-        let cell = DocumentTool
+        let cell = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -16583,7 +16706,7 @@ mod tests {
                 )],
             ),
         );
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -16748,7 +16871,7 @@ mod tests {
             ),
         );
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -16788,7 +16911,7 @@ mod tests {
             ),
         );
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -16851,7 +16974,7 @@ mod tests {
             &with_parts(&base, &[("ppt/presentation.xml", unnumbered.as_bytes())]),
         );
         let before = generated_count(&ws);
-        let err = DocumentTool
+        let err = confined_document()
             .execute(
                 &ws,
                 json!({
@@ -17071,7 +17194,7 @@ mod tests {
     /// would reach the model as its own literal spelling.
     #[test]
     fn the_description_states_every_rule_it_names() {
-        let description = DocumentTool.description();
+        let description = confined_document().description();
         assert!(
             !description.contains("{{"),
             "the description left a placeholder unreplaced:\n{description}"

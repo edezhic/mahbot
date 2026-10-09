@@ -580,7 +580,10 @@ impl Session {
     ///                          state is Init (or via the greeting kickoff's
     ///                          pending-guide bridge)
     /// active_models_opts     — Assistant only, when the catalogs are available
-    /// workspace boilerplate  — from src/prompt/context/workspace.md, substituted (always)
+    /// workspace boilerplate  — src/prompt/context/workspace.md, with the
+    ///                          per-role frame from context/workspace_frame.md
+    ///                          (or context/workspace_frame_admin.md for the
+    ///                          admin's Assistant); substituted (always)
     /// skills                 — if any skills exist in the workspace
     /// alarms                 — Assistant only, when the user has active alarms
     /// personal_files         — Assistant only, when the personal workspace has files
@@ -635,6 +638,10 @@ impl Session {
         let workspace_boilerplate = substitute(
             &load_prompt("context/workspace.md"),
             &[
+                (
+                    "{{path_frame}}",
+                    &load_prompt(workspace_frame_key(*role, is_admin)),
+                ),
                 ("{{operating_system}}", std::env::consts::OS),
                 ("{{workspace}}", &ws.as_path().display().to_string()),
                 ("{{workspace_context}}", &workspace_context),
@@ -955,6 +962,18 @@ async fn fetch_assistant_context(
         registered.into_iter().zip(summaries).collect()
     };
     tokio::join!(alarms, workspaces, fetch_personal_files(user_name))
+}
+
+/// The workspace-frame asset for a role: the admin's Assistant is not confined
+/// to the workspace, so it gets the frame that says so (and names what stays
+/// closed); a guest's Assistant and every pipeline role keep the workspace
+/// frame. `context/workspace.md` carries the rest of the boilerplate either way.
+fn workspace_frame_key(role: Role, is_admin: bool) -> &'static str {
+    if matches!(role, Role::Assistant) && is_admin {
+        "context/workspace_frame_admin.md"
+    } else {
+        "context/workspace_frame.md"
+    }
 }
 
 /// Compose the Assistant-only system-prompt blocks from pre-fetched data.
@@ -1687,6 +1706,58 @@ mod tests {
         let b_payload: crate::ToolResultPayload =
             serde_json::from_str(&rows[3].get::<String>(2).unwrap()).unwrap();
         assert_eq!(b_payload.content, "result b", "captured sibling verbatim");
+    }
+
+    /// The workspace frame the admin's Assistant receives states what is closed
+    /// instead of reading as confinement, and no other role stops being told
+    /// where the workspace is — the two frame assets the gating rule can pick
+    /// between, rendered into the one boilerplate the roles share.
+    #[test]
+    fn the_admin_workspace_frame_states_what_is_closed() {
+        let shared = crate::prompt::load_prompt("context/workspace.md");
+        assert!(
+            shared.contains("{{path_frame}}"),
+            "the shared boilerplate takes the role's frame: {shared}"
+        );
+        let frame = crate::prompt::load_prompt("context/workspace_frame.md");
+        assert!(
+            frame.contains("outside the workspace"),
+            "the shared frame keeps the workspace rule: {frame}"
+        );
+        let admin = crate::prompt::load_prompt("context/workspace_frame_admin.md");
+        assert!(
+            !admin.contains("outside the workspace"),
+            "the admin's frame must not read as confinement: {admin}"
+        );
+        for named in ["registered project workspaces", "live databases"] {
+            assert!(
+                admin.contains(named),
+                "the admin's frame must name what stays closed ({named}): {admin}"
+            );
+        }
+
+        // The frame is a fragment: the boilerplate's own line break separates it
+        // from the line below, so a trailing newline would inject a blank line
+        // into every role's system prompt.
+        for asset in [&frame, &admin] {
+            assert!(
+                !asset.ends_with('\n'),
+                "the frame assets are fragments and must not end with a newline"
+            );
+        }
+
+        // Only the admin's Assistant gets that frame.
+        assert_eq!(
+            workspace_frame_key(Role::Assistant, true),
+            "context/workspace_frame_admin.md"
+        );
+        for pick in [
+            workspace_frame_key(Role::Assistant, false),
+            workspace_frame_key(Role::Manager, true),
+            workspace_frame_key(Role::Engineer, false),
+        ] {
+            assert_eq!(pick, "context/workspace_frame.md");
+        }
     }
 
     /// Pure gating of the Assistant context blocks: a guest's Assistant gets

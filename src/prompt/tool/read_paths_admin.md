@@ -1,0 +1,3 @@
+Any file or directory on this machine is readable, wherever it is: your home directory, other users' folders, the product's own data directory, system paths. Relative paths resolve from the workspace; `~` and `~/…` mean your home directory, and `~user` is refused — spell another user's path absolutely instead.
+
+The one place closed to reads is the product's own live databases (`core.db`, `logs.db` and their journal tails, in the product's `db` directory): they are refused by where they are, and never opened — the service holds locks on them, and opening one from inside it releases those locks silently. Read the product's own data with the `mahbot_debug` tool instead. Copies of those databases are ordinary files.

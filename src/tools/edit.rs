@@ -1,3 +1,4 @@
+use super::path::PathAccess;
 use crate::{Tool, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -22,7 +23,27 @@ use std::path::PathBuf;
 ///   literals are tolerated there. By default the `old_string` must appear
 ///   exactly once (zero matches = not found, multiple = ambiguous).
 ///   `new_string` may be empty to delete the matched text.
-pub struct EditTool;
+///
+/// Where the write may land is `access`, fixed when the role's toolset is built:
+/// a pipeline role and a guest Assistant write inside their own workspace, the
+/// admin Assistant writes anywhere the shell could (see
+/// [`super::path::PathAccess`]).
+pub struct EditTool {
+    access: PathAccess,
+}
+
+impl EditTool {
+    #[must_use]
+    pub(crate) const fn new(access: PathAccess) -> Self {
+        Self { access }
+    }
+
+    /// The workspace-confined edit every role but the admin's Assistant gets.
+    #[must_use]
+    pub fn confined() -> Self {
+        Self::new(PathAccess::Workspace)
+    }
+}
 
 #[async_trait]
 impl Tool for EditTool {
@@ -30,12 +51,26 @@ impl Tool for EditTool {
         "edit"
     }
 
+    /// The prompt asset with this write's own path policy rendered in: the
+    /// skeleton is shared, so the two statements cannot drift from each other's
+    /// structure.
+    fn description(&self) -> String {
+        let path_policy = crate::prompt::load_prompt(match self.access {
+            PathAccess::Unrestricted => "tool/edit_paths_admin.md",
+            PathAccess::Workspace | PathAccess::Allowlisted => "tool/edit_paths_workspace.md",
+        });
+        crate::prompt::substitute(
+            &crate::prompt::load_prompt("tool/edit.md"),
+            &[("{{path_policy}}", &path_policy)],
+        )
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         super::tool_params_schema(
             &json!({
                 "path": {
                     "type": "string",
-                    "description": "Path to the file (required on every call). Relative paths resolve from workspace; absolute paths are validated against the workspace boundary."
+                    "description": "Path to the file (required on every call)."
                 },
                 "old_string": {
                     "type": "string",
@@ -85,7 +120,8 @@ fn not_found_error(path: &str, detail: &str) -> anyhow::Error {
 impl EditTool {
     /// Write a new file with the given content.
     async fn execute_write(&self, ws: &Workspace, path: &str, new_string: &str) -> Result<String> {
-        let resolved_target = super::path::resolve_write_target(ws.as_path(), path, true).await?;
+        let resolved_target =
+            super::path::resolve_write_target(ws.as_path(), path, true, self.access).await?;
 
         if tokio::fs::try_exists(&resolved_target)
             .await
@@ -127,7 +163,8 @@ impl EditTool {
         }
 
         // ── 1. Path pre-validation ───────────────────────────────
-        let resolved_target = super::path::resolve_write_target(ws.as_path(), path, false).await?;
+        let resolved_target =
+            super::path::resolve_write_target(ws.as_path(), path, false, self.access).await?;
 
         let use_ws_matching = is_ws_insensitive_extension(path);
 
@@ -495,6 +532,18 @@ impl LfView {
 /// exhausted), we log a warning but don't fail — the background watcher
 /// will eventually trigger a full rescan.
 fn update_search_index_after_write(ws: &Workspace, file_path: &std::path::Path) {
+    // The workspace index maps the workspace tree, so a write that landed
+    // outside it (the admin Assistant's, which reaches the machine) is not
+    // something it can hold. The edited path arrives with its parent already
+    // canonicalized, so the workspace root is compared in the same form — a
+    // root kept as it was configured (`/tmp/…` beside a resolved `/private/tmp/…`,
+    // the sandbox `HOME`) would otherwise read every in-workspace write as an
+    // outside one.
+    let ws_root =
+        std::fs::canonicalize(ws.as_path()).unwrap_or_else(|_| ws.as_path().to_path_buf());
+    if !crate::util::is_within(file_path, &ws_root) {
+        return;
+    }
     let Some(entry) = crate::search_engine::get_engine_by_name(&ws.name) else {
         return;
     };
@@ -1065,7 +1114,7 @@ mod tests {
             .unwrap();
 
         // single match without multiple flag still works
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({"path": "test.txt", "old_string": "b", "new_string": "x"}),
@@ -1082,7 +1131,7 @@ mod tests {
         );
 
         // multiple=true replaces all occurrences
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({"path": "test.txt", "old_string": "a", "new_string": "y", "multiple": true}),
@@ -1099,7 +1148,7 @@ mod tests {
         );
 
         // multiple=true with no matches still fails
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({"path": "test.txt", "old_string": "z", "new_string": "w", "multiple": true}),
@@ -1119,7 +1168,7 @@ mod tests {
         tokio::fs::write(dir.path().join("test.txt"), "only one")
             .await
             .unwrap();
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(&Workspace::from_path(dir.path()), json!({"path": "test.txt", "old_string": "one", "new_string": "two", "multiple": true}))
             .await;
         assert!(
@@ -1144,7 +1193,7 @@ mod tests {
             .unwrap();
 
         // replace single match
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({"path": "test.txt", "old_string": "hello", "new_string": "goodbye"}),
@@ -1160,7 +1209,7 @@ mod tests {
             "goodbye world"
         );
         // not found
-        let result = EditTool.execute(&Workspace::from_path(dir.path()), json!({"path": "test.txt", "old_string": "nonexistent", "new_string": "replacement"})).await;
+        let result = EditTool::confined().execute(&Workspace::from_path(dir.path()), json!({"path": "test.txt", "old_string": "nonexistent", "new_string": "replacement"})).await;
         assert!(
             result.is_err(),
             "edit with nonexistent string should fail: {result:?}"
@@ -1174,7 +1223,7 @@ mod tests {
         tokio::fs::write(dir.path().join("test.txt"), "aaa bbb aaa")
             .await
             .unwrap();
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({"path": "test.txt", "old_string": "aaa", "new_string": "ccc"}),
@@ -1194,7 +1243,7 @@ mod tests {
     #[tokio::test]
     async fn file_edit_delete_via_empty_new_string() {
         with_temp_workspace(&[("test.txt", "keep remove keep")], |dir| async move {
-            let result = EditTool
+            let result = EditTool::confined()
                 .execute(
                     &test_ws(&dir),
                     json!({"path": "test.txt", "old_string": " remove", "new_string": ""}),
@@ -1236,7 +1285,9 @@ mod tests {
                 args["old_string"] = json!(old);
             }
 
-            let result = EditTool.execute(&test_ws(dir.path()), args).await;
+            let result = EditTool::confined()
+                .execute(&test_ws(dir.path()), args)
+                .await;
             assert!(result.is_ok(), "{} should succeed: {result:?}", case.name);
             assert!(
                 result.unwrap().contains("8 bytes"),
@@ -1255,7 +1306,7 @@ mod tests {
     async fn edit_write_mode_creates_parent_dirs() {
         let dir = TempDir::new().unwrap();
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({"path": "a/b/c/deep.txt", "new_string": "deep"}),
@@ -1271,7 +1322,7 @@ mod tests {
     #[tokio::test]
     async fn file_edit_blocks_dangerous_paths() {
         with_temp_workspace(&[], |dir| async move {
-            let result = EditTool
+            let result = EditTool::confined()
                 .execute(
                     &test_ws(&dir),
                     json!({"path": "../../etc/passwd", "old_string": "root", "new_string": "x"}),
@@ -1283,7 +1334,7 @@ mod tests {
                 err.contains("forbidden: cannot write to ../../etc/passwd"),
                 "canonical forbidden shape: {err}"
             );
-            let result = EditTool
+            let result = EditTool::confined()
                 .execute(
                     &test_ws(&dir),
                     json!({"path": "/etc/passwd", "old_string": "root", "new_string": "x"}),
@@ -1308,7 +1359,7 @@ mod tests {
             &[("workspace/nested/target.txt", "hello world")],
             |root| async move {
                 let workspace = root.join("workspace");
-                let result = EditTool
+                let result = EditTool::confined()
                     .execute(
                         &test_ws(&workspace), json!({"path": "nested/target.txt", "old_string": "world", "new_string": "mahbot"}),
                     )
@@ -1339,7 +1390,7 @@ mod tests {
             .unwrap();
         symlink(outside.join("target.txt"), workspace.join("linked.txt")).unwrap();
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(&workspace),
                 json!({
@@ -1369,7 +1420,7 @@ mod tests {
     #[tokio::test]
     async fn file_edit_nonexistent_file() {
         with_temp_workspace(&[], |dir| async move {
-            let result = EditTool
+            let result = EditTool::confined()
                 .execute(
                     &test_ws(&dir),
                     json!({"path": "missing.txt", "old_string": "a", "new_string": "b"}),
@@ -1390,7 +1441,7 @@ mod tests {
                 // Canonicalize so the workspace dir matches resolved paths on macOS (/private/var/…)
                 let dir = tokio::fs::canonicalize(&dir).await.unwrap();
                 let abs_path = dir.join("target.txt");
-                let result = EditTool
+                let result = EditTool::confined()
                     .execute(
                         &test_ws(&dir), json!({"path": abs_path.to_string_lossy().to_string(), "old_string": "old content", "new_string": "new content"}),
                     )
@@ -1412,7 +1463,7 @@ mod tests {
         with_temp_workspace(
             &[("lib.rs", "let  x  =  1;\nlet  x  =  1;\nlet  y  =  2;\n")],
             |dir| async move {
-                let result = EditTool
+                let result = EditTool::confined()
                     .execute(
                         &test_ws(&dir),
                         json!({
@@ -1446,7 +1497,7 @@ mod tests {
         with_temp_workspace(
             &[("lib.rs", "let  x  =  1;\nlet  y  =  2;\n")],
             |dir| async move {
-                let result = EditTool
+                let result = EditTool::confined()
                     .execute(
                         &test_ws(&dir),
                         json!({
@@ -1470,7 +1521,7 @@ mod tests {
         // is never reached. Ensure a .txt file with multiple normalized matches
         // gets the standard exact-match error, not the WS-ambiguity error.
         with_temp_workspace(&[("readme.txt", "a  b  a  b")], |dir| async move {
-            let result = EditTool
+            let result = EditTool::confined()
                 .execute(
                     &test_ws(&dir),
                     json!({
@@ -1547,7 +1598,7 @@ mod tests {
                     "{name} ({ending:?}) is read with LF"
                 );
 
-                let result = EditTool
+                let result = EditTool::confined()
                     .execute(
                         &ws,
                         json!({
@@ -1589,7 +1640,7 @@ mod tests {
             "item = 1\nkeep = 0\nitem = 1\nkeep = 0"
         );
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &ws,
                 json!({
@@ -1621,7 +1672,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({
@@ -1652,7 +1703,7 @@ mod tests {
             .unwrap();
         let ws = test_ws(dir.path());
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &ws,
                 json!({"path": "unix.txt", "old_string": "b\nc", "new_string": "b\nC"}),
@@ -1664,7 +1715,7 @@ mod tests {
             b"a\nb\nC\n".as_slice()
         );
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &ws,
                 json!({"path": "unix.txt", "old_string": "a\nb", "new_string": "a\r\nB"}),
@@ -1687,7 +1738,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({"path": "mixed.txt", "old_string": "mid", "new_string": "mid\nmiddle"}),
@@ -1712,7 +1763,7 @@ mod tests {
             .unwrap();
         let ws = test_ws(dir.path());
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &ws,
                 json!({"path": "classic.txt", "old_string": "a\rb", "new_string": "a\rB"}),
@@ -1726,7 +1777,7 @@ mod tests {
 
         // A lone `\r` inside the replacement survives; only real endings are
         // rewritten to the file's ending.
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &ws,
                 json!({"path": "classic.txt", "old_string": "c", "new_string": "c\rd\ne"}),
@@ -1739,7 +1790,7 @@ mod tests {
         );
 
         // An LF-spelled pattern does not match across the lone CR.
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &ws,
                 json!({"path": "classic.txt", "old_string": "a\nb", "new_string": "x"}),
@@ -1767,7 +1818,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let result = EditTool
+            let result = EditTool::confined()
                 .execute(
                     &test_ws(dir.path()),
                     json!({"path": name, "old_string": old, "new_string": new}),
@@ -1793,7 +1844,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let result = EditTool
+            let result = EditTool::confined()
                 .execute(
                     &test_ws(dir.path()),
                     json!({
@@ -1822,7 +1873,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({"path": "unix.txt", "old_string": "a\r\nb", "new_string": "a\nB"}),
@@ -1847,7 +1898,7 @@ mod tests {
             .unwrap();
         let ws = test_ws(dir.path());
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &ws,
                 json!({"path": "mid.txt", "old_string": "ne", "new_string": "NE\nline"}),
@@ -1865,7 +1916,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({"path": "tail.txt", "old_string": "b", "new_string": "b\nx"}),
@@ -1887,7 +1938,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({"path": "oneline", "old_string": "b", "new_string": "x\ny\r\nz"}),
@@ -1911,7 +1962,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({
@@ -1939,7 +1990,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let result = EditTool
+            let result = EditTool::confined()
                 .execute(
                     &test_ws(dir.path()),
                     json!({"path": name, "old_string": "\n", "new_string": " "}),
@@ -1963,7 +2014,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({"path": "lib.rs", "old_string": "a b", "new_string": "a  b"}),
@@ -1985,7 +2036,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({"path": "readme.txt", "old_string": "a b", "new_string": "a+b"}),
@@ -2009,7 +2060,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = EditTool
+        let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
                 json!({

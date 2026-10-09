@@ -31,7 +31,7 @@
 //!   each one twice, as an `mc:Choice` and as the `mc:Fallback` beside it.
 //!
 //! The notation the model reads, every marker spelled out, is documented in
-//! `src/prompt/tool/read.md` and `read_strict.md`, and every marker this walk
+//! `src/prompt/tool/read.md`, and every marker this walk
 //! prints is listed once in `assets/docgen/rules.json` (`docx_marks`) — the list
 //! the document kit refuses a `find` carrying one by, and the list the test
 //! `every_docx_mark_the_shared_list_names_is_a_mark_the_reader_prints` checks

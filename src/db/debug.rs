@@ -258,24 +258,32 @@ pub(crate) struct FamilyMeta {
 ///
 /// Rejects sidecar members (`-wal`-suffixed names), foreign files,
 /// and any path-like name — the path-safety gate for `--family <id>`: only a
-/// parsed family id reaches `root/db/<id>`. The stamp is shape-checked
+/// parsed family id reaches the store directory. The stamp is shape-checked
 /// (16 chars, digits around `T`/`Z`), not calendar-validated; a store name of
 /// `.` or `..` parses (flat filename — no traversal possible).
+///
+/// Every part is matched without ASCII case — the volumes the stores live on
+/// compare file names that way, so a differently-cased spelling of a family name
+/// is the same file — while the parsed fields keep the spelling they came in as.
 ///
 /// The formats are written by `db::quarantine_family` (quarantine) and the
 /// pre-reindex snapshot in `db::snapshot_store_via_engine` (REINDEX repair) —
 /// keep both sides of the naming contract in sync; the writer round-trip test
 /// locks the coupling.
 pub(crate) fn parse_family_name(name: &str) -> Option<FamilyMeta> {
-    let (kind, marker) = if name.contains(".quarantine-") {
+    let lower = name.to_ascii_lowercase();
+    let (kind, marker) = if lower.contains(".quarantine-") {
         (FamilyKind::Quarantine, ".quarantine-")
-    } else if name.contains(".pre-reindex-") {
+    } else if lower.contains(".pre-reindex-") {
         (FamilyKind::PreReindex, ".pre-reindex-")
     } else {
         return None;
     };
-    let (prefix, tail) = name.split_once(marker)?;
-    let store = prefix.strip_suffix(".db")?;
+    // The lowercased copy is the same length with the same ASCII offsets, so the
+    // marker's position maps onto the caller's own spelling.
+    let at = lower.find(marker)?;
+    let (prefix, tail) = (&name[..at], &name[at + marker.len()..]);
+    let store = crate::util::strip_suffix_ignoring_case(prefix, ".db")?;
     if store.is_empty() || store.contains('/') || store.contains('\\') {
         return None;
     }
@@ -305,23 +313,24 @@ pub(crate) fn parse_family_name(name: &str) -> Option<FamilyMeta> {
     })
 }
 
-/// True for the `%Y%m%dT%H%M%SZ` stamp shape (16 chars, digits around `T`/`Z`).
+/// True for the `%Y%m%dT%H%M%SZ` stamp shape (16 chars, digits around `T`/`Z`,
+/// either case — the files are named on volumes that compare names without it).
 fn is_family_stamp(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 16
-        && b[8] == b'T'
-        && b[15] == b'Z'
+        && b[8].eq_ignore_ascii_case(&b'T')
+        && b[15].eq_ignore_ascii_case(&b'Z')
         && b[..8].iter().all(u8::is_ascii_digit)
         && b[9..15].iter().all(u8::is_ascii_digit)
 }
 
-/// Discover all forensic families under `root/db/` and classify them.
+/// Discover all forensic families under the store directory and classify them.
 ///
 /// Families are found from their base file name or from a `-wal`-only member
 /// (such a quarantine has no base file). Foreign files (`.DS_Store`, live
 /// stores) are ignored. Sorted by (store, kind, stamp).
 fn list_families(root: &Path) -> Result<Vec<FamilyInfo>> {
-    let db_dir = root.join("db");
+    let db_dir = super::store_dir(root);
     // Fresh install: no store directory yet — nothing to list, not an error.
     let entries = match std::fs::read_dir(&db_dir) {
         Ok(rd) => rd,
@@ -372,7 +381,7 @@ const FAMILY_MEMBERS: [(&str, &str); 2] = [("", "db"), ("-wal", "wal")];
 
 /// Classify one family's file set — pure filesystem inspection, never opens.
 fn classify_family(root: &Path, id: String, meta: FamilyMeta) -> FamilyInfo {
-    let db_path = root.join("db").join(&id);
+    let db_path = super::store_dir(root).join(&id);
     let mut members: Vec<&'static str> = Vec::new();
     let mut size: u64 = 0;
     for (suffix, label) in FAMILY_MEMBERS {
@@ -459,7 +468,7 @@ fn execute_family_query(family_id: &str, sql: &str, root: &Path) -> Result<Strin
     parse_family_name(family_id).with_context(|| {
         format!("invalid family id '{family_id}' — list valid ids with `mahbot debug families`")
     })?;
-    let db_path = root.join("db").join(family_id);
+    let db_path = super::store_dir(root).join(family_id);
     if !db_path.exists() {
         // A sidecar-only family (no base file — a quarantine that moved only
         // the `-wal`, or a failed pre-reindex copy) is a real family that
@@ -1640,6 +1649,13 @@ mod tests {
 
         let p = parse_family_name("logs.db.pre-reindex-20260812T120000Z-99").unwrap();
         assert_eq!(p.kind, FamilyKind::PreReindex);
+
+        // A differently-cased spelling is the same family — the volumes compare
+        // file names without case — while the fields keep the given spelling.
+        let c = parse_family_name("CORE.DB.Quarantine-20260812t120000z-1234").unwrap();
+        assert_eq!(c.store, "CORE");
+        assert_eq!(c.kind, FamilyKind::Quarantine);
+        assert_eq!(c.stamp, "20260812t120000z");
 
         // Format-focused rejections; the -wal sidecar / path-traversal /
         // live-store-name cases are covered end-to-end by

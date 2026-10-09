@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::time::Duration;
 
 use super::listing::{ListingEntry, format_listing, human_readable_size};
+use super::path::PathAccess;
 use crate::tools::search::SearchTool;
 use crate::tools::shell::try_spill_to_file;
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
@@ -12,25 +11,24 @@ use async_trait::async_trait;
 use serde_json::json;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
-/// The `read` tool. `strict` selects the workspace-only variant used by the
-/// Assistant: it permits no path outside the workspace (no dependency-source
-/// caches, temp spill files, or `/tmp`). The general variant additionally
-/// permits those outside paths.
+/// The `read` tool. `access` is the caller's [`PathAccess`], fixed when the
+/// role's toolset is built: a guest Assistant's read is confined to its
+/// workspace, a pipeline role's reaches the read allowlist too, and the admin
+/// Assistant's reaches any path the shell could name.
 pub struct ReadTool {
-    strict: bool,
+    access: PathAccess,
 }
 
 impl ReadTool {
+    #[must_use]
+    pub(crate) const fn new(access: PathAccess) -> Self {
+        Self { access }
+    }
+
     /// General read: workspace plus dependency-source / temp-file paths.
     #[must_use]
     pub fn general() -> Self {
-        Self { strict: false }
-    }
-
-    /// Workspace-only read (the Assistant's restricted variant).
-    #[must_use]
-    pub fn workspace_only() -> Self {
-        Self { strict: true }
+        Self::new(PathAccess::Allowlisted)
     }
 }
 
@@ -118,19 +116,19 @@ fn sniff_read_image(bytes: &[u8]) -> Option<SniffedImage> {
     }
 }
 
-/// FIFO-safe file-magic gate: true only when `path` (a regular file) begins
-/// with PNG/JPEG/WebP magic. Reuses [`sniff_read_image`] so the native-format
-/// decision has a single source — no duplicated format-match arms, no drift
-/// risk. Returns `false` for text, unsupported formats, and FIFO/special files
-/// without a full read or decode. This is the robust gate `image_payload` uses
-/// instead of the annotation wording.
+/// Regular-file-only file-magic gate: true only when `path` (a regular file)
+/// begins with PNG/JPEG/WebP magic. Reuses [`sniff_read_image`] so the
+/// native-format decision has a single source — no duplicated format-match
+/// arms, no drift risk. Returns `false` for text, unsupported formats, and any
+/// special file, without a full read or decode. This is the robust gate
+/// `image_payload` uses instead of the annotation wording.
 async fn is_native_image_file(path: &Path) -> bool {
     use tokio::io::AsyncReadExt;
     let Ok(meta) = tokio::fs::metadata(path).await else {
         return false;
     };
-    // FIFO/special files are never reopened — a stream cannot be sampled
-    // without blocking.
+    // A special file is never reopened — a stream cannot be sampled without
+    // blocking.
     if !meta.is_file() {
         return false;
     }
@@ -220,21 +218,29 @@ pub(super) struct ResolvedRead {
 pub(super) async fn resolve_content_read(
     ws: &Workspace,
     path: &str,
-    strict: bool,
+    access: PathAccess,
 ) -> anyhow::Result<ResolvedRead> {
-    match super::path::resolve_read_target(ws.as_path(), path, strict).await {
+    match super::path::resolve_read_target(ws.as_path(), path, access).await {
         Ok(resolved) => Ok(ResolvedRead {
             path: resolved,
             recovery_note: None,
         }),
-        Err(e) if !e.to_string().contains("File not found") => Err(e),
+        // Recovery is for a typo's sake, and only where the workspace is the
+        // frame: the admin reaches the whole machine, so a path that is not
+        // there is answered as missing rather than answered with a different
+        // file of the same name from the workspace.
+        Err(e)
+            if access == PathAccess::Unrestricted || !e.to_string().contains("File not found") =>
+        {
+            Err(e)
+        }
         Err(e) => {
             let matches = find_recovery_candidates(ws, path).await;
             match matches.len() {
                 1 => {
                     let recovered = &matches[0];
                     let resolved =
-                        super::path::resolve_read_target(ws.as_path(), recovered, strict).await?;
+                        super::path::resolve_read_target(ws.as_path(), recovered, access).await?;
                     Ok(ResolvedRead {
                         path: resolved,
                         recovery_note: Some(recovery_note(path, recovered)),
@@ -271,9 +277,8 @@ fn read_mode(args: &serde_json::Value) -> ReadMode {
     }
 }
 
-/// Build the read tool's parameter schema. `path_desc` describes the path
-/// boundary so the strict variant (workspace-only) can advertise an accurate
-/// restriction while the general variant keeps its allowlist wording.
+/// Build the read tool's parameter schema. `path_desc` states this read's own
+/// path boundary, so each [`PathAccess`] advertises the one it enforces.
 fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
     super::tool_params_schema(
         &json!({
@@ -329,13 +334,18 @@ impl Tool for ReadTool {
         let labels = crate::docgen::ppt_slide_labels();
         let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
         let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
+        // The path boundary, in the wording of this read's own access level —
+        // the skeleton is shared, so the three statements cannot drift from
+        // each other's structure.
+        let path_policy = crate::prompt::load_prompt(match self.access {
+            PathAccess::Workspace => "tool/read_paths_workspace.md",
+            PathAccess::Allowlisted => "tool/read_paths_allowlisted.md",
+            PathAccess::Unrestricted => "tool/read_paths_admin.md",
+        });
         crate::prompt::substitute(
-            &crate::prompt::load_prompt(if self.strict {
-                "tool/read_strict.md"
-            } else {
-                "tool/read.md"
-            }),
+            &crate::prompt::load_prompt("tool/read.md"),
             &[
+                ("{{path_policy}}", &path_policy),
                 ("{{ppt_title_mark}}", &marks.title),
                 ("{{ppt_hidden_slide_mark}}", &marks.hidden_slide),
                 ("{{ppt_diagram_text_mark}}", &marks.diagram_text),
@@ -360,10 +370,9 @@ impl Tool for ReadTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        read_parameters_schema(if self.strict {
-            "Path to the file within the personal workspace. Only the workspace is accessible — dependency sources, temp files, and other outside paths are rejected."
-        } else {
-            "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
+        read_parameters_schema(match self.access {
+            PathAccess::Workspace => "Path to the file or directory within the personal workspace.",
+            PathAccess::Allowlisted | PathAccess::Unrestricted => "Path to the file or directory.",
         })
     }
 
@@ -371,7 +380,7 @@ impl Tool for ReadTool {
     /// [`Tool::execute_with_payloads`] (their pages need images), so a direct
     /// `execute` call gets the lossy path — the agent loop always uses the hook.
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
-        execute_read(ws, args, self.strict).await
+        execute_read(ws, args, self.access).await
     }
 
     fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
@@ -440,15 +449,15 @@ impl Tool for ReadTool {
         // Everything else takes the ordinary read below.
         if read_mode(&args) == ReadMode::Content
             && let Ok(path) = super::get_str(&args, "path")
-            && !super::path::contains_glob(path, true)
+            && !super::path::is_wildcard_read(ws.as_path(), path, self.access).await
         {
-            let res = resolve_content_read(ws, path, self.strict).await?;
+            let res = resolve_content_read(ws, path, self.access).await?;
             // A read that is not a document has paid one extra metadata + 16-byte
             // head read for the sniff; sharing the converter's own detection
             // (rather than an extension pre-filter that could drift from it) is
             // what that buys. The raster `image_payload` below still resolves the
             // path for itself, as it always did.
-            if let Some(out) = super::read_document::read_document(ws, &res, self.strict).await? {
+            if let Some(out) = super::read_document::read_document(ws, &res, self.access).await? {
                 return Ok(out);
             }
             let text = read_resolved(&res, &args).await?;
@@ -466,17 +475,16 @@ impl Tool for ReadTool {
         ws: &Workspace,
         args: &serde_json::Value,
     ) -> Option<crate::tools::ImagePayload> {
-        read_image_payload(ws, args, self.strict).await
+        read_image_payload(ws, args, self.access).await
     }
 }
 
-/// Produce the image payload for a read, honoring the strict workspace-only
-/// boundary when `strict` is set (the Assistant's restricted read). The
-/// non-strict path additionally allows dependency-source / temp-file reads.
+/// Produce the image payload for a read, resolving the path under the caller's
+/// [`PathAccess`] — the same boundary the read itself used.
 async fn read_image_payload(
     ws: &Workspace,
     args: &serde_json::Value,
-    strict: bool,
+    access: PathAccess,
 ) -> Option<crate::tools::ImagePayload> {
     // Robust file-magic gate (NOT the annotation wording): only a PNG/JPEG/
     // WebP raster opens the decode+encode below. This runs AFTER path
@@ -487,19 +495,19 @@ async fn read_image_payload(
     if read_mode(args) != ReadMode::Content {
         return None;
     }
-    if super::path::contains_glob(&path, true) {
+    if super::path::is_wildcard_read(ws.as_path(), &path, access).await {
         return None;
     }
     // Resolve the literal path, or — for a typo'd path that `execute`
     // already recovered to a unique match — the recovered path, so a
     // recovered raster is attached rather than only annotated.
-    let res = resolve_content_read(ws, &path, strict).await.ok()?;
+    let res = resolve_content_read(ws, &path, access).await.ok()?;
     if !is_native_image_file(&res.path).await {
         return None;
     }
     // The compressed encode applies EXIF orientation and reports the
     // post-EXIF/post-resize dims + source-format label; its metadata-first
-    // `is_file()` guard keeps a FIFO/special file from being reopened.
+    // `is_file()` guard keeps a special file from being reopened.
     let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&res.path)
         .await
         .ok()?;
@@ -551,20 +559,6 @@ async fn read_resolved(res: &ResolvedRead, args: &serde_json::Value) -> anyhow::
         return list_directory(resolved_path).await;
     }
     super::check_size_within(&meta, super::MAX_FILE_SIZE_BYTES, "File too large")?;
-    // FIFOs are streams, not seekable files — read them with a
-    // bounded non-blocking wait so a missing writer cannot hang
-    // the tool (see read_fifo). Other modes (symbols/zoom) make no
-    // sense on a pipe, so content is always used.
-    #[cfg(unix)]
-    if std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()) {
-        let bytes = read_fifo(resolved_path, fifo_read_timeout()).await?;
-        let contents = String::from_utf8_lossy(&bytes);
-        return Ok(finish_read_body(
-            resolved_path,
-            format_content(&contents, args)?,
-            recovery_note,
-        ));
-    }
 
     let body = match read_mode(args) {
         ReadMode::Symbols => execute_symbols(resolved_path).await?,
@@ -757,21 +751,20 @@ fn symbol_suggestions(ps: &ParsedSource, query: &Query, wanted: &str) -> Vec<Str
 }
 
 /// The read tool's raw-text read, reached through `Tool::execute`: a wildcard
-/// listing, or a file the document hook did not take. `strict` controls whether
-/// [`super::path::resolve_read_target`] permits `EXTRA_READ_ALLOWED` paths
-/// (spill files, dependency caches).
+/// listing, or a file the document hook did not take. `access` is the caller's
+/// [`PathAccess`], the boundary [`super::path::resolve_read_target`] applies.
 async fn execute_read(
     ws: &Workspace,
     args: serde_json::Value,
-    strict: bool,
+    access: PathAccess,
 ) -> anyhow::Result<String> {
     let path = super::get_str(&args, "path")?.to_string();
 
-    if super::path::contains_glob(&path, true) {
+    if super::path::is_wildcard_read(ws.as_path(), &path, access).await {
         return recover_wildcard_path(ws, &path).await;
     }
 
-    let res = resolve_content_read(ws, &path, strict).await?;
+    let res = resolve_content_read(ws, &path, access).await?;
     read_resolved(&res, &args).await
 }
 
@@ -816,114 +809,6 @@ fn format_content(contents: &str, args: &serde_json::Value) -> anyhow::Result<St
     };
 
     Ok(format!("{summary}\n{numbered}"))
-}
-
-/// Default bound on FIFO (named pipe) reads: how long to wait for a writer
-/// before erroring. A FIFO with no writer must never hang the tool.
-#[cfg(unix)]
-const DEFAULT_FIFO_READ_TIMEOUT_SECS: u64 = 10;
-
-/// FIFO read bound for [`read_fifo`]. Overridable via env for tuning; tests
-/// pass explicit durations.
-#[cfg(unix)]
-fn fifo_read_timeout() -> Duration {
-    crate::util::env_duration_secs(
-        "MAHBOT_FIFO_READ_TIMEOUT_SECS",
-        DEFAULT_FIFO_READ_TIMEOUT_SECS,
-    )
-}
-
-/// Read all bytes from a FIFO with a bounded wait, so a missing writer errors
-/// instead of hanging forever.
-///
-/// The FIFO is opened `O_NONBLOCK` — the open itself never blocks on a
-/// missing writer (unlike a blocking open), and every read returns
-/// immediately (data, EOF, or `WouldBlock`). The loop polls with a sliding
-/// deadline: while no writer is open the reads return EOF (0 bytes), which is
-/// treated as "no data yet" and polled again — a live writer that opens after
-/// the reader still delivers its data (FIFOs are not sticky-EOF). A
-/// successful read resets the deadline, so a writer that keeps producing data
-/// keeps the read alive (capped by the size limit) — deliberate: only the
-/// no-data / no-EOF case must be bounded. A writer that wrote data then went
-/// idle past the bound still gets its buffered bytes delivered (fail-open);
-/// only a writer that produced nothing errors. No blocking thread is ever
-/// leaked — a bare `timeout` around a blocking read would pin a tokio
-/// blocking-pool thread for every hang.
-#[cfg(unix)]
-async fn read_fifo(path: &Path, timeout: Duration) -> anyhow::Result<Vec<u8>> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|e| anyhow::anyhow!("Failed to open {}: {e}", path.display()))?;
-
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let mut last_activity = std::time::Instant::now();
-    loop {
-        let remaining = timeout.saturating_sub(last_activity.elapsed());
-        if remaining.is_zero() {
-            if !buf.is_empty() {
-                // Data arrived before the bound — deliver it rather than
-                // discarding bytes the agent already received.
-                return Ok(buf);
-            }
-            // One final non-blocking read: a writer may have delivered bytes
-            // during the last inactivity sleep — deliver them instead of a
-            // spurious error (bytes stay in the FIFO buffer either way).
-            let timed_out = || {
-                anyhow::anyhow!(
-                    "Timed out after {:.0}s waiting for FIFO data on {} \
-                 (no writer appeared or a writer left the pipe open)",
-                    timeout.as_secs_f64(),
-                    path.display()
-                )
-            };
-            match file.read(&mut chunk) {
-                Ok(0) => return Err(timed_out()),
-                Ok(n) => {
-                    buf.extend_from_slice(&chunk[..n]);
-                    return Ok(buf);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(timed_out()),
-                Err(e) => {
-                    anyhow::bail!("Failed reading FIFO {}: {e}", path.display());
-                }
-            }
-        }
-        match file.read(&mut chunk) {
-            Ok(0) => {
-                // EOF with an empty buffer: no writer is open right now. A
-                // writer may still appear, so keep polling until the bound.
-                if buf.is_empty() {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                }
-                return Ok(buf); // writer finished — normal EOF
-            }
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() as u64 > super::MAX_FILE_SIZE_BYTES {
-                    anyhow::bail!(
-                        "FIFO {} output exceeded {} bytes",
-                        path.display(),
-                        super::MAX_FILE_SIZE_BYTES
-                    );
-                }
-                last_activity = std::time::Instant::now();
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Writer present but idle — poll again shortly.
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(e) => {
-                anyhow::bail!("Failed reading FIFO {}: {e}", path.display());
-            }
-        }
-    }
 }
 
 // ── Tree-sitter infrastructure ────────────────────────────────────────
@@ -1304,11 +1189,12 @@ fn path_io_error(path: &Path, err: &std::io::Error, context: &str) -> anyhow::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::EditTool;
     use crate::workspace::test_ws;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    /// Default (non-strict) read tool for the common test scenarios.
+    /// The general read tool for the common test scenarios.
     fn tool() -> ReadTool {
         ReadTool::general()
     }
@@ -1370,7 +1256,11 @@ mod tests {
         let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
         // Two of the report's lines, as the reader that prints them spells them.
         let report = crate::reader_output::unshown_report_examples();
-        for tool in [ReadTool::general(), ReadTool::workspace_only()] {
+        for tool in [
+            ReadTool::general(),
+            ReadTool::new(PathAccess::Workspace),
+            ReadTool::new(PathAccess::Unrestricted),
+        ] {
             let description = tool.description();
             assert!(
                 !description.contains("{{"),
@@ -1571,53 +1461,132 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn read_denies_protected_private_keys() {
+    async fn read_reaches_private_key_places() {
         use std::os::unix::fs::symlink;
 
-        // Workspace file literally named `id_rsa` — denied in both variants.
-        let (dir, ws_path) = temp_workspace(&[("id_rsa", "secret")]);
+        // A file literally named `id_rsa`, inside a folder named `.ssh`: nothing
+        // about the name or the place is a refusal any more, for any variant.
+        let (_dir, ws_path) = temp_workspace(&[(".ssh/id_rsa", "PRIVATE KEY BODY")]);
         let ws = Workspace::from_path(&ws_path);
         for tool in [
             &ReadTool::general() as &dyn Tool,
-            &ReadTool::workspace_only() as &dyn Tool,
+            &ReadTool::new(PathAccess::Workspace) as &dyn Tool,
         ] {
-            let result = tool.execute(&ws, json!({"path": "id_rsa"})).await;
-            assert!(result.is_err(), "id_rsa should be denied: {result:?}");
-            let err = format!("{}", result.unwrap_err());
-            assert!(err.contains("protected credential location"), "err: {err}");
+            let result = tool.execute(&ws, json!({"path": ".ssh/id_rsa"})).await;
+            let text = result.expect("a private key's name is not a refusal");
+            assert!(
+                text.contains("PRIVATE KEY BODY"),
+                "the key body must come back whole: {text}"
+            );
         }
-        drop(dir);
 
-        // Workspace symlink `data.txt` -> canonicalized <tmp>/keys/id_rsa (real file).
+        // The same through a symlinked name and a symlinked directory.
         let root = TempDir::new().unwrap();
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        let raw_keys = root.path().join("keys");
-        std::fs::create_dir_all(&raw_keys).unwrap();
-        let keys_dir = std::fs::canonicalize(&raw_keys).unwrap();
-        std::fs::write(keys_dir.join("id_rsa"), "secret").unwrap();
-        symlink(keys_dir.join("id_rsa"), workspace.join("data.txt")).unwrap();
+        let keys = root.path().join(".ssh");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("id_rsa"), "PRIVATE KEY BODY").unwrap();
+        symlink(keys.join("id_rsa"), workspace.join("data.txt")).unwrap();
+        symlink(&keys, workspace.join("dirlink")).unwrap();
 
         let ws = Workspace::from_path(&workspace);
-        let result = tool().execute(&ws, json!({"path": "data.txt"})).await;
-        assert!(
-            result.is_err(),
-            "symlinked key should be denied: {result:?}"
-        );
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("protected credential location"), "err: {err}");
+        for path in ["data.txt", "dirlink/id_rsa"] {
+            let result = tool().execute(&ws, json!({"path": path})).await;
+            let text = result.unwrap_or_else(|e| panic!("{path} should read: {e}"));
+            assert!(text.contains("PRIVATE KEY BODY"), "{path}: {text}");
+        }
+    }
 
-        // Directory-link case: `dirlink` -> canonicalized <tmp>/keys (dir). The file
-        // under it is protected; the directory-link itself is the path-level case
-        // already covered in path.rs.
-        symlink(&keys_dir, workspace.join("dirlink")).unwrap();
-        let result = tool().execute(&ws, json!({"path": "dirlink/id_rsa"})).await;
+    /// The admin's read reaches the machine, and a path that is not there is
+    /// answered as missing: no same-named file from the workspace is substituted
+    /// for it (which is what the other access levels still do for a typo).
+    #[tokio::test]
+    async fn unrestricted_read_neither_frames_nor_substitutes() {
+        // The fuzzy recovery needs the global search-engine registry.
+        crate::util::test::init_test_stores().await;
+        let (dir, ws_path) = temp_workspace(&[("notes.md", "workspace notes")]);
+        let ws = Workspace::from_path(&ws_path);
+
+        // A typo inside the workspace is still recovered for the general read.
+        let recovered = tool()
+            .execute(&ws, json!({"path": "notez.md"}))
+            .await
+            .expect("a typo'd workspace path is recovered");
+        assert!(recovered.contains("[Recovered path:"), "{recovered}");
+
+        // An absent path outside every allowed root — nothing is created for it,
+        // and it is named after this process so it cannot be someone's file.
+        let absent = PathBuf::from(format!(
+            "/mahbot-read-outside-{}/notes.md",
+            std::process::id()
+        ));
+
+        // The admin's read of a missing path is a missing path — never the
+        // workspace's own file of the same name.
+        let err = ReadTool::new(PathAccess::Unrestricted)
+            .execute(&ws, json!({"path": absent.to_string_lossy()}))
+            .await
+            .expect_err("a missing path must be reported as missing");
+        assert!(err.to_string().contains("File not found"), "{err}");
+        assert!(!err.to_string().contains("Recovered"), "{err}");
+
+        // And a file outside the workspace is read as given.
+        let outside = TempDir::new().unwrap();
+        let outside_notes = outside.path().join("notes.md");
+        std::fs::write(&outside_notes, "outside notes").unwrap();
+        let text = ReadTool::new(PathAccess::Unrestricted)
+            .execute(&ws, json!({"path": outside_notes.to_string_lossy()}))
+            .await
+            .expect("an outside file is readable for the admin");
+        assert!(text.contains("outside notes"), "{text}");
+
+        // The general read still stops at its own envelope on the same path.
+        let err = tool()
+            .execute(&ws, json!({"path": absent.to_string_lossy()}))
+            .await
+            .expect_err("the general read stays inside its envelope");
         assert!(
-            result.is_err(),
-            "dir-symlinked key should be denied: {result:?}"
+            err.to_string()
+                .contains("outside the allowed read envelope"),
+            "{err}"
         );
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("protected credential location"), "err: {err}");
+
+        drop((dir, outside));
+    }
+
+    /// A path whose own name carries glob metacharacters is read as the file it
+    /// names when that file exists — the shell's own reading, and what the edit
+    /// tool does — while a pattern that names nothing still lists the workspace.
+    #[tokio::test]
+    async fn a_metacharacter_name_is_read_as_the_file_it_names() {
+        let (dir, ws_path) = temp_workspace(&[("report[1].txt", "the file's own text")]);
+        let ws = Workspace::from_path(&ws_path);
+
+        let text = tool()
+            .execute(&ws, json!({"path": "report[1].txt"}))
+            .await
+            .expect("a metacharacter name that exists is read as a file");
+        assert!(text.contains("the file's own text"), "{text}");
+
+        // The admin reads the same kind of name outside the workspace.
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("report[2].txt");
+        std::fs::write(&outside_file, "outside the workspace").unwrap();
+        let text = ReadTool::new(PathAccess::Unrestricted)
+            .execute(&ws, json!({"path": outside_file.to_string_lossy()}))
+            .await
+            .expect("the admin reads a metacharacter name outside the workspace");
+        assert!(text.contains("outside the workspace"), "{text}");
+
+        // A pattern that names no file is still a wildcard.
+        let err = tool()
+            .execute(&ws, json!({"path": "*.missing"}))
+            .await
+            .expect_err("a pattern that names nothing falls through to the listing");
+        assert!(err.to_string().to_lowercase().contains("wildcard"), "{err}");
+
+        drop((dir, outside));
     }
 
     #[tokio::test]
@@ -2564,104 +2533,44 @@ impl Baz {}
         assert_eq!(world.start_line, 4, "world starts at line 4");
     }
 
-    /// A FIFO with no writer must error within the bound, never hang. The
-    /// no-writer case is detected at the bound (empty EOF keeps polling).
+    /// A channel (FIFO) is neither a regular file nor a directory: the read
+    /// refuses it for every role rather than blocking on a writer that may
+    /// never appear, and the same refusal meets the read an edit does.
     #[cfg(unix)]
     #[tokio::test]
-    async fn fifo_without_writer_errors_bounded() {
+    async fn non_regular_file_is_refused() {
         let dir = TempDir::new().unwrap();
         let fifo_path = dir.path().join("nofifo.pipe");
         let c_path = std::ffi::CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
         let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
         assert_eq!(ret, 0, "mkfifo should succeed");
 
-        let result = read_fifo(&fifo_path, Duration::from_millis(100)).await;
-        let err = result.expect_err("no-writer FIFO must error");
-        assert!(
-            err.to_string().contains("no writer"),
-            "error should name the no-writer cause: {err}"
-        );
-
-        // The tool-level path also errors instead of hanging (bounded via env).
-        let _guard = crate::util::test::set_env_var("MAHBOT_FIFO_READ_TIMEOUT_SECS", Some("1"));
         let ws = test_ws(dir.path());
-        let result = tool()
+
+        let err = tool()
             .execute(
                 &ws,
                 json!({"path": fifo_path.to_string_lossy().into_owned()}),
             )
-            .await;
-        let err = result.expect_err("tool read of no-writer FIFO must error");
+            .await
+            .expect_err("a channel must be refused");
         assert!(
-            err.to_string().contains("no writer"),
-            "tool error should name the no-writer cause: {err}"
+            err.to_string()
+                .contains("neither a regular file nor a directory"),
+            "the refusal must say what the path is: {err}"
         );
-    }
 
-    /// A FIFO with a live writer keeps working — the bounded read returns the
-    /// written data instead of erroring. The writer opens after the reader
-    /// (read-fifo opens O_NONBLOCK and polls), proving late writers work.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fifo_with_writer_reads_data() {
-        let dir = TempDir::new().unwrap();
-        let fifo_path = dir.path().join("wfifo.pipe");
-        let c_path = std::ffi::CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
-        let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
-        assert_eq!(ret, 0, "mkfifo should succeed");
-
-        // Writer on the blocking pool: the write-open blocks until a reader
-        // appears, which must not pin the async executor.
-        let writer_path = fifo_path.clone();
-        let writer = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&writer_path)
-                .expect("open FIFO for writing");
-            f.write_all(b"fifo data\n").expect("write to FIFO");
-        });
-
-        let result = read_fifo(&fifo_path, Duration::from_secs(5)).await;
-        writer.await.unwrap();
-        let bytes = result.expect("FIFO with writer should read data");
-        assert_eq!(bytes, b"fifo data\n");
-    }
-
-    /// A writer that wrote data then holds the pipe open idle past the bound:
-    /// the already-received bytes are delivered (fail-open), never discarded.
-    ///
-    /// This test is `#[ignore]` by default because the writer holds the pipe open with a hardcoded 2 s sleep. Run it
-    /// explicitly with:
-    ///
-    /// ```sh
-    /// cargo test fifo_writer_idle_after_data_delivers_buffered_bytes -- --ignored --nocapture
-    /// ```
-    #[ignore = "hardcoded 2 s writer sleep to verify fail-open buffered delivery; runs only when explicitly invoked"]
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fifo_writer_idle_after_data_delivers_buffered_bytes() {
-        let dir = TempDir::new().unwrap();
-        let fifo_path = dir.path().join("idle.pipe");
-        let c_path = std::ffi::CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
-        let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
-        assert_eq!(ret, 0, "mkfifo should succeed");
-
-        let writer_path = fifo_path.clone();
-        let writer = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&writer_path)
-                .expect("open FIFO for writing");
-            f.write_all(b"buffered data\n").expect("write to FIFO");
-            // Hold the pipe open idle well past the reader's bound.
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        });
-
-        let result = read_fifo(&fifo_path, Duration::from_millis(300)).await;
-        writer.await.unwrap();
-        let bytes = result.expect("bytes written before the bound must be delivered");
-        assert_eq!(bytes, b"buffered data\n");
+        // The read an edit performs meets the same refusal — a relative path, so
+        // it is the file's own kind that decides, not the workspace frame.
+        let editor = EditTool::confined();
+        let edited = editor.execute(
+            &ws,
+            json!({ "path": "nofifo.pipe", "old_string": "a", "new_string": "b" }),
+        );
+        let err = edited.await.expect_err("an edit must refuse a channel");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "the write side must refuse it too: {err}"
+        );
     }
 }

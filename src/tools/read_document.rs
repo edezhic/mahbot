@@ -5,10 +5,11 @@
 //!
 //! Artifacts (a page raster, an embedded image, a spilled text body) are
 //! per-call intermediates in a uniquely named `read_<nonce>` directory, removed
-//! when the run ends like a shell spill. The general read writes them into the
-//! daemon temp service area ([`crate::tools::shell::agent_temp_dir`]); the
-//! restricted (workspace-only) read, which cannot open temp paths, into its
-//! caller's workspace `uploads/` (a re-read re-converts). What a crash leaves
+//! when the run ends like a shell spill. Every access but the workspace-only one
+//! writes them into the daemon temp service area
+//! ([`crate::tools::shell::agent_temp_dir`]); the workspace-only read, which
+//! cannot open temp paths, into its caller's workspace `uploads/` (a re-read
+//! re-converts). What a crash leaves
 //! behind is reclaimed there too — by the OS temp sweep and the periodic temp
 //! cleaner in the first case, by the workspace media sweep in the second, which
 //! removes the leftover files but not the empty directory. That `uploads/` parent
@@ -18,6 +19,7 @@
 use crate::Workspace;
 use crate::document::DocOutcome;
 use crate::reader_output::Unshown;
+use crate::tools::path::PathAccess;
 use crate::tools::{ImagePayload, ImagePayloadSource, ToolOutput};
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -43,7 +45,7 @@ const NO_ARTIFACT_DIR_REASON: &str = "could not be converted";
 pub(super) async fn read_document(
     ws: &Workspace,
     res: &super::read::ResolvedRead,
-    strict: bool,
+    access: PathAccess,
 ) -> anyhow::Result<Option<ToolOutput>> {
     // Only a regular file is converted: a directory keeps the ordinary listing
     // read, and a special file is never opened (the converter's read is unbounded).
@@ -73,7 +75,7 @@ pub(super) async fn read_document(
     )?;
 
     // No artifact directory, no conversion — a plain answer, not a failed call.
-    let dir = match create_artifact_dir(ws, strict).await {
+    let dir = match create_artifact_dir(ws, access).await {
         Ok(dir) => dir,
         Err(e) => {
             tracing::warn!(error = %e, "Failed to create a document artifact directory");
@@ -125,8 +127,10 @@ fn answer_line(display: &str, body: impl std::fmt::Display) -> String {
 
 /// A fresh uniquely named directory for this call's artifacts — its location is
 /// the module header's subject.
-async fn create_artifact_dir(ws: &Workspace, strict: bool) -> anyhow::Result<PathBuf> {
-    let parent = if strict {
+async fn create_artifact_dir(ws: &Workspace, access: PathAccess) -> anyhow::Result<PathBuf> {
+    // The workspace-only read cannot open a temp path, so its artifacts go to a
+    // directory it can reach; every other access uses the shared agent temp area.
+    let parent = if access == PathAccess::Workspace {
         ws.as_path().join("uploads")
     } else {
         crate::tools::shell::agent_temp_dir()
@@ -381,13 +385,13 @@ mod tests {
         owner: &SpillOwner,
         ws: &Workspace,
         name: &str,
-        strict: bool,
+        access: PathAccess,
     ) -> Option<ToolOutput> {
-        let res = super::super::read::resolve_content_read(ws, name, strict)
+        let res = super::super::read::resolve_content_read(ws, name, access)
             .await
             .expect("resolve the fixture");
         owner
-            .scope(read_document(ws, &res, strict))
+            .scope(read_document(ws, &res, access))
             .await
             .expect("read the document")
     }
@@ -460,7 +464,7 @@ mod tests {
         let empty = zip_fixture(&[("word/document.xml", EMPTY_DOCX_BODY)]);
         let owner = SpillOwner::new();
         let (_dir, ws) = temp_workspace(&[("empty.docx", &empty)]);
-        let out = convert(&owner, &ws, "empty.docx", false)
+        let out = convert(&owner, &ws, "empty.docx", PathAccess::Allowlisted)
             .await
             .expect("a .docx is a document");
         assert_eq!(out.image_payloads.len(), 0);
@@ -472,7 +476,7 @@ mod tests {
 
         let with_media = docx_with_images(EMPTY_DOCX_BODY, 6);
         let (_dir, ws) = temp_workspace(&[("scanned.docx", &with_media)]);
-        let out = convert(&owner, &ws, "scanned.docx", false)
+        let out = convert(&owner, &ws, "scanned.docx", PathAccess::Allowlisted)
             .await
             .expect("a .docx is a document");
         assert_eq!(
@@ -498,7 +502,7 @@ mod tests {
         let owner = SpillOwner::new();
         let (_dir, ws) = temp_workspace(&[("scan.pdf", &raster_only_pdf())]);
 
-        let out = convert(&owner, &ws, "scan.pdf", false)
+        let out = convert(&owner, &ws, "scan.pdf", PathAccess::Allowlisted)
             .await
             .expect("a .pdf is a document");
         assert_eq!(
@@ -536,7 +540,7 @@ mod tests {
         ]);
         let (_dir, ws) = temp_workspace(&[("clip.docx", &with_media)]);
 
-        let out = convert(&owner, &ws, "clip.docx", false)
+        let out = convert(&owner, &ws, "clip.docx", PathAccess::Allowlisted)
             .await
             .expect("a .docx is a document");
         // The report leads the notes, one line per kind: the clip is a video,
@@ -560,7 +564,7 @@ mod tests {
 
         let plain = zip_fixture(&[("word/document.xml", DOCX_BODY)]);
         let (_dir, ws) = temp_workspace(&[("plain.docx", &plain)]);
-        let out = convert(&owner, &ws, "plain.docx", false)
+        let out = convert(&owner, &ws, "plain.docx", PathAccess::Allowlisted)
             .await
             .expect("a .docx is a document");
         assert!(
@@ -578,7 +582,7 @@ mod tests {
         let owner = SpillOwner::new();
         let (_dir, ws) = temp_workspace(&[("broken.pdf", &pdf_with_no_media_box())]);
 
-        let out = convert(&owner, &ws, "broken.pdf", false)
+        let out = convert(&owner, &ws, "broken.pdf", PathAccess::Allowlisted)
             .await
             .expect("a .pdf is a document");
         assert!(
@@ -608,7 +612,7 @@ mod tests {
         let owner = SpillOwner::new();
         let (_dir, ws) = temp_workspace(&[("filled.pdf", &pdf_scan_with_only_a_form_value())]);
 
-        let out = convert(&owner, &ws, "filled.pdf", false)
+        let out = convert(&owner, &ws, "filled.pdf", PathAccess::Allowlisted)
             .await
             .expect("a .pdf is a document");
         assert_eq!(
@@ -645,7 +649,7 @@ mod tests {
         let owner = SpillOwner::new();
         let (_dir, ws) = temp_workspace(&[("broken.pdf", b"%PDF-1.4\ngarbage")]);
 
-        let out = convert(&owner, &ws, "brokn.pdf", false)
+        let out = convert(&owner, &ws, "brokn.pdf", PathAccess::Allowlisted)
             .await
             .expect("a .pdf is a document");
         assert!(out.text.starts_with("[Recovered path: "), "{}", out.text);
@@ -673,7 +677,7 @@ mod tests {
         let owner = SpillOwner::new();
         let (_dir, ws) = temp_workspace(&[("report.docx", &fixture)]);
 
-        let out = convert(&owner, &ws, "report.docx", false)
+        let out = convert(&owner, &ws, "report.docx", PathAccess::Allowlisted)
             .await
             .expect("a .docx is a document");
         assert!(
@@ -711,7 +715,7 @@ mod tests {
         let owner = SpillOwner::new();
         let (_dir, ws) = temp_workspace(&[("many.docx", &fixture)]);
 
-        let out = convert(&owner, &ws, "many.docx", false)
+        let out = convert(&owner, &ws, "many.docx", PathAccess::Allowlisted)
             .await
             .expect("a .docx is a document");
         assert!(
@@ -735,7 +739,11 @@ mod tests {
         let owner = SpillOwner::new();
         let (_dir, ws) = temp_workspace(&[("notes.md", b"# Notes\n")]);
 
-        assert!(convert(&owner, &ws, "notes.md", false).await.is_none());
+        assert!(
+            convert(&owner, &ws, "notes.md", PathAccess::Allowlisted)
+                .await
+                .is_none()
+        );
 
         let out = owner
             .scope(
@@ -792,7 +800,7 @@ mod tests {
     async fn strict_read_keeps_artifacts_inside_the_workspace() {
         let (dir, ws) = temp_workspace(&[("scan.pdf", &raster_only_pdf())]);
 
-        let out = convert(&SpillOwner::new(), &ws, "scan.pdf", true)
+        let out = convert(&SpillOwner::new(), &ws, "scan.pdf", PathAccess::Workspace)
             .await
             .expect("a .pdf is a document");
         let image = out.image_payloads.first().expect("the page is attached");
@@ -820,7 +828,7 @@ mod tests {
         let owner = SpillOwner::new();
         let (_dir, ws) = temp_workspace(&[("long.docx", &fixture)]);
 
-        let out = convert(&owner, &ws, "long.docx", false)
+        let out = convert(&owner, &ws, "long.docx", PathAccess::Allowlisted)
             .await
             .expect("a .docx is a document");
         assert!(

@@ -161,10 +161,12 @@ fn render_dump(messages: &[&ChatMessage]) -> String {
 
 /// Resolve the directory holding compaction dumps for this role.
 ///
-/// - [`Role::Assistant`]: pinned to the user's personal workspace — the only
-///   place its strict (workspace-only) read tool can open — so the dump goes
-///   to `<personal_workspace>/{[`DUMP_DIR_NAME`]}`. `user_name` is validated
-///   via [`crate::users::is_valid_personal_user_name`]; `None` when invalid.
+/// - [`Role::Assistant`]: pinned to the user's personal workspace —
+///   `<personal_workspace>/{[`DUMP_DIR_NAME`]}` — because that is the one
+///   location both audiences' read tools can open: the admin's reaches the
+///   machine, a guest's only reaches its workspace, and the general read's
+///   temp allowlist is not the guest's. `user_name` is validated via
+///   [`crate::users::is_valid_personal_user_name`]; `None` when invalid.
 /// - Every other role has the general read tool, and the whole pinned temp
 ///   root is already inside its allowlist, so the dump goes to
 ///   `<agent_temp_dir>/compaction`. It deliberately does NOT use the

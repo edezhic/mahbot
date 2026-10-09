@@ -1,0 +1,1 @@
+Reads are limited to your own personal workspace: dependency-source caches, temp spill files, `/tmp` and every other system path are not accessible. Relative paths resolve from the workspace.

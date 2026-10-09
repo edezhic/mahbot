@@ -251,6 +251,7 @@ use crate::Workspace;
 use crate::config::CONFIG;
 #[cfg(not(target_os = "macos"))]
 use crate::tools::ComputerTool;
+use crate::tools::path::PathAccess;
 use crate::tools::{
     AddAlarmTool, AddCommentTool, AnalyzeTool, ChromeTool, CreateTicketTool, CustomTool,
     DispatchMode, DocumentTool, EditTool, GetTicketTool, ImageGenTool, ImplementTool,
@@ -300,7 +301,7 @@ impl Role {
         vec![
             Box::new(ShellTool::new(ShellMode::Full)),
             Box::new(ReadTool::general()),
-            Box::new(EditTool),
+            Box::new(EditTool::confined()),
             Box::new(SearchTool),
         ]
     }
@@ -405,12 +406,19 @@ impl Role {
                 } else {
                     AnalyzeTool::new(DispatchMode::Async, Role::Assistant)
                 };
+                // The admin's Assistant reaches the machine; a guest's is
+                // confined to its own workspace (see `PathAccess`).
+                let file_access = if is_admin {
+                    PathAccess::Unrestricted
+                } else {
+                    PathAccess::Workspace
+                };
                 let mut t: Vec<Box<dyn Tool>> = vec![
                     Box::new(analyze),
                     Box::new(AddAlarmTool),
                     Box::new(ListAlarmsTool),
                     Box::new(RemoveAlarmTool),
-                    Box::new(EditTool),
+                    Box::new(EditTool::new(file_access)),
                     Box::new(SearchTool),
                     Box::new(SleepTool),
                     // Media tools serve every Assistant alike: the media
@@ -420,23 +428,18 @@ impl Role {
                     Box::new(VideoGenTool),
                     Box::new(VideoEditTool),
                     // Likewise, the document tool serves every account: its
-                    // outputs stay inside the caller's own workspace, and every
-                    // input path it accepts is confined to that workspace.
-                    Box::new(DocumentTool),
+                    // outputs always stay inside the caller's own workspace, and
+                    // its input paths follow the caller's access.
+                    Box::new(DocumentTool::new(file_access)),
                 ];
                 // The grant-gated forwarding tool: every Assistant can call
                 // admin-authored scripts; the grant (or admin rights) decides
                 // what each call may reach.
                 t.push(Box::new(CustomTool));
                 // A guest's Assistant read access is workspace-bounded; the
-                // admin's retains the general ReadTool so it can also read
-                // dependency sources / temp files. (Media tools write only into
-                // the workspace's generated/ tree in both cases.)
-                if is_admin {
-                    t.push(Box::new(ReadTool::general()));
-                } else {
-                    t.push(Box::new(ReadTool::workspace_only()));
-                }
+                // admin's reaches any path the shell could name. (Media tools
+                // write only into the workspace's generated/ tree in both cases.)
+                t.push(Box::new(ReadTool::new(file_access)));
                 if is_admin {
                     t.push(Box::new(ShellTool::new(ShellMode::Full)));
                     t.push(Box::new(ImplementTool::targeted(Role::Assistant)));
@@ -697,8 +700,7 @@ mod tests {
         // The Assistant toolset must differ by whether the triggering account
         // is the admin: a guest's Assistant has no shell/implement/research/
         // computer, the admin's does. A guest gets the workspace-only read
-        // (`ReadTool::workspace_only()`); the admin keeps the general read
-        // (which also permits dependency sources).
+        // access; the admin's reaches the machine.
         let ws = crate::workspace::test_ws("test");
         let guest = crate::Role::Assistant.tools(&ws, false, test_sessions());
         let admin = crate::Role::Assistant.tools(&ws, true, test_sessions());
@@ -726,25 +728,61 @@ mod tests {
                 "the admin's Assistant must not advertise `computer` on macOS"
             );
         }
-        // The read boundary is what the model is told: a guest (restricted)
-        // only advertises the personal workspace; the admin keeps the general
-        // allowlist.
+        // The read boundary is what the model is told — the tool's own
+        // description, not a restatement in its parameter schema: a guest
+        // (restricted) only reaches the personal workspace; the admin's names
+        // the machine and what stays closed.
         let guest_read = guest.iter().find(|t| t.name() == "read");
-        let guest_path_desc = guest_read
-            .map(|t| t.parameters_schema()["properties"]["path"]["description"].to_string())
+        let guest_read_desc = guest_read.map(|t| t.description()).unwrap_or_default();
+        assert!(
+            guest_read_desc.contains("limited to your own personal workspace"),
+            "a guest's Assistant read must advertise the workspace-only boundary, got: \
+             {guest_read_desc}"
+        );
+        let admin_read_desc = admin
+            .iter()
+            .find(|t| t.name() == "read")
+            .map(|t| t.description())
             .unwrap_or_default();
         assert!(
-            guest_path_desc.contains("Only the workspace is accessible"),
-            "a guest's Assistant read must advertise the workspace-only boundary, got: {guest_path_desc}"
+            admin_read_desc.contains("your home directory")
+                && admin_read_desc.contains("own live databases"),
+            "the admin's Assistant read must advertise the machine-wide boundary and what it \
+             refuses, got: {admin_read_desc}"
         );
-        let admin_read = admin.iter().find(|t| t.name() == "read");
-        let admin_path_desc = admin_read
-            .map(|t| t.parameters_schema()["properties"]["path"]["description"].to_string())
+
+        // The write boundary likewise: the admin's edit names the two refusals,
+        // a guest's edit states the workspace boundary.
+        let admin_edit_desc = admin
+            .iter()
+            .find(|t| t.name() == "edit")
+            .map(|t| t.description())
             .unwrap_or_default();
         assert!(
-            admin_path_desc.contains("policy allowlist"),
-            "the admin's Assistant read must advertise the general allowlist boundary, got: {admin_path_desc}"
+            admin_edit_desc.contains("registered project workspaces")
+                && admin_edit_desc.contains("home directory"),
+            "the admin's Assistant edit must name what stays closed, got: {admin_edit_desc}"
         );
+        let guest_edit_desc = guest
+            .iter()
+            .find(|t| t.name() == "edit")
+            .map(|t| t.description())
+            .unwrap_or_default();
+        assert!(
+            guest_edit_desc.contains("confined to your workspace"),
+            "a guest's Assistant edit must keep the workspace boundary, got: {guest_edit_desc}"
+        );
+        for (who, desc) in [
+            ("the admin's read", &admin_read_desc),
+            ("the admin's edit", &admin_edit_desc),
+            ("a guest's read", &guest_read_desc),
+            ("a guest's edit", &guest_edit_desc),
+        ] {
+            assert!(
+                !desc.contains("{{"),
+                "{who} description left a placeholder unrendered: {desc}"
+            );
+        }
 
         // The optional `target` delegation argument is the admin's alone: the
         // admin's `analyze` and `implement` advertise it, the guest's `analyze`

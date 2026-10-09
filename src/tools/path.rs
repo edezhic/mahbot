@@ -1,12 +1,38 @@
 //! Path validation and resolution functions for tool operations.
 //!
-//! This module implements the path security boundary for all tool file operations.
-//! It enforces workspace-scoped access, temp-file allowlists, dependency-cache
-//! access for reading, spill-file detection, and symlink/symlink-escape protection.
+//! This module implements the path boundary for all tool file operations. The
+//! boundary itself is the tool's [`PathAccess`], fixed when a role's toolset is
+//! built: the guest Assistant's workspace-only frame, the pipeline roles' read
+//! allowlist (temp files, dependency caches) and the admin Assistant's
+//! unrestricted access.
+//!
+//! Two product rules hold whatever the level. The service's own live stores are
+//! refused by location ([`StoreFile`]) for every read and every write. A write
+//! is refused inside a registered project workspace too — but that second rule
+//! binds only the unrestricted writer ([`unrestricted_write_refusal`]): a
+//! confined write is inside its own workspace, where the case never arises.
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+
+/// What a file tool may reach. The level is fixed when a role's toolset is
+/// built ([`crate::Role::tools`]), so it is a property of the tool instance and
+/// never of a call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PathAccess {
+    /// The guest Assistant: the workspace alone.
+    Workspace,
+    /// The pipeline roles, and every general read: the workspace plus the read
+    /// allowlist (dependency caches, SDK headers, temp roots, spill files).
+    /// Writes have no extra allowed paths, so this reads as [`Self::Workspace`]
+    /// for them.
+    Allowlisted,
+    /// The admin Assistant: any path the shell could name, minus the two places
+    /// the product keeps to itself (see [`StoreFile`] and
+    /// [`unrestricted_write_refusal`]).
+    Unrestricted,
+}
 
 /// True when `s` contains glob metacharacters (`*`, `?`, `[`, and optionally `]`).
 ///
@@ -76,15 +102,20 @@ async fn resolve_directory_read_fallback(full_path: &Path) -> Option<PathBuf> {
 
 /// Resolve and validate a file target for write/edit operations.
 ///
-/// Path security is enforced via [`is_path_safe_for_workspace`] (pre- and
-/// post-canonicalization). Extra read paths (spill files, dependency caches)
-/// are **not** allowed for writes.
+/// For every access but [`PathAccess::Unrestricted`], path validation is
+/// [`is_path_safe_for_workspace`] (pre- and post-canonicalization): the write
+/// stays inside the workspace, where the extra *read* paths (spill files,
+/// dependency caches) are not writable either.
 ///
 /// Additional security:
 /// 1. Canonicalize the **parent** directory only — the file itself may not exist yet.
 /// 2. Symlink check: if the target exists and is a symlink, refuse (unlike reading,
 ///    where `canonicalize` resolves through symlinks safely).
 /// 3. If `ensure_parent` is `true`, creates parent directories before canonicalizing.
+///
+/// [`PathAccess::Unrestricted`] (the admin Assistant) instead reaches anything
+/// the shell could, minus two places, and resolves the file the write would
+/// really land in — see [`resolve_unrestricted_write`].
 ///
 /// See [`resolve_read_target`] for the read-side counterpart.
 ///
@@ -93,10 +124,22 @@ pub(crate) async fn resolve_write_target(
     workspace_root: &Path,
     path: &str,
     ensure_parent: bool,
+    access: PathAccess,
 ) -> anyhow::Result<PathBuf> {
-    let full_path = resolve_tool_path_with_base(path, workspace_root);
+    let full_path = resolve_tool_path_with_base(path, workspace_root, access)?;
 
-    // Pre-canonicalization check — strict, no extra allowed paths
+    if access == PathAccess::Unrestricted {
+        return resolve_unrestricted_write(workspace_root, &full_path, path, ensure_parent).await;
+    }
+
+    // The live stores are an invariant of the product, not a rule of a role:
+    // refused by location for every holder, before anything is created. It can
+    // only bite here if a workspace covers the store directory.
+    if let Some(StoreFile::Live) = product_store_file(&full_path) {
+        return Err(live_store_refusal("write to", path));
+    }
+
+    // Pre-canonicalization check — the workspace frame, no extra allowed paths
     if !is_path_safe_for_workspace(path, workspace_root) {
         anyhow::bail!(
             "forbidden: cannot write to {path}: outside the workspace — hint: writes are only \
@@ -119,6 +162,13 @@ pub(crate) async fn resolve_write_target(
     let resolved_target = canonicalize_parent_and_join(&full_path)
         .await
         .context("Failed to resolve file path")?;
+
+    // The post-canonicalization half of the store rule, as on the read side: a
+    // parent that is a symlink into the store directory is not visible in the
+    // spelling, and the resolved file is what would be opened.
+    if let Some(StoreFile::Live) = product_store_file(&resolved_target) {
+        return Err(live_store_refusal("write to", path));
+    }
 
     // Re-extract canonicalized parent for the post-canonicalization security check.
     let Some(resolved_parent) = resolved_target.parent() else {
@@ -145,37 +195,243 @@ pub(crate) async fn resolve_write_target(
         );
     }
 
+    refuse_non_regular_target(&resolved_target, path).await?;
+
     Ok(resolved_target)
+}
+
+/// Refuse a write whose target already exists as anything but a regular file:
+/// a device, a socket or a FIFO has no bounded read — and the edit tool reads
+/// the file it edits — and a directory is not what any caller means to write
+/// over.
+async fn refuse_non_regular_target(resolved_target: &Path, requested: &str) -> anyhow::Result<()> {
+    if let Ok(meta) = tokio::fs::symlink_metadata(resolved_target).await
+        && !meta.is_file()
+    {
+        anyhow::bail!(
+            "forbidden: cannot write to {requested}: {} already exists and is not a regular file \
+             — hint: only a regular file can be written; create a file inside a directory instead \
+             of over it",
+            resolved_target.display()
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a write for the admin's Assistant: any path the shell could name,
+/// minus two places — the product's own store files, and the registered project
+/// workspaces, whose work belongs to their own Manager.
+///
+/// The decision is made on the file the write would really land in: the deepest
+/// existing ancestor is canonicalized, so every symlink and `..` on the way —
+/// the final component included — is settled before the checks read the path.
+/// Nothing is created on disk until every check has passed, so a refused write
+/// leaves no directory behind.
+async fn resolve_unrestricted_write(
+    own_workspace: &Path,
+    full_path: &Path,
+    requested: &str,
+    ensure_parent: bool,
+) -> anyhow::Result<PathBuf> {
+    let resolved = resolve_through_existing_ancestor(full_path)
+        .await
+        .with_context(|| format!("Failed to resolve file path: {}", full_path.display()))?;
+    // A dangling final component is a link the walk above cannot settle (its
+    // target does not exist yet): it is followed to the file it names, which is
+    // the file the write really lands in — the shell would create that same
+    // file through the link.
+    let resolved = follow_final_links(resolved).await?;
+
+    // The list is read before anything is judged, so an unreadable registry is
+    // a refusal rather than a silently empty one.
+    let projects = registered_projects(requested).await?;
+    // Only the resolved file is judged: the file the write really lands in is
+    // what decides, never the spelling it came in as.
+    if let Some(err) = unrestricted_write_refusal(own_workspace, &resolved, requested, &projects) {
+        return Err(err);
+    }
+
+    refuse_non_regular_target(&resolved, requested).await?;
+
+    if ensure_parent && let Some(parent) = resolved.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("Failed to create parent directories")?;
+    }
+
+    Ok(resolved)
+}
+
+/// The refusal a write of the admin's Assistant meets, or `None` when the write
+/// is allowed. Both refusals are by location and neither by content: the
+/// product's own store files (never opened to find out what they are), and the
+/// registered project workspaces, whose work belongs to their own manager.
+/// `own_workspace` — the admin's own working folder — outranks the second rule,
+/// so a personal folder that happens to sit inside a registered project area
+/// stays writable.
+fn unrestricted_write_refusal(
+    own_workspace: &Path,
+    candidate: &Path,
+    requested: &str,
+    projects: &[(String, PathBuf)],
+) -> Option<anyhow::Error> {
+    match product_store_file(candidate) {
+        Some(StoreFile::Live) => return Some(live_store_refusal("write to", requested)),
+        Some(StoreFile::Copy) => {
+            return Some(anyhow::anyhow!(
+                "forbidden: cannot write to {requested}: it is a copy the service keeps of its own \
+                 databases — hint: only the service's own copies are closed; every other database \
+                 (its format notwithstanding) is an ordinary file"
+            ));
+        }
+        None => {}
+    }
+    if is_within_ignoring_case(candidate, &crate::util::canonical_or_self(own_workspace)) {
+        return None;
+    }
+    projects
+        .iter()
+        .find(|(_, path)| is_within_ignoring_case(candidate, path))
+        .map(|(name, _)| {
+            anyhow::anyhow!(
+                "forbidden: cannot write to {requested}: it is inside the registered project \
+                 workspace '{name}' — hint: work in a project goes through that project's manager \
+                 (`send_message_to_manager`); the admin's own workspace and any unregistered \
+                 directory stay writable"
+            )
+        })
+}
+
+/// The registered project workspaces, by name and path.
+///
+/// An unreadable list is an error, never an empty one: a write that cannot see
+/// which areas belong to projects is refused rather than guessed at. The
+/// consequence is accepted — while the product's stores are unavailable, the
+/// admin cannot write into its own memory either.
+async fn registered_projects(requested: &str) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    registered_projects_from(crate::users::registered_workspaces().await, requested)
+}
+
+/// [`registered_projects`] over an already-read registry, so the refusal an
+/// unreadable one meets is decided without the store.
+fn registered_projects_from(
+    read: anyhow::Result<Vec<crate::Workspace>>,
+    requested: &str,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    read.map(|projects| {
+        projects
+            .into_iter()
+            .map(|ws| (ws.name, PathBuf::from(ws.path)))
+            .collect()
+    })
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "forbidden: cannot write to {requested}: the registered project workspaces cannot be \
+             read ({e}) — hint: the refusal is the safe answer for a write; retry once the \
+             product's own stores are available"
+        )
+    })
+}
+
+/// Canonicalize the deepest existing ancestor of `path` and re-append the
+/// components below it — the resolution a target that does not exist yet needs,
+/// so every symlink and `..` on the way is settled before any check reads the
+/// path. Nothing is created on disk.
+///
+/// The walk keeps the caller's own spelling: a `..` behind a symlinked component
+/// is settled by the filesystem, as the shell settles it. Only the components
+/// below the deepest existing ancestor are resolved lexically (they do not
+/// exist, so no symlink can hide in them) — where a component on the way is a
+/// *dangling* symlink, no ancestor including it canonicalizes and the tail stays
+/// lexical, so the path lands beside the link where the shell's own open would
+/// fail. Both the checks and the write use the same resolved path, so no
+/// boundary is crossed.
+async fn resolve_through_existing_ancestor(path: &Path) -> std::io::Result<PathBuf> {
+    let components: Vec<std::path::Component<'_>> = path.components().collect();
+    let mut last_error = None;
+    for keep in (1..=components.len()).rev() {
+        let mut ancestor = PathBuf::new();
+        for component in &components[..keep] {
+            ancestor.push(component.as_os_str());
+        }
+        match tokio::fs::canonicalize(&ancestor).await {
+            Ok(resolved) => {
+                let mut out = crate::util::strip_verbatim_prefix(&resolved);
+                for component in &components[keep..] {
+                    out.push(component.as_os_str());
+                }
+                return Ok(normalize_path(&out));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => last_error = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no existing ancestor for {}", path.display()),
+        )
+    }))
+}
+
+/// How many links a resolved path may end in before the chain is refused, as
+/// the shell refuses a link loop.
+const MAX_FINAL_LINKS: usize = 32;
+
+/// Settle a chain of symlinks at the END of `resolved` — the part
+/// [`resolve_through_existing_ancestor`] cannot canonicalize, because the file
+/// it names does not exist yet. Each link is replaced by the file it points at
+/// and resolved in turn, so the returned path is a name that is not a link (or
+/// does not exist at all). Nothing is created.
+async fn follow_final_links(resolved: PathBuf) -> std::io::Result<PathBuf> {
+    let mut resolved = resolved;
+    for _ in 0..MAX_FINAL_LINKS {
+        match tokio::fs::symlink_metadata(&resolved).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = tokio::fs::read_link(&resolved).await?;
+                let next = match resolved.parent() {
+                    Some(parent) if !target.is_absolute() => parent.join(&target),
+                    _ => target,
+                };
+                resolved = resolve_through_existing_ancestor(&next).await?;
+            }
+            _ => return Ok(resolved),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "too many levels of symbolic links resolving {} — hint: break the link loop and \
+             retry",
+            resolved.display()
+        ),
+    ))
 }
 
 /// Resolve and validate a file path for read operations.
 ///
-/// Path security is enforced by `check_path_read_allowed` (pre- and
-/// post-canonicalization). When `strict` is `true`, only workspace-scoped paths
-/// are permitted — `EXTRA_READ_ALLOWED` paths (temp files, dependency source
-/// directories) and spill-file early-returns are **not** allowed. When `strict`
-/// is `false`, the legacy behavior applies (`EXTRA_READ_ALLOWED` paths are
-/// permitted in addition to workspace-scoped paths).
+/// `access` decides the boundary (see [`check_path_read_allowed`]), checked
+/// pre- and post-canonicalization. Whatever the access, a path that is neither
+/// a regular file nor a directory is refused: the read tool holds no bounded
+/// read for a device, a socket or a channel.
 ///
 /// Key differences from [`resolve_write_target`]:
 /// - Canonicalizes the **full path**, not just the parent (file must exist).
 /// - No `ensure_parent` parameter — parent creation is a write-only concept.
 /// - No explicit symlink refusal — `tokio::fs::canonicalize` resolves symlinks,
 ///   so the post-canonicalization check catches escapes via the resolved path.
-/// - Also allows `EXTRA_READ_ALLOWED` paths (e.g. /tmp files, dependency caches)
-///   when `strict` is `false`.
 ///
 /// Returns `Ok(path)` on success, or an error message to propagate to the agent.
 pub(crate) async fn resolve_read_target(
     workspace_root: &Path,
     path: &str,
-    strict: bool,
+    access: PathAccess,
 ) -> anyhow::Result<PathBuf> {
-    let full_path = resolve_tool_path_with_base(path, workspace_root);
+    let full_path = resolve_tool_path_with_base(path, workspace_root, access)?;
 
     // Pre-canonicalization check — allows EXTRA_READ_ALLOWED paths
     // (temp files, dependency source directories) outside the workspace
-    check_path_read_allowed(path, workspace_root, strict)?;
+    check_path_read_allowed(path, workspace_root, access)?;
 
     // Canonicalize full path (file must exist). Resolves symlinks,
     // so the post-canonicalization check catches escapes.
@@ -196,7 +452,22 @@ pub(crate) async fn resolve_read_target(
         }
     };
 
-    check_path_read_allowed(&resolved_path.to_string_lossy(), workspace_root, strict)?;
+    check_path_read_allowed(&resolved_path.to_string_lossy(), workspace_root, access)?;
+
+    // The read tool opens regular files and lists directories. Anything else —
+    // a device, a socket, a channel — has no bounded read and is refused for
+    // every role: the refusal is about what the tool can hold open, not about
+    // policy (which is what `access` decides above).
+    let meta = tokio::fs::metadata(&resolved_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", resolved_path.display()))?;
+    if !meta.is_file() && !meta.is_dir() {
+        anyhow::bail!(
+            "forbidden: cannot read {path}: {} is neither a regular file nor a directory — hint: \
+             the read tool reads regular files and lists directories only",
+            resolved_path.display()
+        );
+    }
 
     Ok(resolved_path)
 }
@@ -408,95 +679,181 @@ fn is_grandparent_temp_root(path: &Path) -> bool {
         .is_some_and(is_os_temp_root)
 }
 
-/// Credential directories that are hard-denied for reading, in every read
-/// variant (including the workspace-strict one) and regardless of any
-/// allowlist. `~/.config/...` entries also generate an `$XDG_CONFIG_HOME`
-/// variant via [`xdg_variant_path`].
-const DENIED_CREDENTIAL_RAW_DIRS: &[&str] = &[
-    "~/.ssh/",
-    "~/.aws/",
-    "~/.gnupg/",
-    "~/.config/gcloud/",
-    "~/.docker/",
-    "~/.kube/",
-];
-
-/// Private-key file names that are denied anywhere (even inside the workspace).
-const DENIED_PRIVATE_KEY_NAMES: &[&str] = &["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
-
-/// Expanded credential-deny roots (with XDG variants for `~/.config/...`).
-///
-/// Each root is registered in both its raw expanded form and its
-/// canonicalized form (via [`add_path_with_canonical`]) so the
-/// post-canonicalization deny re-check in [`resolve_read_target`] also
-/// matches when `$HOME`/`$XDG_CONFIG_HOME` contains a symlink component.
-///
-/// The deny is location-based: the lexical pre-check denies every read
-/// through a credential path (`~/.ssh/config`) even when the directory is a
-/// symlink created after startup. Only a symlink target reached via its own
-/// allowlisted path (e.g. directly under `/tmp`) can be read — the caller
-/// explicitly using a different, allowed path.
-static DENIED_CREDENTIAL_DIRS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
-    let mut dirs = Vec::new();
-    for raw in DENIED_CREDENTIAL_RAW_DIRS {
-        let entry = raw.trim_end_matches('/');
-        let expanded = crate::util::expand_tilde(entry);
-        add_path_with_canonical(&mut dirs, expanded);
-        if let Some(xdg_path) = xdg_variant_path(entry) {
-            add_path_with_canonical(&mut dirs, PathBuf::from(xdg_path));
-        }
-    }
-    dirs
-});
-
-/// Whether `path` hits a hard credential denial: a protected credential
-/// directory, or a private-key file name at any depth.
-///
-/// Lexical only (expand_tilde + normalize, no I/O): the caller's
-/// post-canonicalization re-check in [`resolve_read_target`] re-runs this on
-/// the resolved path, which is what catches symlinks into denied locations.
-///
-/// Residual risk (accepted): the shell tool has no read-path gate, so
-/// credential protection is complete only for the read tool.
-#[must_use]
-#[expect(
-    clippy::case_sensitive_file_extension_comparisons,
-    reason = "the file name is lowercased first, so the comparison is case-insensitive"
-)]
-fn is_denied_credential_path(path: &str) -> bool {
-    if is_path_under_roots(Path::new(path), &DENIED_CREDENTIAL_DIRS) {
-        return true;
-    }
-    crate::util::expand_tilde(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|name| {
-            DENIED_PRIVATE_KEY_NAMES.contains(&name.as_str()) || name.ends_with(".ppk")
-        })
+/// The product's own storage root — where its stores, and the copies it keeps
+/// of them, live. Read from the running configuration (set at startup; a test
+/// run resolves its own root), so no path is hard-coded here.
+fn storage_root() -> Option<PathBuf> {
+    crate::config::CONFIG
+        .try_storage_root()
+        .or_else(|| crate::config::default_config_dir().ok())
 }
 
-/// Check that a path is allowed by the read-path security policy.
+/// Sidecar suffixes of a store file — the write-ahead log and its journal
+/// siblings. They belong to the store and are refused with it.
+const STORE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
+
+/// A store file of the product, identified by its location alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StoreFile {
+    /// One of the two live stores. The service holds whole-file locks on them,
+    /// so opening one from inside the service — briefly, to read a header, to
+    /// find out whether it is a database — silently releases those locks for
+    /// the rest of the process's life. Never opened, by any tool, for any
+    /// reason.
+    Live,
+    /// A copy the service keeps for itself: the quarantine and pre-reindex
+    /// families, and the rebuild's own temp file. Static, so it is readable as
+    /// an ordinary file; only the unrestricted writer's refusal covers it.
+    Copy,
+}
+
+/// Whether `path` is inside `base`, comparing every component without ASCII
+/// case.
 ///
-/// When `strict` is `true`, the ONLY allowed paths are those within the
-/// workspace (via [`is_path_safe_for_workspace`]) — `EXTRA_READ_ALLOWED`
-/// directories and the spill-file early-return are skipped.
+/// The store and project rules are location rules, and the volumes they run on
+/// (macOS, Windows) compare file names without case, while a canonicalized path
+/// keeps the spelling the caller typed — so a differently-cased spelling of a
+/// protected place is that place, and the rule must answer it the same way. On a
+/// case-sensitive volume the two spellings are two directories; the comparison
+/// still answers as if they were one, which over-refuses where it backs a
+/// refusal (accepted — a rule that limits rather than fences the shell) and
+/// over-permits where it backs the admin's own-folder exemption (a case-varied
+/// sibling of that folder inside a registered project stays writable). The
+/// supported volumes cannot tell the two apart.
+#[must_use]
+fn is_within_ignoring_case(candidate: &Path, base: &Path) -> bool {
+    let candidate = crate::util::strip_verbatim_prefix(candidate);
+    let base = crate::util::strip_verbatim_prefix(base);
+    let mut candidate = candidate.components();
+    let mut base = base.components();
+    loop {
+        match (candidate.next(), base.next()) {
+            (_, None) => return true,
+            (Some(candidate), Some(base)) => {
+                if !candidate.as_os_str().eq_ignore_ascii_case(base.as_os_str()) {
+                    return false;
+                }
+            }
+            (None, Some(_)) => return false,
+        }
+    }
+}
+
+/// Classify `path` as one of the product's own store files under the store
+/// directory — **by location and name only**, and without case. Deciding what a
+/// file is by opening it is exactly what the live-store rule forbids, so the
+/// store file itself is never opened here (only its directory's spelling is
+/// settled).
+fn store_file_at(root: &Path, path: &Path) -> Option<StoreFile> {
+    // The store directory is matched in both spellings: a caller's resolved
+    // path carries the canonical one (`/private/tmp` where the storage root is
+    // spelled `/tmp`), and the rule must not depend on which of the two a path
+    // happened to come in as.
+    let db_dir = crate::db::store_dir(root);
+    let candidate = normalize_path(&crate::util::expand_tilde(&path.to_string_lossy()));
+    let under = is_within_ignoring_case(&candidate, &db_dir)
+        || std::fs::canonicalize(&db_dir)
+            .is_ok_and(|canonical| is_within_ignoring_case(&candidate, &canonical));
+    if !under {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let base = STORE_SIDECAR_SUFFIXES
+        .iter()
+        .find_map(|suffix| crate::util::strip_suffix_ignoring_case(name, suffix))
+        .unwrap_or(name);
+    let lowered = base.to_ascii_lowercase();
+    // `{store}.db` is a live store — only the two the service runs on, so a
+    // file left over from a retired store name is an ordinary file.
+    if let Some(stem) = lowered.strip_suffix(".db")
+        && (stem == crate::db::CONSOLIDATED_DB_NAME || stem == crate::db::LOG_DB_NAME)
+    {
+        return Some(StoreFile::Live);
+    }
+    // `{store}.db.{copy}` is a copy the service keeps of one — of ANY store,
+    // since it quarantines a retired name exactly as it quarantines a live one.
+    // The naming contract is `db::debug`'s (and the rebuild's own, `db`'s), so
+    // a copy is recognised through them rather than through a second spelling
+    // of either; both are matched without case, like the rest of this rule.
+    if let Some((_, rest)) = lowered.split_once(".db")
+        && rest.starts_with(crate::db::REBUILD_TEMP_MARKER)
+    {
+        return Some(StoreFile::Copy);
+    }
+    crate::db::debug::parse_family_name(base).map(|_| StoreFile::Copy)
+}
+
+/// [`store_file_at`] against the running storage root. `None` when the root
+/// cannot be resolved at all (no `HOME` and no user directories) — a case a
+/// running service cannot be in, since it resolves the root before any tool
+/// runs.
+fn product_store_file(path: &Path) -> Option<StoreFile> {
+    store_file_at(&storage_root()?, path)
+}
+
+/// The live-store refusal, worded once so the read and write sides cannot drift.
+fn live_store_refusal(action: &str, path: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "forbidden: cannot {action} {path}: it is one of the product's own live databases, or a \
+         journal tail of one — hint: the service holds locks on them, and opening one from inside \
+         the running service silently releases those locks for the rest of the process; the \
+         product's own data is read through its debug surface (`mahbot debug`, or the admin's \
+         `mahbot_debug` tool) instead"
+    )
+}
+
+/// Whether `path` names an existing file or directory once resolved the way a
+/// read resolves it — the test that tells a literal path whose own name carries
+/// glob metacharacters from a pattern.
+pub(crate) async fn literal_path_exists(
+    workspace_root: &Path,
+    path: &str,
+    access: PathAccess,
+) -> bool {
+    let Ok(full_path) = resolve_tool_path_with_base(path, workspace_root, access) else {
+        return false;
+    };
+    tokio::fs::try_exists(full_path).await.unwrap_or(false)
+}
+
+/// Whether a read of `path` is a wildcard listing rather than a read of the file
+/// it names: the path carries glob metacharacters (`* ? [ ]`) AND names nothing.
 ///
-/// When `strict` is `false`, the path may additionally be within one of the
-/// [`EXTRA_READ_ALLOWED`] directories (temp files, dependency caches, SDK
-/// headers, etc.), or be a spill file on an OS temp root (allowed
-/// unconditionally).
-fn check_path_read_allowed(path: &str, workspace_root: &Path, strict: bool) -> anyhow::Result<()> {
-    // Hard credential denial wins over the allowlist and applies to the
-    // strict workspace-only variant too. Runs pre- and post-canonicalization.
-    if is_denied_credential_path(path) {
-        anyhow::bail!(
-            "forbidden: cannot read {path}: protected credential location — hint: this denial is \
-             intentional; do not attempt to reach credential files through other paths"
-        );
+/// A file whose own name holds one (`report[1].txt`) is an ordinary path the
+/// shell could name — the edit tool takes it — so the read does too, and only a
+/// pattern that names no file falls through to the workspace listing.
+pub(crate) async fn is_wildcard_read(
+    workspace_root: &Path,
+    path: &str,
+    access: PathAccess,
+) -> bool {
+    contains_glob(path, true) && !literal_path_exists(workspace_root, path, access).await
+}
+
+/// Check that a path is allowed by the read policy of `access`.
+///
+/// Every level is refused the product's own live stores. Beyond that,
+/// [`PathAccess::Workspace`] allows the workspace alone,
+/// [`PathAccess::Unrestricted`] allows anything, and
+/// [`PathAccess::Allowlisted`] allows the workspace plus [`EXTRA_READ_ALLOWED`]
+/// (temp files, dependency caches, SDK headers) and spill files on a temp root.
+fn check_path_read_allowed(
+    path: &str,
+    workspace_root: &Path,
+    access: PathAccess,
+) -> anyhow::Result<()> {
+    // The live stores are an invariant of the product, not a rule of a role:
+    // refused by location, before anything is opened, for every holder and
+    // every access level. Copies are ordinary files and pass.
+    if let Some(StoreFile::Live) = product_store_file(Path::new(path)) {
+        return Err(live_store_refusal("read", path));
     }
 
-    if strict {
+    if access == PathAccess::Unrestricted {
+        return Ok(());
+    }
+
+    if access == PathAccess::Workspace {
         if is_path_safe_for_workspace(path, workspace_root) {
             return Ok(());
         }
@@ -946,17 +1303,56 @@ fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
 }
 
 /// Resolve a user path segment against `workspace_root`.
-#[must_use]
-fn resolve_tool_path_with_base(path: &str, workspace_root: &Path) -> PathBuf {
+///
+/// A bare `~` means the workspace root — except for the admin's Assistant,
+/// whose `~` is the shell's: the user's home directory, bare or with a path
+/// under it (`~/notes.md`). `~user` is refused there rather than answered with
+/// `$HOME/user`, which is not the file the shell would name; the other access
+/// levels keep their existing wording, where the frame refuses it.
+fn resolve_tool_path_with_base(
+    path: &str,
+    workspace_root: &Path,
+    access: PathAccess,
+) -> anyhow::Result<PathBuf> {
     let trimmed = path.trim();
-    if trimmed.is_empty() || trimmed == "~" {
-        return workspace_root.to_path_buf();
+    if trimmed.is_empty() {
+        return Ok(workspace_root.to_path_buf());
     }
+
+    if access == PathAccess::Unrestricted {
+        if is_foreign_tilde(trimmed) {
+            anyhow::bail!(
+                "forbidden: cannot resolve {path}: `~user` is not expanded — hint: only `~` and \
+                 `~/…` are, and they mean your own home directory; spell another user's path \
+                 absolutely"
+            );
+        }
+        if trimmed.starts_with('~') {
+            let home = crate::util::expand_tilde(trimmed);
+            if !home.is_absolute() {
+                anyhow::bail!(
+                    "forbidden: cannot resolve {path}: no home directory is set — hint: spell the \
+                     path absolutely"
+                );
+            }
+            return Ok(home);
+        }
+    } else if trimmed == "~" {
+        return Ok(workspace_root.to_path_buf());
+    }
+
     let expanded = crate::util::expand_tilde(trimmed);
     if expanded.is_absolute() {
-        return expanded;
+        return Ok(expanded);
     }
-    workspace_root.join(expanded)
+    Ok(workspace_root.join(expanded))
+}
+
+/// A `~`-prefixed spelling that names another user (`~user…`) rather than the
+/// caller's own home — [`crate::util::expand_tilde`] would answer it with
+/// `$HOME/user…`, a file the caller did not name.
+fn is_foreign_tilde(path: &str) -> bool {
+    path.starts_with('~') && path != "~" && !path.starts_with("~/")
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -1012,12 +1408,12 @@ mod tests {
                 safe: false,
             },
             Case {
-                name: "ssh_private_key",
+                name: "home_ssh_key_outside_workspace",
                 path: "~/.ssh/id_rsa",
                 safe: false,
             },
             Case {
-                name: "gnupg_secret",
+                name: "home_gnupg_outside_workspace",
                 path: "~/.gnupg/secring.gpg",
                 safe: false,
             },
@@ -1235,6 +1631,32 @@ mod tests {
         ));
     }
 
+    /// The location rules' own comparison: same shape as [`crate::util::is_within`]
+    /// but case-blind, so a differently-cased spelling of a protected place is
+    /// that place — the bypass a byte-exact comparison left open on the
+    /// case-insensitive volumes the product ships on.
+    #[test]
+    fn location_containment_is_case_blind() {
+        assert!(is_within_ignoring_case(
+            Path::new("/Storage/DB/Core.db"),
+            Path::new("/storage/db")
+        ));
+        assert!(is_within_ignoring_case(
+            Path::new(r"\\?\C:/ws/a/b"),
+            Path::new("C:/WS")
+        ));
+        // A sibling that merely shares the name prefix is still outside, in
+        // either spelling.
+        assert!(!is_within_ignoring_case(
+            Path::new("/storage/db-other/core.db"),
+            Path::new("/storage/db")
+        ));
+        assert!(!is_within_ignoring_case(
+            Path::new("/other/core.db"),
+            Path::new("/storage/db")
+        ));
+    }
+
     // ── is_path_under_roots / allowed_temp_roots tests ───────────────────
 
     /// The roots gate settles the verbatim spelling the way containment does: a
@@ -1322,7 +1744,7 @@ mod tests {
         });
 
         for case in &cases {
-            let result = check_path_read_allowed(&case.path, &workspace, false);
+            let result = check_path_read_allowed(&case.path, &workspace, PathAccess::Allowlisted);
             assert_eq!(
                 result.is_ok(),
                 case.allowed,
@@ -1342,7 +1764,12 @@ mod tests {
         {
             let mac_spill = PathBuf::from("/var/folders/xx/yy/T/.agent/spill_cd34.txt");
             assert!(
-                check_path_read_allowed(&mac_spill.to_string_lossy(), &workspace, false).is_ok(),
+                check_path_read_allowed(
+                    &mac_spill.to_string_lossy(),
+                    &workspace,
+                    PathAccess::Allowlisted
+                )
+                .is_ok(),
                 "macOS-shaped spill path should be allowed"
             );
         }
@@ -1355,7 +1782,12 @@ mod tests {
         {
             let outside = PathBuf::from("/usr/local/.agent/spill_ab12.txt");
             assert!(
-                check_path_read_allowed(&outside.to_string_lossy(), &workspace, false).is_err(),
+                check_path_read_allowed(
+                    &outside.to_string_lossy(),
+                    &workspace,
+                    PathAccess::Allowlisted
+                )
+                .is_err(),
                 "non-temp spill-shaped path should be rejected"
             );
         }
@@ -1445,7 +1877,7 @@ mod tests {
         let temp_file = std::env::temp_dir().join("test-read.txt");
         let temp_str = temp_file.to_string_lossy().to_string();
         assert!(
-            check_path_read_allowed(&temp_str, &workspace, false).is_ok(),
+            check_path_read_allowed(&temp_str, &workspace, PathAccess::Allowlisted).is_ok(),
             "Temp file should be allowed for read"
         );
 
@@ -1453,20 +1885,20 @@ mod tests {
         if let Ok(home) = std::env::var("HOME") {
             let dep_path = format!("{home}/.cargo/registry/src/crate-0.1.0/src/lib.rs");
             assert!(
-                check_path_read_allowed(&dep_path, &workspace, false).is_ok(),
+                check_path_read_allowed(&dep_path, &workspace, PathAccess::Allowlisted).is_ok(),
                 "Dependency path should be allowed for read"
             );
 
             // ~-prefixed version (pre-canonicalization check)
             let tilde_input = "~/.cargo/registry/src/crate-0.1.0/src/lib.rs";
             assert!(
-                check_path_read_allowed(tilde_input, &workspace, false).is_ok(),
+                check_path_read_allowed(tilde_input, &workspace, PathAccess::Allowlisted).is_ok(),
                 "~-prefixed dependency path should be allowed for read"
             );
         }
     }
 
-    // ── Env-derived & credential-deny tests ────────────────────────────
+    // ── Env-derived allowed-path tests ─────────────────────────────────
 
     #[test]
     fn env_derived_allowed_paths_pure() {
@@ -1585,146 +2017,194 @@ mod tests {
     }
 
     #[test]
-    fn credential_deny_paths() {
-        struct Case {
-            name: &'static str,
-            path: &'static str,
-            denied: bool,
+    fn access_levels_each_reach_what_they_should() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().to_path_buf();
+        let outside = "/etc/passwd";
+        let dependency = "~/.cargo/registry/src/crate-0.1.0/src/lib.rs";
+        let credential = "~/.ssh/id_rsa";
+
+        // The guest Assistant reaches the workspace and nothing else.
+        assert!(check_path_read_allowed("src/main.rs", &workspace, PathAccess::Workspace).is_ok());
+        for path in [outside, dependency, credential, "/tmp/note.txt"] {
+            assert!(
+                check_path_read_allowed(path, &workspace, PathAccess::Workspace).is_err(),
+                "the workspace-only read must refuse {path}"
+            );
         }
 
-        let cases = [
-            Case {
-                name: "ssh_id_rsa",
-                path: "~/.ssh/id_rsa",
-                denied: true,
-            },
-            Case {
-                name: "ssh_dir_itself",
-                path: "~/.ssh",
-                denied: true,
-            },
-            Case {
-                name: "ssh_config_nonkey",
-                path: "~/.ssh/config",
-                denied: true,
-            },
-            Case {
-                name: "aws_credentials",
-                path: "~/.aws/credentials",
-                denied: true,
-            },
-            Case {
-                name: "gnupg_secring",
-                path: "~/.gnupg/secring.gpg",
-                denied: true,
-            },
-            Case {
-                name: "gcloud_credentials",
-                path: "~/.config/gcloud/credentials.db",
-                denied: true,
-            },
-            Case {
-                name: "docker_config",
-                path: "~/.docker/config.json",
-                denied: true,
-            },
-            Case {
-                name: "kube_config",
-                path: "~/.kube/config",
-                denied: true,
-            },
-            Case {
-                name: "bare_id_rsa",
-                path: "id_rsa",
-                denied: true,
-            },
-            Case {
-                name: "nested_id_ed25519",
-                path: "secrets/id_ed25519",
-                denied: true,
-            },
-            Case {
-                name: "server_ppk",
-                path: "keys/server.ppk",
-                denied: true,
-            },
-            Case {
-                name: "case_insensitive",
-                path: "ID_RSA",
-                denied: true,
-            },
-            Case {
-                name: "sshx_private_key_name_denied",
-                path: "~/.sshx/id_rsa",
-                denied: true,
-            },
-            Case {
-                // Component-safe directory prefix: `.sshx` is NOT `.ssh`, so
-                // a non-key file under it is not credential-denied.
-                name: "sshx_component_safe",
-                path: "~/.sshx/config",
-                denied: false,
-            },
-            Case {
-                name: "notes_txt",
-                path: "notes.txt",
-                denied: false,
-            },
-            Case {
-                name: "public_key_ok",
-                path: "id_rsa.pub",
-                denied: false,
-            },
-            Case {
-                name: "relative_src",
-                path: "src/main.rs",
-                denied: false,
-            },
-        ];
+        // A pipeline role reaches the workspace and its dependency caches —
+        // including a name that used to be a credential denial, inside the
+        // workspace where its own envelope already reached.
+        for path in ["src/main.rs", dependency, "src/id_rsa"] {
+            assert!(
+                check_path_read_allowed(path, &workspace, PathAccess::Allowlisted).is_ok(),
+                "the general read must allow {path}"
+            );
+        }
+        assert!(
+            check_path_read_allowed(outside, &workspace, PathAccess::Allowlisted).is_err(),
+            "the general read stays inside its envelope"
+        );
+        assert!(
+            check_path_read_allowed(credential, &workspace, PathAccess::Allowlisted).is_err(),
+            "a credential place outside the envelope stays out of a pipeline role's reach"
+        );
 
-        for case in &cases {
-            assert_eq!(
-                is_denied_credential_path(case.path),
-                case.denied,
-                "case: {}",
-                case.name
+        // The admin Assistant reaches the machine — `..`, symlinks and
+        // "forbidden" names included, all of which the other levels refuse.
+        for path in [
+            outside,
+            dependency,
+            credential,
+            "/tmp/note.txt",
+            "../sibling/file.txt",
+            "~/.aws/credentials",
+        ] {
+            assert!(
+                check_path_read_allowed(path, &workspace, PathAccess::Unrestricted).is_ok(),
+                "the unrestricted read must allow {path}"
             );
         }
     }
 
+    // ── Store-file tests ───────────────────────────────────────────────
+
+    /// A store file is recognised from its name and its place, never from its
+    /// contents: the two live stores and their tails are refused, the recovery
+    /// copies are recognised as copies, and everything else in the directory —
+    /// including a stale `config.db` or a file left by a retired store name — is
+    /// an ordinary file. Name and place are matched without case, because the
+    /// volumes the service runs on compare them without case: a differently-cased
+    /// spelling is the same file.
     #[test]
-    fn check_path_read_allowed_credential_denial() {
+    fn store_files_are_classified_by_name_and_place() {
+        let root = Path::new("/storage");
+        let db = root.join("db");
+
+        for name in [
+            "core.db",
+            "logs.db",
+            "core.db-wal",
+            "logs.db-wal",
+            "core.db-shm",
+            "logs.db-journal",
+            // The same files as the volume sees them.
+            "Core.db",
+            "CORE.DB",
+            "core.DB-wal",
+            "Logs.Db-SHM",
+        ] {
+            assert_eq!(
+                store_file_at(root, &db.join(name)),
+                Some(StoreFile::Live),
+                "{name} is a live store's own file"
+            );
+        }
+
+        for name in [
+            "core.db.quarantine-20260101T101010Z-42",
+            "core.db.quarantine-20260101T101010Z-42-1",
+            "logs.db.quarantine-20260101T101010Z-42-wal",
+            "core.db.pre-reindex-20260101T101010Z-42",
+            "core.db.pre-reindex-20260101T101010Z-42-wal",
+            "core.db.rebuild-20260101T101010Z",
+            // The same copies as the volume sees them.
+            "Core.db.Quarantine-20260101t101010z-42",
+            "LOGS.DB.Pre-Reindex-20260101T101010z-42",
+            // A copy of ANY store: the service quarantines a retired store name
+            // exactly as it quarantines a live one.
+            "board.db.quarantine-20260101T101010Z-42",
+            "sessions.db.pre-reindex-20260101T101010Z-42",
+            "stats.db.rebuild-20260101T101010Z",
+        ] {
+            assert_eq!(
+                store_file_at(root, &db.join(name)),
+                Some(StoreFile::Copy),
+                "{name} is a copy the service keeps of its own store"
+            );
+        }
+
+        for name in [
+            "config.db",
+            ".DS_Store",
+            "core.db.quarantine-nonsense",
+            "some_other.db",
+            "core.txt",
+            // A retired store name is not a live store: the service runs on the
+            // consolidated file and the logs file, and everything else in the
+            // directory is an ordinary file.
+            "board.db",
+            "board.db-wal",
+            "sessions.db",
+        ] {
+            assert_eq!(
+                store_file_at(root, &db.join(name)),
+                None,
+                "{name} is an ordinary file"
+            );
+        }
+
+        // The directory's own spelling does not decide either.
+        assert_eq!(
+            store_file_at(root, &root.join("DB/core.db")),
+            Some(StoreFile::Live),
+            "a store file under a differently-cased store directory is the same file"
+        );
+
+        // Outside `db/`, the same names mean nothing.
+        assert_eq!(store_file_at(root, &root.join("core.db")), None);
+        assert_eq!(
+            store_file_at(root, &root.join("models/core.db")),
+            None,
+            "a store name outside the store directory is an ordinary file"
+        );
+    }
+
+    /// The read refusal is wired to the running storage root for every access
+    /// level — the product invariant, not a rule of a role.
+    #[test]
+    fn live_stores_are_refused_at_every_access_level() {
+        let Some(root) = storage_root() else {
+            return; // no HOME and no user directory: nothing to refuse
+        };
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().to_path_buf();
 
-        let denied_abs = ["~/.ssh/id_rsa", "~/.aws/credentials", "~/.kube/config"];
-        let denied_rel = ["sub/id_rsa", "id_ed25519"];
-
-        for strict in [true, false] {
-            for path in denied_abs {
-                let err = check_path_read_allowed(path, &workspace, strict).unwrap_err();
+        for name in [
+            "core.db",
+            "logs.db",
+            "core.db-wal",
+            "Core.db",
+            "core.DB-WAL",
+        ] {
+            let path = root.join("db").join(name);
+            let path = path.to_string_lossy().to_string();
+            for access in [
+                PathAccess::Workspace,
+                PathAccess::Allowlisted,
+                PathAccess::Unrestricted,
+            ] {
+                let err = check_path_read_allowed(&path, &workspace, access)
+                    .expect_err("a live store must be refused");
                 assert!(
-                    err.to_string().contains("protected credential location"),
-                    "strict={strict}: {path} should be credential-denied: {err}"
+                    err.to_string().contains("live databases"),
+                    "{name} at {access:?}: {err}"
                 );
             }
-
-            // A private-key file name inside the workspace is denied too,
-            // even though the path itself is workspace-safe.
-            for path in denied_rel {
-                let err = check_path_read_allowed(path, &workspace, strict).unwrap_err();
-                assert!(
-                    err.to_string().contains("protected credential location"),
-                    "strict={strict}: workspace private key {path} should be denied: {err}"
-                );
-            }
-
-            // No over-blocking: a normal workspace file is still allowed.
-            assert!(
-                check_path_read_allowed("src/main.rs", &workspace, strict).is_ok(),
-                "strict={strict}: normal workspace file should be allowed"
-            );
         }
+
+        // A copy is readable — only writing to it is refused.
+        let copy = root.join("db/core.db.quarantine-20260101T101010Z-42");
+        assert!(
+            check_path_read_allowed(
+                &copy.to_string_lossy(),
+                &workspace,
+                PathAccess::Unrestricted
+            )
+            .is_ok(),
+            "a snapshot is an ordinary read"
+        );
     }
 
     #[test]
@@ -1749,7 +2229,7 @@ mod tests {
         ];
         for path in allowed {
             assert!(
-                check_path_read_allowed(path, &workspace, false).is_ok(),
+                check_path_read_allowed(path, &workspace, PathAccess::Allowlisted).is_ok(),
                 "expected allowed: {path}"
             );
         }
@@ -1768,16 +2248,20 @@ mod tests {
                     .to_string_lossy()
                     .into_owned();
                 assert!(
-                    check_path_read_allowed(&header, &workspace, false).is_ok(),
+                    check_path_read_allowed(&header, &workspace, PathAccess::Allowlisted).is_ok(),
                     "expected enumerated JVM header allowed: {header}"
                 );
             }
         }
 
-        // Gradle root (outside caches/) is NOT covered — the allowlist is
-        // deliberately caches-only because the root holds credential files.
-        let err =
-            check_path_read_allowed("~/.gradle/gradle.properties", &workspace, false).unwrap_err();
+        // Gradle root (outside caches/) is NOT covered: the allowlist is
+        // deliberately as narrow as the caches themselves.
+        let err = check_path_read_allowed(
+            "~/.gradle/gradle.properties",
+            &workspace,
+            PathAccess::Allowlisted,
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("outside the allowed read envelope"),
@@ -1785,24 +2269,425 @@ mod tests {
         );
     }
 
+    /// The admin's write refusals, which are the only two: the product's own
+    /// store files, and the registered project workspaces — with the admin's
+    /// own folder outranking the second rule.
     #[test]
-    fn check_path_read_allowed_credential_symlink_target() {
-        let tmp = TempDir::new().expect("tempdir");
-        let workspace = tmp.path().to_path_buf();
+    fn unrestricted_write_refusals() {
+        let own = Path::new("/storage/userspaces/admin");
+        let project = PathBuf::from("/work/proj");
+        let projects = vec![("proj".to_string(), project.clone())];
 
-        // Post-canonicalization shape: an absolute $HOME-based path, exactly
-        // what resolve_read_target passes after canonicalization.
-        if let Ok(home) = std::env::var("HOME") {
-            let abs = PathBuf::from(&home).join(".ssh/id_rsa");
-            let abs_str = abs.to_string_lossy().to_string();
-            for strict in [true, false] {
-                let err = check_path_read_allowed(&abs_str, &workspace, strict).unwrap_err();
-                assert!(
-                    err.to_string().contains("protected credential location"),
-                    "strict={strict}: post-canonicalization credential path should be denied: {err}"
-                );
+        let err =
+            unrestricted_write_refusal(own, &project.join("src/main.rs"), "src/main.rs", &projects)
+                .expect("a write inside a project must be refused");
+        assert!(err.to_string().contains("'proj'"), "{err}");
+        assert!(
+            err.to_string().contains("manager"),
+            "the refusal must name the route: {err}"
+        );
+
+        // The volume compares names without case, so a differently-cased
+        // spelling of the project is the same place and must be refused too —
+        // the bypass a byte-exact comparison left open.
+        let err = unrestricted_write_refusal(
+            own,
+            &PathBuf::from("/WORK/Proj/src/main.rs"),
+            "src/main.rs",
+            &projects,
+        )
+        .expect("a differently-cased project spelling must be refused");
+        assert!(err.to_string().contains("'proj'"), "{err}");
+
+        // Everything else is an ordinary file: another tree, another user's
+        // folder, and a database of any kind — the product's own stores
+        // excepted, and only by location.
+        for allowed in [
+            "/work/other/src/main.rs",
+            "/storage/userspaces/bob/notes.md",
+            "/home/bob/user.db",
+            "/var/lib/postgresql/data/base.db",
+        ] {
+            assert!(
+                unrestricted_write_refusal(own, Path::new(allowed), "x", &projects).is_none(),
+                "{allowed} must be writable"
+            );
+        }
+
+        // The admin's own folder outranks the project rule, even when it sits
+        // inside a registered area.
+        let nested = project.join("personal");
+        assert!(
+            unrestricted_write_refusal(&nested, &nested.join("MEMORY.md"), "MEMORY.md", &projects)
+                .is_none(),
+            "the admin's own workspace stays writable inside a registered area"
+        );
+        assert!(
+            unrestricted_write_refusal(
+                &nested,
+                &project.join("shared.txt"),
+                "shared.txt",
+                &projects
+            )
+            .is_some(),
+            "a sibling of the admin's own folder is still the project's"
+        );
+    }
+
+    /// The admin's own folder outranks the project rule even when the two are
+    /// spelled differently: the candidate arrives resolved, so the folder is
+    /// compared in its canonical spelling rather than as it was stored.
+    #[cfg(unix)]
+    #[test]
+    fn the_admin_own_folder_outranks_a_project_it_is_spelled_differently_in() {
+        let tmp = TempDir::new().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).expect("the temp dir resolves");
+        let project = base.join("real/proj");
+        std::fs::create_dir_all(project.join("admin")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&project, &link).unwrap();
+        let projects = vec![("proj".to_string(), project.clone())];
+
+        // The folder kept under the link's spelling, the candidate resolved.
+        let own = link.join("admin");
+        assert!(
+            unrestricted_write_refusal(
+                &own,
+                &project.join("admin/notes.md"),
+                "notes.md",
+                &projects
+            )
+            .is_none(),
+            "the admin's own folder stays writable"
+        );
+        assert!(
+            unrestricted_write_refusal(&own, &project.join("shared.md"), "shared.md", &projects)
+                .is_some(),
+            "a sibling of the admin's own folder is still the project's"
+        );
+    }
+
+    /// The project rule end to end, through the store the registry is read
+    /// from: the wiring a pure-helper test cannot reach.
+    #[tokio::test]
+    async fn unrestricted_write_consults_the_registered_projects() {
+        crate::util::test::init_test_stores().await;
+        let (dir, own) = test_workspace().await;
+        let project_dir = TempDir::new().expect("tempdir");
+        let project = tokio::fs::canonicalize(project_dir.path())
+            .await
+            .expect("the project directory resolves");
+        crate::util::test::create_test_workspace(&project.to_string_lossy(), "path-policy-project")
+            .await;
+
+        // A write inside the project is refused, naming the project and the
+        // route, and creates nothing on the way.
+        let inside = project.join("src/main.rs");
+        let err = resolve_write_target(
+            &own,
+            &inside.to_string_lossy(),
+            true,
+            PathAccess::Unrestricted,
+        )
+        .await
+        .expect_err("a write inside a registered project must be refused");
+        assert!(err.to_string().contains("path-policy-project"), "{err}");
+        assert!(err.to_string().contains("manager"), "{err}");
+        assert!(
+            !project.join("src").exists(),
+            "a refused write creates nothing"
+        );
+
+        // What decides is the file the write lands in: a spelling that only
+        // passes through the project on its way out is an ordinary write.
+        let through = project.join("../elsewhere/new.txt");
+        let resolved = resolve_write_target(
+            &own,
+            &through.to_string_lossy(),
+            false,
+            PathAccess::Unrestricted,
+        )
+        .await
+        .expect("a write that only passes through the project lands outside it");
+        assert!(!resolved.starts_with(&project), "{resolved:?}");
+
+        drop((dir, project_dir));
+    }
+
+    /// An unreadable project registry refuses the write with a plain message
+    /// rather than an accident — the accepted price is that the admin's own
+    /// memory is closed with it.
+    #[test]
+    fn an_unreadable_project_registry_refuses_the_write() {
+        let read = Err(anyhow::anyhow!("the workspace store is not open"));
+        let err = registered_projects_from(read, "notes/todo.md")
+            .expect_err("an unreadable registry must refuse the write");
+        let message = err.to_string();
+        assert!(
+            message.starts_with("forbidden: cannot write to notes/todo.md"),
+            "{message}"
+        );
+        assert!(message.contains("cannot be read"), "{message}");
+        assert!(message.contains("retry once"), "{message}");
+    }
+
+    /// The store half of the same rule: the live stores and their tails are
+    /// refused, the copies the service keeps are refused too, and nothing is
+    /// opened to decide any of it.
+    #[test]
+    fn unrestricted_write_refuses_store_files() {
+        let Some(root) = storage_root() else {
+            return;
+        };
+        let own = TempDir::new().expect("tempdir");
+        let own = own.path();
+        let projects: Vec<(String, PathBuf)> = Vec::new();
+
+        for name in [
+            "core.db",
+            "logs.db",
+            "core.db-wal",
+            "logs.db-shm",
+            "Core.db",
+            "LOGS.DB",
+        ] {
+            let candidate = root.join("db").join(name);
+            let err = unrestricted_write_refusal(own, &candidate, name, &projects)
+                .expect("a live store must be refused");
+            assert!(err.to_string().contains("live databases"), "{name}: {err}");
+        }
+
+        for name in [
+            "core.db.quarantine-20260101T101010Z-42",
+            "logs.db.pre-reindex-20260101T101010Z-42",
+            "core.db.rebuild-20260101T101010Z",
+            "Core.db.Quarantine-20260101t101010z-42",
+            "board.db.quarantine-20260101T101010Z-42",
+        ] {
+            let candidate = root.join("db").join(name);
+            let err = unrestricted_write_refusal(own, &candidate, name, &projects)
+                .expect("a copy the service keeps must be refused");
+            assert!(
+                err.to_string().contains("a copy the service keeps"),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    /// A `~` reading, for the admin's Assistant alone: the home directory, bare
+    /// or with a path under it. Every other access keeps the workspace-root
+    /// reading, and `~user` is refused with the way out rather than answered
+    /// with `$HOME/user`.
+    #[tokio::test]
+    async fn tilde_is_the_home_directory_for_the_admin_only() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let home = tokio::fs::canonicalize(&home)
+            .await
+            .expect("the home directory resolves");
+        let (dir, ws) = test_workspace().await;
+
+        assert_eq!(
+            resolve_read_target(&ws, "~", PathAccess::Unrestricted)
+                .await
+                .expect("the admin's `~` is readable"),
+            home,
+            "the admin's bare `~` is the home directory"
+        );
+        assert_eq!(
+            resolve_read_target(&ws, "~", PathAccess::Allowlisted)
+                .await
+                .expect("`~` is the workspace root for every other access"),
+            ws,
+        );
+        assert_eq!(
+            resolve_read_target(&ws, "~/..", PathAccess::Unrestricted)
+                .await
+                .expect("`~/…` reads from the home directory"),
+            home.parent().expect("the home directory has a parent"),
+        );
+
+        // Another user's `~` never becomes `$HOME/user`: it is refused, and the
+        // refusal says how to spell the path instead.
+        for access in [PathAccess::Unrestricted, PathAccess::Allowlisted] {
+            let read = resolve_read_target(&ws, "~other/notes.md", access).await;
+            let err = read.expect_err("`~user` must be refused");
+            if access == PathAccess::Unrestricted {
+                assert!(err.to_string().contains("absolutely"), "{err}");
+            }
+            let err = resolve_write_target(&ws, "~other/notes.md", false, access)
+                .await
+                .expect_err("`~user` must be refused for writes too");
+            if access == PathAccess::Unrestricted {
+                assert!(err.to_string().contains("absolutely"), "{err}");
             }
         }
+
+        drop(dir);
+    }
+
+    /// The admin's write reaches what the frame refuses everyone else (a `..`
+    /// spelling, a database of another product, the admin's own memory),
+    /// creates parents on the way, and leaves nothing behind when it is refused.
+    #[tokio::test]
+    async fn unrestricted_write_reaches_outside_without_leaving_traces() {
+        crate::util::test::init_test_stores().await;
+        let (dir, own) = test_workspace().await;
+        let outside = TempDir::new().expect("tempdir");
+        let outside = tokio::fs::canonicalize(outside.path())
+            .await
+            .expect("the temp dir resolves");
+
+        // A `..` spelling and a brand-new tree outside the workspace.
+        let target = own.join("..").join("elsewhere/deep/new.txt");
+        let resolved = resolve_write_target(
+            &own,
+            &target.to_string_lossy(),
+            true,
+            PathAccess::Unrestricted,
+        )
+        .await
+        .expect("an unrestricted write reaches outside the workspace");
+        assert!(resolved.ends_with("elsewhere/deep/new.txt"), "{resolved:?}");
+        assert!(resolved.is_absolute(), "the `..` was settled: {resolved:?}");
+        tokio::fs::write(&resolved, "hello").await.unwrap();
+
+        // The admin's own workspace and a database of someone else's — the
+        // same format as the product's, and an ordinary file for all that.
+        for path in [own.join("MEMORY.md"), outside.join("user.db")] {
+            let resolved = resolve_write_target(
+                &own,
+                &path.to_string_lossy(),
+                true,
+                PathAccess::Unrestricted,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{} must be writable: {e}", path.display()));
+            tokio::fs::write(&resolved, "written").await.unwrap();
+            assert!(resolved.exists(), "{resolved:?}");
+        }
+
+        drop((dir, outside));
+    }
+
+    /// Every symlink the admin's write meets is settled by the file the write
+    /// would land in: a link into a private-key folder is writable, a `..`
+    /// behind a link follows the target, a dangling link is followed to the file
+    /// it names, and a link that leads to a live store is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_write_settles_every_symlink_by_its_target() {
+        use std::os::unix::fs::symlink;
+        crate::util::test::init_test_stores().await;
+        let (dir, own) = test_workspace().await;
+        let outside = TempDir::new().expect("tempdir");
+        let outside = tokio::fs::canonicalize(outside.path())
+            .await
+            .expect("the temp dir resolves");
+
+        let keys = outside.join("keys");
+        tokio::fs::create_dir_all(&keys).await.unwrap();
+        symlink(&keys, own.join("link-to-keys")).unwrap();
+        let via_link = own.join("link-to-keys/id_rsa");
+        let resolved = resolve_write_target(
+            &own,
+            &via_link.to_string_lossy(),
+            true,
+            PathAccess::Unrestricted,
+        )
+        .await
+        .expect("a symlink into a private-key folder is writable");
+        assert_eq!(resolved, keys.join("id_rsa"));
+        tokio::fs::write(&resolved, "PRIVATE KEY BODY")
+            .await
+            .unwrap();
+
+        // `..` behind a symlinked component is the filesystem's to settle, as it
+        // is the shell's: the write lands beside the link's target, not beside
+        // the link.
+        let through_link = own.join("link-to-keys/../through-link.txt");
+        let resolved = resolve_write_target(
+            &own,
+            &through_link.to_string_lossy(),
+            false,
+            PathAccess::Unrestricted,
+        )
+        .await
+        .expect("a `..` behind a symlinked component is settled by the filesystem");
+        assert_eq!(
+            resolved,
+            outside.join("through-link.txt"),
+            "the `..` is the link target's parent, not the link's"
+        );
+
+        // A link whose target does not exist yet is followed to that target: the
+        // shell would create it through the link, so the write lands there and
+        // the link itself is left alone.
+        let dangling = own.join("not-yet.txt");
+        symlink(outside.join("made-by-link.txt"), &dangling).unwrap();
+        let resolved = resolve_write_target(
+            &own,
+            &dangling.to_string_lossy(),
+            true,
+            PathAccess::Unrestricted,
+        )
+        .await
+        .expect("a dangling link is followed to the file it names");
+        assert_eq!(resolved, outside.join("made-by-link.txt"));
+        // The link is not what gets written: the file the link names is.
+        tokio::fs::write(&resolved, "through the link")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_link(&dangling)
+                .await
+                .expect("the link is still there"),
+            outside.join("made-by-link.txt")
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&dangling).await.unwrap(),
+            "through the link",
+            "reading the link reaches the file the write landed in"
+        );
+
+        // The same link aimed at a live store is refused, and the refusal
+        // creates nothing anywhere on the way.
+        let Some(root) = storage_root() else {
+            return;
+        };
+        let store_dir = root.join("db");
+        let linked_dir = own.join("link-to-store");
+        symlink(&store_dir, &linked_dir).unwrap();
+        let err = resolve_write_target(
+            &own,
+            &linked_dir.join("sub/core.db").to_string_lossy(),
+            true,
+            PathAccess::Unrestricted,
+        )
+        .await
+        .expect_err("a live store is refused through a link too");
+        assert!(err.to_string().contains("live databases"), "{err}");
+        assert!(
+            !store_dir.join("sub").exists(),
+            "a refused write must not create directories"
+        );
+
+        // A link as the final component is the same question: what counts is
+        // the file the write would land in.
+        let file_link = own.join("store-link.db");
+        symlink(store_dir.join("core.db"), &file_link).unwrap();
+        let err = resolve_write_target(
+            &own,
+            &file_link.to_string_lossy(),
+            false,
+            PathAccess::Unrestricted,
+        )
+        .await
+        .expect_err("a link to a live store is refused too");
+        assert!(err.to_string().contains("live databases"), "{err}");
+
+        drop((dir, outside));
     }
 
     // ── Path resolution tests ──────────────────────────────────────────
@@ -1823,7 +2708,7 @@ mod tests {
         let file_path = ws.join("existing.txt");
         tokio::fs::write(&file_path, "hello").await.unwrap();
 
-        let result = resolve_read_target(&ws, "existing.txt", false).await;
+        let result = resolve_read_target(&ws, "existing.txt", PathAccess::Allowlisted).await;
         assert!(
             result.is_ok(),
             "Should resolve existing file: {:?}",
@@ -1846,7 +2731,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = resolve_read_target(&ws, "nested", false).await;
+        let result = resolve_read_target(&ws, "nested", PathAccess::Allowlisted).await;
         assert!(
             result.is_ok(),
             "Should resolve existing directory without trailing slash: {:?}",
@@ -1860,7 +2745,7 @@ mod tests {
     async fn resolve_read_target_file_not_found() {
         let (_tmp, ws) = test_workspace().await;
 
-        let result = resolve_read_target(&ws, "nonexistent.txt", false).await;
+        let result = resolve_read_target(&ws, "nonexistent.txt", PathAccess::Allowlisted).await;
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains("File not found"),
@@ -1882,7 +2767,7 @@ mod tests {
         // Remove search permission from directory so canonicalize can't enter it
         std::fs::set_permissions(&restricted_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let result = resolve_read_target(&ws, "secret/file.txt", false).await;
+        let result = resolve_read_target(&ws, "secret/file.txt", PathAccess::Allowlisted).await;
 
         // Restore permissions so TempDir can clean up
         let _ = std::fs::set_permissions(&restricted_dir, std::fs::Permissions::from_mode(0o755));
@@ -1904,7 +2789,7 @@ mod tests {
         let link = ws.join("link.txt");
         std::os::unix::fs::symlink(&secret, &link).unwrap();
 
-        let result = resolve_read_target(&ws, "link.txt", false).await;
+        let result = resolve_read_target(&ws, "link.txt", PathAccess::Allowlisted).await;
         assert!(result.is_ok(), "Should resolve symlink: {:?}", result.err());
 
         let resolved = result.unwrap();
@@ -1929,7 +2814,7 @@ mod tests {
             .unwrap();
         let spill_str = spill_file.to_string_lossy().to_string();
 
-        let result = resolve_read_target(&ws, &spill_str, false).await;
+        let result = resolve_read_target(&ws, &spill_str, PathAccess::Allowlisted).await;
         let _ = tokio::fs::remove_file(&spill_file).await;
 
         assert!(
@@ -1940,7 +2825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_read_target_strict_rejects_extra_allowed_path() {
+    async fn resolve_read_target_workspace_only_rejects_extra_allowed_path() {
         let tmp = TempDir::new().expect("tempdir");
         let ws = tmp.path().join("ws");
         tokio::fs::create_dir(&ws).await.unwrap();
@@ -1953,24 +2838,25 @@ mod tests {
             .unwrap();
         let spill_str = spill_file.to_string_lossy().to_string();
 
-        // Non-strict read still permits the extra-allowed spill path.
-        let result = resolve_read_target(&ws, &spill_str, false).await;
+        // The general read still permits the extra-allowed spill path.
+        let result = resolve_read_target(&ws, &spill_str, PathAccess::Allowlisted).await;
         assert!(
             result.is_ok(),
-            "non-strict read should allow extra-allowed path: {:?}",
+            "the general read should allow an extra-allowed path: {:?}",
             result.err()
         );
 
-        // Strict read rejects it — the ONLY allowed paths are in-workspace.
-        let result = resolve_read_target(&ws, &spill_str, true).await;
+        // The workspace-only read rejects it — the only allowed paths are
+        // in-workspace.
+        let result = resolve_read_target(&ws, &spill_str, PathAccess::Workspace).await;
         assert!(
             result.is_err(),
-            "strict read must reject an extra-allowed path"
+            "the workspace-only read must reject an extra-allowed path"
         );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("forbidden: cannot read") && err.contains("outside the workspace"),
-            "strict rejection should cite the workspace-only read envelope: {err}"
+            "the workspace-only rejection should cite its envelope: {err}"
         );
 
         let _ = tokio::fs::remove_file(&spill_file).await;
@@ -1989,7 +2875,7 @@ mod tests {
         tokio::fs::write(&file_path, "world").await.unwrap();
 
         // Use the non-canonicalized ws_dir as workspace_root.
-        let result = resolve_read_target(&ws_dir, "hello.txt", false).await;
+        let result = resolve_read_target(&ws_dir, "hello.txt", PathAccess::Allowlisted).await;
         assert!(
             result.is_ok(),
             "Read should succeed even with non-canonicalized root: {:?}",
@@ -2007,7 +2893,8 @@ mod tests {
         let subdir = ws.join("subdir");
         tokio::fs::create_dir(&subdir).await.unwrap();
 
-        let result = resolve_write_target(&ws, "subdir/new_file.rs", false).await;
+        let result =
+            resolve_write_target(&ws, "subdir/new_file.rs", false, PathAccess::Workspace).await;
         assert!(
             result.is_ok(),
             "Should resolve new file in existing dir: {:?}",
@@ -2027,7 +2914,8 @@ mod tests {
     async fn resolve_write_target_new_file_new_dir_with_ensure_parent() {
         let (_tmp, ws) = test_workspace().await;
 
-        let result = resolve_write_target(&ws, "a/b/c/new_file.rs", true).await;
+        let result =
+            resolve_write_target(&ws, "a/b/c/new_file.rs", true, PathAccess::Workspace).await;
         assert!(
             result.is_ok(),
             "Should create parent directories: {:?}",
@@ -2052,7 +2940,13 @@ mod tests {
     async fn resolve_write_target_new_file_new_dir_no_ensure_parent() {
         let (_tmp, ws) = test_workspace().await;
 
-        let result = resolve_write_target(&ws, "nonexistent_dir/new_file.rs", false).await;
+        let result = resolve_write_target(
+            &ws,
+            "nonexistent_dir/new_file.rs",
+            false,
+            PathAccess::Workspace,
+        )
+        .await;
         assert!(result.is_err(), "Should fail when parent doesn't exist");
         let err = result.unwrap_err();
         assert!(
@@ -2070,7 +2964,8 @@ mod tests {
         let link = ws.join("malicious_link.txt");
         std::os::unix::fs::symlink("/etc/passwd", &link).unwrap();
 
-        let result = resolve_write_target(&ws, "malicious_link.txt", false).await;
+        let result =
+            resolve_write_target(&ws, "malicious_link.txt", false, PathAccess::Workspace).await;
         assert!(result.is_err(), "Should refuse to write through symlink");
         let err = result.unwrap_err();
         assert!(
@@ -2084,7 +2979,13 @@ mod tests {
         let (_tmp, ws) = test_workspace().await;
         let outside = PathBuf::from("/tmp/outside_write_test.txt");
 
-        let result = resolve_write_target(&ws, &outside.to_string_lossy(), false).await;
+        let result = resolve_write_target(
+            &ws,
+            &outside.to_string_lossy(),
+            false,
+            PathAccess::Workspace,
+        )
+        .await;
         assert!(result.is_err(), "Should reject write outside workspace");
         let err = result.unwrap_err();
         assert!(
