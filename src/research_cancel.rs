@@ -726,6 +726,7 @@ mod tests {
             &crate::jobs::SpawnChild::Research,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -739,6 +740,7 @@ mod tests {
             "caller-user",
             "telegram",
             &ws.name,
+            None,
         )
         .await;
         // The in-tx gate rolled the completion back: no pending row exists

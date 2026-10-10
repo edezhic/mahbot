@@ -4,7 +4,7 @@
 use iced::Background;
 use iced::Color;
 use iced::border;
-use iced::widget::{container, pick_list, scrollable, toggler};
+use iced::widget::{checkbox, container, pick_list, scrollable, toggler};
 
 use crate::WorkspaceStatus;
 use crate::pipeline::board::TicketPhase;
@@ -181,6 +181,7 @@ pub fn role_icon(role: &crate::Role) -> iced::widget::Text<'static, iced::Theme,
         crate::Role::Reviewer => lucide::file_check(),
         crate::Role::Sanitation => lucide::spray_can(),
         crate::Role::Assistant => lucide::message_square(),
+        crate::Role::Custom => lucide::puzzle(),
     }
 }
 
@@ -877,6 +878,36 @@ pub fn toggler_style(_theme: &iced::Theme, status: toggler::Status) -> toggler::
         text_color: None,
         border_radius: None,
         padding_ratio: 0.1,
+    }
+}
+
+/// Flexoki-dark themed style for [`fn@checkbox`] widgets.
+#[must_use]
+pub fn checkbox_style(_theme: &iced::Theme, status: checkbox::Status) -> checkbox::Style {
+    let (background, icon, border) = match status {
+        checkbox::Status::Active { is_checked: true }
+        | checkbox::Status::Hovered { is_checked: true } => (ACCENT, BG_BASE, None),
+        checkbox::Status::Active { is_checked: false } => (BG_ELEVATED, TEXT_MUTED, Some(BORDER)),
+        checkbox::Status::Hovered { is_checked: false } => {
+            (BG_ELEVATED, TEXT_SECONDARY, Some(BORDER_STRONG))
+        }
+        checkbox::Status::Disabled { is_checked: true } => (ACCENT_DIM, BG_BASE, None),
+        checkbox::Status::Disabled { is_checked: false } => (BG_SURFACE, TEXT_FAINT, Some(BORDER)),
+    };
+    // A marked box is filled outright; an empty one is drawn by its border.
+    let (border_color, border_width) = match border {
+        Some(color) => (color, 1.0),
+        None => (Color::TRANSPARENT, 0.0),
+    };
+    checkbox::Style {
+        background: Background::Color(background),
+        icon_color: icon,
+        border: iced::Border {
+            color: border_color,
+            width: border_width,
+            radius: 4.0.into(),
+        },
+        text_color: Some(TEXT_PRIMARY),
     }
 }
 

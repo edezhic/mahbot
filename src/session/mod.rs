@@ -144,8 +144,9 @@ crate::columns! {
     }
 }
 
-// Session list with metadata (7-column SELECT: sm.agent_id, sm.last_activity,
-// sm.message_count, sm.token_length, sm.role, sm.user_name, sm.workspace_name).
+// Session list with metadata (10-column SELECT: sm.agent_id, sm.last_activity,
+// sm.message_count, sm.token_length, sm.role, sm.user_name, sm.workspace_name,
+// sm.custom_role, sm.custom_identifier, sm.launch_stopped).
 // Counts are read from the denormalized metadata column — NOT from a JOIN over
 // the `sessions` message table (the list query runs on Sessions-page navigation
 // and from the dead-session recovery poller; scanning the full message table
@@ -155,13 +156,16 @@ crate::columns! {
 // predate the metadata column default to 0. Schema: `db/migrations.rs`.
 crate::columns! {
     SESSION_LIST_COLUMNS [SL] {
-        AGENT_ID       => "sm.agent_id",
-        LAST_ACTIVITY  => "sm.last_activity",
-        MESSAGE_COUNT  => "sm.message_count",
-        TOKEN_LENGTH   => "sm.token_length",
-        ROLE           => "sm.role",
-        USER_NAME      => "sm.user_name",
-        WORKSPACE_NAME => "sm.workspace_name",
+        AGENT_ID          => "sm.agent_id",
+        LAST_ACTIVITY     => "sm.last_activity",
+        MESSAGE_COUNT     => "sm.message_count",
+        TOKEN_LENGTH      => "sm.token_length",
+        ROLE              => "sm.role",
+        USER_NAME         => "sm.user_name",
+        WORKSPACE_NAME    => "sm.workspace_name",
+        CUSTOM_ROLE       => "sm.custom_role",
+        CUSTOM_IDENTIFIER => "sm.custom_identifier",
+        LAUNCH_STOPPED    => "sm.launch_stopped",
     }
 }
 
@@ -179,6 +183,10 @@ crate::columns! {
 ///   prefix (see [`safe_user_segment`]).
 /// - Manager: `manager_{ws_name}` — the Manager session carries both chat conversation
 ///   and notification context and must never be added here.
+/// - A custom role's continuable branch: `role_{name}` / `role_{name}:{identifier}`
+///   ([`custom_role_agent_id`]) — an administrator-defined conversation the user
+///   comes back to, so it persists like a direct one. Only its one-off siblings
+///   (`rolerun_`, [`custom_role_run_agent_id`]) are transient.
 ///
 /// If a new agent role is added that can talk to users directly, its agent ID prefix
 /// must also be excluded from this list.
@@ -189,7 +197,30 @@ const TRANSIENT_AGENT_ID_PREFIXES: &[&str] = &[
     "cleanup_",
     "maintainer_",
     "discovery_",
+    "rolerun_",
 ];
+
+/// Agent-id prefix of a custom role's continuable branch — `role_{name}` (the
+/// record's default branch) or `role_{name}:{identifier}` (a named branch). The
+/// `:` separator is what makes the two forms injective: names and identifiers
+/// may both contain `_`, so a `_` separator would alias `(a_b, None)` with
+/// `(a, Some(b))` — the `personal:{user}` workspace key already establishes `:`
+/// in agent ids.
+///
+/// Deliberately NOT in [`TRANSIENT_AGENT_ID_PREFIXES`]: the branch is a
+/// user-facing conversation the administrator defined and comes back to, so it
+/// is never TTL-purged and is eligible for dead-session recovery. It is in the
+/// wider [`reserved_agent_id_prefixes`] union, so no direct user id can start
+/// with it (a user literally named `role` is escaped to `user_role`).
+pub(crate) const CUSTOM_ROLE_AGENT_ID_PREFIX: &str = "role_";
+
+/// Agent-id prefix of a custom role's ONE-OFF run — `rolerun_{name}:{suffix}`.
+/// The same `:` separator, and the same injectivity rule, as
+/// [`CUSTOM_ROLE_AGENT_ID_PREFIX`] — here the [`crate::generate_suffix`] NanoID
+/// suffix itself may contain `_`, which is exactly why that rule applies too.
+/// Registered in [`TRANSIENT_AGENT_ID_PREFIXES`] so it expires with the
+/// ordinary session lifetime.
+pub(crate) const CUSTOM_ROLE_RUN_AGENT_ID_PREFIX: &str = "rolerun_";
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionMetadata {
@@ -205,6 +236,14 @@ pub(crate) struct SessionMetadata {
     pub role: Option<String>,
     pub user_name: Option<String>,
     pub workspace_name: Option<String>,
+    /// The custom role this session belongs to, when it is a custom-role
+    /// session.
+    pub custom_role: Option<String>,
+    /// The named branch this custom-role session continues, when the branch
+    /// was named.
+    pub custom_identifier: Option<String>,
+    /// Whether the launch was stopped before it produced anything.
+    pub launch_stopped: bool,
 }
 
 /// Context data stored alongside a session for recovery purposes.
@@ -229,8 +268,15 @@ pub(crate) struct SessionContext {
     pub workspace_name: String,
     /// Agent role (e.g. `"engineer"`, `"analyst"`, `"reviewer"`).
     pub role: String,
+    /// The custom role this session belongs to, when it is a custom-role
+    /// session.
+    pub custom_role: Option<String>,
+    /// The named branch the custom-role session continues, when the branch was
+    /// named.
+    pub custom_identifier: Option<String>,
 }
 
+#[expect(clippy::too_many_arguments)]
 fn session_metadata_from_row(
     agent_id: &str,
     activity_str: &str,
@@ -239,6 +285,9 @@ fn session_metadata_from_row(
     role: Option<String>,
     user_name: Option<String>,
     workspace_name: Option<String>,
+    custom_role: Option<String>,
+    custom_identifier: Option<String>,
+    launch_stopped: Option<String>,
 ) -> Result<SessionMetadata> {
     let last_activity = db::parse_utc_timestamp(activity_str).with_context(|| {
         format!("invalid last_activity {activity_str:?} for session {agent_id}")
@@ -251,6 +300,9 @@ fn session_metadata_from_row(
         role,
         user_name,
         workspace_name,
+        custom_role,
+        custom_identifier,
+        launch_stopped: launch_stopped.is_some_and(|flag| flag == "1"),
     })
 }
 
@@ -453,6 +505,9 @@ fn session_metadata_row(row: &Row) -> Result<SessionMetadata> {
         row.get::<Option<String>>(COL_SL_ROLE)?,
         row.get::<Option<String>>(COL_SL_USER_NAME)?,
         row.get::<Option<String>>(COL_SL_WORKSPACE_NAME)?,
+        row.get::<Option<String>>(COL_SL_CUSTOM_ROLE)?,
+        row.get::<Option<String>>(COL_SL_CUSTOM_IDENTIFIER)?,
+        row.get::<Option<String>>(COL_SL_LAUNCH_STOPPED)?,
     )
 }
 
@@ -504,6 +559,10 @@ enum MetadataColumn {
     ActiveModels,
     TokenLength,
     SleepEnded,
+    CustomRole,
+    CustomIdentifier,
+    LaunchStopped,
+    WorkspaceName,
 }
 
 impl MetadataColumn {
@@ -512,6 +571,10 @@ impl MetadataColumn {
             Self::ActiveModels => "active_models",
             Self::TokenLength => "token_length",
             Self::SleepEnded => "sleep_ended",
+            Self::CustomRole => "custom_role",
+            Self::CustomIdentifier => "custom_identifier",
+            Self::LaunchStopped => "launch_stopped",
+            Self::WorkspaceName => "workspace_name",
         }
     }
 }
@@ -738,6 +801,27 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Rewrite the content of the session's FIRST message row for the agent —
+    /// the fixed system block a custom-role session always opens with (the
+    /// first turn writes it there, and every compaction puts it back at the
+    /// head). A single-row positional UPDATE targeting the `MIN(id)` row.
+    pub(crate) async fn rewrite_first_message(&self, agent_id: &str, content: &str) -> Result<()> {
+        let tx = self.conn.begin_tx().await?;
+        let changed = tx
+            .execute(
+                "UPDATE sessions SET content = ?1 WHERE id = (
+                    SELECT MIN(id) FROM sessions WHERE agent_id = ?2
+                )",
+                params![content, agent_id],
+            )
+            .await?;
+        tx.commit().await?;
+        if changed == 0 {
+            anyhow::bail!("no message row to rewrite for agent {agent_id}");
+        }
+        Ok(())
+    }
+
     /// Test-only thin wrapper: begin a transaction, run the tx-core settle, and
     /// commit. Production uses [`Self::settle_tool_results_tx`] inside the
     /// agent's atomic settle+terminalize transaction.
@@ -898,6 +982,13 @@ impl SessionStore {
     }
 
     pub(crate) async fn delete(&self, agent_id: &str) -> Result<bool> {
+        // Every deletion path (the `/clear` command, the Sessions page, the
+        // maintainer's self-cleanup) goes through here, so this is where a
+        // launch folder's search engine — held for the session's lifetime and
+        // referenced by nothing else (see `search_engine::release_path_named_engine`)
+        // is released. Read the recorded folder before the rows go; release it
+        // only for a real removal.
+        let workspace = self.session_workspace_name(agent_id).await;
         let tx = self.conn.begin_tx().await?;
         let deleted = tx
             .execute(
@@ -911,6 +1002,11 @@ impl SessionStore {
         )
         .await?;
         tx.commit().await?;
+        if deleted > 0
+            && let Some(workspace) = workspace
+        {
+            crate::search_engine::release_path_named_engine(&workspace);
+        }
         Ok(deleted > 0)
     }
 
@@ -1037,7 +1133,8 @@ impl SessionStore {
         let rows = self
             .conn
             .query(
-                "SELECT channel, user_name, workspace_name, role FROM session_metadata WHERE agent_id = ?1",
+                "SELECT channel, user_name, workspace_name, role, custom_role, custom_identifier \
+                 FROM session_metadata WHERE agent_id = ?1",
                 params![agent_id],
             )
             .await
@@ -1047,11 +1144,15 @@ impl SessionStore {
             let user_name: Option<String> = row.get(1).ok();
             let workspace_name: Option<String> = row.get(2).ok();
             let role: Option<String> = row.get(3).ok();
+            let custom_role: Option<String> = row.get(4).ok().flatten();
+            let custom_identifier: Option<String> = row.get(5).ok().flatten();
             Some(SessionContext {
                 channel: channel?,
                 user_name: user_name?,
                 workspace_name: workspace_name?,
                 role: role?,
+                custom_role,
+                custom_identifier,
             })
         })
     }
@@ -1186,6 +1287,102 @@ impl SessionStore {
         .await
         .is_some_and(|flag| flag == "1")
     }
+
+    /// Record the custom role this session belongs to — the record's name and
+    /// the named branch it continues, if any — so the session can be resumed as
+    /// the same role without parsing the agent ID. Both columns are written in
+    /// ONE upsert, on every appending turn of a custom-role session, so a single
+    /// failed write cannot leave the branch without a recorded role.
+    pub(crate) async fn set_custom_role(
+        &self,
+        agent_id: &str,
+        name: &str,
+        identifier: Option<&str>,
+    ) -> Result<()> {
+        let now = db::now();
+        let created_at = now.clone();
+        let role_col = MetadataColumn::CustomRole.as_str();
+        let id_col = MetadataColumn::CustomIdentifier.as_str();
+        self.conn
+            .upsert_row(
+                &format!(
+                    "UPDATE session_metadata SET {role_col} = ?1, {id_col} = ?2 \
+                     WHERE agent_id = ?3"
+                ),
+                || params![name, identifier, agent_id],
+                &format!(
+                    "INSERT INTO session_metadata \
+                     (agent_id, last_activity, {role_col}, {id_col}, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT(agent_id) DO NOTHING"
+                ),
+                params![
+                    agent_id,
+                    now.as_str(),
+                    name,
+                    identifier,
+                    created_at.as_str()
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Persist the launch-stopped marker (`"1"`) or clear it (`"0"`) for a
+    /// custom-role session whose launch was stopped before it produced anything.
+    pub(crate) async fn set_launch_stopped(&self, agent_id: &str, stopped: bool) -> Result<()> {
+        let flag = if stopped { "1" } else { "0" };
+        self.set_metadata_value(
+            agent_id,
+            MetadataColumn::LaunchStopped,
+            db::Value::Text(flag.into()),
+        )
+        .await
+    }
+
+    /// Whether a custom-role session's launch was stopped before it produced
+    /// anything.
+    pub(crate) async fn get_launch_stopped(&self, agent_id: &str) -> bool {
+        self.get_metadata_value(
+            agent_id,
+            MetadataColumn::LaunchStopped,
+            "Failed to read launch-stopped flag",
+            |row| row.get::<Option<String>>(0),
+        )
+        .await
+        .is_some_and(|flag| flag == "1")
+    }
+
+    /// The workspace address recorded for a session, if any — used to release a
+    /// stopped custom-role branch's launch-folder engine. Best-effort: a failed
+    /// read returns `None` (the engine simply stays registered).
+    pub(crate) async fn session_workspace_name(&self, agent_id: &str) -> Option<String> {
+        self.get_metadata_value(
+            agent_id,
+            MetadataColumn::WorkspaceName,
+            "Failed to read the session's recorded workspace name",
+            |row| row.get::<Option<String>>(0),
+        )
+        .await
+    }
+
+    /// The branch list of one custom role: every session (`agent_id`) whose
+    /// metadata records `custom_role = name`. Used by
+    /// [`crate::custom_role::delete`] to stop them all.
+    pub(crate) async fn custom_role_sessions(&self, name: &str) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT agent_id FROM session_metadata WHERE custom_role = ?1",
+                params![name],
+            )
+            .await?;
+        let mut agent_ids = Vec::with_capacity(rows.len());
+        for row in &rows {
+            agent_ids.push(row.get::<String>(0)?);
+        }
+        Ok(agent_ids)
+    }
 }
 
 /// Delete all transient (background-only) sessions whose `last_activity` is older than
@@ -1195,6 +1392,9 @@ impl SessionStore {
 /// `TRANSIENT_AGENT_ID_PREFIXES`.
 ///
 /// Both `sessions` and `session_metadata` tables are cleaned up in a single transaction.
+/// The launch folders of the purged rows are released with them — this is where a
+/// one-off custom-role run's search engine dies (see
+/// [`crate::search_engine::release_path_named_engine`]).
 pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
     let session_store = store();
     let tx = session_store.conn.begin_tx().await?;
@@ -1224,6 +1424,20 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
          AND agent_id NOT IN (SELECT agent_id FROM agents)"
     );
 
+    // The launch folders of the rows about to go: a one-off custom-role run's
+    // engine is held for the run and referenced by nothing else (see
+    // `search_engine::release_path_named_engine`), and this bulk purge is the one
+    // path that ends such a session without going through `delete`.
+    let purged_folders: Vec<String> = tx
+        .query(
+            &format!("SELECT workspace_name FROM session_metadata WHERE {safety_predicate}"),
+            build_params.clone(),
+        )
+        .await?
+        .iter()
+        .filter_map(|row| row.get::<Option<String>>(0).ok().flatten())
+        .collect();
+
     tx.execute(
         &format!(
             "DELETE FROM sessions WHERE agent_id IN ( \
@@ -1243,19 +1457,36 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
 
     tx.commit().await?;
 
+    // After the commit: the purged sessions are gone, so the launch folders they
+    // named are no longer referenced by anything.
+    for workspace in purged_folders {
+        crate::search_engine::release_path_named_engine(&workspace);
+    }
+
     Ok(deleted)
 }
 
-/// Reserved agent-ID prefix union: `manager_` plus every
+/// The prefixes of every non-user-facing agent id: `manager_` plus every
 /// [`TRANSIENT_AGENT_ID_PREFIXES`] entry.
 ///
-/// These identify non-user-facing session keys (Manager / transient /
-/// background). The dead-session poller excludes the whole union, while
-/// [`cleanup_old_transient_sessions`] purges only the transient entries
+/// These identify session keys a user never talks to directly (Manager /
+/// transient / background). The dead-session poller excludes this whole union,
+/// while [`cleanup_old_transient_sessions`] purges only the transient entries
 /// (`manager_` is intentionally excluded there). Both match via SQL
 /// `LIKE 'prefix_%'`, which Turso applies case-insensitively for ASCII.
-fn reserved_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
+pub(crate) fn non_user_facing_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
     std::iter::once("manager_").chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
+}
+
+/// The union a **user-facing direct agent id** must never start with: every
+/// non-user-facing prefix ([`non_user_facing_agent_id_prefixes`]) plus
+/// [`CUSTOM_ROLE_AGENT_ID_PREFIX`], which a direct id must also not shadow.
+///
+/// A real user whose name collides with any of these is escaped with a `user_`
+/// prefix by [`safe_user_segment`] — so a user literally named `role` becomes
+/// `user_role`, protecting the start of a custom-role address.
+pub(crate) fn reserved_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
+    non_user_facing_agent_id_prefixes().chain(std::iter::once(CUSTOM_ROLE_AGENT_ID_PREFIX))
 }
 
 /// Case-insensitive (ASCII) [`str::starts_with`], matching Turso's `LIKE`
@@ -1411,6 +1642,28 @@ pub(crate) fn resolve_agent_id(user_name: &str, role: &str, ws_name: &str) -> St
     }
 }
 
+/// The agent address of `user_name`'s Assistant session.
+///
+/// The single source of the owner's Assistant address — used by alarm arming
+/// and by notices addressed to the assistant, never re-derived ad hoc.
+#[must_use]
+pub(crate) fn assistant_agent_id(user_name: &str) -> String {
+    resolve_agent_id(
+        user_name,
+        crate::Role::Assistant.as_str(),
+        &crate::users::personal_workspace_name(user_name),
+    )
+}
+
+/// Whether `agent_id` addresses a custom-role session: a continuable branch
+/// ([`CUSTOM_ROLE_AGENT_ID_PREFIX`]) or a one-off run
+/// ([`CUSTOM_ROLE_RUN_AGENT_ID_PREFIX`]).
+#[must_use]
+pub(crate) fn is_custom_role_agent_id(agent_id: &str) -> bool {
+    agent_id.starts_with(CUSTOM_ROLE_AGENT_ID_PREFIX)
+        || agent_id.starts_with(CUSTOM_ROLE_RUN_AGENT_ID_PREFIX)
+}
+
 /// Clear the session for a user/role/workspace, returning the confirmation
 /// message. Fail-closed: the session's unfinished sync jobs are abandoned
 /// FIRST, and a failed abandon aborts the clear so the caller can surface the
@@ -1475,6 +1728,52 @@ pub(crate) fn research_agent_id(ws_name: &str, label: &str) -> String {
 #[must_use]
 pub(crate) fn discovery_agent_id(ws_name: &str, role: &str) -> String {
     transient_agent_id("discovery_", ws_name, role)
+}
+
+/// Construct the agent ID of a custom role's continuable branch.
+///
+/// Format: `role_{name}` for the record's default branch, or
+/// `role_{name}:{identifier}` for a named branch. Deterministic, so the next
+/// message on the same branch resumes the same session; the branch persists
+/// like a direct conversation (see [`CUSTOM_ROLE_AGENT_ID_PREFIX`]).
+#[must_use]
+pub(crate) fn custom_role_agent_id(name: &str, identifier: Option<&str>) -> String {
+    match identifier {
+        Some(identifier) => format!("{CUSTOM_ROLE_AGENT_ID_PREFIX}{name}:{identifier}"),
+        None => format!("{CUSTOM_ROLE_AGENT_ID_PREFIX}{name}"),
+    }
+}
+
+/// Construct the agent ID of a custom role's ONE-OFF run.
+///
+/// Format: `rolerun_{name}:{suffix}` — fresh per launch and registered as
+/// transient (see [`CUSTOM_ROLE_RUN_AGENT_ID_PREFIX`]).
+#[must_use]
+pub(crate) fn custom_role_run_agent_id(name: &str) -> String {
+    format!(
+        "{CUSTOM_ROLE_RUN_AGENT_ID_PREFIX}{name}:{}",
+        crate::generate_suffix()
+    )
+}
+
+/// Whether a custom role's `name` may not be used: it IS a built-in
+/// agent-address namespace word, or it begins that namespace's address family
+/// (the namespace prefix including its `_`), so the role's id
+/// ([`custom_role_agent_id`] / [`custom_role_run_agent_id`]) cannot read as a
+/// built-in one.
+///
+/// The `_` is part of an address, not the SQL `LIKE` wildcard the user-name
+/// escaper ([`user_segment_collides`]) must defend against: `ticket`, `role`
+/// and the `ticket_*` / `role_*` families are refused, while `ticketx`,
+/// `rolex` and `roleplay` shadow nothing and are allowed.
+#[must_use]
+pub(crate) fn custom_role_name_is_reserved(name: &str) -> bool {
+    non_user_facing_agent_id_prefixes()
+        .chain([CUSTOM_ROLE_AGENT_ID_PREFIX, CUSTOM_ROLE_RUN_AGENT_ID_PREFIX])
+        .any(|prefix| {
+            let word = prefix.trim_end_matches('_');
+            name.eq_ignore_ascii_case(word) || starts_with_ignore_ascii_case(name, prefix)
+        })
 }
 
 // ── Existing tests ──────────────────────────────────────────────
@@ -1749,6 +2048,7 @@ mod tests {
             &[],
             &crate::jobs::SpawnChild::Analyze,
             Some(&agent_id),
+            None,
             None,
         )
         .await
@@ -2118,7 +2418,8 @@ mod tests {
         let (store, _dir) = crate::open_test_store!(crate::session::SessionStore, "session");
 
         // Direct session plus one session per excluded prefix — the union of
-        // `manager_` and [`TRANSIENT_AGENT_ID_PREFIXES`].
+        // `manager_` and [`TRANSIENT_AGENT_ID_PREFIXES`], plus the custom-role
+        // continuable `role_` branch the wider reserved set adds.
         let direct_id = unique_key();
         let excluded_prefixes: Vec<&str> = reserved_agent_id_prefixes().collect();
         let prefixed_ids: Vec<String> = excluded_prefixes
@@ -2661,6 +2962,26 @@ mod transient_prefix_tests {
             "discovery_",
             "discovery_agent_id('ws', 'analyst')",
         );
+        assert_transient_key(
+            &custom_role_run_agent_id("ws"),
+            "rolerun_",
+            "custom_role_run_agent_id('ws')",
+        );
+    }
+
+    /// A one-off run's address must keep its role name recoverable: with a `_`
+    /// separator, a role named `a_b` and the NanoID suffix's own `_` would make
+    /// role `a_b` + suffix `c` and role `a` + suffix `b_c` one identical id.
+    #[test]
+    fn one_off_run_address_separates_the_name_from_its_suffix() {
+        let id = custom_role_run_agent_id("a_b");
+        let (name, suffix) = id
+            .strip_prefix(CUSTOM_ROLE_RUN_AGENT_ID_PREFIX)
+            .expect("the one-off prefix")
+            .split_once(':')
+            .expect("a `:` between the name and the generated suffix");
+        assert_eq!(name, "a_b");
+        assert!(!suffix.is_empty(), "the suffix must survive the separator");
     }
 
     #[test]

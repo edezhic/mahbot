@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::Workspace;
-use crate::alarms::{Trigger, add_alarm, format_fire_time, list_alarms, remove_alarm};
+use crate::alarms::{AlarmTarget, Trigger, add_alarm, format_fire_time, list_alarms, remove_alarm};
 use crate::tools::Tool;
 
 /// The calling Assistant's personal-session identity: the agent id plus the
@@ -79,6 +79,27 @@ impl Tool for AddAlarmTool {
                 "required": ["tool"]
             }),
         );
+        properties.insert(
+            "role".to_string(),
+            json!({
+                "type": "string",
+                "description": "Wake this custom role instead of the assistant; the role's name"
+            }),
+        );
+        properties.insert(
+            "identifier".to_string(),
+            json!({
+                "type": "string",
+                "description": "Optional branch identifier for the role; omit for the role's default behaviour"
+            }),
+        );
+        properties.insert(
+            "workspace".to_string(),
+            json!({
+                "type": "string",
+                "description": "Optional folder the role works in — a registered workspace name or an absolute path; omit for your own personal folder"
+            }),
+        );
         super::tool_params_schema(&json!(properties), &["text"])
     }
 
@@ -97,6 +118,9 @@ impl Tool for AddAlarmTool {
         let fire_at = super::get_opt_str(&args, "fire_at");
         let interval_seconds = super::get_opt_u64(&args, "interval_seconds")?;
         let trigger = read_trigger(&args, &ident.user_name).await?;
+        let target = read_target(&args)?;
+        // `add_alarm` resolves the owner's assistant session itself for a
+        // custom-role caller — the raw agent id is passed through.
         let alarm = add_alarm(
             &ident.agent_id,
             &ident.user_name,
@@ -104,6 +128,7 @@ impl Tool for AddAlarmTool {
             fire_at,
             interval_seconds,
             trigger,
+            target,
         )
         .await?;
         let display = format_fire_time(&alarm.next_fire_at)?;
@@ -117,8 +142,38 @@ impl Tool for AddAlarmTool {
         if let Some(trigger) = &alarm.trigger {
             let _ = write!(base, "\nTrigger: {}", trigger.render());
         }
+        if let Some(target) = alarm.role_target() {
+            let _ = write!(base, "\n{target}");
+        }
         Ok(base)
     }
+}
+
+/// Read the optional custom-role target from the call's `role`, `identifier`
+/// and `workspace` parameters. An empty/whitespace value counts as absent;
+/// `identifier`/`workspace` given without a `role` are a caller error. The
+/// authority check (only the admin may address a role) lives in [`add_alarm`],
+/// so the value is passed through as supplied.
+fn read_target(args: &serde_json::Value) -> Result<Option<AlarmTarget>> {
+    let normalized = |key: &str| {
+        super::get_opt_str(args, key)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let Some(role) = normalized("role") else {
+        anyhow::ensure!(
+            normalized("identifier").is_none() && normalized("workspace").is_none(),
+            "usage: `identifier` and `workspace` only apply to an alarm addressed to a custom \
+             role — pass `role` too"
+        );
+        return Ok(None);
+    };
+    Ok(Some(AlarmTarget {
+        role,
+        identifier: normalized("identifier"),
+        workspace: normalized("workspace"),
+    }))
 }
 
 /// Read and validate the optional `trigger` parameter for `caller`: the named
@@ -167,7 +222,8 @@ impl Tool for ListAlarmsTool {
     }
 
     async fn execute(&self, _ws: &Workspace, _args: serde_json::Value) -> Result<String> {
-        let session_id = identity()?.agent_id;
+        let ident = identity()?;
+        let session_id = crate::alarms::owner_alarm_session(&ident.agent_id, &ident.user_name);
         let alarms = list_alarms(&session_id).await?;
         if alarms.is_empty() {
             return Ok("(no active alarms)".to_string());
@@ -175,26 +231,18 @@ impl Tool for ListAlarmsTool {
         let mut out = String::new();
         for alarm in alarms {
             let display = format_fire_time(&alarm.next_fire_at)?;
-            match &alarm.trigger {
-                Some(trigger) => {
-                    let _ = writeln!(
-                        out,
-                        "- {}, {}, {}, next fire: {}, trigger: {}",
-                        alarm.id,
-                        alarm.kind,
-                        alarm.text,
-                        display,
-                        trigger.render()
-                    );
-                }
-                None => {
-                    let _ = writeln!(
-                        out,
-                        "- {}, {}, {}, next fire: {}",
-                        alarm.id, alarm.kind, alarm.text, display
-                    );
-                }
+            let _ = write!(
+                out,
+                "- {}, {}, {}, next fire: {}",
+                alarm.id, alarm.kind, alarm.text, display
+            );
+            if let Some(target) = alarm.role_target() {
+                let _ = write!(out, ", {target}");
             }
+            if let Some(trigger) = &alarm.trigger {
+                let _ = write!(out, ", trigger: {}", trigger.render());
+            }
+            out.push('\n');
         }
         Ok(out.trim().to_string())
     }
@@ -221,7 +269,8 @@ impl Tool for RemoveAlarmTool {
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        let session_id = identity()?.agent_id;
+        let ident = identity()?;
+        let session_id = crate::alarms::owner_alarm_session(&ident.agent_id, &ident.user_name);
         let id = super::get_str(&args, "id")?;
         match remove_alarm(&session_id, id).await? {
             Some(alarm) => {
@@ -336,5 +385,47 @@ mod tests {
         arm("arming_grantee", arming)
             .await
             .expect("a guest granted the tool arms its trigger");
+    }
+
+    /// The role-target parameters are passed through to `add_alarm`: a branch
+    /// without a role is a usage error, and an addressing call names the role
+    /// in its confirmation.
+    #[tokio::test]
+    async fn arming_passes_the_role_target_through() {
+        crate::util::test::init_management_test_stores().await;
+        let (text, fire) = ("wake the role", "2099-01-01T00:00:00Z");
+
+        let err = arm(
+            "admin",
+            json!({ "text": text, "fire_at": fire, "identifier": "daily" }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.starts_with("usage: "), "got: {err}");
+
+        crate::custom_role::create(
+            "tool_role_probe",
+            "do it",
+            &[],
+            crate::custom_role::CustomRoleBehavior::Continuous,
+        )
+        .await
+        .unwrap();
+        let out = arm(
+            "admin",
+            json!({
+                "text": text,
+                "fire_at": fire,
+                "role": "tool_role_probe",
+                "identifier": "daily",
+            }),
+        )
+        .await
+        .expect("the admin arms a role-faced alarm");
+        assert!(
+            out.contains("addressed to custom role \"tool_role_probe\" (branch \"daily\")"),
+            "got: {out}"
+        );
     }
 }

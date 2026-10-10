@@ -35,10 +35,11 @@
 //! mechanism from filesystem reclamation). The agent's final response is
 //! logged for observability; there is no report archive.
 //!
-//! ## Assistant media sweep
+//! ## Media sweep
 //!
 //! `sweep_media` deletes generated/uploads files in userspaces that no
-//! Assistant session mentions (keep-detection is strictly session-based).
+//! media-keeping session (the Assistant's or a custom role's) mentions
+//! (keep-detection is strictly session-based).
 //! It is orthogonal to research-run cleanup and stays in the periodic
 //! cleanup loop.
 
@@ -60,8 +61,9 @@ pub(crate) const COMMAND_DUMP_CAP_BYTES: usize = 10 * 1024 * 1024;
 /// the cancel sweep spares a folder iff this file exists (see
 /// [`command_dump_exists`]) and the cleanup prompt receives its path.
 pub(crate) const COMMAND_DUMP_FILE: &str = "commands.dump";
-/// Per-tick assistant-session scan budget (bytes of session content). Typical
-/// bases (~3 MB) fit in one tick; pathological growth is cut across ticks.
+/// Per-tick media-keeping-session scan budget (bytes of session content).
+/// Typical bases (~3 MB) fit in one tick; pathological growth is cut across
+/// ticks.
 const MEDIA_SCAN_BUDGET_BYTES: usize = 10 * 1024 * 1024;
 /// Video extensions for case-insensitive keep-matching.
 const MEDIA_VIDEO_EXTS: &[&str] = &[".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"];
@@ -504,6 +506,7 @@ async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Result<Option<S
         &crate::jobs::SpawnChild::ResearchCleanup,
         None,
         None,
+        None,
     )
     .await
     .map_err(|e| {
@@ -765,18 +768,21 @@ async fn list_files(dir: &Path) -> Vec<PathBuf> {
     .unwrap_or_default()
 }
 
-/// Assistant sessions for a user: `session_metadata` rows with role=assistant
-/// and the user's name (agent id + last_activity, most-recent-first — the
-/// activity doubles as the content-change signal for the scan cursor). A DB
-/// error is returned (NOT swallowed as empty — an empty list would trivially
-/// satisfy full coverage and trigger mass deletion against an empty
-/// keep-set).
-async fn assistant_session_ids(user_name: &str) -> anyhow::Result<Vec<(String, String)>> {
+/// Media-keeping sessions for a user: the `session_metadata` rows (agent id +
+/// `last_activity`, most-recent-first — the activity doubles as the
+/// content-change signal for the scan cursor) whose role can generate or
+/// upload media into the user's own folder — `assistant` and `custom`. A
+/// custom role launched in the owner's personal folder writes its media into
+/// that folder's `generated`/`uploads` tree, so its sessions must keep those
+/// files alive exactly like the Assistant's. A DB error is returned (NOT
+/// swallowed as empty — an empty list would trivially satisfy full coverage
+/// and trigger mass deletion against an empty keep-set).
+async fn media_keeping_session_ids(user_name: &str) -> anyhow::Result<Vec<(String, String)>> {
     let rows = crate::session::store()
         .conn
         .query(
-            "SELECT agent_id, last_activity FROM session_metadata WHERE role = 'assistant' \
-             AND user_name = ?1 ORDER BY last_activity DESC",
+            "SELECT agent_id, last_activity FROM session_metadata \
+             WHERE role IN ('assistant', 'custom') AND user_name = ?1 ORDER BY last_activity DESC",
             params![user_name],
         )
         .await?;
@@ -793,13 +799,13 @@ async fn assistant_session_ids(user_name: &str) -> anyhow::Result<Vec<(String, S
     Ok(out)
 }
 
-/// One assistant session's message content (fail-open only via the `Result` —
-/// a DB read failure must not masquerade as an empty session: the sweep would
+/// One media-keeping session's message content (fail-open only via the `Result`
+/// — a DB read failure must not masquerade as an empty session: the sweep would
 /// advance coverage and delete files the unread session mentions). Fail
 /// CLOSED on a malformed row (same deletion-safety class as
-/// [`assistant_session_ids`]: a row failing to decode loses its mentions from
-/// the keep-set while the session still counts as scanned).
-async fn assistant_session_content(agent_id: &str) -> anyhow::Result<String> {
+/// [`media_keeping_session_ids`]: a row failing to decode loses its mentions
+/// from the keep-set while the session still counts as scanned).
+async fn media_keeping_session_content(agent_id: &str) -> anyhow::Result<String> {
     let rows = crate::session::store()
         .conn
         .query(
@@ -906,10 +912,10 @@ async fn sweep_user_media(
 ) -> u64 {
     let cursor = cursors.entry(user_name.to_string()).or_default();
     // Fail-open on DB trouble: a transient read failure must not be confused
-    // with "no assistant sessions" — the latter trivially satisfies coverage
-    // and would delete EVERY file. Skip the user for this tick instead.
-    let Ok(session_ids) = assistant_session_ids(user_name).await else {
-        tracing::warn!(user = %user_name, "Media sweep: assistant-session query failed — user skipped for this tick");
+    // with "no media-keeping sessions" — the latter trivially satisfies
+    // coverage and would delete EVERY file. Skip the user for this tick instead.
+    let Ok(session_ids) = media_keeping_session_ids(user_name).await else {
+        tracing::warn!(user = %user_name, "Media sweep: session query failed — user skipped for this tick");
         return 0;
     };
     // A DELETED session (e.g. /clear) invalidates the accumulated keep-set:
@@ -941,7 +947,7 @@ async fn sweep_user_media(
     // delete on no evidence; the rotation fires only when at least one
     // session remains.
     if session_ids.is_empty() {
-        tracing::debug!(user = %user_name, "Media sweep: no assistant sessions — files kept");
+        tracing::debug!(user = %user_name, "Media sweep: no media-keeping sessions — files kept");
         return 0;
     }
     // Overflowed keep-set (incomplete evidence): the safe direction is never
@@ -972,7 +978,7 @@ async fn sweep_user_media(
         if *budget == 0 {
             break;
         }
-        let Ok(content) = assistant_session_content(id).await else {
+        let Ok(content) = media_keeping_session_content(id).await else {
             tracing::warn!(user = %user_name, "Media sweep: session read failed — user skipped for this tick");
             return 0;
         };
@@ -1349,6 +1355,7 @@ mod tests {
             crate::Role::Sanitation,
             &[],
             &crate::jobs::SpawnChild::ResearchCleanup,
+            None,
             None,
             None,
         )

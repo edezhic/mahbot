@@ -401,6 +401,7 @@ pub(crate) async fn spawn_job(
     child: &SpawnChild,
     caller_agent_id: Option<&str>,
     exec_dir: Option<&str>,
+    custom_launch: Option<&crate::CustomRoleLaunch>,
 ) -> Result<()> {
     let tx = conn.begin_tx().await?;
     insert_job_tx(
@@ -415,6 +416,7 @@ pub(crate) async fn spawn_job(
         child,
         caller_agent_id,
         exec_dir,
+        custom_launch,
     )
     .await?;
     tx.commit().await?;
@@ -439,6 +441,7 @@ async fn insert_job_tx(
     child: &SpawnChild,
     caller_agent_id: Option<&str>,
     exec_dir: Option<&str>,
+    custom_launch: Option<&crate::CustomRoleLaunch>,
 ) -> Result<()> {
     let kind = child.kind_str();
     let ticket_id = child_ticket_id(child);
@@ -450,11 +453,18 @@ async fn insert_job_tx(
     } else {
         JobMode::Async
     };
+    // JSON for the custom-role launch the round was dispatched by (`NULL` for
+    // every built-in caller) — read back by `job_caller` on boot resume.
+    let custom_launch_json = custom_launch
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serialize jobs.custom_launch")?;
     let now = db::now();
     tx.execute(
         "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
-         ticket_id, retry_count, created_at, updated_at, caller_agent_id, mode, exec_dir) \
-         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10, ?11, ?12)",
+         ticket_id, retry_count, created_at, updated_at, caller_agent_id, mode, exec_dir, \
+         custom_launch) \
+         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10, ?11, ?12, ?13)",
         params![
             id,
             kind,
@@ -468,6 +478,7 @@ async fn insert_job_tx(
             caller_agent_id,
             mode.as_str(),
             exec_dir,
+            custom_launch_json,
         ],
     )
     .await
@@ -598,6 +609,11 @@ pub(crate) async fn complete_job_with_envelope(
 /// the caller falls back to a best-effort route: the result still reaches the
 /// caller (never a silent drop — the envelope is the caller's only result
 /// path), the pending row is simply absent.
+///
+/// `custom`, when present, is the calling custom role's launch — written into
+/// the envelope so [`envelope_target`] resolves the custom branch instead of a
+/// fabricated built-in address.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn complete_durable_job(
     job_id: &str,
     content: String,
@@ -606,6 +622,7 @@ pub(crate) async fn complete_durable_job(
     user_name: &str,
     channel: &str,
     workspace_name: &str,
+    custom: Option<crate::CustomRoleLaunch>,
 ) -> AgentJob {
     let mut envelope = AgentJob {
         content,
@@ -617,6 +634,8 @@ pub(crate) async fn complete_durable_job(
         reply_target: None,
         pending_job_id: Some(job_id.to_string()),
         originating_workspace: None,
+        custom_role: custom,
+        reply_to_custom: None,
     };
     // INSERT-failure policy: fall back to a non-durable best-effort route.
     if complete_job_with_envelope(&crate::session::store().conn, job_id, &envelope)
@@ -710,6 +729,7 @@ pub(crate) async fn transition_research_to_cleanup(
             task: cleanup_task.to_string(),
         }],
         &SpawnChild::ResearchCleanup,
+        None,
         None,
         None,
     )
@@ -1016,7 +1036,15 @@ async fn delete_job_tx(tx: &TxGuard<'_>, job_id: &str) -> Result<()> {
 /// user's assistant session). `session::resolve_agent_id` already branches on
 /// `role == "manager"` internally, so this is the single canonical form —
 /// analyze/research delivery paths call it instead of reimplementing the branch.
+///
+/// A custom-role launch's address is not derivable from (user, role, workspace):
+/// it is carried explicitly in the envelope's `custom_role`, so it is returned
+/// directly when present. Boot replay uses the STORED `target_agent_id` written
+/// from this same derivation, so both stay in agreement.
 pub(crate) fn envelope_target(job: &AgentJob) -> String {
+    if let Some(custom) = &job.custom_role {
+        return custom.agent_id.clone();
+    }
     crate::session::resolve_agent_id(&job.user_name, job.role.as_str(), &job.workspace_name)
 }
 
@@ -1030,6 +1058,12 @@ pub(crate) struct JobCaller {
     pub role: String,
     pub user_name: String,
     pub channel: String,
+    /// The custom-role launch the job was dispatched by (`jobs.custom_launch`),
+    /// `None` for every built-in caller and for a NULL/unreadable value. A
+    /// resume uses it to address the custom branch instead of a fabricated
+    /// built-in address. Boxed so the caller payload stays small enough for the
+    /// resume-outcome enums.
+    pub custom_launch: Option<Box<crate::CustomRoleLaunch>>,
 }
 
 /// Discriminated resume preamble so sync callers never mistake a gone job
@@ -1064,14 +1098,37 @@ pub(crate) enum SyncResumeOutcome {
 /// Load the task + caller identity of a job from the `jobs` row alone.
 async fn job_caller(conn: &Connection, job_id: &str) -> Result<Option<JobCaller>> {
     conn.query_optional(
-        "SELECT task, role, user_name, channel FROM jobs WHERE id = ?1",
+        "SELECT task, role, user_name, channel, custom_launch FROM jobs WHERE id = ?1",
         params![job_id],
         |r| {
+            // Fail-soft on an unreadable launch: it is treated as absent, so the
+            // caller decides. That is a shape a resume cannot honour — a
+            // launch-carrying row must resume as its branch — and the refusal
+            // lives downstream, in the consumer loop's custom-role funnel, which
+            // skips the job and reclaims its pending row. The resume itself
+            // proceeds: `envelope_target` derives a fabricated `…_custom`
+            // address for a `Role::Custom` caller whose launch is missing, and
+            // the consumer refuses that address exactly like the corrupted row
+            // it came from.
+            let custom_launch = match r.get::<Option<String>>(4)? {
+                None => None,
+                Some(raw) => match serde_json::from_str(&raw) {
+                    Ok(launch) => Some(Box::new(launch)),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "jobs.custom_launch is unreadable — treating as absent",
+                        );
+                        None
+                    }
+                },
+            };
             Ok::<_, anyhow::Error>(JobCaller {
                 task: r.get::<String>(0)?,
                 role: r.get::<String>(1)?,
                 user_name: r.get::<String>(2)?,
                 channel: r.get::<String>(3)?,
+                custom_launch,
             })
         },
     )
@@ -1116,7 +1173,12 @@ pub(crate) async fn resume_job_preamble_discrete(
     }
     match job_caller(conn, job_id).await {
         Ok(Some(caller)) => {
-            let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(Role::Manager);
+            let mut caller_role =
+                std::str::FromStr::from_str(&caller.role).unwrap_or(Role::Manager);
+            // A row that carries a launch resumes as its custom branch: the
+            // persisted launch is the address authority, never the tool's own
+            // construction role.
+            caller_role = caller_role.for_launch(caller.custom_launch.as_deref());
             ResumePreamble::Proceed(caller, caller_role)
         }
         // The row is only ever absent because an explicit abandon raced this
@@ -1312,6 +1374,29 @@ pub(crate) async fn delete_pending_job(conn: &Connection, id: &str) -> Result<()
         .await
         .context("delete pending job")?;
     Ok(())
+}
+
+/// Delete every deferred envelope addressed to `target_agent_id`, returning how
+/// many rows were dropped. The deliberate-stop path is the ONE place that drops
+/// durable envelopes by address, and it deliberately waives the at-least-once
+/// guarantee (a stopped launch must not be replayed at boot); every other
+/// deletion stays by row id.
+#[expect(clippy::cast_possible_truncation)] // u64 row count fits usize on all supported targets
+pub(crate) async fn delete_pending_jobs_for(target_agent_id: &str) -> Result<usize> {
+    let conn = &crate::session::store().conn;
+    let deleted = conn
+        .execute(
+            "DELETE FROM pending_jobs WHERE target_agent_id = ?1",
+            params![target_agent_id],
+        )
+        .await
+        .context("delete pending jobs for agent")?;
+    info!(
+        target_agent_id,
+        count = deleted,
+        "dropped deferred envelopes for a stopped launch"
+    );
+    Ok(deleted as usize)
 }
 
 // ── Boot recovery scan ─────────────────────────────────────────────────
@@ -1628,6 +1713,12 @@ fn skip_sync_job(job: &JobRow) -> bool {
 /// is left in place, not terminalized — the row is deleted only by explicit
 /// abandon, so the boot loop skips it without bumping retry_count or touching
 /// the roster. Returns `true` when the job should be skipped.
+///
+/// Deliberately NOT reported as a failure: the row is parked, not lost, and a
+/// workspace that is merely unmounted resumes on a later boot. A custom role's
+/// own launch never reaches here — the durable envelope is replayed through the
+/// consumer loop, which reports it as a failed launch when its folder is gone
+/// (`message_router::report_unrunnable_custom_role`).
 async fn workspace_unresolvable(job: &JobRow) -> bool {
     if crate::users::resolve_workspace(&job.workspace_name)
         .await
@@ -1992,6 +2083,7 @@ mod tests {
                 &child,
                 caller,
                 exec_dir,
+                None,
             )
             .await
             .unwrap();
@@ -2145,6 +2237,7 @@ mod tests {
                 &child,
                 caller,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2221,6 +2314,7 @@ mod tests {
                 }],
                 &child,
                 caller,
+                None,
                 None,
             )
             .await

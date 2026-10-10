@@ -11,6 +11,7 @@
 //! cannot be read is a check that cannot run, and is treated as one.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -39,6 +40,9 @@ crate::columns! {
         KIND             => "kind",
         TEXT             => "text",
         TRIGGER          => "trigger",
+        ROLE             => "role",
+        IDENTIFIER       => "identifier",
+        WORKSPACE        => "workspace",
         INTERVAL_SECONDS => "interval_seconds",
         NEXT_FIRE_AT     => "next_fire_at",
     }
@@ -56,10 +60,44 @@ pub(crate) struct Alarm {
     pub text: String,
     /// Optional custom-tool check to run at fire time (triggered alarm).
     pub trigger: Option<StoredTrigger>,
+    /// The custom role this alarm wakes; `None` wakes the Assistant.
+    pub role: Option<String>,
+    /// The custom role branch identifier, when one was given.
+    pub identifier: Option<String>,
+    /// The folder the role's launch runs in (a registered workspace name, a
+    /// `personal:{user}` key, or an absolute path); `None` = the owner's
+    /// personal folder.
+    pub workspace: Option<String>,
     /// Periodic interval in seconds.
     pub interval_seconds: Option<i64>,
     /// RFC3339 UTC next fire time.
     pub next_fire_at: String,
+}
+
+impl Alarm {
+    /// The alarm's custom-role target as the listing surfaces show it —
+    /// `addressed to custom role "analyst" (branch "daily") in my-workspace`,
+    /// with the branch and folder only when recorded. `None` for an alarm that
+    /// wakes the Assistant.
+    pub(crate) fn role_target(&self) -> Option<String> {
+        let role = self.role.as_deref()?;
+        let mut out = format!("addressed to custom role \"{role}\"");
+        if let Some(identifier) = &self.identifier {
+            let _ = write!(out, " (branch \"{identifier}\")");
+        }
+        if let Some(workspace) = &self.workspace {
+            let _ = write!(out, " in {workspace}");
+        }
+        Some(out)
+    }
+}
+
+/// The custom role an alarm is addressed to (an alarm with no target wakes the
+/// Assistant, as before).
+pub(crate) struct AlarmTarget {
+    pub role: String,
+    pub identifier: Option<String>,
+    pub workspace: Option<String>,
 }
 
 /// An alarm's trigger: one custom tool, plus the arguments that tool receives.
@@ -152,6 +190,9 @@ fn alarm_from_row(row: &db::Row) -> Result<Alarm, ::turso::Error> {
         kind: row.get(COL_ALARM_KIND)?,
         text: row.get(COL_ALARM_TEXT)?,
         trigger: stored_trigger(row)?,
+        role: row.get(COL_ALARM_ROLE)?,
+        identifier: row.get(COL_ALARM_IDENTIFIER)?,
+        workspace: row.get(COL_ALARM_WORKSPACE)?,
         interval_seconds: row.get(COL_ALARM_INTERVAL_SECONDS)?,
         next_fire_at: row.get(COL_ALARM_NEXT_FIRE_AT)?,
     })
@@ -196,12 +237,85 @@ pub(crate) fn format_fire_time(timestamp: &str) -> Result<String> {
 
 // ── Alarm CRUD ──────────────────────────────────────────────────────────
 
+/// Validate an alarm's optional custom-role target before it is stored: only the
+/// administrator may address an alarm to a custom role, the role must exist, the
+/// branch identifier and folder must resolve to what will be stored, and a role-
+/// addressed alarm's text is the launch message so it must not be empty and
+/// cannot also carry a check. Returns the role, branch identifier and folder
+/// address to store.
+async fn validate_alarm_target(
+    user_name: &str,
+    text: &str,
+    target: Option<AlarmTarget>,
+    has_trigger: bool,
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    let Some(target) = target else {
+        return Ok((None, None, None));
+    };
+    anyhow::ensure!(
+        crate::users::is_admin_name(user_name),
+        "usage: only the administrator may address an alarm to a custom role"
+    );
+    anyhow::ensure!(
+        crate::custom_role::get(&target.role).await?.is_some(),
+        "no custom role named '{}'",
+        target.role
+    );
+    // An explicit empty/whitespace identifier counts as absent.
+    let identifier = target
+        .identifier
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+    if let Some(id) = &identifier {
+        crate::custom_role::validate_identifier(id)?;
+    }
+    // Same for the workspace, resolved to the address actually stored.
+    let workspace = match target
+        .workspace
+        .map(|w| w.trim().to_string())
+        .filter(|w| !w.is_empty())
+    {
+        None => None,
+        Some(raw) => Some(crate::custom_role::resolve_launch_workspace(&raw).await?),
+    };
+    anyhow::ensure!(
+        !has_trigger,
+        "usage: a role-addressed alarm's text IS the role's launch message, so its \
+         check cannot be combined with a role target"
+    );
+    anyhow::ensure!(
+        !text.trim().is_empty(),
+        "usage: a role-addressed alarm's text is the role's launch message, so it must not be empty"
+    );
+    Ok((Some(target.role), identifier, workspace))
+}
+
+/// The session an alarm call actually acts on: a custom-role caller's alarms
+/// live on the owner's Assistant session, the caller's own id otherwise.
+///
+/// A custom role runs at the owner's strength, and a plain alarm it arms is
+/// still an owner reminder delivered to the assistant — so `add`/`list`/`remove`
+/// all resolve the owner's assistant session for such a caller, never the role's
+/// own branch (which would hold an alarm it could never see or cancel).
+#[must_use]
+pub(crate) fn owner_alarm_session(agent_id: &str, user_name: &str) -> String {
+    if crate::session::is_custom_role_agent_id(agent_id) {
+        crate::session::assistant_agent_id(user_name)
+    } else {
+        agent_id.to_string()
+    }
+}
+
 /// Create a new alarm for a session.
 ///
 /// Exactly one of `fire_at` (one-shot) or `interval_seconds` (periodic) must be
 /// provided. One-shot fire times are normalized to RFC3339 UTC and must be in
 /// the future; periodic intervals must be at least 5 seconds. At most
 /// [`MAX_ACTIVE_ALARMS`] active alarms may exist per session.
+///
+/// `target` addresses the alarm to a custom role instead of the Assistant: only
+/// the administrator may do that, the role must exist, and the alarm carries no
+/// trigger — its text IS the role's launch message.
 pub(crate) async fn add_alarm(
     session_id: &str,
     user_name: &str,
@@ -209,7 +323,19 @@ pub(crate) async fn add_alarm(
     fire_at: Option<&str>,
     interval_seconds: Option<u64>,
     trigger: Option<Trigger>,
+    target: Option<AlarmTarget>,
 ) -> Result<Alarm> {
+    // A role-addressed alarm the owner's own Assistant never sees belongs on
+    // the assistant's session: a custom role may hold the alarm tools, but a
+    // plain alarm it arms is still an owner reminder.
+    let session_id = owner_alarm_session(session_id, user_name);
+
+    // Validate the target before touching the DB: a broken target must never be
+    // armed. A role-addressed alarm's text is the launch message, so a trigger
+    // can never ride along and the text must be non-empty.
+    let (role, identifier, workspace) =
+        validate_alarm_target(user_name, text, target, trigger.is_some()).await?;
+
     // Validate an optional trigger before touching the DB: the whole stored
     // trigger — the tool's name together with its arguments — is bounded.
     let encoded_trigger = trigger.as_ref().map(Trigger::encode);
@@ -263,7 +389,7 @@ pub(crate) async fn add_alarm(
         .conn
         .query(
             "SELECT COUNT(*) FROM alarms WHERE session_id = ?1 AND status = 'active'",
-            db::params![session_id],
+            db::params![session_id.as_str()],
         )
         .await?;
     let count: i64 = rows.first().map(|r| r.get(0)).transpose()?.unwrap_or(0);
@@ -278,11 +404,11 @@ pub(crate) async fn add_alarm(
         .conn
         .execute(
             "INSERT INTO alarms \
-             (id, session_id, user_name, kind, text, fire_at, interval_seconds, next_fire_at, status, created_at, trigger) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10)",
+             (id, session_id, user_name, kind, text, fire_at, interval_seconds, next_fire_at, status, created_at, trigger, role, identifier, workspace) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?11, ?12, ?13)",
             db::params![
                 id.clone(),
-                session_id,
+                session_id.as_str(),
                 user_name,
                 kind,
                 text,
@@ -291,17 +417,23 @@ pub(crate) async fn add_alarm(
                 next_fire_at.clone(),
                 created_at.clone(),
                 encoded_trigger.clone(),
+                role.clone(),
+                identifier.clone(),
+                workspace.clone(),
             ],
         )
         .await?;
 
     Ok(Alarm {
         id,
-        session_id: session_id.to_string(),
+        session_id,
         user_name: user_name.to_string(),
         kind: kind.to_string(),
         text: text.to_string(),
         trigger: trigger.map(StoredTrigger::Tool),
+        role,
+        identifier,
+        workspace,
         interval_seconds: interval_secs,
         next_fire_at,
     })
@@ -370,6 +502,20 @@ pub(crate) async fn remove_alarm(session_id: &str, id: &str) -> Result<Option<Al
     Ok(Some(alarm))
 }
 
+/// Mark every ACTIVE alarm addressed to `role_name` as `'removed'` (soft
+/// delete, consistent with the rest of the module); returns the number changed.
+#[expect(clippy::cast_possible_truncation)] // u64 row count fits usize on all supported targets
+pub(crate) async fn delete_alarms_for_role(role_name: &str) -> Result<usize> {
+    let changed = store()
+        .conn
+        .execute(
+            "UPDATE alarms SET status = 'removed' WHERE role = ?1 AND status = 'active'",
+            db::params![role_name],
+        )
+        .await?;
+    Ok(changed as usize)
+}
+
 /// Soft-delete an alarm regardless of its current status (idempotent).
 ///
 /// Unlike [`remove_alarm`] this has no `status = 'active'` gate, so it also
@@ -402,18 +548,115 @@ async fn due_alarms(now: &str) -> Result<Vec<Alarm>> {
 
 /// Route a due alarm into the Assistant's own session and update its state.
 ///
-/// A triggered alarm (`trigger` set) runs its custom tool and delivers the
-/// check's result; a plain alarm delivers the reminder text. The notification is
-/// delivered as a user-role message into the calling assistant's own session
-/// (`alarm.session_id`, resolved directly — never re-derived from the id, which
-/// would double-escape colliding user names). One-shot alarms are terminalized
-/// (`status='fired'`); periodic alarms advance `next_fire_at` past every missed
-/// whole period.
+/// A role-addressed alarm (`role` set) wakes that custom role instead; the
+/// Assistant wakes otherwise — a triggered alarm (`trigger` set) runs its custom
+/// tool and delivers the check's result; a plain alarm delivers the reminder
+/// text. The notification is delivered as a user-role message into the calling
+/// assistant's own session (`alarm.session_id`, resolved directly — never
+/// re-derived from the id, which would double-escape colliding user names).
+/// One-shot alarms are terminalized (`status='fired'`); periodic alarms advance
+/// `next_fire_at` past every missed whole period.
 async fn fire_alarm(alarm: &Alarm) -> Result<()> {
+    if alarm.role.is_some() {
+        return fire_custom_role_alarm(alarm).await;
+    }
     match &alarm.trigger {
         Some(trigger) => fire_trigger_alarm(alarm, trigger).await,
         None => fire_plain_alarm(alarm).await,
     }
+}
+
+/// Wake the custom role an alarm is addressed to, with the alarm's text as the
+/// launch message. A role that has since been deleted removes the alarm and
+/// tells the owner through his Assistant: a broken alarm must never keep
+/// firing. A store failure is not a verdict about the role — the alarm stays
+/// armed and the next sweep retries.
+///
+/// Any other launch failure of a ONE-SHOT alarm is terminal: the alarm is
+/// removed and the owner is told the reason. A PERIODIC alarm instead advances
+/// its state like a completed fire and stays armed, so a transient failure (e.g.
+/// a launch folder on a temporarily unavailable mount) loses no reminder and
+/// retries at its next scheduled time rather than every sweep tick. The notice
+/// names the reason and lets the owner re-arm once the cause is fixed.
+async fn fire_custom_role_alarm(alarm: &Alarm) -> Result<()> {
+    let role = alarm.role.as_deref().unwrap_or_default();
+    // `removed` = this failure disarms the alarm; a periodic launch failure
+    // keeps it armed (see below).
+    let (reason, removed) = if crate::custom_role::get(role).await?.is_none() {
+        ("the custom role no longer exists".to_string(), true)
+    } else {
+        match crate::custom_role::launch(
+            role,
+            &alarm.text,
+            alarm.identifier.as_deref(),
+            alarm.workspace.as_deref(),
+        )
+        .await
+        {
+            Ok(_) => {
+                // The launch is already persisted durably before it is routed
+                // (see `custom_role::launch`), so the state advance runs after,
+                // exactly as on the plain path.
+                advance_alarm_state(alarm, &db::now()).await?;
+                return Ok(());
+            }
+            Err(e) if crate::db::is_store_error(&e) => {
+                // A store failure says nothing about the role: leave the alarm
+                // armed and let the next sweep retry, instead of disarming a
+                // working reminder on a transient read/write error.
+                tracing::warn!(
+                    alarm = %alarm.id,
+                    role = %role,
+                    error = %e,
+                    "Store failure launching a custom-role alarm — alarm left armed"
+                );
+                return Err(e);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    alarm = %alarm.id,
+                    role = %role,
+                    error = %e,
+                    "Failed to launch a custom role alarm"
+                );
+                if alarm.kind == "one-shot" {
+                    (e.to_string(), true)
+                } else {
+                    // A periodic reminder must survive a transient launch
+                    // failure: advance its state like a completed fire so it
+                    // retries at its next scheduled time instead of every sweep
+                    // tick (the sweep re-selects due alarms once a second).
+                    advance_alarm_state(alarm, &db::now()).await?;
+                    (e.to_string(), false)
+                }
+            }
+        }
+    };
+    if removed {
+        delete_alarm_after_run(alarm).await?;
+    }
+    // The notice goes to the owner (the assistant), never to the role.
+    let workspace_line = match &alarm.workspace {
+        Some(workspace) => format!(" in {workspace}"),
+        None => String::new(),
+    };
+    let outcome = if removed {
+        "The alarm was removed."
+    } else {
+        "The reminder stays armed and will fire again at its next scheduled time."
+    };
+    let content = crate::prompt::substitute(
+        &crate::prompt::load_prompt("alarm_role_notification.md"),
+        &[
+            ("{{text}}", &alarm.text),
+            ("{{role}}", role),
+            ("{{workspace_line}}", &workspace_line),
+            ("{{reason}}", &reason),
+            ("{{outcome}}", outcome),
+        ],
+    );
+    deliver_alarm_notification(alarm, content).await;
+    Ok(())
 }
 
 /// Deliver a plain (untriggered) alarm reminder and advance its state.
@@ -814,6 +1057,7 @@ mod tests {
             Some("2020-01-01T00:00:00Z"),
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -822,7 +1066,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_alarm_rejects_short_periodic_interval() {
-        let err = add_alarm("session-a", "alice", "remind me", None, Some(4), None)
+        let err = add_alarm("session-a", "alice", "remind me", None, Some(4), None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least 5 seconds"), "got: {err}");
@@ -837,6 +1081,7 @@ mod tests {
             None,
             Some(u64::MAX),
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -846,7 +1091,7 @@ mod tests {
     #[tokio::test]
     async fn add_alarm_requires_exactly_one_of_fire_at_or_interval() {
         // Neither provided.
-        let err = add_alarm("session-a", "alice", "remind me", None, None, None)
+        let err = add_alarm("session-a", "alice", "remind me", None, None, None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Exactly one"), "got: {err}");
@@ -858,6 +1103,7 @@ mod tests {
             "remind me",
             Some("2099-01-01T00:00:00Z"),
             Some(60),
+            None,
             None,
         )
         .await
@@ -878,6 +1124,7 @@ mod tests {
                 Some(&fire),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -887,6 +1134,7 @@ mod tests {
             "alice",
             "one too many",
             Some("2099-01-01T00:01:00Z"),
+            None,
             None,
             None,
         )
@@ -918,6 +1166,7 @@ mod tests {
                 Some("2099-01-01T00:00:00Z"),
                 None,
                 Some(trigger),
+                None,
             )
             .await
             .unwrap_err()
@@ -951,6 +1200,7 @@ mod tests {
             Some("2099-01-01T00:00:00Z"),
             None,
             Some(weather_trigger()),
+            None,
         )
         .await
         .unwrap();
@@ -978,9 +1228,12 @@ mod tests {
             user_name: "alice".to_string(),
             kind: "periodic".to_string(),
             text: "check the thing".to_string(),
+            trigger: Some(StoredTrigger::Tool(weather_trigger())),
+            role: None,
+            identifier: None,
+            workspace: None,
             interval_seconds: Some(60),
             next_fire_at: "2026-09-04T12:00:00+00:00".to_string(),
-            trigger: Some(StoredTrigger::Tool(weather_trigger())),
         }
     }
 
@@ -1168,6 +1421,7 @@ mod tests {
                 tool: tool.to_string(),
                 args,
             }),
+            None,
         )
         .await
         .expect("arm the trigger alarm");
@@ -1233,6 +1487,7 @@ mod tests {
             Some("2099-01-01T00:00:00Z"),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1249,6 +1504,206 @@ mod tests {
             "fired",
             "one-shot must be terminalized"
         );
+    }
+
+    /// A role target with no branch and no workspace.
+    fn role_target(role: &str) -> AlarmTarget {
+        AlarmTarget {
+            role: role.to_string(),
+            identifier: None,
+            workspace: None,
+        }
+    }
+
+    /// The refusal from arming a role-addressed alarm under `user`.
+    async fn try_arm_role(user: &str, role: &str, trigger: Option<Trigger>) -> String {
+        add_alarm(
+            "assistant:role-target-it",
+            user,
+            "run it",
+            Some("2099-01-01T00:00:00Z"),
+            None,
+            trigger,
+            Some(role_target(role)),
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+    }
+
+    /// Arming a role-addressed alarm fails closed: only the admin may address a
+    /// role, the role must exist, and the alarm's text (the role's launch
+    /// message) cannot also carry a trigger.
+    #[tokio::test]
+    async fn add_alarm_validates_a_role_target_before_storing_it() {
+        crate::util::test::init_test_stores().await;
+
+        let err = try_arm_role("alice", "analyst", None).await;
+        assert!(err.contains("only the administrator"), "got: {err}");
+
+        let err = try_arm_role(crate::users::ADMIN_USER_NAME, "no_such_role", None).await;
+        assert!(
+            err.contains("no custom role named 'no_such_role'"),
+            "got: {err}"
+        );
+
+        crate::custom_role::create(
+            "alarm_role_probe",
+            "do it",
+            &[],
+            crate::custom_role::CustomRoleBehavior::Continuous,
+        )
+        .await
+        .unwrap();
+        let err = try_arm_role(
+            crate::users::ADMIN_USER_NAME,
+            "alarm_role_probe",
+            Some(weather_trigger()),
+        )
+        .await;
+        assert!(
+            err.contains("cannot be combined with a role target"),
+            "got: {err}"
+        );
+    }
+
+    /// Fire-time integration: an alarm addressed to a custom role launches that
+    /// role's branch with the alarm's text as its launch message, then
+    /// terminalizes the one-shot.
+    #[tokio::test]
+    async fn fire_role_alarm_launches_the_role_and_terminalizes_the_alarm() {
+        crate::util::test::init_management_test_stores().await;
+        crate::custom_role::create(
+            "alarm_runner",
+            "do the thing",
+            &[],
+            crate::custom_role::CustomRoleBehavior::Continuous,
+        )
+        .await
+        .unwrap();
+        let alarm = add_alarm(
+            &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+            crate::users::ADMIN_USER_NAME,
+            "run the runner",
+            Some("2099-01-01T00:00:00Z"),
+            None,
+            None,
+            Some(role_target("alarm_runner")),
+        )
+        .await
+        .unwrap();
+
+        let branch = crate::session::custom_role_agent_id("alarm_runner", None);
+        let mut rx = crate::agent::message_router::register_agent(&branch);
+        fire_alarm(&alarm).await.unwrap();
+        let job = rx
+            .recv()
+            .await
+            .expect("the role's branch must receive the launch message");
+        crate::agent::message_router::unregister_agent(&branch);
+        assert_eq!(job.content, "run the runner");
+        assert_eq!(
+            alarm_status(&alarm.id).await,
+            "fired",
+            "one-shot must be terminalized"
+        );
+    }
+
+    /// Fire-time integration: a role deleted after arming takes its alarm with
+    /// it — the owner is told through his Assistant and the alarm is removed.
+    #[tokio::test]
+    async fn fire_role_alarm_reports_a_deleted_role_and_removes_the_alarm() {
+        crate::util::test::init_management_test_stores().await;
+        crate::custom_role::create(
+            "alarm_vanishing",
+            "do the thing",
+            &[],
+            crate::custom_role::CustomRoleBehavior::Continuous,
+        )
+        .await
+        .unwrap();
+        let alarm = add_alarm(
+            &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+            crate::users::ADMIN_USER_NAME,
+            "wake the role",
+            Some("2099-01-01T00:00:00Z"),
+            None,
+            None,
+            Some(role_target("alarm_vanishing")),
+        )
+        .await
+        .unwrap();
+        // Remove the record out of band, leaving the armed alarm behind.
+        crate::custom_role::CUSTOM_ROLES
+            .get()
+            .expect("custom role store")
+            .conn
+            .execute(
+                "DELETE FROM custom_roles WHERE name = ?1",
+                db::params!["alarm_vanishing"],
+            )
+            .await
+            .unwrap();
+
+        let mut rx = crate::agent::message_router::register_agent(&alarm.session_id);
+        fire_alarm(&alarm).await.unwrap();
+        let job = rx.recv().await.expect("the owner must be told");
+        crate::agent::message_router::unregister_agent(&alarm.session_id);
+        assert!(job.content.contains("<alarm-notification>"));
+        assert!(
+            job.content.contains("alarm_vanishing"),
+            "got: {}",
+            job.content
+        );
+        assert!(
+            job.content.contains("no longer exists"),
+            "got: {}",
+            job.content
+        );
+        assert_eq!(alarm_status(&alarm.id).await, "removed");
+    }
+
+    /// `delete_alarms_for_role` soft-deletes exactly the role's ACTIVE alarms.
+    #[tokio::test]
+    async fn delete_alarms_for_role_soft_deletes_only_its_active_alarms() {
+        crate::util::test::init_management_test_stores().await;
+        crate::custom_role::create(
+            "alarm_cleanup",
+            "done",
+            &[],
+            crate::custom_role::CustomRoleBehavior::Continuous,
+        )
+        .await
+        .unwrap();
+        let alarm = add_alarm(
+            &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+            crate::users::ADMIN_USER_NAME,
+            "one",
+            Some("2099-01-01T00:00:00Z"),
+            None,
+            None,
+            Some(role_target("alarm_cleanup")),
+        )
+        .await
+        .unwrap();
+        // A plain alarm of another owner must survive.
+        let plain = add_alarm(
+            "assistant:alarm-cleanup-it",
+            "alarm-cleanup-user",
+            "two",
+            Some("2099-01-01T00:00:00Z"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(delete_alarms_for_role("alarm_cleanup").await.unwrap(), 1);
+        assert_eq!(alarm_status(&alarm.id).await, "removed");
+        assert_eq!(alarm_status(&plain.id).await, "active");
+        // Idempotent: nothing left to remove.
+        assert_eq!(delete_alarms_for_role("alarm_cleanup").await.unwrap(), 0);
     }
 
     /// Fire-time integration: a trigger naming a tool the catalogue does not

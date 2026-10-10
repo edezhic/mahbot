@@ -12,6 +12,7 @@
 pub(crate) mod alarms;
 pub(crate) mod board;
 pub(crate) mod common;
+pub(crate) mod custom_roles;
 pub(crate) mod custom_tools;
 pub(crate) mod dialog;
 pub(crate) mod diff;
@@ -407,7 +408,8 @@ pub enum Message {
     Sessions(sessions::SessionsMessage),
     /// Alarms page messages (refresh and card-menu deletion).
     Alarms(alarms::AlarmsMessage),
-    /// Running Agents page messages (manual research-run cancel).
+    /// Running Agents page messages (manual stop of a research run or a
+    /// custom-role launch).
     RunningAgents(running::RunningMessage),
     /// Diff modal overlay (not a page) — wraps [`diff::DiffMessage`].
     /// Named `DiffModal` rather than `Diff` to avoid ambiguity with the
@@ -660,11 +662,12 @@ pub struct Dashboard {
     /// [`Message::UpdateBot`]; the update itself only starts on
     /// [`Message::ConfirmUpdate`], so dismissing leaves the system untouched.
     show_update_confirm: bool,
-    /// Research run awaiting manual-cancel confirmation — the run's durable
-    /// job id. `Some` while the confirm dialog is shown on the Running Agents
-    /// page; the cancel runs only on [`running::RunningMessage::CancelConfirmed`].
-    /// The id is never displayed as text — the button message carries it.
-    pending_research_cancel: Option<String>,
+    /// Running work item awaiting manual-stop confirmation: a research run or a
+    /// custom-role launch. `Some` while the confirm dialog is shown on the
+    /// Running Agents page; the stop runs only on
+    /// [`running::RunningMessage::StopConfirmed`]. The carried key is never
+    /// displayed as text — the button message carries it.
+    pending_stop: Option<running::StopTarget>,
     /// Running Agents page expanded-card state, keyed by (agent_id, generation)
     /// so a recycled agent_id never inherits a stale expansion. Pruned against
     /// the live agent list on each [`Message::RuntimeChanged`] registry event.
@@ -728,7 +731,7 @@ impl Dashboard {
             exit_requested_during_update: false,
             draining: false,
             show_update_confirm: false,
-            pending_research_cancel: None,
+            pending_stop: None,
             running_expanded: HashSet::new(),
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
@@ -1001,12 +1004,13 @@ impl Dashboard {
             Page::Settings => {
                 self.settings_state.refresh();
                 // Workspace list comes from the shared map; only the users
-                // list and the custom-tools area need a DB / folder read on
-                // navigation.
+                // list, the custom-tools area and the custom-roles list need a
+                // DB / folder read on navigation.
                 self.sync_settings_workspaces_from_map();
                 Task::batch([
                     self.refresh_settings_users(),
                     self.refresh_settings_custom_tools(),
+                    self.refresh_settings_custom_roles(),
                 ])
             }
         };
@@ -1030,6 +1034,15 @@ impl Dashboard {
             .custom_tools_state
             .refresh()
             .map(|msg| Message::Settings(settings::SettingsMessage::CustomToolsMsg(msg)))
+    }
+
+    /// Refresh the Settings custom-roles list (its DB read). Does not absorb the
+    /// config snapshot (`settings_state.refresh()`).
+    fn refresh_settings_custom_roles(&self) -> Task<Message> {
+        self.settings_state
+            .custom_roles_state
+            .refresh()
+            .map(|msg| Message::Settings(settings::SettingsMessage::CustomRolesMsg(msg)))
     }
 
     /// Sync the Settings workspaces section list from the shared workspace map
@@ -1135,10 +1148,10 @@ impl Dashboard {
                     .update(board::BoardMessage::Escape)
                     .map(Message::Board),
                 // Shell and Alarms have no escape handling.
-                // Running Agents: Escape dismisses the pending research-cancel
+                // Running Agents: Escape dismisses the pending stop
                 // confirmation (Keep) — never confirms it.
                 Page::RunningAgents => {
-                    self.pending_research_cancel = None;
+                    self.pending_stop = None;
                     Task::none()
                 }
                 Page::Shell | Page::Alarms => Task::none(),
@@ -1195,42 +1208,65 @@ impl Dashboard {
         }
     }
 
-    /// Process a Running Agents page message — the manual research-run
-    /// cancel flow: button → pending-confirmation → async cancel → toast.
+    /// Process a Running Agents page message — the manual-stop flow for
+    /// research runs and custom-role launches: button → pending-confirmation →
+    /// async stop → toast.
     fn process_running_message(&mut self, msg: running::RunningMessage) -> Task<Message> {
         match msg {
-            running::RunningMessage::CancelRequest(run_key) => {
+            running::RunningMessage::StopRequest(target) => {
                 // Pending-confirmation only: the dialog renders over the
-                // Running Agents page; the run key is never displayed.
-                self.pending_research_cancel = Some(run_key);
+                // Running Agents page; the target's key is never displayed.
+                self.pending_stop = Some(target);
                 Task::none()
             }
-            running::RunningMessage::CancelConfirmed => {
-                let Some(run_key) = self.pending_research_cancel.take() else {
+            running::RunningMessage::StopConfirmed => {
+                let Some(target) = self.pending_stop.take() else {
                     return Task::none();
                 };
-                // The cancel is async: fire the run's signal and stop the run's
-                // agents. Silent to the Manager/caller — only the GUI gets a
-                // toast. The cancelled-run handoff (or a no-orchestrator sweep)
-                // owns the cleanup dispatch and folder release.
-                Task::perform(
-                    async move { crate::research_cancel::cancel_research_run(&run_key).await },
-                    |()| Message::RunningAgents(running::RunningMessage::CancelFinished),
-                )
+                match target {
+                    // The cancel is async: fire the run's signal and stop the
+                    // run's agents. Silent to the Manager/caller — only the GUI
+                    // gets a toast. The cancelled-run handoff (or a
+                    // no-orchestrator sweep) owns the cleanup dispatch and
+                    // folder release. Infallible.
+                    running::StopTarget::Research(run_key) => Task::perform(
+                        async move { crate::research_cancel::cancel_research_run(&run_key).await },
+                        |()| {
+                            Message::RunningAgents(running::RunningMessage::StopFinished(Ok(
+                                "Research run cancelled — agents stopped; the run's temporary \
+                                 traces are being removed."
+                                    .to_string(),
+                            )))
+                        },
+                    ),
+                    // Stopping a launch: cancel its agent, mark the branch as
+                    // deliberately stopped and drop its pending messages. A
+                    // failure is reported as an error toast, not swallowed.
+                    running::StopTarget::CustomLaunch(agent_id) => Task::perform(
+                        async move {
+                            match crate::custom_role::stop(&agent_id).await {
+                                Ok(()) => {
+                                    Ok("Launch stopped — its branch is marked stopped and its \
+                                     pending messages were dropped."
+                                        .to_string())
+                                }
+                                Err(e) => Err(format!("could not stop the launch: {e}")),
+                            }
+                        },
+                        |result| {
+                            Message::RunningAgents(running::RunningMessage::StopFinished(result))
+                        },
+                    ),
+                }
             }
-            running::RunningMessage::CancelDismissed => {
-                self.pending_research_cancel = None;
+            running::RunningMessage::StopDismissed => {
+                self.pending_stop = None;
                 Task::none()
             }
-            running::RunningMessage::CancelFinished => {
-                // cancel_research_run is infallible — the handoff (or the
-                // no-orchestrator sweep) always makes progress.
-                self.push_toast_msg(&ToastMessage::SuccessMsg(
-                    "Research run cancelled — agents stopped; the run's temporary \
-                     traces are being removed."
-                        .to_string(),
-                ))
-            }
+            running::RunningMessage::StopFinished(result) => match result {
+                Ok(text) => self.push_toast_msg(&ToastMessage::SuccessMsg(text)),
+                Err(text) => self.push_toast_msg(&ToastMessage::Error(text)),
+            },
             running::RunningMessage::ToggleAgentExpanded {
                 agent_id,
                 generation,
@@ -2028,7 +2064,7 @@ impl Dashboard {
     /// modal is not included: it renders only inside the Home page content
     /// (never the global overlay stack), so it cannot sit above the editor.
     ///
-    /// `pending_research_cancel` is likewise excluded: it is rendered inside
+    /// `pending_stop` is likewise excluded: it is rendered inside
     /// the Running Agents page body, not as an overlay over other pages.
     fn overlay_modal_open(&self) -> bool {
         self.foreign_workspace.is_some()
@@ -2143,7 +2179,7 @@ impl Dashboard {
                 .map(Message::Settings),
             Page::RunningAgents => running::view(
                 &self.workspaces,
-                self.pending_research_cancel.as_deref(),
+                self.pending_stop.as_ref(),
                 &self.running_expanded,
             ),
         };

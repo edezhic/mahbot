@@ -6,8 +6,9 @@
 //! toggles/pickers) via the per-field persistence
 //! functions in [`crate::config`].
 //!
-//! Also manages workspaces, users and the custom-tools list (formerly separate
-//! pages), with modal dialogs for the add operations.
+//! Also manages workspaces, users, the custom-tools list and the admin-defined
+//! custom roles (formerly separate pages), with modal dialogs for the add
+//! operations.
 
 use crate::Role;
 use crate::Workspace;
@@ -21,13 +22,14 @@ use crate::config::{
 use crate::config::{
     CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_TTS_ENABLED, CONFIG_KEY_VOICE_ENABLED,
 };
+use crate::custom_role::{CustomRole, CustomRoleBehavior};
 use crate::tools::custom::ToolListing;
 use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
-    Column, Id, Row, Space, button, column, container, image, pick_list, row, stack, text, toggler,
-    tooltip,
+    Column, Id, Row, Space, button, checkbox, column, container, image, pick_list, responsive, row,
+    stack, text, toggler, tooltip,
 };
 #[cfg(target_os = "macos")]
 use iced::widget::{Text, text::IntoFragment};
@@ -38,6 +40,7 @@ use iced_fonts::lucide;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::common::SingleLineEditorState;
+use super::custom_roles;
 use super::custom_tools;
 use super::dialog;
 use super::editor_widget::EditorAction;
@@ -332,6 +335,9 @@ pub enum SettingsMessage {
     // ── Custom tools area (sub-messages) ────────────────────────
     /// Wrapped custom-tools area message.
     CustomToolsMsg(custom_tools::CustomToolsMessage),
+    // ── Custom roles area (sub-messages) ────────────────────────
+    /// Wrapped custom-roles area message.
+    CustomRolesMsg(custom_roles::CustomRolesMessage),
     /// Escape key pressed (dismisses modal if open).
     Escape,
     // ── Model picker messages ─────────────────────────────
@@ -553,6 +559,11 @@ pub struct SettingsState {
     /// The read-only list of custom tool files (see [`custom_tools`]).
     pub(crate) custom_tools_state: custom_tools::CustomToolsState,
 
+    // ── Custom roles area state ─────────────────────────────────
+    /// The admin-defined custom roles, their create/edit window and their
+    /// deletion (see [`custom_roles`]).
+    pub(crate) custom_roles_state: custom_roles::CustomRolesState,
+
     // ── Model picker state ────────────────────────────────
     /// Text input buffers for model pickers, indexed by [`ModelPickerTarget::idx`].
     model_picker_inputs: [SingleLineEditorState; ModelPickerTarget::COUNT],
@@ -597,6 +608,27 @@ fn sync_voice_state(enabled: bool) {
     }
 }
 
+/// Height of the custom-role tool picker's viewport — the catalogue is ~22
+/// entries, so the list is bounded instead of stretching the window to fit it.
+const TOOL_PICKER_HEIGHT: f32 = 260.0;
+
+/// Vertical space the custom-role window must leave to everything outside its
+/// scrolling body: the title, the name row, the spacers, the footer and the
+/// dialog's own padding. The body gets what the window has beyond this, so the
+/// Add/Save footer stays on screen at the 500px minimum window height.
+const CUSTOM_ROLE_DIALOG_CHROME: f32 = 240.0;
+
+/// Floor for the custom-role window's scrolling body, so the prompt editor and
+/// the tool picker stay usable in a window shorter than
+/// [`CUSTOM_ROLE_DIALOG_CHROME`] can account for.
+const CUSTOM_ROLE_BODY_MIN_HEIGHT: f32 = 200.0;
+
+/// The behaviours the custom-role window's picker offers, in the order it shows
+/// them. The labels it shows are [`CustomRoleBehavior`]'s `Display`; the stored
+/// value stays `as_str()`.
+const BEHAVIORS: [CustomRoleBehavior; 2] =
+    [CustomRoleBehavior::Continuous, CustomRoleBehavior::OneOff];
+
 impl SettingsState {
     pub fn new() -> Self {
         // The field editors are seeded from `self.config` (see
@@ -627,6 +659,7 @@ impl SettingsState {
             add_user_sender: SingleLineEditorState::new(""),
             add_user_adding: false,
             custom_tools_state: custom_tools::CustomToolsState::new(),
+            custom_roles_state: custom_roles::CustomRolesState::new(),
             model_picker_inputs: std::array::from_fn(|_| SingleLineEditorState::new("")),
             #[cfg(target_os = "macos")]
             voice_toggle_gen: 0,
@@ -1525,6 +1558,14 @@ impl SettingsState {
                 .update(msg)
                 .map(SettingsMessage::CustomToolsMsg),
 
+            // ── Custom roles area ───────────────────────────────
+            // The list is only ever changed by the admin's own actions, so the
+            // area re-reads it after every mutation and never polls.
+            SettingsMessage::CustomRolesMsg(msg) => self
+                .custom_roles_state
+                .update(msg)
+                .map(SettingsMessage::CustomRolesMsg),
+
             // ── Model picker messages ─────────────────────────
             SettingsMessage::ModelPicker { target, action } => {
                 match (target, action) {
@@ -1611,10 +1652,12 @@ impl SettingsState {
                     self.close_add_user_modal();
                 } else {
                     // The last tier, matching render_modal_overlay: the
-                    // custom-tools details window and the delete-confirm and
-                    // diagnostics modals are all dismissed here (each only if
-                    // it is the open one).
+                    // custom-tools details window, the custom-roles editor and
+                    // delete dialogs, and the delete-confirm and diagnostics
+                    // modals are all dismissed here (each only if it is the open
+                    // one).
                     self.custom_tools_state.close_details();
+                    self.custom_roles_state.close_dialogs();
                     return Task::batch([
                         self.workspaces_state
                             .update(workspaces::WorkspacesMessage::Escape)
@@ -1643,6 +1686,9 @@ impl SettingsState {
 
         // Custom tools area (right column, below users)
         let tools_section = self.custom_tools_section();
+
+        // Custom roles area (right column, below the custom tools)
+        let roles_section = self.custom_roles_section();
 
         // Existing config sections (left column)
         let config_sections = Column::new()
@@ -1681,6 +1727,8 @@ impl SettingsState {
             us_section,
             Space::new().height(16),
             tools_section,
+            Space::new().height(16),
+            roles_section,
         ];
 
         let mut content = column![];
@@ -2407,9 +2455,296 @@ impl SettingsState {
         .into()
     }
 
+    /// Render the custom roles area for the Settings page: the "Add role"
+    /// header action, the list's error banner and one card per record.
+    fn custom_roles_section(&self) -> Element<'_, SettingsMessage> {
+        let roles = &self.custom_roles_state;
+
+        let mut rows = Column::new().spacing(theme::SPACE_4);
+        rows = widgets::push_error_banner(rows, roles.error.as_deref());
+
+        // The empty line stands in only for a successfully read, genuinely
+        // empty list: a failed read keeps its banner instead.
+        if roles.roles.is_empty() && roles.loaded && roles.error.is_none() {
+            rows = rows.push(
+                text("No custom roles.")
+                    .size(theme::TEXT_12)
+                    .color(theme::TEXT_MUTED),
+            );
+        }
+
+        for role in &roles.roles {
+            rows = rows.push(Self::custom_role_card(role));
+        }
+
+        section_with_header_action(
+            "Custom roles",
+            section_plus_button(
+                "Add role",
+                SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::OpenCreate),
+            ),
+            rows,
+        )
+    }
+
+    /// One custom role as the area lists it: its name, its behaviour's label and
+    /// how many tools it holds, with the two actions that act on it. The
+    /// prompt is deliberately absent — it is the whole definition of a role and
+    /// belongs in the editor, not on a card.
+    fn custom_role_card(role: &CustomRole) -> Element<'_, SettingsMessage> {
+        let card_body = Column::new()
+            .spacing(theme::SPACE_2)
+            .push(
+                text(&role.name)
+                    .size(theme::TEXT_13)
+                    .font(theme::JETBRAINS_MONO)
+                    .color(theme::TEXT_PRIMARY),
+            )
+            .push(
+                row![
+                    text(role.behavior.to_string())
+                        .size(theme::TEXT_11)
+                        .color(theme::TEXT_SECONDARY),
+                    text(format!("{} tools", role.tools.len()))
+                        .size(theme::TEXT_11)
+                        .color(theme::TEXT_SECONDARY),
+                ]
+                .spacing(theme::SPACE_10),
+            );
+
+        container(
+            row![
+                card_body.width(Length::Fill),
+                button(text("Edit").size(theme::TEXT_11))
+                    .style(theme::button_secondary)
+                    .on_press(SettingsMessage::CustomRolesMsg(
+                        custom_roles::CustomRolesMessage::OpenEdit(role.name.clone()),
+                    )),
+                button(text("Delete").size(theme::TEXT_11))
+                    .style(theme::button_danger)
+                    .on_press(SettingsMessage::CustomRolesMsg(
+                        custom_roles::CustomRolesMessage::DeleteRequest(role.name.clone()),
+                    )),
+            ]
+            .spacing(theme::SPACE_8)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(theme::PAD_8)
+        .style(theme::surface_card_style)
+        .into()
+    }
+
+    /// The custom-role create/edit window: the name field, the prompt editor,
+    /// the behaviour picker, the tool picker and the window's own error line.
+    fn custom_role_editor_window(
+        editor: &custom_roles::RoleEditor,
+    ) -> Element<'_, SettingsMessage> {
+        let is_new = editor.original.is_none();
+        let mut middle = Column::new().spacing(theme::SPACE_8);
+
+        // Editing never renames: the name is shown as a static row and the
+        // submit targets the record by the name it was opened on.
+        if let Some(original) = &editor.original {
+            middle = middle.push(field_row(
+                "Name",
+                text(original.clone()).size(theme::TEXT_13).into(),
+                None,
+            ));
+        }
+
+        // The prompt + behaviour + tool picker body is taller than a small
+        // window can show (≈450px against the window's 500px minimum height),
+        // so it scrolls inside a viewport sized to the height this window can
+        // spare. The title, the name row and the footer stay outside it, so
+        // Add/Save is reachable at every window size.
+        middle = middle.push(responsive(move |size| {
+            let cap = (size.height - CUSTOM_ROLE_DIALOG_CHROME).max(CUSTOM_ROLE_BODY_MIN_HEIGHT);
+            container(widgets::vscroll_sized(
+                Self::custom_role_body(editor),
+                Length::Fill,
+                Length::Shrink,
+            ))
+            .max_height(cap)
+            .into()
+        }));
+
+        if let Some(err) = &editor.error {
+            middle = middle.push(text(err).size(theme::TEXT_12).color(theme::STATUS_ERROR));
+        }
+
+        let name_field = [DialogField {
+            label: "Name",
+            placeholder: "role name",
+            value: &editor.name,
+            id: "custom_role_name",
+            on_input: |action| {
+                SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::Name(action))
+            },
+        }];
+        let fields: &[DialogField] = if is_new { &name_field } else { &[] };
+
+        modal_dialog(
+            if is_new {
+                "New custom role"
+            } else {
+                "Edit custom role"
+            }
+            .to_string(),
+            fields,
+            Some(middle.into()),
+            if is_new { "Add" } else { "Save" },
+            editor.in_flight,
+            !editor.name.text().is_empty() && !editor.prompt.text().is_empty() && !editor.in_flight,
+            SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::CloseEditor),
+            SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::SubmitEditor),
+        )
+    }
+
+    /// The scrolling body of the custom-role window: the authorial prompt, the
+    /// behaviour without an identifier and the tool picker.
+    fn custom_role_body(editor: &custom_roles::RoleEditor) -> Column<'_, SettingsMessage> {
+        let mut body = Column::new().spacing(theme::SPACE_8);
+
+        // The prompt: the administrator's authorial text, the whole definition
+        // of the role (built like the workspace notes editor).
+        let prompt_editor = super::editor_widget::EditorWidget::new(&editor.prompt)
+            .show_gutter(false)
+            .code_mode(false)
+            .enter(super::editor_widget::EnterBehavior::Newline)
+            .id(iced::widget::Id::from("custom_role_prompt"))
+            .placeholder("The authorial text that fully defines the role…")
+            .min_height(120.0)
+            .max_height(280.0)
+            .padding(theme::PAD_5);
+        let prompt_field: Element<'_, SettingsMessage> =
+            iced::Element::new(prompt_editor).map(|action| {
+                SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::Prompt(action))
+            });
+        body = body.push(
+            container(prompt_field)
+                .width(Length::Fill)
+                .height(Length::Shrink)
+                .style(theme::elevated_card_style),
+        );
+
+        // What the role does when it is launched without a branch identifier.
+        let behavior_pick = pick_list(BEHAVIORS, Some(editor.behavior), |behavior| {
+            SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::SetBehavior(behavior))
+        })
+        .text_size(theme::TEXT_13)
+        .style(theme::pick_list_style)
+        .menu_style(theme::pick_list_menu_style)
+        .width(Length::Fill);
+        body = body.push(field_row(
+            "Behaviour without an identifier",
+            behavior_pick.into(),
+            None,
+        ));
+
+        body.push(Self::custom_role_tool_picker(editor))
+    }
+
+    /// The custom-role tool picker: the window's catalogue plus any stored name
+    /// this installation cannot serve right now (e.g. `computer` on macOS),
+    /// marked and labelled as unavailable. The record's validators re-check a
+    /// newly marked name on save, so "validated while marking" is structural —
+    /// what can be marked is what a role may be given; an unserviceable name is
+    /// still offered because the launch omits it and the record keeps it, so it
+    /// must be visible to be removable.
+    fn custom_role_tool_picker(editor: &custom_roles::RoleEditor) -> Element<'_, SettingsMessage> {
+        let mut tool_rows = Column::new().spacing(theme::SPACE_2);
+        let unavailable = editor
+            .tools
+            .iter()
+            .filter(|tool| !editor.catalog.contains(&tool.as_str()));
+        let rows = editor
+            .catalog
+            .iter()
+            .map(|name| ((*name).to_string(), false))
+            .chain(unavailable.map(|name| (name.clone(), true)));
+        for (label, is_unavailable) in rows {
+            let shown = if is_unavailable {
+                format!("{label} (not available here)")
+            } else {
+                label.clone()
+            };
+            tool_rows = tool_rows.push(
+                checkbox(editor.tools.iter().any(|tool| tool == &label))
+                    .label(shown)
+                    .text_size(theme::TEXT_12)
+                    .style(theme::checkbox_style)
+                    .on_toggle(move |_| {
+                        SettingsMessage::CustomRolesMsg(
+                            custom_roles::CustomRolesMessage::ToggleTool(label.clone()),
+                        )
+                    }),
+            );
+        }
+        column![
+            text("Tools")
+                .size(theme::TEXT_13)
+                .color(theme::TEXT_SECONDARY),
+            widgets::vscroll_sized(tool_rows, Length::Fill, Length::Fixed(TOOL_PICKER_HEIGHT)),
+        ]
+        .spacing(theme::SPACE_4)
+        .into()
+    }
+
+    /// The custom-role delete confirmation: what the record's removal takes
+    /// with it.
+    fn custom_role_delete_dialog(name: &str) -> Element<'_, SettingsMessage> {
+        dialog::confirm_dialog(
+            dialog::dialog_title(format!("Delete custom role {name}?")),
+            dialog::dialog_body([
+                "This removes the role's record. Alarms addressed to it can no longer wake \
+                 anyone, and the role's continued branches can never be resumed.",
+            ]),
+            [
+                dialog::DialogAction::secondary(
+                    "Keep",
+                    SettingsMessage::CustomRolesMsg(
+                        custom_roles::CustomRolesMessage::DismissDelete,
+                    ),
+                ),
+                dialog::DialogAction::danger(
+                    "Delete",
+                    SettingsMessage::CustomRolesMsg(
+                        custom_roles::CustomRolesMessage::ConfirmDelete,
+                    ),
+                ),
+            ],
+        )
+        .into()
+    }
+
+    /// The overlay the custom roles area owns — the create/edit window, the
+    /// delete confirmation, or nothing. The settings page's overlay chain takes
+    /// `Option`s, so the closed state is `None` rather than a placeholder.
+    fn custom_roles_modal(&self) -> Option<Element<'_, SettingsMessage>> {
+        if let Some(editor) = &self.custom_roles_state.editor {
+            let dialog = Self::custom_role_editor_window(editor);
+            return Some(widgets::modal_backdrop(
+                dialog,
+                SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::CloseEditor),
+                0.5,
+            ));
+        }
+        if let Some(name) = self.custom_roles_state.delete_target.as_deref() {
+            let dialog = Self::custom_role_delete_dialog(name);
+            return Some(widgets::modal_backdrop(
+                dialog,
+                SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::DismissDelete),
+                0.5,
+            ));
+        }
+        None
+    }
+
     /// Render the Settings modal overlay: whichever of the add-workspace,
-    /// add-user, user delete-confirm, workspace diagnostics and custom-tool
-    /// details windows is open, or a type-stable placeholder when none is.
+    /// add-user, user delete-confirm, workspace diagnostics, custom-tool
+    /// details and custom-role editor / delete-confirm windows is open, or a
+    /// type-stable placeholder when none is.
     fn render_modal_overlay(&self) -> Element<'_, SettingsMessage> {
         if self.show_add_workspace_modal {
             let dialog = self.add_workspace_dialog();
@@ -2438,6 +2773,8 @@ impl SettingsState {
                 SettingsMessage::CustomToolsMsg(custom_tools::CustomToolsMessage::CloseDetails),
                 0.5,
             )
+        } else if let Some(roles_modal) = self.custom_roles_modal() {
+            roles_modal
         } else {
             // Keep Stack widget type stable
             iced::widget::stack([widgets::empty_stack_placeholder()]).into()

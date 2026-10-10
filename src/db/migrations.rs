@@ -49,12 +49,15 @@
 //! on-disk layout (see [`REBUILD_TICKET_TITLE_FTS_INDEX`]), and the tail's
 //! newest upfill is `47`, which adds the `jobs.exec_dir` column. The tail's
 //! newest entries are `48`, which merges the retired `in_diagnostics` stage
-//! into `verification`, `49`, which drops the stored workspace contexts that
-//! claim the project commands already ran before the round, and `50`, which
-//! rewrites the retired image-generation default to its successor in the
-//! picker list and in every account's pick.
+//! into `verification`, `49`, which drops the stored workspace contexts
+//! that claim the project commands already ran before the round, and `50`,
+//! which rewrites the retired image-generation default to its successor in the
+//! picker list and in every account's pick. The newest entries are the
+//! custom-role tail `51`–`53` (`custom_roles` plus the custom-role columns on
+//! `session_metadata` and `alarms`) and `54`, which adds `jobs.custom_launch`
+//! so a boot resume re-addresses a durable round to its custom branch.
 //!
-//! Future schema changes resume the chain at id `51` with monotonically
+//! Future schema changes resume the chain at id `55` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -116,11 +119,11 @@ pub(crate) struct Migration {
 /// on upgraded databases), not in this batch — the batch cannot reference a
 /// column that a later Rust delta adds.
 ///
-/// `jobs` is created WITH `caller_agent_id`, `mode` and `exec_dir` as its
-/// trailing columns, matching the shape the retired `ALTER TABLE ...` plus
-/// deltas `28`/`30`/`47` produce, so `idx_jobs_phase_ticket` (which references
-/// `jobs.ticket_id`) is safe to create in the same batch. Every statement
-/// is `IF NOT EXISTS`.
+/// `jobs` is created WITH `caller_agent_id`, `mode`, `exec_dir` and
+/// `custom_launch` as its trailing columns, matching the shape the retired
+/// `ALTER TABLE ...` plus deltas `28`/`30`/`47`/`54` produce, so
+/// `idx_jobs_phase_ticket` (which references `jobs.ticket_id`) is safe to
+/// create in the same batch. Every statement is `IF NOT EXISTS`.
 const BASELINE_CORE_SCHEMA: &str = "\
 -- ── Board (tickets, comments, counters) ────────────────────────────────
 CREATE TABLE IF NOT EXISTS tickets (
@@ -178,7 +181,10 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     token_length  INTEGER,
     message_count INTEGER NOT NULL DEFAULT 0,
     created_at    TEXT,
-    sleep_ended   TEXT
+    sleep_ended   TEXT,
+    custom_role   TEXT,
+    custom_identifier TEXT,
+    launch_stopped TEXT
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id             TEXT PRIMARY KEY,
@@ -195,7 +201,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     ticket_id      TEXT REFERENCES tickets(id),
     caller_agent_id TEXT,
     mode           TEXT,
-    exec_dir       TEXT
+    exec_dir       TEXT,
+    custom_launch  TEXT
 );
 CREATE TABLE IF NOT EXISTS agents (
     job_id     TEXT REFERENCES jobs(id) ON DELETE CASCADE,
@@ -311,7 +318,17 @@ CREATE TABLE IF NOT EXISTS alarms (
     next_fire_at     TEXT NOT NULL,
     status           TEXT NOT NULL DEFAULT 'active',
     created_at       TEXT NOT NULL,
-    trigger          TEXT
+    trigger          TEXT,
+    role             TEXT,
+    identifier       TEXT,
+    workspace        TEXT
+);
+CREATE TABLE IF NOT EXISTS custom_roles (
+    name       TEXT PRIMARY KEY,
+    prompt     TEXT NOT NULL,
+    tools      TEXT NOT NULL,
+    behavior   TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 -- ── Indexes ────────────────────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket_id ON ticket_comments(ticket_id);
@@ -613,6 +630,18 @@ UPDATE tickets SET phase = 'verification' WHERE phase = 'in_diagnostics';\
 UPDATE ticket_chronicle SET source_phase = 'verification' WHERE source_phase = 'in_diagnostics';\
 UPDATE ticket_chronicle SET target_phase = 'verification' WHERE target_phase = 'in_diagnostics';";
 
+/// Delta `51` (existing installs): the `custom_roles` table for
+/// administrator-defined agent roles. The baseline (`24`) already declares it,
+/// so on a fresh install this is `IF NOT EXISTS` no-op; on an existing install
+/// it creates the table.
+const CUSTOM_ROLES_TABLE: &str = "CREATE TABLE IF NOT EXISTS custom_roles (
+    name       TEXT PRIMARY KEY,
+    prompt     TEXT NOT NULL,
+    tools      TEXT NOT NULL,
+    behavior   TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);";
+
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
 /// Entries `24`–`26` are the consolidated current-shape baseline; entries
@@ -680,6 +709,18 @@ UPDATE ticket_chronicle SET target_phase = 'verification' WHERE target_phase = '
 ///   stored `image_gen_models` picker list and in every account's
 ///   `users.image_gen_model` pick, matched on the exact (trimmed) id, so a
 ///   near-miss id and the owner's other picks survive.
+/// - `51` adds the `custom_roles` table (fresh installs get it from entry
+///   `24`'s `CREATE TABLE`, so this is a no-op there).
+/// - `52` adds the `session_metadata.custom_role` /
+///   `session_metadata.custom_identifier` / `session_metadata.launch_stopped`
+///   columns (a no-op on fresh installs, whose baseline already declares them).
+/// - `53` adds the `alarms.role` / `alarms.identifier` / `alarms.workspace`
+///   columns that address an alarm to a custom role (a no-op on fresh installs,
+///   whose baseline already declares them).
+/// - `54` adds the nullable `jobs.custom_launch` column — the JSON
+///   [`crate::CustomRoleLaunch`] a durable round was dispatched by, so a boot
+///   resume re-addresses the round to the caller's custom branch (a no-op on
+///   fresh installs, whose baseline already declares it).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -815,6 +856,26 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "50",
         target: TargetDb::Core,
         body: MigrationBody::Rust(retire_old_image_gen_model),
+    },
+    Migration {
+        id: "51",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(CUSTOM_ROLES_TABLE),
+    },
+    Migration {
+        id: "52",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_session_metadata_custom_role),
+    },
+    Migration {
+        id: "53",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_alarms_custom_target),
+    },
+    Migration {
+        id: "54",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_jobs_custom_launch),
     },
 ];
 
@@ -1112,6 +1173,55 @@ fn add_jobs_exec_dir(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 /// re-runnable until recorded).
 async fn run_add_jobs_exec_dir(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "jobs", "exec_dir").await
+}
+
+fn add_session_metadata_custom_role(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_session_metadata_custom_role(conn))
+}
+
+/// Upfill the per-session `custom_role` (the custom-role record this session
+/// belongs to), `custom_identifier` (the named branch it continues, when it was
+/// named) and `launch_stopped` (its launch was stopped before it produced
+/// anything) columns for databases created before delta `52`. Fresh installs
+/// get the columns from entry `24`'s `CREATE TABLE`, so the probe makes this a
+/// no-op there. Guarded by [`add_column_if_missing`], so this body is
+/// idempotent (non-transactional like every Rust body, re-runnable until
+/// recorded).
+async fn run_add_session_metadata_custom_role(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "session_metadata", "custom_role").await?;
+    add_column_if_missing(conn, "session_metadata", "custom_identifier").await?;
+    add_column_if_missing(conn, "session_metadata", "launch_stopped").await
+}
+
+fn add_alarms_custom_target(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_alarms_custom_target(conn))
+}
+
+/// Upfill the nullable `alarms.role` / `alarms.identifier` / `alarms.workspace`
+/// columns for databases created before delta `53` — the custom role, its
+/// branch identifier and the workspace an alarm is addressed to. Fresh installs
+/// get the columns from entry `24`'s `CREATE TABLE`, so the probe makes this a
+/// no-op there. Guarded by [`add_column_if_missing`], so this body is
+/// idempotent (non-transactional like every Rust body, re-runnable until
+/// recorded).
+async fn run_add_alarms_custom_target(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "alarms", "role").await?;
+    add_column_if_missing(conn, "alarms", "identifier").await?;
+    add_column_if_missing(conn, "alarms", "workspace").await
+}
+
+fn add_jobs_custom_launch(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_jobs_custom_launch(conn))
+}
+
+/// Upfill the nullable `jobs.custom_launch` column for databases created
+/// before delta `54` — the JSON [`crate::CustomRoleLaunch`] a durable round was
+/// dispatched by (`NULL` for every built-in caller). Fresh installs get the
+/// column from entry `24`'s `CREATE TABLE`, so the probe makes this a no-op
+/// there. Guarded by [`add_column_if_missing`], so this body is idempotent
+/// (non-transactional like every Rust body, re-runnable until recorded).
+async fn run_add_jobs_custom_launch(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "jobs", "custom_launch").await
 }
 
 fn add_session_metadata_sleep_ended(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1683,6 +1793,9 @@ mod tests {
                 "status",
                 "created_at",
                 "trigger",
+                "role",
+                "identifier",
+                "workspace",
             ],
         ),
         (
@@ -1705,6 +1818,10 @@ mod tests {
         (
             "config_model_routing",
             &["model", "provider_order", "allow_fallbacks"],
+        ),
+        (
+            "custom_roles",
+            &["name", "prompt", "tools", "behavior", "created_at"],
         ),
         (
             "editor_tabs",
@@ -1735,6 +1852,7 @@ mod tests {
                 "caller_agent_id",
                 "mode",
                 "exec_dir",
+                "custom_launch",
             ],
         ),
         (
@@ -1757,6 +1875,9 @@ mod tests {
                 "message_count",
                 "created_at",
                 "sleep_ended",
+                "custom_role",
+                "custom_identifier",
+                "launch_stopped",
             ],
         ),
         (
@@ -2010,6 +2131,21 @@ mod tests {
         expected_core_table_names()
             .into_iter()
             .filter(|n| *n != "schema_migrations")
+            .collect()
+    }
+
+    /// Tables a reopen introduces which the pre-reopen fixture cannot carry
+    /// (delta `51`'s `custom_roles`). They have no "before" row count to
+    /// compare, so the reopen snapshot skips them; their arrival is asserted by
+    /// the schema comparison instead.
+    const REOPEN_NEW_CORE_TABLES: &[&str] = &["custom_roles"];
+
+    /// Domain tables whose row counts a reopen snapshot compares: every
+    /// expected domain table except the ones the reopen introduces.
+    fn counted_core_domain_tables() -> Vec<&'static str> {
+        expected_core_domain_tables()
+            .into_iter()
+            .filter(|n| !REOPEN_NEW_CORE_TABLES.contains(n))
             .collect()
     }
 
@@ -2864,10 +3000,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             applied,
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-                "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50"
+                "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
+                "54"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–50 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–54 tail exactly"
         );
     }
 
@@ -3041,7 +3178,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             tables: table_defs(conn).await,
             indexes: index_defs(conn).await,
             cols: column_sets(conn, &expected_core_table_names()).await,
-            counts: table_row_counts(conn, &expected_core_domain_tables()).await,
+            counts: table_row_counts(conn, &counted_core_domain_tables()).await,
             chat: conn
                 .query("SELECT content FROM chat_history", ())
                 .await
@@ -3075,9 +3212,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// Assert that reopening the core catalog leaves the database unchanged,
     /// except for `except_tables`, whose table DDL and column set may differ on
     /// reopen (the delta-27 `workspaces` column upfill, the delta-28
-    /// `jobs`/`session_metadata` column upfills), and `except_indexes`, whose
-    /// definitions may be added on reopen. Row counts, `chat_history` content
-    /// and `tickets` content are asserted to be strictly unchanged.
+    /// `jobs`/`session_metadata` column upfills, the delta-47 `jobs.exec_dir`
+    /// column and the delta-54 `jobs.custom_launch` column, and the
+    /// delta-51/52/53 tail — `custom_roles` plus the custom-role columns on
+    /// `session_metadata` and
+    /// `alarms`), and `except_indexes`, whose definitions may be added on
+    /// reopen. Row counts, `chat_history` content and `tickets` content are
+    /// asserted to be strictly unchanged.
     async fn assert_core_catalog_unchanged(
         conn: &Connection,
         before: &CoreSnapshot,
@@ -3103,7 +3244,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "core column sets (except {except_tables:?}) must be unchanged on reopen"
         );
         assert_eq!(
-            table_row_counts(conn, &expected_core_domain_tables()).await,
+            table_row_counts(conn, &counted_core_domain_tables()).await,
             before.counts,
             "core row counts must be unchanged on reopen"
         );
@@ -3187,7 +3328,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50",
+            "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
+            "54",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3196,7 +3338,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..50"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..54"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -3204,7 +3346,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         // jobs.mode (delta 30), session_metadata.sleep_ended (delta 31),
         // alarms.command (delta 32, retired by deltas 41/42/43),
         // chat_history.broadcast_id (delta 33),
-        // tickets/ticket_chronicle (delta 34) and jobs.exec_dir (delta 47)
+        // tickets/ticket_chronicle (delta 34), jobs.exec_dir (delta 47),
+        // jobs.custom_launch (delta 54) and the
+        // custom-role tail (delta 51's `custom_roles` table plus the
+        // session_metadata/alarms columns of deltas 52/53)
         // change in shape and the delta-28
         // `idx_jobs_caller_agent` index is added. Delta `36` rewrites
         // `users.selected_workspace` data (detaching the seeded guest),
@@ -3224,6 +3369,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "chat_history",
                 "tickets",
                 "ticket_chronicle",
+                // Introduced by delta 51 — absent from the pre-reopen fixture.
+                "custom_roles",
             ],
             &["idx_jobs_caller_agent"],
         )
@@ -3240,17 +3387,22 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_jobs_cols.push("caller_agent_id".to_string());
         expected_jobs_cols.push("mode".to_string());
         expected_jobs_cols.push("exec_dir".to_string());
+        expected_jobs_cols.push("custom_launch".to_string());
         assert_eq!(
             after_jobs_cols["jobs"], expected_jobs_cols,
-            "reopen must append exactly caller_agent_id/mode/exec_dir to jobs columns"
+            "reopen must append exactly caller_agent_id/mode/exec_dir/custom_launch to jobs columns"
         );
         let after_sm_cols = column_sets(&conn, &["session_metadata"]).await;
         let mut expected_sm_cols = before.cols["session_metadata"].clone();
         expected_sm_cols.push("created_at".to_string());
         expected_sm_cols.push("sleep_ended".to_string());
+        expected_sm_cols.push("custom_role".to_string());
+        expected_sm_cols.push("custom_identifier".to_string());
+        expected_sm_cols.push("launch_stopped".to_string());
         assert_eq!(
             after_sm_cols["session_metadata"], expected_sm_cols,
-            "reopen must append exactly created_at/sleep_ended to session_metadata columns"
+            "reopen must append exactly created_at/sleep_ended/custom_role/custom_identifier/\
+             launch_stopped to session_metadata columns"
         );
         let after_users_cols = column_sets(&conn, &["users"]).await;
         let mut expected_users_cols = before.cols["users"].clone();
@@ -3266,9 +3418,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let after_alarms_cols = column_sets(&conn, &["alarms"]).await;
         let mut expected_alarms_cols = before.cols["alarms"].clone();
         expected_alarms_cols.push("trigger".to_string());
+        expected_alarms_cols.push("role".to_string());
+        expected_alarms_cols.push("identifier".to_string());
+        expected_alarms_cols.push("workspace".to_string());
         assert_eq!(
             after_alarms_cols["alarms"], expected_alarms_cols,
-            "reopen must trade command (delta 32) for trigger (deltas 42/43) on alarms columns"
+            "reopen must trade command (delta 32) for trigger (deltas 42/43) and add the \
+             custom-role target columns (delta 53) on alarms columns"
         );
         let after_chat_cols = column_sets(&conn, &["chat_history"]).await;
         let mut expected_chat_cols = before.cols["chat_history"].clone();
@@ -3394,7 +3550,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
     /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
     /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
-    /// entries `36`–`50`: the data migrations (detaching guests from
+    /// entries `36`–`54`: the data migrations (detaching guests from
     /// shared workspaces, rewriting the legacy `DeepSeek` routing slug,
     /// deleting the command-armed alarm rows, rewriting the retired
     /// `in_review`/`in_qa` stages to `verification`, invalidating the
@@ -3402,8 +3558,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// replacing the retired image-generation model in the picker list and in
     /// the account picks), the `users.granted_tools`
     /// column, the drops of the account-kind `users.permissions` /
-    /// `users.selected_role` columns, and the `alarms.trigger` upfill plus the
-    /// `alarms.command` drop that retire the command-armed alarm feature.
+    /// `users.selected_role` columns, the `alarms.trigger` upfill plus the
+    /// `alarms.command` drop that retire the command-armed alarm feature, the
+    /// custom-role tail (`custom_roles` plus the `session_metadata` and
+    /// `alarms` columns), and the `jobs.exec_dir` / `jobs.custom_launch`
+    /// columns.
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
@@ -3456,6 +3615,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                     && *n != "tickets"
                     && *n != "ticket_chronicle"
                     && *n != "schema_migrations"
+                    // Introduced by delta `51` — absent before the upgrade.
+                    && *n != "custom_roles"
             })
             .collect();
         let before_other = column_sets(&conn, &untouched_tables).await;
@@ -3505,7 +3666,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
-            "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50",
+            "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
+            "54",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3514,7 +3676,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..50"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..54"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -3565,7 +3727,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
              (delta 30), session_metadata.sleep_ended (delta 31), \
              alarms.command → trigger (deltas 32/41/42/43) and \
              tickets/ticket_chronicle (delta 34) \
-             columns may change on the 0.5.0 upgrade"
+             columns may change on the 0.5.0 upgrade (plus the custom-role \
+             columns of deltas 52/53)"
         );
     }
 

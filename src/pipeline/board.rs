@@ -1691,6 +1691,8 @@ impl BoardStore {
                 reply_target: None,
                 pending_job_id: None,
                 originating_workspace: None,
+                custom_role: None,
+                reply_to_custom: None,
             };
 
             if crate::agent::message_router::try_route(&agent_id, job) {

@@ -446,6 +446,10 @@ impl Tool for ResearchTool {
         let caller_role = self.caller_role;
         let user_name = crate::agent::tool_user_name();
         let channel = crate::agent::tool_channel();
+        // Read the caller's custom-role launch synchronously before the spawn
+        // (task-local contract): the round's envelope and job row must carry the
+        // custom branch when the caller is a custom role.
+        let custom = crate::agent::tool_custom_launch();
         let job_id = crate::generate_id();
         let ack = format!(
             "Deep research dispatched (job {job_id}). One report will be delivered when the run completes."
@@ -463,6 +467,7 @@ impl Tool for ResearchTool {
                     user_name.clone(),
                     channel.clone(),
                     &job_id,
+                    custom.clone(),
                 )
                 .await
             })
@@ -495,10 +500,12 @@ impl Tool for ResearchTool {
                         user_name,
                         channel,
                         kind: MessageKind::ResearchResult,
-                        role: caller_role,
+                        role: caller_role.for_launch(custom.as_ref()),
                         reply_target: None,
                         pending_job_id: Some(job_id),
                         originating_workspace: None,
+                        custom_role: custom,
+                        reply_to_custom: None,
                     }
                 }
             };
@@ -532,12 +539,17 @@ async fn dispatch_durable_research(
     user_name: String,
     channel: String,
     job_id: &str,
+    custom: Option<crate::CustomRoleLaunch>,
 ) -> Option<AgentJob> {
     // The run's cancel signal lives for the whole invocation — fresh dispatch
     // and its terminalization tail. A manual cancel from the Running Agents
     // page fires it; the orchestrator's boundary gates observe it and stop
     // permanently (ResearchExit::Cancelled).
     let _cancel_guard = crate::research_cancel::register(job_id);
+    // A round dispatched by a custom role owns a custom branch address — its
+    // jobs row and result envelope must say `Role::Custom` plus the launch, not
+    // the tool's construction role.
+    let caller_role = caller_role.for_launch(custom.as_ref());
     let spawn = async {
         // SPAWN: one tx — jobs + research_jobs child row (the shared in-tx
         // child pattern; a crash mid-spawn leaves either all or none).
@@ -553,6 +565,7 @@ async fn dispatch_durable_research(
             &crate::jobs::SpawnChild::Research,
             None,
             None,
+            custom.as_ref(),
         )
         .await
     };
@@ -599,6 +612,7 @@ async fn dispatch_durable_research(
         &user_name,
         &channel,
         spawned,
+        custom,
     )
     .await
 }
@@ -645,6 +659,7 @@ async fn terminalize_research(
     user_name: &str,
     channel: &str,
     spawned: bool,
+    custom: Option<crate::CustomRoleLaunch>,
 ) -> Option<AgentJob> {
     // Manual-cancel gate BEFORE any artifact is written: a cancel that landed
     // after the orchestrator's last boundary check (mid-terminalization) must
@@ -683,6 +698,7 @@ async fn terminalize_research(
         user_name,
         channel,
         &ws.name,
+        custom,
     )
     .await;
     // Defensive post-completion gate: the in-tx cancel gate in
@@ -742,6 +758,7 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
     else {
         return;
     };
+    let custom = caller.custom_launch.as_deref().cloned();
     let result = match run_deep_research(ws, &caller.task, job_id, true).await {
         ResearchExit::Aborted => {
             tracing::info!(
@@ -771,6 +788,7 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
         &caller.user_name,
         &caller.channel,
         true,
+        custom,
     )
     .await
     else {
@@ -3760,6 +3778,7 @@ mod tests {
             "caller-user",
             "telegram",
             false,
+            None,
         )
         .await
         .expect("spawn failure still delivers an error envelope");

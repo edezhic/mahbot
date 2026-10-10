@@ -22,7 +22,13 @@
 //!
 //! - [`Role::Manager`] responses relay to the admin's Assistant via
 //!   the durable `<manager-message>` envelope ([`route_manager_notify`]) —
-//!   there is no direct user delivery.
+//!   there is no direct user delivery. When the Manager answers a custom-role
+//!   caller, the reply instead returns into that branch
+//!   ([`route_manager_reply_to_custom`]).
+//! - [`Role::Custom`] responses relay to the admin's Assistant the same way,
+//!   via the durable `<custom-role-message>` envelope
+//!   ([`route_custom_role_notify`] / [`route_custom_role_failure`]) — a custom
+//!   role delivers nothing to the owner's channels.
 //! - Other roles deliver to the triggering user's channel bindings (with an
 //!   unregistered-user fallback).
 
@@ -101,6 +107,13 @@ pub enum MessageKind {
     /// pending rows deserializable at boot replay.
     #[serde(alias = "ManagerReply")]
     ManagerNotify,
+    /// A custom role's finished answer or its failure, routed into the admin's
+    /// Assistant session (`<custom-role-message>` envelope; the job's workspace
+    /// is the admin's personal one, the folder the launch ran in travels only in
+    /// the envelope's `workspace` attribute). Durable — produced through
+    /// `stamp_and_route`. Deliberately distinct from `UserMessage` so the
+    /// failure-emoji gate (`== UserMessage`) structurally excludes it.
+    CustomRoleNotify,
 }
 
 /// A single unit of work for an agent consumer.
@@ -135,6 +148,27 @@ pub struct AgentJob {
     /// relaying Assistant sits in the admin's personal workspace.
     #[serde(default)]
     pub originating_workspace: Option<String>,
+    /// The custom-role launch this job runs, when the role is [`Role::Custom`]:
+    /// the authorial definition taken at launch plus the resolved branch
+    /// address. `#[serde(default)]` keeps already-persisted `pending_jobs`
+    /// envelopes (which predate the field) decodable at boot replay.
+    #[serde(default)]
+    pub custom_role: Option<crate::CustomRoleLaunch>,
+    /// A Manager-bound request dispatched by a custom role: the Manager's
+    /// answer returns into that branch instead of the admin's Assistant (see
+    /// [`route_manager_reply_to_custom`]). `None` for every other job.
+    #[serde(default)]
+    pub reply_to_custom: Option<ManagerReply>,
+}
+
+/// Where a Manager's answer must go when the requesting caller was a custom
+/// role: back into the asking branch, in the folder that turn ran in.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManagerReply {
+    pub launch: crate::CustomRoleLaunch,
+    /// The folder the asking turn runs in — the branch's own folder, so the
+    /// answer re-enters the same conversation in the same place.
+    pub workspace: String,
 }
 
 // ── Global router ─────────────────────────────────────────────────────────
@@ -281,10 +315,12 @@ pub async fn route_user_message(
         reply_target,
         pending_job_id: None,
         originating_workspace: None,
+        custom_role: None,
+        reply_to_custom: None,
     };
 
     // DURABLE kinds = UserMessage (manager-bound), AgentMessage, ManagerNotify,
-    // AnalyzeToolResult, ResearchResult.
+    // CustomRoleNotify, AnalyzeToolResult, ResearchResult.
     if job.role == Role::Manager {
         stamp_and_route(job, &agent_id, "manager message").await;
         return;
@@ -314,7 +350,7 @@ async fn persist_and_stamp(job: &mut AgentJob) -> anyhow::Result<()> {
 /// has already stopped pulling, so the message can still be lost at
 /// exit — the fix primarily closes the silent-drop on the normal-path
 /// double fault, not the drain window.
-async fn stamp_and_route(mut job: AgentJob, target: &str, producer: &str) {
+pub(crate) async fn stamp_and_route(mut job: AgentJob, target: &str, producer: &str) {
     let persisted = match persist_and_stamp(&mut job).await {
         Ok(()) => true,
         Err(e) => {
@@ -334,7 +370,12 @@ async fn stamp_and_route(mut job: AgentJob, target: &str, producer: &str) {
 
 /// Build the `<assistant-message>` envelope job addressed to the workspace
 /// Manager (`MessageKind::AgentMessage`, durable).
-fn agent_message_job(content: String, workspace_name: String, user_name: &str) -> AgentJob {
+fn agent_message_job(
+    content: String,
+    workspace_name: String,
+    user_name: &str,
+    reply_to: Option<ManagerReply>,
+) -> AgentJob {
     let user_name =
         crate::session::normalize_user_name(user_name, "route_agent_message_to_manager")
             .to_string();
@@ -348,19 +389,24 @@ fn agent_message_job(content: String, workspace_name: String, user_name: &str) -
         reply_target: None,
         pending_job_id: None,
         originating_workspace: None,
+        custom_role: None,
+        reply_to_custom: reply_to,
     }
 }
 
 /// Route a message from an assistant agent into the workspace Manager's
-/// session (`MessageKind::AgentMessage`). No addressed reply leg anymore — the
-/// Manager's response auto-delivers to the admin's Assistant via
-/// [`route_manager_notify`].
+/// session (`MessageKind::AgentMessage`). For a non-custom caller there is no
+/// addressed reply leg — the Manager's response auto-delivers to the admin's
+/// Assistant via [`route_manager_notify`]. A Manager-bound request from a custom
+/// role DOES have one: `reply_to` carries the asking branch, and the answer
+/// re-enters it via [`route_manager_reply_to_custom`].
 pub async fn route_agent_message_to_manager(
     content: String,
     workspace_name: String,
     user_name: String,
+    reply_to: Option<ManagerReply>,
 ) {
-    let job = agent_message_job(content, workspace_name, &user_name);
+    let job = agent_message_job(content, workspace_name, &user_name, reply_to);
     let target = crate::jobs::envelope_target(&job);
     stamp_and_route(job, &target, "agent message").await;
 }
@@ -414,6 +460,8 @@ pub(crate) async fn deliver_assistant_notice(
         reply_target: None,
         pending_job_id: None,
         originating_workspace: None,
+        custom_role: None,
+        reply_to_custom: None,
     };
     let durable = persist_and_stamp(&mut job).await;
     route(agent_id, job);
@@ -512,6 +560,11 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             }
         };
 
+        // A launch and the role are one fact: derive the role from the launch
+        // FIRST, so a job built without the derivation cannot smuggle a launch
+        // past the pinning rule below or the custom-role guard that follows.
+        job.role = job.role.for_launch(job.custom_role.as_ref());
+
         // Execution-time invariant: pinned roles (Assistant)
         // never run outside the user's personal workspace, no matter what the
         // producer stored. Empty-user envelopes for pinned roles are refused
@@ -530,6 +583,45 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         };
         job.workspace_name = pinned_ws;
 
+        // A custom-role job is meaningless without its launch — the record's
+        // prompt, tool subset and branch address all travel in it — and a
+        // branch whose record has since been deleted must never be resumed
+        // with a definition that no longer exists (a round the role dispatched
+        // may still complete after the delete). Both are refused here, in the
+        // one funnel every producer goes through, and the durable pending row
+        // is reclaimed so boot replay does not resurrect them. The cost is one
+        // primary-key lookup per custom-role turn.
+        if job.role == Role::Custom {
+            let refusal = match job.custom_role.as_ref() {
+                None => Some("the job carries no custom-role launch"),
+                Some(launch) => match crate::custom_role::get(&launch.name).await {
+                    Ok(Some(_)) => None,
+                    Ok(None) => Some("the custom role no longer exists"),
+                    Err(e) => {
+                        // A transient read failure is not a verdict about the
+                        // role: run the turn and let the error surface wherever
+                        // the turn itself needs the store.
+                        warn!(
+                            agent_id = %agent_id,
+                            role = %launch.name,
+                            error = %e,
+                            "Message router: custom role lookup failed — running the turn anyway",
+                        );
+                        None
+                    }
+                },
+            };
+            if let Some(refusal) = refusal {
+                warn!(
+                    agent_id = %agent_id,
+                    reason = %refusal,
+                    "Message router: refusing a custom-role job",
+                );
+                confirm_pending_delivery(&job).await;
+                continue;
+            }
+        }
+
         debug!(
             agent_id = %agent_id,
             workspace = %job.workspace_name,
@@ -547,6 +639,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                     workspace = %job.workspace_name,
                     "Message router: workspace not found — skipping job",
                 );
+                report_unrunnable_custom_role(&job).await;
                 continue;
             }
             Err(e) => {
@@ -589,8 +682,10 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         // ── Resolve users for response delivery ───────────────────────
         // Non-Manager roles deliver to the specific triggering user. The
         // Manager has no direct user delivery: its responses relay to the
-        // admin's Assistant via the ManagerNotify envelope below.
-        let users: Vec<UserRecord> = if role == Role::Manager {
+        // admin's Assistant via the ManagerNotify envelope below. A custom
+        // role delivers nothing to the owner's channels either — its answer
+        // goes to the admin's Assistant via the CustomRoleNotify envelope.
+        let users: Vec<UserRecord> = if matches!(role, Role::Manager | Role::Custom) {
             Vec::new()
         } else {
             match resolve_single_user(&job.user_name).await {
@@ -637,12 +732,30 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
 
         // ── Run the agent ─────────────────────────────────────────────
         // The admin gets the Assistant's widened toolset and role prompt;
-        // everyone else runs the guest Assistant. Manager jobs resolve no
-        // users, so `is_admin` is always false there — inert for this role
-        // (nothing in the Manager toolset or prompt gates on it).
+        // everyone else runs the guest Assistant.
+        // Manager and custom-role jobs resolve no users, so `is_admin` is false
+        // for both — and nothing reads it for either: a custom role's strength
+        // comes from its own tool subset (`Role::custom_role_tools`), not from
+        // this flag.
         let is_admin = users
             .first()
             .is_some_and(|user| crate::users::is_admin_name(&user.name));
+        // The Running Agents grouping for this job: a custom-role launch is one
+        // conversation keyed by its own agent id, with the display label naming
+        // the role and (when named) its branch. Everything else stays
+        // ungrouped, exactly as before.
+        let (parent_key, parent_label) = match &job.custom_role {
+            Some(launch) => (
+                Some(crate::agent::registry::ParentKey::CustomLaunch(
+                    launch.agent_id.clone(),
+                )),
+                Some(crate::custom_role::display_label(
+                    &launch.name,
+                    launch.identifier.as_deref(),
+                )),
+            ),
+            None => (None, None),
+        };
         let (agent, response) = crate::agent::run_agent(
             agent_id.clone(),
             role,
@@ -655,8 +768,9 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             None,
             false,
             None,
-            None,
-            None,
+            parent_key,
+            parent_label,
+            job.custom_role.clone(),
         )
         .await;
 
@@ -668,6 +782,22 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         broadcast_typing(&users, &job.workspace_name, false);
 
         let Some(response) = response else {
+            // A custom role's failure produces no answer: deliver the durable
+            // failure notice to the admin's Assistant — never the emoji, never
+            // anything to the owner. Guarded exactly like the emoji branch: a
+            // deliberately stopped or drained launch stays silent. The two arms
+            // are mutually exclusive: a custom role must NEVER also emit the
+            // generic failure emoji into the owner's channel.
+            if role == Role::Custom {
+                if !agent.is_cancelled() && !crate::shutdown::aborting() {
+                    let name = job
+                        .custom_role
+                        .as_ref()
+                        .map(|c| c.name.as_str())
+                        .unwrap_or_default();
+                    route_custom_role_failure(name, &job.workspace_name).await;
+                }
+            }
             // Send emoji error only for UserMessage jobs where the agent truly
             // failed (not cancelled or shutdown). Internal job kinds
             // (TicketNotify, AnalyzeToolResult, ResearchResult, ManagerNotify)
@@ -681,7 +811,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             // Drained agents must NOT emit the failure emoji: their round was
             // cut short by the graceful-drain window (or shutdown), not a
             // failure.
-            if job.kind == MessageKind::UserMessage
+            else if job.kind == MessageKind::UserMessage
                 && !agent.is_cancelled()
                 && !crate::shutdown::aborting()
             {
@@ -702,12 +832,28 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
 
         // ── Response delivery ─────────────────────────────────────────
         // Manager: the sole delivery path is the durable <manager-message>
-        // envelope into the admin's personal Assistant.
+        // envelope into the admin's personal Assistant — unless the Manager was
+        // answering a custom-role caller, in which case the answer delivers
+        // back into that branch.
+        // A custom role: the durable <custom-role-message> envelope into the
+        // admin's personal Assistant (the folder the launch ran in travels in
+        // the envelope's `workspace` attribute).
         // Other roles: broadcast to all of the triggering user's channel
         // bindings (or use fallback for unregistered users).
         match role {
-            Role::Manager => {
-                route_manager_notify(&response, &job.workspace_name).await;
+            Role::Manager => match job.reply_to_custom.clone() {
+                Some(reply) => {
+                    route_manager_reply_to_custom(&response, &job.workspace_name, &reply).await;
+                }
+                None => route_manager_notify(&response, &job.workspace_name).await,
+            },
+            Role::Custom => {
+                let name = job
+                    .custom_role
+                    .as_ref()
+                    .map(|c| c.name.as_str())
+                    .unwrap_or_default();
+                route_custom_role_notify(&response, name, &job.workspace_name).await;
             }
             _ => {
                 if users.is_empty() {
@@ -725,15 +871,17 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
 /// Consumer-confirmed delivery: delete the durable pending_jobs row after the
 /// agent ran (at-least-once boundary — the row is created before routing and
 /// reclaimed only here or by boot replay). Also invoked on the
-/// pin-refusal path (a pinned-role envelope with an empty user): the consumer
-/// accept-and-discards the job, and the row is reclaimed here so boot replay
-/// does not resurrect it. One sync retry on failure, then
-/// log-and-continue: residual duplicate re-delivery at next boot is bounded
-/// and accepted. Never called on workspace-not-found (the consumer skips the
-/// job) — a pending row for a deleted workspace re-routes and consumer-skips
-/// at every boot until the workspace returns; bounded and accepted (purge
-/// reclaims only `jobs`, never `pending_jobs` — the at-least-once guarantee
-/// keeps unconfirmed rows alive).
+/// pin-refusal path (a pinned-role envelope with an empty user), the
+/// custom-role refusal path, and an unrunnable custom-role launch
+/// ([`report_unrunnable_custom_role`]): the consumer accept-and-discards the
+/// job, and the row is reclaimed here so boot replay does not resurrect it. One
+/// sync retry on failure, then log-and-continue: residual duplicate
+/// re-delivery at next boot is bounded and accepted. Never called on
+/// workspace-not-found for a built-in role (the consumer skips the job) — a
+/// pending row for a deleted workspace re-routes and consumer-skips at every
+/// boot until the workspace returns; bounded and accepted (purge reclaims only
+/// `jobs`, never `pending_jobs` — the at-least-once guarantee keeps unconfirmed
+/// rows alive).
 async fn confirm_pending_delivery(job: &AgentJob) {
     let Some(id) = job.pending_job_id.as_deref() else {
         return;
@@ -757,6 +905,25 @@ async fn confirm_pending_delivery(job: &AgentJob) {
             }
         }
     }
+}
+
+/// Report a custom-role job that cannot run because the folder its launch names
+/// is gone — the rule being that an unrunnable launch is reported to the admin's
+/// Assistant, naming the role and the folder it was launched into, never to the
+/// owner directly and never to a guest. The durable pending row is reclaimed
+/// with the notice, because the reported failure IS the delivery.
+///
+/// Only the positively-gone case reports: a transient store failure on the
+/// lookup above is not a verdict about the folder, so it keeps the plain skip
+/// (the pending row survives and re-routes). No-op for a built-in role, whose
+/// pending row is deliberately kept so it re-routes when the workspace returns
+/// (see [`confirm_pending_delivery`]).
+async fn report_unrunnable_custom_role(job: &AgentJob) {
+    let Some(launch) = job.custom_role.as_ref() else {
+        return;
+    };
+    route_custom_role_failure(&launch.name, &job.workspace_name).await;
+    confirm_pending_delivery(job).await;
 }
 
 // ── Typing helpers ────────────────────────────────────────────────────────
@@ -886,9 +1053,106 @@ async fn route_manager_notify(response: &str, source_workspace: &str) {
         reply_target: None,
         pending_job_id: None,
         originating_workspace: Some(source_workspace.to_string()),
+        custom_role: None,
+        reply_to_custom: None,
     };
     let target = crate::jobs::envelope_target(&job);
     stamp_and_route(job, &target, "manager notify envelope").await;
+}
+
+/// Deliver a Manager's answer back into the custom-role branch that asked for
+/// it — the mirror image of the analyze/implement/research result envelopes:
+/// the job carries the branch address (via its launch) and the folder the
+/// asking turn ran in, and is tagged `<manager-message>` because that is the
+/// shape `send_message_to_manager` promises its caller.
+async fn route_manager_reply_to_custom(
+    response: &str,
+    source_workspace: &str,
+    reply: &ManagerReply,
+) {
+    if response.is_empty() {
+        return;
+    }
+    let content = crate::prompt::substitute(
+        &crate::prompt::load_prompt("manager_message.md"),
+        &[
+            ("{{workspace}}", source_workspace),
+            ("{{message}}", response),
+        ],
+    );
+    let job = AgentJob {
+        content,
+        workspace_name: reply.workspace.clone(),
+        user_name: crate::users::ADMIN_USER_NAME.to_string(),
+        channel: "gui".to_string(),
+        kind: MessageKind::ManagerNotify,
+        role: Role::Custom,
+        reply_target: None,
+        pending_job_id: None,
+        originating_workspace: None,
+        custom_role: Some(reply.launch.clone()),
+        reply_to_custom: None,
+    };
+    let target = crate::jobs::envelope_target(&job);
+    stamp_and_route(job, &target, "manager reply envelope").await;
+}
+
+/// The durable `<custom-role-message>` envelope addressed to the admin's
+/// Assistant — the shape both [`route_custom_role_notify`] and
+/// [`route_custom_role_failure`] share. The job targets the admin's personal
+/// workspace; the folder the launch ran in travels only in
+/// `originating_workspace`.
+fn custom_role_notify_job(content: String, source_workspace: &str) -> AgentJob {
+    AgentJob {
+        content,
+        // The admin's own personal workspace; the consumer loop re-validates
+        // the pinning invariant, so no re-pinning is needed here.
+        workspace_name: crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+        user_name: crate::users::ADMIN_USER_NAME.to_string(),
+        channel: "gui".to_string(),
+        kind: MessageKind::CustomRoleNotify,
+        role: Role::Assistant,
+        reply_target: None,
+        pending_job_id: None,
+        originating_workspace: Some(source_workspace.to_string()),
+        custom_role: None,
+        reply_to_custom: None,
+    }
+}
+
+/// Deliver a finished custom role's answer into the admin Assistant's session
+/// (`<custom-role-message>` envelope, `MessageKind::CustomRoleNotify`), message
+/// kind durable. `source_workspace` is the folder the launch ran in and travels
+/// in `originating_workspace`, so a file/media reference in the answer is
+/// validated against the folder it was produced in. An empty answer delivers
+/// nothing.
+async fn route_custom_role_notify(response: &str, role_name: &str, source_workspace: &str) {
+    if response.is_empty() {
+        return;
+    }
+    let content = crate::prompt::substitute(
+        &crate::prompt::load_prompt("custom_role_message.md"),
+        &[
+            ("{{role}}", role_name),
+            ("{{workspace}}", source_workspace),
+            ("{{message}}", response),
+        ],
+    );
+    let job = custom_role_notify_job(content, source_workspace);
+    let target = crate::jobs::envelope_target(&job);
+    stamp_and_route(job, &target, "custom role notify envelope").await;
+}
+
+/// Deliver the notice that a custom role's launch failed, naming the role and
+/// the folder it ran in. Nothing goes to the owner directly.
+async fn route_custom_role_failure(role_name: &str, source_workspace: &str) {
+    let content = crate::prompt::substitute(
+        &crate::prompt::load_prompt("custom_role_failure.md"),
+        &[("{{role}}", role_name), ("{{workspace}}", source_workspace)],
+    );
+    let job = custom_role_notify_job(content, source_workspace);
+    let target = crate::jobs::envelope_target(&job);
+    stamp_and_route(job, &target, "custom role failure envelope").await;
 }
 
 /// Transport-deliver `response` to every channel binding of `users`
@@ -1104,6 +1368,8 @@ mod tests {
             reply_target: None,
             pending_job_id: None,
             originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
         }
     }
 
@@ -1291,6 +1557,32 @@ mod tests {
         );
     }
 
+    /// A path that is a registered workspace's own folder resolves to that
+    /// workspace — not to a separate path-named area over the same tree — so a
+    /// launch addressed by path still runs with the workspace's notes, its pause
+    /// state and its search engine.
+    #[tokio::test]
+    #[serial_test::serial(provider)]
+    async fn test_resolve_workspace_path_of_registered_workspace() {
+        crate::util::test::init_management_test_stores().await;
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        // The spelling `workspace::add` writes: canonical, trailing separator.
+        let stored = format!(
+            "{}{}",
+            canonical.to_string_lossy(),
+            std::path::MAIN_SEPARATOR
+        );
+        crate::util::test::create_test_workspace(&stored, "path_resolved_ws").await;
+
+        let resolved = crate::users::resolve_workspace(&dir.path().to_string_lossy())
+            .await
+            .expect("resolve should succeed")
+            .expect("a folder that is a registered workspace resolves");
+
+        assert_eq!(resolved.name, "path_resolved_ws");
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────
 
     /// A channel name unique to the message_router delivery tests, so the
@@ -1424,6 +1716,8 @@ mod tests {
             reply_target: Some("chat_123".to_string()),
             pending_job_id: None,
             originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
         };
 
         // Should complete without panic.
@@ -1465,6 +1759,8 @@ mod tests {
             reply_target: None,
             pending_job_id: None,
             originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
         };
 
         // Should complete without panic — broadcasts to the "gui" binding.
@@ -1499,6 +1795,8 @@ mod tests {
             reply_target: None,
             pending_job_id: None,
             originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
         };
 
         // Should complete without panic — broadcast+persist runs, transport
@@ -1549,6 +1847,8 @@ mod tests {
             reply_target: None,
             pending_job_id: None,
             originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
         };
 
         deliver_single_user_response(
@@ -1572,14 +1872,15 @@ mod tests {
     /// `agent_message_job` threads the normalized identity + durable kind.
     #[test]
     fn agent_message_job_threading() {
-        let job = agent_message_job("hello".to_string(), "proj_ws".to_string(), "alice");
+        let job = agent_message_job("hello".to_string(), "proj_ws".to_string(), "alice", None);
         assert_eq!(job.user_name, "alice");
         assert_eq!(job.kind, MessageKind::AgentMessage);
         assert_eq!(job.role, Role::Manager);
         assert_eq!(job.workspace_name, "proj_ws");
+        assert!(job.reply_to_custom.is_none());
 
         // Empty user_name normalizes to the seeded 'admin'.
-        let job = agent_message_job("hello".to_string(), "proj_ws".to_string(), "");
+        let job = agent_message_job("hello".to_string(), "proj_ws".to_string(), "", None);
         assert_eq!(job.user_name, "admin");
     }
 
@@ -1593,11 +1894,7 @@ mod tests {
     #[serial_test::serial(provider)]
     async fn manager_notify_delivers_to_admin_assistant() {
         setup_response_test_infra().await;
-        let target = crate::session::resolve_agent_id(
-            crate::users::ADMIN_USER_NAME,
-            "assistant",
-            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
-        );
+        let target = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
 
         // Snapshot existing rows so cleanup removes ONLY rows this test created.
         let before: HashSet<String> = crate::jobs::list_pending_jobs(&crate::session::store().conn)
@@ -1819,6 +2116,24 @@ mod tests {
             MessageKind::UserMessage,
             "RecoveryRetry must be a distinct variant from UserMessage — \
              the emoji gate's `== MessageKind::UserMessage` check naturally excludes it",
+        );
+    }
+
+    /// A custom role's answer is an internal envelope addressed to the admin's
+    /// personal Assistant — never the owner's channels and never Telegram —
+    /// carrying the folder the launch ran in so a `[FILE:]`/`[IMAGE:]` marker in
+    /// the answer can be relayed out of it.
+    #[test]
+    fn custom_role_notify_targets_the_admin_assistant() {
+        let job = custom_role_notify_job("<custom-role-message/>".to_string(), "/data/proj");
+        assert_eq!(job.kind, MessageKind::CustomRoleNotify);
+        assert_eq!(job.role, Role::Assistant);
+        assert_eq!(job.user_name, crate::users::ADMIN_USER_NAME);
+        assert_eq!(job.originating_workspace.as_deref(), Some("/data/proj"));
+        assert!(job.custom_role.is_none());
+        assert_eq!(
+            crate::jobs::envelope_target(&job),
+            crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
         );
     }
 }

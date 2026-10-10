@@ -17286,6 +17286,7 @@ mod tests {
             &ws,
             false,
             std::sync::Arc::default(),
+            None,
         );
         assert_eq!(
             tools.iter().any(|tool| tool.name() == "document"),

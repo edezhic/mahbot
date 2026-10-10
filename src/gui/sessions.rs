@@ -37,9 +37,14 @@ const BUBBLE_BODY_RATIO: f32 = 0.75;
 /// collapse.
 const COLLAPSE_COMMIT_DELAY: Duration = Duration::from_millis(350);
 
-/// Max characters for the card title (user/workspace name) before an
-/// ellipsis is appended — the card column is 350px wide.
+/// Max characters for the card title (a user/workspace name) before an ellipsis
+/// is appended — the card column is 350px wide. A custom-role row carries its
+/// own compact spelling under the same bound (see [`custom_role_title`]).
 const CARD_TITLE_MAX_CHARS: usize = 32;
+
+/// Max characters of the branch identifier inside a custom-role card title — a
+/// branch is the discriminating half of the label, so it keeps half the budget.
+const CARD_TITLE_BRANCH_MAX_CHARS: usize = CARD_TITLE_MAX_CHARS / 2;
 
 /// Shared transcript render context: the flat session ledger, its per-entry
 /// markdown bodies, the element expansion set, the collapse-measurement
@@ -126,6 +131,12 @@ struct CachedSessionItem {
     /// User name when present (Some and non-empty), otherwise the workspace
     /// name (may be empty if both are absent).
     title: String,
+    /// The custom role this session belongs to, when it is a custom-role
+    /// session — its name titles the row instead of `title`.
+    custom_role: Option<String>,
+    /// The named branch that custom-role session continues, when the branch was
+    /// named.
+    custom_identifier: Option<String>,
     /// Pre-formatted message count string.
     msg_count_label: String,
     /// Pre-formatted compact token count (same format as the Running Agents
@@ -133,6 +144,38 @@ struct CachedSessionItem {
     token_label: Option<String>,
     /// Pre-formatted timestamp string.
     timestamp_label: String,
+}
+
+impl CachedSessionItem {
+    /// The row's title as the list shows it. A custom-role session is titled by
+    /// the role it belongs to — and its branch, when the branch was named —
+    /// instead of the user/workspace name every other role shows.
+    fn display_title(&self) -> String {
+        match (self.role, self.custom_role.as_deref()) {
+            (Some(crate::Role::Custom), Some(name)) => {
+                custom_role_title(name, self.custom_identifier.as_deref())
+            }
+            _ => self.title.clone(),
+        }
+    }
+}
+
+/// Card title for a custom-role row: the compact `name · branch` spelling under
+/// the same [`CARD_TITLE_MAX_CHARS`] bound every other row's title has. A named
+/// branch keeps its identifier: the role's own name is truncated (a role name
+/// may itself be [`crate::custom_role::MAX_ROLE_NAME_CHARS`] long) so the
+/// suffix always fits. The full [`crate::custom_role::display_label`] wording is
+/// used where the surface has room for it — the Running Agents card.
+fn custom_role_title(name: &str, identifier: Option<&str>) -> String {
+    let Some(identifier) = identifier else {
+        return crate::util::truncate(name, CARD_TITLE_MAX_CHARS);
+    };
+    // The identifier is capped at half the budget, so the rest of the budget is
+    // always enough for the separator and a usable share of the name.
+    let identifier = crate::util::truncate(identifier, CARD_TITLE_BRANCH_MAX_CHARS);
+    let suffix = format!(" · {identifier}");
+    let room = CARD_TITLE_MAX_CHARS - suffix.chars().count();
+    format!("{}{suffix}", crate::util::truncate(name, room))
 }
 
 pub(crate) struct SessionsState {
@@ -480,6 +523,8 @@ impl SessionsState {
                     agent_id: s.agent_id.clone(),
                     role,
                     title: crate::util::truncate(name, CARD_TITLE_MAX_CHARS),
+                    custom_role: s.custom_role.clone(),
+                    custom_identifier: s.custom_identifier.clone(),
                     msg_count_label: format!("{} msgs", s.message_count),
                     token_label: s.token_length.map(theme::format_compact_tokens),
                     timestamp_label: theme::format_relative_time(
@@ -589,7 +634,7 @@ impl SessionsState {
                         theme::TEXT_PRIMARY
                     };
                     title_row = title_row.push(
-                        text(item.title.clone())
+                        text(item.display_title())
                             .size(theme::TEXT_13)
                             .color(title_color),
                     );

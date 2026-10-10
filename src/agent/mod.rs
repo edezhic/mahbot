@@ -82,6 +82,15 @@ pub(crate) fn tool_channel() -> String {
         .unwrap_or_default()
 }
 
+/// Synchronous read of [`CURRENT_TOOL_CUSTOM_LAUNCH`]. Same contract as
+/// [`tool_user_name`]: a tool that dispatches a durable round must read it
+/// before its `tokio::spawn` boundary so the round carries the caller's branch.
+pub(crate) fn tool_custom_launch() -> Option<crate::CustomRoleLaunch> {
+    CURRENT_TOOL_CUSTOM_LAUNCH
+        .try_with(std::clone::Clone::clone)
+        .unwrap_or(None)
+}
+
 tokio::task_local! {
     pub(crate) static CURRENT_TOOL_USER_NAME: String;
     pub(crate) static CURRENT_TOOL_CHANNEL: String;
@@ -117,6 +126,11 @@ tokio::task_local! {
     /// [`crate::agent::registry::NON_AGENT_CALLS`] instead.
     pub(crate) static CURRENT_TOOL_AGENT_TRACKING:
         Option<crate::agent::registry::AgentTracking>;
+    /// The calling agent's custom-role launch — set for the duration of tool
+    /// execution so a tool that dispatches a durable round (analyze/implement/
+    /// research) carries the caller's branch address into the round's envelope
+    /// and job row. `None` for every built-in role.
+    pub(crate) static CURRENT_TOOL_CUSTOM_LAUNCH: Option<crate::CustomRoleLaunch>;
 }
 
 /// Maximum number of completed tool rounds before the agent loop bails out.
@@ -405,19 +419,28 @@ fn injected_images_message(
 /// ([`role_tool_specs`]), so the frozen post-deadline replay can never drift from
 /// the live agent's tools (KV-cache byte identity). The caller owns the run-scoped
 /// tracker of the chrome sessions those tools open, which the run's end releases
-/// ([`crate::tools::chrome::ChromeRunSessions::for_run`]).
+/// ([`crate::tools::chrome::ChromeRunSessions::for_run`]). `custom` is the
+/// launch a custom role runs under (its record's tool subset); `None` for every
+/// built-in role.
 #[must_use]
 pub(crate) fn role_tools_and_specs(
     role: crate::Role,
     ws: &crate::Workspace,
     is_admin: bool,
     chrome_sessions: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
+    custom: Option<&crate::CustomRoleLaunch>,
 ) -> (Vec<Box<dyn Tool>>, Vec<crate::ToolSpec>) {
-    let tools: Vec<Box<dyn Tool>> = role
-        .tools(ws, is_admin, chrome_sessions)
-        .into_iter()
-        .filter(|t| t.is_advertised())
-        .collect();
+    // A custom role's tool set is derived from its record's chosen subset of the
+    // admin Assistant's tools (at the admin's strength), not from the static
+    // per-role factory — every other role keeps `role.tools(...)`.
+    let tools: Vec<Box<dyn Tool>> = if role == crate::Role::Custom {
+        crate::Role::custom_role_tools(custom.map(|c| c.tools.as_slice()).unwrap_or_default())
+    } else {
+        role.tools(ws, is_admin, chrome_sessions)
+    }
+    .into_iter()
+    .filter(|t| t.is_advertised())
+    .collect();
     let tool_specs = tools.iter().map(|t| t.spec()).collect();
     (tools, tool_specs)
 }
@@ -437,6 +460,7 @@ pub(crate) fn role_tool_specs(
         ws,
         is_admin,
         std::sync::Arc::new(crate::tools::chrome::ChromeRunSessions::default()),
+        None,
     )
     .1
 }
@@ -521,6 +545,11 @@ impl Agent {
     /// presentational. `None` falls back to the ticket title when the effective
     /// parent is a ticket; callers of analyze/research rounds pass the
     /// question/task text explicitly.
+    ///
+    /// `custom` is the custom-role launch this agent runs under (name, authorial
+    /// prompt, tool subset, branch address) — `Some` only for
+    /// [`crate::Role::Custom`]. It is attached to the session so the system
+    /// prompt is assembled from it (see `Session::append_turn_message`).
     #[must_use]
     #[expect(clippy::too_many_arguments)] // one positional arg per construction field; callers use literals
     pub fn new(
@@ -533,10 +562,16 @@ impl Agent {
         is_admin: bool,
         parent_key: Option<crate::agent::registry::ParentKey>,
         parent_label: Option<String>,
+        custom: Option<crate::CustomRoleLaunch>,
     ) -> Self {
         let chrome_sessions = crate::tools::chrome::ChromeRunSessions::for_run(&agent_id);
-        let (tools, tool_specs) =
-            role_tools_and_specs(role, ws, is_admin, std::sync::Arc::clone(&chrome_sessions));
+        let (tools, tool_specs) = role_tools_and_specs(
+            role,
+            ws,
+            is_admin,
+            std::sync::Arc::clone(&chrome_sessions),
+            custom.as_ref(),
+        );
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let pause_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -587,6 +622,10 @@ impl Agent {
         session.attach_transcript(
             crate::session::TRANSCRIPT_REGISTRY.register(agent_id.clone(), generation),
         );
+        // The custom-role launch travels with the session: the prompt is
+        // assembled from it at the first turn and the fixed workspace block is
+        // re-rendered from it on later turns.
+        session.custom = custom;
 
         Self {
             agent_id,
@@ -823,13 +862,15 @@ impl Agent {
         // The session is re-engaging (any job kind: user message, async result,
         // alarm, boot replay): clear a stale sleep-ended flag BEFORE this turn
         // runs, so a genuine crash mid-round on this turn is still recovered
-        // normally by the dead-session poller. Only the Assistant and the
-        // Manager can write the flag (`sleep` is granted only to them), so
-        // other roles skip the read.
-        if matches!(self.role, crate::Role::Assistant | crate::Role::Manager)
-            && crate::session::store()
-                .get_sleep_ended(&self.agent_id)
-                .await
+        // normally by the dead-session poller. Only the Assistant, the Manager
+        // and a custom role (which is granted the sleep tool) can write the
+        // flag, so other roles skip the read.
+        if matches!(
+            self.role,
+            crate::Role::Assistant | crate::Role::Manager | crate::Role::Custom
+        ) && crate::session::store()
+            .get_sleep_ended(&self.agent_id)
+            .await
             && let Err(e) = crate::session::store()
                 .set_sleep_ended(&self.agent_id, false)
                 .await
@@ -838,6 +879,24 @@ impl Agent {
                 agent_id = %self.agent_id,
                 error = %e,
                 "Failed to clear sleep-ended flag"
+            );
+        }
+
+        // A custom role also clears the persisted deliberate-stop mark, fail-soft
+        // like the sleep mark above: a fresh launch of a stopped branch
+        // re-enables dead-session recovery for it.
+        if self.role == crate::Role::Custom
+            && crate::session::store()
+                .get_launch_stopped(&self.agent_id)
+                .await
+            && let Err(e) = crate::session::store()
+                .set_launch_stopped(&self.agent_id, false)
+                .await
+        {
+            tracing::warn!(
+                agent_id = %self.agent_id,
+                error = %e,
+                "Failed to clear launch-stopped flag"
             );
         }
 
@@ -1435,6 +1494,7 @@ impl Agent {
             role: self.role.as_str().to_string(),
             workspace: self.workspace.name.clone(),
         });
+        let custom = self.session.custom.clone();
         CURRENT_TOOL_USER_NAME
             .scope(user_name, async {
                 CURRENT_TOOL_CHANNEL
@@ -1448,7 +1508,11 @@ impl Agent {
                                                 CURRENT_TOOL_AGENT_ID
                                                     .scope(agent_id, async {
                                                         CURRENT_TOOL_AGENT_TRACKING
-                                                            .scope(agent_tracking, fut)
+                                                            .scope(agent_tracking, async {
+                                                                CURRENT_TOOL_CUSTOM_LAUNCH
+                                                                    .scope(custom, fut)
+                                                                    .await
+                                                            })
                                                             .await
                                                     })
                                                     .await
@@ -2744,6 +2808,10 @@ impl Drop for RunEndCleanup {
 ///
 /// Returns `(agent, Some(response))` on success.
 /// Returns `(agent, None)` on error (already logged).
+///
+/// `custom` is the custom-role launch this run executes — `Some` only for
+/// [`crate::Role::Custom`] (the authorial prompt and tool subset taken at
+/// launch, plus the resolved branch address); `None` for every built-in role.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_agent(
     agent_id: String,
@@ -2761,6 +2829,7 @@ pub(crate) async fn run_agent(
     round: Option<RoundOpts>,
     parent_key: Option<crate::agent::registry::ParentKey>,
     parent_label: Option<String>,
+    custom: Option<crate::CustomRoleLaunch>,
 ) -> (Agent, Option<String>) {
     // Unregister from the message router on EVERY exit path, including a
     // panic mid-work (Drop runs during unwind) — a leaked router entry would
@@ -2787,6 +2856,7 @@ pub(crate) async fn run_agent(
         is_admin,
         parent_key,
         parent_label,
+        custom,
     );
     agent.incoming_rx = incoming_rx;
     if let Some(round) = round {
@@ -2888,6 +2958,7 @@ pub(crate) async fn run_default_agent(
         round,
         parent_key,
         parent_label,
+        None,
     )
     .await
 }
@@ -3497,6 +3568,8 @@ mod tests {
             reply_target: None,
             pending_job_id: None,
             originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
         };
         let _ = tx.send(job);
 
@@ -3539,6 +3612,8 @@ mod tests {
             reply_target: None,
             pending_job_id: None,
             originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
         };
         let _ = tx.send(job);
 
@@ -3996,6 +4071,7 @@ mod tests {
             }),
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -4039,6 +4115,7 @@ mod tests {
             false,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4088,6 +4165,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(response2.as_deref(), Some("back online"));
@@ -4128,6 +4206,7 @@ mod tests {
             false,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4208,6 +4287,7 @@ mod tests {
             false,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -6196,6 +6276,7 @@ mod tests {
                 }],
                 &crate::jobs::SpawnChild::Analyze,
                 Some(pin),
+                None,
                 None,
             )
             .await

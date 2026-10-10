@@ -59,6 +59,11 @@ pub(crate) struct Session {
     /// agent (tests, detached sessions). Set by
     /// [`attach_transcript`](Self::attach_transcript) from `Agent::new`.
     transcript: Option<Arc<ArcSwap<TranscriptSnapshot>>>,
+    /// The custom-role launch this session runs under — the authorial
+    /// definition taken at launch plus the resolved branch address. `Some` only
+    /// for a [`Role::Custom`] session; `None` for every built-in role. Set by
+    /// `Agent::new` from the run's launch.
+    pub(crate) custom: Option<crate::CustomRoleLaunch>,
 }
 
 /// Outcome of a [`Session::finalize`] call.
@@ -101,6 +106,22 @@ pub(crate) struct PendingToolFrame {
     pub calls: Vec<crate::ToolCall>,
     pub has_text: bool,
     pub call_count: usize,
+}
+
+/// Render the fixed system block a custom role's prompt opens with: this
+/// launch's folder and the system. Nothing else — the role itself is defined by
+/// the administrator's authorial text ([`crate::CustomRoleLaunch::prompt`]),
+/// which follows as the second system part. Rendered from
+/// `context/custom_role.md`; a launch in a different folder re-renders this
+/// block (see [`Session::append_turn_message`]).
+fn custom_role_block(ws: &Workspace) -> String {
+    substitute(
+        &load_prompt("context/custom_role.md"),
+        &[
+            ("{{workspace}}", &ws.as_path().display().to_string()),
+            ("{{operating_system}}", std::env::consts::OS),
+        ],
+    )
 }
 
 impl Session {
@@ -165,9 +186,17 @@ impl Session {
             let is_new = self.history.is_empty();
 
             if is_new {
-                let (msgs, snapshot) =
-                    Self::build_turn_messages(msg, ws, role, ticket, round_ts, is_admin, user_name)
-                        .await;
+                let (msgs, snapshot) = Self::build_turn_messages(
+                    msg,
+                    ws,
+                    role,
+                    ticket,
+                    round_ts,
+                    is_admin,
+                    user_name,
+                    self.custom.as_ref(),
+                )
+                .await;
 
                 // Batch-write all messages + session context atomically.
                 crate::session::store()
@@ -186,6 +215,38 @@ impl Session {
                     Self::persist_active_models_snapshot(agent_id, &snapshot).await;
                 }
             } else {
+                // A custom role's fixed block records the folder the branch was
+                // last launched in; a launch in a different folder must show the
+                // role where it actually works. The authorial text above/below
+                // the block is untouched.
+                if self.custom.is_some() {
+                    let block = custom_role_block(ws);
+                    if self.history.first().map(|m| m.content.as_str()) != Some(block.as_str()) {
+                        // The fixed block is always the session's first row (the
+                        // first turn writes it there, and every compaction puts
+                        // it back at the head), so a targeted rewrite leaves
+                        // `persisted_len` untouched.
+                        crate::session::store()
+                            .rewrite_first_message(agent_id, &block)
+                            .await?;
+                        if let Some(first) = self.history.first_mut() {
+                            first.content = block;
+                        }
+                        // The launch landed in a different folder than the one
+                        // recorded for the branch, so the engine the branch held
+                        // for that folder is now unreferenced — release it (the
+                        // new folder's engine is created on demand and kept for
+                        // as long as the branch works there). Read before the
+                        // append below rewrites the recorded folder.
+                        if let Some(previous) = crate::session::store()
+                            .session_workspace_name(agent_id)
+                            .await
+                            && previous != ws.name
+                        {
+                            crate::search_engine::release_path_named_engine(&previous);
+                        }
+                    }
+                }
                 // Caching: system prompt is NOT rebuilt on subsequent turns
                 // (see doc comment above). The session DB caches the full
                 // first-turn message set. The only rebuild path is
@@ -218,6 +279,24 @@ impl Session {
                     Self::persist_active_models_snapshot(agent_id, &snapshot).await;
                 }
                 self.history.push(user_msg);
+            }
+            // A custom-role session records its role name and — when the branch
+            // was named — the identifier it continues, on EVERY appending turn,
+            // so the dead-session poller can resume the branch as the same role
+            // without parsing the agent ID. It sits outside the `is_new` branch
+            // so a single failed first-turn write cannot leave the branch
+            // permanently without a recorded role. Log-and-continue like the
+            // snapshot writes above.
+            if let Some(launch) = &self.custom
+                && let Err(e) = crate::session::store()
+                    .set_custom_role(agent_id, &launch.name, launch.identifier.as_deref())
+                    .await
+            {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "Failed to record custom-role session metadata"
+                );
             }
             // The appended message is durably written above — advance the
             // persisted prefix and refresh the live transcript.
@@ -482,8 +561,15 @@ impl Session {
         user_name: &str,
     ) {
         // Build fresh system prompt (may have changed since session start).
-        let (mut compacted, snapshot) =
-            Self::build_context_messages(ws, role, ticket, is_admin, user_name).await;
+        let (mut compacted, snapshot) = Self::build_context_messages(
+            ws,
+            role,
+            ticket,
+            is_admin,
+            user_name,
+            self.custom.as_ref(),
+        )
+        .await;
 
         // Append conversation summary, then the retained latest turns in
         // chronological order. The in-flight user message is already among
@@ -600,13 +686,39 @@ impl Session {
     /// [`Self::build_turn_messages`] wraps it to add the per-turn user message.
     /// The Assistant block is re-emitted on compaction, so long sessions never
     /// lose the capability info.
+    ///
+    /// # Custom roles
+    /// A custom role ([`Role::Custom`]) receives exactly two system parts and
+    /// nothing else: the fixed [`custom_role_block`] first and the launch's
+    /// authorial text (taken at session start) second. Everything the built-in
+    /// roles receive — workspace boilerplate, skills, notes, alarms/board/ticket
+    /// context, personal files, custom tools, active models — is deliberately
+    /// absent, because the administrator's own words are the whole definition.
     async fn build_context_messages(
         ws: &Workspace,
         role: &Role,
         ticket: Option<&crate::pipeline::board::Ticket>,
         is_admin: bool,
         user_name: &str,
+        custom: Option<&crate::CustomRoleLaunch>,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
+        // A `Role::Custom` session ALWAYS opens with the two-part custom prompt —
+        // the fixed workspace block plus the authorial text. A launch that
+        // arrives without one (a mis-routed envelope, an old row, a bug) renders
+        // the fixed block with an empty authorial part instead of falling
+        // through to the built-in path, which would `load_prompt("role/custom.md")`
+        // and panic (there is no such asset). The message router already refuses
+        // a launch-less custom-role job, so this is only the last line of
+        // defence.
+        if role == &Role::Custom {
+            return (
+                vec![
+                    ChatMessage::system(custom_role_block(ws)),
+                    ChatMessage::system(custom.map_or("", |launch| launch.prompt.as_str())),
+                ],
+                ModelSnapshot::default(),
+            );
+        }
         let (stored_context, board_context) = tokio::join!(
             lookup_workspace_context(ws, role),
             build_board_context(ws, role),
@@ -741,6 +853,7 @@ impl Session {
     /// System prompts are cached; user messages carry the timestamp block —
     /// round-pinned for parallel-round first messages, fresh for everything
     /// else (see [`crate::session::render_timestamp`]).
+    #[expect(clippy::too_many_arguments)]
     async fn build_turn_messages(
         msg: &str,
         ws: &Workspace,
@@ -749,9 +862,10 @@ impl Session {
         round_ts: Option<&str>,
         is_admin: bool,
         user_name: &str,
+        custom: Option<&crate::CustomRoleLaunch>,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
         let (mut msgs, snapshot) =
-            Self::build_context_messages(ws, role, ticket, is_admin, user_name).await;
+            Self::build_context_messages(ws, role, ticket, is_admin, user_name, custom).await;
         msgs.push(crate::session::user_msg_with_ts(msg, round_ts));
         (msgs, snapshot)
     }
@@ -1034,6 +1148,9 @@ fn render_alarm_lines(alarms: &[Alarm]) -> Option<String> {
         let _ = write!(out, ", {}, next fire: {}", alarm.text, fire);
         if let Some(trigger) = &alarm.trigger {
             let _ = write!(out, ", trigger: {}", trigger.render());
+        }
+        if let Some(target) = alarm.role_target() {
+            let _ = write!(out, ", {target}");
         }
         out.push('\n');
     }
@@ -1776,6 +1893,9 @@ mod tests {
             kind: "one-shot".to_string(),
             text: "hello".to_string(),
             trigger: None,
+            role: None,
+            identifier: None,
+            workspace: None,
             interval_seconds: None,
             next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
         };
@@ -1893,6 +2013,9 @@ mod tests {
             kind: "one-shot".to_string(),
             text: "hello".to_string(),
             trigger: None,
+            role: None,
+            identifier: None,
+            workspace: None,
             interval_seconds: None,
             next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
         };
@@ -1912,11 +2035,27 @@ mod tests {
                     ),
                 ]),
             })),
+            role: None,
+            identifier: None,
+            workspace: None,
             interval_seconds: Some(3600),
             next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
         };
+        let role = Alarm {
+            id: "a3".to_string(),
+            session_id: "s1".to_string(),
+            user_name: "u".to_string(),
+            kind: "one-shot".to_string(),
+            text: "wake the role".to_string(),
+            trigger: None,
+            role: Some("analyst".to_string()),
+            identifier: Some("daily".to_string()),
+            workspace: Some("my-workspace".to_string()),
+            interval_seconds: None,
+            next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
+        };
 
-        let lines = render_alarm_lines(&[one_shot, periodic]).expect("alarms render");
+        let lines = render_alarm_lines(&[one_shot, periodic, role]).expect("alarms render");
         assert!(lines.contains("every 3600 seconds"));
         assert!(lines.contains("trigger: weather "));
         assert!(lines.contains("\"city\":\"Minsk\""));
@@ -1924,6 +2063,12 @@ mod tests {
         // reaches the persisted prompt verbatim.
         assert!(lines.contains("\"api_key\":\"supersecretvalue123\""));
         assert!(lines.contains("next fire:"));
+        assert!(
+            lines.contains(
+                "addressed to custom role \"analyst\" (branch \"daily\") in my-workspace"
+            ),
+            "got: {lines}"
+        );
 
         assert!(render_alarm_lines(&[]).is_none());
     }
@@ -1950,5 +2095,34 @@ mod tests {
         assert!(lines.contains("- other (pending): /data/other"));
 
         assert!(render_workspace_lines(&[]).is_none());
+    }
+
+    /// A custom role's system prompt is exactly two parts — the fixed
+    /// folder/system block and the administrator's authorial text verbatim —
+    /// and nothing else, in that order, whatever folder the launch runs in.
+    #[tokio::test]
+    async fn custom_role_prompt_is_the_fixed_block_plus_the_authorial_text() {
+        let ws = crate::workspace::test_ws_named("/data/proj", "/data/proj");
+        let launch = crate::CustomRoleLaunch {
+            name: "briefer".to_string(),
+            identifier: Some("week2".to_string()),
+            prompt: "You write the morning brief.\nNothing else.".to_string(),
+            tools: vec!["read".to_string()],
+            agent_id: "role_briefer:week2".to_string(),
+        };
+        let (messages, _) = Session::build_context_messages(
+            &ws,
+            &crate::Role::Custom,
+            None,
+            false,
+            "admin",
+            Some(&launch),
+        )
+        .await;
+
+        assert_eq!(messages.len(), 2, "got: {messages:?}");
+        assert_eq!(messages[0].content, custom_role_block(&ws));
+        assert!(messages[0].content.contains("/data/proj"));
+        assert_eq!(messages[1].content, launch.prompt);
     }
 }

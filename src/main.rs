@@ -1140,6 +1140,8 @@ async fn deliver_clear_reply(
             reply_target: Some(msg.reply_target.clone()),
             pending_job_id: None,
             originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
         },
         &effective_role,
         &[],

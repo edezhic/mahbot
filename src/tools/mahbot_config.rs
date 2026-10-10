@@ -8,6 +8,7 @@ use crate::config::{
     CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
     CONFIG_KEY_WEB_SEARCH_PROVIDER,
 };
+use crate::custom_role::CustomRoleBehavior;
 use crate::users::{GrantChange, format_grants};
 use crate::{Tool, Workspace};
 use anyhow::anyhow;
@@ -37,6 +38,47 @@ fn get_binding_value(args: &serde_json::Value, key: &str) -> anyhow::Result<Stri
     }
 }
 
+/// Read an optional string field, distinguishing absent (or explicit null) from
+/// a present value. The deliberately silent [`super::get_opt_str`] would let a
+/// wrong-typed value masquerade as absent, so a present non-string is refused.
+fn optional_str<'a>(args: &'a serde_json::Value, key: &str) -> anyhow::Result<Option<&'a str>> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => Ok(Some(
+            v.as_str()
+                .ok_or_else(|| super::wrong_type(key, "a string", v))?,
+        )),
+    }
+}
+
+/// Read the optional `tools` field as a name list; absent (or explicit null)
+/// yields [`Option::None`], a present value is validated as an array of strings.
+fn optional_tools(args: &serde_json::Value) -> anyhow::Result<Option<Vec<String>>> {
+    match args.get("tools") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(_) => Ok(Some(super::get_str_array(args, "tools")?)),
+    }
+}
+
+/// Read the optional `behavior` field; absent (or explicit null) yields
+/// [`Option::None`], a present value must be `continuous` or `one_off`.
+fn read_behavior(args: &serde_json::Value) -> anyhow::Result<Option<CustomRoleBehavior>> {
+    match optional_str(args, "behavior")? {
+        None => Ok(None),
+        Some(value) => Ok(Some(CustomRoleBehavior::parse(value)?)),
+    }
+}
+
+/// Render a custom role's chosen tool subset for a human: the names joined, or
+/// "none" for the empty subset.
+fn format_tools(tools: &[String]) -> String {
+    if tools.is_empty() {
+        "none".to_string()
+    } else {
+        tools.join(", ")
+    }
+}
+
 /// Dispatch a single configuration action for the admin.
 pub(crate) struct MahbotConfigTool;
 
@@ -60,6 +102,10 @@ impl Tool for MahbotConfigTool {
                         "grant_tool",
                         "revoke_tool",
                         "list_grants",
+                        "create_custom_role",
+                        "update_custom_role",
+                        "list_custom_roles",
+                        "delete_custom_role",
                     ],
                     "description": "Which configuration action to perform."
                 },
@@ -74,12 +120,30 @@ impl Tool for MahbotConfigTool {
                 "name": {
                     "type": "string",
                     "description": format!(
-                        "(add_workspace / add_user) A short unique name for the workspace (used \
-                         in ticket ids and the GUI), or the new user's display name. An added \
-                         user's name is also the name of their personal workspace folder, so it \
-                         must be one every platform the service runs on can create: {}.",
+                        "(add_workspace / add_user / create_custom_role / update_custom_role / \
+                         delete_custom_role) For a workspace: a short unique name (used in ticket \
+                         ids and the GUI). For a new user: their display name, which is also the \
+                         name of their personal workspace folder, so it must be one every platform \
+                         the service runs on can create: {}. For a custom role: the role's name — \
+                         short, ASCII letters, digits, '_' and '-' only, starting with a letter, \
+                         and not colliding with a built-in agent namespace (so not `ticket`, \
+                         `maintainer`, `manager`, `role`, ...).",
                         crate::util::folder_name::RULE_SUMMARY
                     )
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "(create_custom_role / update_custom_role) The authorial text that fully defines the role. It is the whole definition of the role: it is the only thing the role is told besides the folder it works in, so everything the role must know and do has to be written in it."
+                },
+                "tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "(create_custom_role / update_custom_role) The chosen subset of your own tools' names; the same names the tool list uses. A name that is not one of your tools is refused. Omit for no tools."
+                },
+                "behavior": {
+                    "type": "string",
+                    "enum": ["continuous", "one_off"],
+                    "description": "(create_custom_role / update_custom_role) What a launch does when no branch identifier is given: `continuous` keeps one common branch of the role, `one_off` runs once and reports back."
                 },
                 "user": {
                     "type": "string",
@@ -125,9 +189,14 @@ impl Tool for MahbotConfigTool {
             "grant_tool" => self.exec_grant_tool(args).await,
             "revoke_tool" => self.exec_revoke_tool(args).await,
             "list_grants" => self.exec_list_grants(args).await,
+            "create_custom_role" => self.exec_create_custom_role(args).await,
+            "update_custom_role" => self.exec_update_custom_role(args).await,
+            "list_custom_roles" => self.exec_list_custom_roles().await,
+            "delete_custom_role" => self.exec_delete_custom_role(args).await,
             other => Err(err(format!(
                 "unknown action '{other}' — expected one of: setup_telegram_bot, bind_telegram, \
-                 add_workspace, add_user, setup_web_search, grant_tool, revoke_tool, list_grants"
+                 add_workspace, add_user, setup_web_search, grant_tool, revoke_tool, list_grants, \
+                 create_custom_role, update_custom_role, list_custom_roles, delete_custom_role"
             ))),
         }
     }
@@ -348,6 +417,62 @@ impl MahbotConfigTool {
         }
         Ok(format!("{user}: {}", format_grants(&grants)))
     }
+
+    async fn exec_create_custom_role(&self, args: serde_json::Value) -> anyhow::Result<String> {
+        let name = super::get_str(&args, "name")?;
+        let prompt = super::get_str(&args, "prompt")?;
+        let tools = optional_tools(&args)?.unwrap_or_default();
+        let behavior = read_behavior(&args)?.unwrap_or(CustomRoleBehavior::Continuous);
+        crate::custom_role::create(name, prompt, &tools, behavior).await?;
+        Ok(format!(
+            "Created custom role '{name}' (behaviour: {}) with tools: {}.",
+            behavior.as_str(),
+            format_tools(&tools)
+        ))
+    }
+
+    async fn exec_update_custom_role(&self, args: serde_json::Value) -> anyhow::Result<String> {
+        let name = super::get_str(&args, "name")?;
+        let prompt = optional_str(&args, "prompt")?;
+        let tools = optional_tools(&args)?;
+        let behavior = read_behavior(&args)?;
+        anyhow::ensure!(
+            prompt.is_some() || tools.is_some() || behavior.is_some(),
+            "usage: update_custom_role needs at least one of `prompt`, `tools` or `behavior` to \
+             change"
+        );
+        crate::custom_role::update(name, prompt, tools.as_deref(), behavior).await?;
+        Ok(format!("Updated custom role '{name}'."))
+    }
+
+    async fn exec_list_custom_roles(&self) -> anyhow::Result<String> {
+        let roles = crate::custom_role::list().await?;
+        if roles.is_empty() {
+            return Ok("No custom roles are defined.".to_string());
+        }
+        Ok(roles
+            .iter()
+            .map(|role| {
+                format!(
+                    "{} — behaviour: {}, tools: {}\n  prompt: {}",
+                    role.name,
+                    role.behavior.as_str(),
+                    format_tools(&role.tools),
+                    role.prompt
+                )
+            })
+            .collect::<Vec<String>>()
+            .join("\n\n"))
+    }
+
+    async fn exec_delete_custom_role(&self, args: serde_json::Value) -> anyhow::Result<String> {
+        let name = super::get_str(&args, "name")?;
+        crate::custom_role::delete(name).await?;
+        Ok(format!(
+            "Deleted custom role '{name}'. Alarms addressed to it can no longer wake anyone, and \
+             the owner was notified through the assistant."
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -364,9 +489,10 @@ mod tests {
         let tool = MahbotConfigTool;
         let ws = test_ws("/tmp/test_ws");
 
-        // `list_grants` is absent: it has no required field, so it would
-        // legitimately succeed with these args — its name is pinned by the
-        // unknown-action message asserted below instead.
+        // `list_grants` and `list_custom_roles` are absent: neither has a
+        // required field, so they would legitimately succeed with these args —
+        // their names are pinned by the unknown-action message asserted below
+        // instead.
         for action in [
             "setup_telegram_bot",
             "bind_telegram",
@@ -375,6 +501,9 @@ mod tests {
             "setup_web_search",
             "grant_tool",
             "revoke_tool",
+            "create_custom_role",
+            "update_custom_role",
+            "delete_custom_role",
         ] {
             let args = json!({ "action": action });
             // Each action reports its own missing required field, proving the
@@ -425,7 +554,11 @@ mod tests {
                 && err.contains("setup_web_search")
                 && err.contains("grant_tool")
                 && err.contains("revoke_tool")
-                && err.contains("list_grants"),
+                && err.contains("list_grants")
+                && err.contains("create_custom_role")
+                && err.contains("update_custom_role")
+                && err.contains("list_custom_roles")
+                && err.contains("delete_custom_role"),
             "unknown-action error must list the valid actions, got: {err}"
         );
     }
@@ -451,6 +584,16 @@ mod tests {
             (json!({ "action": "grant_tool", "user": "alice" }), "tool"),
             (json!({ "action": "revoke_tool" }), "user"),
             (json!({ "action": "revoke_tool", "user": "alice" }), "tool"),
+            (
+                json!({ "action": "create_custom_role", "prompt": "p" }),
+                "name",
+            ),
+            (
+                json!({ "action": "create_custom_role", "name": "a" }),
+                "prompt",
+            ),
+            (json!({ "action": "update_custom_role" }), "name"),
+            (json!({ "action": "delete_custom_role" }), "name"),
         ];
 
         for (args, field) in cases {
@@ -461,6 +604,22 @@ mod tests {
                 "case {case_desc} should report missing '{field}', got: {err}"
             );
         }
+
+        // A name with nothing to change is not a missing required argument but
+        // a usage error of its own: `update_custom_role` must be told what to
+        // update.
+        let err = tool
+            .execute(&ws, json!({ "action": "update_custom_role", "name": "a" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("usage:")
+                && err.contains("prompt")
+                && err.contains("tools")
+                && err.contains("behavior"),
+            "update with nothing to change must be a usage error, got: {err}"
+        );
     }
 
     #[tokio::test]

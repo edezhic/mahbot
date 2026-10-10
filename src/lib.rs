@@ -30,6 +30,7 @@ pub(crate) mod chrome;
 pub mod config;
 pub mod config_db;
 pub(crate) mod consensus;
+pub(crate) mod custom_role;
 pub mod db;
 /// The document kit runner: the embedded script and PDF text font the
 /// `document` tool runs on the managed bun runtime ([`crate::tools::document`]).
@@ -751,6 +752,38 @@ pub enum Role {
     Maintainer,
     Sanitation,
     Assistant,
+    Custom,
+}
+
+/// A custom role launch: the authorial definition as it stood when the launch
+/// was created — a later edit of the record takes effect on the NEXT launch —
+/// together with the resolved branch address this launch runs under.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomRoleLaunch {
+    /// The custom role's name.
+    pub name: String,
+    /// The branch identifier this launch continues, when the branch was named.
+    /// `None` for an unnamed branch (the record's default branch or a one-off run).
+    #[serde(default)]
+    pub identifier: Option<String>,
+    /// The authorial prompt text, taken at launch.
+    pub prompt: String,
+    /// The chosen subset of the admin Assistant's tool names, taken at launch.
+    pub tools: Vec<String>,
+    /// The resolved session/branch address (`role_{name}`, `role_{name}:{id}`
+    /// or `rolerun_{name}:{suffix}`).
+    pub agent_id: String,
+}
+
+impl Role {
+    /// The role a dispatched round belongs to: a round carrying a custom-role
+    /// launch belongs to [`Role::Custom`] whatever the tool's own construction
+    /// role was — the launch is the address authority, and the round's job row
+    /// and result envelope must say so.
+    #[must_use]
+    pub(crate) fn for_launch(self, custom: Option<&CustomRoleLaunch>) -> Self {
+        if custom.is_some() { Self::Custom } else { self }
+    }
 }
 
 // ── Agent ───────────────────────────────────────────────────────

@@ -23,11 +23,13 @@
 //!
 //! The poller skips `manager_*` (Manager has its own lifecycle) plus every
 //! prefix in [`super::TRANSIENT_AGENT_ID_PREFIXES`] (transient or
-//! background-only agents).
+//! background-only agents) — the union returned by
+//! `super::non_user_facing_agent_id_prefixes`. A custom role's continuable
+//! `role_*` branch is NOT in that union and IS recovered.
 //!
 //! Only direct user-agent sessions (format `{user}_{ws}_{role}`, or the
-//! deduped `{user}_personal:{role}` for the user's own personal workspace)
-//! are eligible for recovery.
+//! deduped `{user}_personal:{role}` for the user's own personal workspace) and
+//! custom roles' continuable branches are eligible for recovery.
 //!
 //! # Retry safety design
 //!
@@ -225,10 +227,11 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
     // per-session `get_last_message_tail` queries below are lightweight
     // (indexed `ORDER BY id DESC LIMIT 1`) — fetching both the role and the
     // content of the tail row in a single read — and only run for eligible
-    // sessions.
+    // sessions. A custom role's continuable `role_` branch is deliberately not
+    // excluded: it is recovered like a direct session.
     let sessions = crate::session::store()
         .list_sessions_with_metadata_excluding(
-            &crate::session::reserved_agent_id_prefixes().collect::<Vec<&str>>(),
+            &crate::session::non_user_facing_agent_id_prefixes().collect::<Vec<&str>>(),
         )
         .await;
 
@@ -284,6 +287,16 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
             continue;
         }
 
+        // ── Condition 5: a deliberately stopped launch stays stopped ──────
+        // A custom-role launch stopped before it produced anything must never
+        // be auto-restarted. It does NOT consume retry budget — clean up any
+        // stale tracker entry and skip; a later fresh launch re-enables
+        // recovery by clearing the mark (see `Agent::work`).
+        if session.launch_stopped {
+            DEAD_SESSION_TRACKER.cleanup(agent_id);
+            continue;
+        }
+
         // ── Safety guard: retry cap / adaptive backoff ─────────────────
         if !DEAD_SESSION_TRACKER.should_retry(agent_id) {
             // Either the session exhausted its retries (the entry persists
@@ -327,7 +340,9 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         // while registered; this catches the tail it leaves after bailing.
         // User/Tool tails stay exempt: answering a pending user prompt matches
         // normal direct-chat behavior, which a workspace pause does not freeze.
-        if needs_pause_guard {
+        // A custom role is exempt too: a workspace pause freezes only launches
+        // tied to a ticket, never a custom role's branch.
+        if needs_pause_guard && role != Role::Custom {
             match crate::workspace::get_by_name(&ctx.workspace_name).await {
                 Ok(Some(ws)) if ws.paused => {
                     tracing::debug!(
@@ -352,10 +367,14 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         // Phase 2: route the recovery job (fire-and-forget mpsc send).
         // Failures in Phase 1 (missing context, invalid role) are NOT
         // counted — they are permanent data issues that will never
-        // resolve with retries.
-        attempt_recovery(agent_id, &ctx, role);
-
-        DEAD_SESSION_TRACKER.record_attempt(agent_id);
+        // resolve with retries. A `false` return means the branch is
+        // permanently un-recoverable (its custom-role record is gone): drop
+        // the tracker entry rather than consuming retry budget on it.
+        if attempt_recovery(agent_id, &ctx, role).await {
+            DEAD_SESSION_TRACKER.record_attempt(agent_id);
+        } else {
+            DEAD_SESSION_TRACKER.cleanup(agent_id);
+        }
     }
 
     Ok(())
@@ -368,10 +387,17 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
 /// Caller must have already called [`get_session_context`](super::SessionStore::get_session_context)
 /// and validated that the role can be parsed.  The routing is fire-and-forget
 /// (sends on an mpsc channel).
-fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
+///
+/// Returns `true` when the attempt should count against the retry budget (a job
+/// was routed, or the retry was refused for a reason a later retry might
+/// outlive). Returns `false` when the branch is permanently un-recoverable —
+/// the caller drops its tracker entry.
+async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> bool {
     // Execution-time invariant: pinned roles (Assistant) never
     // run outside the user's personal workspace, even on recovery. A pinned
-    // role with an empty user has no personal identity — refuse the retry.
+    // role with an empty user has no personal identity — a permanent data
+    // condition, like the other permanent-data refusals below: refuse the
+    // retry for good.
     let Some(workspace_name) =
         crate::users::enforce_personal_pinning(role, &ctx.workspace_name, &ctx.user_name)
     else {
@@ -381,8 +407,52 @@ fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
             workspace = %ctx.workspace_name,
             "Dead session recovery: pinned role with empty user — refusing to route unpinned"
         );
-        return;
+        return false;
     };
+
+    // A custom-role branch is resumable only while its record still exists: the
+    // record owns the authorial prompt and the tool subset, so a deleted role
+    // leaves nothing to run. Abandon the branch permanently in that case.
+    let custom_role = if role == Role::Custom {
+        let Some(name) = ctx.custom_role.as_deref() else {
+            tracing::warn!(
+                agent_id = %agent_id,
+                "Dead session recovery: custom-role session without a role name — skipping permanently"
+            );
+            return false;
+        };
+        match crate::custom_role::get(name).await {
+            Ok(Some(record)) => Some(crate::CustomRoleLaunch {
+                name: name.to_string(),
+                identifier: ctx.custom_identifier.clone(),
+                prompt: record.prompt,
+                tools: record.tools,
+                agent_id: agent_id.to_string(),
+            }),
+            Ok(None) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    role = %name,
+                    "Dead session recovery: custom role no longer exists — skipping permanently"
+                );
+                return false;
+            }
+            Err(e) => {
+                // A transient read failure must not abandon a branch forever —
+                // count the attempt and let the backoff retry later.
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    role = %name,
+                    error = %e,
+                    "Dead session recovery: custom role lookup failed — skipping this cycle"
+                );
+                return true;
+            }
+        }
+    } else {
+        None
+    };
+
     // Recovery retry: uses `RecoveryRetry` kind with empty content so the
     // agent runs against the EXISTING session history (which already contains
     // the user's original message).  No boilerplate message is injected, and
@@ -411,9 +481,12 @@ fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
         reply_target: None,
         pending_job_id: None,
         originating_workspace: None,
+        custom_role,
+        reply_to_custom: None,
     };
 
     crate::agent::message_router::route(agent_id, job);
+    true
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -422,6 +495,34 @@ fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
 mod tests {
     use super::*;
     use crate::Tool;
+
+    /// A custom branch with no role record (or a session that never recorded
+    /// one) has no prompt and no tool set: `attempt_recovery` abandons it rather
+    /// than consuming the retry budget on a turn that could never run.
+    #[tokio::test]
+    async fn attempt_recovery_abandons_a_custom_branch_without_a_role_record() {
+        crate::util::test::init_test_stores().await;
+        let ctx = SessionContext {
+            channel: "gui".to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            workspace_name: crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+            role: crate::Role::Custom.as_str().to_string(),
+            custom_role: None,
+            custom_identifier: None,
+        };
+        assert!(
+            !attempt_recovery("role_test_launchless", &ctx, Role::Custom).await,
+            "a custom session without a recorded role is permanently un-recoverable"
+        );
+        let deleted = SessionContext {
+            custom_role: Some("ghost_role".to_string()),
+            ..ctx
+        };
+        assert!(
+            !attempt_recovery("role_test_ghost", &deleted, Role::Custom).await,
+            "a branch whose custom role was deleted is permanently un-recoverable"
+        );
+    }
 
     #[test]
     fn test_is_recovery_candidate_classification() {

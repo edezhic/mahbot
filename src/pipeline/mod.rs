@@ -422,6 +422,7 @@ async fn dispatch_working_phases(ws: &Workspace) {
             },
             None,
             None,
+            None,
         )
         .await
         {
@@ -897,6 +898,8 @@ fn notify_manager_system(ws_name: &str, content: String) {
             reply_target: None,
             pending_job_id: None,
             originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
         },
     );
 }
@@ -1076,6 +1079,8 @@ async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
             reply_target: None,
             pending_job_id: None,
             originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
         },
     );
 }
@@ -1352,6 +1357,7 @@ async fn run_parallel_agents(
                         Some(round),
                         None,
                         None,
+                        None,
                     )
                     .await;
 
@@ -1505,6 +1511,7 @@ async fn run_single_agent(
         false,
         Some(incoming_rx),
         resume,
+        None,
         None,
         None,
         None,

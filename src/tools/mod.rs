@@ -24,6 +24,7 @@ pub(crate) mod document;
 pub(crate) mod edit;
 pub(crate) mod image_gen;
 pub(crate) mod implement;
+pub(crate) mod launch_role;
 pub(crate) mod listing;
 pub(crate) mod mahbot_config;
 pub(crate) mod mahbot_debug;
@@ -195,6 +196,7 @@ pub(crate) use document::DocumentTool;
 pub(crate) use edit::EditTool;
 pub(crate) use image_gen::ImageGenTool;
 pub(crate) use implement::ImplementTool;
+pub(crate) use launch_role::LaunchRoleTool;
 pub(crate) use mahbot_config::MahbotConfigTool;
 pub(crate) use mahbot_debug::MahbotDebugTool;
 pub(crate) use manager_chat::SendMessageToManagerTool;
@@ -437,6 +439,14 @@ pub(crate) struct SpawnRecord<'a> {
     /// reply always names the directory really used and a restart resumes into
     /// the same identity. Persisted as `jobs.exec_dir`.
     pub exec_dir: Option<&'a str>,
+    /// The CALLER's custom-role launch, when the round was dispatched by a
+    /// custom role: persisted as `jobs.custom_launch` so a boot resume rebuilds
+    /// the envelope addressed to the custom branch (rather than the tool's
+    /// construction role). The WHOLE launch travels — a resumed turn opens its
+    /// branch from this snapshot, so the authorial prompt and the tool subset
+    /// are as load-bearing as the branch address. `None` for every built-in
+    /// caller.
+    pub custom_launch: Option<&'a crate::CustomRoleLaunch>,
 }
 
 /// The single outcome form of the durable sync cores (analyze/implement):
@@ -516,14 +526,16 @@ impl SyncDurableCore {
         // job remains and this spawns fresh.
 
         let job_id = crate::generate_id();
+        let custom = crate::agent::tool_custom_launch();
         let args = CoreJobArgs {
             job_id: &job_id,
-            caller_role,
+            caller_role: caller_role.for_launch(custom.as_ref()),
             user_name: &user_name,
             channel: &channel,
             spawn: Some(SpawnRecord {
                 delivery_name: &ws.name,
                 exec_dir: None,
+                custom_launch: custom.as_ref(),
             }),
             caller_agent_id: caller_agent_id.as_deref(),
             fail_on_checkpoint_error: caller_agent_id.is_some(),
@@ -677,6 +689,11 @@ impl SyncDurableCore {
     /// `target`, when present, is the directory the round executes in — the
     /// sub-agents' root, context and search key, while delivery stays the
     /// caller's.
+    ///
+    /// `custom`, when present, is the calling custom role's launch: the round's
+    /// envelopes and its jobs row carry `Role::Custom` and the launch so a boot
+    /// resume delivers back to the custom branch, never to the tool's own
+    /// construction role's address.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn dispatch_durable(
         self,
@@ -687,9 +704,11 @@ impl SyncDurableCore {
         user_name: &str,
         channel: &str,
         job_id: &str,
+        custom: Option<crate::CustomRoleLaunch>,
     ) -> Option<AgentJob> {
         let exec = target.unwrap_or(delivery);
         let exec_dir = target.map(|t| t.path.as_str());
+        let caller_role = caller_role.for_launch(custom.as_ref());
         let result = match self
             .run(
                 exec,
@@ -702,6 +721,7 @@ impl SyncDurableCore {
                     spawn: Some(SpawnRecord {
                         delivery_name: &delivery.name,
                         exec_dir,
+                        custom_launch: custom.as_ref(),
                     }),
                     caller_agent_id: None,
                     fail_on_checkpoint_error: false,
@@ -741,6 +761,7 @@ impl SyncDurableCore {
                 user_name,
                 channel,
                 &delivery.name,
+                custom,
             )
             .await,
         )
@@ -782,9 +803,10 @@ impl SyncDurableCore {
                 Err(e) => Err(e),
             },
         };
-        let (caller_role, caller, result) = match resumed {
+        let (caller_role, caller, custom, result) = match resumed {
             Ok(crate::jobs::SyncResumeOutcome::Terminal(caller_role, caller, result)) => {
-                (caller_role, caller, result)
+                let custom = caller.custom_launch.as_deref().cloned();
+                (caller_role, caller, custom, result)
             }
             // Drain-cut mid-resume / job row gone (explicitly abandoned): abort
             // quietly — the core logs the reason; a gone job was already noted.
@@ -807,6 +829,7 @@ impl SyncDurableCore {
                 else {
                     return;
                 };
+                let custom = caller.custom_launch.as_deref().cloned();
                 let envelope = crate::jobs::complete_durable_job(
                     job_id,
                     self.build_async_message(job_id, &Err(e), exec_dir),
@@ -815,6 +838,7 @@ impl SyncDurableCore {
                     &caller.user_name,
                     &caller.channel,
                     &delivery.name,
+                    custom,
                 )
                 .await;
                 crate::agent::message_router::route(
@@ -843,6 +867,7 @@ impl SyncDurableCore {
             &caller.user_name,
             &caller.channel,
             &delivery.name,
+            custom,
         )
         .await;
         crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
@@ -896,6 +921,11 @@ impl SyncDurableCore {
     ) {
         let user_name = crate::agent::tool_user_name();
         let channel = crate::agent::tool_channel();
+        // Read synchronously before the spawn (task-local contract): the round's
+        // envelope and job row must carry the caller's branch when it is a
+        // custom role, and the default construction role otherwise — that
+        // derivation lives in `dispatch_durable`.
+        let custom = crate::agent::tool_custom_launch();
         let (delivery, task) = (delivery.clone(), task.to_string());
         let target = target.cloned();
         let ws_name = delivery.name.clone();
@@ -910,6 +940,7 @@ impl SyncDurableCore {
                     &user_name,
                     &channel,
                     &job_id,
+                    custom.clone(),
                 )
                 .await
             })
@@ -930,6 +961,9 @@ impl SyncDurableCore {
                     if let Some(exec) = target.as_ref() {
                         crate::tools::delegation::release_exec_engine(exec);
                     }
+                    // A custom-role round owns a custom branch address: derive
+                    // the envelope's role the same way `dispatch_durable` does.
+                    let role = caller_role.for_launch(custom.as_ref());
                     AgentJob {
                         content: self.build_async_message(
                             &job_id,
@@ -940,10 +974,12 @@ impl SyncDurableCore {
                         user_name,
                         channel,
                         kind: self.message_kind(),
-                        role: caller_role,
+                        role,
                         reply_target: None,
                         pending_job_id: Some(job_id),
                         originating_workspace: None,
+                        custom_role: custom,
+                        reply_to_custom: None,
                     }
                 }
             };

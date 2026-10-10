@@ -282,6 +282,9 @@ pub(crate) async fn run_analyze_with_job(
                 // The round's execution directory (the caller's target, when one
                 // was asked for) so a restart resumes into the same directory.
                 spawn.exec_dir,
+                // The calling custom role's launch, when there is one, so a
+                // resume rebuilds an envelope addressed to its branch.
+                spawn.custom_launch,
             )
             .await?;
             (slots, Vec::new())
@@ -317,6 +320,7 @@ pub(crate) async fn run_analyze_with_job(
                     job_id.to_string(),
                 )),
                 Some(analyze.to_string()),
+                None,
             );
             let _ = agent.session.init(&slot.agent_id).await;
             runs.push(AnalyzeRun::Completed {
@@ -415,6 +419,7 @@ async fn run_analyze_slots(
                     Some(round),
                     Some(crate::agent::registry::ParentKey::AnalyzeRound(round_key)),
                     Some(question),
+                    None,
                 )
                 .await
             }
@@ -1647,6 +1652,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         AnalyzeRun::Completed {
             agent,
@@ -2445,6 +2451,7 @@ mod tests {
             &crate::jobs::SpawnChild::Analyze,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2517,6 +2524,7 @@ mod tests {
             &crate::jobs::SpawnChild::Analyze,
             None,
             Some(target),
+            None,
         )
         .await
         .unwrap();
@@ -2849,6 +2857,7 @@ mod tests {
             &crate::jobs::SpawnChild::Analyze,
             Some(pin),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2893,6 +2902,7 @@ mod tests {
             &crate::jobs::SpawnChild::Research,
             Some(pin),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2924,6 +2934,7 @@ mod tests {
                 ticket_id: ticket_id.clone(),
             },
             Some(pin),
+            None,
             None,
         )
         .await

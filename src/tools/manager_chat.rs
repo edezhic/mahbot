@@ -4,8 +4,9 @@
 //! The Assistant addresses the Manager on the user's behalf via an internal
 //! agent message (wrapped in an `<assistant-message>` envelope). The send is
 //! fully internal: nothing reaches the workspace users' chat history or
-//! channel bindings. The tool is gated to the admin's Assistant (see
-//! `Role::Assistant` toolset).
+//! channel bindings. The tool is held by the admin's Assistant (see
+//! `Role::Assistant` toolset) and by custom roles the administrator granted it
+//! to — its presence in a role's tool subset is the boundary.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -40,8 +41,11 @@ impl Tool for SendMessageToManagerTool {
         )
     }
 
-    async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
+    async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let (_, user_name) = crate::agent::tool_identity()?;
+        // Read before any spawn: routes the Manager's answer back into this
+        // branch when the caller is a custom role.
+        let custom = crate::agent::tool_custom_launch();
 
         let workspace = super::get_str(&args, "workspace")?;
         let message = super::get_str(&args, "message")?;
@@ -67,6 +71,10 @@ impl Tool for SendMessageToManagerTool {
             envelope,
             workspace.to_string(),
             user_name,
+            custom.map(|launch| crate::agent::message_router::ManagerReply {
+                launch,
+                workspace: ws.name.clone(),
+            }),
         )
         .await;
 

@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Timelike, Utc};
 use futures_util::future::join_all;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use strum::IntoEnumIterator;
@@ -949,6 +950,36 @@ fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
     ))
 }
 
+/// Synthesize a workspace from an absolute path to an existing directory — the
+/// way a custom-role launch can name *any* folder on the machine as its
+/// workspace, without it being registered.
+///
+/// `None` unless `name` is an absolute path that exists and is a directory (the
+/// two syscalls run on the blocking-friendly path, like the delegation target
+/// resolution). The synthesized workspace's `name` is the canonical path itself
+/// — NOT the `dir-…` short key a targeted delegation round uses: the name is
+/// the durable key a launch is recorded under
+/// (`session_metadata.workspace_name`, `jobs.workspace_name`, the sub-round
+/// envelopes), and [`crate::users::resolve_workspace`] accepts an absolute
+/// path, so the address must be the folder itself for the launch to resolve
+/// back after a restart. A registered workspace with that name is resolved by
+/// the caller first and still wins — as does the registered workspace whose
+/// folder this path is (`WorkspaceStore::get_by_path`).
+#[must_use]
+pub(crate) fn synthesize_from_path(name: &str) -> Option<Workspace> {
+    let path = Path::new(name);
+    if !path.is_absolute() {
+        return None;
+    }
+    let (exists, is_dir) = crate::util::with_block_in_place(|| (path.exists(), path.is_dir()));
+    if !exists || !is_dir {
+        return None;
+    }
+    let canonical = crate::stored_workspace_path(path);
+    let address = canonical.to_string_lossy().to_string();
+    Some(Workspace::ephemeral_run(&address, &canonical))
+}
+
 fn workspace_from_row(row: &db::Row) -> anyhow::Result<Workspace> {
     Ok(Workspace {
         name: row.get(COL_WS_NAME)?,
@@ -1056,6 +1087,27 @@ impl WorkspaceStore {
             .query_optional_cached(
                 &format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE name = ?1"),
                 db::params![name],
+                workspace_from_row,
+            )
+            .await
+    }
+
+    /// Look up the registered workspace whose folder is `path` — a caller may
+    /// name a registered workspace by its path instead of its name
+    /// ([`crate::users::resolve_workspace`]). Registered rows store the
+    /// canonical path with a trailing separator
+    /// ([`canonicalize_workspace_path`]), so the candidate is normalized the
+    /// same way before the comparison.
+    pub async fn get_by_path(&self, path: &str) -> Result<Option<Workspace>> {
+        let canonical = ensure_trailing_separator(
+            crate::stored_workspace_path(std::path::Path::new(path))
+                .to_string_lossy()
+                .to_string(),
+        );
+        self.conn
+            .query_optional_cached(
+                &format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE path = ?1"),
+                db::params![canonical],
                 workspace_from_row,
             )
             .await
@@ -2554,6 +2606,7 @@ mod tests {
             String::new(),
             String::new(),
             false,
+            None,
             None,
             None,
         );

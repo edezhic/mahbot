@@ -174,6 +174,16 @@ fn render_alarm(alarm: &Alarm, now: DateTime<Local>) -> Element<'_, AlarmsMessag
                 .color(theme::TEXT_MUTED),
         );
     }
+    if let Some(target) = alarm.role_target() {
+        // The role the alarm is addressed to, worded exactly as the assistant
+        // sees it — an alarm that wakes the Assistant has no such line.
+        entry = entry.push(
+            text(target)
+                .size(theme::TEXT_11)
+                .font(super::JETBRAINS_MONO)
+                .color(theme::TEXT_MUTED),
+        );
+    }
 
     // Keyed by the alarm's row: a refresh that reshuffles the list closes this
     // menu instead of redirecting its Delete at another alarm.
@@ -285,6 +295,9 @@ mod tests {
             kind: "one-shot".to_string(),
             text: text.to_string(),
             trigger: None,
+            role: None,
+            identifier: None,
+            workspace: None,
             interval_seconds: None,
             next_fire_at: String::new(),
         }

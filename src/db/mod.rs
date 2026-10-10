@@ -89,7 +89,8 @@ pub(crate) fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::Pars
 pub(crate) const EXPERIMENTAL_FEATURES: &[&str] = &["index_method"];
 
 /// Name (file stem) of the single consolidated domain database file that backs
-/// the board, sessions, workspaces, users, config, chat_history, and alarms stores.
+/// the board, sessions, workspaces, users, config, chat_history, alarms and
+/// custom_roles stores.
 ///
 /// The domain stores were historically split across separate files; they
 /// now share one file (and one shared [`Connection`]) so that cross-store
@@ -116,6 +117,7 @@ const DOMAIN_STORE_NAMES: &[&str] = &[
     "config",
     "chat_history",
     "alarms",
+    "custom_roles",
 ];
 
 /// Name (file stem) of the logs store — the one store that stays a separate
@@ -168,7 +170,7 @@ pub(crate) fn iter_checkpoint_stores()
 /// # Consolidated layout
 ///
 /// The domain stores (board, sessions, workspaces, users, config,
-/// chat_history, alarms) are consolidated into ONE physical file
+/// chat_history, alarms, custom_roles) are consolidated into ONE physical file
 /// ([`CONSOLIDATED_DB_NAME`]); only the logs store is a separate file. This
 /// function returns the LOGICAL store names so `--db board`, `--db sessions`,
 /// etc. resolve to the single consolidated file via [`store_db_path`].
@@ -195,7 +197,8 @@ pub(crate) fn debug_db_names() -> Vec<&'static str> {
 /// Initialize all database stores concurrently.
 ///
 /// This is the canonical initialization path for the domain stores (board,
-/// session, workspace, users, chat_history, config, alarms).  The `logs` store
+/// session, workspace, users, chat_history, config, alarms, custom_roles).
+/// The `logs` store
 /// is **not** included here because it must be initialized earlier via
 /// [`crate::logs::init_tracing`], which requires the log store before any
 /// other subsystem is ready. The stats tables (tool_calls, llm_requests)
@@ -233,6 +236,7 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
     let config = crate::config_db::ConfigStore { conn: conn.clone() };
     let chat_history = crate::channels::chat_history::ChatHistoryStore { conn: conn.clone() };
     let alarms = crate::alarms::AlarmStore { conn: conn.clone() };
+    let custom_roles = crate::custom_role::CustomRoleStore { conn: conn.clone() };
 
     // Record the shared connection before setting any cell so a concurrent
     // re-entry observes it and short-circuits.
@@ -254,6 +258,11 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
         "CHAT_HISTORY",
     )?;
     init_cell(&crate::alarms::ALARMS, alarms, "ALARMS")?;
+    init_cell(
+        &crate::custom_role::CUSTOM_ROLES,
+        custom_roles,
+        "CUSTOM_ROLES",
+    )?;
 
     Ok(())
 }
@@ -647,6 +656,15 @@ pub(crate) fn is_store_lock_error(e: &anyhow::Error) -> bool {
             .downcast_ref::<turso::Error>()
             .is_some_and(is_open_time_lock_error)
     })
+}
+
+/// True when `e`, or any cause beneath it, is a store (Turso) failure — the
+/// database itself could not serve the operation, as opposed to a verdict
+/// about the data. Callers use it to retry later instead of acting on a
+/// transient read/write error.
+pub(crate) fn is_store_error(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| cause.downcast_ref::<turso::Error>().is_some())
 }
 
 /// A store that exists but is not positively recognised as usable. The service

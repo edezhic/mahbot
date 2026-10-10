@@ -234,6 +234,9 @@ pub(crate) async fn run_implement_with_job(
                 // The round's execution directory (the caller's target, when one was
                 // asked for) so a restart resumes into the same directory.
                 spawn.exec_dir,
+                // The calling custom role's launch, when there is one, so a
+                // resume rebuilds an envelope addressed to its branch.
+                spawn.custom_launch,
             )
             .await?;
             (coder_agent_id, None)
@@ -271,6 +274,7 @@ pub(crate) async fn run_implement_with_job(
         None,
         parent_key,
         parent_label,
+        None,
     )
     .await;
 
@@ -356,6 +360,7 @@ mod tests {
                 "admin",
                 "gui",
                 job_id,
+                None,
             )
             .await
             .expect("the round completes");

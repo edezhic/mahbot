@@ -1,6 +1,6 @@
 //! The optional `target` argument of the two delegation tools: the admin's
-//! Assistant can point a round at a chosen directory instead of its own
-//! personal workspace.
+//! Assistant — and any custom role that takes these tools from his catalogue —
+//! can point a round at a chosen directory instead of its own workspace.
 //!
 //! Resolution is exact and every refusal is explicit — a target that resolves
 //! to nothing usable never falls back to the caller's own workspace. A value is
@@ -24,11 +24,6 @@ use anyhow::{Context as _, Result, bail};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
-
-/// The name prefix of a directory-scoped synthetic workspace — impossible in a
-/// registered name (`workspace::validate_name` allows only letters and
-/// underscores), so it identifies one unambiguously.
-const DIR_WORKSPACE_PREFIX: &str = "dir-";
 
 /// Which delegation tool is resolving a target — the two differ in what they
 /// refuse.
@@ -213,13 +208,22 @@ pub(crate) fn release_exec_engine(exec: &Workspace) {
     crate::search_engine::remove_engine(&exec.name);
 }
 
-/// A directory-scoped execution workspace. The name is
-/// `dir-<basename>-<hash of the canonical path>`: the embedded `-` is impossible
-/// in a registered workspace name (`validate_name` allows only letters and
-/// underscores), so a name-keyed surface — the per-workspace search index above
-/// all — can never hand this directory a registered workspace's state, and the
-/// path hash keeps two directories apart. The derivation is deterministic, so a
-/// resumed round re-derives the same agent/session/search identity.
+/// The name prefix of a directory-scoped synthetic workspace — impossible in a
+/// registered name (`validate_name` allows only letters and underscores), so it
+/// identifies one unambiguously.
+const DIR_WORKSPACE_PREFIX: &str = "dir-";
+
+/// A directory-scoped execution workspace for a targeted delegation round. The
+/// name is `dir-<basename>-<hash of the canonical path>`: the embedded `-` is
+/// impossible in a registered workspace name (`validate_name` allows only
+/// letters and underscores), so a name-keyed surface — the per-workspace search
+/// index above all — can never hand this directory a registered workspace's
+/// state, and the path hash keeps two directories apart. The derivation is
+/// deterministic, so a resumed round re-derives the same agent/session/search
+/// identity.
+///
+/// The short key is only ever an in-memory execution identity, bounded by the
+/// round that created it — never a durable launch address.
 fn dir_workspace(canonical: &Path) -> Workspace {
     let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
     let hash = crate::util::hex_string(&digest[..6]);

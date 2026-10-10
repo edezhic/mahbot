@@ -1247,9 +1247,18 @@ async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
 /// `~/.mahbot/userspaces/<user>/` and are constructed on the fly as ephemeral
 /// [`Workspace`] structs.
 ///
+/// An absolute path to an existing directory is also a legal workspace name
+/// (`crate::workspace::synthesize_from_path`): a custom-role launch may name
+/// any folder on the machine. A path that is a *registered* workspace's own
+/// folder resolves to that registered workspace, so the launch runs with its
+/// notes, its pause state and its search engine instead of a second, path-named
+/// area over the same tree. Any other path is addressed by the canonical path
+/// itself (its `name` and `path` are the same string); a registered workspace
+/// with that name (checked first) still wins.
+///
 /// Returns `Ok(Some(ws))` when the workspace is found or constructed,
 /// `Ok(None)` when the workspace genuinely does not exist (and is not a
-/// personal workspace), `Err` on database errors.
+/// personal or directory workspace), `Err` on database errors.
 ///
 /// Shared by the message router and the boot resume path so both treat
 /// synthetic personal workspaces identically.
@@ -1270,6 +1279,11 @@ pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>
         let user_name = personal_user_name(workspace_name)
             .expect("invariant: is_personal_workspace checked the prefix");
         Ok(Some(personal_workspace_struct(user_name)))
+    } else if let Some(ws) = crate::workspace::synthesize_from_path(workspace_name) {
+        match crate::workspace::store().get_by_path(&ws.path).await? {
+            Some(registered) => Ok(Some(registered)),
+            None => Ok(Some(ws)),
+        }
     } else {
         Ok(None)
     }
