@@ -38,11 +38,16 @@
 //!   named in a note; the pages without a usable text layer are rasterized so the
 //!   document is still delivered, because a page whose text could not be read is
 //!   not a page that has none.
-//! - **Content-first detection.** Magic bytes decide the format; the extension
-//!   only disambiguates formats that share a container (a ZIP is a
-//!   `.docx`/`.xlsx`/`.pptx`, and a CFB is an encrypted OOXML package or a
-//!   legacy `.doc`/`.xls`/`.ppt`, only when the name says so) or that have no
-//!   magic (plain text).
+//! - **Content-first detection.** Magic bytes decide the format, and a shared
+//!   container is opened to read what it really holds: a CFB's own directory
+//!   tells a legacy `.doc`/`.xls`/`.ppt` from a genuinely encrypted package,
+//!   and a ZIP's own entries tell a `.docx`/`.xlsx`/`.pptx`. The name only
+//!   decides what the content cannot — a container that names no Office
+//!   document at all falls back to the name's claim, and plain text has no
+//!   container to read — so a renamed file is read — and reported — for what it
+//!   is. The gate that decides whether a file is converted at all has only its
+//!   head to read, so a ZIP is still a ZIP by name there: a real `.xlsx` named
+//!   `notes.bin` is read as the raw bytes that name claims.
 //! - **`out_dir` is created on demand** and is the only place artifacts are
 //!   written, with names taken from the source/entry file name — never from a
 //!   full ZIP entry path, so a crafted archive cannot write outside it.
@@ -62,9 +67,12 @@ use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings};
 use image::codecs::jpeg::JpegEncoder;
 use image::{RgbImage, RgbaImage};
+use office_oxide::cfb::CfbReader;
 use pdf_extract::{Document, PlainTextOutput, output_doc_page};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use zip::ZipArchive;
 
 /// Maximum extracted-text length (Unicode chars) inlined into the message.
 pub(crate) const INLINE_TEXT_MAX_CHARS: usize = 5000;
@@ -90,9 +98,9 @@ const PDF_MAGIC: &[u8] = b"%PDF-";
 /// Magic bytes at the start of a ZIP local file header — the OOXML packages
 /// (Word/Excel/PowerPoint) and plain archives alike.
 const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
-/// CFB/OLE container magic — what an *encrypted* OOXML package and a legacy
-/// `.doc`/`.xls`/`.ppt` are both wrapped in. Shared with the `document` tool,
-/// which gives an OOXML-named one the same password-protected verdict.
+/// CFB/OLE container magic — what a legacy `.doc`/`.xls`/`.ppt` and a genuinely
+/// encrypted OOXML package are both wrapped in. Shared with the `document`
+/// tool, which refuses such a container by what its own directory says it is.
 pub(crate) const CFB_MAGIC: &[u8] = &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 /// Extensions treated as plain text regardless of content.
 const PLAIN_TEXT_EXTENSIONS: &[&str] = &[
@@ -103,11 +111,12 @@ const PLAIN_TEXT_EXTENSIONS: &[&str] = &[
 /// Reason reported for a document whose bytes could not be read or whose
 /// conversion panicked.
 const UNREADABLE_REASON: &str = "could not be read";
-/// Bound on the concurrent heavy document reads — converting a document, and the
-/// deck walk a `pptx_edit` refusal's diagram text needs (see
-/// [`read_pptx_diagram_text`]): each holds the whole document (plus, for a
-/// conversion, its decoded rasters), and every caller runs on its own task, so a
-/// burst would otherwise multiply peak memory.
+/// Bound on the concurrent heavy document parses — a conversion, the deck walk a
+/// `pptx_edit` refusal's diagram text needs (see [`read_pptx_diagram_text`]), and
+/// the parse a container's own bytes need to name their family (see
+/// [`run_document_parse`]): each holds a whole document (plus, for a conversion,
+/// its decoded rasters), and every caller runs on its own task, so a burst would
+/// otherwise multiply peak memory.
 static DOCUMENT_CONVERSIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 // ── Delivery notes shared by both callers ───────────────────────
@@ -164,8 +173,104 @@ pub(crate) enum DocOutcome {
     Unsupported,
 }
 
-/// What [`convert_document`] found in `bytes`: the format whose container the
-/// magic marks, or the extension's verdict where the container is shared.
+// ── What a file really is, from its own bytes ───────────────────
+//
+// Both callers of this module answer a file by its CONTENT: the name is only
+// what the user called it, and the formats that share a container (a CFB, a
+// ZIP) can be told apart no other way. The reading and writing halves of the
+// `document` tool therefore ask this one classifier, so the two paths cannot
+// disagree about what a file is.
+
+/// What a file really is, decided from its bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RealFamily {
+    Pdf,
+    Docx,
+    Xlsx,
+    Pptx,
+    /// A pre-OOXML Word document (`.doc`, a CFB container).
+    LegacyDoc,
+    /// A pre-OOXML Excel workbook (`.xls`, a CFB container).
+    LegacyXls,
+    /// A pre-OOXML PowerPoint presentation (`.ppt`, a CFB container).
+    LegacyPpt,
+    /// A genuinely encrypted document, which needs a password rather than a
+    /// reading: a CFB container holding `EncryptionInfo` and `EncryptedPackage`,
+    /// or one of the three old binary formats whose own reader reports a
+    /// password — the container alone cannot tell the two apart.
+    Encrypted,
+    /// None of the formats above — an OLE container that is not an Office
+    /// document (an Outlook `.msg`, say), a container too broken to open, or
+    /// bytes that are no document container at all.
+    Other,
+}
+
+/// `bytes`'s real family — the container's own content, never the file's name.
+#[must_use]
+pub(crate) fn real_family(bytes: &[u8]) -> RealFamily {
+    if bytes.starts_with(PDF_MAGIC) {
+        return RealFamily::Pdf;
+    }
+    if bytes.starts_with(CFB_MAGIC) {
+        return cfb_family(bytes);
+    }
+    if bytes.starts_with(ZIP_MAGIC) {
+        return zip_family(bytes);
+    }
+    RealFamily::Other
+}
+
+/// A CFB container's family, from its own directory: the streams it declares are
+/// the only thing separating a legacy `.doc`/`.xls`/`.ppt` from a genuinely
+/// encrypted OOXML package from an OLE container that is neither. A container
+/// that is neither, or one this reader cannot open at all, has no family of its
+/// own — the caller falls back to the name's claim ([`named_container_kind`]),
+/// the only evidence such a file leaves.
+fn cfb_family(bytes: &[u8]) -> RealFamily {
+    let Ok(reader) = CfbReader::new(Cursor::new(bytes)) else {
+        return RealFamily::Other;
+    };
+    // Genuine encryption wins over everything: a package encrypted this way
+    // carries these two streams and nothing a reader could read, so a stray
+    // `WordDocument` (or an OOXML name) must not talk the verdict out of the
+    // password prompt the file really is.
+    if reader.has_stream("EncryptionInfo") && reader.has_stream("EncryptedPackage") {
+        return RealFamily::Encrypted;
+    }
+    if reader.has_stream("WordDocument") {
+        return RealFamily::LegacyDoc;
+    }
+    // Excel 97 writes `Workbook`, the 5.0/95 readers `Book`.
+    if reader.has_stream("Workbook") || reader.has_stream("Book") {
+        return RealFamily::LegacyXls;
+    }
+    if reader.has_stream("PowerPoint Document") {
+        return RealFamily::LegacyPpt;
+    }
+    RealFamily::Other
+}
+
+/// A ZIP container's family, from the package's own entry names. Only the
+/// central directory is read — no entry is ever decompressed — so deciding a
+/// package's family cannot inflate anything.
+fn zip_family(bytes: &[u8]) -> RealFamily {
+    let Ok(archive) = ZipArchive::new(Cursor::new(bytes)) else {
+        return RealFamily::Other;
+    };
+    let has = |part: &str| archive.file_names().any(|name| name == part);
+    if has(crate::ooxml::DOCX_BODY_PART) {
+        RealFamily::Docx
+    } else if has(crate::ooxml::WORKBOOK_PART) {
+        RealFamily::Xlsx
+    } else if has(crate::ooxml::PPT_PRESENTATION_PART) {
+        RealFamily::Pptx
+    } else {
+        RealFamily::Other
+    }
+}
+
+/// What [`convert_document`] found in `bytes`: the format its own container
+/// declares, or the extension's verdict where the container declares none.
 enum DocumentKind {
     Pdf,
     Docx,
@@ -177,55 +282,58 @@ enum DocumentKind {
     LegacyXls,
     /// A legacy binary PowerPoint presentation (`.ppt`, a CFB container).
     LegacyPpt,
-    /// An encrypted OOXML package: a CFB container, which needs a password
-    /// rather than a conversion.
-    EncryptedOoxml,
+    /// A genuinely encrypted OOXML package, whatever the name claims: a CFB
+    /// container that needs a password rather than a conversion.
+    Encrypted,
     PlainText,
     Unsupported,
 }
 
 /// Whether `head` opens a ZIP container — an OOXML package of the three families
-/// this module converts, or a plain archive, which only the name tells apart. The
-/// `document` tool's refusal for an old-format name asks this, both for a
-/// `fill_template` sample and for an edit input, so a file whose bytes are a
-/// package is described by them rather than by its name.
+/// this module converts, or a plain archive. A head of magic alone cannot tell
+/// those apart, so this answers only "a ZIP"; [`real_family`] opens the central
+/// directory to say which family a package holds. The `document` tool's
+/// classifier asks this, so a file whose bytes are a package is read whole and
+/// described by them rather than by its name.
 #[must_use]
 pub(crate) fn is_zip_container(head: &[u8]) -> bool {
     head.starts_with(ZIP_MAGIC)
 }
 
-/// Classify `bytes` named `path`: magic bytes first, the extension only where
-/// the container is shared (a ZIP is a `.docx`/`.xlsx`/`.pptx` only when the
-/// name says so) or absent (plain text). The single dispatch behind
-/// [`convert_document`] and [`needs_extraction`], so detection cannot drift
-/// between them.
+/// Classify `bytes` named `path`: the container's own content first, the name
+/// only where the content cannot decide (a container that names no Office
+/// document) or there is no container to read (plain text). The single dispatch
+/// behind [`convert_document`] and [`needs_extraction`], so detection cannot
+/// drift between them.
 fn classify(bytes: &[u8], path: &Path) -> DocumentKind {
     if bytes.starts_with(PDF_MAGIC) {
         return DocumentKind::Pdf;
     }
-    // Checked before the ZIP attempt: an encrypted OOXML package and a legacy
-    // `.doc`/`.xls`/`.ppt` are both CFB containers, and their bytes would
-    // otherwise look like corruption. An OOXML-named one is a password prompt;
-    // a legacy-named one is a format this converts (from its own reader).
+    // Checked before the ZIP attempt: a legacy `.doc`/`.xls`/`.ppt`, an
+    // encrypted package and any other OLE container alike are CFB, and their
+    // bytes would otherwise look like corruption. The container's own directory
+    // decides first; a directory that names no Office document leaves the name's
+    // claim, the only evidence such a container has.
     if bytes.starts_with(CFB_MAGIC) {
-        if crate::ooxml::family_of(path).is_some() {
-            return DocumentKind::EncryptedOoxml;
-        }
-        return match crate::legacy::family_of(path) {
-            Some(crate::legacy::Family::Doc) => DocumentKind::LegacyDoc,
-            Some(crate::legacy::Family::Xls) => DocumentKind::LegacyXls,
-            Some(crate::legacy::Family::Ppt) => DocumentKind::LegacyPpt,
-            None => DocumentKind::Unsupported,
+        return match real_family(bytes) {
+            RealFamily::Encrypted => DocumentKind::Encrypted,
+            RealFamily::LegacyDoc => DocumentKind::LegacyDoc,
+            RealFamily::LegacyXls => DocumentKind::LegacyXls,
+            RealFamily::LegacyPpt => DocumentKind::LegacyPpt,
+            _ => named_container_kind(path),
         };
     }
     if bytes.starts_with(ZIP_MAGIC) {
-        // ZIP magic alone is shared by every OOXML package and plain archives;
-        // only the name can tell which kind, if any, this is.
-        return match crate::ooxml::family_of(path) {
-            Some(crate::ooxml::Family::Docx) => DocumentKind::Docx,
-            Some(crate::ooxml::Family::Xlsx) => DocumentKind::Xlsx,
-            Some(crate::ooxml::Family::Pptx) => DocumentKind::Pptx,
-            None => DocumentKind::Unsupported,
+        // The package's own entries win where they name a family, so a real
+        // `.xlsx` named `.docx` reads as a spreadsheet. A ZIP that is no OOXML
+        // package at all keeps the name's verdict — a broken package named
+        // `.docx` is still a corrupt `.docx` — because a plain archive and a
+        // package sharing a name are told apart by nothing else.
+        return match real_family(bytes) {
+            RealFamily::Docx => DocumentKind::Docx,
+            RealFamily::Xlsx => DocumentKind::Xlsx,
+            RealFamily::Pptx => DocumentKind::Pptx,
+            _ => named_package_kind(path),
         };
     }
     // A known text extension is decoded lossily; anything else must look like
@@ -236,13 +344,51 @@ fn classify(bytes: &[u8], path: &Path) -> DocumentKind {
     DocumentKind::Unsupported
 }
 
+/// The OOXML package family a name claims, or [`DocumentKind::Unsupported`] when
+/// the name is none of the three — the fallback for a ZIP whose own entries say
+/// nothing, and the verdict a file whose bytes changed under the caller gets.
+fn named_package_kind(path: &Path) -> DocumentKind {
+    match crate::ooxml::family_of(path) {
+        Some(crate::ooxml::Family::Docx) => DocumentKind::Docx,
+        Some(crate::ooxml::Family::Xlsx) => DocumentKind::Xlsx,
+        Some(crate::ooxml::Family::Pptx) => DocumentKind::Pptx,
+        None => DocumentKind::Unsupported,
+    }
+}
+
+/// The kind a name claims for a container whose own bytes name no Office
+/// document: a package's name makes the file that package's own reading — a
+/// `.docx`-named container holding no package is read as a corrupt `.docx` —
+/// and an old format's name hands it to that family's reader, which answers a
+/// file it cannot read as a corrupt one of its own format. A name claiming
+/// neither leaves the file to the ordinary read, the way every other binary
+/// file is read. Only a CFB reaches this: an old binary format is always an OLE
+/// container, so an old name over ZIP bytes is a name with nothing behind it.
+fn named_container_kind(path: &Path) -> DocumentKind {
+    if crate::ooxml::family_of(path).is_some() {
+        return named_package_kind(path);
+    }
+    match crate::legacy::named_family(path) {
+        Some(crate::legacy::Family::Doc) => DocumentKind::LegacyDoc,
+        Some(crate::legacy::Family::Xls) => DocumentKind::LegacyXls,
+        Some(crate::legacy::Family::Ppt) => DocumentKind::LegacyPpt,
+        None => DocumentKind::Unsupported,
+    }
+}
+
 /// Whether a document's leading bytes mark one of the containers this module
 /// extracts text and images from — the kinds that must be converted rather
-/// than read as bytes. Only the head is needed: every extraction arm is
-/// magic-local, and the text arm (plain UTF-8 / known text extension) is
-/// exactly the "no extraction needed" case.
+/// than read as bytes. Every arm but the CFB one is magic-local; a CFB's own
+/// directory lies past the head, so every CFB is sent to the full-bytes pass:
+/// a legacy `.doc` named `.docx` must reach its reader, and a container naming
+/// no Office document falls back to the name's claim, which — for a name
+/// claiming nothing — is the ordinary read. The text arm (plain UTF-8 / known
+/// text extension) is exactly the "no extraction needed" case.
 #[must_use]
 pub(crate) fn needs_extraction(head: &[u8], file_name: &str) -> bool {
+    if head.starts_with(CFB_MAGIC) {
+        return true;
+    }
     matches!(
         classify(head, Path::new(file_name)),
         DocumentKind::Pdf
@@ -252,14 +398,14 @@ pub(crate) fn needs_extraction(head: &[u8], file_name: &str) -> bool {
             | DocumentKind::LegacyDoc
             | DocumentKind::LegacyXls
             | DocumentKind::LegacyPpt
-            | DocumentKind::EncryptedOoxml
+            | DocumentKind::Encrypted
     )
 }
 
 /// Convert `bytes` named `file_name`, writing extracted page/embedded images
 /// into `out_dir` (created if missing). Synchronous and CPU-bound — callers run
-/// it on a blocking thread. Format detection is content-first (magic bytes),
-/// with the file extension as a secondary signal.
+/// it on a blocking thread. Format detection is content-first (the container's
+/// own content), with the file extension as a secondary signal.
 ///
 /// Reached from the crate through [`convert_document_file`]; the tests in this
 /// module call it directly. `out_dir` only matters to the arms that extract
@@ -268,7 +414,7 @@ pub(crate) fn needs_extraction(head: &[u8], file_name: &str) -> bool {
 fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome {
     match classify(bytes, Path::new(file_name)) {
         DocumentKind::Pdf => convert_pdf(bytes, out_dir),
-        DocumentKind::EncryptedOoxml => DocOutcome::Unreadable {
+        DocumentKind::Encrypted => DocOutcome::Unreadable {
             reason: "password-protected".to_string(),
         },
         DocumentKind::Docx => crate::ooxml::convert_docx(bytes, out_dir),
@@ -336,23 +482,38 @@ pub(crate) async fn convert_document_file(
     }
 }
 
+/// Run a whole-file document parse off the async executor and under the
+/// document bound: the one way a caller runs a parse outside the conversion
+/// entry point, so a third-party reader's panic degrades to `None` instead of
+/// unwinding the caller's turn, a synchronous parse never stalls an async task,
+/// and a burst of callers cannot multiply peak memory. `None` means the parse
+/// panicked.
+pub(crate) async fn run_document_parse<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let _permit = DOCUMENT_CONVERSIONS.acquire().await;
+    tokio::task::spawn_blocking(f).await.ok()
+}
+
 /// The diagram text a presentation's slides show, keyed by slide part (see
 /// [`crate::ooxml::pptx_diagram_text`]), read the way every other heavy document
-/// operation is: the walk reads a whole package and parses its slide, layout and
-/// diagram parts, so it runs on a blocking thread — a synchronous parse never
-/// stalls an async task — and holds [`DOCUMENT_CONVERSIONS`], so an edit cannot
-/// multiply peak memory or starve the document work the daemon is already doing.
+/// operation is: the file's bytes are read and the slide, layout and diagram
+/// parts parsed from them through [`run_document_parse`], so both the read and
+/// the parse happen off the async executor and under [`DOCUMENT_CONVERSIONS`] —
+/// an edit cannot multiply peak memory or stall a task.
 ///
 /// Best effort by design: a file that cannot be read yields an empty map, and the
 /// caller's refusal keeps its generic wording.
 pub(crate) async fn read_pptx_diagram_text(path: &Path) -> HashMap<String, Vec<String>> {
-    let _permit = DOCUMENT_CONVERSIONS.acquire().await;
-    let Ok(bytes) = tokio::fs::read(path).await else {
-        return HashMap::new();
-    };
-    tokio::task::spawn_blocking(move || crate::ooxml::pptx_diagram_text(&bytes))
-        .await
-        .unwrap_or_default()
+    let path = path.to_path_buf();
+    run_document_parse(move || {
+        std::fs::read(&path).map_or_else(
+            |_| HashMap::new(),
+            |bytes| crate::ooxml::pptx_diagram_text(&bytes),
+        )
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Extract text, page rasters and embedded images from a PDF: every page that
@@ -1688,6 +1849,9 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::test_fixtures::*;
     use super::*;
+    // The CFB container and `.doc` package recipes live with the readers that
+    // consume them, so a classification test and a reading test build one file.
+    use crate::legacy::test_fixtures::{cfb, doc_fixture};
     // The ZIP/OOXML fixtures live with the arm that reads them.
     use crate::ooxml::test_fixtures::zip_fixture;
     use std::io::Write;
@@ -1823,41 +1987,138 @@ mod tests {
         pdf_fixture(b"0.1 0.5 0.9 rg 0 0 612 792 re f", &[image])
     }
 
+    /// A CFB container's own directory, never the file's name, decides what it
+    /// is — and a real legacy Word `.doc` is the very case the name gets wrong:
+    /// under a modern name it must still read with its own reader, not be called
+    /// a password-protected package.
     #[test]
-    fn cfb_magic_classifies_by_name() {
-        let mut bytes = CFB_MAGIC.to_vec();
-        bytes.extend_from_slice(b"OLE container body that is not a zip");
+    fn legacy_doc_named_docx_is_read_as_a_legacy_document() {
+        let bytes = doc_fixture("Hello legacy doc", &[], false);
+        assert_eq!(real_family(&bytes), RealFamily::LegacyDoc);
         let dir = tempfile::tempdir().expect("tempdir");
-        // An OOXML-named CFB container is a password prompt.
-        for name in ["secret.docx", "book.xlsx", "deck.pptx"] {
-            assert!(matches!(
-                convert_document(&bytes, name, dir.path()),
-                DocOutcome::Unreadable { reason } if reason == "password-protected"
-            ));
-        }
-        // A legacy-named one is a format this converts: the container is not a
-        // valid document, so the reader's verdict is corruption — never
-        // `Unsupported`, which would fall back to the raw bytes.
-        for (name, format) in [
-            ("old.doc", ".doc"),
-            ("old.xls", ".xls"),
-            ("old.ppt", ".ppt"),
-        ] {
-            assert!(matches!(
-                convert_document(&bytes, name, dir.path()),
-                DocOutcome::Unreadable { reason }
-                    if reason == format!("corrupt or unreadable {format}")
-            ));
+        for name in ["words.docx", "words.docm", "words.bin"] {
+            assert!(
+                matches!(
+                    convert_document(&bytes, name, dir.path()),
+                    DocOutcome::Text { text, .. } if text == "Hello legacy doc"
+                ),
+                "{name} must read as the old document its container says it is"
+            );
             assert!(
                 needs_extraction(&bytes, name),
                 "{name} must be extracted, not returned as bytes"
             );
         }
-        // An unnamed CFB container is not a format this converts.
-        assert!(matches!(
-            convert_document(&bytes, "blob.bin", dir.path()),
-            DocOutcome::Unsupported
-        ));
+    }
+
+    /// Genuine encryption is a password prompt under any name, a modern one or
+    /// an old one: the two streams an encrypted package declares are what
+    /// matters, so a legacy name cannot turn it into a legacy file.
+    #[test]
+    fn encrypted_cfb_is_password_protected_whatever_the_name() {
+        let bytes = cfb(&[
+            ("EncryptionInfo", b"info".as_slice()),
+            ("EncryptedPackage", b"package".as_slice()),
+        ]);
+        assert_eq!(real_family(&bytes), RealFamily::Encrypted);
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["secret.docx", "book.xlsx", "old.doc", "old.xls", "blob.bin"] {
+            assert!(
+                matches!(
+                    convert_document(&bytes, name, dir.path()),
+                    DocOutcome::Unreadable { reason } if reason == "password-protected"
+                ),
+                "{name} must be a password prompt"
+            );
+        }
+    }
+
+    /// The container's own streams name the legacy family, and a container whose
+    /// directory names no Office document is decided by its name: a `.docx`-named
+    /// one reaches the package reader as a corrupt `.docx`, a `.doc`-named one the
+    /// legacy reader as a corrupt old document, and a name claiming no document at
+    /// all leaves it to the ordinary read — never a password prompt.
+    #[test]
+    fn a_cfb_is_classified_by_its_contents_then_its_name() {
+        assert_eq!(
+            real_family(&cfb(&[("Workbook", b"workbook".as_slice())])),
+            RealFamily::LegacyXls
+        );
+        assert_eq!(
+            real_family(&cfb(&[("Book", b"book".as_slice())])),
+            RealFamily::LegacyXls
+        );
+        assert_eq!(
+            real_family(&cfb(&[("PowerPoint Document", b"deck".as_slice())])),
+            RealFamily::LegacyPpt
+        );
+        // A container this reader cannot even open has no family either — the
+        // bare magic is not a document.
+        assert_eq!(real_family(CFB_MAGIC), RealFamily::Other);
+
+        let bytes = cfb(&[("__properties_version1.0", b"outlook".as_slice())]);
+        assert_eq!(real_family(&bytes), RealFamily::Other);
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["mail.msg", "mail.docx", "mail.doc", "blob.bin"] {
+            assert!(needs_extraction(&bytes, name), "{name} must be extracted");
+        }
+        for name in ["mail.msg", "blob.bin"] {
+            assert!(
+                matches!(
+                    convert_document(&bytes, name, dir.path()),
+                    DocOutcome::Unsupported
+                ),
+                "{name} names no document, so the ordinary read applies"
+            );
+        }
+        assert!(
+            matches!(
+                convert_document(&bytes, "mail.docx", dir.path()),
+                DocOutcome::Unreadable { reason } if reason == "corrupt or unsupported .docx"
+            ),
+            "a package name makes the reader answer a corrupt .docx"
+        );
+        assert!(
+            matches!(
+                convert_document(&bytes, "mail.doc", dir.path()),
+                DocOutcome::Unreadable { reason } if reason == "corrupt or unreadable .doc"
+            ),
+            "an old format's name hands the container to that reader"
+        );
+    }
+
+    /// A ZIP's own entries win over its name: a real `.xlsx` named `.docx` is
+    /// read as the spreadsheet it is, because only the package can say which of
+    /// the three OOXML families it holds.
+    #[test]
+    fn an_xlsx_named_docx_reads_as_a_spreadsheet() {
+        let bytes = one_cell_xlsx();
+        assert_eq!(real_family(&bytes), RealFamily::Xlsx);
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["book.docx", "book.docm"] {
+            assert!(
+                matches!(
+                    convert_document(&bytes, name, dir.path()),
+                    DocOutcome::Text { text, .. } if text == "Sheet \"S\":\n  A1: cell"
+                ),
+                "{name} must read as the spreadsheet it holds"
+            );
+        }
+    }
+
+    /// PDF magic decides a PDF: renaming one changes nothing, not even when the
+    /// new name is one whose extension would otherwise be decoded as text.
+    #[test]
+    fn a_pdf_under_another_name_is_still_a_pdf() {
+        let bytes = text_pdf(&[]);
+        assert_eq!(real_family(&bytes), RealFamily::Pdf);
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["notes.txt", "notes.docx", "notes.bin"] {
+            let DocOutcome::Text { text, .. } = convert_document(&bytes, name, dir.path()) else {
+                panic!("{name} must still read as a PDF");
+            };
+            assert!(text.contains("Hello PDF text layer"), "{name}: {text:?}");
+        }
     }
 
     #[test]
@@ -1886,24 +2147,26 @@ mod tests {
         ));
     }
 
+    /// A ZIP holding no OOXML package at all keeps the name's verdict: only a
+    /// name of one of the three families is read, and a plain archive is a
+    /// format this project does not convert.
     #[test]
     fn zip_with_non_ooxml_extension_is_unsupported() {
-        let bytes = zip_fixture(&[("xl/workbook.xml", b"<workbook/>")]);
+        let bytes = zip_fixture(&[("readme.txt", b"plain archive contents")]);
         let dir = tempfile::tempdir().expect("tempdir");
-        for name in ["book.zip", "book.bin"] {
+        for name in ["bundle.zip", "bundle.bin"] {
             assert!(matches!(
                 convert_document(&bytes, name, dir.path()),
                 DocOutcome::Unsupported
             ));
+            assert!(!needs_extraction(&bytes, name));
         }
     }
 
-    /// A ZIP named as one of the new OOXML formats reaches that format's reader
-    /// rather than the single Word arm.
-    #[test]
-    fn ooxml_zip_packages_dispatch_to_their_arm() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let xlsx = zip_fixture(&[
+    /// A one-sheet `.xlsx` package: the workbook part, its relationships and one
+    /// inline-string cell.
+    fn one_cell_xlsx() -> Vec<u8> {
+        zip_fixture(&[
             (
                 "xl/workbook.xml",
                 br#"<workbook xmlns:r="r"><sheets><sheet name="S" r:id="rId1"/></sheets></workbook>"#,
@@ -1916,9 +2179,16 @@ mod tests {
                 "xl/worksheets/sheet1.xml",
                 br#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>cell</t></is></c></row></sheetData></worksheet>"#,
             ),
-        ]);
+        ])
+    }
+
+    /// A ZIP named as one of the new OOXML formats reaches that format's reader
+    /// rather than the single Word arm.
+    #[test]
+    fn ooxml_zip_packages_dispatch_to_their_arm() {
+        let dir = tempfile::tempdir().expect("tempdir");
         assert!(matches!(
-            convert_document(&xlsx, "book.xlsx", dir.path()),
+            convert_document(&one_cell_xlsx(), "book.xlsx", dir.path()),
             DocOutcome::Text { text, .. } if text == "Sheet \"S\":\n  A1: cell"
         ));
 

@@ -289,7 +289,7 @@ fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
             "mode": {
                 "type": "string",
                 "enum": ["content", "symbols", "zoom"],
-                "description": "Read mode. 'content' (default): line-numbered file read — large outputs are truncated to a ~5 KB budget — or, for a raster image (PNG, JPEG, WebP), attaches it to the conversation as a native image instead; a PDF or Office document (Word, Excel, PowerPoint) is converted the way an inbound chat attachment is — extracted text (for a PDF, `Page <n>:` blocks by page number plus its `Annotations:` and `Form fields:` sections; for a `.pptx`/`.pptm` presentation, `Slide <n>:` blocks marking the slide's own title, a hidden slide and a diagram's text), plus text-free or unreadable pages and embedded images attached as native images; over 5 of them, all are reported as paths instead (or, if that listing would not fit, as the folder holding them). 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name. 'symbols'/'zoom' work for supported code formats only.",
+                "description": "Read mode. 'content' (default): line-numbered file read — large outputs are truncated to a ~5 KB budget — or, for a raster image (PNG, JPEG, WebP), attaches it to the conversation as a native image instead; a PDF or Office document (Word, Excel, PowerPoint) is converted to text instead of its raw bytes (the tool description says what a converted document yields). 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name. 'symbols'/'zoom' work for supported code formats only.",
                 "default": "content"
             },
             "symbol": {
@@ -299,13 +299,13 @@ fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
             },
             "offset": {
                 "type": "integer",
-                "description": "Starting line number (1-based, default: 1). Not used for a converted document (see 'mode').",
+                "description": "Starting line number (1-based, default: 1). Not used for a converted document.",
                 "default": 1,
                 "minimum": 1
             },
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of lines to return (default: all). Not used for a converted document (see 'mode').",
+                "description": "Maximum number of lines to return (default: all). Not used for a converted document.",
                 "minimum": 1
             }
         }),
@@ -350,6 +350,7 @@ impl Tool for ReadTool {
                 ("{{ppt_hidden_slide_mark}}", &marks.hidden_slide),
                 ("{{ppt_diagram_text_mark}}", &marks.diagram_text),
                 ("{{ppt_diagram_text_lost_mark}}", &marks.diagram_text_lost),
+                ("{{ppt_no_text_mark}}", &marks.no_text),
                 ("{{ppt_slide_label}}", &slide_label),
                 ("{{ppt_notes_label}}", &notes_label),
                 (
@@ -1271,6 +1272,7 @@ mod tests {
                 &marks.hidden_slide,
                 &marks.diagram_text,
                 &marks.diagram_text_lost,
+                &marks.no_text,
                 &slide_label,
                 &notes_label,
                 crate::reader_output::DOC_HEADERS_FOOTERS,
@@ -1286,6 +1288,51 @@ mod tests {
                     "the description does not name {mark:?}:\n{description}"
                 );
             }
+        }
+    }
+
+    /// The first paragraph of the description's document section — what a reading
+    /// of a container gives and does not give — and the paragraph that follows it,
+    /// which is no longer about documents.
+    const DOCUMENT_SECTION_START: &str = "A content-mode document container";
+    const DOCUMENT_SECTION_END: &str = "Reading a credential-bearing file";
+
+    /// What that section measured when the document contract was settled: 10,888
+    /// bytes rendered, with the marks and labels a reading prints substituted in.
+    /// It is held to at most half of it — the same rule the writing tool's
+    /// description answers to — so the document half of what the model reads
+    /// cannot drift back up.
+    const DOCUMENT_SECTION_BASELINE: usize = 10_888;
+
+    /// The document section of `description`.
+    fn document_section(description: &str) -> &str {
+        let start = description
+            .find(DOCUMENT_SECTION_START)
+            .expect("the description states the container rule");
+        let end = description
+            .find(DOCUMENT_SECTION_END)
+            .expect("the description states the credential rule after it");
+        &description[start..end]
+    }
+
+    /// The document section is the other half of the capability's model-read text,
+    /// so it is measured the way the writing tool's description is: at most half
+    /// of what the section's own paragraphs cost before the contract was settled.
+    #[test]
+    fn the_document_section_stays_inside_half_its_baseline() {
+        for tool in [
+            ReadTool::general(),
+            ReadTool::new(PathAccess::Workspace),
+            ReadTool::new(PathAccess::Unrestricted),
+        ] {
+            let description = tool.description();
+            let section = document_section(&description);
+            assert!(
+                section.len() * 2 <= DOCUMENT_SECTION_BASELINE,
+                "the document section is {} bytes, more than half its \
+                 {DOCUMENT_SECTION_BASELINE}-byte baseline",
+                section.len()
+            );
         }
     }
 

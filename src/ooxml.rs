@@ -35,9 +35,9 @@ use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
 mod docx;
-pub(crate) use docx::convert_docx;
+pub(crate) use docx::{DOCX_BODY_PART, convert_docx};
 mod xlsx;
-pub(crate) use xlsx::convert_xlsx;
+pub(crate) use xlsx::{WORKBOOK_PART, convert_xlsx};
 
 // ── Package parts and bounds ────────────────────────────────────
 
@@ -47,7 +47,7 @@ pub(crate) use xlsx::convert_xlsx;
 const MAX_ZIP_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Part listing the presentation's slides in slide order.
-const PPT_PRESENTATION_PART: &str = "ppt/presentation.xml";
+pub(crate) const PPT_PRESENTATION_PART: &str = "ppt/presentation.xml";
 /// Relationships of the presentation part: slide relationship id -> slide part.
 const PPT_PRESENTATION_RELS_PART: &str = "ppt/_rels/presentation.xml.rels";
 /// Base every presentation relationship target resolves against.
@@ -133,10 +133,10 @@ pub(crate) fn family_of(path: &Path) -> Option<Family> {
 #[must_use]
 pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
-        return unreadable(".pptx");
+        return unreadable(Family::Pptx);
     };
     let Some(parts) = resolve_slide_parts(&mut archive) else {
-        return unreadable(".pptx");
+        return unreadable(Family::Pptx);
     };
 
     ensure_out_dir(out_dir);
@@ -1405,11 +1405,20 @@ fn unique_out_path(
     out_dir.join(crate::util::suffixed_name(file_name, *n))
 }
 
+/// The reason a reading gives a recognized OOXML package it cannot open — the
+/// container unreadable, or a part it needs missing or unparsable. The `document`
+/// tool's refusal quotes it verbatim when it turns away a file named as this
+/// family whose bytes hold no such package, so a file's reading and a refusal of
+/// it cannot name the same failure differently.
+pub(crate) fn corrupt_reason(family: Family) -> String {
+    format!("corrupt or unsupported .{}", family.name())
+}
+
 /// The shared "recognized OOXML package of this kind that cannot be read"
 /// outcome.
-fn unreadable(extension: &str) -> DocOutcome {
+fn unreadable(family: Family) -> DocOutcome {
     DocOutcome::Unreadable {
-        reason: format!("corrupt or unsupported {extension}"),
+        reason: corrupt_reason(family),
     }
 }
 

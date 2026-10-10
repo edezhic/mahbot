@@ -30,8 +30,9 @@ use std::path::{Path, PathBuf};
 /// listing would not fit the answer.
 const MAX_INJECTED_IMAGES: usize = 5;
 
-/// Bytes read from the head of the file for the format sniff: every extraction
-/// arm of [`crate::document::needs_extraction`] is magic-local.
+/// Bytes read from the head of the file for the format sniff: every arm of
+/// [`crate::document::needs_extraction`] is magic-local, and a CFB container —
+/// whose own directory lies further in — is extracted on its magic alone.
 const HEAD_SNIFF_BYTES: usize = 16;
 
 /// Answer for a document whose conversion could not start (no temp area, or an
@@ -85,8 +86,9 @@ pub(super) async fn read_document(
     crate::tools::shell::record_spill_owner(dir.clone());
 
     let outcome = match crate::document::convert_document_file(&res.path, name, &dir).await {
-        // The file changed under us between the sniff and the conversion: the
-        // ordinary read decides what it now is.
+        // The ordinary read applies: the file changed under us between the sniff
+        // and the conversion, or the container names no Office document at all
+        // (an Outlook `.msg`, say) and so is not one this converter reads.
         DocOutcome::Unsupported => None,
         DocOutcome::Unreadable { reason } => Some(plain_answer(res, &reason)),
         DocOutcome::Text {
@@ -339,6 +341,9 @@ mod tests {
     use crate::document::test_fixtures::{
         PdfFixture, multi_page_pdf, one_page_pdf, pdf_text_string,
     };
+    // The CFB container and `.doc` package recipes live with the legacy reader,
+    // so a classification test and this reading test build one file.
+    use crate::legacy::test_fixtures::{cfb, doc_fixture};
     use crate::ooxml::test_fixtures::{DOCX_BODY, zip_fixture};
     use tempfile::TempDir;
 
@@ -655,6 +660,50 @@ mod tests {
         assert!(out.text.starts_with("[Recovered path: "), "{}", out.text);
         assert!(out.text.contains("could not be parsed"), "{}", out.text);
         assert!(out.image_payloads.is_empty());
+    }
+
+    /// A CFB container is decided by its contents, and by its name when its
+    /// directory names no Office document: a legacy Word `.doc` under a `.docx`
+    /// name reads as the old document it is, a `.doc`-named container holding no
+    /// document at all is answered by the legacy reader's own corruption verdict,
+    /// and a `.msg` — a CFB naming nothing — is left to the ordinary read rather
+    /// than given a note.
+    #[tokio::test]
+    async fn a_cfb_container_is_answered_by_its_contents_then_its_name() {
+        crate::util::test::init_test_stores().await;
+        let owner = SpillOwner::new();
+        let doc = doc_fixture("Hello legacy doc", &[], false);
+        let other = cfb(&[("__properties_version1.0", b"outlook".as_slice())]);
+        let (_dir, ws) = temp_workspace(&[
+            ("words.docx", &doc),
+            ("old.doc", &other),
+            ("mail.msg", &other),
+        ]);
+
+        let out = convert(&owner, &ws, "words.docx", PathAccess::Allowlisted)
+            .await
+            .expect("a legacy document is a document");
+        assert!(
+            out.text.contains("Hello legacy doc"),
+            "the old document's own reading is delivered: {}",
+            out.text
+        );
+
+        let out = convert(&owner, &ws, "old.doc", PathAccess::Allowlisted)
+            .await
+            .expect("a container named as an old document is answered, not failed");
+        assert!(
+            out.text.contains("corrupt or unreadable .doc"),
+            "the legacy reader's own verdict answers it: {}",
+            out.text
+        );
+
+        assert!(
+            convert(&owner, &ws, "mail.msg", PathAccess::Allowlisted)
+                .await
+                .is_none(),
+            "a container naming no document is left to the ordinary read"
+        );
     }
 
     /// A `.docx` whose document body is `body` plus `count` embedded media

@@ -93,9 +93,10 @@ pub(crate) fn effective_reference_max(catalog_max: i64) -> i64 {
 
 /// Canonical list of argument aliases for file path parameters.
 ///
-/// The aliases `"file"` and `"filename"` are remapped to `"path"` for every
-/// tool call by [`normalize_tool_arguments`]. Tools that do not accept a
-/// `"path"` parameter are unaffected — unknown keys are discarded downstream.
+/// The aliases `"file"` and `"filename"` are remapped to `"path"` by
+/// [`normalize_tool_arguments`] — everywhere but the document tool, which names
+/// its own arguments and refuses one its action does not take, so an alias left
+/// as written is refused under the spelling the caller used.
 const PATH_ALIAS_KEYS: &[&str] = &["file", "filename"];
 
 /// Check that a file's size is within `limit` bytes, naming `label` in the
@@ -1278,10 +1279,15 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
         return;
     };
 
-    // Apply path-aliases (file/filename) universally for every tool call.
-    // Tools that do not accept a "path" parameter silently ignore the extra key.
-    for &alias in PATH_ALIAS_KEYS {
-        remap_arg_key(obj, alias, "path");
+    // Apply path-aliases (file/filename) for every tool call. Tools that do not
+    // take a "path" simply ignore the extra key — except the document tool, whose
+    // contract refuses every argument an action does not take: an alias is left
+    // as the caller wrote it, so a refusal names that spelling rather than a
+    // "path" the caller never passed.
+    if name != "document" {
+        for &alias in PATH_ALIAS_KEYS {
+            remap_arg_key(obj, alias, "path");
+        }
     }
 
     match name {
@@ -1815,19 +1821,24 @@ mod tests {
 
     // ── normalize_tool_call tests ─────────────────────────────────────
 
-    /// Verify that [`normalize_tool_call`] universally remaps every alias in
+    /// Verify that [`normalize_tool_call`] remaps every alias in
     /// [`PATH_ALIAS_KEYS`] to `"path"` — regardless of whether the tool
     /// explicitly accepts a `"path"` parameter.
     ///
     /// This test verifies path-aliasing for both a path-accepting tool (`read`)
     /// and a non-path tool (`shell`). The remap happens unconditionally;
-    /// tools that do not use `"path"` simply ignore the extra key.
+    /// such tools simply ignore the extra key.
     ///
     /// This test explicitly iterates the constant so the loop-based approach in
     /// [`normalize_tool_arguments`] is verified against all current aliases.
     /// If an alias is added to [`PATH_ALIAS_KEYS`], this test immediately
     /// exercises it — preventing any gap between the lookup path and the
     /// normalization path.
+    ///
+    /// The document tool is the one exemption: it declares and enforces its own
+    /// argument names, so an alias is left as the caller wrote it and refused by
+    /// that name instead of being remapped into a `"path"` two of its actions do
+    /// not take.
     #[test]
     fn normalize_tool_call_remaps_all_path_aliases() {
         for &alias in PATH_ALIAS_KEYS {
@@ -1847,8 +1858,8 @@ mod tests {
                     name, *tool_name,
                     "tool name should not change for {tool_name} with alias {alias}"
                 );
-                // The alias is remapped to "path" unconditionally — even for tools
-                // that don't use the "path" parameter (unknown keys are discarded).
+                // The alias is remapped to "path" for every tool but the document
+                // tool: tools that don't use "path" simply ignore the extra key.
                 assert_eq!(
                     args["path"], "src/main.rs",
                     "alias {alias} should be remapped to 'path' for tool {tool_name}"
@@ -1864,6 +1875,11 @@ mod tests {
                 }
             }
         }
+        // The document tool's own contract names its arguments: an alias stays as
+        // the caller wrote it, for the boundary to refuse that spelling by name.
+        let (_, args) = normalize_tool_call("document", serde_json::json!({ "file": "a.pdf" }));
+        assert_eq!(args["file"], "a.pdf");
+        assert!(args.get("path").is_none());
     }
 
     // ── resolve_local_media_path tests ─────────────────────────────────────

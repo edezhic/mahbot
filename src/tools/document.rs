@@ -8,7 +8,7 @@
 //!
 //! # Path confinement
 //!
-//! Every path the model supplies — a template, a PDF to edit, an image to embed —
+//! Every path the model supplies — a sample, a PDF to edit, an image to embed —
 //! is resolved with [`crate::tools::path::resolve_read_target`] under the
 //! caller's [`PathAccess`]: workspace-only for a guest's Assistant, anywhere the
 //! shell could name for the admin's. The OUTPUT path is never the model's: the
@@ -64,13 +64,9 @@ const GENERATED_DIR: &str = "generated";
 /// filesystem's component limit.
 const MAX_BASE_CHARS: usize = 80;
 
-/// Upper bound on pages ONE REQUEST may name, so a huge range (or several ranges
-/// that add up) cannot make the tool allocate before the kit ever sees it.
-const MAX_PAGES_PER_REQUEST: usize = 10_000;
-
-/// Upper bound on the files ONE `pdf_split` call may produce. The range list is
-/// the model's, so without this a call could turn a document into thousands of
-/// attachments; the page cap above bounds the pages, not the files they are cut
+/// Upper bound on the files ONE `pdf_split` call may produce. The selection list
+/// is the model's, so without this a call could turn a document into thousands of
+/// attachments; the page cap bounds the pages, not the files they are cut
 /// into. More than this is more than a reply can carry.
 const MAX_SPLIT_PARTS: usize = 50;
 
@@ -89,8 +85,9 @@ const MAX_MERGE_BYTES: u64 = 200 * 1024 * 1024;
 const UNSUPPORTED_NOTE_MAX: usize = 10;
 
 /// The tool's fixed operation set, in the order the schema lists it. The schema's
-/// `enum` and the hint for an unknown action both come from here; only the
-/// dispatch `match` spells the names again.
+/// `oneOf` entries and the hint for an unknown action both come from here; the
+/// dispatch `match` and [`action_schema`] spell the names again, one arm per
+/// action.
 const ACTIONS: [&str; 11] = [
     "create",
     "fill_template",
@@ -105,44 +102,134 @@ const ACTIONS: [&str; 11] = [
     "pdf_form_fill",
 ];
 
-/// The ops each family's edit action accepts, in the order the refusal names
-/// them. The kit owns the same vocabularies; these lists are what the boundary
-/// check answers an unknown `op` with, before a runtime is spawned.
-const DOCX_EDIT_OPS: [&str; 7] = [
-    "replace_text",
-    "insert_text",
-    "remove_text",
-    "format_text",
-    "format_paragraph",
-    "add_paragraph",
-    "remove_paragraph",
-];
+/// One family's edit vocabulary: every op with the fields it takes, in the order
+/// the description states them. The `op` enum, the `Fields by op:` text, the
+/// refusal of an unknown op and the refusal of a field its op does not take all
+/// read this one table, so none of them can disagree about what an edit takes.
+/// The rules a field list cannot carry — one target only, at least one property
+/// named — are stated beside it, in the family's own `edits_arg` sentence.
+#[expect(clippy::too_many_lines)] // the one table every family's vocabulary lives in
+fn edit_op_fields(
+    family: crate::ooxml::Family,
+) -> &'static [(&'static str, &'static [&'static str])] {
+    match family {
+        crate::ooxml::Family::Docx => &[
+            ("replace_text", &["find", "replace"]),
+            ("insert_text", &["find", "insert", "position"]),
+            ("remove_text", &["find"]),
+            ("remove_paragraph", &["find"]),
+            (
+                "format_text",
+                &[
+                    "find",
+                    "bold",
+                    "italic",
+                    "underline",
+                    "strike",
+                    "size",
+                    "color",
+                ],
+            ),
+            (
+                "format_paragraph",
+                &[
+                    "find",
+                    "align",
+                    "style",
+                    "indent_left",
+                    "indent_right",
+                    "indent_first_line",
+                    "spacing_before",
+                    "spacing_after",
+                    "line_spacing",
+                    "list",
+                    "level",
+                ],
+            ),
+            ("add_paragraph", &["text", "after"]),
+        ],
+        crate::ooxml::Family::Xlsx => &[
+            ("set_cell", &["sheet", "cell", "value", "number_format"]),
+            ("clear_cell", &["sheet", "cell"]),
+            (
+                "format_cells",
+                &[
+                    "sheet",
+                    "range",
+                    "column",
+                    "row",
+                    "font",
+                    "size",
+                    "bold",
+                    "italic",
+                    "underline",
+                    "strike",
+                    "color",
+                    "fill",
+                    "border",
+                    "align",
+                    "vertical",
+                    "wrap",
+                    "number_format",
+                    "width_chars",
+                    "height_points",
+                ],
+            ),
+            ("insert_row", &["sheet", "row"]),
+            ("delete_row", &["sheet", "row"]),
+            ("insert_column", &["sheet", "column"]),
+            ("delete_column", &["sheet", "column"]),
+        ],
+        crate::ooxml::Family::Pptx => &[
+            ("replace_text", &["slide", "find", "replace"]),
+            ("remove_text", &["slide", "find"]),
+            (
+                "format_text",
+                &[
+                    "slide",
+                    "find",
+                    "bold",
+                    "italic",
+                    "underline",
+                    "strike",
+                    "size",
+                    "color",
+                    "align",
+                ],
+            ),
+            ("add_paragraph", &["slide", "text", "after", "level"]),
+            ("remove_paragraph", &["slide", "find"]),
+            (
+                "add_image",
+                &[
+                    "slide",
+                    "image",
+                    "x_fraction",
+                    "y_fraction",
+                    "width_fraction",
+                    "height_fraction",
+                ],
+            ),
+            ("add_slide", &["after", "title", "bullets"]),
+            ("delete_slide", &["slide"]),
+            ("move_slide", &["slide", "to"]),
+            ("duplicate_slide", &["slide"]),
+            ("replace_notes", &["slide", "find", "replace"]),
+            ("remove_notes", &["slide", "find"]),
+            ("add_notes", &["slide", "text"]),
+        ],
+    }
+}
 
-const XLSX_EDIT_OPS: [&str; 7] = [
-    "set_cell",
-    "clear_cell",
-    "format_cells",
-    "insert_row",
-    "delete_row",
-    "insert_column",
-    "delete_column",
-];
-
-const PPTX_EDIT_OPS: [&str; 13] = [
-    "replace_text",
-    "remove_text",
-    "format_text",
-    "add_paragraph",
-    "remove_paragraph",
-    "add_image",
-    "add_slide",
-    "delete_slide",
-    "move_slide",
-    "duplicate_slide",
-    "replace_notes",
-    "remove_notes",
-    "add_notes",
-];
+/// The fields the op `op` of `family` takes, from the one table the `op` enum,
+/// the op description and the unknown-field refusal read.
+fn op_fields(family: crate::ooxml::Family, op: &str) -> &'static [&'static str] {
+    edit_op_fields(family)
+        .iter()
+        .find(|(name, _)| *name == op)
+        .map(|(_, fields)| *fields)
+        .expect("the op was checked against the family's vocabulary")
+}
 
 /// The pptx edits that look text up on the slide itself, and so are the only
 /// ones whose refusal can name a diagram's text (the kit's `slideFindRefusal`):
@@ -205,14 +292,17 @@ struct Rules {
     heading_levels: Vec<f64>,
     scalar_kinds: Vec<String>,
     image_extensions: Vec<String>,
-    image_side_px: Span,
+    /// A length in points on a page, where zero is not a length: a placed
+    /// picture's width or height — a content block's image (`width`/`height`) and
+    /// a `pdf_image`'s placed size alike — and the font size a `pdf_text` draws
+    /// at. One unit and one bound wherever a page measure is stated.
+    dimension_points: Span,
     /// A pptx `add_image` placement: the fraction of the slide's width or
     /// height the image is placed at.
     slide_position_fraction: Span,
     /// A pptx `add_image` size: the fraction of the slide's width or height the
     /// image is scaled to, where zero is not a size.
     slide_size_fraction: Span,
-    pdf_size_points: Span,
     /// A docx `format_text` size in points. Word's `<w:sz>` counts half-points
     /// and caps the value at 1638 — 819 points — so the kit writes the doubled
     /// number and both sides refuse past this bound rather than write a
@@ -268,6 +358,10 @@ struct Rules {
     /// (`"A1:A1048576"`) would write a sheet-sized body instead of the handful
     /// of cells the caller meant.
     format_cells_max: usize,
+    /// The pages one request may name, read by `pages_arg`, by the tool's own
+    /// explicit-selection bound and — in the kit — by a selection the document's
+    /// own length resolves.
+    max_pages_per_request: usize,
     pdf_point_abs_max: f64,
     color_digits: usize,
     /// A pptx `format_text` alignment: the word a caller names, and the `algn`
@@ -366,254 +460,73 @@ impl Tool for DocumentTool {
         true
     }
 
-    /// The prompt asset with the shared rules rendered in: the tool's prompt
-    /// states the rules it enforces, and `assets/docgen/rules.json` is their
-    /// one owner, so the two cannot drift — an asset bound that the rules moved
-    /// past would otherwise be told to the model as a stale number.
+    /// The prompt asset with the rules the interface cannot state rendered in:
+    /// what the model cannot derive from the parameter schema — the safety
+    /// promise, the reader's own printing it must not mistake for a document's
+    /// text, and the losses and refusals no argument carries. Every bound lives in
+    /// the schema beside the argument that carries it, so the two cannot drift.
     fn description(&self) -> String {
-        let degrees_step = RULES.degrees_step.to_string();
-        let heading_levels = listed(&RULES.heading_levels);
-        let image_side_px = RULES.image_side_px.bounds();
-        let slide_position_fraction = RULES.slide_position_fraction.bounds();
-        let slide_size_fraction = RULES.slide_size_fraction.bounds();
-        let pdf_size_points = RULES.pdf_size_points.bounds();
-        let text_size_points = RULES.text_size_points.bounds();
-        let paragraph_indent_points = RULES.paragraph_indent_points.bounds();
-        let paragraph_spacing_points = RULES.paragraph_spacing_points.bounds();
-        let paragraph_line_points = RULES.paragraph_line_points.bounds();
-        let slide_text_size_points = RULES.slide_text_size_points.bounds();
-        let cell_font_points = RULES.cell_font_points.bounds();
-        let column_width_chars = RULES.column_width_chars.bounds();
-        let row_height_points = RULES.row_height_points.bounds();
-        // The alignments, colours and sets the prompt spells in a JSON edit:
-        // quoted and pipe-separated, in the order the rules state them.
-        let slide_alignments = quoted_words(&pair_words(&RULES.slide_alignments));
-        let paragraph_alignments = quoted_words(&pair_words(&RULES.paragraph_alignments));
-        let paragraph_lists = quoted_words(&pair_words(&RULES.paragraph_lists));
-        let cell_alignments = quoted_words(&RULES.cell_alignments);
-        let cell_verticals = quoted_words(&RULES.cell_verticals);
-        let cell_border_sides = quoted_words(&RULES.cell_border_sides);
-        let pdf_point_abs_max = RULES.pdf_point_abs_max.to_string();
-        let color_digits = RULES.color_digits.to_string();
-        let merge_inputs = MAX_MERGE_INPUTS.to_string();
-        let merge_mb = megabytes(MAX_MERGE_BYTES).to_string();
-        let split_parts = MAX_SPLIT_PARTS.to_string();
+        let marks = crate::docgen::ppt_marks();
+        // The reader prints a slide's number where these spell `<n>`, so the
+        // description names the label the reader prints rather than a
+        // substitution of its own.
+        let labels = crate::docgen::ppt_slide_labels();
+        let ppt_slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
+        let ppt_notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
         let input_mb = megabytes(crate::util::FILE_MAX_BYTES).to_string();
-        let sheet_name_max = RULES.sheet_name_max.to_string();
         let edit_text_max = RULES.edit_text_max.to_string();
-        let edits_max = RULES.edits_max.to_string();
-        let bullets_max = RULES.bullets_max.to_string();
-        let paragraph_level_max = RULES.paragraph_level_max.to_string();
-        let paragraph_style_max = RULES.paragraph_style_max.to_string();
-        let sheet_row_max = RULES.sheet_row_max.to_string();
-        let sheet_column_max = RULES.sheet_column_max.to_string();
-        let number_format_max = RULES.number_format_max.to_string();
-        let font_name_max = RULES.font_name_max.to_string();
-        let format_cells_max = RULES.format_cells_max.to_string();
-        // The set with its backslash escaped, as a quoted string spells one: a
-        // bare `\` before the closing quote reads as an escaped quote.
-        let sheet_name_forbidden = format!("{:?}", RULES.sheet_name_forbidden);
-        let ppt_marks = crate::docgen::ppt_marks();
-        // The Word marks the description names are quoted from the shared list:
-        // the ones a reading prints in brackets and the labels and annotations it
-        // adds without them (see `spelled_docx_marks`).
-        let docx_inline_marks = spelled_docx_marks(true);
-        let docx_label_marks = spelled_docx_marks(false);
-        // The two headers a reading prints a slide's own block and its notes
-        // under, from the same statement the reader and the kit's refusals use —
-        // rendered with `<n>` where the reader prints the slide's number, the way
-        // the rest of the description spells a place a real value fills.
-        let ppt_labels = crate::docgen::ppt_slide_labels();
-        let ppt_slide_label = crate::reader_output::slide_label(&ppt_labels.slide, "<n>");
-        let ppt_notes_label = crate::reader_output::slide_label(&ppt_labels.notes, "<n>");
         crate::prompt::substitute(
             &crate::prompt::load_prompt("tool/document.md"),
             &[
                 ("{{input_location}}", self.input_location()),
-                ("{{degrees_step}}", &degrees_step),
-                ("{{heading_levels}}", &heading_levels),
-                ("{{image_side_px}}", &image_side_px),
-                ("{{slide_position_fraction}}", &slide_position_fraction),
-                ("{{slide_size_fraction}}", &slide_size_fraction),
-                ("{{pdf_size_points}}", &pdf_size_points),
-                ("{{text_size_points}}", &text_size_points),
-                ("{{paragraph_alignments}}", &paragraph_alignments),
-                ("{{paragraph_lists}}", &paragraph_lists),
-                ("{{paragraph_indent_points}}", &paragraph_indent_points),
-                ("{{paragraph_spacing_points}}", &paragraph_spacing_points),
-                ("{{paragraph_line_points}}", &paragraph_line_points),
-                ("{{paragraph_style_max}}", &paragraph_style_max),
-                ("{{slide_text_size_points}}", &slide_text_size_points),
-                ("{{cell_font_points}}", &cell_font_points),
-                ("{{column_width_chars}}", &column_width_chars),
-                ("{{row_height_points}}", &row_height_points),
-                ("{{slide_alignments}}", &slide_alignments),
-                ("{{cell_alignments}}", &cell_alignments),
-                ("{{cell_verticals}}", &cell_verticals),
-                ("{{cell_border_sides}}", &cell_border_sides),
-                ("{{pdf_point_abs_max}}", &pdf_point_abs_max),
-                ("{{color_digits}}", &color_digits),
-                ("{{merge_inputs}}", &merge_inputs),
-                ("{{merge_mb}}", &merge_mb),
-                ("{{split_parts}}", &split_parts),
                 ("{{input_mb}}", &input_mb),
-                ("{{sheet_name_max}}", &sheet_name_max),
-                ("{{sheet_name_forbidden}}", &sheet_name_forbidden),
                 ("{{edit_text_max}}", &edit_text_max),
-                ("{{edits_max}}", &edits_max),
-                ("{{bullets_max}}", &bullets_max),
-                ("{{paragraph_level_max}}", &paragraph_level_max),
-                ("{{sheet_row_max}}", &sheet_row_max),
-                ("{{sheet_column_max}}", &sheet_column_max),
-                ("{{number_format_max}}", &number_format_max),
-                ("{{font_name_max}}", &font_name_max),
-                ("{{format_cells_max}}", &format_cells_max),
-                ("{{docx_label_marks}}", docx_label_marks.as_str()),
-                ("{{docx_inline_marks}}", docx_inline_marks.as_str()),
-                ("{{ppt_slide_label}}", ppt_slide_label.as_str()),
-                ("{{ppt_notes_label}}", ppt_notes_label.as_str()),
-                ("{{ppt_title_mark}}", ppt_marks.title.as_str()),
-                ("{{ppt_hidden_slide_mark}}", ppt_marks.hidden_slide.as_str()),
-                ("{{ppt_diagram_text_mark}}", ppt_marks.diagram_text.as_str()),
-                (
-                    "{{ppt_diagram_text_lost_mark}}",
-                    ppt_marks.diagram_text_lost.as_str(),
-                ),
-                ("{{ppt_no_text_mark}}", ppt_marks.no_text.as_str()),
+                // The Word marks are quoted from the shared list: the ones a
+                // reading prints in brackets and the labels it adds without them
+                // (see `spelled_docx_marks`).
+                ("{{docx_inline_marks}}", &spelled_docx_marks(true)),
+                ("{{docx_label_marks}}", &spelled_docx_marks(false)),
+                ("{{ppt_slide_label}}", &ppt_slide_label),
+                ("{{ppt_notes_label}}", &ppt_notes_label),
+                ("{{ppt_title_mark}}", &marks.title),
+                ("{{ppt_hidden_slide_mark}}", &marks.hidden_slide),
+                ("{{ppt_diagram_text_mark}}", &marks.diagram_text),
+                ("{{ppt_diagram_text_lost_mark}}", &marks.diagram_text_lost),
+                ("{{ppt_no_text_mark}}", &marks.no_text),
             ],
         )
     }
 
-    #[expect(clippy::too_many_lines)] // the one schema the tool advertises, argument by argument
+    /// The machine-readable per-action contract, in the shape the other
+    /// action-rich tool (`chrome`) uses: the root declares `action` as a `oneOf`
+    /// with one entry per action, each built by [`super::action_entry_schema`] so
+    /// the arguments it takes, the ones it requires and every selector's allowed
+    /// values are the schema's own statement rather than prose. The bounds the
+    /// tool enforces on a value the model passes appear in the description of the
+    /// argument that carries it (see [`action_schema`]).
     fn parameters_schema(&self) -> Value {
         super::tool_params_schema(
             &json!({
                 "action": {
-                    "type": "string",
-                    "enum": ACTIONS,
-                    "description": "Operation to perform."
+                    "oneOf": ACTIONS.iter().map(|action| action_schema(action)).collect::<Vec<_>>()
                 },
-                "file_name": {
-                    "type": "string",
-                    "description": "Base name for the produced file. Sanitized to a single path component and made unique in the generated directory; a trailing extension the tool itself produces (.docx/.docm/.xlsx/.xlsm/.pptx/.pptm/.pdf) is dropped from your value instead of being doubled."
-                },
-                "format": {
-                    "type": "string",
-                    "enum": SUPPORTED_FORMATS,
-                    "description": "create: the file format to write."
-                },
-                "content": {
-                    "type": "array",
-                    "items": { "type": "object" },
-                    "description": "create (docx/pptx/pdf): content blocks. Each block is {\"type\": \"heading|paragraph|list|table|image|notes\", …} — see the tool description."
-                },
-                "sheets": {
-                    "type": "array",
-                    "items": { "type": "object" },
-                    "description": "create (xlsx): sheets, each {\"name\": …, \"rows\": [[cell, …]]}. A cell is a string, a number, a boolean, or {\"formula\": \"SUM(A1:A2)\"}."
-                },
-                "template": {
-                    "type": "string",
-                    "description": "fill_template: path of the user's own .docx/.pptx/.xlsx sample; {name} placeholders are replaced with values. The sample is never modified."
-                },
-                "values": {
-                    "type": "object",
-                    "description": "fill_template / pdf_form_fill: values keyed by placeholder or form-field name; each value is text, a number or a boolean. pdf_form_fill needs at least one field."
-                },
-                "edits": {
-                    "type": "array",
-                    "items": { "type": "object" },
-                    "description": format!(
-                        "docx_edit/xlsx_edit/pptx_edit: the edits to apply in order, at most {}; \
-                         each is an object with an \"op\" and that op's fields — see the tool \
-                         description. Applied to a copy; the file passed is never changed.",
-                        RULES.edits_max
-                    )
-                },
-                "files": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": format!(
-                        "pdf_merge: two or more PDF paths, merged in order — at most {} \
-                         files, totalling at most {} MB, in one call.",
-                        MAX_MERGE_INPUTS,
-                        megabytes(MAX_MERGE_BYTES)
-                    )
-                },
-                "path": {
-                    "type": "string",
-                    "description": "PDF and edit actions: path of the file."
-                },
-                "image": {
-                    "type": "string",
-                    "description": "pdf_image: path of the PNG or JPEG to place on the pages."
-                },
-                "ranges": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": format!(
-                        "pdf_split: one range per output file, e.g. [\"1-3\", \"5\"], at most {} \
-                         per call.",
-                        MAX_SPLIT_PARTS
-                    )
-                },
-                "pages": {
-                    "type": "string",
-                    "description": "Pages to act on: \"all\" or a list like \"1-3,5\". Defaults to all pages."
-                },
-                "degrees": {
-                    "type": "integer",
-                    "description": format!(
-                        "pdf_rotate: rotation to add, a multiple of {} taken modulo 360; a whole \
-                         turn is refused.",
-                        RULES.degrees_step
-                    )
-                },
-                "text": {
-                    "type": "string",
-                    "description": "pdf_text: the text to draw."
-                },
-                "x": { "type": "number", "description": "pdf_text/pdf_image: X position in points." },
-                "y": { "type": "number", "description": "pdf_text/pdf_image: Y position in points." },
-                "size": {
-                    "type": "number",
-                    "description": format!(
-                        "pdf_text: font size in points, {}.",
-                        RULES.pdf_size_points.bounds()
-                    )
-                },
-                "color": {
-                    "type": "string",
-                    "description": format!(
-                        "pdf_text: text colour as {} hex digits, with an optional leading \"#\".",
-                        RULES.color_digits
-                    )
-                },
-                "stamp": { "type": "boolean", "description": "pdf_text: draw a box around the text." },
-                "rotate": { "type": "number", "description": "pdf_text: rotation of the drawn text, in degrees." },
-                "width": {
-                    "type": "number",
-                    "description": format!(
-                        "pdf_image: placed width in points, {}.",
-                        RULES.pdf_size_points.bounds()
-                    )
-                },
-                "height": {
-                    "type": "number",
-                    "description": format!(
-                        "pdf_image: placed height in points, {}.",
-                        RULES.pdf_size_points.bounds()
-                    )
-                },
-                "flatten": { "type": "boolean", "description": "pdf_form_fill: flatten the filled fields into the page content." }
+                "file_name": file_name_arg(),
             }),
             &["action"],
         )
     }
 
     async fn execute(&self, ws: &Workspace, args: Value) -> Result<String> {
+        let args = normalize_call(&args)?;
+        let action = super::get_str(&args, "action")?;
+        // Only a real action is checked against its schema entry: an action the
+        // tool does not have keeps its own refusal below rather than being
+        // reported as taking no arguments.
+        if ACTIONS.contains(&action) {
+            require_declared_arguments(action, &args)?;
+        }
         let generated = ws.as_path().join(GENERATED_DIR);
-        match super::get_str(&args, "action")? {
+        match action {
             "create" => self.create(ws, &args, &generated).await,
             "fill_template" => self.fill_template(ws, &args, &generated).await,
             "docx_edit" => {
@@ -640,6 +553,804 @@ impl Tool for DocumentTool {
             ),
         }
     }
+}
+
+/// A document call's arguments in the flat shape the dispatch reads: `action` a
+/// string with the action's own arguments beside it. The nested shape the schema
+/// literally describes — `{"action": {"pdf_rotate": {…}}}` — is flattened onto
+/// it, and so is the chrome-shaped `{"action": "pdf_rotate", "pdf_rotate": {…}}`;
+/// the shared top-level `file_name` is merged in. Anything else is refused with
+/// the shape the caller was expected to use.
+fn normalize_call(args: &Value) -> Result<Value> {
+    let nested_shape = || {
+        anyhow::anyhow!(
+            "usage: \"action\" must name one of {} as a string with the action's own arguments \
+             beside it, or as an object naming one action — hint: like {{\"action\": \"pdf_rotate\", \
+             \"path\": \"…\", \"degrees\": 90}} or {{\"action\": {{\"pdf_rotate\": {{…}}}}}}",
+            ACTIONS.join(", ")
+        )
+    };
+    let flattened = |name: &str, fields: &serde_json::Map<String, Value>| {
+        // The caller's other top-level keys come along rather than being dropped:
+        // an argument stated beside the action object is the caller's, and one the
+        // action does not take is refused by name afterwards — never silently lost.
+        let object = args
+            .as_object()
+            .expect("a call whose action matched is an object");
+        let mut flat = object
+            .iter()
+            .filter(|(key, _)| key.as_str() != "action" && key.as_str() != name)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<serde_json::Map<String, Value>>();
+        flat.extend(fields.clone());
+        flat.insert("action".to_owned(), json!(name));
+        if let Some(file_name) = args.get("file_name") {
+            flat.insert("file_name".to_owned(), file_name.clone());
+        }
+        Value::Object(flat)
+    };
+    match args.get("action") {
+        // The flat call, and the chrome-shaped one whose arguments sit under a
+        // key named after the action rather than beside it.
+        Some(Value::String(name)) => match args.get(name.as_str()) {
+            Some(Value::Object(fields)) => Ok(flattened(name, fields)),
+            _ => Ok(args.clone()),
+        },
+        // The nested call the schema describes: the one key names the action and
+        // its value is that action's arguments.
+        Some(Value::Object(action)) if action.len() == 1 => {
+            let (name, fields) = action.iter().next().expect("one key");
+            match fields {
+                Value::Object(fields) => Ok(flattened(name, fields)),
+                _ => Err(nested_shape()),
+            }
+        }
+        _ => Err(nested_shape()),
+    }
+}
+
+/// Refuse an argument the action does not take, from the action's own schema
+/// entry: the interface is the contract, so a key the action has no place for is
+/// named rather than silently ignored. `action` and the shared `file_name` are
+/// every action's own. A `null` value is not stated, the way the whole boundary
+/// reads one, so a null key is not an argument the action does not take.
+fn require_declared_arguments(action: &str, args: &Value) -> Result<()> {
+    let entry = action_schema(action);
+    let declared = entry["properties"][action]["properties"]
+        .as_object()
+        .expect("every action's entry declares its arguments");
+    let accepted = std::iter::once("action")
+        .chain(std::iter::once("file_name"))
+        .chain(declared.keys().map(String::as_str))
+        .collect::<Vec<_>>();
+    let Some(object) = args.as_object() else {
+        return Ok(());
+    };
+    let unknown = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !accepted.contains(key) && stated(object, key))
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        let named = listed(
+            &unknown
+                .iter()
+                .map(|key| format!("\"{key}\""))
+                .collect::<Vec<_>>(),
+        );
+        anyhow::bail!(
+            "usage: {action} takes no argument {named} — hint: it takes {}",
+            listed(&accepted)
+        );
+    }
+    Ok(())
+}
+
+// ── the parameter interface ──────────────────────────────────────────
+//
+// One builder per argument shape: an action's entry names the arguments it takes
+// rather than restating them, and every bound a value is checked against — the
+// shared rules and this tool's own caps — appears in the description of the
+// argument that carries it, so what the model is told is what the boundary
+// enforces.
+
+/// A string argument.
+fn text_arg(description: &str) -> Value {
+    json!({ "type": "string", "description": description })
+}
+
+/// A number argument.
+fn number_arg(description: &str) -> Value {
+    json!({ "type": "number", "description": description })
+}
+
+/// A whole-number argument.
+fn integer_arg(description: &str) -> Value {
+    json!({ "type": "integer", "description": description })
+}
+
+/// A run toggle: its meaning is stated once, in the `op` of the family's own
+/// formatting path, rather than beside each of the four names.
+fn toggle_arg() -> Value {
+    json!({ "type": "boolean" })
+}
+
+/// A boolean argument.
+fn bool_arg(description: &str) -> Value {
+    json!({ "type": "boolean", "description": description })
+}
+
+/// A string argument closed to `values`.
+fn choice_arg<S: AsRef<str>>(values: &[S], description: &str) -> Value {
+    let values: Vec<&str> = values.iter().map(AsRef::as_ref).collect();
+    json!({ "type": "string", "enum": values, "description": description })
+}
+
+/// An array argument of `items`.
+fn array_arg(items: &Value, description: &str) -> Value {
+    json!({ "type": "array", "items": items, "description": description })
+}
+
+/// The scalar a bullet or a cell may be — the kinds the shared rules name.
+fn scalar_arg() -> Value {
+    json!({ "type": RULES.scalar_kinds })
+}
+
+/// `file_name`: the produced file's base name, capped at [`MAX_BASE_CHARS`].
+fn file_name_arg() -> Value {
+    text_arg(&format!(
+        "Base name for the produced file (max {MAX_BASE_CHARS} chars); the tool appends the \
+         extension, puts the file in the workspace's generated/ directory and makes the name \
+         unique."
+    ))
+}
+
+/// `path`: the one input document every action but `pdf_merge` takes. The file is
+/// never modified, and what its own bytes hold is the format the action works on.
+fn path_arg() -> Value {
+    text_arg("The document to work on.")
+}
+
+/// `image`: the picture to place — a PNG or a JPEG, by its content — and the one
+/// sizing rule every placement shares.
+fn image_arg() -> Value {
+    text_arg(
+        "The picture to place (PNG or JPEG); naming one side's size alone keeps its own proportions.",
+    )
+}
+
+/// `paths`: a merge's inputs, with the item count the interface declares and the
+/// total size the boundary enforces — the count as `minItems`/`maxItems`, the
+/// total as the one thing only the description can state.
+fn paths_arg() -> Value {
+    json!({
+        "type": "array",
+        "items": text_arg("Path of one PDF."),
+        "minItems": 2,
+        "maxItems": MAX_MERGE_INPUTS,
+        "description": format!(
+            "The PDFs to merge, in order: at most {} MB in total.",
+            megabytes(MAX_MERGE_BYTES)
+        ),
+    })
+}
+
+/// `values`: the name-keyed map both fills take. At least one entry is required —
+/// the schema's `minProperties` and the boundary's refusal alike.
+fn values_arg(kind: &str) -> Value {
+    json!({
+        "type": "object",
+        "minProperties": 1,
+        "description": format!(
+            "One entry per {kind}, keyed by its name; a value is text, a number or a boolean."
+        ),
+    })
+}
+
+/// `pages`: the one page grammar every PDF action that takes pages uses. An
+/// element is `"all"` or a comma-separated list of `N` and `N-M`; for a split
+/// each element is one output file, for the other actions their union is what the
+/// action acts on.
+fn pages_arg(split: bool) -> Value {
+    let element = text_arg(
+        "An entry: \"all\", a page, a range, or a comma list like \"1-3,5\"; \"all\" stands alone.",
+    );
+    if split {
+        json!({
+            "type": "array",
+            "items": element,
+            "minItems": 1,
+            "maxItems": MAX_SPLIT_PARTS,
+            "description": format!(
+                "One output file per entry, in order: [\"1-3\", \"5\"] makes two files, and \
+                 [\"1-3,5\"] one file holding those four pages. At most {MAX_SPLIT_PARTS} files \
+                 and {} pages.",
+                RULES.max_pages_per_request
+            ),
+        })
+    } else {
+        array_arg(
+            &element,
+            &format!(
+                "The pages to act on, as [\"1-3\", \"5\"]; absent means all pages. At most \
+                 {} pages.",
+                RULES.max_pages_per_request
+            ),
+        )
+    }
+}
+
+/// A row of a table or a sheet: the cells of one row, the scalars the shared
+/// rules name (a sheet cell may also be a formula object).
+fn row_arg() -> Value {
+    json!({ "type": "array", "items": scalar_arg() })
+}
+
+/// A size a picture is placed at, in points — a content-block image's `height`
+/// and a `pdf_image`'s alike, so the bound has one statement.
+fn placed_size_arg(what: &str) -> Value {
+    number_arg(&format!(
+        "{what} in points, {}.",
+        RULES.dimension_points.bounds()
+    ))
+}
+
+/// A content-block image's placed width: the shared placement bound, and the
+/// fallback only a laid-out block has — with neither side named the picture keeps
+/// its own size, capped to the width the page's text has room for.
+fn content_image_width_arg(what: &str) -> Value {
+    number_arg(&format!(
+        "{what} in points, {}; with neither side named the picture keeps its own size, capped to \
+         the width the page's text has room for.",
+        RULES.dimension_points.bounds()
+    ))
+}
+
+/// A `format_cells` `border`: the sides to set, each a boolean — true puts a thin
+/// border on that side, false takes that side's own away. The sides come from the
+/// shared rules, so the declaration and the boundary's refusal name the same ones.
+/// An object naming no side states nothing and is refused, which a declaration
+/// cannot say.
+fn border_arg() -> Value {
+    let sides = RULES
+        .cell_border_sides
+        .iter()
+        .map(|side| (side.clone(), bool_arg("Set this side.")))
+        .collect::<serde_json::Map<String, Value>>();
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": sides,
+        "description": "The sides to set — true draws a thin border on that side, false takes its \
+                        own away — at least one of them.",
+    })
+}
+
+/// A colour in the shared rules' hex digits, with the optional leading `#`.
+fn color_arg(what: &str) -> Value {
+    text_arg(&format!("{what}: {} hex digits.", RULES.color_digits))
+}
+
+/// A `format_paragraph` `list`: the words the shared rules state, whose values
+/// name the kind, or `false` taking the paragraph's list away. The two shapes
+/// share one declaration, so the words still come from `RULES.paragraph_lists`
+/// while `false` says the paragraph loses its numbering.
+fn list_arg() -> Value {
+    let mut values = pair_words(&RULES.paragraph_lists)
+        .into_iter()
+        .map(|word| json!(word))
+        .collect::<Vec<_>>();
+    values.push(json!(false));
+    json!({
+        "type": ["string", "boolean"],
+        "enum": values,
+        "description": "The list kind, or false to take the paragraph's list away; absent keeps \
+                        its numbering.",
+    })
+}
+
+/// A `format_cells` `fill`: the shared rules' hex digits for the colour, or
+/// `false` taking the cell's fill away — no colour means "no fill", so `false`
+/// is the shape that removes it.
+fn fill_arg() -> Value {
+    json!({
+        "anyOf": [
+            { "type": "string" },
+            { "enum": [false] },
+        ],
+        "description": format!(
+            "Background: {} hex digits, or false to take the cell's fill away.",
+            RULES.color_digits
+        ),
+    })
+}
+
+/// The block kinds `create`'s `content` accepts: the fields each kind takes and
+/// the ones it cannot do without (beyond the `type` every block carries). One
+/// owner: the declaration's variant per kind is built from this table and the
+/// boundary refuses a field a block's kind does not take against it.
+const CONTENT_BLOCKS: &[(&str, &[&str], &[&str])] = &[
+    // kind, its fields, the fields it requires
+    ("heading", &["text", "level"], &["text"]),
+    ("paragraph", &["text"], &["text"]),
+    ("notes", &["text"], &["text"]),
+    ("list", &["items", "ordered"], &["items"]),
+    ("table", &["headers", "rows"], &[]),
+    ("image", &["image", "width", "height"], &["image"]),
+];
+
+/// How `create` declares one block field: the single statement of what that field
+/// is, whichever kind carries it.
+fn block_field(name: &str) -> Value {
+    match name {
+        "text" => text_arg("The block's text."),
+        "level" => integer_arg(&format!("Level {}.", listed(&RULES.heading_levels))),
+        "items" => array_arg(&scalar_arg(), "The bullets."),
+        "ordered" => bool_arg("Number them."),
+        "headers" => array_arg(&scalar_arg(), "The header cells."),
+        "rows" => array_arg(&row_arg(), "The rows."),
+        "image" => image_arg(),
+        "width" => content_image_width_arg("Placed width"),
+        "height" => placed_size_arg("Placed height"),
+        other => unreachable!("every block field has a declaration: {other}"),
+    }
+}
+
+/// `content`: the blocks a docx/pptx/pdf create lays out, in order. One variant per
+/// kind, so the fields a block declares are the ones its kind takes — the fields
+/// the boundary refuses a block of another kind against — and every variant
+/// requires what its kind cannot do without.
+fn content_arg() -> Value {
+    let variants = CONTENT_BLOCKS
+        .iter()
+        .map(|(kind, fields, required)| {
+            let mut properties = serde_json::Map::new();
+            properties.insert("type".to_owned(), json!({ "enum": [kind] }));
+            properties.extend(
+                fields
+                    .iter()
+                    .map(|name| ((*name).to_owned(), block_field(name))),
+            );
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": std::iter::once("type").chain(required.iter().copied()).collect::<Vec<_>>(),
+                "properties": properties,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "items": { "oneOf": variants },
+        "description": "The blocks, in order, each with its own \"type\"; \"notes\" is pptx speaker \
+                        notes, and a table needs a row or a header.",
+    })
+}
+
+/// The fields `create` declares for a sheet, and the one a sheet cannot do
+/// without — the one owner of that vocabulary, read by the declaration
+/// ([`sheets_arg`]) and by the boundary's refusal alike, the way
+/// [`CONTENT_BLOCKS`] owns a block's.
+const SHEET_FIELDS: &[(&str, bool)] = &[
+    // field, required
+    ("name", false),
+    ("rows", true),
+];
+
+/// The field names of [`SHEET_FIELDS`].
+fn sheet_field_names() -> Vec<&'static str> {
+    SHEET_FIELDS.iter().map(|(name, _)| *name).collect()
+}
+
+/// `sheets`: a workbook's sheets, each with a name and its rows. The characters a
+/// name may not hold are stated inline in the name's own description.
+fn sheets_arg() -> Value {
+    let properties = SHEET_FIELDS
+        .iter()
+        .map(|(name, _)| ((*name).to_owned(), sheet_field(name)))
+        .collect::<serde_json::Map<String, Value>>();
+    let required = SHEET_FIELDS
+        .iter()
+        .filter(|(_, required)| *required)
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>();
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": required,
+            "properties": properties,
+        },
+        "description": "The workbook's sheets, in order.",
+    })
+}
+
+/// How `create` declares one field of a sheet (see [`sheets_arg`]).
+fn sheet_field(name: &str) -> Value {
+    match name {
+        "name" => text_arg(&format!(
+            "Sheet name: at most {} characters, none of {:?}, unique ignoring case; without one it \
+             becomes Sheet<n>.",
+            RULES.sheet_name_max, RULES.sheet_name_forbidden,
+        )),
+        "rows" => array_arg(&sheet_row_arg(), "The rows, top to bottom."),
+        other => unreachable!("every sheet field has a declaration: {other}"),
+    }
+}
+
+/// A cell's value, in the one declaration `set_cell` writes and a sheet's rows
+/// hold: text (a string that starts with `=` stays text), a number, a boolean,
+/// or a formula object, which is written as a formula and never evaluated. A
+/// number is written as the cell stores it, not as it was displayed.
+fn cell_arg() -> Value {
+    json!({
+        "anyOf": [
+            scalar_arg(),
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": { "formula": text_arg("The formula, without a leading =.") },
+                "required": ["formula"],
+            },
+        ],
+        "description": "Text (a string starting with `=` stays text), a number, a boolean, or \
+                        {\"formula\": \"SUM(A1:A2)\"}; a number is written as the cell stores it, \
+                        not as a reading displayed it.",
+    })
+}
+
+/// A sheet's row: its cells.
+fn sheet_row_arg() -> Value {
+    array_arg(
+        &cell_arg(),
+        "One row, one cell after another, left to right.",
+    )
+}
+
+/// What the four run toggles mean in every family's formatting path: the one
+/// statement rather than a description beside each of the twelve names.
+const TOGGLE_RULE: &str = "bold, italic, underline and strike are toggles: true sets the \
+                            property, false switches it off.";
+
+/// `edits`: one edit object per family, declaring that family's `op` enum and the
+/// union of the fields its ops take. The `op` description carries the op -> field
+/// mapping and the family's cross-cutting rules, so no op gets a branch of its
+/// own.
+fn edits_arg(family: crate::ooxml::Family, fields: &Value, rules: &str) -> Value {
+    let op_fields = edit_op_fields(family);
+    let ops: Vec<&str> = op_fields.iter().map(|(op, _)| *op).collect();
+    let mut properties = fields.clone();
+    // The op -> field mapping the description states, from the one table the enum
+    // and the refusal read too.
+    let fields_by_op = op_fields
+        .iter()
+        .map(|(op, taken)| format!("{op}: {}", taken.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    // Three statements, one per line of the op's own contract: the family's
+    // cross-cutting rules, what its toggles mean, and which fields each op takes.
+    let statements = [
+        rules,
+        TOGGLE_RULE,
+        &format!("Fields by op: {fields_by_op}."),
+    ];
+    let description = statements
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    properties["op"] = choice_arg(&ops, &description);
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": RULES.edits_max,
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": properties,
+            "required": ["op"],
+        },
+        "description": format!(
+            "The edits, in order, at most {}. Applied whole or not at all: an edit whose fields \
+             do not fit its op is refused by name rather than partly applied.",
+            RULES.edits_max
+        ),
+    })
+}
+
+/// The schema's `oneOf` entry for one action, by name: what it does (one line,
+/// with the refusal a caller would otherwise learn by making the call), the
+/// arguments it requires and exactly the arguments it takes.
+#[expect(clippy::too_many_lines)] // the one place every action's arguments are stated
+fn action_schema(action: &str) -> Value {
+    match action {
+        "create" => super::action_entry_schema(
+            "create",
+            "Write a new file: blocks for docx/pptx/pdf, sheets for xlsx. A PDF is laid out as a \
+             simple stream: blocks follow one another down the page, and columns, floating objects \
+             and exact page placement are not attempted.",
+            &["format"],
+            &json!({
+                "format": choice_arg(&SUPPORTED_FORMATS, "The format to write."),
+                "content": content_arg(),
+                "sheets": sheets_arg(),
+            }),
+        ),
+        "fill_template" => super::action_entry_schema(
+            "fill_template",
+            "Fill a copy of the user's own .docx/.pptx/.xlsx sample's placeholders.",
+            &["path", "values"],
+            &json!({ "path": path_arg(), "values": values_arg("placeholder") }),
+        ),
+        "docx_edit" => super::action_entry_schema(
+            "docx_edit",
+            "Edit a .docx/.docm; a .docx package is required.",
+            &["path", "edits"],
+            &json!({
+                "path": path_arg(),
+                "edits": edits_arg(
+                    crate::ooxml::Family::Docx,
+                    &json!({
+                        "find": text_arg("Text to find."),
+                        "replace": text_arg("Text to write."),
+                        "insert": text_arg("Text to insert."),
+                        "position": choice_arg(&["before", "after"], "Where it lands."),
+                        "text": text_arg("The paragraph's text."),
+                        "after": text_arg("The paragraph to land after."),
+                        "bold": toggle_arg(),
+                        "italic": toggle_arg(),
+                        "underline": toggle_arg(),
+                        "strike": toggle_arg(),
+                        "size": number_arg(&format!(
+                            "Font size, {} points.",
+                            RULES.text_size_points.bounds()
+                        )),
+                        "color": color_arg("Text colour"),
+                        "align": choice_arg(
+                            &pair_words(&RULES.paragraph_alignments),
+                            "Paragraph alignment."
+                        ),
+                        "style": text_arg(&format!(
+                            "A paragraph style the document defines, at most {} characters; \
+                             Normal, Heading 1, Heading 2 and Heading 3 always work.",
+                            RULES.paragraph_style_max
+                        )),
+                        "indent_left": number_arg(&format!(
+                            "Left indent, {} points.",
+                            RULES.paragraph_indent_points.bounds()
+                        )),
+                        "indent_right": number_arg(&format!(
+                            "Right indent, {} points.",
+                            RULES.paragraph_indent_points.bounds()
+                        )),
+                        "indent_first_line": number_arg(&format!(
+                            "First-line indent, {} points; a negative one hangs.",
+                            RULES.paragraph_indent_points.bounds()
+                        )),
+                        "spacing_before": number_arg(&format!(
+                            "Space above, {} points.",
+                            RULES.paragraph_spacing_points.bounds()
+                        )),
+                        "spacing_after": number_arg(&format!(
+                            "Space below, {} points.",
+                            RULES.paragraph_spacing_points.bounds()
+                        )),
+                        "line_spacing": number_arg(&format!(
+                            "Line height, {} points.",
+                            RULES.paragraph_line_points.bounds()
+                        )),
+                        "list": list_arg(),
+                        "level": integer_arg(&format!("List level, 0 to {}.", RULES.paragraph_level_max)),
+                    }),
+                    "format_text and format_paragraph need one property beyond find.",
+                ),
+            }),
+        ),
+        "xlsx_edit" => super::action_entry_schema(
+            "xlsx_edit",
+            "Edit an .xlsx/.xlsm; an .xlsx package is required.",
+            &["path", "edits"],
+            &json!({
+                "path": path_arg(),
+                "edits": edits_arg(
+                    crate::ooxml::Family::Xlsx,
+                    &json!({
+                        "sheet": text_arg("Sheet name, as a reading prints it."),
+                        "cell": text_arg("A1 address, like B7."),
+                        "value": cell_arg(),
+                        "number_format": text_arg(&format!(
+                            "An Excel format code, at most {} characters.",
+                            RULES.number_format_max
+                        )),
+                        "range": text_arg(&format!(
+                            "Cells, like B2:D2, corners in either order, at most {} cells.",
+                            RULES.format_cells_max
+                        )),
+                        "column": text_arg(&format!(
+                            "Column letters, up to the {}th column.",
+                            RULES.sheet_column_max
+                        )),
+                        "row": integer_arg(&format!(
+                            "The 1-based row, up to {}.",
+                            RULES.sheet_row_max
+                        )),
+                        "width_chars": number_arg(&format!(
+                            "Column width, {} characters (as Excel shows one).",
+                            RULES.column_width_chars.bounds()
+                        )),
+                        "height_points": number_arg(&format!(
+                            "Row height, {} points.",
+                            RULES.row_height_points.bounds()
+                        )),
+                        "font": text_arg(&format!(
+                            "Font name, at most {} characters.",
+                            RULES.font_name_max
+                        )),
+                        "size": number_arg(&format!(
+                            "Font size, {} points.",
+                            RULES.cell_font_points.bounds()
+                        )),
+                        "bold": toggle_arg(),
+                        "italic": toggle_arg(),
+                        "underline": toggle_arg(),
+                        "strike": toggle_arg(),
+                        "color": color_arg("Text colour"),
+                        "fill": fill_arg(),
+                        "border": border_arg(),
+                        "align": choice_arg(&RULES.cell_alignments, "Horizontal alignment."),
+                        "vertical": choice_arg(&RULES.cell_verticals, "Vertical alignment."),
+                        "wrap": bool_arg("Wrap the text."),
+                    }),
+                    "One target only: range, column or row, with at least one of its own properties. \
+                     An inserted row or column may be one past the sheet's used range; a deleted \
+                     one must be inside it.",
+                ),
+            }),
+        ),
+        "pptx_edit" => super::action_entry_schema(
+            "pptx_edit",
+            "Edit a .pptx/.pptm; a slide is its 1-based number.",
+            &["path", "edits"],
+            &json!({
+                "path": path_arg(),
+                "edits": edits_arg(
+                    crate::ooxml::Family::Pptx,
+                    &json!({
+                        "slide": integer_arg("Slide number, as a reading prints it, 1-based."),
+                        "find": text_arg("Text to find on the slide."),
+                        "replace": text_arg("Text to write."),
+                        "text": text_arg("The text to write."),
+                        "after": {
+                            "type": ["string", "integer"],
+                            "description": "add_paragraph: the text it follows; add_slide: the slide number.",
+                        },
+                        "level": integer_arg(&format!("Outline level, 0 to {}.", RULES.paragraph_level_max)),
+                        "bold": toggle_arg(),
+                        "italic": toggle_arg(),
+                        "underline": toggle_arg(),
+                        "strike": toggle_arg(),
+                        "size": number_arg(&format!(
+                            "Font size, {} points.",
+                            RULES.slide_text_size_points.bounds()
+                        )),
+                        "color": color_arg("Text colour"),
+                        "align": choice_arg(&pair_words(&RULES.slide_alignments), "Alignment."),
+                        "image": image_arg(),
+                        "x_fraction": number_arg(&format!(
+                            "Across the slide, {} of its width; an unnamed place is the slide's \
+                             middle and an unnamed size the largest that fits, so a place named \
+                             without a size can push the picture past the slide's edge.",
+                            RULES.slide_position_fraction.bounds()
+                        )),
+                        "y_fraction": number_arg(&format!(
+                            "Down the slide, {} of its height.",
+                            RULES.slide_position_fraction.bounds()
+                        )),
+                        "width_fraction": number_arg(&format!(
+                            "Width, {} of the slide's width.",
+                            RULES.slide_size_fraction.bounds()
+                        )),
+                        "height_fraction": number_arg(&format!(
+                            "Height, {} of the slide's height.",
+                            RULES.slide_size_fraction.bounds()
+                        )),
+                        "title": text_arg("The slide's title."),
+                        "bullets": array_arg(
+                            &scalar_arg(),
+                            &format!("The slide's bullets, at most {}.", RULES.bullets_max),
+                        ),
+                        "to": integer_arg("The slide it moves to."),
+                    }),
+                    "format_text needs one property beyond find.",
+                ),
+            }),
+        ),
+        "pdf_merge" => super::action_entry_schema(
+            "pdf_merge",
+            "Merge PDFs into one new file.",
+            &["paths"],
+            &json!({ "paths": paths_arg() }),
+        ),
+        "pdf_split" => super::action_entry_schema(
+            "pdf_split",
+            "Split a PDF, one output file per page entry.",
+            &["path", "pages"],
+            &json!({ "path": path_arg(), "pages": pages_arg(true) }),
+        ),
+        "pdf_rotate" => super::action_entry_schema(
+            "pdf_rotate",
+            "Add a rotation to a PDF's pages.",
+            &["path", "degrees"],
+            &json!({ "path": path_arg(), "degrees": degrees_arg(), "pages": pages_arg(false) }),
+        ),
+        "pdf_text" => super::action_entry_schema(
+            "pdf_text",
+            "Draw text on a PDF's pages, as page content rather than an annotation.",
+            &["path", "text"],
+            &json!({
+                "path": path_arg(),
+                "text": text_arg("The text to draw."),
+                "pages": pages_arg(false),
+                "x": point_arg("X position"),
+                "y": point_arg("Y position"),
+                "size": number_arg(&format!(
+                    "Font size, {} points.",
+                    RULES.dimension_points.bounds()
+                )),
+                "color": color_arg("Text colour"),
+                "stamp": bool_arg("Draw a box around the text."),
+                "rotate": number_arg(&format!(
+                    "Rotation in degrees, within ±{}.",
+                    RULES.pdf_point_abs_max
+                )),
+            }),
+        ),
+        "pdf_image" => super::action_entry_schema(
+            "pdf_image",
+            "Place a PNG or JPEG on a PDF's pages, as page content rather than an annotation.",
+            &["path", "image"],
+            &json!({
+                "path": path_arg(),
+                "image": image_arg(),
+                "pages": pages_arg(false),
+                "x": point_arg("X position"),
+                "y": point_arg("Y position"),
+                "width": placed_size_arg("Placed width"),
+                "height": placed_size_arg("Placed height"),
+            }),
+        ),
+        "pdf_form_fill" => super::action_entry_schema(
+            "pdf_form_fill",
+            "Fill a PDF's form fields into a copy.",
+            &["path", "values"],
+            &json!({
+                "path": path_arg(),
+                "values": values_arg("form field"),
+                "flatten": bool_arg("Bake the fields into the page content and remove them."),
+            }),
+        ),
+        other => unreachable!("the schema lists exactly the dispatched actions: {other}"),
+    }
+}
+
+/// A PDF position in points, bounded by the shared rules.
+fn point_arg(what: &str) -> Value {
+    number_arg(&format!(
+        "{what} in points, within ±{}.",
+        RULES.pdf_point_abs_max
+    ))
+}
+
+/// `degrees`: the rotation a `pdf_rotate` adds.
+fn degrees_arg() -> Value {
+    integer_arg(&format!(
+        "A multiple of {}, not a whole turn.",
+        RULES.degrees_step
+    ))
 }
 
 impl DocumentTool {
@@ -690,49 +1401,26 @@ impl DocumentTool {
         args: &Value,
         generated: &Path,
     ) -> Result<String> {
-        let (template, _) =
-            resolve_input(ws, super::get_str(args, "template")?, self.access).await?;
-        let values = super::get_object(args, "values")?;
+        let (sample, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
+        let values = require_values(args, "placeholder")?;
         require_scalar_values(&values)?;
-        let name = file_name_of(&template);
-        let head = head_of(&template).await?;
         // The kit's `format` is the sample's FAMILY: a workbook has its own
         // cell-wise filler, while a document and a presentation both go through
-        // the template library (which reads the package's file type itself).
-        let Some(family) = crate::ooxml::family_of(&template) else {
-            // Only the three OOXML families carry `{name}` placeholders; naming
-            // the alternatives beats the package reader's own parse error.
-            let hint = old_format_hint(
-                &template,
-                &head,
-                "fill",
-                "an old .doc/.xls/.ppt file is read but never filled or edited, so save it as one \
-                 of the OOXML families first",
-            )
-            .unwrap_or_else(|| {
-                "a PDF is annotated with the pdf_text, pdf_image or pdf_form_fill actions"
-                    .to_string()
-            });
-            anyhow::bail!(
-                "usage: a sample must be a .docx/.docm, .pptx/.pptm or .xlsx/.xlsm file, got {name} \
-                 — hint: {hint}"
-            );
-        };
-        // The OUTPUT keeps the sample's own extension — an `.xlsm` copy stays an
-        // `.xlsm` one, macros and all — which a matched family guarantees it has.
-        let extension = template
-            .extension()
-            .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
-            .expect("a matched family means the sample is named with its extension");
-        ensure_input_readable(&template, &head)?;
+        // the template library (which reads the package's file type itself). The
+        // name picks it, and the sample's own bytes must hold it — a sample of
+        // another family, an old binary one or an encrypted package is refused
+        // here, before a runtime is spawned.
+        let family = require_sample_family(&sample).await?;
+        let extension = copy_extension(&sample, family);
         let base = sanitize_base(
             opt_string(args, "file_name")?,
-            &input_base(&template, "filled"),
+            &input_base(&sample, "filled"),
         );
         let outputs = reserve(generated, std::slice::from_ref(&base), &extension).await?;
         let request = json!({
             "op": "fill_template",
-            "template": template.to_string_lossy(),
+            // The kit's own field name for the sample it fills.
+            "template": sample.to_string_lossy(),
             "format": family.name(),
             "values": values,
             "output": outputs[0].to_string_lossy(),
@@ -751,14 +1439,13 @@ impl DocumentTool {
         family: crate::ooxml::Family,
     ) -> Result<String> {
         let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
-        // The file's head is read once and answers both questions: the family its
-        // name claims (its own family, never the name alone, is what this action
-        // edits — a package of another family or a PDF is refused by name and an
-        // old binary format with the hint that it is read but never edited) and
-        // whether it is an encrypted package this tool cannot open at all.
-        let head = head_of(&input).await?;
-        require_edit_family(&input, &head, family)?;
-        ensure_input_readable(&input, &head)?;
+        // The file's own bytes decide what it is, never its name: the input must
+        // really be the package family this action edits — a package of another
+        // family, a PDF, a container that is no document and an old binary
+        // `.doc`/`.xls`/`.ppt` are each refused naming what they are, and a
+        // genuinely encrypted package is the password verdict whatever the name
+        // claims.
+        require_edit_family(&input, family).await?;
         let mut edits = validate_edits(family, args)?;
         // Only a presentation needs either of these: a resolved path for the
         // image an edit places, and the diagram text a refusal about the slide's
@@ -774,12 +1461,7 @@ impl DocumentTool {
                 diagram_text = crate::document::read_pptx_diagram_text(&input).await;
             }
         }
-        // The OUTPUT keeps the input's own extension — a `.docm` copy stays a
-        // `.docm` one, macros and all — which a matched family guarantees it has.
-        let extension = input
-            .extension()
-            .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
-            .expect("a matched family means the input is named with its extension");
+        let extension = copy_extension(&input, family);
         let base = sanitize_base(
             opt_string(args, "file_name")?,
             &input_base(&input, "edited"),
@@ -801,37 +1483,43 @@ impl DocumentTool {
 
     /// `pdf_merge` — every input's pages, in order, in one file.
     async fn pdf_merge(&self, ws: &Workspace, args: &Value, generated: &Path) -> Result<String> {
-        let files = super::get_str_array(args, "files")?;
-        if files.len() < 2 {
+        let paths = super::get_str_array(args, "paths")?;
+        if paths.len() < 2 {
             anyhow::bail!(
-                "usage: `files` needs at least 2 PDFs to merge, got {} — hint: pass two or \
+                "usage: `paths` needs at least 2 PDFs to merge, got {} — hint: pass two or \
                  more PDF paths",
-                files.len()
+                paths.len()
             );
         }
-        if files.len() > MAX_MERGE_INPUTS {
+        if paths.len() > MAX_MERGE_INPUTS {
             anyhow::bail!(
-                "usage: {} files is more than one merge takes (limit {MAX_MERGE_INPUTS}) — hint: \
-                 merge them in batches",
-                files.len()
+                "usage: `paths` holds {} files, more than one merge takes (limit \
+                 {MAX_MERGE_INPUTS}) — hint: merge them in batches",
+                paths.len()
             );
         }
-        let mut inputs = Vec::with_capacity(files.len());
+        let mut inputs = Vec::with_capacity(paths.len());
         // The kit decodes every input into memory at once, so the size of the
         // whole call is bounded, not just of one file.
         let mut total = 0u64;
-        for file in &files {
-            let (path, size) = resolve_input(ws, file, self.access).await?;
+        for path in &paths {
+            let (resolved, size) = resolve_input(ws, path, self.access).await?;
             total += size;
-            inputs.push(path);
+            inputs.push(resolved);
         }
         if total > MAX_MERGE_BYTES {
             anyhow::bail!(
-                "usage: the files total {} MB, more than one merge takes (limit {} MB) — hint: \
+                "usage: `paths` totals {} MB, more than one merge takes (limit {} MB) — hint: \
                  merge them in batches",
                 megabytes(total),
                 megabytes(MAX_MERGE_BYTES)
             );
+        }
+        // Every argument is read before anything is reserved, and the content
+        // verdict comes with them: a merge of anything but PDFs is refused here,
+        // naming what each input really holds.
+        for input in &inputs {
+            require_pdf(input).await?;
         }
         let base = sanitize_base(
             opt_string(args, "file_name")?,
@@ -847,10 +1535,11 @@ impl DocumentTool {
             .await
     }
 
-    /// `pdf_split` — one file per range.
+    /// `pdf_split` — one file per page selection.
     async fn pdf_split(&self, ws: &Workspace, args: &Value, generated: &Path) -> Result<String> {
         let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         let groups = split_groups(args)?;
+        require_pdf(&input).await?;
         let base = sanitize_base(
             opt_string(args, "file_name")?,
             crate::util::name_stem(&file_name_of(&input)),
@@ -901,6 +1590,7 @@ impl DocumentTool {
             "degrees": degrees,
         });
         request["pages"] = opt_pages(args)?.kit_value();
+        require_pdf(&input).await?;
         let base = sanitize_base(
             opt_string(args, "file_name")?,
             &input_base(&input, "rotated"),
@@ -922,7 +1612,7 @@ impl DocumentTool {
         request["pages"] = opt_pages(args)?.kit_value();
         set_number(&mut request, args, "x")?;
         set_number(&mut request, args, "y")?;
-        set_positive_number(&mut request, args, "size")?;
+        set_positive_number(&mut request, args, "size", &RULES.dimension_points)?;
         set_number(&mut request, args, "rotate")?;
         if let Some(color) = opt_string(args, "color")? {
             // A pdf argument is named quoted, as the neighbouring refusals do.
@@ -932,6 +1622,7 @@ impl DocumentTool {
         if let Some(stamp) = super::get_opt_bool(args, "stamp")? {
             request["stamp"] = json!(stamp);
         }
+        require_pdf(&input).await?;
         let base = sanitize_base(opt_string(args, "file_name")?, &input_base(&input, "text"));
         let outputs = reserve(generated, std::slice::from_ref(&base), "pdf").await?;
         request["output"] = json!(outputs[0].to_string_lossy());
@@ -951,8 +1642,9 @@ impl DocumentTool {
         request["pages"] = opt_pages(args)?.kit_value();
         set_number(&mut request, args, "x")?;
         set_number(&mut request, args, "y")?;
-        set_positive_number(&mut request, args, "width")?;
-        set_positive_number(&mut request, args, "height")?;
+        set_positive_number(&mut request, args, "width", &RULES.dimension_points)?;
+        set_positive_number(&mut request, args, "height", &RULES.dimension_points)?;
+        require_pdf(&input).await?;
         let base = sanitize_base(opt_string(args, "file_name")?, &input_base(&input, "image"));
         let outputs = reserve(generated, std::slice::from_ref(&base), "pdf").await?;
         request["output"] = json!(outputs[0].to_string_lossy());
@@ -968,19 +1660,12 @@ impl DocumentTool {
         generated: &Path,
     ) -> Result<String> {
         let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
-        let values = super::get_object(args, "values")?;
-        // A form filled with nothing is a copy, not a fill: reporting that as
-        // "filled the form" would name a success where nothing happened.
-        if values.is_empty() {
-            anyhow::bail!(
-                "usage: missing or empty argument \"values\" — hint: name at least one form field, \
-                 e.g. {{\"name\": \"Иван\"}}"
-            );
-        }
+        let values = require_values(args, "form field")?;
         require_scalar_values(&values)?;
         // Every argument is read before anything is reserved: a call the tool
         // refuses must not leave an empty output file behind.
         let flatten = super::get_bool(args, "flatten", false)?;
+        require_pdf(&input).await?;
         let base = sanitize_base(
             opt_string(args, "file_name")?,
             &input_base(&input, "filled"),
@@ -1157,9 +1842,8 @@ async fn resolve_input(ws: &Workspace, path: &str, access: PathAccess) -> Result
     Ok((resolved, meta.len()))
 }
 
-/// The leading bytes of `path` — the shape every container this module asks
-/// about is recognized by. A sample and an edit input are each read once and both
-/// their questions (password, family) asked of the same head.
+/// The leading bytes of `path` — the five-byte PDF magic [`real_family_of`]
+/// settles a PDF with, without reading a whole file for it.
 async fn head_of(path: &Path) -> Result<[u8; 8]> {
     use tokio::io::AsyncReadExt as _;
     let mut magic = [0u8; 8];
@@ -1172,61 +1856,268 @@ async fn head_of(path: &Path) -> Result<[u8; 8]> {
     Ok(magic)
 }
 
-/// Refuse an encrypted OOXML input — a `fill_template` sample or an edit's
-/// input. Such a file is a CFB container that no package reader can open; the
-/// read path gives the same file the password-protected verdict, and the kit's
-/// own failure would be a zip-level message that says nothing about the
-/// password. Only a file whose name claims one of the OOXML families reaches
-/// this — a legacy `.doc`/`.xls`/`.ppt` is a CFB container too, and the family
-/// check refuses it before this point because an old format is read but never
-/// filled or edited.
-fn ensure_input_readable(path: &Path, head: &[u8]) -> Result<()> {
-    if head != crate::document::CFB_MAGIC {
-        return Ok(());
+/// What the file at `path` really is, from its own bytes — never its name. The
+/// head settles everything a container is not needed for — a PDF's five-byte
+/// magic, and bytes that are no document container at all — so a caller's own
+/// PDF, the common and heaviest case, is never read whole. A container's own
+/// directory lies further in, so a container goes to [`container_family`].
+async fn real_family_of(path: &Path) -> Result<crate::document::RealFamily> {
+    let head = head_of(path).await?;
+    if !crate::document::is_zip_container(&head) && !head.starts_with(crate::document::CFB_MAGIC) {
+        return Ok(crate::document::real_family(&head));
     }
-    anyhow::bail!(
-        "usage: {} is password-protected — hint: remove the protection, save an unprotected copy \
-         and fill or edit that",
-        path.display()
-    )
+    let owned = path.to_owned();
+    // The whole-file read and the legacy parse run on a blocking thread under
+    // the document bound (see `crate::document::run_document_parse`): the parse
+    // is a third-party reader, so its panic must cost the call rather than the
+    // caller's turn.
+    match crate::document::run_document_parse(move || container_family(&owned)).await {
+        Some(checked) => checked,
+        None => anyhow::bail!(
+            "usage: {} could not be read — hint: retry it, or check the file is intact",
+            file_name_of(path)
+        ),
+    }
 }
 
-/// The answer a file NAMED as an old binary format but holding an OOXML package
-/// is owed. The legacy answer — the format is read but never written — would
-/// describe a file it is not, and the name is what this tool addresses a package
-/// by (it is what picks the family to fill or edit), so renaming it is the fix.
-/// `action` is what the caller can then do with it (`edit`, `fill`).
-fn misnamed_package(action: &str) -> String {
-    format!(
-        "the file's bytes are an OOXML package, so name it as the family it really is and {action} \
-         that"
-    )
-}
-
-/// The hint an input named in the old `.doc`/`.xls`/`.ppt` family is owed, or
-/// `None` when its name says nothing about old formats. The container, not the
-/// name alone, decides which of the two answers such a name gets: one whose bytes
-/// are an OOXML package is not an old format — the read path would not read it as
-/// one — and is owed the same "name it as the family it really is" hint a misnamed
-/// package gets anywhere else. `action` is what the caller can then do with it
-/// (`edit`, `fill`), and `old_format` the sentence an action that cannot write the
-/// format says instead.
-fn old_format_hint(path: &Path, head: &[u8], action: &str, old_format: &str) -> Option<String> {
-    crate::legacy::family_of(path).is_some().then(|| {
-        if crate::document::is_zip_container(head) {
-            misnamed_package(action)
-        } else {
-            old_format.to_string()
+/// What a container at `path` really holds, from its own bytes: the whole-file
+/// read ([`crate::util::FILE_MAX_BYTES`], already checked by [`resolve_input`])
+/// and the family parse that has to see past the head.
+fn container_family(path: &Path) -> Result<crate::document::RealFamily> {
+    use crate::document::RealFamily;
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let real = crate::document::real_family(&bytes);
+    // A CFB container whose own directory names no Office document leaves the
+    // name as the only evidence, and the reading path answers such a file the
+    // same way (`crate::document::classify`): an old-format name makes it that
+    // old format's file, while a package's name stays the package's own
+    // corruption verdict (`real_clause` reads the name for that).
+    let real = match real {
+        RealFamily::Other if bytes.starts_with(crate::document::CFB_MAGIC) => {
+            crate::legacy::named_family(path).map_or(real, crate::legacy::Family::real)
         }
-    })
+        other => other,
+    };
+    // A legacy `.doc`/`.xls`/`.ppt` can be genuinely encrypted, which its
+    // container alone does not say: only the family's own reader can tell a
+    // password from corruption, so a legacy family that is really encrypted is
+    // answered with the password verdict here. `crate::document::real_family`
+    // itself stays pure — the reading path asks it about every old document and
+    // must not pay a second parse for a verdict only the write path needs.
+    if let Some(RealFormat::Legacy(family)) = RealFormat::of(real)
+        && crate::legacy::is_encrypted(&bytes, family)
+    {
+        return Ok(RealFamily::Encrypted);
+    }
+    Ok(real)
 }
 
-/// Require an edit input to be a package of the family its action edits: a file
-/// of another family (or a PDF) is refused by name, and an old binary
-/// `.doc`/`.xls`/`.ppt` gets the answer the old formats are owed — the format is
-/// read but never edited — instead of a file substituted for the one asked for.
-fn require_edit_family(path: &Path, head: &[u8], family: crate::ooxml::Family) -> Result<()> {
-    if crate::ooxml::family_of(path) == Some(family) {
+/// The verdict a genuinely encrypted input gets, whatever its name says: its own
+/// container declares genuine encryption, and the read path gives the same file
+/// the same answer. `wanted` names what the caller would have done to the file,
+/// so the refusal tells it what a password-free copy is for in its own voice.
+fn password_refusal(path: &Path, wanted: Wanted) -> anyhow::Error {
+    anyhow::anyhow!(
+        "usage: {} is password-protected — hint: remove the protection, save an unprotected copy \
+         and {}",
+        file_name_of(path),
+        wanted.unprotected()
+    )
+}
+
+/// The middle clause of a refusal: the file's real format when its bytes name
+/// one. When they name none, the name decides: a `.docx`/`.xlsx`/`.pptx` name
+/// means a package of that family that cannot be read, the same verdict a
+/// reading gives such a file, and any other name means bytes that are no
+/// document this tool knows.
+fn real_clause(real: Option<RealFormat>, path: &Path) -> String {
+    if let Some(format) = real {
+        return format!("which is really {}", format.phrase());
+    }
+    crate::ooxml::family_of(path).map_or_else(
+        || "which is not a Word, Excel, PowerPoint or PDF document".to_owned(),
+        |family| format!("which is {}", crate::ooxml::corrupt_reason(family)),
+    )
+}
+
+/// What a refusal names a file as: the formats a sentence can speak of. The
+/// password case is answered before a format is asked for ([`wrong_family`]),
+/// and a container that names no format has none ([`real_clause`] reads the
+/// name for those) — so this is the one mapping from
+/// [`crate::document::RealFamily`]'s variants to the three kinds every refusal
+/// sentence is written against.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RealFormat {
+    Pdf,
+    Package(crate::ooxml::Family),
+    Legacy(crate::legacy::Family),
+}
+
+impl RealFormat {
+    /// The format `real` is, or `None` for a file that names none.
+    fn of(real: crate::document::RealFamily) -> Option<Self> {
+        use crate::document::RealFamily;
+        match real {
+            RealFamily::Pdf => Some(Self::Pdf),
+            RealFamily::Docx => Some(Self::Package(crate::ooxml::Family::Docx)),
+            RealFamily::Xlsx => Some(Self::Package(crate::ooxml::Family::Xlsx)),
+            RealFamily::Pptx => Some(Self::Package(crate::ooxml::Family::Pptx)),
+            RealFamily::LegacyDoc => Some(Self::Legacy(crate::legacy::Family::Doc)),
+            RealFamily::LegacyXls => Some(Self::Legacy(crate::legacy::Family::Xls)),
+            RealFamily::LegacyPpt => Some(Self::Legacy(crate::legacy::Family::Ppt)),
+            RealFamily::Encrypted | RealFamily::Other => None,
+        }
+    }
+
+    /// What it is, as a refusal names it.
+    fn phrase(self) -> &'static str {
+        match self {
+            Self::Pdf => "a PDF",
+            Self::Package(crate::ooxml::Family::Docx) => "a .docx package",
+            Self::Package(crate::ooxml::Family::Xlsx) => "an .xlsx package",
+            Self::Package(crate::ooxml::Family::Pptx) => "a .pptx package",
+            Self::Legacy(crate::legacy::Family::Doc) => "an old .doc file",
+            Self::Legacy(crate::legacy::Family::Xls) => "an old .xls file",
+            Self::Legacy(crate::legacy::Family::Ppt) => "an old .ppt file",
+        }
+    }
+}
+
+/// What the caller's action can do with a file of its own family: the one thing
+/// the advice a wrong-family refusal ends with needs beyond the file's real
+/// family — which door to point the caller at, and what the old formats are
+/// owed. The clause naming the action is the caller's own and `takes` is what
+/// the action accepts in the short form a hint carries.
+#[derive(Clone, Copy)]
+enum Wanted {
+    /// One of the three editable packages: another package's edit action — a
+    /// caller that works on files, like `Self::Pdf`.
+    Package,
+    /// A sample of the user's own to fill.
+    Sample,
+    /// A PDF, for the actions that work on one. One takes a PDF, so a real PDF is
+    /// never refused for it ([`require_pdf`] returns before the advice is asked
+    /// for) and this is only ever answered as a caller that works on files.
+    Pdf,
+}
+
+impl Wanted {
+    /// The verb a sentence about this action uses.
+    const fn verb(self) -> &'static str {
+        match self {
+            Self::Package => "edited",
+            Self::Sample => "filled",
+            Self::Pdf => "written",
+        }
+    }
+
+    /// What the old formats' sentence tells the caller to convert the file to.
+    const fn convert(self) -> &'static str {
+        match self {
+            Self::Pdf => "save it as a PDF first",
+            Self::Package | Self::Sample => "save it as one of the OOXML families first",
+        }
+    }
+
+    /// What a wrong-family PDF is owed: a caller that fills cannot fill pages, so
+    /// it is pointed at the one action that fills a PDF's own fields, and every
+    /// caller that works on files at the PDF actions.
+    const fn pdf(self) -> &'static str {
+        match self {
+            Self::Sample => "a PDF's form fields are filled with pdf_form_fill",
+            Self::Package | Self::Pdf => {
+                "a PDF's own actions are pdf_merge, pdf_split, pdf_rotate, pdf_text, pdf_image and \
+                 pdf_form_fill"
+            }
+        }
+    }
+
+    /// What the password refusal tells the caller to do with a password-free
+    /// copy, in this action's own voice.
+    const fn unprotected(self) -> &'static str {
+        match self {
+            Self::Package => "edit that",
+            Self::Sample => "fill that",
+            Self::Pdf => "convert it to a PDF",
+        }
+    }
+}
+
+/// The advice a wrong-family refusal ends with: another OOXML package points at
+/// the action that edits it (or, for a PDF's own actions, at a PDF), an
+/// old-format file keeps the sentence the old formats are owed, a PDF is what
+/// the PDF actions are for, and a file that names no format is passed as what
+/// the action takes. `takes` names what the caller's action accepts (`pass a
+/// PDF`, say) and `wanted` what that action does to a file it does take. A caller
+/// never asks about a format it takes: an edit action is never given its own
+/// package, a fill is never given a package it fills, a PDF action is never given
+/// a PDF.
+fn wrong_family_advice(real: Option<RealFormat>, takes: &str, wanted: Wanted) -> String {
+    match real {
+        Some(RealFormat::Package(family)) => match wanted {
+            Wanted::Package => format!("use {}_edit to edit it", family.name()),
+            // A package a fill can fill is filled, so the package it is refused is
+            // one whose name disagrees with its bytes: the name is the one thing
+            // the file is missing.
+            Wanted::Sample => "rename it to match its content".to_owned(),
+            Wanted::Pdf => "convert it to a PDF first".to_owned(),
+        },
+        Some(RealFormat::Legacy(_)) => old_format_advice(wanted),
+        Some(RealFormat::Pdf) => wanted.pdf().to_owned(),
+        None => format!("pass {takes}"),
+    }
+}
+
+/// The sentence the old binary formats are owed — they are read, but never
+/// written — in the caller's own verb, telling it what to convert one to.
+fn old_format_advice(wanted: Wanted) -> String {
+    format!(
+        "an old .doc/.xls/.ppt file is read but never {}; {}",
+        wanted.verb(),
+        wanted.convert()
+    )
+}
+
+/// The refusal an input of the wrong family is owed, in the action's own voice.
+/// `what` states what the caller's action takes (`docx_edit edits only a
+/// .docx/.docm file`), `takes` the same in the short form a hint can carry (`a
+/// .docx/.docm file`), `path` the file as the caller named it, `real` what the
+/// file's own bytes really hold, and `wanted` what the action would have done to
+/// a file it does take. The verdict follows the bytes: only a real old binary
+/// `.doc`/`.xls`/`.ppt` is owed the old formats' sentence, and the name is
+/// consulted just for the bytes that are no document at all.
+fn wrong_family(
+    what: &str,
+    takes: &str,
+    path: &Path,
+    real: crate::document::RealFamily,
+    wanted: Wanted,
+) -> anyhow::Error {
+    use crate::document::RealFamily;
+    // The password verdict is owed whatever the action asked for: every
+    // sentence below names a format, and an encrypted file's own format is not
+    // one the caller can act on.
+    if real == RealFamily::Encrypted {
+        return password_refusal(path, wanted);
+    }
+    let format = RealFormat::of(real);
+    anyhow::anyhow!(
+        "usage: {what}, got {}, {} — hint: {}",
+        file_name_of(path),
+        real_clause(format, path),
+        wrong_family_advice(format, takes, wanted)
+    )
+}
+
+/// Require an edit input to be the package family its action edits, from the
+/// file's own bytes: a package of another family, a PDF, a container that is no
+/// document and an old binary `.doc`/`.xls`/`.ppt` are each named for what they
+/// really are — the old format keeping the sentence the old formats are owed —
+/// and a genuinely encrypted package is the password verdict whatever the name
+/// claims.
+async fn require_edit_family(path: &Path, family: crate::ooxml::Family) -> Result<()> {
+    let real = real_family_of(path).await?;
+    if RealFormat::of(real) == Some(RealFormat::Package(family)) {
         return Ok(());
     }
     let accepted = match family {
@@ -1234,33 +2125,58 @@ fn require_edit_family(path: &Path, head: &[u8], family: crate::ooxml::Family) -
         crate::ooxml::Family::Xlsx => "a .xlsx/.xlsm file",
         crate::ooxml::Family::Pptx => "a .pptx/.pptm file",
     };
-    let name = file_name_of(path);
-    if let Some(hint) = old_format_hint(
+    Err(wrong_family(
+        &format!("{}_edit edits only {accepted}", family.name()),
+        accepted,
         path,
-        head,
-        "edit",
-        "an old .doc/.xls/.ppt file is read but never edited; say so, or write a new file with \
-         create",
-    ) {
-        anyhow::bail!(
-            "usage: {}_edit edits only {accepted}, got {name} — hint: {hint}",
-            family.name()
-        );
-    }
-    anyhow::bail!(
-        "usage: {}_edit edits only {accepted}, got {name} — hint: pass the file's own family, or \
-         use the pdf_* actions for a PDF",
-        family.name()
-    )
+        real,
+        Wanted::Package,
+    ))
 }
 
-/// The ops one family's edit action accepts.
-fn edit_ops(family: crate::ooxml::Family) -> &'static [&'static str] {
-    match family {
-        crate::ooxml::Family::Docx => &DOCX_EDIT_OPS,
-        crate::ooxml::Family::Xlsx => &XLSX_EDIT_OPS,
-        crate::ooxml::Family::Pptx => &PPTX_EDIT_OPS,
+/// The family a fill must treat `sample` as: the family its name claims — which
+/// picks the kit's filler, the copy's extension and the file the copy is compared
+/// against — that the sample's own bytes must be. A sample whose bytes are one of
+/// the three packages this tool fills but whose name says otherwise is one rename
+/// away, so it is refused with the name it needs rather than with the edit advice
+/// a call to fill cannot use. A sample of another family, an old binary document,
+/// a PDF or no document at all is refused naming what it holds, and a genuinely
+/// encrypted one is the password verdict.
+async fn require_sample_family(sample: &Path) -> Result<crate::ooxml::Family> {
+    let real = real_family_of(sample).await?;
+    let format = RealFormat::of(real);
+    if let Some(RealFormat::Package(family)) = format
+        && crate::ooxml::family_of(sample) == Some(family)
+    {
+        return Ok(family);
     }
+    let accepted = "a .docx/.docm, .pptx/.pptm or .xlsx/.xlsm sample";
+    let what = if matches!(format, Some(RealFormat::Package(_))) {
+        "the sample's name must be the family its bytes are".to_owned()
+    } else {
+        format!("a sample must be {accepted}")
+    };
+    Err(wrong_family(&what, accepted, sample, real, Wanted::Sample))
+}
+
+/// Require a `pdf_*` input to really be a PDF, from its own bytes: a valid PDF
+/// under a non-PDF name keeps working, and a file that is not one is refused
+/// naming what it really holds rather than left to the kit's parser. Its
+/// sentences are the caller that works on PDFs: another package is told to
+/// convert to a PDF first, and an old-format file is owed the old formats'
+/// sentence with a PDF as what to convert it to.
+async fn require_pdf(path: &Path) -> Result<()> {
+    let real = real_family_of(path).await?;
+    if real == crate::document::RealFamily::Pdf {
+        return Ok(());
+    }
+    Err(wrong_family(
+        "the input must be a PDF",
+        "a PDF",
+        path,
+        real,
+        Wanted::Pdf,
+    ))
 }
 
 /// Validate and normalize the `edits` argument for one family's edit action,
@@ -1268,7 +2184,10 @@ fn edit_ops(family: crate::ooxml::Family) -> &'static [&'static str] {
 /// ops the family accepts, the fields each op needs, and the shared bounds in
 /// `assets/docgen/rules.json`. Returns the array the request carries.
 fn validate_edits(family: crate::ooxml::Family, args: &Value) -> Result<Value> {
-    let ops = edit_ops(family);
+    let names = edit_op_fields(family)
+        .iter()
+        .map(|(op, _)| *op)
+        .collect::<Vec<_>>();
     let edits = match args.get("edits") {
         Some(Value::Array(edits)) if !edits.is_empty() => edits,
         Some(Value::Array(_)) => {
@@ -1295,13 +2214,13 @@ fn validate_edits(family: crate::ooxml::Family, args: &Value) -> Result<Value> {
             anyhow::bail!("usage: {at} must be an object — hint: give every edit an \"op\"");
         };
         let Some(op) = object.get("op").and_then(Value::as_str) else {
-            anyhow::bail!("usage: {at} has no \"op\" — hint: use {}", ops.join(", "));
+            anyhow::bail!("usage: {at} has no \"op\" — hint: use {}", names.join(", "));
         };
-        if !ops.contains(&op) {
+        if !names.contains(&op) {
             anyhow::bail!(
                 "usage: unknown {} edit \"{op}\" — hint: use {}",
                 family.name(),
-                ops.join(", ")
+                names.join(", ")
             );
         }
         out.push(validate_edit(family, edit, object, op, &at)?);
@@ -1320,6 +2239,13 @@ fn validate_edit(
     op: &str,
     at: &str,
 ) -> Result<Value> {
+    require_taken_keys(
+        object,
+        at,
+        &format!("{} \"{op}\"", family.name()),
+        op_fields(family, op),
+        &["op"],
+    )?;
     let validated = match family {
         crate::ooxml::Family::Docx => {
             validate_docx_edit(object, op, at)?;
@@ -1456,56 +2382,28 @@ fn edit_number(
 /// runs in the body, so the field each op needs and the shapes it accepts are
 /// stated here once.
 fn validate_docx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &str) -> Result<()> {
-    let keys =
-        |allowed: &[&str]| require_edit_keys(object, crate::ooxml::Family::Docx, op, allowed, at);
     match op {
         "replace_text" => {
-            keys(&["find", "replace"])?;
             edit_string_non_empty(object, "find", at)?;
             edit_string_present(object, "replace", at)?;
         }
         "insert_text" => {
-            keys(&["find", "insert", "position"])?;
             edit_string_non_empty(object, "find", at)?;
             edit_string_non_empty(object, "insert", at)?;
             require_position(object, at)?;
         }
         "remove_text" | "remove_paragraph" => {
-            keys(&["find"])?;
             edit_string_non_empty(object, "find", at)?;
         }
         "format_text" => {
-            keys(&[
-                "find",
-                "bold",
-                "italic",
-                "underline",
-                "strike",
-                "size",
-                "color",
-            ])?;
             edit_string_non_empty(object, "find", at)?;
             require_format(object, at)?;
         }
         "format_paragraph" => {
-            keys(&[
-                "find",
-                "align",
-                "style",
-                "indent_left",
-                "indent_right",
-                "indent_first_line",
-                "spacing_before",
-                "spacing_after",
-                "line_spacing",
-                "list",
-                "level",
-            ])?;
             edit_string_non_empty(object, "find", at)?;
             require_paragraph_format(object, at)?;
         }
         "add_paragraph" => {
-            keys(&["text", "after"])?;
             edit_string_present(object, "text", at)?;
             require_optional_text(object, "after", at)?;
         }
@@ -1741,6 +2639,8 @@ impl FormatCellsTarget {
                 "size",
                 "bold",
                 "italic",
+                "underline",
+                "strike",
                 "color",
                 "fill",
                 "border",
@@ -1749,8 +2649,8 @@ impl FormatCellsTarget {
                 "wrap",
                 "number_format",
             ],
-            Self::Column => &["width"],
-            Self::Row => &["height"],
+            Self::Column => &["width_chars"],
+            Self::Row => &["height_points"],
         }
     }
 
@@ -1945,27 +2845,42 @@ fn require_alignment<W: AsRef<str> + std::fmt::Display>(
     }
 }
 
-/// Refuse an edit's key that its op does not take, naming the fields the op does:
-/// the kit reads only those, so an extra one would be dropped in silence. A null
-/// value is not stated — the boundary reads a `null` as absent everywhere (see
-/// `stated`) — so a key whose value is null is not a key the op does not take.
-fn require_edit_keys(
+/// Refuse a key of the object at `at` that the shape `subject` names does not
+/// take, naming the ones it does: the kit reads only those, so an extra key would
+/// be dropped in silence. `fields` is the shape's own vocabulary and `always` the
+/// keys every shape of that kind takes beyond it (`op` on an edit, `type` on a
+/// block). A null value is not stated — the boundary reads a `null` as absent
+/// everywhere (see [`stated`]) — so a key whose value is null is not a key the
+/// shape does not take.
+fn require_taken_keys(
     object: &serde_json::Map<String, Value>,
-    family: crate::ooxml::Family,
-    op: &str,
-    allowed: &[&str],
     at: &str,
+    subject: &str,
+    fields: &[&str],
+    always: &[&str],
 ) -> Result<()> {
     for key in object.keys() {
-        if key != "op" && !allowed.contains(&key.as_str()) && stated(object, key) {
+        if !always.contains(&key.as_str()) && !fields.contains(&key.as_str()) && stated(object, key)
+        {
+            let taken = always.iter().chain(fields).copied().collect::<Vec<_>>();
             anyhow::bail!(
-                "usage: {at}.{key} is not a field of {} \"{op}\" — hint: it takes {}",
-                family.name(),
-                allowed.join(", ")
+                "usage: {at}.{key} is not a field of {subject} — hint: it takes {}",
+                listed(&taken)
             );
         }
     }
     Ok(())
+}
+
+/// Refuse a content block's key its own kind does not take, against the fields
+/// [`CONTENT_BLOCKS`] states for that kind — the same table the declaration is
+/// built from, so the two cannot drift.
+fn require_block_keys(object: &serde_json::Map<String, Value>, at: &str, kind: &str) -> Result<()> {
+    let fields = CONTENT_BLOCKS
+        .iter()
+        .find_map(|(name, fields, _)| (*name == kind).then_some(*fields))
+        .expect("every block kind the boundary reads is one the declaration names");
+    require_taken_keys(object, at, &format!("the {kind} block"), fields, &["type"])
 }
 
 /// The xlsx edit vocabulary and the cell, row and column shapes its writer
@@ -1978,13 +2893,10 @@ fn validate_xlsx_edit(
     op: &str,
     at: &str,
 ) -> Result<Value> {
-    let keys =
-        |allowed: &[&str]| require_edit_keys(object, crate::ooxml::Family::Xlsx, op, allowed, at);
     let sheet = edit_string_non_empty(object, "sheet", at)?;
     require_sheet_name_length(sheet, &format!("{at}.sheet"))?;
     match op {
         "set_cell" => {
-            keys(&["sheet", "cell", "value", "number_format"])?;
             require_cell(object, at)?;
             require_name(object, "number_format", RULES.number_format_max, at)?;
             let mut normalized = edit.clone();
@@ -1992,16 +2904,27 @@ fn validate_xlsx_edit(
             return Ok(normalized);
         }
         "clear_cell" => {
-            keys(&["sheet", "cell"])?;
             require_cell(object, at)?;
         }
         "format_cells" => {
             let target = require_format_cells_target(object, at)?;
-            keys(&target.keys())?;
+            // A property another target owns (`bold` on a column, which sets only a
+            // width) would be dropped in silence, so it is refused by name.
+            require_taken_keys(
+                object,
+                at,
+                &format!("a {} target", target.key()),
+                &target.keys(),
+                &["op"],
+            )?;
             let named = match target {
                 FormatCellsTarget::Range => {
                     require_format_cells_range(object, at)?;
-                    let mut named = require_toggles(object, &["bold", "italic", "wrap"], at)?;
+                    let mut named = require_toggles(
+                        object,
+                        &["bold", "italic", "underline", "strike", "wrap"],
+                        at,
+                    )?;
                     // Excel's own name length; `<name val>` carries the name verbatim.
                     named |= require_name(object, "font", RULES.font_name_max, at)?;
                     named |= require_stated_number(
@@ -2026,7 +2949,7 @@ fn validate_xlsx_edit(
                     require_column(object, at)?;
                     require_stated_number(
                         object,
-                        "width",
+                        "width_chars",
                         &RULES.column_width_chars,
                         "give a width in characters, as Excel shows one",
                         at,
@@ -2036,7 +2959,7 @@ fn validate_xlsx_edit(
                     require_row(object, at)?;
                     require_stated_number(
                         object,
-                        "height",
+                        "height_points",
                         &RULES.row_height_points,
                         "give a height in points",
                         at,
@@ -2052,11 +2975,9 @@ fn validate_xlsx_edit(
             }
         }
         "insert_row" | "delete_row" => {
-            keys(&["sheet", "row"])?;
             require_row(object, at)?;
         }
         "insert_column" | "delete_column" => {
-            keys(&["sheet", "column"])?;
             require_column(object, at)?;
         }
         _ => unreachable!("the op was checked against the family's vocabulary"),
@@ -2176,37 +3097,22 @@ fn require_column(object: &serde_json::Map<String, Value>, at: &str) -> Result<(
 /// The pptx edit vocabulary: a slide is its 1-based number as the reader shows
 /// it, and a text op names a fragment that must be on that slide.
 fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &str) -> Result<()> {
-    let keys =
-        |allowed: &[&str]| require_edit_keys(object, crate::ooxml::Family::Pptx, op, allowed, at);
     match op {
         "replace_text" | "replace_notes" => {
-            keys(&["slide", "find", "replace"])?;
             require_slide(object, at)?;
             require_pptx_lookup(edit_string_non_empty(object, "find", at)?, "find", at)?;
             edit_string_present(object, "replace", at)?;
         }
         "remove_text" | "remove_paragraph" | "remove_notes" => {
-            keys(&["slide", "find"])?;
             require_slide(object, at)?;
             require_pptx_lookup(edit_string_non_empty(object, "find", at)?, "find", at)?;
         }
         "format_text" => {
-            keys(&[
-                "slide",
-                "find",
-                "bold",
-                "italic",
-                "underline",
-                "size",
-                "color",
-                "align",
-            ])?;
             require_slide(object, at)?;
             require_pptx_lookup(edit_string_non_empty(object, "find", at)?, "find", at)?;
             require_pptx_format(object, at)?;
         }
         "add_paragraph" => {
-            keys(&["slide", "text", "after", "level"])?;
             require_slide(object, at)?;
             edit_string_present(object, "text", at)?;
             // An absent anchor places the paragraph last; a blank one is refused
@@ -2217,13 +3123,11 @@ fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &st
             require_optional_level(object, at)?;
         }
         "add_image" => {
-            keys(&["slide", "path", "x", "y", "width", "height"])?;
             require_slide(object, at)?;
-            edit_string_non_empty(object, "path", at)?;
+            edit_string_non_empty(object, "image", at)?;
             require_image_geometry(object, at)?;
         }
         "add_slide" => {
-            keys(&["after", "title", "bullets"])?;
             if edit_integer(object, "after", at)? == Some(0) {
                 anyhow::bail!("usage: {at}.after must be a whole number of at least 1");
             }
@@ -2231,16 +3135,13 @@ fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &st
             require_bullets(object, at)?;
         }
         "delete_slide" | "duplicate_slide" => {
-            keys(&["slide"])?;
             require_slide(object, at)?;
         }
         "move_slide" => {
-            keys(&["slide", "to"])?;
             require_slide(object, at)?;
             require_slide_number(object, "to", at)?;
         }
         "add_notes" => {
-            keys(&["slide", "text"])?;
             require_slide(object, at)?;
             edit_string_present(object, "text", at)?;
         }
@@ -2337,16 +3238,6 @@ fn pair_words(list: &[(String, String)]) -> Vec<&str> {
     list.iter().map(|(word, _)| word.as_str()).collect()
 }
 
-/// A rule's values as the prompt spells one in a JSON edit: quoted and
-/// pipe-separated, in the order the rules state them.
-fn quoted_words<S: AsRef<str>>(words: &[S]) -> String {
-    words
-        .iter()
-        .map(|word| format!("\"{}\"", word.as_ref()))
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
 /// The examples of the shared Word marks a reading prints in brackets, and the
 /// labels and annotations it adds without them — quoted and comma-separated for
 /// the prompt, which names every one of them from this one statement (see
@@ -2366,7 +3257,7 @@ fn spelled_docx_marks(bracketed: bool) -> String {
 /// the shape the kit writes: a boolean run toggle, a point size inside the
 /// presentation's own bound, a hex colour, or a paragraph alignment.
 fn require_pptx_format(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
-    let mut any = require_toggles(object, &["bold", "italic", "underline"], at)?;
+    let mut any = require_toggles(object, &["bold", "italic", "underline", "strike"], at)?;
     any |= require_stated_number(
         object,
         "size",
@@ -2378,26 +3269,27 @@ fn require_pptx_format(object: &serde_json::Map<String, Value>, at: &str) -> Res
     any |= require_alignment(object, "align", &pair_words(&RULES.slide_alignments), at)?;
     if !any {
         anyhow::bail!(
-            "usage: {at} (format_text) needs at least one of bold, italic, underline, size, color \
-             or align — hint: a boolean toggles bold, italic or underline, size is in points, \
-             color is hex digits and align is {}",
+            "usage: {at} (format_text) needs at least one of bold, italic, underline, strike, \
+             size, color or align — hint: a boolean sets bold, italic, underline or strike (false \
+             switches it off), size is in points, color is hex digits and align is {}",
             listed(&pair_words(&RULES.slide_alignments))
         );
     }
     Ok(())
 }
 
-/// Require an `add_image`'s optional placement and size: `x` and `y` are fractions
-/// of the slide's own width and height and may sit on its edge, while `width` and
-/// `height` are fractions of that size and may not be zero.
+/// Require an `add_image`'s optional placement and size: `x_fraction` and
+/// `y_fraction` are fractions of the slide's own width and height and may sit on
+/// its edge, while `width_fraction` and `height_fraction` are fractions of that
+/// size and may not be zero.
 fn require_image_geometry(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
     let place = "give the fraction of the slide the image is placed at";
     let size = "give the fraction of the slide the image is scaled to";
     for (key, span, what) in [
-        ("x", &RULES.slide_position_fraction, place),
-        ("y", &RULES.slide_position_fraction, place),
-        ("width", &RULES.slide_size_fraction, size),
-        ("height", &RULES.slide_size_fraction, size),
+        ("x_fraction", &RULES.slide_position_fraction, place),
+        ("y_fraction", &RULES.slide_position_fraction, place),
+        ("width_fraction", &RULES.slide_size_fraction, size),
+        ("height_fraction", &RULES.slide_size_fraction, size),
     ] {
         require_span_number(object, key, span, what, at)?;
     }
@@ -2437,16 +3329,19 @@ async fn resolve_content(
                  table, image or notes"
             );
         };
+        let at = format!("content[{index}]");
         // Every arm produces the block to push: it validates the shape and hands
         // back what the request will carry, the image's path resolved against the
         // workspace. One push after the match keeps the two in step.
         let resolved = match kind {
             "heading" => {
+                require_block_keys(object, &at, "heading")?;
                 require_string(object, "text", index)?;
                 require_heading_level(object, index)?;
                 block.clone()
             }
             "paragraph" => {
+                require_block_keys(object, &at, "paragraph")?;
                 require_string(object, "text", index)?;
                 block.clone()
             }
@@ -2459,10 +3354,12 @@ async fn resolve_content(
                          only pptx has notes — hint: write a paragraph block instead"
                     );
                 }
+                require_block_keys(object, &at, "notes")?;
                 require_string(object, "text", index)?;
                 block.clone()
             }
             "list" => {
+                require_block_keys(object, &at, "list")?;
                 let Some(items) = object.get("items") else {
                     anyhow::bail!("usage: content[{index}] has no \"items\"");
                 };
@@ -2471,6 +3368,7 @@ async fn resolve_content(
                 block.clone()
             }
             "table" => {
+                require_block_keys(object, &at, "table")?;
                 require_table_rows(object, index)?;
                 // `headers` is optional — null counts as absent here exactly as
                 // it does for `rows` and every other optional argument.
@@ -2483,23 +3381,30 @@ async fn resolve_content(
                 normalize_table(object, index)?
             }
             "image" => {
+                require_block_keys(object, &at, "image")?;
                 require_optional_size(object, "width", index)?;
                 require_optional_size(object, "height", index)?;
-                let Some(raw) = object.get("path").and_then(Value::as_str) else {
+                let Some(raw) = object.get("image").and_then(Value::as_str) else {
                     anyhow::bail!(
-                        "usage: content[{index}] (image) has no \"path\" — hint: give the image's \
+                        "usage: content[{index}] (image) has no \"image\" — hint: give the image's \
                          path"
                     );
                 };
                 let (image, _) = resolve_input(ws, raw, access).await?;
                 ensure_image(&image)?;
                 let mut resolved = block.clone();
-                resolved["path"] = json!(image.to_string_lossy());
+                // The kit reads the placed picture from the block's `image`.
+                resolved["image"] = json!(image.to_string_lossy());
                 resolved
             }
             other => anyhow::bail!(
-                "usage: content[{index}] has unknown type \"{other}\" — hint: use heading, \
-                 paragraph, list, table, image or notes"
+                "usage: content[{index}] has unknown type \"{other}\" — hint: use {}",
+                listed(
+                    &CONTENT_BLOCKS
+                        .iter()
+                        .map(|(kind, _, _)| *kind)
+                        .collect::<Vec<_>>()
+                )
             ),
         };
         out.push(resolved);
@@ -2507,12 +3412,12 @@ async fn resolve_content(
     Ok(Value::Array(out))
 }
 
-/// Resolve every `add_image` path in a validated pptx edit list under the
+/// Resolve every `add_image` picture in a validated pptx edit list under the
 /// caller's [`PathAccess`], the way `create`'s image block is: the kit is handed
 /// a path it can open, and the same read rule keeps an edit from embedding a
 /// file the caller did not name inside its own reach. The list's shape — an array of
 /// objects, each naming an `op`, an `add_image` also carrying a non-empty
-/// `path` — is the pptx validator's own contract.
+/// `image` — is the pptx validator's own contract.
 async fn resolve_edit_images(ws: &Workspace, edits: &mut Value, access: PathAccess) -> Result<()> {
     let list = edits
         .as_array_mut()
@@ -2525,13 +3430,13 @@ async fn resolve_edit_images(ws: &Workspace, edits: &mut Value, access: PathAcce
             continue;
         }
         let raw = object
-            .get("path")
+            .get("image")
             .and_then(Value::as_str)
-            .expect("the pptx validator requires an add_image path")
+            .expect("the pptx validator requires an add_image image")
             .to_owned();
         let (image, _) = resolve_input(ws, &raw, access).await?;
         ensure_image(&image)?;
-        object.insert("path".to_owned(), json!(image.to_string_lossy()));
+        object.insert("image".to_owned(), json!(image.to_string_lossy()));
     }
     Ok(())
 }
@@ -2576,6 +3481,13 @@ fn resolve_sheets(args: &Value) -> Result<Value> {
                 "usage: sheets[{index}] must be an object — hint: {{\"name\": …, \"rows\": [[…]]}}"
             );
         };
+        require_taken_keys(
+            object,
+            &format!("sheets[{index}]"),
+            "a sheet",
+            &sheet_field_names(),
+            &[],
+        )?;
         let name = match object.get("name") {
             None | Some(Value::Null) => None,
             Some(Value::String(name)) => Some(name.as_str()),
@@ -2888,8 +3800,9 @@ fn require_heading_level(object: &serde_json::Map<String, Value>, index: usize) 
 /// Require an optional size field of a content block (an image's `width` or
 /// `height`) to be a number inside the range the writers can lay out: zero or a
 /// negative number is not a size, anything past the shared rules'
-/// `image_side_px` upper bound is beyond any page, and anything else is not a
-/// size at all.
+/// `dimension_points` upper bound is beyond any page, and anything else is not
+/// a size at all. The unit is the point, which is what every writer places a
+/// picture in.
 fn require_optional_size(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -2901,11 +3814,11 @@ fn require_optional_size(
             let number = value.as_f64().ok_or_else(|| {
                 super::wrong_type(&format!("content[{index}].{key}"), "a number", value)
             })?;
-            if !RULES.image_side_px.contains(number) {
+            if !RULES.dimension_points.contains(number) {
                 anyhow::bail!(
-                    "usage: content[{index}].{key} must be {} pixels, got {number} — hint: give \
+                    "usage: content[{index}].{key} must be {} points, got {number} — hint: give \
                      the size the image should be placed at",
-                    RULES.image_side_px.bounds()
+                    RULES.dimension_points.bounds()
                 );
             }
             Ok(())
@@ -2953,6 +3866,21 @@ fn optional_string<'a>(value: Option<&'a Value>, at: &str, key: &str) -> Result<
 /// A present optional string of a top-level argument.
 fn opt_string<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
     optional_string(args.get(key), "", key)
+}
+
+/// Require a fill's `values` to be present and non-empty, and hand the map back:
+/// a fill with no values is a copy, not a fill, and reporting that as a success
+/// would name an outcome where nothing happened. Both fills resolve their input
+/// first, so a call that cannot read the file at all is refused for that first.
+fn require_values(args: &Value, kind: &str) -> Result<serde_json::Map<String, Value>> {
+    let values = super::get_object(args, "values")?;
+    if values.is_empty() {
+        anyhow::bail!(
+            "usage: missing or empty argument \"values\" — hint: name at least one {kind}, e.g. \
+             {{\"name\": \"Иван\"}}"
+        );
+    }
+    Ok(values)
 }
 
 /// Require every value of a name-keyed map — a sample's placeholders, a form's
@@ -3016,11 +3944,11 @@ fn ensure_image(path: &Path) -> Result<()> {
     }
 }
 
-/// A parsed `pages` argument.
+/// The pages a PDF action acts on: the union of the `pages` elements.
 enum Pages {
-    /// Every page (`"all"` or absent).
+    /// Every page (`"all"`, an empty `pages`, or an absent one).
     All,
-    /// 1-based page numbers in the order given.
+    /// 1-based page numbers, in the order the elements name them.
     Explicit(Vec<u32>),
 }
 
@@ -3035,48 +3963,98 @@ impl Pages {
     }
 }
 
-/// Parse the optional `pages` argument.
-fn opt_pages(args: &Value) -> Result<Pages> {
-    match args.get("pages") {
-        None | Some(Value::Null) => Ok(Pages::All),
-        Some(Value::String(spec)) => parse_pages(spec),
-        Some(v) => Err(super::wrong_type("pages", "a string", v)),
-    }
-}
-
-/// Parse `"all"` (or empty) into [`Pages::All`], else a range list.
-fn parse_pages(spec: &str) -> Result<Pages> {
-    let spec = spec.trim();
-    if spec.is_empty() || spec.eq_ignore_ascii_case("all") {
-        return Ok(Pages::All);
-    }
-    let mut seen = HashSet::new();
-    Ok(Pages::Explicit(parse_range(spec, &mut seen)?))
-}
-
-/// Parse one `pdf_split` range per output file.
-fn split_groups(args: &Value) -> Result<Vec<Vec<u32>>> {
-    let ranges = super::get_str_array(args, "ranges")?;
-    if ranges.is_empty() {
+/// The page selections a call names, from the one `pages` argument every PDF
+/// action that takes it shares: absent, null or an empty list names none (every
+/// page), and an element is `"all"` or a comma-separated list of `N` and `N-M`
+/// that [`parse_range`] reads. An `"all"` element takes every page, so it cannot
+/// sit beside another element: the two would name the same page twice, which the
+/// per-element duplicate rule already refuses for named pages.
+fn page_selections(args: &Value) -> Result<Vec<String>> {
+    let selections = match args.get("pages") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(elements)) => {
+            let mut selections = Vec::with_capacity(elements.len());
+            for element in elements {
+                match element {
+                    Value::String(selection) => selections.push(selection.clone()),
+                    // The element's own name is what a caller can fix, so the
+                    // refusal is the array's, naming the shape it wants.
+                    other => return Err(super::wrong_type("pages", "an array of strings", other)),
+                }
+            }
+            selections
+        }
+        Some(v) => return Err(super::wrong_type("pages", "an array of strings", v)),
+    };
+    if selections.len() > 1
+        && selections
+            .iter()
+            .any(|selection| selection.trim().eq_ignore_ascii_case("all"))
+    {
         anyhow::bail!(
-            "usage: missing required argument \"ranges\" — hint: one range per output file, \
+            "usage: an \"all\" selection takes every page, so it cannot sit beside another \
+             selection — hint: name every page explicitly, or pass \"all\" alone"
+        );
+    }
+    Ok(selections)
+}
+
+/// Parse the optional `pages` argument into the pages the action acts on: the
+/// union of every element, in the order the elements name them. An absent, null
+/// or empty list means every page, and `"all"` is the only element that means
+/// it — it stands alone, so no element can be widened by another.
+fn opt_pages(args: &Value) -> Result<Pages> {
+    let mut seen = HashSet::new();
+    let mut pages = Vec::new();
+    let mut all = false;
+    for selection in page_selections(args)? {
+        let selection = selection.trim();
+        if selection.eq_ignore_ascii_case("all") {
+            all = true;
+            continue;
+        }
+        pages.extend(parse_range(selection, &mut seen)?);
+    }
+    if all || pages.is_empty() {
+        Ok(Pages::All)
+    } else {
+        Ok(Pages::Explicit(pages))
+    }
+}
+
+/// Parse one `pdf_split` page selection per output file, in order. The list is
+/// required and non-empty, and one output file per element makes the element
+/// count the attachment count. An element's grammar is the one every PDF action
+/// uses, `"all"` included — and, as everywhere, an `"all"` element stands alone,
+/// so no page is written into two files. The kit resolves that element against
+/// the document's own page count, the only place it is known.
+fn split_groups(args: &Value) -> Result<Vec<Value>> {
+    let selections = page_selections(args)?;
+    if selections.is_empty() {
+        anyhow::bail!(
+            "usage: missing required argument \"pages\" — hint: one page selection per output file, \
              e.g. [\"1-3\", \"5\"]"
         );
     }
-    // One output file per range, so the range count IS the attachment count: an
-    // unbounded list would turn one call into as many files as the model asked
-    // for, which is not something a reply can carry.
-    if ranges.len() > MAX_SPLIT_PARTS {
+    if selections.len() > MAX_SPLIT_PARTS {
         anyhow::bail!(
             "usage: {} output files is more than one call can produce (limit {MAX_SPLIT_PARTS}) — \
-             hint: ask for fewer ranges, or wider ones",
-            ranges.len()
+             hint: ask for fewer page selections, or wider ones",
+            selections.len()
         );
     }
+    // The `seen` set is the request's, not an element's: a page named in two
+    // elements would be written into two files, and the page cap is on the whole
+    // request rather than on any one element.
     let mut seen = HashSet::new();
-    let mut groups = Vec::with_capacity(ranges.len());
-    for range in &ranges {
-        groups.push(parse_range(range, &mut seen)?);
+    let mut groups = Vec::with_capacity(selections.len());
+    for selection in &selections {
+        let selection = selection.trim();
+        if selection.eq_ignore_ascii_case("all") {
+            groups.push(json!("all"));
+            continue;
+        }
+        groups.push(json!(parse_range(selection, &mut seen)?));
     }
     Ok(groups)
 }
@@ -3092,7 +4070,8 @@ fn parse_range(spec: &str, seen: &mut HashSet<u32>) -> Result<Vec<u32>> {
         let token = token.trim();
         if token.is_empty() {
             anyhow::bail!(
-                "usage: empty page range in \"{spec}\" — hint: write ranges like \"1-3,5\""
+                "usage: empty page range in \"{spec}\" — hint: write a selection like \
+                 \"1-3,5\""
             );
         }
         let (start, end) = if let Some((start, end)) = token.split_once('-') {
@@ -3114,8 +4093,11 @@ fn parse_range(spec: &str, seen: &mut HashSet<u32>) -> Result<Vec<u32>> {
                 );
             }
             pages.push(page);
-            if seen.len() > MAX_PAGES_PER_REQUEST {
-                anyhow::bail!("usage: too many pages requested (limit {MAX_PAGES_PER_REQUEST})");
+            if seen.len() > RULES.max_pages_per_request {
+                anyhow::bail!(
+                    "usage: too many pages requested (limit {})",
+                    RULES.max_pages_per_request
+                );
             }
         }
     }
@@ -3163,15 +4145,17 @@ fn set_number(request: &mut Value, args: &Value, key: &str) -> Result<()> {
 }
 
 /// [`set_number`] for a measure the writers lay out — a font size or a placed
-/// size, where zero or a negative number is not a thing a document can show.
-fn set_positive_number(request: &mut Value, args: &Value, key: &str) -> Result<()> {
+/// size, where zero or a negative number is not a thing a document can show. The
+/// caller passes the span that governs the measure, so what a size may be is
+/// stated by the rule rather than here.
+fn set_positive_number(request: &mut Value, args: &Value, key: &str, span: &Span) -> Result<()> {
     set_number(request, args, key)?;
     if let Some(number) = request.get(key).and_then(Value::as_f64)
-        && !RULES.pdf_size_points.contains(number)
+        && !span.contains(number)
     {
         anyhow::bail!(
             "usage: \"{key}\" must be {}, got {number} — hint: give a size in points",
-            RULES.pdf_size_points.bounds()
+            span.bounds()
         );
     }
     Ok(())
@@ -3331,6 +4315,21 @@ fn input_base(input: &Path, suffix: &str) -> String {
 #[must_use]
 fn file_name_of(path: &Path) -> String {
     crate::util::file_name_or_path(&path.to_string_lossy()).to_string()
+}
+
+/// The extension a copy of `input` is written with: the input's own when its
+/// name is the family its own bytes are — a `.docm` copy stays a `.docm` one,
+/// macros and all — and the family's name otherwise, so a dotless or foreign
+/// name never hands the copy an extension that says nothing about what is in
+/// it.
+#[must_use]
+fn copy_extension(input: &Path, family: crate::ooxml::Family) -> String {
+    if crate::ooxml::family_of(input) == Some(family)
+        && let Some(ext) = input.extension()
+    {
+        return ext.to_string_lossy().to_ascii_lowercase();
+    }
+    family.name().to_string()
 }
 
 /// Paths as strings for a JSON request.
@@ -3778,6 +4777,37 @@ mod tests {
         path
     }
 
+    /// A package whose only part is `part`: the family verdict reads the
+    /// container's own entry names, so a fixture standing for a family only has
+    /// to be a ZIP holding that family's own main part.
+    fn package_with(part: &str) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        add_bytes(&mut zip, part, b"<x/>");
+        zip.finish().expect("finish package").into_inner()
+    }
+
+    /// A genuinely encrypted OOXML package: a CFB container declaring both
+    /// streams genuine encryption writes, which is the pair the verdict reads.
+    fn encrypted_package() -> Vec<u8> {
+        crate::legacy::test_fixtures::cfb(&[
+            ("EncryptionInfo", b"info".as_slice()),
+            ("EncryptedPackage", b"data".as_slice()),
+        ])
+    }
+
+    /// A legacy `.doc`: a CFB container declaring the old Word stream.
+    fn legacy_doc() -> Vec<u8> {
+        crate::legacy::test_fixtures::cfb(&[("WordDocument", b"legacy word".as_slice())])
+    }
+
+    /// A password-protected legacy `.doc`: the same container as [`legacy_doc`],
+    /// but with the `.doc` reader's own encrypted fixture, whose FIB sets
+    /// `fEncrypted` — a flag only the reader can see, so the classifier has to ask
+    /// it.
+    fn encrypted_legacy_doc() -> Vec<u8> {
+        crate::legacy::test_fixtures::doc_fixture("secret", &[], true)
+    }
+
     /// A freshly created one-sheet workbook (`S`, one seed row): the package the
     /// format tests start from, each writing the parts it means to edit over it.
     async fn created_xlsx(ws: &Workspace) -> Vec<u8> {
@@ -3960,6 +4990,69 @@ mod tests {
         encrypted.into_bytes()
     }
 
+    /// A one-page PDF carrying everything the PDF-files paragraph says a merge
+    /// leaves behind: a `/Title`, an outline, tags, page labels, an embedded file, a
+    /// text annotation, a fillable form field, a page rotation and a named
+    /// destination.
+    fn everything_a_merge_drops_pdf() -> Vec<u8> {
+        use crate::document::test_fixtures::PdfFixture;
+        let mut fixture = PdfFixture::new();
+        let content = b"BT /F1 18 Tf 72 720 Td (Carried page text) Tj ET";
+        let font =
+            fixture.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+        let contents = fixture.push(format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            String::from_utf8_lossy(content)
+        ));
+        let annot = fixture.push(
+            "<< /Type /Annot /Subtype /Text /Rect [72 700 100 728] \
+             /Contents (a carried note) >>"
+                .to_string(),
+        );
+        let page = fixture.reserve();
+        let pages = fixture.push(format!("<< /Type /Pages /Kids [{page}] /Count 1 >>"));
+        fixture.set(
+            &page,
+            format!(
+                "<< /Type /Page /Parent {pages} /MediaBox [0 0 595 842] /Rotate 90 /Resources \
+                 << /Font << /F1 {font} >> >> /Contents {contents} /Annots [{annot}] >>"
+            ),
+        );
+        // A fillable text field: the widget's `/P` names the page it sits on, and
+        // the catalog's `/AcroForm /Fields` names it back as a form field.
+        let field = fixture.push(format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (field) /Rect [72 600 200 620] /P {page} >>"
+        ));
+        let outlines = fixture.reserve();
+        let item = fixture.push(format!(
+            "<< /Title (Bookmark) /Parent {outlines} /Dest [{page} /Fit] >>"
+        ));
+        fixture.set(
+            &outlines,
+            format!("<< /Type /Outlines /First {item} /Last {item} /Count 1 >>"),
+        );
+        let struct_root = fixture.push(format!("<< /Type /StructTreeRoot /K [{page}] >>"));
+        let embedded = fixture
+            .push("<< /Type /EmbeddedFile /Length 5 >>\nstream\nhello\nendstream".to_string());
+        let filespec = fixture.push(format!(
+            "<< /Type /Filespec /F (x) /EF << /F {embedded} >> >>"
+        ));
+        let info = fixture.push("<< /Title (Fixture title) >>".to_string());
+        let assembled = fixture.build(&format!(
+            "/Pages {pages} /Outlines {outlines} /MarkInfo << /Marked true >> \
+             /StructTreeRoot {struct_root} /PageLabels << /Nums [0 << /S /D >>] >> \
+             /Names << /EmbeddedFiles << /Names [(x) {filespec}] >> >> \
+             /AcroForm << /Fields [{field}] >> /Dests << /Names [(target) [{page} /Fit]] >>"
+        ));
+        // The information dictionary hangs off the trailer, not the catalog, so
+        // the assembled trailer is given the `/Info` key a producer would write.
+        String::from_utf8(assembled)
+            .expect("the fixture is ASCII")
+            .replace("/Root 1 0 R >>", &format!("/Root 1 0 R /Info {info} >>"))
+            .into_bytes()
+    }
+
     /// A Word document is created and read back: the text survives a round trip
     /// through the shared converter and the package carries its required parts.
     #[tokio::test]
@@ -4020,6 +5113,41 @@ mod tests {
         assert!(
             !body.contains("<w:tr/>"),
             "a cell-less row reached the file: {body}"
+        );
+    }
+
+    /// An image block's `width` and `height` are points, and the drawing states
+    /// them in EMU: the kit converts a stated point to the pixels the docx library
+    /// lays a picture out in at 96/72 (a point is 4/3 of a pixel) and the library
+    /// a pixel to 9525 EMU, so 100 pt × 50 pt lands on exactly 1_270_000 × 635_000
+    /// EMU — the two conversions multiplying back out to 12_700 EMU per point.
+    /// Pinned here because every other image test only asserts that an image was
+    /// embedded, which a wrong factor would satisfy just as well.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn a_created_docx_image_states_the_points_it_was_placed_at() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let image = ws.as_path().join("sized.png");
+        std::fs::write(&image, noisy_png(40, 20)).expect("write png");
+        let reply = run(
+            &ws,
+            json!({
+                "action": "create", "format": "docx", "file_name": "sized",
+                "content": [
+                    { "type": "image", "image": image.to_string_lossy(),
+                      "width": 100, "height": 50 },
+                ],
+            }),
+        )
+        .await;
+        let body = part_text(&single(&reply), "word/document.xml");
+        assert_eq!(
+            element_named(&body, "wp:extent"),
+            r#"<wp:extent cx="1270000" cy="635000"/>"#,
+            "a 100 pt × 50 pt image is not placed at its own size in EMU: {body}"
         );
     }
 
@@ -4926,7 +6054,7 @@ mod tests {
                 &ws,
                 json!({
                     "action": "fill_template", "file_name": "copy",
-                    "template": sample_path.to_string_lossy(),
+                    "path": sample_path.to_string_lossy(),
                     "values": { "name": "Имя" },
                 }),
             )
@@ -4975,7 +6103,7 @@ mod tests {
                 &ws,
                 json!({
                     "action": "fill_template", "file_name": "copy",
-                    "template": sample_path.to_string_lossy(),
+                    "path": sample_path.to_string_lossy(),
                     "values": { "name": "Имя" },
                 }),
             )
@@ -5006,7 +6134,7 @@ mod tests {
                 "action": "create", "format": "docx", "file_name": "sample",
                 "content": [
                     { "type": "paragraph", "text": "Привет, {name}! {unfilled}" },
-                    { "type": "image", "path": image.to_string_lossy() },
+                    { "type": "image", "image": image.to_string_lossy() },
                 ],
             }),
         )
@@ -5017,7 +6145,7 @@ mod tests {
             &ws,
             json!({
                 "action": "fill_template", "file_name": "filled",
-                "template": sample_path.to_string_lossy(),
+                "path": sample_path.to_string_lossy(),
                 "values": { "name": "Имя" },
             }),
         )
@@ -5065,7 +6193,7 @@ mod tests {
             &ws,
             json!({
                 "action": "fill_template", "file_name": "book-filled",
-                "template": sample.to_string_lossy(),
+                "path": sample.to_string_lossy(),
                 "values": { "name": "Имя", "amount": 42 },
             }),
         )
@@ -5127,7 +6255,7 @@ mod tests {
             &ws,
             json!({
                 "action": "fill_template", "file_name": "no-addresses-filled",
-                "template": sample.to_string_lossy(),
+                "path": sample.to_string_lossy(),
                 "values": { "name": "Отчёт" },
             }),
         )
@@ -5178,7 +6306,7 @@ mod tests {
             &ws,
             json!({
                 "action": "fill_template", "file_name": "slides-filled",
-                "template": sample_path.to_string_lossy(),
+                "path": sample_path.to_string_lossy(),
                 "values": { "name": "Имя" },
             }),
         )
@@ -5220,7 +6348,7 @@ mod tests {
             &ws,
             json!({
                 "action": "pdf_merge", "file_name": "merged",
-                "files": [first.to_string_lossy(), second.to_string_lossy()],
+                "paths": [first.to_string_lossy(), second.to_string_lossy()],
             }),
         )
         .await;
@@ -5240,7 +6368,7 @@ mod tests {
             json!({
                 "action": "pdf_split", "file_name": "split",
                 "path": merged_path.to_string_lossy(),
-                "ranges": ["1", "2"],
+                "pages": ["1", "2"],
             }),
         )
         .await;
@@ -5257,6 +6385,143 @@ mod tests {
                 .await
                 .contains("Второй документ"),
             "second part lost its text"
+        );
+
+        // The one page grammar's `"all"` element: the kit resolves it against the
+        // document's own page count, so a split can name every page as one file.
+        let whole = run(
+            &ws,
+            json!({
+                "action": "pdf_split", "file_name": "whole",
+                "path": merged_path.to_string_lossy(),
+                "pages": ["all"],
+            }),
+        )
+        .await;
+        let one = file_paths(&whole);
+        assert_eq!(one.len(), 1, "one element is one file: {whole}");
+        let text = converted_text(&ws, &one[0]).await;
+        assert!(
+            text.contains("Первый документ") && text.contains("Второй документ"),
+            "an element naming every page lost one: {text}"
+        );
+    }
+
+    /// A PDF parsed from `path`, the way every produced-file assertion reads one.
+    fn parsed_pdf(path: &Path) -> hayro::hayro_syntax::Pdf {
+        hayro::hayro_syntax::Pdf::new(std::fs::read(path).expect("read pdf"))
+            .expect("the produced file parses as a PDF")
+    }
+
+    /// Whether the catalog of `pdf` carries `key`.
+    fn catalog_carries(pdf: &hayro::hayro_syntax::Pdf, key: &str) -> bool {
+        pdf.xref()
+            .get::<hayro::hayro_syntax::object::dict::Dict>(pdf.xref().root_id())
+            .expect("the file has a catalog")
+            .contains_key(key)
+    }
+
+    /// A merge carries only the pages: the source's title, bookmarks, tags, page
+    /// labels, embedded files, form fields, named destinations and other catalog
+    /// entries are left behind, while the pages, their rotation and their
+    /// annotations come along.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pdf_merge_carries_only_the_pages() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(&ws, "rich.pdf", &everything_a_merge_drops_pdf());
+
+        // The fixture really carries what a merge is claimed to drop; without
+        // this the assertions below could pass on a fixture that never had them.
+        let fixture = hayro::hayro_syntax::Pdf::new(std::fs::read(&source).expect("read fixture"))
+            .expect("the fixture parses as a PDF");
+        let dropped = [
+            "Outlines",
+            "StructTreeRoot",
+            "MarkInfo",
+            "PageLabels",
+            "Names",
+            "AcroForm",
+            "Dests",
+        ];
+        for key in dropped {
+            assert!(catalog_carries(&fixture, key), "the fixture lacks /{key}");
+        }
+        assert!(
+            fixture.metadata().title.is_some(),
+            "the fixture carries no /Title"
+        );
+
+        let merged = run(
+            &ws,
+            json!({
+                "action": "pdf_merge", "file_name": "merged",
+                "paths": [source.to_string_lossy(), source.to_string_lossy()],
+            }),
+        )
+        .await;
+        let merged_path = single(&merged);
+        let pdf = parsed_pdf(&merged_path);
+        for key in dropped {
+            assert!(
+                !catalog_carries(&pdf, key),
+                "the merge carried the source's /{key}"
+            );
+        }
+        assert!(
+            pdf.metadata().title.is_none(),
+            "the merge carried the source's /Title"
+        );
+        assert!(
+            matches!(
+                pdf.pages().first().expect("one page").rotation(),
+                hayro::hayro_syntax::page::Rotation::Horizontal
+            ),
+            "the merge did not carry the page's rotation"
+        );
+
+        let text = converted_text(&ws, &merged_path).await;
+        assert!(
+            text.contains("Carried page text"),
+            "page text was lost: {text}"
+        );
+        assert!(
+            text.contains("a carried note"),
+            "the page's annotation was lost: {text}"
+        );
+
+        // A split drops the same catalog entries as the merge, and carries the
+        // page's rotation and annotation just the same.
+        let split = run(
+            &ws,
+            json!({
+                "action": "pdf_split", "file_name": "split",
+                "path": source.to_string_lossy(), "pages": ["1"],
+            }),
+        )
+        .await;
+        let split_path = single(&split);
+        let split_pdf = parsed_pdf(&split_path);
+        for key in ["AcroForm", "Dests"] {
+            assert!(
+                !catalog_carries(&split_pdf, key),
+                "the split carried the source's /{key}"
+            );
+        }
+        assert!(
+            matches!(
+                split_pdf.pages().first().expect("one page").rotation(),
+                hayro::hayro_syntax::page::Rotation::Horizontal
+            ),
+            "the split did not carry the page's rotation"
+        );
+        let split_text = converted_text(&ws, &split_path).await;
+        assert!(
+            split_text.contains("a carried note"),
+            "the split's page lost its annotation: {split_text}"
         );
     }
 
@@ -5307,7 +6572,7 @@ mod tests {
                 &ws,
                 json!({
                     "action": "pdf_rotate", "file_name": "turned",
-                    "path": source.to_string_lossy(), "pages": "5", "degrees": 90,
+                    "path": source.to_string_lossy(), "pages": ["5"], "degrees": 90,
                 }),
             )
             .await
@@ -5322,7 +6587,7 @@ mod tests {
                 &ws,
                 json!({
                     "action": "pdf_split", "file_name": "parts",
-                    "path": source.to_string_lossy(), "ranges": ["3"],
+                    "path": source.to_string_lossy(), "pages": ["3"],
                 }),
             )
             .await
@@ -5355,7 +6620,7 @@ mod tests {
                     &ws,
                     json!({
                         "action": "pdf_rotate", "file_name": "turned",
-                        "path": path.to_string_lossy(), "pages": "all", "degrees": 90,
+                        "path": path.to_string_lossy(), "pages": ["all"], "degrees": 90,
                     }),
                 )
                 .await
@@ -5435,25 +6700,22 @@ mod tests {
         drop((dir, outside));
     }
 
-    /// A sample the package reader cannot open at all — an encrypted (CFB)
-    /// `.docx`, which has no ZIP central directory to read — is the request's own
-    /// input, so the answer names the file as a usage error rather than reporting
-    /// an unexplained kit failure.
+    /// A sample the family verdict cannot take — a genuinely encrypted (CFB)
+    /// `.docx`, whose container declares `EncryptionInfo` and `EncryptedPackage` —
+    /// is the request's own input, so the answer names the file as a usage error
+    /// rather than reporting an unexplained kit failure. A legacy container under
+    /// the same name is the old format it is, never the password verdict.
     #[tokio::test]
     async fn an_unopenable_sample_is_refused_as_a_usage_error() {
         let (_dir, ws) = workspace();
-        let sample = ws.as_path().join("encrypted.docx");
-        // The CFB compound-file magic an encrypted OOXML package starts with.
-        let mut bytes = vec![0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
-        bytes.resize(512, 0);
-        std::fs::write(&sample, bytes).expect("write fixture");
+        let sample = write_fixture(&ws, "encrypted.docx", &encrypted_package());
 
         let err = confined_document()
             .execute(
                 &ws,
                 json!({
                     "action": "fill_template", "file_name": "copy",
-                    "template": sample.to_string_lossy(), "values": { "name": "Имя" },
+                    "path": sample.to_string_lossy(), "values": { "name": "Имя" },
                 }),
             )
             .await
@@ -5468,25 +6730,129 @@ mod tests {
             message.contains("encrypted.docx"),
             "the refusal must name the file: {message}"
         );
+
+        let legacy = write_fixture(&ws, "legacy.docx", &legacy_doc());
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({
+                    "action": "fill_template", "file_name": "copy",
+                    "path": legacy.to_string_lossy(), "values": { "name": "Имя" },
+                }),
+            )
+            .await
+            .expect_err("a legacy document is not a modern package");
+        assert!(
+            !err.to_string().contains("password-protected"),
+            "an old-format document under a .docx name is not encrypted: {err}"
+        );
     }
 
-    /// A sample's family comes from its NAME, and the name is judged by the
-    /// container: a sample NAMED as an old binary format whose bytes are an OOXML
-    /// package is told to be renamed, while a real `.doc`/`.xls`/`.ppt` gets the old
-    /// formats' answer — read, but never filled or edited.
+    /// A legacy `.doc` that is genuinely encrypted is the password verdict, not
+    /// the old formats' "save it as OOXML first" sentence: only the family's own
+    /// reader can see the password, so the classifier asks it — for an edit action
+    /// and for a `fill_template` sample alike.
+    #[tokio::test]
+    async fn a_legacy_encrypted_document_is_the_password_verdict() {
+        let (_dir, ws) = workspace();
+        let secret = write_fixture(&ws, "secret.doc", &encrypted_legacy_doc());
+
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "path": secret.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "find": "x", "replace": "y" }],
+                }),
+            )
+            .await
+            .expect_err("an encrypted old document cannot be edited");
+        let message = err.to_string();
+        assert!(
+            message.contains("password-protected"),
+            "the edit refusal must give the read path's verdict: {message}"
+        );
+        assert!(
+            !message.contains("save it as one of the OOXML families"),
+            "a password is not a reason to convert the file: {message}"
+        );
+
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({
+                    "action": "fill_template", "file_name": "copy",
+                    "path": secret.to_string_lossy(), "values": { "name": "Имя" },
+                }),
+            )
+            .await
+            .expect_err("an encrypted old document cannot be filled");
+        let message = err.to_string();
+        assert!(
+            message.contains("password-protected"),
+            "the fill refusal must give the read path's verdict: {message}"
+        );
+        assert!(
+            message.contains("secret.doc"),
+            "the refusal must name the file: {message}"
+        );
+    }
+
+    /// A PDF action given a genuinely encrypted input is owed the password
+    /// verdict in its own voice: what the caller is to save an unprotected copy
+    /// as is a PDF, not something to edit or fill.
+    #[tokio::test]
+    async fn a_pdf_action_tells_an_encrypted_input_to_convert_it_to_a_pdf() {
+        let (_dir, ws) = workspace();
+        for (name, bytes) in [
+            ("package.docx", encrypted_package()),
+            ("secret.doc", encrypted_legacy_doc()),
+        ] {
+            let path = write_fixture(&ws, name, &bytes);
+            let err = confined_document()
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "pdf_rotate", "path": path.to_string_lossy(), "degrees": 90,
+                    }),
+                )
+                .await
+                .expect_err("an encrypted input cannot be read as a PDF");
+            let message = err.to_string();
+            assert!(
+                message.contains("password-protected"),
+                "{name}: the refusal must give the read path's verdict: {message}"
+            );
+            assert!(
+                message.contains("and convert it to a PDF"),
+                "{name}: a PDF action's password refusal must ask for a PDF: {message}"
+            );
+        }
+    }
+
+    /// A sample's family comes from its NAME — the name picks the filler, the
+    /// copy's extension and the file the copy is compared against — and the name
+    /// must be the family the bytes really are: a `.xls`-named sample holding an
+    /// OOXML package is told to be renamed, while a real `.doc`/`.xls`/`.ppt` gets
+    /// the old formats' answer — read, but never filled.
     #[tokio::test]
     async fn a_sample_is_answered_by_what_it_really_holds() {
         let (_dir, ws) = workspace();
         let cases = [
             (
                 "report.doc",
-                [crate::document::CFB_MAGIC, b"the rest of a container"].concat(),
-                "an old .doc/.xls/.ppt file is read but never filled or edited",
+                legacy_doc(),
+                "an old .doc/.xls/.ppt file is read but never filled",
             ),
             (
                 "sheet.xls",
-                b"PK\x03\x04the rest of a package".to_vec(),
-                "the file's bytes are an OOXML package",
+                package_with("xl/workbook.xml"),
+                "hint: rename it to match its content",
+            ),
+            (
+                "chart.docx",
+                b"not a container".to_vec(),
+                "which is corrupt or unsupported .docx",
             ),
         ];
         for (name, bytes, expected) in cases {
@@ -5496,7 +6862,7 @@ mod tests {
                     &ws,
                     json!({
                         "action": "fill_template", "file_name": "copy",
-                        "template": name, "values": { "name": "Имя" },
+                        "path": name, "values": { "name": "Имя" },
                     }),
                 )
                 .await
@@ -5506,6 +6872,32 @@ mod tests {
                 "{name}: expected {expected:?}, got {err}"
             );
         }
+        assert_eq!(generated_count(&ws), 0, "a refused call left an output");
+    }
+
+    /// A fill with no values is a copy, not a fill: the boundary refuses an empty
+    /// `values` object — after the sample's path is resolved, so a call that
+    /// cannot reach its sample is refused for that first.
+    #[tokio::test]
+    async fn a_fill_with_no_values_is_refused() {
+        let (_dir, ws) = workspace();
+        let sample = write_fixture(&ws, "sample.docx", &package_with("word/document.xml"));
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({
+                    "action": "fill_template", "file_name": "copy",
+                    "path": sample.to_string_lossy(), "values": {},
+                }),
+            )
+            .await
+            .expect_err("an empty fill must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("missing or empty argument \"values\""),
+            "got: {message}"
+        );
+        assert!(message.contains("placeholder"), "got: {message}");
         assert_eq!(generated_count(&ws), 0, "a refused call left an output");
     }
 
@@ -5535,7 +6927,7 @@ mod tests {
                 &ws,
                 json!({
                     "action": "fill_template", "file_name": "copy",
-                    "template": sample.to_string_lossy(), "values": { "name": "Имя" },
+                    "path": sample.to_string_lossy(), "values": { "name": "Имя" },
                 }),
             )
             .await
@@ -5572,7 +6964,7 @@ mod tests {
             .await,
         );
         let cases = [
-            (&sheet, "sheet.docx", "really a .xlsx package"),
+            (&sheet, "sheet.docx", "really an .xlsx package"),
             (&word, "word.xlsx", "really a .docx package"),
         ];
         for (source, misnamed, expected) in cases {
@@ -5583,7 +6975,7 @@ mod tests {
                     &ws,
                     json!({
                         "action": "fill_template", "file_name": "copy2",
-                        "template": misnamed.to_string_lossy(), "values": { "name": "Имя" },
+                        "path": misnamed.to_string_lossy(), "values": { "name": "Имя" },
                     }),
                 )
                 .await
@@ -5591,7 +6983,8 @@ mod tests {
             let message = err.to_string();
             assert!(message.starts_with("usage:"), "got: {message}");
             assert!(
-                message.contains("the sample is really a"),
+                message.contains("the sample's name must be the family its bytes are")
+                    && !message.contains("_edit"),
                 "a fill's sample keeps the sample wording: {message}"
             );
             assert!(
@@ -5635,7 +7028,7 @@ mod tests {
             let message = err.to_string();
             assert!(message.starts_with("usage:"), "got: {message}");
             assert!(
-                message.contains("the input is really a") && message.contains(expected),
+                message.contains("which is really") && message.contains(expected),
                 "the refusal must point the edit at the action that fits it: {message}"
             );
         }
@@ -5653,16 +7046,11 @@ mod tests {
         std::fs::write(&sample, b"not a package").expect("write sample");
 
         for action in ["fill_template", "pdf_form_fill"] {
-            let key = if action == "fill_template" {
-                "template"
-            } else {
-                "path"
-            };
             let err = confined_document()
                 .execute(
                     &ws,
                     json!({
-                        "action": action, key: sample.to_string_lossy(),
+                        "action": action, "path": sample.to_string_lossy(),
                         "values": { "name": { "a": 1 } },
                     }),
                 )
@@ -5745,15 +7133,15 @@ mod tests {
             ),
             // A size the layout has no meaning for.
             (
-                json!({ "content": [{ "type": "image", "path": "x.png", "width": { "a": 1 } }] }),
+                json!({ "content": [{ "type": "image", "image": "x.png", "width": { "a": 1 } }] }),
                 "content[0].width",
             ),
             (
-                json!({ "content": [{ "type": "image", "path": "x.png", "height": -1 }] }),
+                json!({ "content": [{ "type": "image", "image": "x.png", "height": -1 }] }),
                 "content[0].height",
             ),
             (
-                json!({ "content": [{ "type": "image", "path": "x.png", "width": 1e30 }] }),
+                json!({ "content": [{ "type": "image", "image": "x.png", "width": 1e30 }] }),
                 "content[0].width",
             ),
         ];
@@ -5912,9 +7300,9 @@ mod tests {
         let notes = ws.as_path().join("notes.txt");
         std::fs::write(&notes, b"not an image").expect("write notes");
         let document = ws.as_path().join("document.pdf");
-        std::fs::write(&document, b"not a pdf").expect("write pdf");
+        std::fs::write(&document, fillable_pdf()).expect("write pdf");
         let merged = ws.as_path().join("merged.pdf");
-        std::fs::write(&merged, b"not a pdf").expect("write pdf");
+        std::fs::write(&merged, fillable_pdf()).expect("write pdf");
         let path = document.to_string_lossy();
         // An input the kit loads whole is bounded: an oversized one must be
         // refused on its own merits rather than as a killed run reported as a
@@ -6009,29 +7397,37 @@ mod tests {
                 "MB limit",
             ),
             (
-                json!({ "action": "pdf_rotate", "path": path, "degrees": 90, "pages": "0" }),
+                json!({ "action": "pdf_rotate", "path": path, "degrees": 90, "pages": ["0"] }),
                 "page 0 does not exist",
             ),
             (
-                json!({ "action": "pdf_merge", "files": [merged.to_string_lossy()] }),
+                json!({ "action": "pdf_merge", "paths": [merged.to_string_lossy()] }),
                 "at least 2",
             ),
             (
                 json!({ "action": "pdf_merge",
-                        "files": (0..=MAX_MERGE_INPUTS).map(|index| format!("part{index}.pdf")).collect::<Vec<_>>() }),
+                        "paths": (0..=MAX_MERGE_INPUTS).map(|index| format!("part{index}.pdf")).collect::<Vec<_>>() }),
                 "limit 50",
             ),
             (
-                json!({ "action": "pdf_merge", "files": batch }),
+                json!({ "action": "pdf_merge", "paths": batch }),
                 "more than one merge takes",
             ),
             (
                 json!({ "action": "pdf_split", "path": path,
-                        "ranges": (1..=MAX_SPLIT_PARTS + 1).map(|n| n.to_string()).collect::<Vec<_>>() }),
+                        "pages": (1..=MAX_SPLIT_PARTS + 1).map(|n| n.to_string()).collect::<Vec<_>>() }),
                 "limit 50",
             ),
+            // The page cap is on the pages the request names, not on the
+            // document's length: a one-page file still refuses a selection that
+            // names more pages than one call takes.
             (
-                json!({ "action": "pdf_split", "path": path, "ranges": ["3-1"] }),
+                json!({ "action": "pdf_split", "path": path,
+                        "pages": [format!("1-{}", RULES.max_pages_per_request + 1)] }),
+                "limit 10000",
+            ),
+            (
+                json!({ "action": "pdf_split", "path": path, "pages": ["3-1"] }),
                 "reversed",
             ),
         ];
@@ -6048,6 +7444,75 @@ mod tests {
         let left = std::fs::read_dir(ws.as_path().join(GENERATED_DIR))
             .map_or(0, std::iter::Iterator::count);
         assert_eq!(left, 0, "a refused call left an output behind");
+    }
+
+    /// The page cap holds for the `"all"` spelling too, which only the document's
+    /// own length can resolve: the kit counts the pages that spelling really names,
+    /// so a document longer than one call takes is refused rather than split.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn an_every_page_selection_meets_the_page_cap() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let pages = RULES.max_pages_per_request + 1;
+        let source = write_fixture(&ws, "long.pdf", &many_page_pdf(pages));
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({ "action": "pdf_split", "path": source.to_string_lossy(),
+                        "pages": ["all"] }),
+            )
+            .await
+            .expect_err("a document longer than one call takes must be refused");
+        assert!(
+            err.to_string().contains(&pages.to_string()),
+            "expected the refusal to name the {pages} pages it resolved: {err}"
+        );
+    }
+
+    /// A PDF of `pages` empty pages in a balanced page tree — one limit is only
+    /// reachable with a document longer than one call takes, and a reader's own
+    /// page walk needs the nesting a tree of that length is written with.
+    fn many_page_pdf(pages: usize) -> Vec<u8> {
+        use crate::document::test_fixtures::PdfFixture;
+        const PER_NODE: usize = 1_000;
+        let mut fixture = PdfFixture::new();
+        let root = fixture.reserve();
+        let mut nodes = Vec::new();
+        let mut left = pages;
+        while left > 0 {
+            let count = left.min(PER_NODE);
+            left -= count;
+            let node = fixture.reserve();
+            let kids = (0..count)
+                .map(|_| {
+                    let page = fixture.reserve();
+                    fixture.set(
+                        &page,
+                        format!("<< /Type /Page /Parent {node} /MediaBox [0 0 595 842] >>"),
+                    );
+                    page
+                })
+                .collect::<Vec<_>>();
+            fixture.set(
+                &node,
+                format!(
+                    "<< /Type /Pages /Parent {root} /Kids [{}] /Count {count} >>",
+                    kids.join(" ")
+                ),
+            );
+            nodes.push(node);
+        }
+        fixture.set(
+            &root,
+            format!(
+                "<< /Type /Pages /Kids [{}] /Count {pages} >>",
+                nodes.join(" ")
+            ),
+        );
+        fixture.build(&format!("/Pages {root}"))
     }
 
     /// Text drawn onto a page reads back through the converter.
@@ -6127,7 +7592,7 @@ mod tests {
         let cases = [
             (
                 "a structured placeholder value",
-                json!({ "action": "fill_template", "template": sample.to_string_lossy(),
+                json!({ "action": "fill_template", "path": sample.to_string_lossy(),
                         "values": { "name": { "a": 1 } } }),
                 json!({ "op": "fill_template", "template": sample.to_string_lossy(), "format": "docx",
                         "values": { "name": { "a": 1 } }, "output": out.join("a.docx").to_string_lossy() }),
@@ -6195,22 +7660,22 @@ mod tests {
             (
                 "image bytes that are not a whole PNG",
                 json!({ "action": "create", "format": "docx",
-                        "content": [{ "type": "image", "path": fake.to_string_lossy() }] }),
+                        "content": [{ "type": "image", "image": fake.to_string_lossy() }] }),
                 json!({ "op": "create", "format": "docx",
-                        "content": [{ "type": "image", "path": fake.to_string_lossy() }],
+                        "content": [{ "type": "image", "image": fake.to_string_lossy() }],
                         "output": out.join("e.docx").to_string_lossy() }),
             ),
             (
                 "a JPEG cut off after its frame marker",
                 json!({ "action": "create", "format": "pptx",
-                        "content": [{ "type": "image", "path": cut.to_string_lossy() }] }),
+                        "content": [{ "type": "image", "image": cut.to_string_lossy() }] }),
                 json!({ "op": "create", "format": "pptx",
-                        "content": [{ "type": "image", "path": cut.to_string_lossy() }],
+                        "content": [{ "type": "image", "image": cut.to_string_lossy() }],
                         "output": out.join("f.pptx").to_string_lossy() }),
             ),
             (
                 "a page the document does not have",
-                json!({ "action": "pdf_rotate", "path": pdf.to_string_lossy(), "pages": "9",
+                json!({ "action": "pdf_rotate", "path": pdf.to_string_lossy(), "pages": ["9"],
                         "degrees": 90 }),
                 json!({ "op": "pdf_rotate", "input": pdf.to_string_lossy(), "pages": [9],
                         "degrees": 90, "output": out.join("g.pdf").to_string_lossy() }),
@@ -6250,9 +7715,9 @@ mod tests {
             (
                 "an image side that is not a number",
                 json!({ "action": "create", "format": "docx",
-                        "content": [{ "type": "image", "path": whole.to_string_lossy(), "width": "wide" }] }),
+                        "content": [{ "type": "image", "image": whole.to_string_lossy(), "width": "wide" }] }),
                 json!({ "op": "create", "format": "docx",
-                        "content": [{ "type": "image", "path": whole.to_string_lossy(), "width": "wide" }],
+                        "content": [{ "type": "image", "image": whole.to_string_lossy(), "width": "wide" }],
                         "output": out.join("l.docx").to_string_lossy() }),
             ),
             (
@@ -6364,9 +7829,9 @@ mod tests {
 
         let calls = [
             json!({ "action": "create", "format": "docx",
-                    "content": [{ "type": "image", "path": fake.to_string_lossy() }] }),
+                    "content": [{ "type": "image", "image": fake.to_string_lossy() }] }),
             json!({ "action": "create", "format": "pptx",
-                    "content": [{ "type": "image", "path": mislabelled.to_string_lossy() }] }),
+                    "content": [{ "type": "image", "image": mislabelled.to_string_lossy() }] }),
             json!({ "action": "pdf_image", "path": source.to_string_lossy(),
                     "image": fake.to_string_lossy() }),
         ];
@@ -6415,7 +7880,7 @@ mod tests {
 
     /// A workspace-only tool refuses a path outside the workspace.
     #[tokio::test]
-    async fn refuses_a_template_outside_the_workspace() {
+    async fn refuses_a_sample_outside_the_workspace() {
         let (_dir, ws) = workspace();
         let outside = tempfile::NamedTempFile::new().expect("temp file");
         let err = confined_document()
@@ -6423,12 +7888,12 @@ mod tests {
                 &ws,
                 json!({
                     "action": "fill_template",
-                    "template": outside.path().to_string_lossy(),
+                    "path": outside.path().to_string_lossy(),
                     "values": {},
                 }),
             )
             .await
-            .expect_err("a template outside the workspace must be refused");
+            .expect_err("a sample outside the workspace must be refused");
         assert!(
             err.to_string().contains("outside the workspace"),
             "got: {err}"
@@ -6497,26 +7962,62 @@ mod tests {
         std::fs::read_dir(ws.as_path().join(GENERATED_DIR)).map_or(0, std::iter::Iterator::count)
     }
 
-    /// The three edit actions address a file's own family: a package of another
-    /// family, a PDF, and an old `.doc`/`.xls`/`.ppt` are refused by name, the
-    /// legacy one with the hint that it is read but never edited — all before a
-    /// runtime is spawned.
+    /// The three edit actions address a file's own FAMILY, decided from its own
+    /// bytes and never from its name: a package of another family, a PDF, a
+    /// container that is no document and an old `.doc`/`.xls`/`.ppt` are each
+    /// refused for what they really are — the legacy one with the hint that it is
+    /// read but never edited — before a runtime is spawned.
     #[tokio::test]
     async fn editing_refuses_an_input_of_another_family() {
         let (_dir, ws) = workspace();
         let legacy = "an old .doc/.xls/.ppt file is read but never edited";
         let cases = [
-            ("report.doc", "docx_edit", legacy),
-            ("sheet.xls", "xlsx_edit", legacy),
-            ("deck.ppt", "pptx_edit", legacy),
-            ("paper.pdf", "docx_edit", "edits only a .docx/.docm file"),
-            ("paper.pdf", "xlsx_edit", "edits only a .xlsx/.xlsm file"),
-            ("paper.pdf", "pptx_edit", "edits only a .pptx/.pptm file"),
-            ("report.docx", "xlsx_edit", "edits only a .xlsx/.xlsm file"),
-            ("sheet.xlsx", "pptx_edit", "edits only a .pptx/.pptm file"),
+            // The input's own bytes, not its name, are what each action takes.
+            ("report.doc", legacy_doc(), "docx_edit", legacy),
+            ("sheet.xls", legacy_doc(), "xlsx_edit", legacy),
+            ("deck.ppt", legacy_doc(), "pptx_edit", legacy),
+            (
+                "paper.pdf",
+                fillable_pdf(),
+                "docx_edit",
+                "edits only a .docx/.docm file",
+            ),
+            (
+                "paper.pdf",
+                fillable_pdf(),
+                "xlsx_edit",
+                "edits only a .xlsx/.xlsm file",
+            ),
+            (
+                "paper.pdf",
+                fillable_pdf(),
+                "pptx_edit",
+                "edits only a .pptx/.pptm file",
+            ),
+            // A real package under another family's name is refused as the family
+            // it really holds, and pointed at the action that edits it.
+            (
+                "report.docx",
+                package_with("xl/workbook.xml"),
+                "docx_edit",
+                "which is really an .xlsx package",
+            ),
+            (
+                "sheet.xlsx",
+                package_with("ppt/presentation.xml"),
+                "xlsx_edit",
+                "which is really a .pptx package",
+            ),
+            // A container that is no document is not called one.
+            (
+                "notes.msg",
+                crate::legacy::test_fixtures::cfb(&[("__properties_version1.0", b"outlook")]),
+                "docx_edit",
+                "which is not a Word, Excel, PowerPoint or PDF document",
+            ),
         ];
-        for (name, action, expected) in cases {
-            std::fs::write(ws.as_path().join(name), b"fixture").expect("write input");
+        for (name, bytes, action, expected) in cases {
+            std::fs::write(ws.as_path().join(name), &bytes).expect("write input");
             let err = confined_document()
                 .execute(
                     &ws,
@@ -6534,47 +8035,287 @@ mod tests {
         }
         assert_eq!(generated_count(&ws), 0, "a refused call left an output");
 
-        // The container decides which answer a `.doc`-shaped name gets: a file
-        // whose bytes are an OOXML package is not an old format — the read path
-        // reads it as the package it holds — while a real CFB container is.
-        std::fs::write(
-            ws.as_path().join("package.doc"),
-            b"PK\x03\x04the-rest-of-a-package",
-        )
-        .expect("write input");
+        // A genuinely encrypted package is the password verdict whatever its name
+        // says — and an old-format document under that same name is not.
+        for (name, bytes, expected) in [
+            ("encrypted.docx", encrypted_package(), "password-protected"),
+            ("container.doc", legacy_doc(), legacy),
+        ] {
+            std::fs::write(ws.as_path().join(name), &bytes).expect("write input");
+            let err = confined_document()
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "docx_edit", "path": name,
+                        "edits": [{ "op": "replace_text", "find": "x", "replace": "y" }],
+                    }),
+                )
+                .await
+                .expect_err("a container is refused for what it really holds");
+            assert!(
+                err.to_string().contains(expected),
+                "{name}: expected {expected:?}, got {err}"
+            );
+        }
+        assert_eq!(generated_count(&ws), 0, "a refused call left an output");
+    }
+
+    /// A `.doc` name is not an old document: a ZIP container named `.doc` whose
+    /// bytes hold no package is refused for what its bytes are, never with the
+    /// sentence the old binary formats are owed — that sentence follows a real
+    /// `LegacyDoc`/`LegacyXls`/`LegacyPpt` verdict, not the name.
+    #[tokio::test]
+    async fn a_doc_named_zip_is_not_an_old_doc() {
+        let (_dir, ws) = workspace();
+        let archive = write_fixture(&ws, "archive.doc", &package_with("mimetype"));
         let err = confined_document()
             .execute(
                 &ws,
                 json!({
-                    "action": "docx_edit", "path": "package.doc",
+                    "action": "docx_edit", "path": archive.to_string_lossy(),
                     "edits": [{ "op": "replace_text", "find": "x", "replace": "y" }],
                 }),
             )
             .await
-            .expect_err("a package under an old-format name is not an old format");
+            .expect_err("a ZIP that holds no package is not a docx");
+        let message = err.to_string();
         assert!(
-            err.to_string()
-                .contains("the file's bytes are an OOXML package"),
+            message.contains("which is not a Word, Excel, PowerPoint or PDF document"),
+            "got: {message}"
+        );
+        assert!(
+            !message.contains("old .doc/.xls/.ppt"),
+            "a container that is no old document must not be called one: {message}"
+        );
+        assert_eq!(generated_count(&ws), 0, "a refused call left an output");
+    }
+
+    /// A file's name is not its format: a valid PDF under a `.txt` name is taken
+    /// by a `pdf_*` action — the verdict reads the bytes — while a file that is
+    /// not a PDF is refused naming what it really holds.
+    #[tokio::test]
+    async fn a_pdf_is_taken_under_any_name() {
+        let (_dir, ws) = workspace();
+        let renamed = write_fixture(&ws, "notes.txt", &fillable_pdf());
+        require_pdf(&renamed)
+            .await
+            .expect("a PDF under any name is a PDF");
+
+        let workbook = write_fixture(&ws, "sheet.txt", &package_with("xl/workbook.xml"));
+        let err = require_pdf(&workbook)
+            .await
+            .expect_err("a workbook is not a PDF, whatever it is called");
+        assert!(
+            err.to_string().contains("which is really an .xlsx package"),
             "got: {err}"
         );
 
-        std::fs::write(
-            ws.as_path().join("container.doc"),
-            [crate::document::CFB_MAGIC, b"the rest of a container"].concat(),
-        )
-        .expect("write input");
+        // The whole call follows the same verdict: what the renamed PDF meets is
+        // the managed runtime, never a refusal about its format.
+        if let Err(e) = confined_document()
+            .execute(
+                &ws,
+                json!({ "action": "pdf_text", "path": "notes.txt", "text": "x" }),
+            )
+            .await
+        {
+            assert!(!e.to_string().contains("must be a PDF"), "got: {e}");
+        }
+    }
+
+    /// `pages` is one argument with one grammar for every PDF action that takes
+    /// it: an array of selections, whose elements are the files a split cuts and
+    /// whose union is what the rotate/text/image actions act on. A page named
+    /// twice anywhere in the request is refused, before the kit is spawned.
+    #[tokio::test]
+    async fn the_pages_argument_is_an_array_of_selections() {
+        let (_dir, ws) = workspace();
+        assert_eq!(
+            split_groups(&json!({ "pages": ["1-3", "5"] })).expect("two selections"),
+            vec![json!([1, 2, 3]), json!([5])],
+            "one output file per element, in order"
+        );
+        // `"all"` is the same element an acting action takes, and the kit resolves
+        // it against the document's own page count — the one place it is known.
+        assert_eq!(
+            split_groups(&json!({ "pages": ["all"] })).expect("one file, every page"),
+            vec![json!("all")],
+            "an element naming every page is passed through unexpanded"
+        );
+        assert_eq!(
+            opt_pages(&json!({ "pages": ["1-3", "5"] }))
+                .expect("a selection list")
+                .kit_value(),
+            json!([1, 2, 3, 5]),
+            "the union of the elements is what the action acts on"
+        );
+        for pages in [
+            json!({}),
+            json!({ "pages": null }),
+            json!({ "pages": [] }),
+            json!({ "pages": ["all"] }),
+        ] {
+            assert_eq!(
+                opt_pages(&pages).expect("every page").kit_value(),
+                json!("all"),
+                "{pages} names no page to narrow the call to"
+            );
+        }
+        // An empty element names no page: `"all"` is the only element that means
+        // every page, so a blank one is refused as an empty selection rather than
+        // silently widening the call.
+        for pages in [json!({ "pages": [""] }), json!({ "pages": ["1-3", ""] })] {
+            let err = opt_pages(&pages)
+                .map(|pages| pages.kit_value())
+                .expect_err("a blank page element must be refused");
+            assert!(
+                err.to_string().contains("empty page range"),
+                "{pages}: got {err}"
+            );
+        }
+        let duplicate = split_groups(&json!({ "pages": ["1", "2", "1"] }))
+            .expect_err("a page named twice is refused");
+        assert!(
+            duplicate.to_string().contains("appears more than once"),
+            "got: {duplicate}"
+        );
+        // An `"all"` element stands alone: beside another element it would name the
+        // same page twice, the way the named duplicate above does.
+        for pages in [
+            json!({ "pages": ["all", "1"] }),
+            json!({ "pages": ["1-3", "all"] }),
+            json!({ "pages": ["all", "all"] }),
+        ] {
+            let err = split_groups(&pages).expect_err("an \"all\" element stands alone");
+            assert!(
+                err.to_string()
+                    .contains("cannot sit beside another selection"),
+                "split {pages}: got {err}"
+            );
+            let err = opt_pages(&pages)
+                .map(|pages| pages.kit_value())
+                .expect_err("an \"all\" element stands alone");
+            assert!(
+                err.to_string()
+                    .contains("cannot sit beside another selection"),
+                "{pages}: got {err}"
+            );
+        }
+
+        let pdf = write_fixture(&ws, "base.pdf", &fillable_pdf());
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({ "action": "pdf_rotate", "path": pdf.to_string_lossy(),
+                        "degrees": 90, "pages": ["1-2", "2"] }),
+            )
+            .await
+            .expect_err("a page named twice is refused");
+        assert!(
+            err.to_string().contains("appears more than once"),
+            "got: {err}"
+        );
+        assert_eq!(generated_count(&ws), 0, "a refused call left an output");
+    }
+
+    /// Both call shapes are accepted: the flat one (an `action` string with the
+    /// action's own arguments beside it) and the nested one the schema literally
+    /// describes, whose single key names the action — and the chrome-shaped call
+    /// whose arguments sit under the action's own key. Anything else is refused
+    /// with the shape the caller was expected to use.
+    #[tokio::test]
+    async fn a_nested_action_call_is_dispatched_like_a_flat_one() {
+        let (_dir, ws) = workspace();
+        assert_eq!(
+            normalize_call(&json!({
+                "action": { "pdf_rotate": { "path": "a.pdf", "degrees": 90 } },
+                "file_name": "turned",
+            }))
+            .expect("the nested shape"),
+            json!({
+                "action": "pdf_rotate", "path": "a.pdf", "degrees": 90, "file_name": "turned"
+            })
+        );
+        assert_eq!(
+            normalize_call(&json!({ "action": "pdf_rotate", "pdf_rotate": { "degrees": 90 } }))
+                .expect("the chrome shape"),
+            json!({ "action": "pdf_rotate", "degrees": 90 })
+        );
+        // An argument stated beside the action object is the caller's: it is kept
+        // rather than dropped, so a nested call cannot widen into a call the
+        // caller did not make.
+        assert_eq!(
+            normalize_call(&json!({
+                "action": { "pdf_text": { "path": "a.pdf", "text": "x" } },
+                "pages": ["1"],
+            }))
+            .expect("the nested shape with a selection beside it"),
+            json!({ "action": "pdf_text", "path": "a.pdf", "text": "x", "pages": ["1"] })
+        );
+        for bad in [
+            json!({ "action": 5 }),
+            json!({ "action": ["pdf_rotate"] }),
+            json!({ "action": { "a": 1, "b": 2 } }),
+            json!({ "action": {} }),
+        ] {
+            let err = normalize_call(&bad).expect_err("a shape the tool cannot read");
+            assert!(err.to_string().contains("\"action\""), "{bad}: {err}");
+        }
+
+        // Dispatch follows the normalisation: the nested call meets the same
+        // refusal the flat one does.
+        let pdf = write_fixture(&ws, "base.pdf", &fillable_pdf());
         let err = confined_document()
             .execute(
                 &ws,
                 json!({
-                    "action": "docx_edit", "path": "container.doc",
-                    "edits": [{ "op": "replace_text", "find": "x", "replace": "y" }],
+                    "action": { "pdf_rotate": { "path": pdf.to_string_lossy(), "degrees": 45 } }
                 }),
             )
             .await
-            .expect_err("a legacy container under an old-format name is an old format");
-        assert!(err.to_string().contains(legacy), "got: {err}");
+            .expect_err("45 degrees is not a multiple of 90");
+        assert!(err.to_string().contains("multiple of 90"), "got: {err}");
+    }
+
+    /// A call is checked against the action's own schema entry: a key the action
+    /// has no place for is refused by name rather than silently ignored, so a
+    /// renamed argument names itself instead of surfacing as a "missing required
+    /// argument" that points at the wrong key. An action the tool does not have
+    /// keeps its own refusal and is not pre-empted.
+    #[tokio::test]
+    async fn an_action_refuses_an_argument_it_does_not_take() {
+        let (_dir, ws) = workspace();
+        for (args, expected) in [
+            // `pages` belongs to the PDF page actions, not to a form fill.
+            (
+                json!({ "action": "pdf_form_fill", "path": "form.pdf", "pages": ["1"],
+                        "values": { "name": "Иван" } }),
+                "takes no argument \"pages\"",
+            ),
+            // `path` is where the sample goes now; `template` was the kit's own
+            // field name and is no argument of the action.
+            (
+                json!({ "action": "fill_template", "template": "sample.docx",
+                        "values": { "name": "Иван" } }),
+                "takes no argument \"template\"",
+            ),
+        ] {
+            let err = confined_document()
+                .execute(&ws, args)
+                .await
+                .expect_err("an argument the action does not take must be refused");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}: {err}"
+            );
+        }
         assert_eq!(generated_count(&ws), 0, "a refused call left an output");
+
+        let err = confined_document()
+            .execute(&ws, json!({ "action": "no_such_action" }))
+            .await
+            .expect_err("an action the tool does not have");
+        assert!(err.to_string().contains("unknown action"), "got: {err}");
     }
 
     /// Every edit shape the kit would fail on is refused at the boundary,
@@ -6583,8 +8324,14 @@ mod tests {
     #[expect(clippy::too_many_lines)] // reason: one refused edit shape per op and field
     async fn edit_shapes_are_checked_before_an_output_is_reserved() {
         let (_dir, ws) = workspace();
-        for name in ["doc.docx", "book.xlsx", "deck.pptx"] {
-            std::fs::write(ws.as_path().join(name), b"fixture").expect("write input");
+        // The input's own bytes decide the family, so a fixture standing for one
+        // is a package holding that family's own main part.
+        for (name, part) in [
+            ("doc.docx", "word/document.xml"),
+            ("book.xlsx", "xl/workbook.xml"),
+            ("deck.pptx", "ppt/presentation.xml"),
+        ] {
+            std::fs::write(ws.as_path().join(name), package_with(part)).expect("write input");
         }
         let too_many: Vec<Value> = (0..=RULES.edits_max)
             .map(|_| json!({ "op": "replace_text", "find": "x", "replace": "y" }))
@@ -6792,19 +8539,19 @@ mod tests {
             (
                 json!({ "action": "xlsx_edit", "path": "book.xlsx",
                         "edits": [{ "op": "format_cells", "sheet": "Values", "column": "A1",
-                                    "width": 10 }] }),
+                                    "width_chars": 10 }] }),
                 "column must be column letters",
             ),
             (
                 json!({ "action": "xlsx_edit", "path": "book.xlsx",
                         "edits": [{ "op": "format_cells", "sheet": "Values", "column": "b",
-                                    "width": 10 }] }),
+                                    "width_chars": 10 }] }),
                 "column must be column letters",
             ),
             (
                 json!({ "action": "xlsx_edit", "path": "book.xlsx",
                         "edits": [{ "op": "format_cells", "sheet": "Values", "row": 99_999_999,
-                                    "height": 20 }] }),
+                                    "height_points": 20 }] }),
                 "row must be a whole number",
             ),
             // A xlsx `format_cells` naming no target, more than one target, or only
@@ -6881,14 +8628,14 @@ mod tests {
             (
                 json!({ "action": "xlsx_edit", "path": "book.xlsx",
                         "edits": [{ "op": "format_cells", "sheet": "Values", "column": "B",
-                                    "width": 300 }] }),
-                "width must be",
+                                    "width_chars": 300 }] }),
+                "width_chars must be",
             ),
             (
                 json!({ "action": "xlsx_edit", "path": "book.xlsx",
                         "edits": [{ "op": "format_cells", "sheet": "Values", "row": 3,
-                                    "height": 500 }] }),
-                "height must be",
+                                    "height_points": 500 }] }),
+                "height_points must be",
             ),
             (
                 json!({ "action": "xlsx_edit", "path": "book.xlsx",
@@ -6999,6 +8746,99 @@ mod tests {
         );
     }
 
+    /// The values the schema now declares are the values the boundary takes: a
+    /// `list` and a `fill` of `false`, and a `set_cell` `value` that is a number
+    /// or the formula object — each proved here through the validators, and each
+    /// proved to be what the action's own schema entry declares.
+    #[test]
+    fn the_schema_declares_the_shapes_the_boundary_accepts() {
+        use crate::ooxml::Family;
+
+        let docx = validate_edits(
+            Family::Docx,
+            &json!({ "edits": [{ "op": "format_paragraph", "find": "x", "list": false }] }),
+        )
+        .expect("list: false takes the paragraph's list away");
+        assert_eq!(
+            docx,
+            json!([{ "op": "format_paragraph", "find": "x", "list": false }])
+        );
+
+        let xlsx = validate_edits(
+            Family::Xlsx,
+            &json!({ "edits": [
+                { "op": "format_cells", "sheet": "S", "range": "A1", "fill": false },
+                { "op": "set_cell", "sheet": "S", "cell": "A1", "value": 42 },
+                { "op": "set_cell", "sheet": "S", "cell": "A2",
+                  "value": { "formula": "SUM(A1:A1)" } },
+            ]}),
+        )
+        .expect("a false fill, a number and a formula object are all declared shapes");
+        assert_eq!(
+            xlsx,
+            json!([
+                { "op": "format_cells", "sheet": "S", "range": "A1", "fill": false },
+                { "op": "set_cell", "sheet": "S", "cell": "A1", "value": 42 },
+                { "op": "set_cell", "sheet": "S", "cell": "A2",
+                  "value": { "formula": "SUM(A1:A1)" } },
+            ])
+        );
+
+        // The same values the boundary just took are the ones the schema states:
+        // the list's enum holds `false` beside the words, the fill is a colour or
+        // `false`, and a cell's `value` is the shared scalar kinds or the formula
+        // object the boundary took above.
+        let fields = |action: &str| {
+            action_schema(action)["properties"][action]["properties"]["edits"]["items"]
+                ["properties"]
+                .clone()
+        };
+        let docx_fields = fields("docx_edit");
+        assert_eq!(docx_fields["list"]["type"], json!(["string", "boolean"]));
+        assert!(
+            docx_fields["list"]["enum"]
+                .as_array()
+                .is_some_and(|values| values.contains(&json!(false))),
+            "the list enum must offer false beside the kinds: {}",
+            docx_fields["list"]
+        );
+        let xlsx_fields = fields("xlsx_edit");
+        assert_eq!(xlsx_fields["fill"]["anyOf"][0]["type"], json!("string"));
+        assert_eq!(xlsx_fields["fill"]["anyOf"][1]["enum"], json!([false]));
+        assert_eq!(
+            xlsx_fields["value"]["anyOf"][0]["type"],
+            json!(RULES.scalar_kinds)
+        );
+        assert_eq!(
+            xlsx_fields["value"]["anyOf"][1]["required"],
+            json!(["formula"])
+        );
+    }
+
+    /// A copy of an edited input is named with the input's own extension when the
+    /// name is the family the bytes are, and with the family's own when the name
+    /// says nothing about them — the copy of a dotless or foreign-named package
+    /// must not be handed an extension it does not have.
+    #[test]
+    fn copy_extension_follows_the_content_when_the_name_does_not() {
+        use crate::ooxml::Family;
+        assert_eq!(
+            copy_extension(Path::new("report.docm"), Family::Docx),
+            "docm"
+        );
+        assert_eq!(
+            copy_extension(Path::new("report.docx"), Family::Docx),
+            "docx"
+        );
+        assert_eq!(copy_extension(Path::new("report"), Family::Docx), "docx");
+        assert_eq!(
+            copy_extension(Path::new("report.bin"), Family::Docx),
+            "docx"
+        );
+        assert_eq!(copy_extension(Path::new("sheet.xls"), Family::Xlsx), "xlsx");
+        assert_eq!(copy_extension(Path::new("deck.ppt"), Family::Pptx), "pptx");
+    }
+
     /// A pptx edit that names a key its op does not take is refused at the
     /// boundary: the kit reads only the fields the op knows, so a mistyped or
     /// extra parameter would be dropped in silence and the model would believe
@@ -7060,6 +8900,53 @@ mod tests {
                 .contains("edits[0].weight is not a field of xlsx \"format_cells\""),
             "got: {err}"
         );
+    }
+
+    /// A content block or a sheet naming a key its own kind does not take is
+    /// refused at the boundary: the schema declares one item object for every
+    /// kind, so only the boundary knows which key belongs to which, and a
+    /// mistyped key would otherwise be dropped in silence.
+    #[tokio::test]
+    async fn a_block_refuses_a_key_its_kind_does_not_take() {
+        let (_dir, ws) = workspace();
+        let err = resolve_content(
+            &ws,
+            &json!({ "content": [{ "type": "paragraph", "text": "x", "level": 1 }] }),
+            "docx",
+            PathAccess::Workspace,
+        )
+        .await
+        .expect_err("a paragraph block does not take a level");
+        assert!(
+            err.to_string().contains("usage:")
+                && err
+                    .to_string()
+                    .contains("content[0].level is not a field of the paragraph block"),
+            "got: {err}"
+        );
+
+        let err = resolve_sheets(&json!({ "sheets": [{ "rows": [["x"]], "columns": 3 }] }))
+            .expect_err("a sheet does not take columns");
+        assert!(
+            err.to_string().contains("usage:")
+                && err
+                    .to_string()
+                    .contains("sheets[0].columns is not a field of a sheet"),
+            "got: {err}"
+        );
+
+        // The accepted kinds still pass: a paragraph naming only its own fields
+        // and a named sheet with rows are the shapes their kinds declare.
+        resolve_content(
+            &ws,
+            &json!({ "content": [{ "type": "paragraph", "text": "ok" }] }),
+            "docx",
+            PathAccess::Workspace,
+        )
+        .await
+        .expect("a paragraph with only its own fields is a valid block");
+        resolve_sheets(&json!({ "sheets": [{ "name": "S", "rows": [["ok"]] }] }))
+            .expect("a named sheet with rows is a valid sheet");
     }
 
     /// Every shape a pptx `format_text` could be given that the kit cannot write
@@ -7187,7 +9074,7 @@ mod tests {
             "an untouched run lost its formatting: {body}"
         );
         assert!(
-            body.contains("<w:b/>") && body.contains(r#"<w:sz w:val="48"/>"#),
+            body.contains(r#"<w:rPr><w:b/><w:bCs/><w:sz w:val="48"/><w:szCs w:val="48"/></w:rPr>"#),
             "format_text wrote no properties: {body}"
         );
     }
@@ -7328,6 +9215,11 @@ mod tests {
     /// `Normal`, a paragraph style whose NAME is Russian and whose id is not, and a
     /// character style — the three answers a `style` can get.
     const FIRM_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Normal" w:default="1"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="Firm"><w:name w:val="Фирменный"/></w:style><w:style w:type="character" w:styleId="Red"><w:name w:val="Red ink"/></w:style></w:styles>"#;
+
+    /// A styles part whose `<w:docDefaults>` state a double strike on every run: a
+    /// `false` that wrote only the plain strike off value would leave this one to
+    /// draw the text struck anyway.
+    const DOUBLE_STRIKE_DEFAULT_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:dstrike/></w:rPr></w:rPrDefault></w:docDefaults><w:style w:type="paragraph" w:styleId="Normal" w:default="1"><w:name w:val="Normal"/></w:style></w:styles>"#;
 
     /// The settings part of a document whose tracked changes are turned on, under
     /// the element the schema — and Word, LibreOffice and the docx library this kit
@@ -7973,7 +9865,7 @@ mod tests {
             "word/document.xml",
         );
         assert!(
-            formatted.contains("<w:tab/>") && formatted.contains("<w:b/>"),
+            formatted.contains("<w:tab/>") && formatted.contains("<w:rPr><w:b/><w:bCs/></w:rPr>"),
             "a formatting-only edit must reach both sides of the tab: {formatted}"
         );
     }
@@ -8080,7 +9972,7 @@ mod tests {
         .await;
         let body = part_text(&single(&reply), "word/document.xml");
         assert!(
-            body.contains("<w:rPr><w:b/><w:i/><w:rPrChange"),
+            body.contains("<w:rPr><w:b/><w:i/><w:iCs/><w:rPrChange"),
             "the toggle did not land before the recorded revision: {body}"
         );
         assert!(
@@ -8102,7 +9994,9 @@ mod tests {
         .await;
         let body = part_text(&single(&reply), "word/document.xml");
         assert!(
-            body.contains(r#"<w:rPr><w:b/><w:sz w:val="24"/><w:szCs w:val="24"/><w:rPrChange"#),
+            body.contains(
+                r#"<w:rPr><w:b/><w:bCs/><w:sz w:val="24"/><w:szCs w:val="24"/><w:rPrChange"#
+            ),
             "the run did not take the properties only its revision held: {body}"
         );
         assert!(
@@ -8110,9 +10004,9 @@ mod tests {
             "the revision's own properties were rewritten: {body}"
         );
 
-        // The other direction: clearing a toggle removes the run's own property and
-        // must leave the recorded revision exactly as it was — dropping the whole
-        // `<w:rPr>` would delete the revision with it.
+        // The other direction: switching a toggle off writes the run's own off
+        // value and must leave the recorded revision exactly as it was — dropping
+        // the run's `<w:rPr>` would delete the revision with it.
         let nested_off = docx_body_fixture(&ws, "nested-rpr-off", NESTED_RPR_BODY).await;
         let reply = run(
             &ws,
@@ -8125,12 +10019,12 @@ mod tests {
         .await;
         let body = part_text(&single(&reply), "word/document.xml");
         assert!(
-            body.contains(r#"<w:rPr><w:rPrChange w:id="1" w:author="A"><w:rPr><w:b/></w:rPr></w:rPrChange></w:rPr><w:t>TARGET"#),
-            "the recorded revision did not survive the toggle being cleared: {body}"
+            body.contains(r#"<w:rPr><w:b w:val="false"/><w:bCs w:val="false"/><w:rPrChange w:id="1" w:author="A"><w:rPr><w:b/></w:rPr></w:rPrChange></w:rPr><w:t>TARGET"#),
+            "the recorded revision did not survive the toggle being switched off: {body}"
         );
 
-        // A run whose only property the revision holds: the request empties the
-        // run's own body, and the revision is all that is left of its `<w:rPr>`.
+        // A run whose own body holds nothing but the revision: a toggle switched off
+        // states itself beside it, and the revision survives exactly as it was.
         let revision_off =
             docx_body_fixture(&ws, "revision-only-off", REVISION_ONLY_RPR_BODY).await;
         let reply = run(
@@ -8144,8 +10038,8 @@ mod tests {
         .await;
         let body = part_text(&single(&reply), "word/document.xml");
         assert!(
-            body.contains(r#"<w:rPr><w:rPrChange w:id="1" w:author="A"><w:rPr><w:b/><w:sz w:val="20"/></w:rPr></w:rPrChange></w:rPr><w:t>TARGET"#),
-            "a request that changed nothing removed the recorded revision: {body}"
+            body.contains(r#"<w:rPr><w:b w:val="false"/><w:bCs w:val="false"/><w:rPrChange w:id="1" w:author="A"><w:rPr><w:b/><w:sz w:val="20"/></w:rPr></w:rPrChange></w:rPr><w:t>TARGET"#),
+            "a request that switched a toggle off lost the recorded revision: {body}"
         );
 
         // `<w:sz>` counts half-points, so the shared bound's low end is the smallest
@@ -8531,9 +10425,14 @@ mod tests {
         )
         .await;
         let edited = part_text(&single(&reply), "word/document.xml");
+        // A `false` states the property off on the run — the spelling
+        // `ST_OnOff` gives that, in both spellings of the strike — so nothing about
+        // the run's look is left to the style, and the colour the same op named stays.
         assert!(
-            edited.contains(r#"<w:rPr><w:color w:val="00AAFF"/></w:rPr><w:t>PLAIN</w:t></w:r>"#),
-            "the colour did not survive the toggles being cleared, or a toggle stayed: {edited}"
+            edited.contains(
+                r#"<w:rPr><w:strike w:val="false"/><w:dstrike w:val="false"/><w:color w:val="00AAFF"/><w:u w:val="none"/></w:rPr><w:t>PLAIN</w:t></w:r>"#
+            ),
+            "the colour did not survive the toggles being switched off: {edited}"
         );
         assert!(
             edited.contains(r#"<w:rPr><w:u w:val="double"/></w:rPr>"#),
@@ -8544,8 +10443,10 @@ mod tests {
             "a double strike was rewritten into a single one the call did not name: {edited}"
         );
         assert!(
-            edited.contains(r"<w:p><w:r><w:t>DROP DOUBLE</w:t></w:r></w:p>"),
-            "a `false` left the run struck: {edited}"
+            edited.contains(
+                r#"<w:rPr><w:strike w:val="false"/><w:dstrike w:val="false"/></w:rPr><w:t>DROP DOUBLE</w:t></w:r>"#
+            ),
+            "a `false` did not switch the strike off explicitly: {edited}"
         );
         assert!(
             edited.contains(r"<w:rPr><w:strike/></w:rPr><w:t>OFF STRIKE</w:t></w:r>"),
@@ -8557,8 +10458,44 @@ mod tests {
         );
         assert_eq!(
             edited.matches("<w:u ").count(),
-            2,
+            3,
             "a run that draws its own underline was given the plain one: {edited}"
+        );
+    }
+
+    /// A `strike: false` states the off value in both spellings of the one property,
+    /// so a double strike the style or `<w:docDefaults>` state cannot render — the
+    /// completion the complex-script bold and italic off values have.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_strike_off_clears_an_inherited_double_strike() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_part_fixture(
+            &ws,
+            "inherited-double-strike",
+            &docx_document(r"<w:p><w:r><w:t>INHERITED DOUBLE</w:t></w:r></w:p>"),
+            &[("word/styles.xml", DOUBLE_STRIKE_DEFAULT_STYLES)],
+            &[],
+        )
+        .await;
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "format_text", "find": "INHERITED DOUBLE", "strike": false }],
+            }),
+        )
+        .await;
+        let edited = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            edited.contains(
+                r#"<w:rPr><w:strike w:val="false"/><w:dstrike w:val="false"/></w:rPr><w:t>INHERITED DOUBLE</w:t></w:r>"#
+            ),
+            "a `false` left one spelling of the strike stated, so an inherited double strike still draws: {edited}"
         );
     }
 
@@ -9003,7 +10940,7 @@ mod tests {
         );
         let edited = part_text(&single(&reply), "word/document.xml");
         assert!(
-            edited.contains(r"<w:rPr><w:i/></w:rPr><w:t>LONGER RUN</w:t></w:r>"),
+            edited.contains(r"<w:rPr><w:i/><w:iCs/></w:rPr><w:t>LONGER RUN</w:t></w:r>"),
             "the run the fragment sits in did not take the formatting: {edited}"
         );
     }
@@ -9738,11 +11675,11 @@ mod tests {
             "the section break was rewritten, or the property did not go before it: {edited}"
         );
         assert!(
-            edited.contains(r#"<w:rPr><w:i/><w:rPrChange w:id="4" w:author="A">"#),
+            edited.contains(r#"<w:rPr><w:i/><w:iCs/><w:rPrChange w:id="4" w:author="A">"#),
             "the recorded revision was rewritten, or the new property did not go before it: {edited}"
         );
         assert!(
-            edited.contains(r#"<w:rPr><w:i/><w:ins w:id="7" w:author="A"/><w:b/></w:rPr>"#),
+            edited.contains(r#"<w:rPr><w:i/><w:iCs/><w:ins w:id="7" w:author="A"/><w:b/></w:rPr>"#),
             "the insertion marker was rewritten, or the new property did not go beside it: {edited}"
         );
         assert!(
@@ -12565,6 +14502,77 @@ mod tests {
         );
     }
 
+    /// `underline` and `strike` are the two toggles a spreadsheet's own font entry
+    /// can state beside `bold`/`italic`: `true` writes the element into the font
+    /// entry (in `EG_Font` order) and `false` leaves it out of the complete entry
+    /// the cell points at — the only two spellings this family has, so a cell's
+    /// look never depends on the row, the column or a named style again.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_format_cells_applies_and_switches_off_underline_and_strike() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(
+            &ws,
+            "styled.xlsx",
+            &with_parts(
+                &created_xlsx(&ws).await,
+                &[
+                    ("xl/styles.xml", FORMAT_STYLES.as_bytes()),
+                    ("xl/worksheets/sheet1.xml", FORMAT_SHEET.as_bytes()),
+                ],
+            ),
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "edited",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_cells", "sheet": "S", "range": "A1",
+                      "bold": true, "underline": true, "strike": true },
+                ],
+            }),
+        )
+        .await;
+        let styles = part_text(&single(&reply), "xl/styles.xml");
+        let xfs = element_children(&styles, "cellXfs", "xf");
+        let fonts = element_children(&styles, "fonts", "font");
+        let on = fonts[attribute_of(xfs[xfs.len() - 1], "fontId")
+            .parse::<usize>()
+            .expect("a font index")];
+        assert_eq!(
+            on,
+            r#"<font><b/><i/><strike/><u/><sz val="11"/><color rgb="FFFF0000"/><name val="Calibri"/></font>"#,
+            "the two toggles are not the cell's own font plus <strike/><u/> in order: {on}"
+        );
+
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "file_name": "cleared",
+                "path": source.to_string_lossy(),
+                "edits": [
+                    { "op": "format_cells", "sheet": "S", "range": "A1",
+                      "underline": false, "strike": false },
+                ],
+            }),
+        )
+        .await;
+        let styles = part_text(&single(&reply), "xl/styles.xml");
+        let xfs = element_children(&styles, "cellXfs", "xf");
+        let fonts = element_children(&styles, "fonts", "font");
+        let off = fonts[attribute_of(xfs[xfs.len() - 1], "fontId")
+            .parse::<usize>()
+            .expect("a font index")];
+        assert!(
+            !off.contains("<u") && !off.contains("<strike"),
+            "a toggle switched off stayed in the font entry the cell points at: {off}"
+        );
+    }
+
     /// A cell that names no `s=` renders as the FIRST `<cellXfs>` entry — the base
     /// style a workbook states — so a format naming one property must clone THAT
     /// entry: a hard-coded default would take away the font (or fill, or
@@ -13215,7 +15223,7 @@ mod tests {
             json!({
                 "action": "xlsx_edit", "file_name": "split",
                 "path": source.to_string_lossy(),
-                "edits": [{ "op": "format_cells", "sheet": "S", "column": "B", "width": 20 }],
+                "edits": [{ "op": "format_cells", "sheet": "S", "column": "B", "width_chars": 20 }],
             }),
         )
         .await;
@@ -13237,7 +15245,7 @@ mod tests {
             json!({
                 "action": "xlsx_edit", "file_name": "bare-width",
                 "path": plain.to_string_lossy(),
-                "edits": [{ "op": "format_cells", "sheet": "S", "column": "B", "width": 20 }],
+                "edits": [{ "op": "format_cells", "sheet": "S", "column": "B", "width_chars": 20 }],
             }),
         )
         .await;
@@ -13255,7 +15263,7 @@ mod tests {
             json!({
                 "action": "xlsx_edit", "file_name": "split-again",
                 "path": output.to_string_lossy(),
-                "edits": [{ "op": "format_cells", "sheet": "S", "column": "B", "width": 20 }],
+                "edits": [{ "op": "format_cells", "sheet": "S", "column": "B", "width_chars": 20 }],
             }),
         )
         .await;
@@ -13289,7 +15297,7 @@ mod tests {
             json!({
                 "action": "xlsx_edit", "file_name": "height",
                 "path": source.to_string_lossy(),
-                "edits": [{ "op": "format_cells", "sheet": "S", "row": 3, "height": 30 }],
+                "edits": [{ "op": "format_cells", "sheet": "S", "row": 3, "height_points": 30 }],
             }),
         )
         .await;
@@ -13311,7 +15319,7 @@ mod tests {
             json!({
                 "action": "xlsx_edit", "file_name": "gap-height",
                 "path": gap_source.to_string_lossy(),
-                "edits": [{ "op": "format_cells", "sheet": "S", "row": 3, "height": 30 }],
+                "edits": [{ "op": "format_cells", "sheet": "S", "row": 3, "height_points": 30 }],
             }),
         )
         .await;
@@ -13341,7 +15349,7 @@ mod tests {
             json!({
                 "action": "xlsx_edit", "file_name": "addressless-height",
                 "path": addressless_source.to_string_lossy(),
-                "edits": [{ "op": "format_cells", "sheet": "S", "row": 3, "height": 30 }],
+                "edits": [{ "op": "format_cells", "sheet": "S", "row": 3, "height_points": 30 }],
             }),
         )
         .await;
@@ -13892,7 +15900,7 @@ mod tests {
                     "<sheetData>",
                     r#"<cols><col min="1" max="1" width="9"/><sheetData>"#,
                 ),
-                json!({ "op": "format_cells", "sheet": "S", "column": "B", "width": 12 }),
+                json!({ "op": "format_cells", "sheet": "S", "column": "B", "width_chars": 12 }),
                 "<cols>",
             ),
             (
@@ -14032,7 +16040,7 @@ mod tests {
                 json!({
                     "action": "xlsx_edit", "file_name": "width",
                     "path": source.to_string_lossy(),
-                    "edits": [{ "op": "format_cells", "sheet": "S", "column": "B", "width": 12 }],
+                    "edits": [{ "op": "format_cells", "sheet": "S", "column": "B", "width_chars": 12 }],
                 }),
             )
             .await;
@@ -14155,7 +16163,7 @@ mod tests {
         let edits = [
             json!({ "op": "format_cells", "sheet": "S", "range": "A1", "align": "center" }),
             json!({ "op": "format_cells", "sheet": "S", "range": "A1", "bold": true }),
-            json!({ "op": "format_cells", "sheet": "S", "column": "A", "width": 12 }),
+            json!({ "op": "format_cells", "sheet": "S", "column": "A", "width_chars": 12 }),
             json!({ "op": "set_cell", "sheet": "S", "cell": "A1", "value": 1,
                     "number_format": "0.00" }),
             json!({ "op": "set_cell", "sheet": "S", "cell": "A1", "value": 1 }),
@@ -14933,8 +16941,8 @@ mod tests {
             json!({
                 "action": "pptx_edit", "file_name": "pictured",
                 "path": spaced.to_string_lossy(),
-                "edits": [{ "op": "add_image", "slide": 1, "path": picture.to_string_lossy(),
-                            "x": 0.1, "y": 0.1, "width": 0.4 }],
+                "edits": [{ "op": "add_image", "slide": 1, "image": picture.to_string_lossy(),
+                            "x_fraction": 0.1, "y_fraction": 0.1, "width_fraction": 0.4 }],
             }),
         )
         .await;
@@ -16174,7 +18182,7 @@ mod tests {
                     json!({
                         "action": "pptx_edit", "file_name": "edited",
                         "path": deck.to_string_lossy(),
-                        "edits": [{ "op": "add_image", "slide": 1, "path": photo.to_string_lossy() }],
+                        "edits": [{ "op": "add_image", "slide": 1, "image": photo.to_string_lossy() }],
                     }),
                 )
                 .await,
@@ -16234,13 +18242,15 @@ mod tests {
                 "path": path,
                 "edits": [
                     { "op": "format_text", "slide": 1, "find": "Целый абзац",
-                      "bold": true, "italic": true, "underline": true, "size": 20,
-                      "color": "#FF0000", "align": "center" },
+                      "bold": true, "italic": true, "underline": true, "strike": true,
+                      "size": 20, "color": "#FF0000", "align": "center" },
+                    { "op": "format_text", "slide": 1, "find": "Заголовок",
+                      "strike": false },
                     { "op": "format_text", "slide": 1, "find": "Второй абзац",
                       "color": "00FF00", "align": "left" },
-                    { "op": "add_image", "slide": 1, "path": picture.to_string_lossy(),
-                      "x": 0.1, "y": 0.2, "width": 0.4 },
-                    { "op": "add_image", "slide": 1, "path": picture.to_string_lossy() },
+                    { "op": "add_image", "slide": 1, "image": picture.to_string_lossy(),
+                      "x_fraction": 0.1, "y_fraction": 0.2, "width_fraction": 0.4 },
+                    { "op": "add_image", "slide": 1, "image": picture.to_string_lossy() },
                 ],
             }),
         )
@@ -16328,7 +18338,13 @@ mod tests {
         let formatted_run = &formatting[formatting
             .find("<a:rPr")
             .expect("the formatted run's properties")..];
-        for attribute in [r#"b="1""#, r#"i="1""#, r#"u="sng""#, r#"sz="2000""#] {
+        for attribute in [
+            r#"b="1""#,
+            r#"i="1""#,
+            r#"u="sng""#,
+            r#"strike="sngStrike""#,
+            r#"sz="2000""#,
+        ] {
             assert!(
                 formatted_run.contains(attribute),
                 "the formatted run lost {attribute}: {formatted_run}"
@@ -16337,6 +18353,13 @@ mod tests {
         assert!(
             formatted_run.contains(r#"<a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>"#),
             "the formatted run did not take the requested colour: {formatted_run}"
+        );
+
+        // A toggle switched off states the off value the family has for it, so the
+        // run stops inheriting a strike from its placeholder or its layout.
+        assert!(
+            paragraph_element(&slide, "Заголовок").contains(r#"strike="noStrike""#),
+            "a run asked to switch its strike off did not state the off value"
         );
 
         let partial = paragraph_element(&slide, "Второй абзац тут");
@@ -17029,12 +19052,12 @@ mod tests {
         assert_eq!(sanitize_base(Some("..."), "fallback"), "fallback");
     }
 
-    /// The page cap is on the total a request names, not on one range's own
-    /// size: two ranges that add up past the limit must be refused before the
+    /// The page cap is on the total a request names, not on one selection's own
+    /// size: two selections that add up past the limit must be refused before the
     /// kit ever sees them.
     #[test]
     fn split_groups_refuses_a_request_over_the_page_cap() {
-        let err = split_groups(&json!({ "ranges": ["1-6000", "6001-12000"] }))
+        let err = split_groups(&json!({ "pages": ["1-6000", "6001-12000"] }))
             .expect_err("a request over the cap must be refused");
         assert!(
             err.to_string().contains("too many pages"),
@@ -17077,8 +19100,8 @@ mod tests {
         );
         assert!(!rules.paragraph_lists.is_empty(), "no paragraph lists");
         assert!(
-            rules.image_side_px.min < rules.image_side_px.max,
-            "an empty image-side range"
+            rules.dimension_points.min < rules.dimension_points.max,
+            "an empty dimension range"
         );
         assert!(
             rules.slide_position_fraction.min < rules.slide_position_fraction.max,
@@ -17087,10 +19110,6 @@ mod tests {
         assert!(
             rules.slide_size_fraction.min < rules.slide_size_fraction.max,
             "an empty slide-size range"
-        );
-        assert!(
-            rules.pdf_size_points.min < rules.pdf_size_points.max,
-            "an empty PDF-size range"
         );
         assert!(
             rules.text_size_points.min < rules.text_size_points.max,
@@ -17187,10 +19206,27 @@ mod tests {
         false
     }
 
-    /// Every rule the description states is the one the tool enforces: the
-    /// asset carries the placeholders and [`DocumentTool::description`] renders
-    /// each from `assets/docgen/rules.json`, so a rule that moved cannot leave a
-    /// stale number in what the model reads — and a placeholder left unreplaced
+    /// Every string the schema itself carries — its descriptions and enum words,
+    /// with no JSON escaping — so a rule stated in the parameter interface is
+    /// searched the same way the rendered description is.
+    fn schema_text(value: &Value) -> String {
+        match value {
+            Value::String(text) => text.clone(),
+            Value::Array(values) => values.iter().map(schema_text).collect::<Vec<_>>().join(" "),
+            Value::Object(object) => object
+                .values()
+                .map(schema_text)
+                .collect::<Vec<_>>()
+                .join(" "),
+            other => other.to_string(),
+        }
+    }
+
+    /// Every rule the tool enforces is stated where the model reads it: the asset
+    /// carries the placeholders and [`DocumentTool::description`] renders each from
+    /// `assets/docgen/rules.json`, while the bounds that live on a single argument
+    /// are stated in the parameter schema — so a rule that moved cannot leave a
+    /// stale number in what the model is told, and a placeholder left unreplaced
     /// would reach the model as its own literal spelling.
     #[test]
     fn the_description_states_every_rule_it_names() {
@@ -17199,12 +19235,12 @@ mod tests {
             !description.contains("{{"),
             "the description left a placeholder unreplaced:\n{description}"
         );
+        let schema = schema_text(&confined_document().parameters_schema());
         for value in [
             listed(&RULES.heading_levels),
-            RULES.image_side_px.bounds(),
+            RULES.dimension_points.bounds(),
             RULES.slide_position_fraction.bounds(),
             RULES.slide_size_fraction.bounds(),
-            RULES.pdf_size_points.bounds(),
             RULES.text_size_points.bounds(),
             RULES.paragraph_indent_points.bounds(),
             RULES.paragraph_spacing_points.bounds(),
@@ -17213,12 +19249,6 @@ mod tests {
             RULES.cell_font_points.bounds(),
             RULES.column_width_chars.bounds(),
             RULES.row_height_points.bounds(),
-            quoted_words(&pair_words(&RULES.slide_alignments)),
-            quoted_words(&pair_words(&RULES.paragraph_alignments)),
-            quoted_words(&pair_words(&RULES.paragraph_lists)),
-            quoted_words(&RULES.cell_alignments),
-            quoted_words(&RULES.cell_verticals),
-            quoted_words(&RULES.cell_border_sides),
             RULES.color_digits.to_string(),
             RULES.degrees_step.to_string(),
             RULES.sheet_name_max.to_string(),
@@ -17233,11 +19263,13 @@ mod tests {
             RULES.number_format_max.to_string(),
             RULES.font_name_max.to_string(),
             RULES.format_cells_max.to_string(),
+            RULES.max_pages_per_request.to_string(),
             megabytes(crate::util::FILE_MAX_BYTES).to_string(),
         ] {
             assert!(
-                states_whole_number(&description, &value),
-                "the description does not state the rule it names — {value:?} is missing as a whole number from:\n{description}"
+                states_whole_number(&description, &value) || states_whole_number(&schema, &value),
+                "neither the description nor the schema states the rule it names — {value:?} is \
+                 missing as a whole number from:\n{description}\n{schema}"
             );
         }
         // A slide mark is not a number, so the whole-number guard above would
@@ -17246,6 +19278,23 @@ mod tests {
         // the shared lists themselves. A label's `{n}` is the reader's own
         // placeholder, so the description states the label with `<n>` where a real
         // number goes.
+        //
+        // The enumerations are the one thing the schema states word by word
+        // rather than as a rendered phrase, so each accepted word is checked on
+        // its own.
+        for word in pair_words(&RULES.paragraph_alignments)
+            .into_iter()
+            .chain(pair_words(&RULES.paragraph_lists))
+            .chain(pair_words(&RULES.slide_alignments))
+            .chain(RULES.cell_alignments.iter().map(String::as_str))
+            .chain(RULES.cell_verticals.iter().map(String::as_str))
+            .chain(RULES.cell_border_sides.iter().map(String::as_str))
+        {
+            assert!(
+                description.contains(word) || schema.contains(word),
+                "neither the description nor the schema names the accepted word {word:?}"
+            );
+        }
         let marks = crate::docgen::ppt_marks();
         let labels = crate::docgen::ppt_slide_labels();
         let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
@@ -17271,6 +19320,59 @@ mod tests {
                 mark.example
             );
         }
+    }
+
+    /// What this tool's model-read text measured when this contract was settled:
+    /// the rendered description for the path-access variant this test builds (the
+    /// admin variant's own input wording makes its description 23,677 bytes) and
+    /// the serialized schema. The settled pair is held to those numbers — the
+    /// description at most half the baseline, and the description and the schema
+    /// together below their sum — so the contract the model reads can only shrink.
+    const BASELINE_DESCRIPTION: usize = 23_565;
+    const BASELINE_SCHEMA: usize = 3_489;
+
+    /// The whole per-action contract is one compact value: every action has an
+    /// entry, each entry declares exactly the arguments that action takes (and the
+    /// ones it requires), and the description and schema together stay within
+    /// their measured baseline.
+    #[test]
+    fn the_schema_is_compact_and_declares_every_action() {
+        let tool = confined_document();
+        let schema = tool.parameters_schema();
+        let entries = schema["properties"]["action"]["oneOf"]
+            .as_array()
+            .expect("the action list is a oneOf");
+        assert_eq!(entries.len(), ACTIONS.len(), "one entry per action");
+        for (entry, action) in entries.iter().zip(ACTIONS) {
+            assert_eq!(
+                entry["properties"][action]["type"], "object",
+                "{action} must be one entry with its own arguments"
+            );
+            assert_eq!(
+                entry["required"],
+                json!([action]),
+                "{action}'s entry must require its own name"
+            );
+            assert_eq!(
+                entry["additionalProperties"], false,
+                "an entry takes only the actions it names"
+            );
+        }
+        let description = tool.description().len();
+        assert!(
+            description * 2 <= BASELINE_DESCRIPTION,
+            "the rendered description is {description} bytes, more than half the measured \
+             {BASELINE_DESCRIPTION}-byte baseline"
+        );
+        let size = serde_json::to_string(&schema)
+            .expect("the schema serializes")
+            .len();
+        assert!(
+            description + size < BASELINE_DESCRIPTION + BASELINE_SCHEMA,
+            "the description ({description}) and serialized schema ({size}) together are no longer \
+             below the measured baseline total {}",
+            BASELINE_DESCRIPTION + BASELINE_SCHEMA
+        );
     }
 
     /// The tool is offered exactly while the managed runtime is present: the

@@ -62,8 +62,9 @@
 //!   searched for.
 
 use super::{
-    DocOutcome, Relationship, SkippedImages, append_entity, attr, ensure_out_dir, read_zip_entry,
-    relationships, resolve_part, scan_elements, unopened_parts, unreadable, write_media_parts,
+    DocOutcome, Family, Relationship, SkippedImages, append_entity, attr, ensure_out_dir,
+    read_zip_entry, relationships, resolve_part, scan_elements, unopened_parts, unreadable,
+    write_media_parts,
 };
 use crate::reader_output::{
     TEXT_BOX, WORD_COMMENT, WORD_ENDNOTE, WORD_FOOTER, WORD_FOOTNOTE, WORD_HEADER, labeled_block,
@@ -92,7 +93,7 @@ const MAX_ELEMENT_DEPTH: usize = 128;
 const MAX_TABLE_COLUMNS: usize = 256;
 
 /// Part holding the WordprocessingML body.
-const DOCX_BODY_PART: &str = "word/document.xml";
+pub(crate) const DOCX_BODY_PART: &str = "word/document.xml";
 /// Prefix of the embedded-media parts in a Word package.
 const DOCX_MEDIA_PREFIX: &str = "word/media/";
 /// Charts in a Word package: `word/charts/chart<N>.xml`.
@@ -2042,10 +2043,10 @@ fn numeric_attr(elem: &Elem, max: usize) -> usize {
 #[must_use]
 pub(crate) fn convert_docx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
-        return unreadable(".docx");
+        return unreadable(Family::Docx);
     };
     let Some(body_xml) = read_zip_entry(&mut archive, DOCX_BODY_PART).bytes() else {
-        return unreadable(".docx");
+        return unreadable(Family::Docx);
     };
     // A package that names no parts conventionally has no headers and no notes,
     // so an unreadable relationship list costs nothing but those.
@@ -2056,7 +2057,7 @@ pub(crate) fn convert_docx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
 
     let mut word = Word::new(&rels, &mut archive);
     let Some(body) = word.body(&body_xml) else {
-        return unreadable(".docx");
+        return unreadable(Family::Docx);
     };
     // The body's bytes are done with: the peripheral parts are read one at a
     // time from here, so nothing large stays resident beside them.

@@ -27,9 +27,8 @@ const BODY_SIZE = 12;
 const CELL_SIZE = 10;
 const CELL_LEADING = 12;
 const CELL_ROW_GAP = 8;
-// A content block states its image size in pixels (the unit the docx and pptx
-// arms take, and what pdf-lib reports for an embedded image), while a PDF page
-// is laid out in points.
+// 96 px = 72 pt: the one factor a request's points are converted with, whichever
+// arm draws the picture — every writer measures an image in its own pixels.
 const PX_TO_POINTS = 72 / 96;
 const DOCX_ORDERED = "document-kit-ordered";
 
@@ -190,13 +189,16 @@ function jpegSize(bytes) {
   }
   return null;
 }
-// The size a content image is drawn at, in the unit its request states (pixels).
-// A request that gives one side only scales the image's own proportions instead
-// of stretching it, and one that gives neither keeps the image's own size, capped
-// to a default width a page's text column comfortably holds: the same numbers for
-// every arm, so one block draws one picture whatever the format. `span` is the
-// range the shared rules allow a stated side (pixels for a content image, points
-// for a placed PDF one) and `maxWidth` is that cap.
+// The size a content image is drawn at, in the pixels every writer measures an
+// image in. A request states its sides in points — the one unit a placed picture
+// is measured in (`RULES.dimension_points`) — and a request that gives one side
+// only scales the image's own proportions instead of stretching it, while one
+// that gives neither keeps the image's own size, capped to a default width a
+// page's text column comfortably holds: the same numbers for every arm, so one
+// block draws one picture whatever the format. `span` is the range the shared
+// rules allow a stated side (points) and `maxWidth` is that cap (pixels), while
+// `natural` and the answer are pixels — the points-to-pixels conversion lives
+// here alone, so no arm converts a measure the others do not.
 const DEFAULT_IMAGE_WIDTH = 400;
 // Whether `value` is a finite number inside `span`, a range from rules.json
 // (`min_exclusive` marks a low end the value must exceed rather than reach).
@@ -219,16 +221,20 @@ function imageSize(natural, width, height, span, maxWidth = DEFAULT_IMAGE_WIDTH)
   for (const side of [width, height]) {
     if (side === undefined || side === null) continue;
     if (!inSpan(side, span)) {
-      // The refusal names the range it enforces: the shared span has an upper
-      // bound, and a low end a placed image's points must exceed rather than
-      // reach, so "positive" would understate both.
-      throw new UsageError(`an image's width and height must be ${spanBounds(span)}, got: ${side}`);
+      // The refusal names the unit it reads and the range it enforces: the shared
+      // span has an upper bound, and a low end a placed image's points must
+      // exceed rather than reach, so "positive" would understate both.
+      throw new UsageError(`an image's width and height must be ${spanBounds(span)} points, got: ${side}`);
     }
   }
+  // The one conversion: a stated side is points, an answer is pixels, and a side
+  // the request leaves out keeps the image's own proportions.
+  const px = (points) => points / PX_TO_POINTS;
+  if (width && height) return { width: px(width), height: px(height) };
+  if (width) return { width: px(width), height: Math.max(1, px(width) * natural.height / natural.width) };
+  if (height) return { width: Math.max(1, px(height) * natural.width / natural.height), height: px(height) };
+  // The fallback below reads the image's own size, which is pixels already.
   const round = (side) => Math.max(1, Math.round(side));
-  if (width && height) return { width, height };
-  if (width) return { width, height: round(width * natural.height / natural.width) };
-  if (height) return { width: round(height * natural.width / natural.height), height };
   const fit = Math.min(1, maxWidth / natural.width);
   return { width: round(natural.width * fit), height: round(natural.height * fit) };
 }
@@ -245,11 +251,11 @@ async function embedImage(pdf, file) {
 
 // ── create: docx ───────────────────────────────────────────────
 function docxImage(block) {
-  const image = readImage(block.path);
+  const image = readImage(block.image);
   return new ImageRun({
     type: image.kind,
     data: image.bytes,
-    transformation: imageSize(image, block.width, block.height, RULES.image_side_px),
+    transformation: imageSize(image, block.width, block.height, RULES.dimension_points),
   });
 }
 function docxTableRow(cells, header) {
@@ -519,8 +525,9 @@ function createPptx(req) {
       y += 0.45 * (body.length + header.length) + 0.3;
     } else if (block.type === "image") {
       if (!slide) fresh();
-      const image = readImage(block.path);
-      const size = imageSize(image, block.width, block.height, RULES.image_side_px);
+      const image = readImage(block.image);
+      const size = imageSize(image, block.width, block.height, RULES.dimension_points);
+      // A presentation is laid out in inches and `imageSize` answers in pixels.
       const w = size.width / 96;
       const h = size.height / 96;
       room(h + 0.2);
@@ -932,8 +939,11 @@ async function createPdf(req) {
       }
       y -= BODY_SIZE;
     } else if (block.type === "image") {
-      const image = await embedImage(pdf, block.path);
-      const size = imageSize(image, block.width, block.height, RULES.image_side_px);
+      const image = await embedImage(pdf, block.image);
+      // The block's sides are points, as the page is laid out: `imageSize` reads
+      // them through the shared span and answers in pixels, which the page draws
+      // in points.
+      const size = imageSize(image, block.width, block.height, RULES.dimension_points);
       let targetWidth = size.width * PX_TO_POINTS;
       let targetHeight = size.height * PX_TO_POINTS;
       // The streaming layout keeps what it draws inside the text column.
@@ -2088,13 +2098,25 @@ const RUN_PROPERTY_ORDER = ["rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", 
 // `w:pPrChange` is not part of it at all and the caller keeps it last.
 const PARAGRAPH_PROPERTY_ORDER = ["pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl", "numPr", "suppressLineNumbers", "pBdr", "shd", "tabs", "suppressAutoHyphens", "kinsoku", "wordWrap", "overflowPunct", "topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd", "snapToGrid", "spacing", "ind", "contextualSpacing", "mirrorIndents", "suppressOverlap", "jc", "textDirection", "textAlignment", "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr"];
 
-// The run-properties body with a bold/italic toggle set or removed. Setting one
-// writes it at its place in the sequence, so a toggle added to a body that
-// already holds a later property (`<w:sz>`, `<w:u>`) is not written where Word
-// would drop it.
+// The run-properties body with a bold/italic toggle set or switched off — in both
+// the plain and the complex-script spelling the property has (`w:b` with `w:bCs`,
+// `w:i` with `w:iCs`), the way `size` writes `w:sz` with `w:szCs`. Either way the
+// run states both itself: a `true` writes `<w:b/>` and `<w:bCs/>` (resp. `<w:i/>`
+// and `<w:iCs/>`) and a `false` the `ST_OnOff` off value of each, so neither what
+// the run's style states nor what `docDefaults` states reaches the text — a `false`
+// that wrote only the plain spelling would answer "not bold" with complex-script
+// text a `<w:bCs/>` still draws bold, and a `true` would leave such text to
+// whatever the style's own `<w:bCs>` states. Setting one writes it at its place in
+// the sequence, so a toggle added to a body that already holds a later property
+// (`<w:sz>`, `<w:u>`) is not written where Word would drop it, and the elements the
+// body spelled are replaced rather than joined by a second one that still states
+// the property as on.
 function runToggle(body, name, on) {
-  const without = body.replace(elementPattern(`w:${name}`), "");
-  return on ? insertOrderedChild(without, name, `<w:${name}/>`, RUN_PROPERTY_ORDER) : without;
+  const csName = `${name}Cs`;
+  const spelling = (property) => (on ? `<w:${property}/>` : `<w:${property} w:val="false"/>`);
+  const without = body.replace(elementPattern(`w:${name}`), "").replace(elementPattern(`w:${csName}`), "");
+  const plain = insertOrderedChild(without, name, spelling(name), RUN_PROPERTY_ORDER);
+  return insertOrderedChild(plain, csName, spelling(csName), RUN_PROPERTY_ORDER);
 }
 
 // The `w:val` spellings `ST_OnOff` reads as false — a value stating the absence
@@ -2118,22 +2140,36 @@ const statesOn = (body, name, off) => [...body.matchAll(elementPattern(name))].s
   return value === undefined || !off.has(value);
 });
 
-// The `<w:rPr>` the format request needs, from the run's own: a boolean writes
-// or drops a toggle (`<w:b>`, `<w:i>`, `<w:u>`, `<w:strike>`), `size` replaces the
-// run's own `<w:sz>`/`<w:szCs>` — in either shape — with the half-point value, the
-// unit `<w:sz>` counts in, and `color` replaces the run's own `<w:color>` — in
-// either shape — with the digits the caller stated. Each property is written at its
-// own place in `EG_RPrBase` (see `insertOrderedChild`). A `null` property counts as
+// The `<w:rPr>` the format request needs, from the run's own: a boolean states the
+// property itself (`<w:b>`, `<w:i>`, `<w:u>`, `<w:strike>`) — the on spelling for a
+// `true`, the off value for a `false`, which is how a request that switches a
+// property off does not fall back to the style's own — and bold and italic state
+// the complex-script spelling of the property beside the plain one (`<w:bCs>`
+// beside `<w:b>`, `<w:iCs>` beside `<w:i>`), the pairing `size` keeps for
+// `<w:sz>`/`<w:szCs>`: a style or `docDefaults` may state the complex-script
+// spelling alone, and one left stated would draw the text with the property the
+// request switched off. `size` replaces the run's own `<w:sz>`/`<w:szCs>` — in
+// either shape — with the half-point value, the unit `<w:sz>` counts in, and
+// `color` replaces the run's own `<w:color>` — in either shape — with the digits
+// the caller stated. Each property is written at its own
+// place in `EG_RPrBase` (see `insertOrderedChild`). A `null` property counts as
 // absent — the caller's own boundary treats a null-valued key that way — so only a
-// stated one is written.
+// stated one is written, and a property whose statement the body already spells is
+// rewritten byte-identically, which `formatRuns` reads as a request that changed
+// nothing.
 //
 // An underline is not a plain toggle: a run's own `<w:u>` may state a richer one
 // (`double`, `dotted`, `wave`) and `<w:u w:val="single"/>` — the plain underline a
 // `true` asks for — would throw it away, so a body that already states an underline
 // keeps exactly what it states, and only a `false`, or a body whose every `<w:u>` is
-// off, is rewritten. A double strike is left the same way, for the same reason: a
-// run already struck keeps the strike it draws, and a `true` never rewrites a
-// `<w:dstrike/>` into the plain `<w:strike/>` a run with neither is given.
+// off, is rewritten. A double strike is left the same way by a `true`, for the same
+// reason: a run already struck keeps the strike it draws, and a `true` never rewrites
+// a `<w:dstrike/>` into the plain `<w:strike/>` a run with neither is given. A `false`
+// writes the family's own off value instead — `<w:u w:val="none"/>`, whose vocabulary
+// it is, and the strike off value in BOTH of the property's spellings
+// (`<w:strike w:val="false"/>` beside `<w:dstrike w:val="false"/>`): a style or
+// `docDefaults` may state either spelling alone, and one left stated would still draw
+// the double strike the request switched off.
 //
 // A `<w:rPrChange>` holds the properties a tracked formatting revision recorded
 // — the state before that revision, not the run's own formatting — so only the
@@ -2165,23 +2201,28 @@ function formattedRunProperties(runXml, edit) {
     // A `<w:u>` whose `w:val` is absent, or states anything outside the spellings
     // that draw no underline, IS an underline — so a `true` leaves such a body
     // exactly as it stands, richer underline and all, while a body stating none is
-    // given the plain one.
+    // given the plain one. A `false` writes the off value in the element's place,
+    // so the run draws no underline whatever its style states.
     const stated = statesOn(body, "w:u", NO_UNDERLINE);
     if (!(edit.underline && stated)) {
       const without = body.replace(elementPattern("w:u"), "");
-      body = edit.underline ? insertOrderedChild(without, "u", '<w:u w:val="single"/>', RUN_PROPERTY_ORDER) : without;
+      body = insertOrderedChild(without, "u", edit.underline ? '<w:u w:val="single"/>' : '<w:u w:val="none"/>', RUN_PROPERTY_ORDER);
     }
   }
   if (edit.strike != null) {
     // A double strike is the same property spelled another way, so a `true` leaves
     // the strike a run already draws — the rule the underline above keeps — rather
     // than rewriting a `<w:dstrike/>` into a single one the caller did not name,
-    // while a `false` takes either spelling away: a run that keeps one would answer
-    // a `false` with text that still reads as struck.
+    // while a `false` states the family's off value in both spellings, neither of
+    // which may be left out if an inherited double strike is to stop rendering.
     const struck = statesOn(body, "w:strike", OFF_VALUES) || statesOn(body, "w:dstrike", OFF_VALUES);
     if (!(edit.strike && struck)) {
       const without = body.replace(elementPattern("w:strike"), "").replace(elementPattern("w:dstrike"), "");
-      body = edit.strike ? insertOrderedChild(without, "strike", "<w:strike/>", RUN_PROPERTY_ORDER) : without;
+      body = insertOrderedChild(without, "strike", edit.strike ? "<w:strike/>" : '<w:strike w:val="false"/>', RUN_PROPERTY_ORDER);
+      // A `false` states the off value in both spellings of the one property: a
+      // spelling left out would let a style's or `docDefaults`' own `<w:dstrike/>`
+      // still draw the strike the request switched off.
+      if (!edit.strike) body = insertOrderedChild(body, "dstrike", '<w:dstrike w:val="false"/>', RUN_PROPERTY_ORDER);
     }
   }
   if (!body && !revision) return "";
@@ -3782,20 +3823,23 @@ function numberFormatId(styles, formatCode) {
 }
 
 // The `<font>` a request needs, from the cell's own: a toggle writes or drops
-// `<b/>`/`<i/>`, `size` replaces `<sz>`, `color` replaces `<color rgb="FF……"/>`
-// (the digits uppercased under a full alpha, the spelling Excel writes) and `font`
-// replaces `<name>` — and takes the font out of the theme's scheme with it: a
-// `<scheme val="minor"/>` beside a `<name>` says the face is the one the workbook's
-// THEME states, so a requested face kept beside it would still render as the
-// theme's and be rewritten by a theme change (the scheme element is what tells a
-// reader the font IS the theme's — ISO/IEC 29500 §18.8.35). `<family>`, `<charset>`
-// and anything the request did not name keep their own bytes, `<scheme>` among them
-// when the face is not named; a child written back goes at its place in `EG_Font`
-// (`insertOrderedChild`), so it is not written where a reader would drop it.
+// `<b/>`, `<i/>`, `<u/>` and `<strike/>` — a `<font>` entry is a complete
+// description of the look, so dropping one IS switching the property off, and the
+// cell renders no such property whatever its row or column states — `size` replaces
+// `<sz>`, `color` replaces `<color rgb="FF……"/>` (the digits uppercased under a full
+// alpha, the spelling Excel writes) and `font` replaces `<name>` — and takes the
+// font out of the theme's scheme with it: a `<scheme val="minor"/>` beside a
+// `<name>` says the face is the one the workbook's THEME states, so a requested face
+// kept beside it would still render as the theme's and be rewritten by a theme
+// change (the scheme element is what tells a reader the font IS the theme's —
+// ISO/IEC 29500 §18.8.35). `<family>`, `<charset>` and anything the request did not
+// name keep their own bytes, `<scheme>` among them when the face is not named; a
+// child written back goes at its place in `EG_Font` (`insertOrderedChild`), so it is
+// not written where a reader would drop it.
 function formatFont(font, edit) {
   const { open, body } = elementParts(font, "font");
   let out = body;
-  for (const [name, toggle] of [["b", "bold"], ["i", "italic"]]) {
+  for (const [name, toggle] of [["b", "bold"], ["i", "italic"], ["u", "underline"], ["strike", "strike"]]) {
     if (edit[toggle] === undefined) continue;
     const without = out.replace(elementPattern(name), "");
     out = edit[toggle] ? insertOrderedChild(without, name, `<${name}/>`, FONT_PROPERTY_ORDER) : without;
@@ -3901,7 +3945,7 @@ function xfAttributeId(styles, xf, attribute, applied) {
 function styledXf(styles, xf, edit) {
   let current = styles;
   let out = xf;
-  if (["font", "size", "bold", "italic", "color"].some((name) => edit[name] !== undefined)) {
+  if (["font", "size", "bold", "italic", "underline", "strike", "color"].some((name) => edit[name] !== undefined)) {
     const fontId = xfAttributeId(current, out, "fontId", "applyFont");
     const put = putStyleEntry(current, "fonts", formatFont(styleBlockEntries(current, "fonts")[fontId] ?? STYLE_PART_ENTRIES.fonts, edit));
     current = put.styles;
@@ -5174,7 +5218,7 @@ function rangeFormat(edit) {
     format.size = edit.size;
     named = true;
   }
-  for (const toggle of ["bold", "italic"]) {
+  for (const toggle of ["bold", "italic", "underline", "strike"]) {
     if (edit[toggle] === undefined) continue;
     if (typeof edit[toggle] !== "boolean") throw new UsageError(`${toggle} must be true or false`);
     format[toggle] = edit[toggle];
@@ -5214,7 +5258,7 @@ function rangeFormat(edit) {
     format.number_format = code;
     named = true;
   }
-  if (!named) throw new UsageError("a format_cells range target names no property — hint: name at least one of font, size, bold, italic, color, fill, border, align, vertical, wrap or number_format");
+  if (!named) throw new UsageError("a format_cells range target names no property — hint: name at least one of font, size, bold, italic, underline, strike, color, fill, border, align, vertical, wrap or number_format");
   return format;
 }
 
@@ -5415,7 +5459,7 @@ function splitColumn(entry, column, width) {
 // directly before `<sheetData>`, the place `CT_Worksheet` requires of it.
 function formatColumn(editor, part, edit) {
   const column = columnNumber(edit.column);
-  const width = edit.width;
+  const width = edit.width_chars;
   editor.sheet(part, (xml) => {
     const source = ensureSheetData(xml);
     // The block the entry goes into, or `undefined` for a sheet that states none; one
@@ -5452,7 +5496,7 @@ function formatColumn(editor, part, edit) {
 // would renumber the rows after it.
 function formatRow(editor, part, edit) {
   const row = rowNumber(edit.row);
-  const height = edit.height;
+  const height = edit.height_points;
   editor.sheet(part, (xml) => {
     const existing = sheetRows(xml).find((candidate) => candidate.number === row);
     if (existing) {
@@ -5490,13 +5534,13 @@ function xlsxFormatCells(editor, edit, input, stylesName) {
     return;
   }
   if (targets[0] === "column") {
-    if (edit.width === undefined) throw new UsageError("a format_cells column target names no width — hint: name width");
-    if (!inSpan(edit.width, RULES.column_width_chars)) throw new UsageError(`width must be ${spanBounds(RULES.column_width_chars)} characters, got: ${JSON.stringify(edit.width)}`);
+    if (edit.width_chars === undefined) throw new UsageError("a format_cells column target names no width_chars — hint: name width_chars");
+    if (!inSpan(edit.width_chars, RULES.column_width_chars)) throw new UsageError(`width_chars must be ${spanBounds(RULES.column_width_chars)} characters, got: ${JSON.stringify(edit.width_chars)}`);
     formatColumn(editor, part, edit);
     return;
   }
-  if (edit.height === undefined) throw new UsageError("a format_cells row target names no height — hint: name height");
-  if (!inSpan(edit.height, RULES.row_height_points)) throw new UsageError(`height must be ${spanBounds(RULES.row_height_points)} points, got: ${JSON.stringify(edit.height)}`);
+  if (edit.height_points === undefined) throw new UsageError("a format_cells row target names no height_points — hint: name height_points");
+  if (!inSpan(edit.height_points, RULES.row_height_points)) throw new UsageError(`height_points must be ${spanBounds(RULES.row_height_points)} points, got: ${JSON.stringify(edit.height_points)}`);
   formatRow(editor, part, edit);
 }
 
@@ -6703,11 +6747,11 @@ function withRunFill(body, element) {
   return written ? out : out + element;
 }
 
-// The run properties a format request writes for one run: `bold`, `italic` and
-// `underline` are attributes of `<a:rPr>`, `size` replaces its `sz` attribute
-// (DrawingML counts hundredths of a point in it) and `color` the run's own solid
-// fill. Everything the request does not name keeps the bytes it had, and a toggle
-// set to `false` writes the off value so it overrides what the run inherits.
+// The run properties a format request writes for one run: `bold`, `italic`,
+// `underline` and `strike` are attributes of `<a:rPr>`, `size` replaces its `sz`
+// attribute (DrawingML counts hundredths of a point in it) and `color` the run's own
+// solid fill. Everything the request does not name keeps the bytes it had, and a
+// toggle set to `false` writes the off value so it overrides what the run inherits.
 function formattedSlideRunProperties(runXml, format) {
   const current = runPropertiesOf(runXml);
   // The properties read through the shared element rule — `elementParts` opens a
@@ -6719,6 +6763,7 @@ function formattedSlideRunProperties(runXml, format) {
   if (format.bold !== undefined) tag = setXmlAttribute(tag, "b", format.bold ? "1" : "0");
   if (format.italic !== undefined) tag = setXmlAttribute(tag, "i", format.italic ? "1" : "0");
   if (format.underline !== undefined) tag = setXmlAttribute(tag, "u", format.underline ? "sng" : "none");
+  if (format.strike !== undefined) tag = setXmlAttribute(tag, "strike", format.strike ? "sngStrike" : "noStrike");
   if (format.size !== undefined) tag = setXmlAttribute(tag, "sz", format.size);
   if (format.color !== undefined) {
     body = withRunFill(body, `<a:solidFill><a:srgbClr val="${format.color}"/></a:solidFill>`);
@@ -6773,7 +6818,7 @@ function slideFormat(edit) {
   const format = { runs: false };
   // A `null` property counts as absent — the caller's own boundary treats a
   // null-valued key that way — so only a stated one is written.
-  for (const name of ["bold", "italic", "underline"]) {
+  for (const name of ["bold", "italic", "underline", "strike"]) {
     if (edit[name] == null) continue;
     if (typeof edit[name] !== "boolean") throw new UsageError(`${name} must be true or false`);
     format[name] = edit[name];
@@ -6795,7 +6840,7 @@ function slideFormat(edit) {
     if (!SLIDE_ALIGNMENTS.has(edit.align)) throw new UsageError(`align must be ${listed([...SLIDE_ALIGNMENTS.keys()])}, got: ${JSON.stringify(edit.align)}`);
     format.align = SLIDE_ALIGNMENTS.get(edit.align);
   }
-  if (!format.runs && format.align === undefined) throw new UsageError("format_text needs at least one of bold, italic, underline, size, color or align");
+  if (!format.runs && format.align === undefined) throw new UsageError("format_text needs at least one of bold, italic, underline, strike, size, color or align");
   return format;
 }
 
@@ -6886,29 +6931,30 @@ function slideSize(zip) {
   return { width: side("cx", SLIDE_SIZE_DEFAULT.width), height: side("cy", SLIDE_SIZE_DEFAULT.height) };
 }
 
-// Where an added image goes, in EMU. `x` and `y` are fractions of the slide's
-// own width and height and so are `width` and `height`, which is what lets a
-// caller place an image without knowing the deck's size; an absent place is the
-// slide's middle and an absent size is the largest that fits the slide with the
-// image's own proportions. A size named on one side only keeps those proportions.
+// Where an added image goes, in EMU. `x_fraction` and `y_fraction` are fractions
+// of the slide's own width and height and so are `width_fraction` and
+// `height_fraction`, which is what lets a caller place an image without knowing
+// the deck's size; an absent place is the slide's middle and an absent size is
+// the largest that fits the slide with the image's own proportions. A size named
+// on one side only keeps those proportions.
 function imagePlacement(image, edit, slide) {
-  for (const name of ["x", "y", "width", "height"]) {
+  for (const name of ["x_fraction", "y_fraction", "width_fraction", "height_fraction"]) {
     const value = edit[name];
     if (value == null) continue;
-    const span = name === "width" || name === "height" ? RULES.slide_size_fraction : RULES.slide_position_fraction;
+    const span = name === "width_fraction" || name === "height_fraction" ? RULES.slide_size_fraction : RULES.slide_position_fraction;
     if (!inSpan(value, span)) throw new UsageError(`${name} must be ${spanBounds(span)}, got: ${JSON.stringify(value)}`);
   }
   const natural = { width: image.width * PX_TO_EMU, height: image.height * PX_TO_EMU };
   let width;
   let height;
-  if (edit.width != null && edit.height != null) {
-    width = edit.width * slide.width;
-    height = edit.height * slide.height;
-  } else if (edit.width != null) {
-    width = edit.width * slide.width;
+  if (edit.width_fraction != null && edit.height_fraction != null) {
+    width = edit.width_fraction * slide.width;
+    height = edit.height_fraction * slide.height;
+  } else if (edit.width_fraction != null) {
+    width = edit.width_fraction * slide.width;
     height = width * natural.height / natural.width;
-  } else if (edit.height != null) {
-    height = edit.height * slide.height;
+  } else if (edit.height_fraction != null) {
+    height = edit.height_fraction * slide.height;
     width = height * natural.width / natural.height;
   } else {
     const scale = Math.min(slide.width / natural.width, slide.height / natural.height);
@@ -6917,8 +6963,8 @@ function imagePlacement(image, edit, slide) {
   }
   const round = (value) => Math.max(1, Math.round(value));
   return {
-    x: Math.round(edit.x != null ? edit.x * slide.width : (slide.width - width) / 2),
-    y: Math.round(edit.y != null ? edit.y * slide.height : (slide.height - height) / 2),
+    x: Math.round(edit.x_fraction != null ? edit.x_fraction * slide.width : (slide.width - width) / 2),
+    y: Math.round(edit.y_fraction != null ? edit.y_fraction * slide.height : (slide.height - height) / 2),
     cx: round(width),
     cy: round(height),
   };
@@ -6965,7 +7011,7 @@ function withRelationshipNamespace(xml) {
 function addSlideImage(editor, edit) {
   const zip = editor.zip;
   const part = addressedSlide(zip, edit.slide);
-  const image = readImage(edit.path);
+  const image = readImage(edit.image);
   const media = nextMediaPart(zip, image.kind);
   editor.add(media, image.bytes);
   editor.part("[Content_Types].xml", (xml) => withOverride(xml, media, image.contentType));
@@ -7043,7 +7089,16 @@ function pageIndices(pdf, pages) {
   for (const index of indices) {
     if (index < 0 || index >= count) throw new UsageError(`no page ${index + 1}: this document has ${count} page(s)`);
   }
+  pageCountLimit(indices.length);
   return indices;
+}
+// The Rust boundary counts the pages a caller names explicitly, but a selection
+// resolving against the document's own length ("all") is only known here, so the
+// shared limit is enforced on the count a selection really resolves to.
+function pageCountLimit(count) {
+  if (count > RULES.max_pages_per_request) {
+    throw new UsageError(`the request names ${count} pages, more than one call takes (limit ${RULES.max_pages_per_request})`);
+  }
 }
 // A PDF position or angle a page operation may state: a finite number whose
 // magnitude no page can carry (a page is laid out in points). One helper, so
@@ -7083,10 +7138,15 @@ async function pdfMerge(req) {
 
 async function pdfSplit(req) {
   const source = await loadPdf(req.input);
+  // Every group's indices resolve first, so the cap is checked on the TOTAL the
+  // call names — 50 groups of "all" would each pass a per-selection check on their
+  // own — before any output is built.
+  const groups = req.groups.map((group) => pageIndices(source, group));
+  pageCountLimit(groups.reduce((total, indices) => total + indices.length, 0));
   const outputs = [];
-  for (const group of req.groups) {
+  for (const indices of groups) {
     const out = await PDFDocument.create();
-    for (const page of await out.copyPages(source, pageIndices(source, group))) out.addPage(page);
+    for (const page of await out.copyPages(source, indices)) out.addPage(page);
     outputs.push(await out.save());
   }
   return outputs;
@@ -7115,8 +7175,8 @@ async function pdfText(req) {
   // An absent size takes the body default; a stated one is a measure the page
   // must be able to show, so a zero is refused rather than read as "absent".
   const size = req.size === undefined ? 12 : req.size;
-  if (!inSpan(size, RULES.pdf_size_points)) {
-    throw new UsageError(`"size" must be ${spanBounds(RULES.pdf_size_points)} points, got ${size}`);
+  if (!inSpan(size, RULES.dimension_points)) {
+    throw new UsageError(`"size" must be ${spanBounds(RULES.dimension_points)} points, got ${size}`);
   }
   // A colour that is present but not a hex string (an empty string, a number,
   // `null`) is refused by `hexColor`; only an absent one takes the default.
@@ -7140,21 +7200,16 @@ async function pdfText(req) {
 async function pdfImage(req) {
   const pdf = await loadPdf(req.input);
   const image = await embedImage(pdf, req.image);
-  // The action's own sides are points, so the natural size is stated in points
-  // too (and the cap with it) — one rule, in the unit the caller is writing in.
-  const size = imageSize(
-    { width: image.width * PX_TO_POINTS, height: image.height * PX_TO_POINTS },
-    req.width,
-    req.height,
-    RULES.pdf_size_points,
-    DEFAULT_IMAGE_WIDTH * PX_TO_POINTS,
-  );
+  // The action's own sides are points, as the page is laid out, and the image's
+  // natural size and the cap are the pixels `imageSize` measures in: it answers in
+  // pixels, which the page draws in points.
+  const size = imageSize(image, req.width, req.height, RULES.dimension_points);
   for (const index of pageIndices(pdf, req.pages)) {
     const page = pdf.getPage(index);
     const { height } = page.getSize();
     const x = req.x === undefined ? MARGIN : pointNumber(req.x, "x");
     const y = req.y === undefined ? height / 2 : pointNumber(req.y, "y");
-    page.drawImage(image, { x, y, width: size.width, height: size.height });
+    page.drawImage(image, { x, y, width: size.width * PX_TO_POINTS, height: size.height * PX_TO_POINTS });
   }
   return pdf.save();
 }
@@ -7262,9 +7317,9 @@ const operations = {
       const edited = xlsxEdit({ input: `${scratch}/probe_edit.xlsx`, edits: [
         { op: "set_cell", sheet: "Данные", cell: "C3", value: "правка" },
         { op: "clear_cell", sheet: "Данные", cell: "A2" },
-        { op: "format_cells", sheet: "Данные", range: "A1:B1", size: 12, bold: true, italic: false, color: "FF0000", fill: "FFF2CC", border: { top: true, bottom: false }, align: "center", vertical: "top", wrap: true, number_format: "#,##0.00" },
-        { op: "format_cells", sheet: "Данные", column: "A", width: 14 },
-        { op: "format_cells", sheet: "Данные", row: 1, height: 20 },
+        { op: "format_cells", sheet: "Данные", range: "A1:B1", size: 12, bold: true, italic: false, underline: true, strike: false, color: "FF0000", fill: "FFF2CC", border: { top: true, bottom: false }, align: "center", vertical: "top", wrap: true, number_format: "#,##0.00" },
+        { op: "format_cells", sheet: "Данные", column: "A", width_chars: 14 },
+        { op: "format_cells", sheet: "Данные", row: 1, height_points: 20 },
         { op: "insert_row", sheet: "Данные", row: 1 },
         { op: "delete_row", sheet: "Данные", row: 4 },
         { op: "insert_column", sheet: "Данные", column: "A" },
@@ -7284,8 +7339,8 @@ const operations = {
       ] }));
       const edited = pptxEdit({ input: `${scratch}/probe_edit.pptx`, edits: [
         { op: "replace_text", slide: 1, find: "слайда", replace: "правки" },
-        { op: "format_text", slide: 1, find: "Текст", bold: true, color: "#FF0000", align: "center" },
-        { op: "add_image", slide: 1, path: `${scratch}/probe.png`, width: 0.3 },
+        { op: "format_text", slide: 1, find: "Текст", bold: true, strike: true, color: "#FF0000", align: "center" },
+        { op: "add_image", slide: 1, image: `${scratch}/probe.png`, width_fraction: 0.3 },
         { op: "add_paragraph", slide: 1, text: "Лишнее" },
         { op: "remove_paragraph", slide: 1, find: "Лишнее" },
         { op: "add_paragraph", slide: 1, text: "Добавлено" },

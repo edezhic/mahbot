@@ -56,22 +56,16 @@ use office_oxide::xls::{CellValue, Sheet, XlsDocument, XlsError};
 use std::io::Cursor;
 use std::path::Path;
 
-/// Extensions accepted as legacy Word documents.
-const DOC_EXTENSIONS: &[&str] = &["doc"];
-/// Extensions accepted as legacy Excel workbooks.
-const XLS_EXTENSIONS: &[&str] = &["xls"];
-/// Extensions accepted as legacy PowerPoint presentations.
-const PPT_EXTENSIONS: &[&str] = &["ppt"];
-
 /// `OleObjectInfo::kind` of an OLE object a deck links rather than holds: the
 /// file keeps the link, and the content it points at is somewhere else, so the
 /// report names nothing for it. The media kinds carry no such distinction, so a
 /// linked sound or video is named like an embedded one.
 const OLE_LINKED: u32 = 1;
 
-/// The legacy family a file name belongs to. The CFB magic is shared by all
-/// three (and by an encrypted OOXML package), so only the name can tell them
-/// apart.
+/// The legacy family a caller reads `bytes` as. The CFB magic is shared by all
+/// three (and by a genuinely encrypted OOXML package), so it says nothing on its
+/// own: [`crate::document::real_family`] is what tells them apart, and the write
+/// path asks the family's own reader whether the file is encrypted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Family {
     Doc,
@@ -89,17 +83,29 @@ impl Family {
             Self::Ppt => "ppt",
         }
     }
+
+    /// The real family an old binary file of this family is.
+    #[must_use]
+    pub(crate) const fn real(self) -> crate::document::RealFamily {
+        match self {
+            Self::Doc => crate::document::RealFamily::LegacyDoc,
+            Self::Xls => crate::document::RealFamily::LegacyXls,
+            Self::Ppt => crate::document::RealFamily::LegacyPpt,
+        }
+    }
 }
 
-/// `path`'s legacy family, or `None` when its name is not one of them. The
-/// extension lists above are the only place the families' extensions live.
+/// The old binary family `path`'s NAME claims, or `None` when it claims none.
+/// Asked only about a CFB container whose own directory names no Office
+/// document, where the name is the last evidence a caller has; the content
+/// decides everywhere else, so a `.doc`-named ZIP is not an old `.doc`.
 #[must_use]
-pub(crate) fn family_of(path: &Path) -> Option<Family> {
-    if crate::util::has_extension(path, DOC_EXTENSIONS) {
+pub(crate) fn named_family(path: &Path) -> Option<Family> {
+    if crate::util::has_extension(path, &["doc"]) {
         Some(Family::Doc)
-    } else if crate::util::has_extension(path, XLS_EXTENSIONS) {
+    } else if crate::util::has_extension(path, &["xls"]) {
         Some(Family::Xls)
-    } else if crate::util::has_extension(path, PPT_EXTENSIONS) {
+    } else if crate::util::has_extension(path, &["ppt"]) {
         Some(Family::Ppt)
     } else {
         None
@@ -126,6 +132,20 @@ fn parse(bytes: &[u8], family: Family) -> DocOutcome {
         Family::Xls => convert_xls(bytes),
         Family::Ppt => convert_ppt(bytes),
     }
+}
+
+/// Whether `bytes` is a password-protected document of `family`. The family's own
+/// reader is the only thing that can tell encryption from corruption — the CFB
+/// container looks the same either way — so this asks it and reads the verdict a
+/// reading would give, rather than second-guessing the streams. Deliberately a
+/// whole parse: only the write path calls this, and it must know about a password
+/// before it reserves an output.
+#[must_use]
+pub(crate) fn is_encrypted(bytes: &[u8], family: Family) -> bool {
+    matches!(
+        convert(bytes, family),
+        DocOutcome::Unreadable { reason } if reason == ENCRYPTED_REASON
+    )
 }
 
 /// A `.doc` reading: the body, then each subdocument story the document has as
@@ -455,11 +475,18 @@ fn paragraph_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The password-protected verdict, shared by all three families and with the
-/// OOXML/PDF arms.
+/// The reason of the password-protected verdict: one literal the whole document
+/// layer states — the OOXML arms and the PDF arm write it themselves — because a
+/// caller recognizes a password by it rather than by the arm that produced it, and
+/// the write path's [`is_encrypted`] must recognize the very verdict a reading
+/// gives.
+const ENCRYPTED_REASON: &str = "password-protected";
+
+/// The password-protected verdict, in the reason every family's reader states
+/// (see [`ENCRYPTED_REASON`]).
 fn encrypted() -> DocOutcome {
     DocOutcome::Unreadable {
-        reason: "password-protected".to_string(),
+        reason: ENCRYPTED_REASON.to_string(),
     }
 }
 
@@ -511,12 +538,15 @@ fn corrupt(family: Family) -> DocOutcome {
     }
 }
 
+/// Fixtures shared by this module's tests and [`crate::document`]'s: both need a
+/// real CFB container, and the CFB assembler and the `.doc` stream recipe are
+/// built here once so the two sides classify and read the very same file.
 #[cfg(test)]
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the hand-built fixtures' stream offsets and counts fit the CFB/BIFF/PPT record fields by construction"
 )]
-mod tests {
+pub(crate) mod test_fixtures {
     use super::*;
 
     // ── CFB container fixture ───────────────────────────────────────────
@@ -543,7 +573,7 @@ mod tests {
     /// 512-byte directory sectors as it takes, chained through the FAT like
     /// every other chain. The header's directory count stays 0 (a v3 reader
     /// derives the span from the chain) and its FAT-sector count stays 1.
-    fn cfb(streams: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn cfb(streams: &[(&str, &[u8])]) -> Vec<u8> {
         // Sector plan: directory sectors (four entries each), the FAT sector,
         // then each stream in order.
         let dir_sectors = (streams.len() + 1).div_ceil(4) as u32;
@@ -651,38 +681,6 @@ mod tests {
         buf[0x78..0x7C].copy_from_slice(&size.to_le_bytes());
     }
 
-    /// One `OfficeArtBlipJPEG` record holding a tiny JPEG: record type 0xF01D
-    /// ([MS-ODRAW] §2.2.27), `rh.recInstance` 0x46A, then the 17-byte header
-    /// the reader's `uid_size` computes for it (16-byte UID + 1 tag byte; a
-    /// bitmap BLIP has no `metafile_header_size`) and a payload starting
-    /// `\xff\xd8`. The bytes mirror `office_oxide`'s own `make_blip_in_data`
-    /// fixture (`doc/images.rs`) record for record: the crate pads that record
-    /// with junk on both sides to imitate a mixed `.doc` `Data` stream, which
-    /// is left off here because the `Pictures` walk reads from the stream's
-    /// first record, while the `.doc`/`.xls` scans search byte by byte and
-    /// find the record wherever it sits. The crate is pinned exactly, so a
-    /// reader change to this shape would be a deliberate version bump.
-    fn jpeg_blip() -> Vec<u8> {
-        let img: &[u8] = b"\xff\xd8\xff\xe0JFIF";
-        let rec_type: u16 = 0xF01D;
-        let inst: u16 = 0x46A;
-        let uid_sz = 17; // no secondary UID: bit 0 of `inst` is clear
-        let rec_len = uid_sz + img.len();
-        let mut buf = (inst << 4).to_le_bytes().to_vec();
-        buf.extend_from_slice(&rec_type.to_le_bytes());
-        buf.extend_from_slice(&(rec_len as u32).to_le_bytes());
-        buf.extend(vec![0u8; uid_sz]);
-        buf.extend_from_slice(img);
-        buf
-    }
-
-    /// The report line an arm gives one embedded image, and one embedded
-    /// object — pinned as literals so a wording drift in
-    /// [`crate::reader_output::Unshown`] fails a test instead of sliding
-    /// through.
-    const UNSHOWN_IMAGE: &str = "1 embedded image(s) not shown";
-    const UNSHOWN_OBJECT: &str = "1 embedded object part(s) not shown";
-
     // ── Word (.doc) ─────────────────────────────────────────────────────
 
     /// Offset the fixtures put the Word text at, past every FIB field.
@@ -750,7 +748,7 @@ mod tests {
     /// subdocuments. Each story is one UTF-16LE piece, laid out after the body
     /// in the fixed `[MS-DOC]` story order its `ccp*` length addresses. `body`
     /// is one piece at [`DOC_TEXT_FC`].
-    fn doc_streams(
+    pub(super) fn doc_streams(
         body: &str,
         stories: &[(SubDocumentKind, &str)],
         encrypted: bool,
@@ -784,10 +782,56 @@ mod tests {
     }
 
     /// A `.doc` package from [`doc_streams`].
-    fn doc_fixture(body: &str, stories: &[(SubDocumentKind, &str)], encrypted: bool) -> Vec<u8> {
+    pub(crate) fn doc_fixture(
+        body: &str,
+        stories: &[(SubDocumentKind, &str)],
+        encrypted: bool,
+    ) -> Vec<u8> {
         let (word, clx) = doc_streams(body, stories, encrypted);
         cfb(&[("WordDocument", &word), ("1Table", &clx)])
     }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the hand-built fixtures' stream offsets and counts fit the CFB/BIFF/PPT record fields by construction"
+)]
+mod tests {
+    use super::test_fixtures::*;
+    use super::*;
+
+    /// One `OfficeArtBlipJPEG` record holding a tiny JPEG: record type 0xF01D
+    /// ([MS-ODRAW] §2.2.27), `rh.recInstance` 0x46A, then the 17-byte header
+    /// the reader's `uid_size` computes for it (16-byte UID + 1 tag byte; a
+    /// bitmap BLIP has no `metafile_header_size`) and a payload starting
+    /// `\xff\xd8`. The bytes mirror `office_oxide`'s own `make_blip_in_data`
+    /// fixture (`doc/images.rs`) record for record: the crate pads that record
+    /// with junk on both sides to imitate a mixed `.doc` `Data` stream, which
+    /// is left off here because the `Pictures` walk reads from the stream's
+    /// first record, while the `.doc`/`.xls` scans search byte by byte and
+    /// find the record wherever it sits. The crate is pinned exactly, so a
+    /// reader change to this shape would be a deliberate version bump.
+    fn jpeg_blip() -> Vec<u8> {
+        let img: &[u8] = b"\xff\xd8\xff\xe0JFIF";
+        let rec_type: u16 = 0xF01D;
+        let inst: u16 = 0x46A;
+        let uid_sz = 17; // no secondary UID: bit 0 of `inst` is clear
+        let rec_len = uid_sz + img.len();
+        let mut buf = (inst << 4).to_le_bytes().to_vec();
+        buf.extend_from_slice(&rec_type.to_le_bytes());
+        buf.extend_from_slice(&(rec_len as u32).to_le_bytes());
+        buf.extend(vec![0u8; uid_sz]);
+        buf.extend_from_slice(img);
+        buf
+    }
+
+    /// The report line an arm gives one embedded image, and one embedded
+    /// object — pinned as literals so a wording drift in
+    /// [`crate::reader_output::Unshown`] fails a test instead of sliding
+    /// through.
+    const UNSHOWN_IMAGE: &str = "1 embedded image(s) not shown";
+    const UNSHOWN_OBJECT: &str = "1 embedded object part(s) not shown";
 
     /// [`doc_fixture`]'s package plus a third root stream `Data` holding one
     /// JPEG BLIP — where Word 97 keeps a picture, which the reader finds by
@@ -1684,20 +1728,10 @@ mod tests {
 
     // ── Classification ──────────────────────────────────────────────────
 
-    #[test]
-    fn family_of_lists_exactly_the_legacy_extensions() {
-        assert_eq!(family_of(Path::new("a.doc")), Some(Family::Doc));
-        assert_eq!(family_of(Path::new("a.DOC")), Some(Family::Doc));
-        assert_eq!(family_of(Path::new("a.xls")), Some(Family::Xls));
-        assert_eq!(family_of(Path::new("a.ppt")), Some(Family::Ppt));
-        assert_eq!(family_of(Path::new("a.docx")), None);
-        assert_eq!(family_of(Path::new("a.txt")), None);
-    }
-
     /// The classification of a legacy-named CFB container is `document.rs`'s
-    /// own (`cfb_magic_classifies_by_name`); what this covers is that every
-    /// family's reader calls a garbage container corruption rather than a format
-    /// this project does not convert.
+    /// own (`legacy_doc_named_docx_is_read_as_a_legacy_document` there); what
+    /// this covers is that every family's reader calls a garbage container
+    /// corruption rather than a format this project does not convert.
     #[test]
     fn garbage_cfb_is_unreadable_not_unsupported() {
         let mut bytes = crate::document::CFB_MAGIC.to_vec();

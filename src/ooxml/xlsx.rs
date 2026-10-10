@@ -41,9 +41,9 @@
 //!   `src/prompt/tool/read.md`** — a mark this module adds belongs there too.
 
 use super::{
-    Part, Relationship, ZipEntry, append_entity, attr, blank, part_dir, read_zip_entry, rel_id,
-    relationship_targets, relationships, relationships_and_whole, rels_part_of, resolve_part,
-    scan_elements, unopened_parts, unreadable, write_media_parts,
+    Family, Part, Relationship, ZipEntry, append_entity, attr, blank, part_dir, read_zip_entry,
+    rel_id, relationship_targets, relationships, relationships_and_whole, rels_part_of,
+    resolve_part, scan_elements, unopened_parts, unreadable, write_media_parts,
 };
 use crate::document::{DocOutcome, SkippedImages, ensure_out_dir};
 use crate::reader_output::{
@@ -64,7 +64,7 @@ mod numfmt;
 // ── Part names ──────────────────────────────────────────────────
 
 /// Part holding the workbook's sheet names and their relationship ids.
-const WORKBOOK_PART: &str = "xl/workbook.xml";
+pub(crate) const WORKBOOK_PART: &str = "xl/workbook.xml";
 /// Relationships of the workbook part: sheet relationship id -> sheet part.
 const WORKBOOK_RELS_PART: &str = "xl/_rels/workbook.xml.rels";
 /// Part holding the strings the `t="s"` cells index into.
@@ -123,7 +123,7 @@ const CHART_SHEET_REL: &str = "/chartsheet";
 #[must_use]
 pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
-        return unreadable(".xlsx");
+        return unreadable(Family::Xlsx);
     };
     // The workbook part is read in one walk: its sheets, its date system and its
     // defined names come out of the same pass, which also says whether the part was
@@ -133,7 +133,7 @@ pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         .bytes()
         .and_then(|xml| workbook(&xml))
     else {
-        return unreadable(".xlsx");
+        return unreadable(Family::Xlsx);
     };
     // The workbook relationships are read once: the sheet parts resolve through
     // them, the shared-string table, the styles part and the persons part are
