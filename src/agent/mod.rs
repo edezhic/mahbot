@@ -5767,7 +5767,7 @@ mod tests {
             arguments: serde_json::json!({"path": "scan.pdf"}),
         }];
         let outcomes = vec![ToolExecutionOutcome {
-            output: "[scan.pdf: no text could be extracted — the pages were provided as images]"
+            output: "[scan.pdf: no text could be extracted — the content was provided as images]"
                 .into(),
             success: true,
             image_payloads: vec![ImagePayload {
@@ -5803,7 +5803,7 @@ mod tests {
             .expect("the tool result is persisted");
         assert_eq!(
             tool_result,
-            "[scan.pdf: no text could be extracted — the pages were provided as images]\n\
+            "[scan.pdf: no text could be extracted — the content was provided as images]\n\
              Generated image file /tmp/read_1/page_1.jpg (800x1000, JPEG). Image content attached \
              to the conversation as a native image.",
             "the answer keeps its text and gains the image annotation: {tool_result:?}"

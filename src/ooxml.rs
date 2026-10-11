@@ -23,7 +23,10 @@
 //!   never escape `out_dir`.
 
 use crate::docgen::ppt_marks;
-use crate::document::{DocOutcome, SkipReason, SkippedImages, ensure_out_dir};
+use crate::document::{
+    DELIVERABLE_IMAGE_EXTENSIONS, DRAWING_EXTENSIONS, DocOutcome, SkipReason, SkippedImages,
+    ensure_out_dir, write_picture,
+};
 use crate::reader_output::{
     Unshown, UnshownKind, slide_header, slide_notes_header, text_block, text_lines,
 };
@@ -61,10 +64,6 @@ const PPT_CHARTS_PREFIX: &str = "ppt/charts/";
 /// The objects a PowerPoint package embeds (`ppt/embeddings/`).
 const PPT_EMBEDDINGS_PREFIX: &str = "ppt/embeddings/";
 
-/// Media extensions written through to `out_dir` verbatim. Everything else
-/// (emf/wmf/tiff/bmp/gif/svg/...) would need transcoding this module avoids.
-const EMBEDDED_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
-
 /// Extensions of the picture formats a package embeds that this pipeline does not
 /// convert and the product's own picture list ([`crate::util::IMAGE_EXTENSIONS`])
 /// does not name: named as images, with the reason, because that is what they are.
@@ -74,10 +73,6 @@ const EMBEDDED_EXTRA_IMAGE_EXTENSIONS: &[&str] =
 /// formats ([`crate::util::VIDEO_EXTENSIONS`]): only a document's media directory
 /// carries these.
 const EMBEDDED_EXTRA_VIDEO_EXTENSIONS: &[&str] = &["m4v", "wmv", "mpg", "mpeg"];
-/// Extensions of the embedded media that are vector drawings rather than
-/// pictures of pixels: the report names them as the drawings they are instead of
-/// as images the pipeline cannot convert.
-const EMBEDDED_DRAWING_EXTENSIONS: &[&str] = &["emf", "wmf", "svg", "pict"];
 /// Extensions of the audio a package embeds.
 const EMBEDDED_AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "wav", "m4a", "aac", "ogg", "oga", "wma", "flac", "mid", "midi",
@@ -855,7 +850,7 @@ fn package_media(file_name: &str) -> PackageMedia {
         || crate::util::has_extension(path, EMBEDDED_EXTRA_IMAGE_EXTENSIONS)
     {
         PackageMedia::Image
-    } else if crate::util::has_extension(path, EMBEDDED_DRAWING_EXTENSIONS) {
+    } else if crate::util::has_extension(path, DRAWING_EXTENSIONS) {
         PackageMedia::Unshown(UnshownKind::Drawing)
     } else if crate::util::is_video_extension(path)
         || crate::util::has_extension(path, EMBEDDED_EXTRA_VIDEO_EXTENSIONS)
@@ -894,7 +889,7 @@ fn write_media_parts<R: Read + Seek>(
         // Only the entry's file name is used: a crafted `../..` entry must
         // never escape `out_dir`.
         let file_name = crate::util::neutralized_name(crate::util::file_name_or_path(&entry));
-        if !crate::util::has_extension(Path::new(&file_name), EMBEDDED_IMAGE_EXTENSIONS) {
+        if !crate::util::has_extension(Path::new(&file_name), DELIVERABLE_IMAGE_EXTENSIONS) {
             match package_media(&file_name) {
                 PackageMedia::Image => skipped.add(SkipReason::Unsupported),
                 PackageMedia::Unshown(kind) => unshown.add(kind, 1),
@@ -906,14 +901,13 @@ fn write_media_parts<R: Read + Seek>(
             skipped.add(SkipReason::Failed);
             continue;
         };
-        let path = unique_out_path(out_dir, &file_name, &mut next_suffix);
-        match std::fs::write(&path, &content) {
-            Ok(()) => images.push(path),
-            Err(e) => {
-                tracing::warn!(%file_name, error = %e, "document: failed to write embedded image");
-                skipped.add(SkipReason::Failed);
-            }
-        }
+        images.extend(write_picture(
+            out_dir,
+            &file_name,
+            &content,
+            &mut next_suffix,
+            skipped,
+        ));
     }
     images
 }
@@ -1378,31 +1372,6 @@ fn read_zip_entry<R: Read + Seek>(archive: &mut ZipArchive<R>, name: &str) -> Zi
         return ZipEntry::Unreadable;
     }
     ZipEntry::Bytes(bytes)
-}
-
-/// `out_dir/<file_name>`, suffixed `_2`, `_3`, … when that name is taken (see
-/// [`crate::util::suffixed_name`]).
-///
-/// A package can hold the same base name under different directories
-/// (`word/media/a.png` and `word/media/sub/a.png`), and only the base name is
-/// used here: without a suffix the first entry would be overwritten and the
-/// survivor ingested twice. The check is against the directory, not a counter,
-/// because `out_dir` also holds the attachment itself. `next_suffix` memoizes
-/// the first suffix still worth trying per name, so a package of many entries
-/// sharing one base name does not rescan the names already taken.
-fn unique_out_path(
-    out_dir: &Path,
-    file_name: &str,
-    next_suffix: &mut HashMap<String, u32>,
-) -> PathBuf {
-    let n = next_suffix.entry(file_name.to_owned()).or_insert(1);
-    while out_dir
-        .join(crate::util::suffixed_name(file_name, *n))
-        .exists()
-    {
-        *n += 1;
-    }
-    out_dir.join(crate::util::suffixed_name(file_name, *n))
 }
 
 /// The reason a reading gives a recognized OOXML package it cannot open — the

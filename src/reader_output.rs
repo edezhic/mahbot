@@ -118,10 +118,10 @@ pub(crate) const CHART_SHEET: &str = "(chart sheet)";
 /// A sheet's block header, marked when the workbook hides the sheet. The state a
 /// workbook writes is one of two words, and a producer's own casing is no reason
 /// to pass a hidden sheet off as an ordinary one. The legacy `.xls` reader
-/// deliberately passes `None`: an old format is read for its text alone and takes
-/// none of the newer arms' marks — not a hidden sheet, though the crate's own
-/// `Sheet::hidden` is right there and that arm reads the sheet struct anyway — so
-/// a legacy sheet is never marked (see [`crate::legacy`]).
+/// deliberately passes `None`: the old format takes none of the newer arms' marks
+/// — not a hidden sheet, though the crate's own `Sheet::hidden` is right there and
+/// that arm reads the sheet struct anyway — so a legacy sheet is never marked (see
+/// [`crate::legacy`]).
 pub(crate) fn sheet_header(name: &str, state: Option<&str>) -> String {
     match state.map(str::to_ascii_lowercase).as_deref() {
         Some("veryhidden") => format!("Sheet \"{name}\" (very hidden):"),
@@ -226,11 +226,8 @@ pub(crate) enum UnshownKind {
     /// so an object a package stores as more than one part (an OLE object and the
     /// workbook beside it) is named by each.
     Object,
-    /// An embedded picture no reader extracts: an old format's pictures, which
-    /// its arms read for text alone.
-    Image,
     /// An embedded vector drawing (EMF, WMF, SVG, PICT) among a package's media or
-    /// in an old format's picture list.
+    /// among an old format's pictures.
     Drawing,
     /// Embedded video among a package's media, or among an old presentation's
     /// objects.
@@ -260,7 +257,6 @@ impl UnshownKind {
             Self::ChartSheet => "chart sheet(s)",
             Self::Diagram => "diagram(s)",
             Self::Object => "embedded object part(s)",
-            Self::Image => "embedded image(s)",
             Self::Drawing => "embedded drawing(s)",
             Self::Video => "embedded video(s)",
             Self::Audio => "embedded audio(s)",

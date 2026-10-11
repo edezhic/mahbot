@@ -191,12 +191,12 @@ async fn compose_output(
     if !over_cap {
         // The payloads carry no recovery note: a document answer is content, so
         // its text block already opens with that note and repeating it on every
-        // page annotation would say the same thing 1+N times.
+        // image annotation would say the same thing 1+N times.
         for image in &images {
             // An image that cannot be encoded is counted in a note rather than
             // failing the call: the document itself was read.
             match crate::util::local_image_to_compressed_data_uri_with_meta(image).await {
-                // The page is this tool's own artifact — it never opened it as a
+                // The image is this tool's own artifact — it never opened it as a
                 // file — so the annotation labels it a produced image.
                 Ok(meta) => attached.push(ImagePayload::from_compressed_meta(
                     image,
@@ -223,8 +223,8 @@ async fn compose_output(
         if all_page_text_lost {
             String::new()
         } else if attached.is_empty() {
-            // Name the pages as provided only when one actually was attached;
-            // with none — no pages produced, all over the cap, or none
+            // Name the content provided as images only when an image actually was
+            // attached; with none — none produced, all over the cap, or none
             // encodable — the plain sentence is the honest one.
             answer_line(&display, crate::document::NO_TEXT_NOTE)
         } else {
@@ -246,8 +246,8 @@ async fn compose_output(
         .collect();
     if unattached > 0 {
         // Not the inbound sentence ("could not be read"): there the image
-        // pipeline rejected an image it was handed, here the raster could not be
-        // encoded. The folder is named so the page stays reachable.
+        // pipeline rejected an image it was handed, here the image could not be
+        // encoded. The folder is named so it stays reachable.
         trailing.push(answer_line(
             &display,
             format!(
@@ -343,8 +343,11 @@ mod tests {
     };
     // The CFB container and `.doc` package recipes live with the legacy reader,
     // so a classification test and this reading test build one file.
-    use crate::legacy::test_fixtures::{cfb, doc_fixture};
+    use crate::legacy::test_fixtures::{
+        cfb, doc_fixture, doc_picture_fixture, ppt_picture_fixture, xls_picture_fixture,
+    };
     use crate::ooxml::test_fixtures::{DOCX_BODY, zip_fixture};
+    use crate::util::test::noisy_png;
     use tempfile::TempDir;
 
     /// A temp workspace holding `files` (name, bytes) — hold the `TempDir` to
@@ -401,17 +404,6 @@ mod tests {
             .expect("read the document")
     }
 
-    /// Real PNG bytes of a `size`×`size` image: an embedded media part the
-    /// converter writes through verbatim and the payload encoder can decode.
-    fn png_fixture(size: u32) -> Vec<u8> {
-        let image = image::RgbImage::from_pixel(size, size, image::Rgb([10, 200, 10]));
-        let mut bytes = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(image)
-            .write_to(&mut bytes, image::ImageFormat::Png)
-            .expect("encode fixture png");
-        bytes.into_inner()
-    }
-
     /// A one-page PDF with a painted rectangle and no text layer: the page has
     /// to be rasterized, so the read comes back as an image and no text.
     fn raster_only_pdf() -> Vec<u8> {
@@ -459,13 +451,13 @@ mod tests {
     const EMPTY_DOCX_BODY: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body></w:body></w:document>"#;
 
-    /// The pages are named as attached only when they actually are: a document
-    /// with neither text nor images says the inbound sentence plainly (never
-    /// "could not be read" for a document that converted fine), and one whose
-    /// images are all over the cap points at the folder instead of claiming they
-    /// were attached.
+    /// A text-free document is called provided as images only when images actually
+    /// were attached: one with neither text nor images says the plain sentence
+    /// (never "could not be read" for a document that converted fine), and one
+    /// whose images are all over the cap points at the folder instead of claiming
+    /// they were attached.
     #[tokio::test]
-    async fn text_free_documents_name_their_pages_only_when_attached() {
+    async fn text_free_documents_claim_images_only_when_attached() {
         let empty = zip_fixture(&[("word/document.xml", EMPTY_DOCX_BODY)]);
         let owner = SpillOwner::new();
         let (_dir, ws) = temp_workspace(&[("empty.docx", &empty)]);
@@ -497,7 +489,7 @@ mod tests {
         );
         assert!(
             !out.text.contains(crate::document::NO_TEXT_LAYER_NOTE),
-            "pages that were not attached are not called attached: {:?}",
+            "images that were not attached are not called attached: {:?}",
             out.text
         );
     }
@@ -518,7 +510,7 @@ mod tests {
         );
         assert!(
             out.text
-                .contains("no text could be extracted — the pages were provided as images"),
+                .contains("no text could be extracted — the content was provided as images"),
             "{}",
             out.text
         );
@@ -709,7 +701,7 @@ mod tests {
     /// A `.docx` whose document body is `body` plus `count` embedded media
     /// entries — the shape the converter treats as delivered images.
     fn docx_with_images(body: &[u8], count: usize) -> Vec<u8> {
-        let png = png_fixture(16);
+        let png = noisy_png(16, 16);
         let names: Vec<String> = (1..=count)
             .map(|page| format!("word/media/page_{page}.png"))
             .collect();
@@ -753,6 +745,44 @@ mod tests {
                 .all(|path| std::path::Path::new(path).is_absolute()),
             "each image is named by its absolute path: {listed:?}"
         );
+    }
+
+    /// A reading of an old binary document delivers its embedded pictures exactly
+    /// as a reading of a modern one does: the picture is written out, attached to
+    /// the conversation as a native image, and no line reports it as left out —
+    /// while the source file is left untouched.
+    #[tokio::test]
+    async fn legacy_readings_deliver_their_pictures_like_a_modern_reading() {
+        let png = noisy_png(16, 16);
+        let fixtures = [
+            ("old.doc", doc_picture_fixture("Body text", &png)),
+            ("old.xls", xls_picture_fixture(&png)),
+            ("old.ppt", ppt_picture_fixture("Slide title", &png)),
+        ];
+        let owner = SpillOwner::new();
+        for (name, fixture) in &fixtures {
+            let (dir, ws) = temp_workspace(&[(name, fixture)]);
+            let out = convert(&owner, &ws, name, PathAccess::Allowlisted)
+                .await
+                .expect("an old binary document is a document");
+            assert_eq!(
+                out.image_payloads.len(),
+                1,
+                "{name}: the embedded picture is attached: {}",
+                out.text
+            );
+            assert_eq!(out.image_payloads[0].format, "PNG", "{name}");
+            assert!(
+                !out.text.contains("not shown]"),
+                "{name}: a delivered picture is not reported as left out: {}",
+                out.text
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join(name)).expect("re-read the source"),
+                *fixture,
+                "{name}: the reading never modifies the source file"
+            );
+        }
     }
 
     /// A listing too long to fit the budget is replaced by the folder holding

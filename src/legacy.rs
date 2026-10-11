@@ -8,17 +8,20 @@
 //! reading an old file and a new one reads both the same way: the Word
 //! subdocument stories are labelled blocks, one per story and in the order a
 //! `.docx` reading prints them, and every value or name is kept to one line.
-//! Each arm also fills the shared report of what a reading did not show
-//! ([`crate::reader_output::Unshown`]): its pictures counted by kind — a vector
-//! metafile as a drawing, every other BLIP as an image — a `.ppt`'s objects
-//! counted by what they are (a video or a sound, otherwise an embedded object; an
-//! OLE object the deck only links is counted not at all, since the file holds the
-//! link and not what it points at), and each `.xls` chart sheet, so no image,
-//! chart or embedded object the crate hands over vanishes silently; the `.xls`
-//! arm names the chart text its reader recovers in a note of its own. A media
-//! object is named by its kind whether the deck holds it or links it: the reader
-//! tells the two apart for OLE objects alone, and the file holds the object's own
-//! record either way. What the arms deliberately do not adopt
+//! Each arm also delivers what the reading found. The pictures the pipeline
+//! converts are written into `out_dir` like a modern package's media parts, and
+//! every picture it does not convert is named: a vector metafile as a drawing in
+//! the shared report of what a reading did not show
+//! ([`crate::reader_output::Unshown`]), any other format in the same "cannot
+//! convert" note a modern package's picture gets. The report also holds a `.ppt`'s
+//! objects counted by what they are (a video or a sound, otherwise an embedded
+//! object; an OLE object the deck only links is counted not at all, since the file
+//! holds the link and not what it points at) and each `.xls` chart sheet, so no
+//! chart or embedded object the crate hands over vanishes silently; the `.xls` arm
+//! names the chart text its reader recovers in a note of its own. A media object is
+//! named by its kind whether the deck holds it or links it: the reader tells the
+//! two apart for OLE objects alone, and the file holds the object's own record
+//! either way. What the arms deliberately do not adopt
 //! is the newer arms' vocabulary: hidden geometry, hidden sheets, hidden slides,
 //! merged ranges, cell comments, hyperlinks, defined names, per-note splitting and
 //! formula text stay out, as does any mark the reader gives no way to place.
@@ -38,23 +41,28 @@
 //!   `Unsupported` (which the callers read as "fall back to the raw bytes");
 //!   everything else unreadable is reported as corrupt, never as a format this
 //!   project does not convert.
-//! - **Reading only.** Nothing here writes a file, touches channel state, the
-//!   database or the network; the old formats are read, never edited.
+//! - **Reading only.** The source file is never modified and never opened for
+//!   writing; the only file created is a delivered picture inside the caller's
+//!   `out_dir`. Nothing here touches channel state, the database or the network.
 
-use crate::document::DocOutcome;
+use crate::document::{
+    DELIVERABLE_IMAGE_EXTENSIONS, DRAWING_EXTENSIONS, DocOutcome, SkipReason, SkippedImages,
+    ensure_out_dir, write_picture,
+};
 use crate::reader_output::{
     DOC_COMMENTS, DOC_ENDNOTES, DOC_FOOTNOTES, DOC_HEADERS_FOOTERS, NO_VALUES, TEXT_BOX, Unshown,
     UnshownKind, column_letters, sheet_header, slide_header, slide_notes_header, text_block,
     text_lines,
 };
 use crate::util::one_line;
-use office_oxide::cfb::blip::{BlipFormat, BlipImage};
+use office_oxide::cfb::blip::BlipImage;
 use office_oxide::doc::{DocDocument, DocError, SubDocumentKind};
 use office_oxide::ir::SheetKind;
 use office_oxide::ppt::{OleObjectInfo, PptDocument, PptError, SlideText, TextType};
 use office_oxide::xls::{CellValue, Sheet, XlsDocument, XlsError};
+use std::collections::HashMap;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// `OleObjectInfo::kind` of an OLE object a deck links rather than holds: the
 /// file keeps the link, and the content it points at is somewhere else, so the
@@ -113,24 +121,25 @@ pub(crate) fn named_family(path: &Path) -> Option<Family> {
 }
 
 /// Read `bytes` as the legacy format `family`, into the shapes the OOXML arms
-/// use. The whole parse is contained: a panic costs the document, not the
+/// use, writing delivered pictures into `out_dir` (see [`write_pictures`]) when it
+/// is given. The whole parse is contained: a panic costs the document, not the
 /// caller's turn. The containment is [`crate::shutdown::contain_panics`] rather
 /// than a bare `catch_unwind`, so a panic inside the `office_oxide` readers on
 /// an ordinary user file does not print a panic report and backtrace into the
 /// product's logs while the caller is told the file is merely corrupt.
 #[must_use]
-pub(crate) fn convert(bytes: &[u8], family: Family) -> DocOutcome {
-    match crate::shutdown::contain_panics(|| parse(bytes, family)) {
+pub(crate) fn convert(bytes: &[u8], family: Family, out_dir: Option<&Path>) -> DocOutcome {
+    match crate::shutdown::contain_panics(|| parse(bytes, family, out_dir)) {
         Ok(outcome) => outcome,
         Err(_) => corrupt(family),
     }
 }
 
-fn parse(bytes: &[u8], family: Family) -> DocOutcome {
+fn parse(bytes: &[u8], family: Family, out_dir: Option<&Path>) -> DocOutcome {
     match family {
-        Family::Doc => convert_doc(bytes),
-        Family::Xls => convert_xls(bytes),
-        Family::Ppt => convert_ppt(bytes),
+        Family::Doc => convert_doc(bytes, out_dir),
+        Family::Xls => convert_xls(bytes, out_dir),
+        Family::Ppt => convert_ppt(bytes, out_dir),
     }
 }
 
@@ -139,11 +148,13 @@ fn parse(bytes: &[u8], family: Family) -> DocOutcome {
 /// container looks the same either way — so this asks it and reads the verdict a
 /// reading would give, rather than second-guessing the streams. Deliberately a
 /// whole parse: only the write path calls this, and it must know about a password
-/// before it reserves an output.
+/// before it reserves an output. The parse is given no output directory, so a
+/// probe that only inspects a file writes nothing and names nothing (the write
+/// path's `container_family` calls it and reserves no output).
 #[must_use]
 pub(crate) fn is_encrypted(bytes: &[u8], family: Family) -> bool {
     matches!(
-        convert(bytes, family),
+        convert(bytes, family, None),
         DocOutcome::Unreadable { reason } if reason == ENCRYPTED_REASON
     )
 }
@@ -156,7 +167,7 @@ pub(crate) fn is_encrypted(bytes: &[u8], family: Family) -> bool {
 /// numbering and the inline `[text box]` placement of the `.docx` reading have
 /// no counterpart in what this reader exposes. The body and every story line
 /// follow the one-line-per-unit rule ([`paragraph_lines`]).
-fn convert_doc(bytes: &[u8]) -> DocOutcome {
+fn convert_doc(bytes: &[u8], out_dir: Option<&Path>) -> DocOutcome {
     match DocDocument::from_reader(Cursor::new(bytes)) {
         Ok(doc) => {
             let mut sections: Vec<String> = Vec::new();
@@ -203,13 +214,14 @@ fn convert_doc(bytes: &[u8]) -> DocOutcome {
                         .to_string(),
                 );
             }
-            // A `.doc` reads for its text only; the object names above are the
-            // reader's own, so only its pictures are left to report.
+            // The reader's object names are the sections above; its pictures are
+            // delivered — and the ones this pipeline does not convert named — the
+            // way any other reading's are.
             let mut unshown = Unshown::default();
-            count_pictures(&mut unshown, doc.images());
+            let images = write_pictures(|| doc.images(), out_dir, &mut unshown, &mut notes);
             DocOutcome::Text {
                 text: sections.join("\n").trim_end().to_string(),
-                images: Vec::new(),
+                images,
                 notes,
                 unshown,
                 all_page_text_lost: false,
@@ -259,7 +271,7 @@ fn doc_plain_text_before_objects(doc: &DocDocument) -> String {
 /// value the way Excel displays it. Hidden geometry, merged ranges, cell comments,
 /// hyperlinks and defined names are marked by the `.xlsx` arm alone. A cell whose
 /// formula the reader cannot recover shows the value Excel cached for it.
-fn convert_xls(bytes: &[u8]) -> DocOutcome {
+fn convert_xls(bytes: &[u8], out_dir: Option<&Path>) -> DocOutcome {
     match XlsDocument::from_reader(Cursor::new(bytes)) {
         Ok(doc) => {
             let mut blocks = Vec::new();
@@ -289,13 +301,15 @@ fn convert_xls(bytes: &[u8]) -> DocOutcome {
                     "the workbook holds text from its charts (chart titles, series and trendline names, and axis titles), which is not extracted".to_string(),
                 );
             }
-            // The report holds the rest of the loss: the pictures by kind, and each
-            // chart sheet as the kind of sheet it is — a sheet the workbook prints
-            // as one with no valued cell, whose whole content is the chart. The cell
-            // comments, hyperlinks and defined names the reader also hands over are
-            // not printed for an old format by choice (see the module docs).
+            // The report holds the rest of the loss: the pictures the pipeline
+            // does not convert (the deliverable ones are written and returned),
+            // and each chart sheet as the kind of sheet it is — a sheet the
+            // workbook prints as one with no valued cell, whose whole content is
+            // the chart. The cell comments, hyperlinks and defined names the
+            // reader also hands over are not printed for an old format by choice
+            // (see the module docs).
             let mut unshown = Unshown::default();
-            count_pictures(&mut unshown, doc.images());
+            let images = write_pictures(|| doc.images(), out_dir, &mut unshown, &mut notes);
             unshown.add(
                 UnshownKind::ChartSheet,
                 doc.sheets
@@ -305,7 +319,7 @@ fn convert_xls(bytes: &[u8]) -> DocOutcome {
             );
             DocOutcome::Text {
                 text: blocks.join("\n\n").trim_end().to_string(),
-                images: Vec::new(),
+                images,
                 notes,
                 unshown,
                 all_page_text_lost: false,
@@ -353,7 +367,7 @@ fn sheet_lines(sheet: &Sheet) -> Vec<String> {
 /// ([`TextType::Title`]/[`TextType::CenterTitle`]) reads here as ordinary text
 /// and a hidden slide ([`SlideText::hidden`]) is not flagged, though the IR
 /// holds both, while a SmartArt diagram's text has no counterpart in it at all.
-fn convert_ppt(bytes: &[u8]) -> DocOutcome {
+fn convert_ppt(bytes: &[u8], out_dir: Option<&Path>) -> DocOutcome {
     match PptDocument::from_reader(Cursor::new(bytes)) {
         Ok(doc) => {
             let mut blocks = Vec::new();
@@ -381,14 +395,15 @@ fn convert_ppt(bytes: &[u8]) -> DocOutcome {
                         .to_string(),
                 );
             }
-            // The deck's pictures by kind, plus the objects the reader resolves
-            // per slide, counted by what the object is: a media object is named as
-            // the video or the sound it holds, an embedded object or an ActiveX
-            // control as an object the reading does not open. An OLE object the
-            // deck only links is skipped: the file holds the link, not the content
-            // it points at.
+            // The deck's pictures are delivered — the ones the pipeline cannot
+            // convert named instead — like any other reading's. The objects the
+            // reader resolves per slide are counted by what the object is: a media
+            // object as the video or the sound it holds, an embedded object or an
+            // ActiveX control as an object the reading does not open. An OLE object
+            // the deck only links is skipped: the file holds the link, not the
+            // content it points at.
             let mut unshown = Unshown::default();
-            count_pictures(&mut unshown, doc.images());
+            let images = write_pictures(|| doc.images(), out_dir, &mut unshown, &mut notes);
             for object in doc.slides.iter().flat_map(|slide| &slide.ole_object_refs) {
                 if object.kind == OLE_LINKED {
                     continue;
@@ -404,7 +419,7 @@ fn convert_ppt(bytes: &[u8]) -> DocOutcome {
             }
             DocOutcome::Text {
                 text: blocks.join("\n\n").trim_end().to_string(),
-                images: Vec::new(),
+                images,
                 notes,
                 unshown,
                 all_page_text_lost: false,
@@ -414,25 +429,53 @@ fn convert_ppt(bytes: &[u8]) -> DocOutcome {
     }
 }
 
-/// The report kind one of an old arm's pictures belongs to: a vector metafile
-/// (EMF, WMF, PICT) is a drawing the reading does not render, every other BLIP
-/// an embedded image. Both are named rather than extracted, since an old format
-/// is read for its text alone.
-fn picture_kind(format: BlipFormat) -> UnshownKind {
-    match format {
-        BlipFormat::Emf | BlipFormat::Wmf | BlipFormat::Pict => UnshownKind::Drawing,
-        _ => UnshownKind::Image,
+/// Write the pictures a legacy reading delivers into `out_dir` (created when the
+/// first one lands) and return their paths, naming every other one the way a
+/// modern package's media gets named: a vector drawing
+/// ([`DRAWING_EXTENSIONS`]) is one the reading does not show — counted in
+/// `unshown` — and any other undelivered format is added to `notes` as the reason
+/// note [`crate::document::SkippedImages`] states for it. The delivered formats
+/// are the shared ones ([`crate::document::DELIVERABLE_IMAGE_EXTENSIONS`]), so an
+/// old format and a modern package deliver the same formats.
+///
+/// The reader's own accessor is called only when there is an `out_dir` to write
+/// into — it extracts its pictures lazily — so the write path's encryption probe,
+/// which passes `None` and wants the reader's verdict alone, makes the reader
+/// scan for pictures not at all.
+fn write_pictures<'a>(
+    images: impl FnOnce() -> &'a [BlipImage],
+    out_dir: Option<&Path>,
+    unshown: &mut Unshown,
+    notes: &mut Vec<String>,
+) -> Vec<PathBuf> {
+    let Some(out_dir) = out_dir else {
+        return Vec::new();
+    };
+    let mut skipped = SkippedImages::default();
+    let mut next_suffix = HashMap::new();
+    let mut paths = Vec::new();
+    for (slot, image) in images().iter().enumerate() {
+        let file_name = format!("image_{}.{}", slot + 1, image.format.extension());
+        let named = Path::new(&file_name);
+        if !crate::util::has_extension(named, DELIVERABLE_IMAGE_EXTENSIONS) {
+            if crate::util::has_extension(named, DRAWING_EXTENSIONS) {
+                unshown.add(UnshownKind::Drawing, 1);
+            } else {
+                skipped.add(SkipReason::Unsupported);
+            }
+            continue;
+        }
+        ensure_out_dir(out_dir);
+        paths.extend(write_picture(
+            out_dir,
+            &file_name,
+            &image.data,
+            &mut next_suffix,
+            &mut skipped,
+        ));
     }
-}
-
-/// Note every picture in `images` by its kind — the picture loss all three arms
-/// share. The count comes from the reader's lazy list: the crate extracts the
-/// images on the first `images()` call, so naming the loss is what costs that
-/// read.
-fn count_pictures(unshown: &mut Unshown, images: &[BlipImage]) {
-    for image in images {
-        unshown.add(picture_kind(image.format), 1);
-    }
+    notes.extend(skipped.notes());
+    paths
 }
 
 /// A slide's own text lines — every run that is not speaker notes, in shape
@@ -538,9 +581,10 @@ fn corrupt(family: Family) -> DocOutcome {
     }
 }
 
-/// Fixtures shared by this module's tests and [`crate::document`]'s: both need a
-/// real CFB container, and the CFB assembler and the `.doc` stream recipe are
-/// built here once so the two sides classify and read the very same file.
+/// Fixtures shared by this module's tests, [`crate::document`]'s and
+/// [`crate::tools::read_document`]'s: the CFB assembler and the `.doc`/`.xls`/
+/// `.ppt` stream recipes (the embedded pictures included) are built here once, so
+/// every side classifies and reads the very same file.
 #[cfg(test)]
 #[expect(
     clippy::cast_possible_truncation,
@@ -548,6 +592,7 @@ fn corrupt(family: Family) -> DocOutcome {
 )]
 pub(crate) mod test_fixtures {
     use super::*;
+    use crate::util::test::noisy_png;
 
     // ── CFB container fixture ───────────────────────────────────────────
 
@@ -790,188 +835,95 @@ pub(crate) mod test_fixtures {
         let (word, clx) = doc_streams(body, stories, encrypted);
         cfb(&[("WordDocument", &word), ("1Table", &clx)])
     }
-}
 
-#[cfg(test)]
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the hand-built fixtures' stream offsets and counts fit the CFB/BIFF/PPT record fields by construction"
-)]
-mod tests {
-    use super::test_fixtures::*;
-    use super::*;
+    // ── Embedded pictures ───────────────────────────────────────────────
 
-    /// One `OfficeArtBlipJPEG` record holding a tiny JPEG: record type 0xF01D
-    /// ([MS-ODRAW] §2.2.27), `rh.recInstance` 0x46A, then the 17-byte header
-    /// the reader's `uid_size` computes for it (16-byte UID + 1 tag byte; a
-    /// bitmap BLIP has no `metafile_header_size`) and a payload starting
-    /// `\xff\xd8`. The bytes mirror `office_oxide`'s own `make_blip_in_data`
-    /// fixture (`doc/images.rs`) record for record: the crate pads that record
-    /// with junk on both sides to imitate a mixed `.doc` `Data` stream, which
-    /// is left off here because the `Pictures` walk reads from the stream's
-    /// first record, while the `.doc`/`.xls` scans search byte by byte and
-    /// find the record wherever it sits. The crate is pinned exactly, so a
-    /// reader change to this shape would be a deliberate version bump.
-    fn jpeg_blip() -> Vec<u8> {
-        let img: &[u8] = b"\xff\xd8\xff\xe0JFIF";
-        let rec_type: u16 = 0xF01D;
-        let inst: u16 = 0x46A;
-        let uid_sz = 17; // no secondary UID: bit 0 of `inst` is clear
-        let rec_len = uid_sz + img.len();
+    /// An OfficeArt record header plus `body`: `recVer` 0 with `recInstance`
+    /// 0x6E0 (even, so the reader computes no secondary UID), `recType`, and
+    /// `recLen` as the given body's length. The bytes mirror `office_oxide`'s own
+    /// `make_blip` fixture (`cfb/blip.rs`) header for header: the reader decodes
+    /// records from the same shape, and the crate is pinned exactly, so a reader
+    /// change to it would be a deliberate version bump.
+    fn record(rec_type: u16, body: &[u8]) -> Vec<u8> {
+        let inst: u16 = 0x6E0;
         let mut buf = (inst << 4).to_le_bytes().to_vec();
         buf.extend_from_slice(&rec_type.to_le_bytes());
-        buf.extend_from_slice(&(rec_len as u32).to_le_bytes());
-        buf.extend(vec![0u8; uid_sz]);
-        buf.extend_from_slice(img);
+        buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(body);
         buf
     }
 
-    /// The report line an arm gives one embedded image, and one embedded
-    /// object — pinned as literals so a wording drift in
-    /// [`crate::reader_output::Unshown`] fails a test instead of sliding
-    /// through.
-    const UNSHOWN_IMAGE: &str = "1 embedded image(s) not shown";
-    const UNSHOWN_OBJECT: &str = "1 embedded object part(s) not shown";
+    /// One bitmap BLIP record: a 16-byte UID, then the 1-byte tag a bitmap BLIP
+    /// carries (a metafile has none), then `picture` — the 17-byte header the
+    /// reader's `uid_size` computes for it.
+    fn blip(rec_type: u16, picture: &[u8]) -> Vec<u8> {
+        let mut body = vec![0u8; 17];
+        body.extend_from_slice(picture);
+        record(rec_type, &body)
+    }
 
-    /// [`doc_fixture`]'s package plus a third root stream `Data` holding one
-    /// JPEG BLIP — where Word 97 keeps a picture, which the reader finds by
-    /// scanning that stream.
-    fn doc_image_fixture(body: &str) -> Vec<u8> {
+    /// An `OfficeArtBlipPNG` ([MS-ODRAW] §2.2.28) record holding `picture`.
+    fn png_blip(picture: &[u8]) -> Vec<u8> {
+        blip(0xF01E, picture)
+    }
+
+    /// An `OfficeArtBlipDIB` ([MS-ODRAW] §2.2.29) record: a format the pipeline
+    /// does not convert, so a reading names it in a "cannot convert" note.
+    fn dib_blip() -> Vec<u8> {
+        blip(0xF01F, &[0u8; 24])
+    }
+
+    /// An `OfficeArtBlipEMF` ([MS-ODRAW] §2.2.24) record: a vector metafile the
+    /// pipeline names as a drawing rather than delivers. A metafile BLIP carries
+    /// no tag byte, so `blip`'s 17-byte header does not fit it — here it is a
+    /// 16-byte UID, then the 34-byte `OfficeArtMetafileHeader` with `compression`
+    /// none (`0xFE`) at its offset 32, then a payload starting with the EMF
+    /// signature the `.doc`/`.xls` scan checks (`\x01\x00\x00\x00`).
+    fn emf_blip() -> Vec<u8> {
+        let mut body = vec![0u8; 16];
+        let mut header = [0u8; 34];
+        header[32] = 0xFE;
+        body.extend_from_slice(&header);
+        body.extend_from_slice(b"\x01\x00\x00\x00");
+        body.extend_from_slice(&[0u8; 8]);
+        record(0xF01A, &body)
+    }
+
+    /// [`doc_fixture`]'s package plus a third root stream `Data` holding one PNG
+    /// BLIP of `picture` — where Word 97 keeps a picture, which the reader finds
+    /// by scanning that stream.
+    pub(crate) fn doc_picture_fixture(body: &str, picture: &[u8]) -> Vec<u8> {
         let (word, clx) = doc_streams(body, &[], false);
-        let data = jpeg_blip();
+        let data = png_blip(picture);
         cfb(&[("WordDocument", &word), ("1Table", &clx), ("Data", &data)])
     }
 
-    #[test]
-    fn doc_fixture_renders_its_text() {
-        let bytes = doc_fixture("Hello legacy doc", &[], false);
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            ..
-        } = convert(&bytes, Family::Doc)
-        else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "Hello legacy doc");
-        assert!(images.is_empty());
-        assert!(notes.is_empty());
-    }
-
-    #[test]
-    fn doc_embedded_image_is_reported_as_not_shown() {
-        // A `.doc` reads for its text only; the picture in its `Data` stream
-        // is not extracted, so the reading reports it.
-        let bytes = doc_image_fixture("Body text");
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            unshown,
-            ..
-        } = convert(&bytes, Family::Doc)
-        else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "Body text");
-        assert!(images.is_empty());
-        assert!(notes.is_empty());
-        assert_eq!(unshown.lines(), [UNSHOWN_IMAGE]);
-    }
-
-    #[test]
-    fn doc_object_names_mirror_stays_a_prefix_of_the_readers_own_text() {
-        // The crate exposes its embedded-object names only in `plain_text()`, so
-        // the assembly before them is mirrored (`doc_plain_text_before_objects`).
-        // No fixture here carries an object pool, so what is pinned is that the
-        // mirror still reproduces the reader's own assembly on a document with
-        // stories: a reader change that moved a separator would stop the mirror
-        // being a prefix and fail here rather than silently dropping the names.
-        let bytes = doc_fixture(
-            "Body text",
-            &[
-                (SubDocumentKind::Footnotes, "A footnote"),
-                (SubDocumentKind::HeadersFooters, "A header\rA footer"),
-            ],
-            false,
-        );
-        let doc = DocDocument::from_reader(Cursor::new(&bytes)).expect("the fixture is read");
-        let plain = doc.plain_text();
-        assert!(
-            plain.starts_with(&doc_plain_text_before_objects(&doc)),
-            "the mirrored prefix must be a prefix of {plain:?}"
-        );
-    }
-
-    #[test]
-    fn doc_subdocument_stories_render_as_labelled_blocks() {
-        let bytes = doc_fixture(
-            "Body text",
-            &[
-                (SubDocumentKind::Footnotes, "A footnote"),
-                (SubDocumentKind::HeadersFooters, "A header\rA footer"),
-                (SubDocumentKind::Comments, "A comment"),
-                (SubDocumentKind::Endnotes, "An endnote"),
-            ],
-            false,
-        );
-        let DocOutcome::Text { text, notes, .. } = convert(&bytes, Family::Doc) else {
-            panic!("expected text");
-        };
-        assert_eq!(
-            text,
-            "Body text\n\
-             Headers and footers:\n  A header\n  A footer\n\
-             Footnotes:\n  A footnote\n\
-             Endnotes:\n  An endnote\n\
-             Comments:\n  A comment"
-        );
-        assert!(notes.is_empty());
-    }
-
-    #[test]
-    fn doc_empty_story_prints_no_block() {
-        // A story whose extracted text trims to nothing is not a subdocument to
-        // the reader at all, so its label gets no empty block.
-        let bytes = doc_fixture(
-            "Body only",
-            &[
-                (SubDocumentKind::Footnotes, " \r"),
-                (SubDocumentKind::Comments, "A comment"),
-            ],
-            false,
-        );
-        let DocOutcome::Text { text, .. } = convert(&bytes, Family::Doc) else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "Body only\nComments:\n  A comment");
-    }
-
-    #[test]
-    fn encrypted_doc_reports_password_protected() {
-        let bytes = doc_fixture("secret", &[], true);
-        assert!(matches!(
-            convert(&bytes, Family::Doc),
-            DocOutcome::Unreadable { reason } if reason == "password-protected"
-        ));
+    /// [`doc_fixture`]'s package whose `Data` stream holds one picture of each
+    /// kind a picture can be: a delivered PNG of `picture`, a DIB the pipeline
+    /// cannot convert and an EMF it names as a drawing.
+    pub(super) fn doc_picture_kinds_fixture(body: &str, picture: &[u8]) -> Vec<u8> {
+        let (word, clx) = doc_streams(body, &[], false);
+        let mut data = png_blip(picture);
+        data.extend(dib_blip());
+        data.extend(emf_blip());
+        cfb(&[("WordDocument", &word), ("1Table", &clx), ("Data", &data)])
     }
 
     // ── Excel (.xls) ────────────────────────────────────────────────────
 
-    const RT_BOF: u16 = 0x0809;
-    const RT_EOF: u16 = 0x000A;
-    const RT_BOUNDSHEET: u16 = 0x0085;
-    const RT_SST: u16 = 0x00FC;
-    const RT_LABELSST: u16 = 0x00FD;
-    const RT_NUMBER: u16 = 0x0203;
-    const RT_FILEPASS: u16 = 0x002F;
-    const RT_SERIESTEXT: u16 = 0x100D;
+    pub(super) const RT_BOF: u16 = 0x0809;
+    pub(super) const RT_EOF: u16 = 0x000A;
+    pub(super) const RT_BOUNDSHEET: u16 = 0x0085;
+    pub(super) const RT_SST: u16 = 0x00FC;
+    pub(super) const RT_LABELSST: u16 = 0x00FD;
+    pub(super) const RT_NUMBER: u16 = 0x0203;
+    pub(super) const RT_FILEPASS: u16 = 0x002F;
+    pub(super) const RT_SERIESTEXT: u16 = 0x100D;
     /// `MSODRAWINGGROUP` ([MS-XLS] 2.4.191) — the globals record whose payload
     /// holds the workbook's OfficeArt drawing data, images included.
-    const RT_MSODRAWINGGROUP: u16 = 0x00EB;
+    pub(super) const RT_MSODRAWINGGROUP: u16 = 0x00EB;
 
-    fn biff_rec(rec_type: u16, data: &[u8]) -> Vec<u8> {
+    pub(super) fn biff_rec(rec_type: u16, data: &[u8]) -> Vec<u8> {
         let mut buf = rec_type.to_le_bytes().to_vec();
         buf.extend_from_slice(&(data.len() as u16).to_le_bytes());
         buf.extend_from_slice(data);
@@ -979,7 +931,7 @@ mod tests {
     }
 
     /// A BIFF8 `BOF` opening a substream of the given doctype.
-    fn bof(doctype: u16) -> Vec<u8> {
+    pub(super) fn bof(doctype: u16) -> Vec<u8> {
         let mut body = 0x0600u16.to_le_bytes().to_vec();
         body.extend_from_slice(&doctype.to_le_bytes());
         body.extend_from_slice(&[0u8; 12]);
@@ -988,7 +940,7 @@ mod tests {
 
     /// A `BOUNDSHEET` with a wide (UTF-16LE) name, so a non-Latin sheet name
     /// exercises the Unicode name path.
-    fn boundsheet(name: &str) -> Vec<u8> {
+    pub(super) fn boundsheet(name: &str) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&0u32.to_le_bytes()); // stream offset, unused
         body.push(0); // visible
@@ -1003,7 +955,7 @@ mod tests {
 
     /// An SST holding one wide string, so the Cyrillic cell pins the Unicode
     /// string path.
-    fn sst(text: &str) -> Vec<u8> {
+    pub(super) fn sst(text: &str) -> Vec<u8> {
         let mut body = 1u32.to_le_bytes().to_vec(); // total
         body.extend_from_slice(&1u32.to_le_bytes()); // unique
         body.extend_from_slice(&(text.encode_utf16().count() as u16).to_le_bytes());
@@ -1015,7 +967,7 @@ mod tests {
     }
 
     /// A `LABELSST` cell indexing shared string 0.
-    fn labelsst(row: u16, col: u16) -> Vec<u8> {
+    pub(super) fn labelsst(row: u16, col: u16) -> Vec<u8> {
         let mut body = row.to_le_bytes().to_vec();
         body.extend_from_slice(&col.to_le_bytes());
         body.extend_from_slice(&0u16.to_le_bytes()); // xf
@@ -1023,7 +975,7 @@ mod tests {
         biff_rec(RT_LABELSST, &body)
     }
 
-    fn number(row: u16, col: u16, value: f64) -> Vec<u8> {
+    pub(super) fn number(row: u16, col: u16, value: f64) -> Vec<u8> {
         let mut body = row.to_le_bytes().to_vec();
         body.extend_from_slice(&col.to_le_bytes());
         body.extend_from_slice(&0u16.to_le_bytes()); // xf
@@ -1034,7 +986,7 @@ mod tests {
     /// The Workbook stream of a one-sheet workbook: cell A1 the shared string
     /// `shared`, B2 the number 3.5, plus `extra` BIFF records in the globals
     /// substream (before its `EOF`).
-    fn xls_stream(shared: &str, encrypted: bool, extra: &[u8]) -> Vec<u8> {
+    pub(super) fn xls_stream(shared: &str, encrypted: bool, extra: &[u8]) -> Vec<u8> {
         let mut stream = bof(0x0005); // globals
         stream.extend(boundsheet("Данные"));
         stream.extend(sst(shared));
@@ -1052,22 +1004,22 @@ mod tests {
 
     /// A `.xls` with one sheet: cell A1 the shared string `shared`, B2 the
     /// number 3.5.
-    fn xls_fixture(shared: &str, encrypted: bool) -> Vec<u8> {
+    pub(super) fn xls_fixture(shared: &str, encrypted: bool) -> Vec<u8> {
         cfb(&[("Workbook", &xls_stream(shared, encrypted, &[]))])
     }
 
-    /// [`xls_fixture`]'s workbook plus one `MSODRAWINGGROUP` record holding a
-    /// JPEG BLIP — the drawing records are where a `.xls` keeps its pictures,
-    /// which this reading does not extract.
-    fn xls_image_fixture() -> Vec<u8> {
-        let drawing = biff_rec(RT_MSODRAWINGGROUP, &jpeg_blip());
+    /// [`xls_fixture`]'s workbook plus one `MSODRAWINGGROUP` record holding a PNG
+    /// BLIP of `picture` — the drawing records are where a `.xls` keeps its
+    /// pictures.
+    pub(crate) fn xls_picture_fixture(picture: &[u8]) -> Vec<u8> {
+        let drawing = biff_rec(RT_MSODRAWINGGROUP, &png_blip(picture));
         cfb(&[("Workbook", &xls_stream("Привет", false, &drawing))])
     }
 
     /// One `SeriesText` record: 2 reserved bytes, the character count, the
     /// flags byte (compressed characters) and the characters — the shape
     /// `office_oxide` writes in its own tests.
-    fn series_text(text: &str) -> Vec<u8> {
+    pub(super) fn series_text(text: &str) -> Vec<u8> {
         let mut data = vec![0u8, 0u8];
         data.push(text.chars().count() as u8);
         data.push(0);
@@ -1078,7 +1030,7 @@ mod tests {
     /// [`xls_fixture`]'s workbook plus a chart sheet of its own: a second
     /// `BOUNDSHEET` whose substream is a chart holding one `SeriesText`, so the
     /// text the arm does not print is what its answer has to name.
-    fn xls_chart_fixture() -> Vec<u8> {
+    pub(super) fn xls_chart_fixture() -> Vec<u8> {
         let mut stream = bof(0x0005); // globals
         stream.extend(boundsheet("Данные"));
         stream.extend(boundsheet("Chart1"));
@@ -1093,131 +1045,51 @@ mod tests {
         cfb(&[("Workbook", &stream)])
     }
 
-    #[test]
-    fn xls_chart_text_is_named_as_left_out() {
-        // A chart sheet's content is its chart's text, which this reading does
-        // not print: the sheet still shows as one with no valued cell, the text
-        // is named in a note rather than left to pass as an empty sheet, and the
-        // sheet itself is reported as the chart sheet it is.
-        let bytes = xls_chart_fixture();
-        let DocOutcome::Text {
-            text,
-            notes,
-            unshown,
-            ..
-        } = convert(&bytes, Family::Xls)
-        else {
-            panic!("expected text");
-        };
-        assert_eq!(
-            text,
-            "Sheet \"Данные\":\n  A1: Привет\n\nSheet \"Chart1\": (no values)"
-        );
-        assert!(
-            notes
-                .iter()
-                .any(|note| note.contains("text from its charts")),
-            "got: {notes:?}"
-        );
-        assert_eq!(unshown.lines(), ["1 chart sheet(s) not shown"]);
-    }
-
-    #[test]
-    fn xls_fixture_renders_sheet_cells_like_xlsx() {
-        let bytes = xls_fixture("Привет", false);
-        let DocOutcome::Text { text, notes, .. } = convert(&bytes, Family::Xls) else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "Sheet \"Данные\":\n  A1: Привет\n  B2: 3.5");
-        assert!(notes.is_empty());
-    }
-
-    #[test]
-    fn xls_embedded_image_is_reported_as_not_shown() {
-        // The pictures in the workbook's drawing records are not extracted, so
-        // the reading reports them alongside the cells it prints.
-        let bytes = xls_image_fixture();
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            unshown,
-            ..
-        } = convert(&bytes, Family::Xls)
-        else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "Sheet \"Данные\":\n  A1: Привет\n  B2: 3.5");
-        assert!(images.is_empty());
-        assert!(notes.is_empty());
-        assert_eq!(unshown.lines(), [UNSHOWN_IMAGE]);
-    }
-
-    #[test]
-    fn xls_shared_string_break_stays_one_line() {
-        // A break inside a value is escaped to `\n` so the cell keeps its one
-        // line, exactly as the `.xlsx` arm's does.
-        let bytes = xls_fixture("two\nlines", false);
-        let DocOutcome::Text { text, .. } = convert(&bytes, Family::Xls) else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "Sheet \"Данные\":\n  A1: two\\nlines\n  B2: 3.5");
-    }
-
-    #[test]
-    fn encrypted_xls_reports_password_protected() {
-        let bytes = xls_fixture("Привет", true);
-        assert!(matches!(
-            convert(&bytes, Family::Xls),
-            DocOutcome::Unreadable { reason } if reason == "password-protected"
-        ));
-    }
-
     // ── PowerPoint (.ppt) ───────────────────────────────────────────────
 
-    const RT_DOCUMENT: u16 = 0x03E8;
-    const RT_SLIDE: u16 = 0x03EE;
-    const RT_SLIDE_ATOM: u16 = 0x03EF;
-    const RT_NOTES: u16 = 0x03F0;
-    const RT_NOTES_ATOM: u16 = 0x03F1;
-    const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
-    const RT_SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
-    const RT_TEXT_HEADER: u16 = 0x0F9F;
-    const RT_TEXT_BYTES: u16 = 0x0FA8;
-    const RT_USER_EDIT_ATOM: u16 = 0x0FF5;
-    const RT_CURRENT_USER_ATOM: u16 = 0x0FF6;
-    const RT_PERSIST_DIRECTORY_ATOM: u16 = 0x1772;
-    const SLWT_SLIDES: u16 = 0;
-    const SLWT_NOTES: u16 = 2;
+    pub(super) const RT_DOCUMENT: u16 = 0x03E8;
+    pub(super) const RT_SLIDE: u16 = 0x03EE;
+    pub(super) const RT_SLIDE_ATOM: u16 = 0x03EF;
+    pub(super) const RT_NOTES: u16 = 0x03F0;
+    pub(super) const RT_NOTES_ATOM: u16 = 0x03F1;
+    pub(super) const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
+    pub(super) const RT_SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
+    pub(super) const RT_TEXT_HEADER: u16 = 0x0F9F;
+    pub(super) const RT_TEXT_BYTES: u16 = 0x0FA8;
+    pub(super) const RT_USER_EDIT_ATOM: u16 = 0x0FF5;
+    pub(super) const RT_CURRENT_USER_ATOM: u16 = 0x0FF6;
+    pub(super) const RT_PERSIST_DIRECTORY_ATOM: u16 = 0x1772;
+    pub(super) const SLWT_SLIDES: u16 = 0;
+    pub(super) const SLWT_NOTES: u16 = 2;
     /// The ClientTextbox container every shape's text lives under.
-    const RT_CLIENT_TEXTBOX: u16 = 0xF00D;
+    pub(super) const RT_CLIENT_TEXTBOX: u16 = 0xF00D;
     /// The group container, a shape and a cell's anchor record — what a
     /// reconstructed table's grid of shapes is built from.
-    const RT_SPGR_CONTAINER: u16 = 0xF003;
-    const RT_SHAPE: u16 = 0xF004;
-    const RT_CHILD_ANCHOR: u16 = 0xF00F;
+    pub(super) const RT_SPGR_CONTAINER: u16 = 0xF003;
+    pub(super) const RT_SHAPE: u16 = 0xF004;
+    pub(super) const RT_CHILD_ANCHOR: u16 = 0xF00F;
     /// `OfficeArtClientData` — a shape's own PPT-specific data, where its
     /// embedded-object reference lives.
-    const RT_CLIENT_DATA: u16 = 0xF011;
+    pub(super) const RT_CLIENT_DATA: u16 = 0xF011;
     /// `ExObjListContainer` — the document-wide table of external objects, a
     /// child of the `Document` container.
-    const RT_EXTERNAL_OBJECT_LIST: u16 = 0x0409;
+    pub(super) const RT_EXTERNAL_OBJECT_LIST: u16 = 0x0409;
     /// `ExEmbed` — the container wrapping one `ExOleObjAtom`.
-    const RT_EXTERNAL_OLE_EMBED: u16 = 0x0FCC;
+    pub(super) const RT_EXTERNAL_OLE_EMBED: u16 = 0x0FCC;
     /// `ExOleObjAtom` — one embedded object's identity (its `objID`, kind and
     /// subtype).
-    const RT_EXTERNAL_OLE_OBJECT_ATOM: u16 = 0x0FC3;
+    pub(super) const RT_EXTERNAL_OLE_OBJECT_ATOM: u16 = 0x0FC3;
     /// `ExObjRefAtom` — a shape's reference to an external object, inside its
     /// `ClientData`.
-    const RT_EXTERNAL_OBJECT_REF_ATOM: u16 = 0x0BC1;
+    pub(super) const RT_EXTERNAL_OBJECT_REF_ATOM: u16 = 0x0BC1;
     /// `ExMediaAtom` — a media object's id inside its container.
-    const RT_EX_MEDIA_ATOM: u16 = 0x1004;
+    pub(super) const RT_EX_MEDIA_ATOM: u16 = 0x1004;
     /// `ExVideoContainer` — the video an `ExAviMovieContainer` holds.
-    const RT_EX_VIDEO: u16 = 0x1005;
+    pub(super) const RT_EX_VIDEO: u16 = 0x1005;
     /// `ExAviMovieContainer` — a video object, which has no `ExOleObjAtom`.
-    const RT_EX_AVI_MOVIE: u16 = 0x1006;
+    pub(super) const RT_EX_AVI_MOVIE: u16 = 0x1006;
     /// `ExWAVAudioEmbeddedContainer` — a sound object, which has none either.
-    const RT_EX_WAV_AUDIO_EMBEDDED: u16 = 0x100F;
+    pub(super) const RT_EX_WAV_AUDIO_EMBEDDED: u16 = 0x100F;
 
     /// The one external object a fixture deck's slide references. An embedded OLE
     /// object and the media objects are resolved from different records, and which
@@ -1225,7 +1097,7 @@ mod tests {
     /// an embedded object; a linked OLE object is the same record as an embedded
     /// one with the kind a deck links by.
     #[derive(Clone, Copy)]
-    enum OleFixture {
+    pub(super) enum OleFixture {
         Embedded(u32),
         Linked(u32),
         Video(u32),
@@ -1251,7 +1123,7 @@ mod tests {
         }
     }
 
-    fn atom(rec_type: u16, instance: u16, data: &[u8]) -> Vec<u8> {
+    pub(super) fn atom(rec_type: u16, instance: u16, data: &[u8]) -> Vec<u8> {
         let mut buf = (instance << 4).to_le_bytes().to_vec();
         buf.extend_from_slice(&rec_type.to_le_bytes());
         buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -1259,7 +1131,7 @@ mod tests {
         buf
     }
 
-    fn container(rec_type: u16, instance: u16, children: &[u8]) -> Vec<u8> {
+    pub(super) fn container(rec_type: u16, instance: u16, children: &[u8]) -> Vec<u8> {
         let mut buf = ((instance << 4) | 0x000F).to_le_bytes().to_vec();
         buf.extend_from_slice(&rec_type.to_le_bytes());
         buf.extend_from_slice(&(children.len() as u32).to_le_bytes());
@@ -1269,7 +1141,7 @@ mod tests {
 
     /// A `ClientTextbox` holding one text run of `text_type`
     /// (`TextTypeEnum`: 0 title, 2 notes).
-    fn textbox(text_type: u32, text: &str) -> Vec<u8> {
+    pub(super) fn textbox(text_type: u32, text: &str) -> Vec<u8> {
         let mut children = atom(RT_TEXT_HEADER, 0, &text_type.to_le_bytes());
         children.extend(atom(RT_TEXT_BYTES, 0, text.as_bytes()));
         container(RT_CLIENT_TEXTBOX, 0, &children)
@@ -1277,7 +1149,7 @@ mod tests {
 
     /// A grid cell of a reconstructed table: a shape anchored at `(left, top)`
     /// whose only text is a `ClientTextbox` of type 4 (`Tx_TYPE_OTHER`).
-    fn table_cell(left: i32, top: i32, text: &str) -> Vec<u8> {
+    pub(super) fn table_cell(left: i32, top: i32, text: &str) -> Vec<u8> {
         let mut anchor = left.to_le_bytes().to_vec();
         anchor.extend_from_slice(&top.to_le_bytes());
         anchor.extend_from_slice(&(left + 100).to_le_bytes());
@@ -1294,7 +1166,7 @@ mod tests {
     /// Cells are emitted column-major (A1, A2, B1, B2) while the reader's cell
     /// order is row-major (A1, B1, A2, B2), so the rendered order proves the
     /// grid was reconstructed rather than walked as flat shapes in shape order.
-    fn table_group(cells: [&str; 4]) -> Vec<u8> {
+    pub(super) fn table_group(cells: [&str; 4]) -> Vec<u8> {
         let mut children = container(RT_SHAPE, 0, &[]);
         children.extend(table_cell(0, 0, cells[0]));
         children.extend(table_cell(0, 50, cells[2]));
@@ -1306,7 +1178,7 @@ mod tests {
     /// A shape whose `ClientData` holds an `ExObjRefAtom` naming embedded
     /// object `obj_id` — the slide-side half of an embedded object, joined
     /// against the document's `ExObjListContainer` by `objID`.
-    fn ole_shape(obj_id: u32) -> Vec<u8> {
+    pub(super) fn ole_shape(obj_id: u32) -> Vec<u8> {
         let client_data = container(
             RT_CLIENT_DATA,
             0,
@@ -1322,7 +1194,7 @@ mod tests {
     /// media object is its own container — a movie holding the video, or a sound
     /// container holding the atom directly — whose `ExMediaAtom` carries the id a
     /// shape references, and it has no OLE atom at all.
-    fn ex_obj_list(ole: OleFixture) -> Vec<u8> {
+    pub(super) fn ex_obj_list(ole: OleFixture) -> Vec<u8> {
         match ole {
             OleFixture::Embedded(_) | OleFixture::Linked(_) => {
                 let mut body = vec![0u8; 16];
@@ -1351,7 +1223,7 @@ mod tests {
     /// A `Slide` container with a `SlideAtom` naming its notes page, one title
     /// textbox and, when given, a reconstructed table shape and a shape
     /// referencing external object `ole`.
-    fn slide_container(
+    pub(super) fn slide_container(
         text: &str,
         notes_id: u32,
         table: Option<[&str; 4]>,
@@ -1372,14 +1244,14 @@ mod tests {
 
     /// A `Notes` container: a `NotesAtom` naming the slide it belongs to and
     /// one notes-type textbox.
-    fn notes_container(text: &str, slide_id: u32) -> Vec<u8> {
+    pub(super) fn notes_container(text: &str, slide_id: u32) -> Vec<u8> {
         let mut children = atom(RT_NOTES_ATOM, 0, &slide_id.to_le_bytes());
         children.extend(textbox(2, text));
         container(RT_NOTES, 0, &children)
     }
 
     /// A `SlidePersistAtom` entry of a slide/notes list.
-    fn slide_persist(persist_id: u32, slide_id: u32) -> Vec<u8> {
+    pub(super) fn slide_persist(persist_id: u32, slide_id: u32) -> Vec<u8> {
         let mut body = persist_id.to_le_bytes().to_vec();
         body.extend_from_slice(&0u32.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
@@ -1390,7 +1262,7 @@ mod tests {
 
     /// A `PersistDirectoryAtom` mapping `(persist id, stream offset)` pairs,
     /// sequential from the first id.
-    fn persist_directory(entries: &[(u32, u32)]) -> Vec<u8> {
+    pub(super) fn persist_directory(entries: &[(u32, u32)]) -> Vec<u8> {
         let header = entries[0].0 | ((entries.len() as u32) << 20);
         let mut body = header.to_le_bytes().to_vec();
         for (_, offset) in entries {
@@ -1400,7 +1272,10 @@ mod tests {
     }
 
     /// A `UserEditAtom` (one edit, so `offsetLastEdit` is 0).
-    fn user_edit_atom(offset_persist_directory: u32, doc_persist_id_ref: u32) -> Vec<u8> {
+    pub(super) fn user_edit_atom(
+        offset_persist_directory: u32,
+        doc_persist_id_ref: u32,
+    ) -> Vec<u8> {
         let mut body = 0u32.to_le_bytes().to_vec(); // lastSlideIdRef
         body.extend_from_slice(&0u32.to_le_bytes()); // version
         body.extend_from_slice(&0u32.to_le_bytes()); // offsetLastEdit
@@ -1413,7 +1288,7 @@ mod tests {
 
     /// A `CurrentUserAtom`; the encrypted `headerToken` is the reader's first
     /// encryption signal ([MS-PPT] §2.3.2).
-    fn current_user(offset_to_current_edit: u32, encrypted: bool) -> Vec<u8> {
+    pub(super) fn current_user(offset_to_current_edit: u32, encrypted: bool) -> Vec<u8> {
         let mut body = 0u32.to_le_bytes().to_vec(); // size
         let token: u32 = if encrypted { 0xF3D1_C4DF } else { 0 };
         body.extend_from_slice(&token.to_le_bytes()); // headerToken
@@ -1431,7 +1306,7 @@ mod tests {
     /// are resolved through the persist directory, the way a real PPT97 file
     /// stores its current content. `ole` names an external object the slide's
     /// shape references, declared in the document's own `ExObjListContainer`.
-    fn ppt_document_stream(
+    pub(super) fn ppt_document_stream(
         slide_text: &str,
         notes: Option<&str>,
         table: Option<[&str; 4]>,
@@ -1492,7 +1367,7 @@ mod tests {
     /// A `.ppt` package: the "PowerPoint Document" stream, the "Current User"
     /// stream, and — when the deck has images — a "Pictures" stream of raw
     /// BLIPs.
-    fn ppt_cfb(
+    pub(super) fn ppt_cfb(
         stream: &[u8],
         edit_offset: u32,
         encrypted: bool,
@@ -1509,24 +1384,24 @@ mod tests {
     /// A `.ppt`, encrypted or not. An encrypted deck needs only the encrypted
     /// `CurrentUserAtom` token — the record stream past the edit is ciphertext
     /// in a real file, but the reader refuses the deck before reading it.
-    fn ppt_fixture(slide_text: &str, notes: Option<&str>, encrypted: bool) -> Vec<u8> {
+    pub(super) fn ppt_fixture(slide_text: &str, notes: Option<&str>, encrypted: bool) -> Vec<u8> {
         let (stream, edit_offset) = ppt_document_stream(slide_text, notes, None, None);
         ppt_cfb(&stream, edit_offset, encrypted, None)
     }
 
-    /// [`ppt_fixture`]'s deck plus a third root stream `Pictures` holding one
-    /// JPEG BLIP — where a `.ppt` keeps its images, a flat sequence the
+    /// [`ppt_fixture`]'s deck plus a third root stream `Pictures` holding one PNG
+    /// BLIP of `picture` — where a `.ppt` keeps its images, a flat sequence the
     /// reader's picture walk reads directly.
-    fn ppt_image_fixture(slide_text: &str) -> Vec<u8> {
+    pub(crate) fn ppt_picture_fixture(slide_text: &str, picture: &[u8]) -> Vec<u8> {
         let (stream, edit_offset) = ppt_document_stream(slide_text, None, None, None);
-        let pictures = jpeg_blip();
+        let pictures = png_blip(picture);
         ppt_cfb(&stream, edit_offset, false, Some(&pictures))
     }
 
     /// A `.ppt` whose only slide shape references embedded object `obj_id`,
     /// which the document's `ExObjListContainer` names — the two halves a
     /// slide's embedded object is resolved from.
-    fn ppt_ole_fixture(slide_text: &str, obj_id: u32) -> Vec<u8> {
+    pub(super) fn ppt_ole_fixture(slide_text: &str, obj_id: u32) -> Vec<u8> {
         let (stream, edit_offset) =
             ppt_document_stream(slide_text, None, None, Some(OleFixture::Embedded(obj_id)));
         ppt_cfb(&stream, edit_offset, false, None)
@@ -1535,31 +1410,274 @@ mod tests {
     /// A `.ppt` whose only slide references the media object `media` — a video or
     /// a sound the deck holds, resolved from the `ExMediaAtom` of its own
     /// container rather than from an `ExOleObjAtom`.
-    fn ppt_media_fixture(slide_text: &str, media: OleFixture) -> Vec<u8> {
+    pub(super) fn ppt_media_fixture(slide_text: &str, media: OleFixture) -> Vec<u8> {
         let (stream, edit_offset) = ppt_document_stream(slide_text, None, None, Some(media));
         ppt_cfb(&stream, edit_offset, false, None)
     }
 
     /// [`ppt_ole_fixture`]'s deck plus a `Pictures` image, so one reading names
-    /// both an image and an object.
-    fn ppt_image_and_object_fixture(slide_text: &str, obj_id: u32) -> Vec<u8> {
+    /// both a delivered picture and an object.
+    pub(super) fn ppt_image_and_object_fixture(slide_text: &str, obj_id: u32) -> Vec<u8> {
         let (stream, edit_offset) =
             ppt_document_stream(slide_text, None, None, Some(OleFixture::Embedded(obj_id)));
-        let pictures = jpeg_blip();
+        let pictures = png_blip(&noisy_png(2, 2));
         ppt_cfb(&stream, edit_offset, false, Some(&pictures))
     }
 
     /// A `.ppt` whose only slide carries an ordinary text run and a 2x2 table
     /// shape — what the reader reconstructs as a `TableBlock`.
-    fn ppt_table_fixture(slide_text: &str, cells: [&str; 4]) -> Vec<u8> {
+    pub(super) fn ppt_table_fixture(slide_text: &str, cells: [&str; 4]) -> Vec<u8> {
         let (stream, edit_offset) = ppt_document_stream(slide_text, None, Some(cells), None);
         ppt_cfb(&stream, edit_offset, false, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_fixtures::*;
+    use super::*;
+    use crate::util::test::noisy_png;
+
+    /// The report line an arm gives one embedded object — pinned as a literal so
+    /// a wording drift in [`crate::reader_output::Unshown`] fails a test instead
+    /// of sliding through.
+    const UNSHOWN_OBJECT: &str = "1 embedded object part(s) not shown";
+
+    #[test]
+    fn doc_fixture_renders_its_text() {
+        let bytes = doc_fixture("Hello legacy doc", &[], false);
+        let DocOutcome::Text {
+            text,
+            images,
+            notes,
+            ..
+        } = convert(&bytes, Family::Doc, None)
+        else {
+            panic!("expected text");
+        };
+        assert_eq!(text, "Hello legacy doc");
+        assert!(images.is_empty());
+        assert!(notes.is_empty());
+    }
+
+    /// Every family's embedded picture is delivered like a modern package's
+    /// media: written out to `out_dir`, decodable and byte-for-byte the bytes the
+    /// reader held, with the family's own text read unchanged beside it and
+    /// nothing reported as left out.
+    #[test]
+    fn every_family_delivers_its_embedded_picture() {
+        let picture = noisy_png(2, 2);
+        for (family, bytes, text) in [
+            (
+                Family::Doc,
+                doc_picture_fixture("Body text", &picture),
+                "Body text",
+            ),
+            (
+                Family::Xls,
+                xls_picture_fixture(&picture),
+                "Sheet \"Данные\":\n  A1: Привет\n  B2: 3.5",
+            ),
+            (
+                Family::Ppt,
+                ppt_picture_fixture("Slide title", &picture),
+                "Slide 1:\n  Slide title",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let DocOutcome::Text {
+                text: read,
+                images,
+                notes,
+                unshown,
+                ..
+            } = convert(&bytes, family, Some(dir.path()))
+            else {
+                panic!("expected text");
+            };
+            assert_eq!(read, text, "{family:?}");
+            assert_eq!(images.len(), 1, "{family:?}");
+            assert_eq!(
+                std::fs::read(&images[0]).expect("read the written picture"),
+                picture,
+                "{family:?}"
+            );
+            image::open(&images[0]).expect("the written picture decodes");
+            assert!(notes.is_empty(), "{family:?}: {notes:?}");
+            assert!(unshown.lines().is_empty(), "{family:?}");
+        }
+    }
+
+    #[test]
+    fn doc_names_each_undelivered_picture_by_its_kind() {
+        // One reading of one `.doc`: the PNG is delivered, the DIB is named in the
+        // shared "cannot convert" note, and the EMF is named as the drawing it is —
+        // the same split a modern package's media gets.
+        let picture = noisy_png(2, 2);
+        let bytes = doc_picture_kinds_fixture("Body text", &picture);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let DocOutcome::Text {
+            images,
+            notes,
+            unshown,
+            ..
+        } = convert(&bytes, Family::Doc, Some(dir.path()))
+        else {
+            panic!("expected text");
+        };
+        assert_eq!(
+            std::fs::read(&images[0]).expect("read the delivered picture"),
+            picture
+        );
+        image::open(&images[0]).expect("the delivered picture decodes");
+        assert!(
+            notes.iter().any(|note| note
+                == "skipped 1 embedded image(s) in a format this pipeline cannot convert"),
+            "got: {notes:?}"
+        );
+        assert_eq!(unshown.lines(), ["1 embedded drawing(s) not shown"]);
+    }
+
+    #[test]
+    fn doc_object_names_mirror_stays_a_prefix_of_the_readers_own_text() {
+        // The crate exposes its embedded-object names only in `plain_text()`, so
+        // the assembly before them is mirrored (`doc_plain_text_before_objects`).
+        // No fixture here carries an object pool, so what is pinned is that the
+        // mirror still reproduces the reader's own assembly on a document with
+        // stories: a reader change that moved a separator would stop the mirror
+        // being a prefix and fail here rather than silently dropping the names.
+        let bytes = doc_fixture(
+            "Body text",
+            &[
+                (SubDocumentKind::Footnotes, "A footnote"),
+                (SubDocumentKind::HeadersFooters, "A header\rA footer"),
+            ],
+            false,
+        );
+        let doc = DocDocument::from_reader(Cursor::new(&bytes)).expect("the fixture is read");
+        let plain = doc.plain_text();
+        assert!(
+            plain.starts_with(&doc_plain_text_before_objects(&doc)),
+            "the mirrored prefix must be a prefix of {plain:?}"
+        );
+    }
+
+    #[test]
+    fn doc_subdocument_stories_render_as_labelled_blocks() {
+        let bytes = doc_fixture(
+            "Body text",
+            &[
+                (SubDocumentKind::Footnotes, "A footnote"),
+                (SubDocumentKind::HeadersFooters, "A header\rA footer"),
+                (SubDocumentKind::Comments, "A comment"),
+                (SubDocumentKind::Endnotes, "An endnote"),
+            ],
+            false,
+        );
+        let DocOutcome::Text { text, notes, .. } = convert(&bytes, Family::Doc, None) else {
+            panic!("expected text");
+        };
+        assert_eq!(
+            text,
+            "Body text\n\
+             Headers and footers:\n  A header\n  A footer\n\
+             Footnotes:\n  A footnote\n\
+             Endnotes:\n  An endnote\n\
+             Comments:\n  A comment"
+        );
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn doc_empty_story_prints_no_block() {
+        // A story whose extracted text trims to nothing is not a subdocument to
+        // the reader at all, so its label gets no empty block.
+        let bytes = doc_fixture(
+            "Body only",
+            &[
+                (SubDocumentKind::Footnotes, " \r"),
+                (SubDocumentKind::Comments, "A comment"),
+            ],
+            false,
+        );
+        let DocOutcome::Text { text, .. } = convert(&bytes, Family::Doc, None) else {
+            panic!("expected text");
+        };
+        assert_eq!(text, "Body only\nComments:\n  A comment");
+    }
+
+    #[test]
+    fn encrypted_doc_reports_password_protected() {
+        let bytes = doc_fixture("secret", &[], true);
+        assert!(matches!(
+            convert(&bytes, Family::Doc, None),
+            DocOutcome::Unreadable { reason } if reason == "password-protected"
+        ));
+    }
+
+    #[test]
+    fn xls_chart_text_is_named_as_left_out() {
+        // A chart sheet's content is its chart's text, which this reading does
+        // not print: the sheet still shows as one with no valued cell, the text
+        // is named in a note rather than left to pass as an empty sheet, and the
+        // sheet itself is reported as the chart sheet it is.
+        let bytes = xls_chart_fixture();
+        let DocOutcome::Text {
+            text,
+            notes,
+            unshown,
+            ..
+        } = convert(&bytes, Family::Xls, None)
+        else {
+            panic!("expected text");
+        };
+        assert_eq!(
+            text,
+            "Sheet \"Данные\":\n  A1: Привет\n\nSheet \"Chart1\": (no values)"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("text from its charts")),
+            "got: {notes:?}"
+        );
+        assert_eq!(unshown.lines(), ["1 chart sheet(s) not shown"]);
+    }
+
+    #[test]
+    fn xls_fixture_renders_sheet_cells_like_xlsx() {
+        let bytes = xls_fixture("Привет", false);
+        let DocOutcome::Text { text, notes, .. } = convert(&bytes, Family::Xls, None) else {
+            panic!("expected text");
+        };
+        assert_eq!(text, "Sheet \"Данные\":\n  A1: Привет\n  B2: 3.5");
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn xls_shared_string_break_stays_one_line() {
+        // A break inside a value is escaped to `\n` so the cell keeps its one
+        // line, exactly as the `.xlsx` arm's does.
+        let bytes = xls_fixture("two\nlines", false);
+        let DocOutcome::Text { text, .. } = convert(&bytes, Family::Xls, None) else {
+            panic!("expected text");
+        };
+        assert_eq!(text, "Sheet \"Данные\":\n  A1: two\\nlines\n  B2: 3.5");
+    }
+
+    #[test]
+    fn encrypted_xls_reports_password_protected() {
+        let bytes = xls_fixture("Привет", true);
+        assert!(matches!(
+            convert(&bytes, Family::Xls, None),
+            DocOutcome::Unreadable { reason } if reason == "password-protected"
+        ));
     }
 
     #[test]
     fn ppt_fixture_renders_slide_and_notes_like_pptx() {
         let bytes = ppt_fixture("Hello deck", Some("A speaker note"), false);
-        let DocOutcome::Text { text, notes, .. } = convert(&bytes, Family::Ppt) else {
+        let DocOutcome::Text { text, notes, .. } = convert(&bytes, Family::Ppt, None) else {
             panic!("expected text");
         };
         assert_eq!(
@@ -1572,7 +1690,7 @@ mod tests {
     #[test]
     fn ppt_without_notes_skips_the_notes_block() {
         let bytes = ppt_fixture("Only slide text", None, false);
-        let DocOutcome::Text { text, .. } = convert(&bytes, Family::Ppt) else {
+        let DocOutcome::Text { text, .. } = convert(&bytes, Family::Ppt, None) else {
             panic!("expected text");
         };
         assert_eq!(text, "Slide 1:\n  Only slide text");
@@ -1582,7 +1700,7 @@ mod tests {
     fn encrypted_ppt_reports_password_protected() {
         let bytes = ppt_fixture("secret", None, true);
         assert!(matches!(
-            convert(&bytes, Family::Ppt),
+            convert(&bytes, Family::Ppt, None),
             DocOutcome::Unreadable { reason } if reason == "password-protected"
         ));
     }
@@ -1590,31 +1708,10 @@ mod tests {
     #[test]
     fn ppt_slide_table_cells_render_after_the_slide_text() {
         let bytes = ppt_table_fixture("Slide title", ["A1", "B1", "A2", "B2"]);
-        let DocOutcome::Text { text, .. } = convert(&bytes, Family::Ppt) else {
+        let DocOutcome::Text { text, .. } = convert(&bytes, Family::Ppt, None) else {
             panic!("expected text");
         };
         assert_eq!(text, "Slide 1:\n  Slide title\n  A1\n  B1\n  A2\n  B2");
-    }
-
-    #[test]
-    fn ppt_embedded_image_is_reported_as_not_shown() {
-        // The deck's `Pictures` stream is not extracted, so the reading reports
-        // the images it holds.
-        let bytes = ppt_image_fixture("Slide title");
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            unshown,
-            ..
-        } = convert(&bytes, Family::Ppt)
-        else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "Slide 1:\n  Slide title");
-        assert!(images.is_empty());
-        assert!(notes.is_empty());
-        assert_eq!(unshown.lines(), [UNSHOWN_IMAGE]);
     }
 
     #[test]
@@ -1629,7 +1726,7 @@ mod tests {
             notes,
             unshown,
             ..
-        } = convert(&bytes, Family::Ppt)
+        } = convert(&bytes, Family::Ppt, None)
         else {
             panic!("expected text");
         };
@@ -1649,7 +1746,7 @@ mod tests {
             (OleFixture::Audio(1), "1 embedded audio(s) not shown"),
         ] {
             let bytes = ppt_media_fixture("Slide title", media);
-            let DocOutcome::Text { text, unshown, .. } = convert(&bytes, Family::Ppt) else {
+            let DocOutcome::Text { text, unshown, .. } = convert(&bytes, Family::Ppt, None) else {
                 panic!("expected text");
             };
             assert_eq!(text, "Slide 1:\n  Slide title");
@@ -1665,23 +1762,31 @@ mod tests {
         let (stream, edit_offset) =
             ppt_document_stream("Slide title", None, None, Some(OleFixture::Linked(1)));
         let bytes = ppt_cfb(&stream, edit_offset, false, None);
-        let DocOutcome::Text { text, unshown, .. } = convert(&bytes, Family::Ppt) else {
+        let DocOutcome::Text { text, unshown, .. } = convert(&bytes, Family::Ppt, None) else {
             panic!("expected text");
         };
         assert_eq!(text, "Slide 1:\n  Slide title");
         assert!(unshown.lines().is_empty());
     }
 
-    /// A deck holding both a picture and an embedded object reports each loss by
-    /// its own kind rather than joined into one line.
+    /// A deck holding both a picture and an embedded object delivers the picture
+    /// and reports the object by its own kind: one line for the object alone.
     #[test]
-    fn ppt_image_and_object_are_reported_separately() {
+    fn ppt_picture_is_delivered_beside_the_object_reported() {
         let bytes = ppt_image_and_object_fixture("Slide title", 1);
-        let DocOutcome::Text { notes, unshown, .. } = convert(&bytes, Family::Ppt) else {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let DocOutcome::Text {
+            images,
+            notes,
+            unshown,
+            ..
+        } = convert(&bytes, Family::Ppt, Some(dir.path()))
+        else {
             panic!("expected text");
         };
+        assert_eq!(images.len(), 1);
         assert!(notes.is_empty());
-        assert_eq!(unshown.lines(), [UNSHOWN_OBJECT, UNSHOWN_IMAGE]);
+        assert_eq!(unshown.lines(), [UNSHOWN_OBJECT]);
     }
 
     #[test]
@@ -1738,7 +1843,7 @@ mod tests {
         bytes.extend_from_slice(b"not a compound file body");
         for family in [Family::Doc, Family::Xls, Family::Ppt] {
             assert!(matches!(
-                convert(&bytes, family),
+                convert(&bytes, family, None),
                 DocOutcome::Unreadable { reason } if reason.starts_with("corrupt or unreadable .")
             ));
         }

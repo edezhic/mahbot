@@ -49,8 +49,10 @@
 //!   head to read, so a ZIP is still a ZIP by name there: a real `.xlsx` named
 //!   `notes.bin` is read as the raw bytes that name claims.
 //! - **`out_dir` is created on demand** and is the only place artifacts are
-//!   written, with names taken from the source/entry file name — never from a
-//!   full ZIP entry path, so a crafted archive cannot write outside it.
+//!   written. No artifact name carries a path a file supplies: a package's media
+//!   entry contributes its base name rather than its full ZIP entry path, and a
+//!   legacy picture is named from its slot, so a crafted archive cannot write
+//!   outside `out_dir`.
 
 use crate::reader_output::{Unshown, UnshownKind};
 use crate::util::media_target::{RASTER_DECODE_MAX_ALLOC_BYTES, RASTER_DECODE_MAX_DIMENSION_PX};
@@ -129,7 +131,7 @@ static DOCUMENT_CONVERSIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::co
 
 /// Body of the note shown when a document produced images but no text.
 pub(crate) const NO_TEXT_LAYER_NOTE: &str =
-    "no text could be extracted — the pages were provided as images";
+    "no text could be extracted — the content was provided as images";
 
 /// Body of the note shown when a document produced neither text nor images.
 pub(crate) const NO_TEXT_NOTE: &str = "no text could be extracted";
@@ -408,8 +410,8 @@ pub(crate) fn needs_extraction(head: &[u8], file_name: &str) -> bool {
 /// own content), with the file extension as a secondary signal.
 ///
 /// Reached from the crate through [`convert_document_file`]; the tests in this
-/// module call it directly. `out_dir` only matters to the arms that extract
-/// rasters.
+/// module call it directly. `out_dir` is where every arm writes what it delivers
+/// — a rasterized page or an embedded picture.
 #[must_use]
 fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome {
     match classify(bytes, Path::new(file_name)) {
@@ -420,9 +422,15 @@ fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome
         DocumentKind::Docx => crate::ooxml::convert_docx(bytes, out_dir),
         DocumentKind::Xlsx => crate::ooxml::convert_xlsx(bytes, out_dir),
         DocumentKind::Pptx => crate::ooxml::convert_pptx(bytes, out_dir),
-        DocumentKind::LegacyDoc => crate::legacy::convert(bytes, crate::legacy::Family::Doc),
-        DocumentKind::LegacyXls => crate::legacy::convert(bytes, crate::legacy::Family::Xls),
-        DocumentKind::LegacyPpt => crate::legacy::convert(bytes, crate::legacy::Family::Ppt),
+        DocumentKind::LegacyDoc => {
+            crate::legacy::convert(bytes, crate::legacy::Family::Doc, Some(out_dir))
+        }
+        DocumentKind::LegacyXls => {
+            crate::legacy::convert(bytes, crate::legacy::Family::Xls, Some(out_dir))
+        }
+        DocumentKind::LegacyPpt => {
+            crate::legacy::convert(bytes, crate::legacy::Family::Ppt, Some(out_dir))
+        }
         DocumentKind::PlainText => DocOutcome::Text {
             text: String::from_utf8_lossy(bytes).into_owned(),
             images: Vec::new(),
@@ -909,6 +917,25 @@ pub(crate) enum SkipReason {
     Failed,
     Oversized,
 }
+
+/// Extensions of the pictures this pipeline delivers: an embedded picture of one
+/// of these formats is written through to `out_dir` verbatim and attached to the
+/// conversation. Every other format would need a transcoding the readings avoid,
+/// and a reading names it instead — as a drawing in
+/// [`crate::reader_output::Unshown`], or in [`SkippedImages`]. The one owner of
+/// what a reading delivers, shared by the OOXML arms' media walk (a package names
+/// a picture by its media part's extension) and the legacy arms' picture list (the
+/// reader spells each BLIP record type's extension), so the two cannot drift.
+pub(crate) const DELIVERABLE_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+
+/// Extensions of the embedded media that are vector drawings rather than pictures
+/// of pixels: a reading names them as the drawings they are instead of as images
+/// the pipeline cannot convert. Like [`DELIVERABLE_IMAGE_EXTENSIONS`] it is asked
+/// of a file name and shared by both readers, because both meet it — a package as
+/// a media part's name, a legacy file as a BLIP record type's — while the package
+/// reader's other media lists stay with the only reader that classifies a part by
+/// name at all.
+pub(crate) const DRAWING_EXTENSIONS: &[&str] = &["emf", "wmf", "svg", "pict"];
 
 /// The images already written for the document: image XObject identities, plus
 /// the form XObjects whose inline images have been collected. A producer
@@ -1620,6 +1647,46 @@ fn rasterize_page(
 pub(crate) fn ensure_out_dir(out_dir: &Path) {
     if let Err(e) = std::fs::create_dir_all(out_dir) {
         tracing::warn!(path = %out_dir.display(), error = %e, "document: failed to create extraction output dir");
+    }
+}
+
+/// Write one embedded picture into `out_dir` under the name the caller states —
+/// a package's media part by its own base name, a legacy BLIP by its slot in the
+/// reading — and return the path it landed at. A name already taken is suffixed
+/// `_2`, `_3`, … (see [`crate::util::suffixed_name`]); the check is against the
+/// directory rather than a counter because `out_dir` also holds the attachment
+/// itself: a package can hold one base name under two directories
+/// (`word/media/a.png` and `word/media/sub/a.png`), and without the suffix the
+/// earlier file would be overwritten and the survivor delivered twice.
+/// `next_suffix` memoizes the first suffix still worth trying per name, so a
+/// package of many entries sharing one base name does not rescan the names
+/// already taken.
+///
+/// A write failure is counted into `skipped`, never raised: the document itself
+/// was read, so a picture that would not land is a note about what the reading
+/// did not deliver, not a failed call.
+pub(crate) fn write_picture(
+    out_dir: &Path,
+    file_name: &str,
+    data: &[u8],
+    next_suffix: &mut HashMap<String, u32>,
+    skipped: &mut SkippedImages,
+) -> Option<PathBuf> {
+    let n = next_suffix.entry(file_name.to_owned()).or_insert(1);
+    while out_dir
+        .join(crate::util::suffixed_name(file_name, *n))
+        .exists()
+    {
+        *n += 1;
+    }
+    let path = out_dir.join(crate::util::suffixed_name(file_name, *n));
+    match std::fs::write(&path, data) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            tracing::warn!(%file_name, error = %e, "document: failed to write an embedded picture");
+            skipped.add(SkipReason::Failed);
+            None
+        }
     }
 }
 

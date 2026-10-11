@@ -554,7 +554,7 @@ async fn handle_file(
         None => format!("[File {name}: received, not saved to the workspace]"),
     };
 
-    // Extracted pages go into the attachment's own per-message directory, so
+    // Extracted images go into the attachment's own per-message directory, so
     // they stay inside the directory the inbound IMAGE containment accepts.
     // A file (checked above) always has a parent directory.
     let out_dir = path_obj.parent().unwrap_or(path_obj);
@@ -587,20 +587,20 @@ async fn handle_file(
             for note in notes {
                 batch.annotations.push(format!("[File {name}: {note}]"));
             }
-            // Extracted pages go through the ordinary IMAGE pipeline: a native
+            // Extracted images go through the ordinary IMAGE pipeline: a native
             // data-URI part plus a workspace copy, so the model sees them and the
-            // agent can reopen them. A page the pipeline rejects is counted into
+            // agent can reopen them. An image the pipeline rejects is counted into
             // one note, like the converter's own skipped-media note.
-            let mut unreadable_pages = 0usize;
+            let mut unreadable_images = 0usize;
             for image in images {
                 let image_path = image.to_string_lossy().to_string();
                 match handle_image(&image_path, &image, Some(uploads_dir), staging_dirs).await {
                     ImageAction::Keep => {}
                     ImageAction::Invalid { delete_temp } => {
-                        // The page is a temp artifact written by this pass into
+                        // The image is a temp artifact written by this pass into
                         // the attachment's per-message directory, so the note
                         // must not name it — the file is deleted right below.
-                        unreadable_pages += 1;
+                        unreadable_images += 1;
                         if delete_temp {
                             batch.files_to_delete.push(image);
                         }
@@ -620,9 +620,9 @@ async fn handle_file(
                     }
                 }
             }
-            if unreadable_pages > 0 {
+            if unreadable_images > 0 {
                 batch.annotations.push(format!(
-                    "[File {name}: {unreadable_pages} extracted page image(s) could not be read]"
+                    "[File {name}: {unreadable_images} extracted image(s) could not be read]"
                 ));
             }
         }
@@ -650,7 +650,7 @@ async fn handle_file(
 /// Short text is inlined; longer text is spilled to
 /// `<uploads>/<stem>.extracted.txt` and the annotation points at that file, so
 /// a book-sized document cannot blow up the message. Empty text (a scanned,
-/// image-only document) names the extracted pages instead.
+/// image-only document) names the delivered images instead.
 async fn extracted_text_annotation(
     uploads_dir: &std::path::Path,
     name: &str,
@@ -807,7 +807,7 @@ impl EnrichmentBatch {
 /// | IMAGE | data URI conversion (original bytes, re-encoded to a bounded JPEG only when over the encoded-payload cap) + workspace copy when in scope |
 /// | AUDIO | transcription on macOS; an honest "not supported" note where the local audio subsystem does not exist |
 /// | VIDEO | workspace copy + `[Saved video: path]` + transcription |
-/// | FILE | workspace copy under the sender's name + extracted text and pages; out-of-scope markers stay verbatim |
+/// | FILE | workspace copy under the sender's name + extracted text and images; out-of-scope markers stay verbatim |
 ///
 /// After processing, the markers this pass consumed (AUDIO, VIDEO) are stripped
 /// from the content, every other kind is preserved (IMAGE is the native image
