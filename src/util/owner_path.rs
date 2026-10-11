@@ -532,8 +532,7 @@ mod unix {
     /// line between the markers (see [`block_regions`]) — is neither counted nor
     /// taken out: the same rule from the other side.
     ///
-    /// Counting a block is an approximation of its having reached his search path —
-    /// nothing here can know whether his shell really sources the file it sits in.
+    /// Counting a block is an approximation of its having reached his search path.
     /// Its ordinary error is the harmless one: a block in a file he does not source
     /// is still counted as the product's own contribution, so a directory that is on
     /// his path anyway can be named once more by today's block. That extra entry does
@@ -2564,11 +2563,10 @@ mod windows {
 
 // ── Tests for the Windows value rules, runnable on any host ───────────────
 
-/// The rules [`planned_path_value`] applies are pure text work, so they are
-/// exercised here rather than only through a registry this host has none of. The
-/// owner's environment is the one the reader publishes, its `PATH` built with this
-/// host's own path joiner so the same fixtures hold on any host; the value is
-/// always split the Windows way, because that is what reads it.
+/// The rules [`planned_path_value`] applies are pure text work. The owner's
+/// environment is the one the reader publishes, its `PATH` built with this host's own
+/// path joiner so the same fixtures hold on any host; the value is always split the
+/// Windows way, because that is what reads it.
 #[cfg(test)]
 mod tests {
     use super::*;

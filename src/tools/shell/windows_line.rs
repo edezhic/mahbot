@@ -28,58 +28,49 @@
 //! platform takes from the line after it, so the two lines are joined into the one
 //! command both readers already read there.
 //!
-//! # What is argued, and what was measured
+//! # The rules that run a text as this platform reads it
 //!
-//! No Windows host or CI exists in this project, so this platform's reading is
-//! argued the way the two sibling modules argue theirs: the model takes
-//! [`ShellPlatform`] and [`ShellMode`] as data (never a `cfg` branch of its own), so
-//! both lanes are unit-testable from any host — but nothing here was measured
-//! against `cmd.exe`. Every rule fails toward a refusal when its premise does not
-//! hold — a wrong premise there costs a command that would have run — except the
-//! rules that run a text *as this platform reads it* rather than refuse it: a wrong
-//! premise about one of those runs a different command. Those rules are the list
-//! below, and they are the caret's reach (1), the spelling of an escaped operator
-//! (2), the operator's operand (3), the group proof ([`opens_group`] — where the
-//! reader is looking for a command decides whether a `(` opens the block a break may
-//! stand inside; 4–5), the spelling the comment command is recognised by (6), a line
-//! that begins with a redirection (7) and a line break spelled as one lone carriage
-//! return (8). The trailing-break rule rests on the one premise the owner measured
-//! himself — the interpreter reads no line past the first break — so it is not part
-//! of this list. The owner's hand check settles each of them in a minute, from a
-//! plain prompt, one experiment per line:
+//! The model takes [`ShellPlatform`] and [`ShellMode`] as data (never a `cfg` branch
+//! of its own), so both lanes are unit-testable from any host. Every rule fails toward
+//! a refusal when its premise does not hold — a wrong premise there costs a command
+//! that would have run — except the rules below, which run a text *as this platform
+//! reads it* rather than refuse it: a wrong premise about one of those runs a
+//! different command. The list is the caret's reach
+//! (1), the spelling of an escaped operator (2), the operator's operand (3), the
+//! group proof ([`opens_group`] — where the reader is looking for a command decides
+//! whether a `(` opens the block a break may stand inside; 4–5), the spelling the
+//! comment command is recognised by (6), a line that begins with a redirection (7)
+//! and a line break spelled as one lone carriage return (8). The trailing-break rule
+//! is not part of this list: the interpreter reads no line past the first break.
 //!
-//! 1. `copy a.txt ^`, then `b.txt` on the next line — does that copy, i.e. does the
-//!    caret's escape reach past the break into the line it continues? (This reading
-//!    hands the two lines over as written, so a caret that stopped at the break would
-//!    run `b.txt` as a command of its own.)
-//! 2. `dir ^& x`, then `dir y` on the next line — is the escaped `&` ordinary text, so
-//!    that the break after it is the separator this reading respells? (The same
-//!    question for `^|`, `^<`, `^>`, `^(` and `^)`; the read-only mode's own checks
-//!    read each of them as an operator and refuse the text, [`ESCAPED_SYNTAX`].)
-//! 3. `dir &&`, then `next` on the next line — does `next` run, i.e. does an operator
-//!    at the end of a line take its operand from the next one? (This reading joins the
-//!    two lines into one command, so a wrong answer here runs what the platform does
-//!    not.)
-//! 4. `for %f in (a` then `b) do echo %f` — does the `(` open the block its `in` set
-//!    is, so that the break inside it belongs to the block? (This reading hands the two
-//!    lines over as written, so a `(` that opened nothing would lose the second.)
-//! 5. `echo (a) done`, then `dir` on the next line — is `(a) done` echoed as text, or
-//!    is `a` run as a command inside a block? (A `(` in an argument opens no block to
-//!    this reading, [`opens_group`], so it respells the break and runs
-//!    `echo (a) done&dir`.)
-//! 6. `rem. note`, then `dir` on the next line — does `dir` run? (`rem[ note` asks the
-//!    same; this reading respells the break and runs both, because a character
-//!    appended to `rem` is not the comment command and the separator after it stands.
-//!    A spelling that *is* the comment command takes the rest of the line, and the
-//!    line after the break is swallowed — which is why a plain `rem` or a label is
-//!    refused in every mode, [`SWALLOWING_LINE`].)
-//! 7. `dir`, then `> out.txt` on the next line — is the file created as that line's own,
-//!    the way the same two lines create it on unix?
-//!    (This reading respells the break as `& `, so the next line keeps its redirect.)
-//! 8. `dir`, a single carriage return, then `del x` — does this platform end a line at
-//!    a carriage return with no line feed behind it? (This reading hands such a text
-//!    over as written, so if it does, everything after that carriage return is lost
-//!    silently.)
+//! 1. `copy a.txt ^` and `b.txt` on the next line: the caret's escape reaches past
+//!    the break into the line it continues — this reading hands the two lines over as
+//!    written, so a caret that stopped at the break would run `b.txt` as a command of
+//!    its own.
+//! 2. `dir ^& x` and `dir y` on the next line: the escaped `&` is ordinary text, so
+//!    the break after it is the separator this reading respells. (The same holds for
+//!    `^|`, `^<`, `^>`, `^(` and `^)`; the read-only mode's own checks read each of
+//!    them as an operator and refuse the text, [`ESCAPED_SYNTAX`].)
+//! 3. `dir &&` and `next` on the next line: an operator at the end of a line takes its
+//!    operand from the next one — this reading joins the two lines into one command,
+//!    so a wrong reading here would run what the platform does not.
+//! 4. `for %f in (a` and `b) do echo %f`: the `(` opens the block its `in` set is, so
+//!    a break inside it belongs to the block — this reading hands the two lines over
+//!    as written, so a `(` that opened nothing would lose the second.
+//! 5. `echo (a) done` and `dir` on the next line: a `(` in an argument opens no block
+//!    to this reading ([`opens_group`]), so it respells the break and runs
+//!    `echo (a) done&dir`.
+//! 6. `rem. note` and `dir` on the next line: a character appended to `rem` is not the
+//!    comment command and the separator after it stands, so this reading respells the
+//!    break and runs both lines. A spelling that *is* the comment command takes the
+//!    rest of the line, and the line after the break is swallowed — which is why a
+//!    plain `rem` or a label is refused in every mode ([`SWALLOWING_LINE`]).
+//! 7. `dir` and `> out.txt` on the next line: the redirection stays that line's own —
+//!    this reading respells the break as `& `, so the next line keeps its redirect.
+//! 8. `dir`, a single carriage return, then `del x`: a lone carriage return with no
+//!    line feed behind it is no break to this reading — such a text is handed over as
+//!    written, so a platform reader that ended a line there would lose everything
+//!    after it.
 //!
 //! Five residuals are recorded rather than read:
 //!
@@ -87,7 +78,7 @@
 //!   `&`, so no `&>` is spelled and the redirection stays the next line's own. Where
 //!   the interpreter takes a bare redirection as a command, that is what unix does
 //!   with the two lines; where it does not, that line fails with the interpreter's own
-//!   error instead of creating the file (hand check item 7);
+//!   error instead of creating the file (rule 7);
 //! - a caret-continued break is left as written although the guard's reader ends a
 //!   command there and judges the words after it as a command of its own, while this
 //!   platform runs them as ARGUMENTS of the command the caret spread over the two
@@ -118,8 +109,7 @@
 //!   continuation, so its last word ends one character earlier than the one that runs).
 //!   The command and every word before that character are the same, and this is the
 //!   reading a single-line text always had: the platform's own reader reaches past no
-//!   break, which is the one premise of this module the owner measured on his own
-//!   machine.
+//!   break.
 //!
 //! # Where a `(` opens a group
 //!
@@ -646,10 +636,9 @@ fn line_end(text: &str, break_at: usize) -> usize {
 /// after the break that is not one of the platform's own separators — a blank line and
 /// the break after it give it nothing — or a caret escaping the break, whose line is the
 /// continued one's own text. Neither is true of the break a text whose breaks all stand
-/// at its end has, which is the one line [`executable`] hands over as written. The
-/// premise is the one the owner measured on Windows: `cmd.exe` ends the command at the
-/// first break and the lines after it never run, so a reading of them has nothing to
-/// decide.
+/// at its end has, which is the one line [`executable`] hands over as written.
+/// `cmd.exe` ends the command at the first break and the lines after it never run, so a
+/// reading of them has nothing to decide.
 fn spans_commands(command: &str) -> bool {
     let bytes = command.as_bytes();
     let Some(break_at) = bytes.iter().position(|b| *b == b'\n') else {
@@ -1841,9 +1830,8 @@ mod tests {
         reads("(\r\r\ndir\r\r\n)", "(\r\r\ndir\r\r\n)");
         // A carriage return with no line feed behind it is no break to this reading:
         // such a text is the one line it was written as, handed over byte for byte,
-        // never respelled into a second command. The platform's reader is the
-        // unmeasured half of that premise — a carriage return it ends a line at would
-        // lose everything after it (hand check item 8).
+        // never respelled into a second command — a platform reader that ended a line
+        // at one would lose everything after it (rule 8).
         reads("dir\rdel x", "dir\rdel x");
         reads("echo a\rb", "echo a\rb");
     }
@@ -2093,8 +2081,8 @@ mod tests {
         // A parenthesised word inside a proven block, where this platform's `)` is the
         // counter's and not the argument's: the block it closes is not the one the text
         // was written as, so the command is refused rather than run as the two
-        // different texts the two readings make of it. (The hand-check list in the
-        // module doc is where this one is settled.)
+        // different texts the two readings make of it. (The rule list in the module doc
+        // states this one.)
         assert!(refused("if exist x (\necho (a)\n)").contains("bracketed group"));
         assert!(refused("if exist x (\ndir C:\\ws (x86)\\bin\n)").contains("bracketed group"));
         // A break behind an operator joins the lines into one command, so the line

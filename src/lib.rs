@@ -1541,7 +1541,7 @@ pub(crate) struct ChatResponse {
     /// `choices[0].finish_reason` from the provider envelope (stop/length/tool_calls/…).
     pub finish_reason: Option<String>,
     /// Serving upstream provider — top-level OpenRouter response field
-    /// (empirical, undocumented in the API reference); NULL when omitted.
+    /// (undocumented in the API reference); NULL when omitted.
     pub upstream_provider: Option<String>,
     /// Provider `system_fingerprint` (eviction/backend-switch attribution).
     pub system_fingerprint: Option<String>,

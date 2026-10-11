@@ -35,12 +35,11 @@
 //! reason's wording; the in-process counter still bounds the warnings within one
 //! process.
 //!
-//! One stated limit of this format: the engine's own reason for a failed
-//! checkpoint ([`crate::db::checkpoint_cause`]) comes from a genuinely failing
-//! engine checkpoint, which is not reproducible hermetically — one serialised
-//! connection per store, and no fault injection into the engine — so the tests
-//! that pin a checkpoint failure's block drive the cause-capturing path rather
-//! than an end-to-end engine failure. The path in production is the same one.
+//! A checkpoint failure's block carries the engine's own reason on its `reason:`
+//! line ([`crate::db::checkpoint_cause`]). The capture reads that reason from the
+//! engine's own event, and only the engine can fail the checkpoint: a store carries
+//! one serialised connection, and nothing in this process injects a failure into the
+//! engine.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

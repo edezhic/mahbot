@@ -32,10 +32,12 @@
 //!
 //! # The runner's own steps
 //!
-//! On Windows a line that runs this product's own image cannot be waited for by
-//! cmd.exe ([`plan`]), so such a line is decomposed and run by the runner itself;
-//! its result is the same [`ShellRunResult`] a shell run produces. The grep engine
-//! ([`grep_engine`]) rewrites searches the same way. The plan runner and the
+//! On Windows a line that runs this product's own image is decomposed by the runner
+//! ([`plan`]): a call it can reproduce as a step of its own is run by the runner,
+//! which waits for it and reports its own status and output — the same
+//! [`ShellRunResult`] a shell run produces — while a shape it cannot reproduce stays
+//! with the shell or is refused (see [`plan`]'s refusals and residuals). The grep
+//! engine ([`grep_engine`]) rewrites searches the same way. The plan runner and the
 //! single-child runner share the capture ([`Readers`]), the containment
 //! ([`tree`]) and the bounds ([`Watchdog`]) below, so a change to any of them is a
 //! change to both.
@@ -2320,17 +2322,17 @@ impl ShellTool {
 
         // ── The runner's own steps ──
         // A produced rewrite is executed by the plan its analysis was rendered
-        // with, because the shell does not wait for this service's own image
-        // ([`plan`]): the members the runner spawns itself are waited for by the
-        // runner, and the status the tool reports is theirs. A produced rewrite that
-        // was never applied bailed out above as an unserved search, so a plan here is
-        // always the one the line was rewritten into.
+        // with, because a call of this service's own image is the runner's to make
+        // ([`plan`]): the members it spawns itself are waited for by the runner, and
+        // the status the tool reports is theirs. A produced rewrite that was never
+        // applied bailed out above as an unserved search, so a plan here is always
+        // the one the line was rewritten into.
         let mut plan_run = grep_serve.plan.take();
         if plan_run.is_none() {
             // A line the serve decision did not plan can still be an own-image
             // call of its own (`mahbot debug …`, `mahbot -V`): one the runner can
-            // run as a single step is run by the runner, one it cannot is
-            // refused rather than handed to a shell that will not wait for it.
+            // run as a single step is run by the runner, one it cannot is refused
+            // rather than run.
             match plan::plan_for_command(
                 windows_line::Executed(&exec_str),
                 windows_line::Written(command_str),
@@ -2513,8 +2515,8 @@ impl ShellTool {
         // engine with a real-grep run — so the row's served flag must reflect
         // the ACTUAL execution. The engine-internal `exec_grep` path (cwd
         // mismatch, matcher-build failure, version mismatch) re-execs real grep
-        // in place, which is NOT observable from the parent; that residual is
-        // documented rather than fixed.
+        // in place, which the parent cannot see; that residual is accepted as it
+        // stands.
         let applied = exec_str != base.as_ref();
         let served = applied && !sentinel_rerun;
         let reason = if sentinel_rerun {
@@ -6080,8 +6082,7 @@ mod tests {
     /// A stop ends the command's whole process tree, not only its direct child:
     /// the timeout path ends the run's containment, so a grandchild the command
     /// backgrounded dies with it. This is the unix arm of [`Tree::terminate`];
-    /// Windows reaches the same outcome through its job object, which only a
-    /// Windows host can exercise.
+    /// Windows reaches the same outcome through its job object.
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_the_command_process_tree() {

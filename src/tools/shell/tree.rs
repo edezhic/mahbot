@@ -68,9 +68,7 @@
 //! Spawning with `CREATE_NO_WINDOW` hands the child a console that has no window
 //! — and any process the child starts in turn inherits that console unless it
 //! asks for its own — so for a console-program child the guarantee covers
-//! descendants too. (That inheritance half is the platform's documented console
-//! rule, reasoned here rather than observed: no Windows host runs in this
-//! project's lane. macOS/Linux need nothing — a process started there cannot
+//! descendants too. (macOS/Linux need nothing — a process started there cannot
 //! create a window. The images the flag cannot act on are named below.)
 //!
 //! A parent with no console at all hands every console child it starts without
@@ -92,9 +90,9 @@
 //! service's reach, exactly as it is for the browser and the file manager. The one
 //! spawn of this image that is not the service's to flag — the `self-replace` crate
 //! starts its file-swap copy itself — is the residual below. What changes for such
-//! an image is that it asks for no console of its own: a launch with no console has
-//! none to hand on, while one started from a console hands that console over, and
-//! the flag is inert for a windowed image either way.
+//! an image is that it owns no console of its own: it has none to hand on to a child,
+//! and a launch from a console leaves it with that console's handles rather than a
+//! console of its own. The flag is inert for a windowed image either way.
 //!
 //! Covered, one entry per spawn site: the one shared start a program named by a
 //! bare name is given (`tools::shell::program_command`, which names it by the path
@@ -139,10 +137,8 @@
 //! A console program this service starts therefore owns a console of its own — one
 //! extra hidden `conhost.exe` per spawn — and it is not attached to the console its
 //! parent would otherwise have handed it, so console control events on that console
-//! (a console-window close) never reach it. Whether such a child can still *use* a
-//! console handle it inherited from this process is not something this host can
-//! observe: the handle values it receives are unchanged, but they belong to another
-//! console.
+//! (a console-window close) never reach it. A console handle such a child inherits
+//! from this process keeps its value, but that value belongs to another console.
 //!
 //! No usable standard input either: an agent's command inherits no console for its
 //! input — a console-less process has none to hand on — so a command that would

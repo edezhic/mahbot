@@ -3,8 +3,7 @@
 //! These run the four pinned Supertonic 3 TTS models (opset 19) through the
 //! runtime with fixed deterministic inputs and compare the outputs
 //! **bit-exactly** against reference tensors captured from the removed
-//! `candle-onnx-mahbot` fork. The fork was the only oracle for
-//! TTS audio; these fixtures preserve that oracle in the repo.
+//! `candle-onnx-mahbot` fork, preserved in the repo as these fixtures.
 //!
 //! Feature-gated behind `voice-tests` (like the wake_word bench)
 //! because they require the ~383 MB model files on disk under

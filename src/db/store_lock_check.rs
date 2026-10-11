@@ -32,10 +32,8 @@
 //! the refusal is recorded as an environment condition, never as damage (skipped
 //! when the test runs as root, where mode 000 denies nothing).
 //!
-//! Verified on macOS, runnable on Linux — the two platforms the project is tested
-//! on (the module is Unix-only, so elsewhere the property is left unverified
-//! rather than checked). Driven by this module's own test drivers, which
-//! re-execute this test binary as the second process.
+//! Unix-only. Driven by this module's own test drivers, which re-execute this test
+//! binary as the second process.
 //!
 //! The foreign probes need the stock `sqlite3` CLI and are skipped without it,
 //! which the evidence line then says in place of their results: the project's

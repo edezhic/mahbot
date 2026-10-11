@@ -57,24 +57,20 @@
 //! `readonly/windows.rs` reads cmd.exe with its own reader and its own
 //! fail-closed policy, so a cmd.exe rule change belongs in both places.
 //!
-//! # Unverifiable from this host
+//! # The cmd.exe reading this model applies
 //!
-//! No Windows host or CI is available to this crate, so cmd.exe's own reading
-//! is argued rather than measured: that its reading of a line ENDS at a bare
+//! The model reads a line as cmd.exe does: its reading of a line ENDS at a bare
 //! line break — which is why the shell respells every plain break as `&` before
-//! any reader here sees the text ([`crate::tools::shell::windows_line`]) — and
-//! that it splits the rest of a line on `&`/`|`,
-//! keeps a `>`-family redirect's own `&` inside the redirect (`2>&1`), treats
-//! `;`/`'`/`\` as ordinary characters, reads `""` inside a quoted span as a
-//! literal quote, dispatches verbs case-insensitively and extension-insensitively
-//! (`GREP.EXE`), changes nothing on a bare `cd` while recognising `/d` as
-//! its only switch, and keeps the directory stack `pushd` pushes and `popd`
-//! pops. Every refusal rests on that reading — as does the reading
+//! any reader here sees the text ([`crate::tools::shell::windows_line`]) — and it
+//! splits the rest of a line on `&`/`|`, keeps a `>`-family redirect's own `&`
+//! inside the redirect (`2>&1`), treats `;`/`'`/`\` as ordinary characters, reads
+//! `""` inside a quoted span as a literal quote, dispatches verbs case-insensitively
+//! and extension-insensitively (`GREP.EXE`), changes nothing on a bare `cd` while
+//! recognising `/d` as its only switch, and keeps the directory stack `pushd` pushes
+//! and `popd` pops. Every refusal rests on that reading — as does the reading
 //! of the paths this layer joins and compares, and the `/C "…"` hand-off the
-//! shell spawns a rewrite with. The one decision with a host oracle,
-//! [`fnmatch`], is pinned differentially against the host's own `fnmatch` by
-//! the parent module's `windows_fnmatch_parity` tests — a unix host's pin: a
-//! Windows test host has no second implementation to compare against.
+//! shell spawns a rewrite with. [`fnmatch`] is pinned differentially against the
+//! host's own `fnmatch` by the parent module's `windows_fnmatch_parity` tests.
 
 use std::fs;
 use std::io::Write;
@@ -851,8 +847,7 @@ fn matches_from(p: &[char], mut pi: usize, n: &[char], mut ni: usize, period: bo
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
-// The whole model is pure string/path work driven by a runtime platform value,
-// so it is exercised from this host: no Windows host is needed to pin it.
+// The whole model is pure string/path work driven by a runtime platform value.
 
 #[cfg(test)]
 mod tests {

@@ -10,7 +10,8 @@
 //! keeps that one event — and nothing else — via a narrow capture layer, armed
 //! per engine call by a [`CauseSink`] so a cause is never stale and never belongs
 //! to another store's call, and attaches it to the checkpoint error instead of
-//! emitting it as a log record of its own.
+//! emitting it as a log record of its own. The daemon's log-layer stack installs it
+//! ([`crate::logs::log_layers`]).
 //!
 //! That reason carries two duties: the failure record shows it to the operator
 //! ([`crate::db::failure_record`]), and [`is_blocked_checkpoint`] uses it to tell a
@@ -26,16 +27,6 @@
 //! process-wide and every `debug!` callsite gets past the static level check to
 //! its own callsite interest rather than short-circuiting at INFO (this layer
 //! interests no other target, so the added work is that lookup).
-//!
-//! What is verified where: the site ([`ENGINE_TARGET`], [`CAUSE_PREFIX`]) is
-//! checked against the pinned engine's own source (`turso_core`'s
-//! `vdbe/execute.rs`), the capture and its attachment are exercised through the
-//! production seam — including under the real layer stack
-//! ([`crate::logs::log_layers`]), which is what installs this layer in the
-//! daemon — and the product's own failure path is driven from the
-//! checkpoint round's attempt seam. An end-to-end engine failure stays
-//! unobserved — that limit is stated with the record format it affects, in
-//! [`crate::db::failure_record`].
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};

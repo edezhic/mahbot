@@ -1,10 +1,12 @@
 #![warn(clippy::pedantic)]
 // Built for the GUI subsystem so a Windows launch never puts a console window on
-// the screen: the platform gives such a process no console, and it does not block
-// the shell that started it. A launch with no console loses this file's own prints
-// — accepted, never fatal: they go through `mahbot::util::print_stdout` /
-// `print_stderr`, where the policy lives. Conditional so the binary's own test
-// harness stays a console program and `cargo test --bins` output stays visible.
+// the screen: the platform gives such a process no console of its own. How a shell
+// treats it turns on the form of launch — at an interactive prompt it does not wait
+// for such a program and does not hand its exit code back, while from a command file
+// it waits. A launch with no console loses this file's own prints — accepted, never
+// fatal: they go through `mahbot::util::print_stdout` / `print_stderr`, where the
+// policy lives. Conditional so the binary's own test harness stays a console program
+// and `cargo test --bins` output stays visible.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use anyhow::Result;

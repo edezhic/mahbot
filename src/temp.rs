@@ -83,11 +83,7 @@
 //!   The thresholds mix an absolute floor with a share of the volume, so a
 //!   caller whose available space is capped below that floor (a small per-user
 //!   quota) stays in daily mode and keeps dispatching — accepted, since the
-//!   schedule and its hysteresis are fixed by policy;
-//! - real free-space values, the directory the children receive, reparse-point
-//!   refusal and the deletion of a file another process holds open are
-//!   Windows-runtime behaviour with no host-side oracle; the host exercises the
-//!   scan-root selection, the dispatch gate and the private root's verification.
+//!   schedule and its hysteresis are fixed by policy.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

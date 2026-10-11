@@ -17,14 +17,15 @@
 //! `.exe`-insensitive dispatch applies wherever a verb is classified; only OS
 //! APIs (`exec`, `creation_flags`, the SIGPIPE disposition) are `#[cfg]`-gated.
 //!
-//! On Windows the rendered rewrite is not handed to `cmd.exe` as one line: this
-//! service is a windowed program, and the shell does not wait for such an image,
-//! so the members that run it are spawned and waited for by the runner itself
-//! ([`plan`]). The same per-member decisions are rendered twice — as the line the
-//! shell would have run, and as that plan — and a plan and a line that disagreed
-//! about a member would be a search whose output came from somewhere the agent
-//! did not look (the drift guard in this module's `plan_pins` holds them
-//! together).
+//! On Windows the rendered rewrite is not handed to `cmd.exe` as one line: a member
+//! of it that is a call of this service's own windowed image becomes the runner's own
+//! step ([`plan`]) — spawned and waited for by the runner, so its own status and
+//! output are what reach the agent — while a member whose shape the runner cannot
+//! reproduce is refused rather than handed to the interpreter. The same per-member
+//! decisions are rendered twice — as the line the shell would have run, and as that
+//! plan — and a plan and a line that disagreed about a member would be a search whose
+//! output came from somewhere the agent did not look (the drift guard in this module's
+//! `plan_pins` holds them together).
 //!
 //! Grep-family invocations that can be served are rewritten to
 //! a hidden `__grep-engine` subcommand of the current binary (dispatched
@@ -116,11 +117,10 @@
 //! keeps the real `grep`. A member the line itself puts in another environment — a
 //! preceding `export`/`unset`/`eval`/`source` — is not served either, since the
 //! verdict is the process environment's and not the one the line built
-//! ([`changes_the_environment`]). There is no such gate on Windows (no host, no system
-//! `grep`): that lane's reading is argued in `windows` and its one host-testable
-//! piece, [`windows::fnmatch`], is pinned differentially against this host's own
-//! `fnmatch`. Grep decisions are recorded in the dedicated `grep_telemetry` table
-//! (logs DB), not the general log stream.
+//! ([`changes_the_environment`]). There is no such gate on Windows (no system `grep`
+//! there): that lane's reading lives in `windows`, and [`windows::fnmatch`] is pinned
+//! differentially against this host's own `fnmatch`. Grep decisions are recorded in the
+//! dedicated `grep_telemetry` table (logs DB), not the general log stream.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -393,8 +393,8 @@ pub(super) struct GrepServe {
     /// shape the runner refuses) carries no rewrite and so no plan, and on Windows
     /// the caller refuses it when it carries a cause — the command it was handed runs
     /// through the shell only on unix or for a demotion with no cause
-    /// ([`GrepServe::refusal`]). A plan exists because the shell does not wait for
-    /// this service's own image — see [`plan`] for the guarantee and for what is
+    /// ([`GrepServe::refusal`]). A plan exists because a call of this service's own
+    /// image is the runner's to make — see [`plan`] for the guarantee and for what is
     /// deliberately refused.
     pub plan: Option<Plan>,
     /// The short cause of the search this platform could not serve, when the
@@ -1115,8 +1115,8 @@ pub(super) enum Fallback {
     /// platform) or the scratch file the Windows transport carries the spec in.
     Handoff(String),
     /// A member the runner has to spawn itself is in a shape the plan cannot run:
-    /// a spelling of this service's own image the shell does not wait for, a
-    /// redirect the runner cannot apply to a member it spawns, or a line the
+    /// a spelling of this service's own image the runner cannot run as one plain
+    /// call, a redirect the runner cannot apply to a member it spawns, or a line the
     /// decomposition cannot represent ([`plan::build`]). The reason is
     /// [`plan::Refusal`]'s own, so the cause reaching the agent is the one the
     /// decomposition refused with rather than a second rendering of it.
@@ -1324,7 +1324,7 @@ fn analyze_command(
     let mut group_depth = 0isize;
     // Set by a segment that may have exported a new environment for the rest of
     // the line (see [`changes_the_environment`]): a grep after it runs under an
-    // environment the parity verdict was not measured for.
+    // environment the line built for itself, which the parity gate does not cover.
     let mut env_may_have_changed = false;
 
     for (idx, (seg, conn)) in segments.iter().enumerate() {
@@ -1544,9 +1544,8 @@ fn analyze_command(
 }
 
 /// One analysis rendered for both of its consumers: the single command line the
-/// shell was going to run, and — on the platform whose shell does not wait for
-/// this service's own image — the plan its runner executes instead
-/// ([`super::plan`]).
+/// shell was going to run, and — where a call of this service's own image is the
+/// runner's rather than the shell's — the plan it executes instead ([`super::plan`]).
 struct Joined {
     /// The rewrite as one command: the members joined with their own connectors —
     /// the joining, and the one connector it can add, are [`join_rewritten`]'s.
@@ -1639,11 +1638,11 @@ fn join_rewritten(
             out.push_str(conn);
         }
     }
-    // The plan is the Windows decomposition (see [`plan`]): the platform whose
-    // shell does not wait for this service's own image is the only one that has
-    // one, and the members above were collected on that platform alone. It reads
-    // the line's cwd itself, tracking every member's `cd` the way the analyzer
-    // did, so the text here and the plan cannot disagree about a directory either.
+    // The plan is the Windows decomposition (see [`plan`]): taking a call of this
+    // service's own image over is Windows-only, so it is the only platform with one,
+    // and the members above were collected there alone. It reads the line's cwd
+    // itself, tracking every member's `cd` the way the analyzer did, so the text here
+    // and the plan cannot disagree about a directory either.
     let plan = match platform {
         ShellPlatform::Windows => {
             match plan::build(&members, Path::new(exe), root_cwd) {
@@ -1908,8 +1907,8 @@ const COMPOUND_KEYWORDS: &[&str] = &[
 
 /// The shell's own variable builtins: a segment holding one in command position
 /// may have exported a new value, so everything after it in the same line runs
-/// under an environment the parity verdict was not measured for (see
-/// [`changes_the_environment`]).
+/// under an environment the line built for itself, which the parity gate does not
+/// cover (see [`changes_the_environment`]).
 const ENV_MUTATING_BUILTINS: &[&str] = &["export", "unset", "eval", "source", "."];
 
 /// True when `seg` may have changed the environment the rest of the line runs
@@ -1946,8 +1945,8 @@ const ENV_MUTATING_BUILTINS: &[&str] = &["export", "unset", "eval", "source", ".
 /// not arise.
 ///
 /// Deliberately not chased, and left as a recorded residual — the spellings in which
-/// a served member can still run under an environment the verdict was not measured
-/// for: a mutating word in any position other than the two that are read — behind a
+/// a served member can still run under an environment the line built for itself:
+/// a mutating word in any position other than the two that are read — behind a
 /// wrapper keyword (`time export LC_ALL=C; grep …`, `! export …`), inside a
 /// construct body (`case x in a) export LC_ALL=C;; esac; grep …`), behind a wrapper
 /// word (`command export …`) or a redirection (`>log export LC_ALL=C`), or with an
@@ -5901,7 +5900,7 @@ mod cd_scan_pins {
 
 // ── Windows fnmatch parity (host-differential) ───────────────────────────
 // The Windows matcher is pure Rust (no libc on that platform), so the host's
-// own `fnmatch` is the only oracle available for it. Both are the SAME
+// own `fnmatch` is what it is pinned against. Both are the SAME
 // semantics the unix lane uses (the engine's filters and the shell's glob
 // expansion), so agreement here is what makes the Windows spelling trustworthy:
 // the cross-product below, malformed spellings included, is this matcher's
@@ -6526,8 +6525,8 @@ mod test_support {
     /// process-wide SIGPIPE disposition back to its default, which this binary
     /// shares with tests whose producer writes into a child pipe expecting
     /// `EPIPE`, and on a cannot-serve path it replaces the process with the real
-    /// `grep`. Unix-gated with its rows: the Windows lane's reading is argued in
-    /// `windows`, never run in-process here.
+    /// `grep`. Unix-gated with its rows: the Windows lane's reading lives in
+    /// `windows`.
     #[cfg(unix)]
     pub(super) fn engine_run(spec: &EngineSpec) -> (Vec<u8>, Vec<u8>, i32) {
         let (out, err, code, _) = engine_run_with_stdin(spec, &[]);
@@ -7011,11 +7010,10 @@ mod refusal_pins {
     }
 
     /// A line that runs this service's own program beside a search is served like
-    /// any other rewritten line: the call is not the shell's to run — the shell
-    /// does not wait for a windowed image — so [`plan`] makes it a step the runner
-    /// spawns itself, and the search beside it is served as usual. This is the
-    /// shape a rewritten `mahbot … && grep …` has, and the reason it is a plan
-    /// rather than a refusal.
+    /// any other rewritten line: a call the runner can reproduce becomes a step the
+    /// runner spawns itself ([`plan`]), and the search beside it is served as usual.
+    /// This is the shape a rewritten `mahbot … && grep …` has, and the reason it is a
+    /// plan rather than a refusal.
     #[test]
     fn windows_serves_a_line_that_runs_the_own_image_beside_a_search() {
         let (_tmp, ws, home) = serve_fixture();

@@ -161,9 +161,8 @@ struct SessionEntry {
 /// The command a background session runs: the shell, or this service's own image
 /// when the command is one call of it ([`super::plan::plan_for_command`]).
 ///
-/// The image is spawned directly rather than through a shell, because the shell
-/// does not wait for it ([`super::plan`]) — and a background session is exactly
-/// where that would report a completion the image never reached. `Err` is the
+/// The image is spawned directly rather than through a shell, so the session waits
+/// for it and reports the child's own status and output ([`super::plan`]). `Err` is the
 /// launch error for a command that names the image in a shape the runner cannot
 /// wire as one command: a launcher spelling the planner refuses, and a line the
 /// planner read as a chain, whose members around the call are steps of their own.
@@ -201,8 +200,8 @@ fn own_image_command(
             let Some((args, redirects, cwd)) = plan.direct_own() else {
                 // A line the runner's own decomposition read as a chain (the
                 // members around the call are steps of their own): a background
-                // session launches one command, so this fails the launch rather
-                // than run a shell whose wait for the image cannot be relied on.
+                // session launches one command, so this fails the launch rather than
+                // report a completion the image never reached.
                 return Err(super::plan::refusal_message(
                     "the command could not be read as a single call of `mahbot`",
                 ));
@@ -258,11 +257,11 @@ impl BackgroundSessions {
         super::record_spill_owner(output_path.clone());
 
         // ── Command child ──
-        // A command that names this service's own image cannot be left to the
-        // shell: the shell does not wait for it ([`super::plan`]), and a session
-        // whose output file claimed a completion the image never reached would be
-        // a lie. A lone own-image call is spawned directly instead, and any other
-        // shape that names the image fails at launch.
+        // A command that names this service's own image cannot be left to the shell
+        // ([`super::plan`]): a session must report the image's own status, and an
+        // output file claiming a completion the image never reached would be a lie.
+        // A lone own-image call is spawned directly instead, and any other shape that
+        // names the image fails at launch.
         let (mut cmd, taken) = match own_image_command(executed, written, workspace_root, mode) {
             Ok(command) => command,
             Err(reason) => {

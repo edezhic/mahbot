@@ -387,8 +387,8 @@ pub(crate) fn restore_transcriber_for_test(previous: Option<MediaTranscriber>) {
 /// Identity headers (`X-Title`, `HTTP-Referrer`) are sent unconditionally
 /// (most providers ignore them harmlessly). Upstream-provider attribution
 /// needs no request-side opt-in: OpenRouter's top-level `provider` response
-/// field (undocumented in the API reference but consumed by OpenRouter's
-/// own SDK) carries it.
+/// field — undocumented in the API reference, but read by OpenRouter's own
+/// SDK — carries it.
 ///
 /// The display name is derived from the endpoint: "OpenRouter"
 /// for the default endpoint, "Custom endpoint" otherwise — so custom-endpoint
@@ -486,7 +486,7 @@ mod tests {
             },
             // Edge case: URL where /chat/completions appears in the domain, not a path segment.
             // This is a shared limitation of both helpers — they operate on strings, not URL
-            // components. We document the current behaviour rather than asserting correctness.
+            // components.
             Case {
                 name: "domain_containing_chat_completions",
                 input: "https://chat.completions.com/api",

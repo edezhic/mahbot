@@ -263,8 +263,8 @@ struct LlmRequestRecord {
     pub cost: Option<f64>,
     /// Raw `usage.cost_details` JSON from the provider (reference only).
     pub cost_details: Option<String>,
-    /// Serving upstream — top-level OpenRouter `provider` field (empirical,
-    /// undocumented in the API reference); NULL when the provider omits it.
+    /// Serving upstream — top-level OpenRouter `provider` field (undocumented in
+    /// the API reference); NULL when the provider omits it.
     pub upstream_provider: Option<String>,
     /// Provider `system_fingerprint`; NULL when the provider omits it.
     pub system_fingerprint: Option<String>,

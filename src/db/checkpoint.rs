@@ -177,8 +177,7 @@ const CHECKPOINT_FAILURE_MIN_ROUNDS: u64 = 2;
 /// failure may decide the stop: the "several minutes" the rule asks for, made explicit
 /// next to the round count. At the 5-minute cadence [`CHECKPOINT_FAILURE_MIN_ROUNDS`]
 /// alone already spans more than this, so the floor is belt-and-braces — it binds only
-/// for rounds run back to back, which no production path does, and the round's test
-/// seam is where it is exercised.
+/// for rounds run back to back, which no production path does.
 const CHECKPOINT_FAILURE_WINDOW: Duration = Duration::from_secs(120);
 
 /// The `record` field's value when the durable block could not be filed: the
@@ -679,17 +678,15 @@ fn cure_failure_window(name: &'static str, key: &Path, round_failures: usize) {
 /// The periodic round's decision table: its arms own what each engine answer means
 /// and [`crate::db::shrink_gate`] owns what a refusal is.
 ///
-/// `attempt` is a parameter because this decision table has to be exercised
-/// without an engine-side failing checkpoint, which is not reproducible
-/// hermetically (see [`crate::db::checkpoint_cause`]): [`periodic_checkpoint`] is
-/// the single caller and always passes the gate + engine attempt. It, and the two
-/// timing parameters — `retry_pauses`, the real pauses before the retries, and
-/// `span`, how long a store's failure window must have been open — are the round's
-/// only seam: the tests compress both, production passes the two constants.
-/// Nothing outside this module can reach it, which is also where the failure
-/// window's whole rule is verified: that a real failure on a *healthy* store would
-/// have been cured by a later attempt is not end-to-end observable, only that the
-/// later attempt is made.
+/// `attempt` is a parameter because a genuinely failing engine checkpoint cannot be
+/// provoked in this process — one serialised connection per store, and no fault
+/// injection into the engine ([`crate::db::failure_record`]) — so the table takes
+/// each engine answer directly: [`periodic_checkpoint`] is the single caller and
+/// always passes the gate + engine attempt. It, and the two timing parameters —
+/// `retry_pauses`, the real pauses before the retries, and `span`, how long a store's
+/// failure window must have been open — are the round's only seam: the tests compress
+/// both, production passes the two constants. Nothing outside this module can reach
+/// it, and its arms are the failure window's whole rule.
 ///
 /// The attempt future is `Send` because the periodic round runs inside the
 /// process's spawned task set.

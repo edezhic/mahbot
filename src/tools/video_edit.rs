@@ -60,21 +60,22 @@ fn classify_model(model: &str) -> VideoEditModel {
 }
 
 impl VideoEditModel {
-    /// Verified input-clip duration bounds in milliseconds — the single
-    /// per-model table backing the pre-flight local-clip check.
+    /// The input-clip duration bounds in milliseconds — the single per-model table
+    /// backing the pre-flight local-clip check.
     ///
-    /// `None` fails open (no check): the limit is unverified or unknown, or
-    /// the model trims over-long inputs instead of rejecting them (seedance
-    /// family). Deleting a row here removes the check everywhere — no other
-    /// copy of a limit exists.
+    /// `None` fails open (no check): no bound is held for this model — the seedance
+    /// family trims over-long inputs instead of rejecting them, and a model the
+    /// classifier does not recognise lands on the same arm. Deleting a row here
+    /// removes the check everywhere — no other copy of a limit exists.
     fn input_duration_limit_ms(self) -> Option<std::ops::RangeInclusive<i64>> {
         match self {
-            // minimax/hailuo-3: 2000–15000 ms per clip — confirmed by live
-            // provider errors ("expected [2000, 15000] ms") and MiniMax docs;
-            // the same bound behind the 50 MB input cap.
+            // minimax/hailuo-3: 2000–15000 ms per clip ("expected [2000, 15000] ms"
+            // from the provider, and MiniMax's own docs); the same bound behind the
+            // 50 MB input cap.
             VideoEditModel::Hailuo3 => Some(2_000..=15_000),
-            // aleph-2's 2–30 s range is NOT verified by a live provider error.
-            // seedance-2.5/2.0-mini TRIM over-long inputs — never hard-reject.
+            // aleph-2 mirrors its input clip's duration, so it has no bound here;
+            // seedance-2.5/2.0-mini TRIM over-long inputs — never hard-reject; and an
+            // unrecognised model has no bound to apply.
             VideoEditModel::Aleph2
             | VideoEditModel::Seedance
             | VideoEditModel::SeedanceMini
@@ -156,8 +157,8 @@ fn validate_params(
             }
         }
         VideoEditModel::SeedanceMini => {
-            // Explicit 4-15s edit duration per native docs/catalog; the relay's
-            // seedance-edit duration handling is unverified — rejection surfaces at submit.
+            // Explicit 4-15s edit duration per native docs/catalog; the check here
+            // is what refuses anything outside it.
             ensure_duration_in(duration, 4..=15, "seedance-2.0-mini duration")?;
         }
         VideoEditModel::Seedance => match mode {
@@ -947,13 +948,14 @@ mod tests {
     }
 
     #[test]
-    fn input_duration_limit_table_verified_only() {
-        // Verified: hailuo-3 input clips 2000–15000 ms.
+    fn input_duration_limit_table_bounds_hailuo3_only() {
+        // Hailuo-3 input clips: 2000–15000 ms.
         assert_eq!(
             VideoEditModel::Hailuo3.input_duration_limit_ms(),
             Some(2_000..=15_000)
         );
-        // Unverified (aleph-2) and trimming (seedance) models fail open.
+        // Aleph-2 (its output mirrors the input) and the trimming seedance models
+        // fail open.
         assert_eq!(VideoEditModel::Aleph2.input_duration_limit_ms(), None);
         assert_eq!(VideoEditModel::Seedance.input_duration_limit_ms(), None);
         assert_eq!(VideoEditModel::SeedanceMini.input_duration_limit_ms(), None);
@@ -1041,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn check_local_input_duration_hard_rejects_only_verified_ranges() {
+    fn check_local_input_duration_hard_rejects_only_bounded_models() {
         let hailuo = ("minimax/hailuo-3", VideoEditModel::Hailuo3);
         // The observed live failure: a 35.2 s clip rejected by hailuo-3.
         let (_dir, overlong) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 35_200))]);
@@ -1057,7 +1059,7 @@ mod tests {
         assert!(msg.contains("exceeds"), "message: {msg}");
         assert!(msg.contains("Trim"), "message: {msg}");
 
-        // Sub-minimum (1.5 s) is equally doomed — same verified range; the
+        // Sub-minimum (1.5 s) is equally doomed — the same bound; the
         // error names the violated lower bound and the actionable direction.
         let (_dir, tooshort) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 1_500))]);
         let err = check_local_input_duration(&tooshort, hailuo.0, hailuo.1).unwrap_err();

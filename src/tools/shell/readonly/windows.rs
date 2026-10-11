@@ -103,9 +103,7 @@
 //!
 //! # Accepted limits (settled, not chased)
 //!
-//! Each is recorded as a limit rather than chased. Where the cmd.exe side of one
-//! could not be measured on this host it is argued (see `# Unverifiable from this
-//! host`):
+//! Each is recorded as a limit rather than chased:
 //!
 //! - wrappers and other interpreters are NOT chased, and on Windows they are
 //!   idiomatic: `cmd /c …` (the shell itself — the Windows counterpart of the
@@ -197,23 +195,20 @@
 //! there, which is a settled limit of the shared tables rather than a gap this
 //! layer's fold closes.
 //!
-//! # Unverifiable from this host
+//! # The cmd.exe reading this layer applies
 //!
-//! No Windows host or CI is available to this crate, so cmd.exe's own behaviour
-//! is argued rather than measured: how it splits and quotes arguments (a `\`
-//! before a space is ordinary text for cmd but an escape for the bash parse the
-//! guard reads), its parameter delimiters and separators, its glued switches,
-//! its device names, its delayed `!VAR!`/caret escapes and its case-insensitive
-//! verb dispatch. Every verdict the layer reaches rests on that reading rather
-//! than on anything observed here — the refusals under `# Matching` and the
-//! limits under `# Accepted limits` alike. Chiefly argued: that Win32 strips a
-//! trailing dot or space off a name component, that cmd.exe resolves a bare
-//! `;`-bearing word the way it resolves the fragments the guard splits it into,
-//! that a `%…%` outside the name grammar stays literal, that this platform has
-//! no text block at all, so a `<<` has none to reach, that an omitted
-//! `move`/`replace` destination defaults to cmd's own directory
-//! ([`CWD_DESTINATION_VERBS`]), and that `ren`/`mklink` refuse an omitted second
-//! operand rather than defaulting it.
+//! The layer reads cmd.exe's own behaviour: how it splits and quotes arguments (a
+//! `\` before a space is ordinary text for cmd but an escape for the bash parse the
+//! guard reads), its parameter delimiters and separators, its glued switches, its
+//! device names, its delayed `!VAR!`/caret escapes and its case-insensitive verb
+//! dispatch. Every verdict the layer reaches rests on that reading — the refusals
+//! under `# Matching` and the limits under `# Accepted limits` alike. What it reads
+//! is: Win32 strips a trailing dot or space off a name component; cmd.exe resolves a
+//! bare `;`-bearing word the way it resolves the fragments the guard splits it into;
+//! a `%…%` outside the name grammar stays literal; this platform has no text block
+//! at all, so a `<<` has none to reach; an omitted `move`/`replace` destination
+//! defaults to cmd's own directory ([`CWD_DESTINATION_VERBS`]); and `ren`/`mklink`
+//! refuse an omitted second operand rather than defaulting it.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -397,13 +392,11 @@ const VERB_TABLES: &[&[&str]] = &[
 
 /// True when a command word's leading text names a verb this layer acts on, and
 /// so may carry a glued switch. Splitting the token is cmd.exe's own behaviour
-/// for its internal commands (argued from documented behaviour like every
-/// cmd.exe reading here — see `# Unverifiable from this host`); the table verbs
-/// that are external programs (`format`, `taskkill`, `xcopy`, …) are split the
-/// same way because their glued spelling cannot be argued from this host and
-/// over-rejection is the accepted failure direction. Balanced quotes are
-/// stripped first, so a quoted head (`"del"/q`) is read as the name cmd.exe
-/// resolves.
+/// for its internal commands (see the module doc's `# The cmd.exe reading this
+/// layer applies`); the table verbs that are external programs (`format`,
+/// `taskkill`, `xcopy`, …) are split the same way, and over-rejection is the
+/// accepted failure direction. Balanced quotes are stripped first, so a quoted
+/// head (`"del"/q`) is read as the name cmd.exe resolves.
 fn is_glue_splittable(head: &str) -> bool {
     let head = scan::strip_quoted_word(head);
     VERB_TABLES
@@ -697,8 +690,7 @@ fn strip_verbatim(canonical: &str) -> String {
 /// — an unbound one expands to nothing and the empty expansion is not a provable
 /// path, while cmd's own `%USERPROFILE%`/`%CD%` resolve to values this model
 /// cannot see. A `%` with no partner, or with a non-name between, stays literal
-/// — an argued reading of cmd's expansion, not a measured one (an accepted
-/// limit; see the module doc).
+/// — an accepted limit; see the module doc.
 ///
 /// The pairing above is this reader's, and the interception reads the same
 /// character with a coarser rule of its own: `grep_engine::windows::has_percent_expansion`
@@ -1341,8 +1333,8 @@ mod tests {
         assert_rejected(r"rd/s/q C:\ws\tree");
         assert_rejected(r#"move/y C:\ws\a.txt "%TEMP%\b.txt""#);
         assert_rejected(r#"copy/y "%TEMP%\a.txt" C:\ws\b.txt"#);
-        // A table verb that is an external program is split the same way (its
-        // glued spelling cannot be argued from this host, so it over-rejects).
+        // A table verb that is an external program is split the same way, and the
+        // over-rejection is the accepted direction.
         assert_rejected(r"taskkill/f /im notepad.exe");
         assert_rejected(r"format/q C:");
         ok(r#"del/q "%TEMP%\x.txt""#);

@@ -125,9 +125,9 @@ struct ApiChatResponse {
     #[serde(default, deserialize_with = "opt_field")]
     system_fingerprint: Option<String>,
     /// Serving upstream provider — OpenRouter's top-level response field
-    /// (undocumented in the API reference but consumed by OpenRouter's own
-    /// SDK; empirically present incl. cache hits, where `openrouter_metadata`
-    /// is stripped). NULL when the provider omits it.
+    /// (undocumented in the API reference; read by OpenRouter's own SDK) and
+    /// present on cache hits too, where `openrouter_metadata` is stripped. NULL
+    /// when the provider omits it.
     #[serde(default, deserialize_with = "opt_field")]
     provider: Option<String>,
 }
@@ -858,10 +858,8 @@ fn translate_for_custom_endpoint(model: &str, effort: &str) -> ReasoningFields {
         // there is no effort field to pass through on this family.
         ReasoningFamily::Mimo => ReasoningFields::ThinkingEnabled,
         // MiniMax M3: thinking is on by default on the OpenAI-compatible
-        // endpoint — omit reasoning_effort AND the thinking object. The
-        // "thinking:{type:adaptive} if verified" clause is deliberately NOT
-        // implemented: there is no live endpoint to verify it, so omit-both
-        // is the only behavior. Field shape dominates for any effort value.
+        // endpoint, and the family has no reasoning_effort field, so both the
+        // effort and the thinking object are omitted for every effort value.
         ReasoningFamily::MiniMax => ReasoningFields::Omit,
         _ => {
             let value = match (family, effort) {

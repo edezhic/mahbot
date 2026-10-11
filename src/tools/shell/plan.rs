@@ -2,20 +2,21 @@
 //!
 //! # The guarantee
 //!
-//! Every step that runs this service's own image is spawned — and waited for — by
-//! the runner itself. This service is built as a **windowed** program
-//! (`windows_subsystem = "windows"`), and the platform documents such an image as
-//! neither allocated a console nor blocking the shell that starts it: a
-//! `cmd.exe /C "… mahbot.exe …"` line returns as soon as cmd.exe has *started* the
-//! image, so the shell's own status and whatever the capture held at that instant
-//! would reach the agent as the command's answer — a truncated or empty result,
-//! or a status that came from the interpreter. The product's file search is the
-//! same image: its call is the one whose refusal, truncation or stale-helper
-//! answer must never arrive looking like "no matches".
+//! This service is built as a **windowed** program
+//! (`windows_subsystem = "windows"`), and how the shell treats such a program turns
+//! on the form of launch: at an interactive prompt it does not wait for it and does
+//! not hand its exit code back, while from a command file it waits. Where the
+//! product needs such a call's own result, it therefore runs the call itself: the
+//! runner spawns the image as argv with the streams wired here, waits for it, and
+//! reports the child's own status and output — never a fold's shell text, which would
+//! hand the call to an interpreter. A member whose shape the runner cannot reproduce
+//! as one plain call of the image is refused loudly rather than run with output nobody
+//! can vouch for (see the refusals below), and a shape this reading cannot reach stays
+//! with the shell (see the residuals below). The product's file search is the same
+//! image: its call is the one whose refusal or stale-helper answer must never arrive
+//! looking like "no matches".
 //!
-//! Nothing on cmd.exe's side can change that: it is what a GUI-subsystem image
-//! *is*. So the runner takes those members over — it spawns the image as argv,
-//! waits for it, and reports its status — and the shell is left with only the
+//! So the runner takes those members over and the shell is left with only the
 //! members it can genuinely be asked to run.
 //!
 //! # One line, two renderings
@@ -114,8 +115,8 @@
 //!   any line the cmd.exe model cannot read while it names the image by that path
 //!   ([`spelling_in_text`]) or where a command can start ([`own_image_in_text`] —
 //!   the reading that also sees through the `@`/`(` punctuation a refused line
-//!   carries). Every one of them is a call the shell does not wait for, so leaving
-//!   it to the shell would hand the agent a truncated or empty answer;
+//!   carries). Every one of them is a shape the runner cannot reproduce as one plain
+//!   call of the image, so it is refused loudly rather than run;
 //! - a fold whose shell state a later fold would have observed (the environment it
 //!   sets, the directory stack it pushes): each fold is a fresh cmd.exe, and state
 //!   that dies with its fold cannot be approximated;
@@ -154,10 +155,10 @@
 //!   owner's alarm program, a diagnostics step — is not a command line this runner
 //!   sees: cmd.exe runs it, and a call of this service's own image inside it is left
 //!   to the shell, with whatever a shell gives a windowed image.
-//! - One class of bare-name call stays the shell's without being refused, and it is
-//!   a windowed image the shell does not wait for: a `mahbot …` command this model
-//!   reads but never in command position — the keyword forms cmd.exe runs a command
-//!   from (`for … do`, `if`, `else`): `for /f %i in ('mahbot -V') do …`,
+//! - One class of bare-name call stays the shell's without being refused: a
+//!   `mahbot …` command this model reads but never in command position — the keyword
+//!   forms cmd.exe runs a command from (`for … do`, `if`, `else`):
+//!   `for /f %i in ('mahbot -V') do …`,
 //!   `if exist x mahbot -V`, `else mahbot -V`, `for %f in (*) do mahbot -V` — and a
 //!   call glued to a connector inside a text this model reads as one word, which is
 //!   another command's quoted argument (`cmd /c "echo hi&&mahbot -V"`) or a line the
@@ -209,15 +210,11 @@
 //!   inside one cmd process, and a member's stdout ordering is preserved by
 //!   member rather than by line: each stream is assembled in execution order.
 //!
-//! # Reasoned, not measured
+//! # Where the executor is pinned
 //!
-//! No Windows host runs in this project's lane, so cmd.exe's reading of the
-//! connectors and redirects modelled here is argued from its documentation, the
-//! way the engine's own `windows` line model is. The plan's steps are plain data,
-//! so the executor's mechanics are driven from any host with shell members, and
-//! [`runs_after`] (the one decision with a host oracle: cmd's errorlevel) is pinned
-//! there by the executor's connector test. What no host here can show is cmd.exe's
-//! agreement with the fold text the runner hands it.
+//! The plan's steps are plain data, so the executor's mechanics are driven from any
+//! host with shell members, and [`runs_after`] — the connector decision cmd.exe's
+//! errorlevel drives — is pinned by the executor's connector test.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -355,15 +352,15 @@ pub(super) enum Member {
     },
 }
 
-/// Why a plan could not be built. Every one of these is a *refusal*: the command
-/// must not be handed to the shell either, because the shell cannot be waited on
-/// for the member the refusal is about — the reason becomes the agent-facing tool
-/// error, and no command runs.
+/// Why a plan could not be built. Every one of these is a *refusal*: the member
+/// cannot be run as one plain call of the image, or the line cannot be decomposed
+/// into steps the runner runs — and the line is never handed to the shell instead.
+/// The reason becomes the agent-facing tool error, and no command runs.
 #[derive(Debug)]
 pub(super) enum Refusal {
     /// A member names this service's own image — in command position, through a
-    /// launcher, or in a line the model cannot read — and the shell does not wait
-    /// for it ([`own_image_reference`]).
+    /// launcher, or in a line the model cannot read — in a shape the runner cannot
+    /// run as one plain call of it ([`own_image_reference`]).
     OwnImageInShell,
     /// A member's command-position word names the image's file name through a
     /// path the runner cannot match to the program it runs
@@ -385,14 +382,17 @@ impl std::fmt::Display for Refusal {
             // `mahbot` is the word the call was written with.
             Refusal::OwnImageInShell => write!(
                 f,
-                "the line also runs `mahbot` itself, which a shell does not wait for — \
-                 such a call would come back truncated or empty"
+                "the line also runs `mahbot` itself in a shape the runner cannot run as \
+                 one plain call of the image — a launcher, or a word the shell would \
+                 expand first — so it is refused rather than run with output nobody can \
+                 vouch for"
             ),
             Refusal::OwnImageSpelling(spelling) => write!(
                 f,
                 "a shell member runs `{spelling}`, which names `mahbot`'s file name but \
-                 is not the program the runner spawns — and a shell does not wait for \
-                 such an image either"
+                 is not the program the runner spawns — a call the runner cannot \
+                 reproduce, so it is refused rather than run with output nobody can \
+                 vouch for"
             ),
             Refusal::Shape(reason) => write!(f, "{reason}"),
         }
@@ -415,9 +415,8 @@ impl std::fmt::Display for Refusal {
 /// arrived as one or had to be converted, and that a fold can never swallow such
 /// a call.
 ///
-/// Windows only, and by construction: this is the platform whose shell does not
-/// wait for this service's own image, so it is the only one whose caller builds a
-/// plan at all.
+/// Windows only, and by construction: elsewhere the shell waits for its children, so
+/// no call of the image is the runner's there and no caller builds a plan.
 pub(super) fn build(
     members: &[(Member, String)],
     exe: &Path,
@@ -463,10 +462,10 @@ pub(super) fn build(
                 // The member's words, read once for every reading below.
                 let words = member_words(text);
                 // A member that is a plain call of this service's own image is not
-                // the shell's to run, whatever its caller took it for: the shell
-                // does not wait for the image, and the fold around it would hand
-                // the call to exactly that shell. It becomes an own step in this
-                // member's place, which is why the fold breaks here.
+                // the shell's to run, whatever its caller took it for: the runner
+                // waits for it and reports the child's own status and output, while a
+                // fold would hand the call to the shell instead. It becomes an own
+                // step in this member's place, which is why the fold breaks here.
                 if let Some((args, redirects)) = own_call(&words, exe) {
                     // An own step needs the tracked directory even when a fold is
                     // open around it (that fold is flushed below).
@@ -476,10 +475,10 @@ pub(super) fn build(
                     let cwd = tracked.clone();
                     (args, redirects, cwd)
                 } else {
-                    // Not a plain call, but still a call the shell cannot be waited
-                    // on for — a launcher spelling, a path that is not the program
-                    // the runner runs, a word cmd.exe would have expanded before any
-                    // program saw it. Refused, never handed over.
+                    // Not a plain call, but still a shape the runner cannot reproduce
+                    // as one call of the image — a launcher spelling, a path that is
+                    // not the program the runner runs, a word cmd.exe would have
+                    // expanded before any program saw it. Refused, never handed over.
                     if let Some(refusal) = own_image_reference(&words, text, exe) {
                         return Err(refusal);
                     }
@@ -1116,10 +1115,10 @@ fn names_image_in_words(words: &[grep_engine::GrepWord], exe: &Path) -> bool {
 /// ([`names_image_file`] — `.\mahbot.exe`, `target\debug\mahbot.exe`); a word
 /// that IS the image ([`is_own_image_word`]) while the member is not one plain call
 /// of it (a `%…%` word cmd.exe would have expanded); and a launcher
-/// ([`launcher_hands_image`]) whose own grammar runs the image while handing the
-/// call to a shell that does not wait for it — or, when that launcher's own command
-/// word is one this model cannot read, the shape refusal, which claims only that
-/// `mahbot` sits after such a launcher.
+/// ([`launcher_hands_image`]) whose own grammar hands the image on rather than
+/// running it — or, when that launcher's own command word is one this model cannot
+/// read, the shape refusal, which claims only that `mahbot` sits after such a
+/// launcher.
 fn own_image_reference(words: &[grep_engine::GrepWord], text: &str, exe: &Path) -> Option<Refusal> {
     // The command word: not cmd.exe's own punctuation, and not a redirection
     // (`> out.txt mahbot -V` names its command in `mahbot`).
@@ -1141,8 +1140,8 @@ fn own_image_reference(words: &[grep_engine::GrepWord], text: &str, exe: &Path) 
             // such a launcher is not proof that the image is what it runs.
             Some(HandsOn::Unreadable) => Some(Refusal::Shape(format!(
                 "the line's member `{text}` runs a launcher whose own command word this \
-                 model cannot read while `mahbot` appears after it, and a call a shell \
-                 might be starting is not one a shell waits for"
+                 model cannot read while `mahbot` appears after it, so the call is not \
+                 one the runner can make"
             ))),
             None => None,
         };
@@ -1150,9 +1149,9 @@ fn own_image_reference(words: &[grep_engine::GrepWord], text: &str, exe: &Path) 
     None
 }
 
-/// The verbs that hand the image to a shell rather than running it themselves:
-/// cmd.exe's own `start` builtin, `call`, and an explicit interpreter launch.
-/// Every one of them is a call the runner cannot wait for either, so a member
+/// The verbs that hand the image on to something else rather than running it
+/// themselves: cmd.exe's own `start` builtin, `call`, and an explicit interpreter
+/// launch. Every one of them is a call the runner cannot make itself, so a member
 /// whose command word is one of these is refused when the word its own grammar
 /// hands the command to is the image ([`launcher_hands_image`]).
 const LAUNCHER_VERBS: &[&str] = &["start", "call", "cmd", "powershell", "pwsh"];
@@ -1254,10 +1253,8 @@ fn names_image(word: &str, exe: &Path) -> bool {
 ///
 /// `None` for a word that names some other file entirely. Such a word is a call
 /// the runner cannot make: it cannot tell which file cmd.exe would resolve the
-/// path to (it is not the path the runner runs, or it would be identity), the
-/// shell would run some other file or none, and the shell does not wait for an
-/// image like this one either way — so the member is refused rather than run or
-/// handed over.
+/// path to (it is not the path the runner runs, or it would be identity), so the
+/// member is refused rather than run.
 #[must_use]
 fn names_image_file<'a>(word: &'a str, exe: &Path) -> Option<&'a str> {
     let name = image_file_name(exe)?;
@@ -1393,11 +1390,11 @@ pub(super) enum OwnImage {
 /// have run it in. A shape that reading cannot represent — a launcher spelling, a
 /// path that is not the program the runner runs, a redirect the runner cannot
 /// apply, a `cd` the tracking cannot follow — is refused ([`Refusal`], rendered by
-/// [`refusal_message`]) rather than handed to a shell that will not wait for the
-/// image. A line the cmd.exe model cannot read is still read for a call where a
-/// command can start ([`own_image_in_text`], the same reading a member gets) and for
-/// the image's path spelling ([`spelling_in_text`]); a line that only mentions the
-/// bare name in text neither reader can read is the shell's (see the residuals).
+/// [`refusal_message`]) rather than run. A line
+/// the cmd.exe model cannot read is still read for a call where a command can start
+/// ([`own_image_in_text`], the same reading a member gets) and for the image's own
+/// path spelling ([`spelling_in_text`]); a line that only mentions the bare name in
+/// text neither reader can read is the shell's (see the residuals).
 ///
 /// Windows-only by construction, like every reading in this module: the platform
 /// gate — and the `current_exe()` lookup with it — is [`plan_for_command`]'s.
@@ -1416,15 +1413,15 @@ fn own_image_plan(
         // A line the segmenter refused is read twice: for a call where a command can
         // start ([`own_image_in_text`] — the line's first word, one after a
         // connector, one a launcher hands the image to, so both `mahbot -V (x)` and
-        // `cd sub && mahbot -V (x)` are the no-wait calls they are) and for the
-        // image's own path spelling anywhere in the text ([`spelling_in_text`] — the
-        // member no command-position reading can see). Only a line that merely
+        // `cd sub && mahbot -V (x)` are the calls the runner has to make itself) and
+        // for the image's own path spelling anywhere in the text ([`spelling_in_text`]
+        // — the member no command-position reading can see). Only a line that merely
         // *mentions* the name is ordinary text (see the residuals).
         return if own_image_in_text(executed.0, exe) || spelling_in_text(executed.0, exe) {
             OwnImage::Refused(format!(
                 "the line names `mahbot` but cannot be read as cmd.exe's own chain of \
-                 commands (`{}`), and a line the shell has to run cannot be \
-                 waited for — run it as a line of its own",
+                 commands (`{}`), and a call in a line the runner cannot read is not \
+                 one it can make itself — run it as a line of its own",
                 written.0
             ))
         } else {
@@ -1491,9 +1488,9 @@ pub(super) fn plan_for_command(
 /// redirect-only member), its command word does not name the image by identity
 /// ([`is_own_image_word`]), or one of its words carries a `%…%` pair cmd.exe would
 /// have expanded (the runner spawns argv directly, so the word would reach the
-/// image as text the shell never delivered). Such a call is one the shell does not
-/// wait for either, so it is refused as [`Refusal::OwnImageInShell`] rather than run
-/// or handed over.
+/// image as text the shell never delivered). Such a member is a call the runner
+/// cannot reproduce as one plain call of the image, so it is refused as
+/// [`Refusal::OwnImageInShell`] rather than run or handed over.
 ///
 /// The command word is the one where cmd.exe starts the command: not its own
 /// punctuation (`@ mahbot -V` is the call `@mahbot -V` is), and not a redirection
@@ -2620,11 +2617,11 @@ mod tests {
 
     /// A member that names this service's own program in a shape the runner cannot
     /// run as one plain call of it refuses the line, and the cause names the shape: a
-    /// launcher, which hands the image to a shell that does not wait for it, and a
-    /// path spelling that names the program's file name but not the program the
-    /// runner runs. Both would otherwise reach the agent as a truncated or empty
-    /// result (the launcher shapes this grammar does not resolve are the shell's —
-    /// see the module's residuals).
+    /// launcher, which hands the image on instead of running it, and a path spelling
+    /// that names the program's file name but not the program the runner runs.
+    /// Neither is one the runner can reproduce, so both are refused (the launcher
+    /// shapes this grammar does not resolve are the shell's — see the module's
+    /// residuals).
     #[test]
     fn a_fold_naming_the_image_in_a_shape_the_runner_cannot_run_refuses_the_line() {
         for (members, spelling) in [
@@ -2941,15 +2938,14 @@ mod tests {
             "powershell -c mahbot",
             "pwsh mahbot.exe -V",
             // A path spelling of the same file name: the word names the image's
-            // name through a path, which the shell would have to resolve (and would
-            // not wait for either way), so the member is the runner's to refuse or
-            // run — never the shell's to start.
+            // name through a path, which the shell would have to resolve, so the
+            // member is the runner's to refuse or run — never the shell's to start.
             r".\mahbot.exe -V",
             r"target\debug\mahbot.exe -V",
             r"C:\somewhere\else\mahbot -V",
             r"start .\mahbot.exe",
             // The connectors cmd.exe reads: a command starts after each of them, so
-            // the call is the no-wait call wherever in the line it sits. The quoted
+            // the call is the runner's own wherever in the line it sits. The quoted
             // `"&"` below is an argument, not a connector.
             "cd sub && mahbot -V",
             "type f.txt | mahbot -V",
@@ -3105,8 +3101,7 @@ mod tests {
     }
 
     /// A shape the generic decomposition cannot represent is refused through the
-    /// plan's own refusals, never handed to a shell that does not wait for the
-    /// image.
+    /// plan's own refusals, never handed to the shell.
     #[test]
     fn an_unrepresentable_own_image_line_is_refused() {
         // A launcher spelling: the member names the image, but not in the command
@@ -3122,14 +3117,13 @@ mod tests {
         // directory the shell would not have used.
         let cause = refusal_cause("cd /x && mahbot -V");
         assert!(cause.contains("`cd` member"), "{cause}");
-        // A `%…%` argument cmd.exe would have expanded before the image saw it:
-        // the member is left to the shell, which is the no-wait call again.
+        // A `%…%` argument cmd.exe would have expanded before the image saw it: a
+        // member the runner cannot reproduce as one plain call, so it is refused.
         let cause = refusal_cause("mahbot -V %TEMP%");
         assert!(cause.contains("runs `mahbot` itself"), "{cause}");
         // A call the line *opens* with in a line the segmenter refused, whose text
         // carries no spelling of the image's path: the bare name is read in
-        // command position, so the call is refused rather than handed to a shell
-        // that does not wait for it.
+        // command position, so the call is refused rather than left to the shell.
         let cause = refusal_cause("mahbot -V (x)");
         assert!(cause.contains("cannot be read"), "{cause}");
         // The same line, with the call further along it: the reading walks the
@@ -3140,8 +3134,8 @@ mod tests {
         let cause = refusal_cause(r"cd sub && C:\Program Files\MahBot\mahbot.exe -V (x)");
         assert!(cause.contains("cannot be read"), "{cause}");
         // cmd.exe's own punctuation does not hide a call: the `@` no-echo prefix
-        // (whose launcher form hands the image to a shell that does not wait) and a
-        // group's parentheses, in both spellings the model can be given.
+        // (whose launcher form hands the image on) and a group's parentheses, in
+        // both spellings the model can be given.
         for command in ["@start mahbot -V", "@cmd /c mahbot -V"] {
             let cause = refusal_cause(command);
             assert!(cause.contains("runs `mahbot` itself"), "{command}: {cause}");

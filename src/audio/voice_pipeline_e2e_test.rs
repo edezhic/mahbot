@@ -2300,7 +2300,7 @@ fn skip_json(reason_key: &str, detail: &str) -> serde_json::Value {
 /// SAME production detection path.
 ///
 /// Always returns a report (ran or documented-skip — never a silent drop)
-/// when the phase cannot run: corpus files are missing/unverifiable —
+/// when the phase cannot run: corpus files are missing or unusable —
 /// download-on-demand is attempted first, then a loud skip.
 #[expect(clippy::too_many_lines)]
 fn run_real_audio_phase() -> serde_json::Value {
