@@ -1,0 +1,1 @@
+Three decorrelated analysts report structured claim-level findings, merged with agreement brackets and contradictions, and disputed ones get a fresh-analyst verification pass appended as a `## Verification` section.

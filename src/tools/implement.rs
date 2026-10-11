@@ -1,175 +1,17 @@
-//! ImplementTool — spawns a single coder sub-agent to carry out a clearly-scoped
-//! implementation task. The coder has full shell/read/edit/search access and
-//! mutates the workspace, so this is a side-effecting tool that never runs
-//! concurrently with other tools.
+//! The durable single-coder round body (`run_implement_with_job`): the coder
+//! sub-agent a `send` `coder` call dispatches. The coder has full
+//! shell/read/edit/search access and mutates the workspace.
 //!
-//! Two dispatch modes:
-//! - [`DispatchMode::Sync`] — the Engineer blocks until the coder completes and
-//!   returns its response inline.
-//! - [`DispatchMode::Async`] — the Assistant dispatches the coder in a durable
-//!   background job and the result is injected back to the caller's agent
-//!   channel via [`crate::agent::message_router::route`] as an
-//!   [`MessageKind::ImplementResult`] envelope.
-//!
-//! The admin Assistant's instance additionally accepts an optional `target`:
-//! for the coder the only usable form is an absolute path to a directory
-//! outside the registered workspaces — a registered workspace, anything inside
-//! one, the filesystem root and MahBot's own data directory (a personal
-//! workspace directory is fine) are refused. Every other holder keeps its
-//! interface with a `target` they pass inert; argument mechanics and refusals
-//! live in [`super::delegation`].
+//! The round itself is dispatched by [`crate::tools::SyncDurableCore::Coder`]
+//! (sync for the Engineer, async for the admin Assistant and custom roles) —
+//! this module owns the round body only; the tool half lives in
+//! [`crate::tools::send`]. The jobs-row kind stays `implement` — the `Coder`
+//! core's own kind ([`crate::jobs::SpawnChild::Implement`]).
 
 use crate::agent::run_agent;
 use crate::session::analyze_agent_id;
-use crate::tools::Tool;
-use crate::tools::analyze::DispatchMode;
 use crate::{Role, Workspace};
-use anyhow::{Result, anyhow};
-use async_trait::async_trait;
-use serde_json::json;
-
-pub struct ImplementTool {
-    /// Controls how the coder sub-agent is dispatched.
-    /// - [`DispatchMode::Sync`] — blocks the caller until the coder completes.
-    /// - [`DispatchMode::Async`] — dispatches in a durable background job, result
-    ///   delivered via the caller's agent queue.
-    dispatch_mode: DispatchMode,
-    /// The role of the calling agent. Used to route async results to the
-    /// correct agent channel.
-    pub caller_role: Role,
-    /// Whether the optional `target` argument is accepted — the admin
-    /// Assistant's instance only. Every other holder keeps the argument-less
-    /// interface; a `target` they pass is inert.
-    accepts_target: bool,
-}
-
-impl ImplementTool {
-    #[must_use]
-    pub const fn new(dispatch_mode: DispatchMode, caller_role: Role) -> Self {
-        Self {
-            dispatch_mode,
-            caller_role,
-            accepts_target: false,
-        }
-    }
-
-    /// The admin Assistant's variant: accepts the optional `target` argument.
-    ///
-    /// Always the async dispatch — a target can only be honoured by a durable
-    /// background round, which records the directory it runs in for resume.
-    #[must_use]
-    pub const fn targeted(caller_role: Role) -> Self {
-        Self {
-            dispatch_mode: DispatchMode::Async,
-            caller_role,
-            accepts_target: true,
-        }
-    }
-}
-
-#[async_trait]
-impl Tool for ImplementTool {
-    fn name(&self) -> &'static str {
-        "implement"
-    }
-
-    /// Mode-keyed tool description (see [`DispatchMode`]).
-    ///
-    /// The sync variant returns the shared `tool/implement.md` asset verbatim.
-    /// The async variant appends the `tool/implement_async.md` note so an agent
-    /// reading the schema instantly understands that the coder's result arrives
-    /// later as an injected follow-up result message, not in the tool's return
-    /// value. The admin Assistant's targeted variant first appends the
-    /// `tool/implement_target.md` note explaining the optional `target`
-    /// argument.
-    fn description(&self) -> String {
-        let mut desc = crate::prompt::load_prompt(&format!("tool/{}.md", self.name()));
-        if self.accepts_target {
-            let target_note =
-                crate::prompt::load_prompt(&format!("tool/{}_target.md", self.name()));
-            desc = format!("{desc}\n\n{target_note}");
-        }
-        if self.dispatch_mode.is_async() {
-            let async_note = crate::prompt::load_prompt(&format!("tool/{}_async.md", self.name()));
-            desc = format!("{desc}\n\n{async_note}");
-        }
-        desc
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        let mut properties = json!({
-            "task": {
-                "type": "string",
-                "description": "The implementation task to delegate to the coder sub-agent"
-            }
-        });
-        if self.accepts_target {
-            properties["target"] = json!({
-                "type": "string",
-                "description": "Optional absolute path to the directory this coder round runs in (outside the registered workspaces). Omit to run in your own workspace."
-            });
-        }
-        super::tool_params_schema(&properties, &["task"])
-    }
-
-    async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        let task = super::get_str(&args, "task")?;
-
-        // Async dispatch path — delegate to a single durable coder in the
-        // background. Spawn/identity/drain-cut/panic/route semantics live in
-        // `SyncDurableCore::spawn_dispatch`.
-        if self.dispatch_mode.is_async() {
-            // The optional `target` is the admin's alone and only a durable
-            // background round can honour it — resolved here, where it is used.
-            // A refused target dispatches nothing and never falls back to the
-            // caller's own workspace — resolution is exact and decided here.
-            let target = if self.accepts_target {
-                super::delegation::resolve(super::delegation::DelegationKind::Implement, &args)
-                    .await?
-            } else {
-                None
-            };
-            let job_id = crate::generate_id();
-            super::SyncDurableCore::Implement.spawn_dispatch(
-                ws,
-                target.as_ref(),
-                task,
-                self.caller_role,
-                job_id.clone(),
-            );
-            return Ok(format!(
-                "Sub-agent dispatched (job {job_id}). Results will follow shortly."
-            ));
-        }
-
-        // Sync path — spawn one coder and block until it completes, through
-        // the durable implement core with a caller-owned jobs row keyed by the
-        // caller's session pin: a graceful drain mid-call surfaces
-        // [`crate::tools::CallSuspended`] — the call's result is left absent
-        // (the job stays launched) and the session's universal
-        // resume-completion step settles it before the next LLM call (this
-        // dispatch itself never binds to prior jobs — it spawns fresh).
-        // The coder inherits the calling agent's DIRECT PARENT INVOCATION group
-        // (e.g. a ticket an engineer is working) via the tool task-local, so
-        // the Running Agents view groups it under the same parent.
-        // (a target is impossible here: `targeted()` is async-only)
-        run_sync_implement(ws, task, self.caller_role).await
-    }
-}
-
-// ── Sync dispatch ────────────────────────────────────────────────────────
-
-/// Sync implement dispatch through the durable core: the jobs row + coder
-/// roster commit BEFORE any coder session write, keyed by the caller's
-/// session pin (`CURRENT_TOOL_AGENT_ID`) so a graceful drain mid-call leaves
-/// the job `launched` for deterministic resume — the emission-time frame is
-/// already durably recorded, so the call's result is simply absent until the
-/// universal resume-completion step settles it.
-async fn run_sync_implement(ws: &Workspace, task: &str, caller_role: Role) -> Result<String> {
-    crate::tools::SyncDurableCore::Implement
-        .run_sync_dispatch(ws, task, caller_role)
-        .await
-}
+use anyhow::anyhow;
 
 /// Spawn the implement job + single-coder roster (one tx), then run the coder.
 /// A resume (`spawn: None`) reuses the stored roster (never regenerate ids —
@@ -197,9 +39,7 @@ pub(crate) async fn run_implement_with_job(
             let rows =
                 crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
             let row = rows.first().ok_or_else(|| {
-                super::internal_fault(
-                    "implement resume found no coder roster row for the stored job",
-                )
+                super::internal_fault("coder round resume found no roster row for the stored job")
             })?;
             // Only a completed (done) coder's outcome is reconstructable — a
             // failed/launched coder is re-run with its stored task on resume.
@@ -231,7 +71,7 @@ pub(crate) async fn run_implement_with_job(
                 &agents,
                 &crate::jobs::SpawnChild::Implement,
                 caller_agent_id,
-                // The round's execution directory (the caller's target, when one was
+                // The round's execution directory (the caller's place, when one was
                 // asked for) so a restart resumes into the same directory.
                 spawn.exec_dir,
                 // The calling custom role's launch, when there is one, so a
@@ -300,9 +140,9 @@ pub(crate) async fn run_implement_with_job(
         // retries; async/boot-resume warn-and-continue (the outcome is
         // recomputable on the next resume).
         if fail_on_checkpoint_error {
-            return Err(e.context("failed to checkpoint implement outcome"));
+            return Err(e.context("failed to checkpoint coder outcome"));
         }
-        tracing::warn!(job = %job_id, error = %e, "Failed to checkpoint implement outcome");
+        tracing::warn!(job = %job_id, error = %e, "Failed to checkpoint coder outcome");
     }
 
     // Drain/shutdown cut the round: leave the job status='launched' for boot
@@ -325,7 +165,7 @@ pub(crate) async fn run_implement_with_job(
 /// [`crate::tools::SyncDurableCore::resume_durable_round`]. `exec_dir` is the
 /// recorded target directory the round ran in, when it had one.
 pub(crate) async fn resume_implement_round(job_id: &str, ws: &Workspace, exec_dir: Option<&str>) {
-    crate::tools::SyncDurableCore::Implement
+    crate::tools::SyncDurableCore::Coder
         .resume_durable_round(job_id, ws, exec_dir)
         .await;
 }
@@ -341,20 +181,20 @@ mod tests {
     /// write through the `edit` tool, so the round's root is observable on disk.
     const WRITTEN_FILE: &str = "coder-written.txt";
 
-    /// Dispatch one targeted coder round and assert the shared contract: the
-    /// coder writes into `target`'s directory, while the durable job and the
+    /// Dispatch one place coder round and assert the shared contract: the
+    /// coder writes into `place`'s directory, while the durable job and the
     /// delivered envelope stay keyed to the caller's own workspace and the
     /// envelope names the directory really used.
-    async fn assert_targeted_round_write(delivery: &Workspace, target: &Workspace, job_id: &str) {
+    async fn assert_place_round_write(delivery: &Workspace, place: &Workspace, job_id: &str) {
         assert!(
-            target.name.starts_with("dir-"),
+            place.name.starts_with("dir-"),
             "a plain directory's identity is the synthetic one, got {}",
-            target.name
+            place.name
         );
-        let envelope = crate::tools::SyncDurableCore::Implement
+        let envelope = crate::tools::SyncDurableCore::Coder
             .dispatch_durable(
                 delivery,
-                Some(target),
+                Some(place),
                 "write the file",
                 Role::Assistant,
                 "admin",
@@ -376,36 +216,36 @@ mod tests {
         assert!(
             envelope
                 .content
-                .contains(&format!("Directory: {}", target.path)),
-            "{}",
+                .contains(&format!("folder=\"{}\"", place.path)),
+            "the coder report names the folder it worked in: {}",
             envelope.content
         );
-        let written = std::path::Path::new(&target.path).join(WRITTEN_FILE);
+        let written = std::path::Path::new(&place.path).join(WRITTEN_FILE);
         assert_eq!(
             std::fs::read_to_string(&written).unwrap_or_default(),
             "hello from the coder",
-            "the coder wrote into the target directory ({})",
+            "the coder wrote into the place directory ({})",
             written.display()
         );
         let conn = &crate::session::store().conn;
-        let target_sessions = conn
+        let place_sessions = conn
             .query(
                 "SELECT agent_id FROM session_metadata WHERE workspace_name = ?1",
-                crate::db::params![target.name.clone()],
+                crate::db::params![place.name.clone()],
             )
             .await
             .unwrap();
         assert_eq!(
-            target_sessions.len(),
+            place_sessions.len(),
             1,
-            "the coder's session belongs to the target directory"
+            "the coder's session belongs to the place directory"
         );
         assert!(
-            target_sessions[0]
+            place_sessions[0]
                 .get::<String>(0)
                 .unwrap()
-                .contains(&target.name),
-            "the coder's agent id carries the target's identity"
+                .contains(&place.name),
+            "the coder's agent id carries the place's identity"
         );
         let caller_sessions = conn
             .query(
@@ -420,14 +260,14 @@ mod tests {
         );
     }
 
-    /// The async targeting path end to end, in both shapes: a delivery of its
-    /// own plus a separate target directory, and a target that IS the caller's
-    /// own directory — still targeted, the reply names the directory and the
+    /// The async place path end to end, in both shapes: a delivery of its
+    /// own plus a separate place directory, and a place that IS the caller's
+    /// own directory — still a place, the reply names the directory and the
     /// coder's session is keyed to the directory's own identity, never silently
-    /// downgraded to an untargeted call.
+    /// downgraded to an unplaced call.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
-    async fn targeted_rounds_run_in_the_target_and_cover_the_callers_own_directory() {
+    async fn place_rounds_run_in_the_place_and_cover_the_callers_own_directory() {
         crate::util::test::init_management_test_stores().await;
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -453,140 +293,28 @@ mod tests {
                 .ok("CODER DONE"),
         ));
 
-        // Case 1: a delivery of its own plus a separate target tempdir.
-        let delivery = test_ws("/tmp/test_ws_target_delivery");
+        // Case 1: a delivery of its own plus a separate place tempdir.
+        let delivery = test_ws("/tmp/test_ws_place_delivery");
         let dir = tempfile::tempdir().unwrap();
         let dir = std::fs::canonicalize(dir.path()).unwrap();
-        let target = crate::tools::delegation::workspace_at_dir(dir.to_str().unwrap())
+        let place = crate::tools::delegation::workspace_at_dir(dir.to_str().unwrap())
             .await
             .unwrap();
-        assert_targeted_round_write(&delivery, &target, "implement_targeted_job").await;
+        assert_place_round_write(&delivery, &place, "implement_place_job").await;
 
-        // Case 2: the target IS the caller's own directory.
+        // Case 2: the place IS the caller's own directory.
         let dir = tempfile::tempdir().unwrap();
         let dir = std::fs::canonicalize(dir.path()).unwrap();
         let dir_path = dir.to_str().unwrap().to_string();
         let delivery = test_ws(&dir_path);
-        let target = crate::tools::delegation::workspace_at_dir(&dir_path)
+        let place = crate::tools::delegation::workspace_at_dir(&dir_path)
             .await
             .unwrap();
         assert_ne!(
-            target.name, delivery.name,
+            place.name, delivery.name,
             "the directory's own identity differs from the caller's name"
         );
-        assert_targeted_round_write(&delivery, &target, "implement_own_dir_job").await;
-    }
-
-    /// The coder tool's own hop: `execute` resolves the target, refuses a
-    /// forbidden one before dispatching anything, and hands the target to the
-    /// async round (which then runs in that directory, never the caller's).
-    /// Called without the `CURRENT_TOOL_*` task-locals: the dispatch still runs
-    /// — only the routed envelope's user/channel are empty, which this test does
-    /// not assert.
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)]
-    async fn the_targeted_implement_tool_dispatches_into_the_target() {
-        crate::util::test::init_management_test_stores().await;
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        let _provider_guard =
-            install_fake_provider(std::sync::Arc::new(FakeProvider::new().ok("CODER DONE")));
-        let caller = test_ws("/tmp/test_ws_implement_tool_caller");
-        let dir = tempfile::tempdir().unwrap();
-        let target_path = crate::stored_workspace_path(dir.path())
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        // A refused target dispatches nothing: the refusal comes back from the
-        // tool itself, before any job id exists.
-        let refused = ImplementTool::targeted(Role::Assistant)
-            .execute(&caller, json!({ "task": "do it", "target": "/" }))
-            .await
-            .expect_err("the tool refuses the filesystem root");
-        assert!(refused.to_string().starts_with("usage:"), "{refused}");
-
-        let ack = ImplementTool::targeted(Role::Assistant)
-            .execute(&caller, json!({ "task": "do it", "target": target_path }))
-            .await
-            .expect("a directory target dispatches");
-        assert!(ack.contains("dispatched"), "{ack}");
-
-        // The round runs in the target directory — never in the caller's.
-        let target_name = crate::tools::delegation::workspace_at_dir(&target_path)
-            .await
-            .unwrap()
-            .name;
-        let conn = &crate::session::store().conn;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let rows = conn
-                .query(
-                    "SELECT COUNT(*) FROM session_metadata WHERE workspace_name = ?1",
-                    crate::db::params![target_name.clone()],
-                )
-                .await
-                .unwrap();
-            if rows[0].get::<i64>(0).unwrap() > 0 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the round never ran in the target directory {target_name}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let caller_sessions = conn
-            .query(
-                "SELECT COUNT(*) FROM session_metadata WHERE workspace_name = ?1",
-                crate::db::params![caller.name.clone()],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            caller_sessions[0].get::<i64>(0).unwrap(),
-            0,
-            "nothing ran in the caller's own workspace"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_implement_missing_args() {
-        let tool = ImplementTool::new(DispatchMode::Sync, Role::Coder);
-        let ws = test_ws("/tmp/test_ws");
-
-        let result = tool.execute(&ws, json!({})).await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("usage: missing required argument \"task\""),
-            "Should mention missing task"
-        );
-    }
-
-    /// Mode-keyed description: the sync variant is the base asset; the async
-    /// variant appends the async-note so an agent sees the result arrives later
-    /// as an injected envelope, not in the return value.
-    #[test]
-    fn implement_description_mode_keyed() {
-        let sync = ImplementTool::new(DispatchMode::Sync, Role::Coder);
-        assert!(
-            !sync.description().contains("dispatched asynchronously"),
-            "sync description must not carry the async note"
-        );
-
-        let async_tool = ImplementTool::new(DispatchMode::Async, Role::Coder);
-        let async_desc = async_tool.description();
-        assert!(
-            async_desc.contains("dispatched asynchronously"),
-            "async description must carry the async note"
-        );
-        assert!(
-            async_desc.contains("<implement-tool-result>"),
-            "async note names the result envelope"
-        );
+        assert_place_round_write(&delivery, &place, "implement_own_dir_job").await;
     }
 
     /// (h) Mirror the analyze durability lifecycle for implement: with drain
@@ -605,10 +333,11 @@ mod tests {
 
         // (e) drain → CallSuspended; the durable job stays launched, caller-owned.
         crate::shutdown::drain_begin();
-        let tool = ImplementTool::new(DispatchMode::Sync, crate::Role::Engineer);
         let res = crate::agent::CURRENT_TOOL_AGENT_ID
             .scope(Some(pin.to_string()), async {
-                tool.execute(&ws, json!({"task": "implement task"})).await
+                crate::tools::SyncDurableCore::Coder
+                    .run_sync_dispatch(&ws, "implement task", crate::Role::Engineer)
+                    .await
             })
             .await;
         crate::shutdown::drain_clear();
@@ -655,8 +384,8 @@ mod tests {
             Some(""),
             &[crate::ToolCall {
                 id: "call_implement_h".to_string(),
-                name: "implement".to_string(),
-                arguments: json!({"task": "implement task"}),
+                name: "send".to_string(),
+                arguments: json!({"message": "implement task"}),
             }],
             None,
         )
@@ -672,7 +401,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "call_implement_h");
 
-        let outcome = crate::tools::SyncDurableCore::Implement
+        let outcome = crate::tools::SyncDurableCore::Coder
             .resume_sync_core(&ws, &job_id, true)
             .await
             .unwrap();

@@ -1,3 +1,0 @@
-Dispatch a single coder sub-agent to carry out a clearly-scoped implementation task. The coder can read, search, edit files, and run shell commands in the workspace, so use it extensively for concrete, well-defined work: a focused implementation draft, a refactor or a set of localized changes.
-
-Give the coder explicit scope: the exact task, relevant files/symbols if known, and the expected outcome.

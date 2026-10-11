@@ -31,6 +31,8 @@ pub(crate) enum CustomRolesMessage {
     SetBehavior(CustomRoleBehavior),
     /// Mark or unmark one tool of the catalogue.
     ToggleTool(String),
+    /// Mark or unmark one KIND of a catalog tool that has a kind vocabulary.
+    ToggleToolKind { tool: String, kind: String },
     /// Submit the open window: create the record, or save the edited one.
     SubmitEditor,
     /// Result of a submit. An error keeps the window open with it.
@@ -100,6 +102,26 @@ impl RoleEditor {
             in_flight: false,
             error: None,
         }
+    }
+
+    /// The kinds of `tool` the record currently holds, in interface order. A
+    /// bare entry holds the tool's narrowest kind, so the picker marks what the
+    /// role can actually call. The read is the same lenient one the launch path
+    /// uses ([`crate::tools::grants::parse_lossy`]): one unparsable entry drops
+    /// itself alone instead of unmarking every kind.
+    pub(crate) fn held_kinds(&self, tool: &str) -> Vec<String> {
+        crate::tools::grants::parse_lossy(&self.tools)
+            .into_iter()
+            .find(|g| g.tool == tool)
+            .map(|grant| crate::tools::grants::held_kinds(&grant))
+            .unwrap_or_default()
+    }
+
+    /// Mark or unmark one kind of a tool with a kind vocabulary — a thin call to
+    /// [`crate::tools::grants::toggle`], which owns the grammar, the interface
+    /// order and the drop of an entry with its last kind.
+    fn toggle_kind(&mut self, tool: &str, kind: &str) {
+        self.tools = crate::tools::grants::toggle(&self.tools, tool, kind);
     }
 }
 
@@ -192,12 +214,25 @@ impl CustomRolesState {
             }
             CustomRolesMessage::ToggleTool(name) => {
                 if let Some(editor) = &mut self.editor {
-                    match editor.tools.iter().position(|tool| tool == &name) {
+                    // An entry is identified by its tool name: a stored entry
+                    // this installation cannot serve may still carry kinds, and
+                    // unticking it must remove it rather than add a second entry.
+                    match editor
+                        .tools
+                        .iter()
+                        .position(|entry| crate::tools::grants::tool_name(entry) == name.as_str())
+                    {
                         Some(at) => {
                             editor.tools.remove(at);
                         }
                         None => editor.tools.push(name),
                     }
+                }
+                Task::none()
+            }
+            CustomRolesMessage::ToggleToolKind { tool, kind } => {
+                if let Some(editor) = &mut self.editor {
+                    editor.toggle_kind(&tool, &kind);
                 }
                 Task::none()
             }
@@ -301,6 +336,87 @@ mod tests {
         let mut state = CustomRolesState::new();
         let _ = state.update(CustomRolesMessage::Refreshed(Ok(vec![role("analyst")])));
         state
+    }
+
+    /// A state loaded with one role whose tool marks are `tools`.
+    fn state_with_tools(name: &str, tools: &[&str]) -> CustomRolesState {
+        let mut state = CustomRolesState::new();
+        let mut role = role(name);
+        role.tools = tools.iter().map(|s| (*s).to_string()).collect();
+        let _ = state.update(CustomRolesMessage::Refreshed(Ok(vec![role])));
+        state
+    }
+
+    /// The kind picker reads and writes the stored grant grammar: a bare
+    /// `analyze` shows the kind it implies, a kind toggles on and off, the entry
+    /// drops when its last kind goes, and a plain `ToggleTool` on the bare entry
+    /// still behaves as it always has.
+    #[test]
+    fn kind_marks_track_the_stored_entries() {
+        let mut state = state_with_tools("analyst", &["analyze", "web_search"]);
+        let _ = state.update(CustomRolesMessage::OpenEdit("analyst".to_string()));
+
+        let editor = state.editor.as_ref().expect("the window is open");
+        assert_eq!(editor.held_kinds("analyze"), vec!["quick".to_string()]);
+        assert!(
+            editor.held_kinds("web_search").is_empty(),
+            "a kindless tool holds no kinds"
+        );
+        assert!(
+            editor.held_kinds("read").is_empty(),
+            "an unheld tool holds no kinds"
+        );
+
+        // Marking the second kind spells the entry out.
+        let _ = state.update(CustomRolesMessage::ToggleToolKind {
+            tool: "analyze".to_string(),
+            kind: "deep".to_string(),
+        });
+        assert_eq!(
+            state.editor.as_ref().unwrap().tools,
+            vec!["analyze:quick,deep".to_string(), "web_search".to_string()]
+        );
+
+        // Unmarking the implied kind leaves the one still held.
+        let _ = state.update(CustomRolesMessage::ToggleToolKind {
+            tool: "analyze".to_string(),
+            kind: "quick".to_string(),
+        });
+        assert_eq!(
+            state.editor.as_ref().unwrap().tools,
+            vec!["analyze:deep".to_string(), "web_search".to_string()]
+        );
+        assert_eq!(
+            state.editor.as_ref().unwrap().held_kinds("analyze"),
+            vec!["deep".to_string()]
+        );
+
+        // The last kind leaving drops the entry from the record.
+        let _ = state.update(CustomRolesMessage::ToggleToolKind {
+            tool: "analyze".to_string(),
+            kind: "deep".to_string(),
+        });
+        assert_eq!(
+            state.editor.as_ref().unwrap().tools,
+            vec!["web_search".to_string()]
+        );
+
+        // `ToggleTool` on the (now absent) bare entry behaves as today: it adds
+        // the name plainly, and the implied kind shows again.
+        let _ = state.update(CustomRolesMessage::ToggleTool("analyze".to_string()));
+        assert_eq!(
+            state.editor.as_ref().unwrap().tools,
+            vec!["web_search".to_string(), "analyze".to_string()]
+        );
+        assert_eq!(
+            state.editor.as_ref().unwrap().held_kinds("analyze"),
+            vec!["quick".to_string()]
+        );
+        let _ = state.update(CustomRolesMessage::ToggleTool("analyze".to_string()));
+        assert_eq!(
+            state.editor.as_ref().unwrap().tools,
+            vec!["web_search".to_string()]
+        );
     }
 
     /// The window is filled from the record the list holds — including the

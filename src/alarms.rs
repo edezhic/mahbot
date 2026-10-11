@@ -276,7 +276,7 @@ async fn validate_alarm_target(
         .filter(|w| !w.is_empty())
     {
         None => None,
-        Some(raw) => Some(crate::custom_role::resolve_launch_workspace(&raw).await?),
+        Some(raw) => Some(crate::launch::resolve_launch_workspace(&raw).await?),
     };
     anyhow::ensure!(
         !has_trigger,
@@ -585,7 +585,7 @@ async fn fire_custom_role_alarm(alarm: &Alarm) -> Result<()> {
     let (reason, removed) = if crate::custom_role::get(role).await?.is_none() {
         ("the custom role no longer exists".to_string(), true)
     } else {
-        match crate::custom_role::launch(
+        match crate::launch::custom_role(
             role,
             &alarm.text,
             alarm.identifier.as_deref(),
@@ -595,7 +595,7 @@ async fn fire_custom_role_alarm(alarm: &Alarm) -> Result<()> {
         {
             Ok(_) => {
                 // The launch is already persisted durably before it is routed
-                // (see `custom_role::launch`), so the state advance runs after,
+                // (see `launch::custom_role`), so the state advance runs after,
                 // exactly as on the plain path.
                 advance_alarm_state(alarm, &db::now()).await?;
                 return Ok(());

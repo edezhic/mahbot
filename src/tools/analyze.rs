@@ -1,17 +1,19 @@
-//! AnalyzeTool — dispatches a batch of parallel analysts to research a question.
+//! AnalyzeTool — dispatches a batch of parallel analysts to research a question,
+//! at one of two depths.
 //!
 //! Analyst-only: every call dispatches analysts (read-only research), never
-//! mutation-capable agents. Available to the Engineer and Maintainer agents
-//! (sync mode), and to the Manager and Assistant agents (async mode). In sync
-//! mode the caller blocks until the sub-agents complete. In async mode the
-//! sub-agents are dispatched in a background task and the result is injected
-//! back to the caller's agent channel via [`crate::agent::message_router::route`].
+//! mutation-capable agents. `quick` runs the single round of parallel analysts;
+//! `deep` runs the multi-round deep investigation ([`super::research`]) to one
+//! consolidated, source-cited report. A holder that has both declares the
+//! `depth` choice; a holder with one fixed depth does not.
 //!
-//! The admin Assistant's instance additionally accepts an optional `target`
-//! argument — a registered workspace name, or an absolute directory path — that
-//! moves this round's execution root for that call only; every other holder's
-//! interface is unchanged, with a `target` they pass inert. Argument mechanics
-//! and refusals live in [`super::delegation`].
+//! Holders: the Engineer, Manager and Maintainer run `quick` (sync for the
+//! Engineer/Maintainer, async for the Manager); a guest Assistant runs `quick`
+//! async; the admin Assistant runs both depths async and additionally accepts an
+//! optional `place` argument (a registered workspace name, or an absolute
+//! directory path) for `quick` that moves the round's execution root for that
+//! call only. `deep` ignores `place`.
+//! Argument mechanics and refusals live in [`super::delegation`].
 //!
 //! Analyst batches run three decorrelated analysts (distinct research angles)
 //! that report structured claim-level findings; consolidation runs the shared
@@ -57,6 +59,42 @@ impl DispatchMode {
     }
 }
 
+/// How deep an `analyze` call goes: `quick` is one round of parallel analysts;
+/// `deep` is the multi-round deep investigation, whose report arrives hours
+/// later. The order of [`Self::ALL`] is the interface order — the narrowest
+/// kind is first.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AnalyzeDepth {
+    Quick,
+    Deep,
+}
+
+impl AnalyzeDepth {
+    /// The argument naming the choice.
+    pub const ARG: &'static str = "depth";
+
+    /// Every depth, in interface order (narrowest first).
+    pub const ALL: [Self; 2] = [Self::Quick, Self::Deep];
+
+    /// The wire spellings of [`Self::ALL`], in the same order.
+    pub const STRS: &'static [&'static str] = &[Self::Quick.as_str(), Self::Deep.as_str()];
+
+    /// The wire spelling of this depth.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Deep => "deep",
+        }
+    }
+
+    /// Parse a wire spelling.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|depth| depth.as_str() == value)
+    }
+}
+
 pub struct AnalyzeTool {
     /// Controls how the sub-agents are dispatched.
     /// - [`DispatchMode::Sync`] — blocks the caller until the sub-agents complete.
@@ -66,32 +104,59 @@ pub struct AnalyzeTool {
     /// The role of the calling agent. Used to route async results to the
     /// correct agent channel (Manager → manager_{ws}, Assistant → direct_{...}).
     pub caller_role: Role,
-    /// Whether the optional `target` argument is accepted — the admin
-    /// Assistant's instance only. Every other holder keeps the argument-less
-    /// interface; a `target` they pass is inert.
-    accepts_target: bool,
+    /// The depths this holder may call, in interface order. A single depth is
+    /// never declared as a choice argument.
+    kinds: Vec<AnalyzeDepth>,
+    /// Whether the optional `place` argument is accepted — the admin Assistant
+    /// and any custom role holding `quick`. Every other holder keeps the
+    /// argument-less interface.
+    accepts_place: bool,
 }
 
 impl AnalyzeTool {
+    /// The quick-only, no-`place` variant: Engineer, Manager, Maintainer and a
+    /// guest Assistant.
     #[must_use]
-    pub const fn new(dispatch_mode: DispatchMode, caller_role: Role) -> Self {
+    pub fn new(dispatch_mode: DispatchMode, caller_role: Role) -> Self {
         Self {
             dispatch_mode,
             caller_role,
-            accepts_target: false,
+            kinds: vec![AnalyzeDepth::Quick],
+            accepts_place: false,
         }
     }
 
-    /// The admin Assistant's variant: accepts the optional `target` argument.
+    /// The admin Assistant's variant: both depths and the optional `place`
+    /// argument (honoured for `quick` only).
     ///
-    /// Always the async dispatch — a target can only be honoured by a durable
+    /// Always the async dispatch — a place can only be honoured by a durable
     /// background round, which records the directory it runs in for resume.
     #[must_use]
-    pub const fn targeted(caller_role: Role) -> Self {
+    pub fn admin(caller_role: Role) -> Self {
         Self {
             dispatch_mode: DispatchMode::Async,
             caller_role,
-            accepts_target: true,
+            kinds: vec![AnalyzeDepth::Quick, AnalyzeDepth::Deep],
+            accepts_place: true,
+        }
+    }
+
+    /// A custom role's variant: exactly the granted depths, always async, with
+    /// `place` offered iff `quick` is held (deep ignores it). Never empty — a
+    /// grant entry that named no kind takes the narrowest kind (`quick`).
+    #[must_use]
+    pub fn granted(kinds: &[AnalyzeDepth]) -> Self {
+        let kinds = if kinds.is_empty() {
+            vec![AnalyzeDepth::Quick]
+        } else {
+            kinds.to_vec()
+        };
+        let accepts_place = kinds.contains(&AnalyzeDepth::Quick);
+        Self {
+            dispatch_mode: DispatchMode::Async,
+            caller_role: Role::Custom,
+            kinds,
+            accepts_place,
         }
     }
 }
@@ -102,42 +167,63 @@ impl Tool for AnalyzeTool {
         "analyze"
     }
 
-    /// Mode-keyed tool description (see [`DispatchMode`]).
-    ///
-    /// The sync variant returns the shared `tool/analyze.md` asset verbatim.
-    /// The async variant appends the `tool/analyze_async.md` note so an agent
-    /// reading the schema instantly understands that the findings arrive later
-    /// as an injected follow-up result message, not in the tool's return value.
-    /// The admin Assistant's targeted variant first appends the
-    /// `tool/analyze_target.md` note explaining the optional `target` argument.
+    /// Compose the description from shared fragments: the base text, the quick
+    /// note when `quick` is held, the depth note for what this holder can call,
+    /// the optional-`place` note, and the async note. The deep note always
+    /// carries the long-running warning and the scope-confirmation requirement.
     fn description(&self) -> String {
-        let mut desc = crate::prompt::load_prompt(&format!("tool/{}.md", self.name()));
-        if self.accepts_target {
-            let target_note =
-                crate::prompt::load_prompt(&format!("tool/{}_target.md", self.name()));
-            desc = format!("{desc}\n\n{target_note}");
+        let mut parts = vec![load_prompt("tool/analyze.md")];
+        if self.kinds.contains(&AnalyzeDepth::Quick) {
+            parts.push(load_prompt("tool/analyze_quick.md"));
+        }
+        if self.kinds.contains(&AnalyzeDepth::Deep) {
+            let note = if self.kinds.contains(&AnalyzeDepth::Quick) {
+                "tool/analyze_depth.md"
+            } else {
+                "tool/analyze_deep.md"
+            };
+            parts.push(load_prompt(note));
+        }
+        if self.accepts_place {
+            parts.push(load_prompt("tool/analyze_place.md"));
         }
         if self.dispatch_mode.is_async() {
-            let async_note = crate::prompt::load_prompt(&format!("tool/{}_async.md", self.name()));
-            desc = format!("{desc}\n\n{async_note}");
+            parts.push(load_prompt("tool/analyze_async.md"));
         }
-        desc
+        parts.join("\n\n")
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         let mut properties = json!({
-            "analyze": {
+            "message": {
                 "type": "string",
-                "description": "The question to delegate to the analysts"
+                "description": "The question for the analysts"
             }
         });
-        if self.accepts_target {
-            properties["target"] = json!({
+        let mut required = vec!["message"];
+        if self.kinds.len() > 1 {
+            let choices: Vec<&str> = self.kinds.iter().map(|depth| depth.as_str()).collect();
+            properties[AnalyzeDepth::ARG] = json!({
                 "type": "string",
-                "description": "Optional directory to run this round in: the name of a registered workspace, or an absolute path to a directory. Omit to run in your own workspace."
+                "enum": choices,
+                "description": "How deep to go; the matching note says what each value does."
+            });
+            required.push(AnalyzeDepth::ARG);
+        }
+        if self.accepts_place {
+            // The interface declares the per-choice requirement — `deep` never
+            // takes the folder — so only a holder that has the `depth` argument
+            // is told about it. How the folder is spelled lives in the note.
+            let mut description = "Optional folder this round works in.".to_string();
+            if self.kinds.contains(&AnalyzeDepth::Deep) {
+                description.push_str(" `deep` ignores it.");
+            }
+            properties["place"] = json!({
+                "type": "string",
+                "description": description
             });
         }
-        super::tool_params_schema(&properties, &["analyze"])
+        super::tool_params_schema(&properties, &required)
     }
 
     /// Sub-agents dispatched by AnalyzeTool are always Analysts, who have no
@@ -159,44 +245,54 @@ impl Tool for AnalyzeTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        let analyze = super::get_str(&args, "analyze")?;
+        let message = super::get_dispatch_message(&args)?;
+        let depth = super::chosen_kind(
+            &args,
+            AnalyzeDepth::ARG,
+            &self.kinds,
+            AnalyzeDepth::as_str,
+            AnalyzeDepth::parse,
+        )?;
 
-        // Async dispatch path — delegate to analysts in the background.
-        // Spawn/identity/drain-cut/panic/route semantics live in
-        // `SyncDurableCore::spawn_dispatch`.
-        if self.dispatch_mode.is_async() {
-            // The optional `target` is the admin's alone and only a durable
-            // background round can honour it — resolved here, where it is used.
-            // A refused target dispatches nothing and never falls back to the
-            // caller's own workspace — resolution is exact and decided here.
-            let target = if self.accepts_target {
-                super::delegation::resolve(super::delegation::DelegationKind::Analyze, &args)
-                    .await?
-            } else {
-                None
-            };
-            let job_id = crate::generate_id();
-            super::SyncDurableCore::Analyze.spawn_dispatch(
+        match depth {
+            AnalyzeDepth::Quick => {
+                // The optional `place` only affects a quick round, and only a
+                // durable background round can honour it — resolved here, where
+                // it is used. A refused place dispatches nothing and never falls
+                // back to the caller's own workspace.
+                let place = if self.accepts_place {
+                    super::delegation::resolve(super::delegation::DelegationKind::Analyze, &args)
+                        .await?
+                } else {
+                    None
+                };
+                if self.dispatch_mode.is_async() {
+                    let job_id = crate::generate_id();
+                    super::SyncDurableCore::Analyze.spawn_dispatch(
+                        ws,
+                        place.as_ref(),
+                        message,
+                        self.caller_role,
+                        job_id.clone(),
+                    );
+                    return Ok(format!(
+                        "Analysis dispatched (job {job_id}). The consolidated answer will follow \
+                         as an <analyze-tool-result> message."
+                    ));
+                }
+                // Sync path — blocks the caller until the analysts complete.
+                // (a place is impossible here: `admin()`/`granted()` are
+                // async-only.)
+                super::SyncDurableCore::Analyze
+                    .run_sync_dispatch(ws, message, self.caller_role)
+                    .await
+            }
+            AnalyzeDepth::Deep => Ok(super::research::dispatch_deep_analysis(
                 ws,
-                target.as_ref(),
-                analyze,
+                message,
                 self.caller_role,
-                job_id.clone(),
-            );
-            return Ok(format!(
-                "Sub-agent dispatched (job {job_id}). Results will follow shortly."
-            ));
+            )),
         }
-
-        // Sync path — blocks caller until the analysts complete. Runs through
-        // the durable analyze core with a caller-owned jobs row keyed by the
-        // caller's session pin: a graceful drain mid-call surfaces
-        // [`crate::tools::CallSuspended`] — the call's result is left absent
-        // (the job stays launched) and the session's universal
-        // resume-completion step settles it before the next LLM call (this
-        // dispatch itself never binds to prior jobs — it spawns fresh).
-        // (a target is impossible here: `targeted()` is async-only)
-        run_sync_analyze(ws, analyze, self.caller_role).await
     }
 }
 
@@ -212,7 +308,7 @@ struct AnalyzeSlot {
 #[expect(clippy::too_many_lines)]
 pub(crate) async fn run_analyze_with_job(
     ws: &Workspace,
-    analyze: &str,
+    message: &str,
     args: crate::tools::CoreJobArgs<'_>,
 ) -> anyhow::Result<crate::tools::SyncCoreOutcome> {
     let crate::tools::CoreJobArgs {
@@ -259,7 +355,7 @@ pub(crate) async fn run_analyze_with_job(
             let mut slots: Vec<AnalyzeSlot> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
             let mut agents: Vec<crate::jobs::NewAgent> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
             for i in 0..PARALLEL_ANALYST_COUNT {
-                let slot = analyst_slot(ws, &angles, &suffix, i, analyze);
+                let slot = analyst_slot(ws, &angles, &suffix, i, message);
                 agents.push(crate::jobs::NewAgent {
                     agent_id: slot.agent_id.clone(),
                     kind: crate::jobs::AgentKind::Analyst,
@@ -271,7 +367,7 @@ pub(crate) async fn run_analyze_with_job(
             crate::jobs::spawn_job(
                 &crate::session::store().conn,
                 job_id,
-                analyze,
+                message,
                 spawn.delivery_name,
                 user_name,
                 channel,
@@ -279,7 +375,7 @@ pub(crate) async fn run_analyze_with_job(
                 &agents,
                 &crate::jobs::SpawnChild::Analyze,
                 caller_agent_id,
-                // The round's execution directory (the caller's target, when one
+                // The round's execution directory (the caller's place, when one
                 // was asked for) so a restart resumes into the same directory.
                 spawn.exec_dir,
                 // The calling custom role's launch, when there is one, so a
@@ -298,7 +394,7 @@ pub(crate) async fn run_analyze_with_job(
         .collect();
     // Round key = the durable job_id — stable across resume so a resumed
     // round's analysts and consolidation call group under the same key.
-    let fresh_runs = run_analyze_slots(ws, &fresh_slots, deadline, resume, job_id, analyze).await;
+    let fresh_runs = run_analyze_slots(ws, &fresh_slots, deadline, resume, job_id, message).await;
 
     // Assemble runs in slot order.
     let mut runs: Vec<AnalyzeRun> = Vec::with_capacity(slots.len());
@@ -319,7 +415,7 @@ pub(crate) async fn run_analyze_with_job(
                 Some(crate::agent::registry::ParentKey::AnalyzeRound(
                     job_id.to_string(),
                 )),
-                Some(analyze.to_string()),
+                Some(message.to_string()),
                 None,
             );
             let _ = agent.session.init(&slot.agent_id).await;
@@ -372,7 +468,7 @@ pub(crate) async fn run_analyze_with_job(
         return Ok(crate::tools::SyncCoreOutcome::DrainCut);
     }
 
-    let result = consolidate_analyst_runs(ws, analyze, runs, deadline, job_id).await;
+    let result = consolidate_analyst_runs(ws, message, runs, deadline, job_id).await;
     Ok(crate::tools::SyncCoreOutcome::Terminal(result))
 }
 
@@ -447,7 +543,7 @@ async fn run_analyze_slots(
 
 /// Boot-resume a durable analyze round — thin wrapper over
 /// [`crate::tools::SyncDurableCore::resume_durable_round`]. `exec_dir` is the
-/// recorded target directory the round ran in, when it had one.
+/// recorded place directory the round ran in, when it had one.
 pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace, exec_dir: Option<&str>) {
     crate::tools::SyncDurableCore::Analyze
         .resume_durable_round(job_id, ws, exec_dir)
@@ -457,7 +553,7 @@ pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace, exec_dir:
 // ── Structured claim-level findings ──────────────────────────────────────
 
 /// A single claim with source and confidence, extracted from an analyst's
-/// response. Shared with the deep research tool (`research.rs`).
+/// response. Shared with the deep investigation (`research.rs`).
 #[expect(clippy::struct_field_names)] // field name matches the JSON schema key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Claim {
@@ -630,7 +726,7 @@ impl AnalyzeRun {
 }
 
 /// Verdict of a single targeted claim verification, dispatched via
-/// [`dispatch_claim_verifiers`] (the deep research tool and the analyze
+/// [`dispatch_claim_verifiers`] (the deep investigation and the analyze
 /// dispute-verification round).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VerificationVerdict {
@@ -694,20 +790,6 @@ fn validate_verification_verdict(v: &VerificationVerdict) -> Result<(), String> 
 /// most 2 (see [`verification_units`]) so the cap is never reached there.
 /// Bounds the shared dispatch — never a per-run analyst budget.
 pub(crate) const VERIFY_MAX_ANALYSTS: usize = 4;
-
-// ── Sync dispatch ────────────────────────────────────────────────────────
-
-/// Sync analyze dispatch through the durable core: the jobs row + analyst
-/// roster commit BEFORE any analyst session write, keyed by the caller's
-/// session pin (`CURRENT_TOOL_AGENT_ID`) so a graceful drain mid-call leaves
-/// the job `launched` for deterministic resume — the emission-time frame is
-/// already durably recorded, so the call's result is simply absent until the
-/// universal resume-completion step settles it.
-async fn run_sync_analyze(ws: &Workspace, analyze: &str, caller_role: Role) -> Result<String> {
-    crate::tools::SyncDurableCore::Analyze
-        .run_sync_dispatch(ws, analyze, caller_role)
-        .await
-}
 
 /// Load the decorrelation angles asset — one distinct research angle per
 /// parallel analyst. Malformed or missing sections degrade to an empty angle
@@ -1124,7 +1206,7 @@ fn render_flat_claim_list(items_by_agent: &[Vec<String>]) -> String {
 }
 
 /// Normalize a claim for deterministic comparisons (QueryLedger, unanswered
-/// dedup). Shared with the deep research tool.
+/// dedup). Shared with the deep investigation.
 pub(crate) fn normalize_claim(s: &str) -> String {
     s.split_whitespace()
         .collect::<Vec<_>>()
@@ -1133,7 +1215,7 @@ pub(crate) fn normalize_claim(s: &str) -> String {
 }
 
 /// Max of two confidence tiers ("low" < "medium" < "high"). Shared with the
-/// deep research tool's cross-round claim merge (`research.rs`).
+/// deep investigation's cross-round claim merge (`research.rs`).
 pub(crate) fn max_confidence(a: &str, b: &str) -> String {
     let rank = |c: &str| match c {
         "high" => 2,
@@ -1168,7 +1250,7 @@ impl VerificationTarget {
 
 /// Extract search/web_search query strings + tool-call counts from session
 /// history messages (for the query ledger and the run summary). Shared with
-/// the deep research tool (`research.rs`), which also feeds it the persisted
+/// the deep investigation (`research.rs`), which also feeds it the persisted
 /// history of deadline-aborted analysts (wrap-up stage).
 pub(crate) fn extract_query_telemetry_from_history(
     history: &[ChatMessage],
@@ -1202,7 +1284,7 @@ pub(crate) fn extract_query_telemetry_from_history(
 
 /// Extract search/web_search query strings + tool-call counts from an
 /// agent's session history (for the query ledger and the run summary).
-/// Shared with the deep research tool (`research.rs`).
+/// Shared with the deep investigation (`research.rs`).
 pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<String>) {
     extract_query_telemetry_from_history(agent.session.history())
 }
@@ -1607,15 +1689,15 @@ mod tests {
         let tool = AnalyzeTool::new(DispatchMode::Sync, Role::Engineer);
         let ws = test_ws("/tmp/test_ws");
 
-        // Missing analyze
+        // Missing message
         let result = tool.execute(&ws, json!({})).await;
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("usage: missing required argument \"analyze\""),
-            "Should mention missing analyze"
+                .contains("usage: missing required argument \"message\""),
+            "Should mention missing message"
         );
     }
 
@@ -1629,7 +1711,7 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let tool = AnalyzeTool::new(DispatchMode::Sync, Role::Engineer);
         let ws = test_ws("/tmp/test_ws");
-        let args = json!({"analyze": "Say 'hello analyst' and nothing else."});
+        let args = json!({"message": "Say 'hello analyst' and nothing else."});
         let result = tool.execute(&ws, args).await.expect("execute");
         assert!(
             result.contains("hello"),
@@ -2246,7 +2328,8 @@ mod tests {
         let envelope = crate::tools::SyncDurableCore::Analyze.build_async_message(
             "job123",
             &result,
-            Some("/tmp/round-target"),
+            Some("/tmp/round-place"),
+            &crate::workspace::test_ws("/tmp/round-delivery"),
         );
         assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
         assert!(
@@ -2255,8 +2338,8 @@ mod tests {
         );
         assert!(envelope.contains("raw report"), "{envelope}");
         assert!(
-            envelope.contains("\n\nJob: job123\n\nDirectory: /tmp/round-target\n\n"),
-            "the target directory must follow the job id: {envelope}"
+            envelope.contains("\n\nJob: job123\n\nDirectory: /tmp/round-place\n\n"),
+            "the place directory must follow the job id: {envelope}"
         );
         assert!(
             envelope.ends_with("</analyze-tool-result>"),
@@ -2274,6 +2357,7 @@ mod tests {
             "job123",
             &Err(anyhow::anyhow!("sub-agent exploded")),
             None,
+            &crate::workspace::test_ws("/tmp/round-delivery"),
         );
         assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
         assert!(
@@ -2282,7 +2366,7 @@ mod tests {
         );
         assert!(
             !envelope.contains("Directory:"),
-            "no directory line without a target: {envelope}"
+            "no directory line without a place: {envelope}"
         );
         assert!(
             envelope.ends_with("</analyze-tool-result>"),
@@ -2496,16 +2580,16 @@ mod tests {
         assert_eq!(envelope.user_name, "caller-user");
     }
 
-    /// A targeted round whose recorded directory is gone must END with a plain
+    /// A place round whose recorded directory is gone must END with a plain
     /// failure — the job terminalizes and the caller receives the reason, never
     /// left launched and silent forever.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
-    async fn resume_targeted_round_with_a_vanished_directory_fails_loudly() {
+    async fn resume_place_round_with_a_vanished_directory_fails_loudly() {
         crate::util::test::init_management_test_stores().await;
-        let ws = test_ws("/tmp/test_ws_resume_targeted");
-        let job_id = "analyze_job_resume_targeted";
-        let target = "/definitely/not/here/analyze-target";
+        let ws = test_ws("/tmp/test_ws_resume_place");
+        let job_id = "analyze_job_resume_place";
+        let place = "/definitely/not/here/analyze-place";
         let conn = &crate::session::store().conn;
         crate::jobs::spawn_job(
             conn,
@@ -2523,13 +2607,13 @@ mod tests {
             }],
             &crate::jobs::SpawnChild::Analyze,
             None,
-            Some(target),
+            Some(place),
             None,
         )
         .await
         .unwrap();
 
-        resume_analyze_round(job_id, &ws, Some(target)).await;
+        resume_analyze_round(job_id, &ws, Some(place)).await;
 
         let job_rows = conn
             .query(
@@ -2551,7 +2635,7 @@ mod tests {
             serde_json::from_str(&pending[0].get::<String>(0).unwrap()).unwrap();
         assert_eq!(
             envelope.workspace_name, ws.name,
-            "the delivery key stays the caller's own workspace, never the target"
+            "the delivery key stays the caller's own workspace, never the place"
         );
         assert!(
             envelope.content.contains("no longer available"),
@@ -2559,7 +2643,7 @@ mod tests {
             envelope.content
         );
         assert!(
-            envelope.content.contains(&format!("Directory: {target}")),
+            envelope.content.contains(&format!("Directory: {place}")),
             "{}",
             envelope.content
         );
@@ -2605,14 +2689,14 @@ mod tests {
         }
     }
 
-    /// End-to-end for an ANALYST-targeted round: the analysts run in the target
+    /// End-to-end for an ANALYST place round: the analysts run in the place
     /// directory's synthetic workspace while the durable job and the delivered
     /// envelope stay keyed to the caller's own workspace, and `jobs.exec_dir`
     /// records the directory really used (so a restart resumes into it). The
     /// gated provider parks the round until the durable row has been observed.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
-    async fn targeted_round_records_exec_dir_and_delivers_to_the_caller() {
+    async fn place_round_records_exec_dir_and_delivers_to_the_caller() {
         crate::util::test::init_management_test_stores().await;
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -2624,25 +2708,25 @@ mod tests {
         let _provider_guard = install_fake_provider(provider.clone());
 
         let dir = tempfile::tempdir().unwrap();
-        // The spelling a resolved target stores (see `stored_workspace_path`):
+        // The spelling a resolved place stores (see `stored_workspace_path`):
         // canonical, without the platform's verbatim prefix.
-        let target_path =
+        let place_path =
             crate::util::strip_verbatim_prefix(&std::fs::canonicalize(dir.path()).unwrap())
                 .to_str()
                 .unwrap()
                 .to_string();
-        let caller = test_ws("/tmp/test_ws_analyze_target");
+        let caller = test_ws("/tmp/test_ws_analyze_place");
 
-        // The admin Assistant's tool path: a target-bearing analyze call (the
+        // The admin Assistant's tool path: a place-bearing analyze call (the
         // caller identity the tool reads from its task-locals).
         let ack = crate::agent::CURRENT_TOOL_USER_NAME
             .scope("admin".to_string(), async {
                 crate::agent::CURRENT_TOOL_CHANNEL
                     .scope("gui".to_string(), async {
-                        AnalyzeTool::targeted(Role::Assistant)
+                        AnalyzeTool::admin(Role::Assistant)
                             .execute(
                                 &caller,
-                                json!({ "analyze": "what is here", "target": target_path }),
+                                json!({ "message": "what is here", "place": place_path }),
                             )
                             .await
                     })
@@ -2658,7 +2742,7 @@ mod tests {
             .to_string();
 
         // The round parks on the gated provider: the job row exists and records
-        // the target directory while the durable delivery key stays the caller's.
+        // the place directory while the durable delivery key stays the caller's.
         let conn = &crate::session::store().conn;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let (workspace_name, exec_dir) = loop {
@@ -2687,7 +2771,7 @@ mod tests {
         );
         assert_eq!(
             exec_dir.as_deref(),
-            Some(target_path.as_str()),
+            Some(place_path.as_str()),
             "jobs.exec_dir records the directory the round really ran in"
         );
 
@@ -2710,7 +2794,7 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the targeted round never delivered its envelope"
+                "the place round never delivered its envelope"
             );
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         };
@@ -2723,34 +2807,34 @@ mod tests {
         assert!(
             envelope
                 .content
-                .contains(&format!("Directory: {target_path}")),
+                .contains(&format!("Directory: {place_path}")),
             "{}",
             envelope.content
         );
 
-        // The analysts really saw the target directory: its path is in their
+        // The analysts really saw the place directory: its path is in their
         // system prompt, and their sessions are keyed to its synthetic
         // workspace — never the caller's.
         let calls = provider.calls.lock().unwrap_poison().join("\n");
         assert!(
-            calls.contains(&target_path),
+            calls.contains(&place_path),
             "the analyst system prompt carries the execution workspace's path"
         );
-        let target_name = crate::tools::delegation::workspace_at_dir(&target_path)
+        let place_name = crate::tools::delegation::workspace_at_dir(&place_path)
             .await
             .unwrap()
             .name;
-        assert!(target_name.starts_with("dir-"), "got {target_name}");
-        let target_sessions = conn
+        assert!(place_name.starts_with("dir-"), "got {place_name}");
+        let place_sessions = conn
             .query(
                 "SELECT agent_id FROM session_metadata WHERE workspace_name = ?1",
-                crate::db::params![target_name],
+                crate::db::params![place_name],
             )
             .await
             .unwrap();
         assert!(
-            !target_sessions.is_empty(),
-            "the analysts' sessions are keyed to the target's synthetic workspace"
+            !place_sessions.is_empty(),
+            "the analysts' sessions are keyed to the place's synthetic workspace"
         );
         let caller_sessions = conn
             .query(
@@ -2765,21 +2849,21 @@ mod tests {
         );
     }
 
-    /// A `target` is inert for every holder but the admin's Assistant: the
+    /// A `place` is inert for every holder but the admin's Assistant: the
     /// guest's tool keeps today's interface (no new error, even for a value the
     /// admin's tool refuses) and still runs the round in the caller's own
     /// workspace, even when the value names a real directory.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
-    async fn a_target_is_inert_for_a_guest_assistant() {
+    async fn a_place_is_inert_for_a_guest_assistant() {
         crate::util::test::init_management_test_stores().await;
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let _provider_guard =
             install_fake_provider(Arc::new(FakeProvider::new().ok("ANALYST FINDING")));
-        let caller = test_ws("/tmp/test_ws_guest_inert_target");
+        let caller = test_ws("/tmp/test_ws_guest_inert_place");
         let dir = tempfile::tempdir().unwrap();
-        let target_path =
+        let place_path =
             crate::util::strip_verbatim_prefix(&std::fs::canonicalize(dir.path()).unwrap())
                 .to_str()
                 .unwrap()
@@ -2788,15 +2872,15 @@ mod tests {
         let tool = AnalyzeTool::new(DispatchMode::Async, Role::Assistant);
         // A value the admin's tool refuses (a bogus name) must not become a new
         // error for the guest.
-        for target in ["not_a_registered_workspace", target_path.as_str()] {
+        for place in ["not_a_registered_workspace", place_path.as_str()] {
             let ack = tool
-                .execute(&caller, json!({ "analyze": "q", "target": target }))
+                .execute(&caller, json!({ "message": "q", "place": place }))
                 .await
-                .expect("an inert target must not surface a new error");
+                .expect("an inert place must not surface a new error");
             assert!(ack.contains("dispatched"), "{ack}");
         }
 
-        // Both rounds run in the caller's own workspace — never the target.
+        // Both rounds run in the caller's own workspace — never the place.
         let conn = &crate::session::store().conn;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -2817,21 +2901,203 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
 
-        let target_name = crate::tools::delegation::workspace_at_dir(&target_path)
+        let place_name = crate::tools::delegation::workspace_at_dir(&place_path)
             .await
             .unwrap()
             .name;
-        let target_sessions = conn
+        let place_sessions = conn
             .query(
                 "SELECT agent_id FROM session_metadata WHERE workspace_name = ?1",
-                crate::db::params![target_name],
+                crate::db::params![place_name],
             )
             .await
             .unwrap();
         assert!(
-            target_sessions.is_empty(),
-            "the inert target directory never ran anything"
+            place_sessions.is_empty(),
+            "the inert place directory never ran anything"
         );
+    }
+
+    /// Run a dispatch tool the way the agent loop does — with the caller
+    /// identity the tool reads from its task-locals (the same scoping the send
+    /// harness uses).
+    async fn dispatch_analyze(
+        tool: &AnalyzeTool,
+        ws: &Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<String> {
+        crate::agent::CURRENT_TOOL_USER_NAME
+            .scope("admin".to_string(), async {
+                crate::agent::CURRENT_TOOL_CHANNEL
+                    .scope("gui".to_string(), async { tool.execute(ws, args).await })
+                    .await
+            })
+            .await
+    }
+
+    /// The `(kind, exec_dir)` a durable round's job row records, within a
+    /// bounded wait — the spawned dispatch writes the row asynchronously.
+    async fn round_row(job_id: &str) -> (String, Option<String>) {
+        let conn = &crate::session::store().conn;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let rows = conn
+                .query(
+                    "SELECT kind, exec_dir FROM jobs WHERE id = ?1",
+                    crate::db::params![job_id],
+                )
+                .await
+                .unwrap();
+            if let Some(row) = rows.first() {
+                return (
+                    row.get::<String>(0).unwrap(),
+                    row.get::<Option<String>>(1).unwrap(),
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no job row for {job_id} — the round was never created"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Ruling 1: a folder name may never refuse a `deep` call. The `place` the
+    /// admin's Assistant may name for `quick` is completely inert for `deep` —
+    /// never a refusal, never a different execution root — and a deep-only
+    /// holder, which is not offered `place` at all, is not tripped by one
+    /// either: the round keeps the caller's own workspace.
+    #[tokio::test]
+    #[serial_test::serial(provider, channel_registry, drain)] // serializes the process-global fake provider + channel registry + shutdown drain flag
+    async fn a_place_never_touches_a_deep_round() {
+        use std::sync::Arc;
+
+        crate::util::test::init_management_test_stores().await;
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let _provider_guard =
+            install_fake_provider(Arc::new(FakeProvider::new().ok("ANALYST FINDING")));
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+
+        let home = tempfile::tempdir().unwrap();
+        let caller = crate::workspace::test_ws_named(
+            home.path().to_str().unwrap(),
+            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+        );
+        // The deep report lands in the asking Assistant's session; register the
+        // consumer exactly as the running service's bootstrap leaves it.
+        let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let _assistant_rx = crate::agent::message_router::register_agent(&assistant);
+
+        // A `place` the `quick` depth refuses: it is not a directory at all.
+        let bogus = "/definitely/not/a/directory/xyz";
+        let admin = AnalyzeTool::admin(Role::Assistant);
+        let err = dispatch_analyze(
+            &admin,
+            &caller,
+            json!({ "message": "quick q", "depth": "quick", "place": bogus }),
+        )
+        .await
+        .expect_err("a quick round refuses a place that is not a directory");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+
+        // The same argument is completely inert for `deep`: the round is
+        // dispatched, so the value never turns into a refusal.
+        let ack = dispatch_analyze(
+            &admin,
+            &caller,
+            json!({ "message": "deep q", "depth": "deep", "place": bogus }),
+        )
+        .await
+        .expect("a deep round is never refused for a place");
+        assert!(ack.contains("Deep analysis dispatched"), "{ack}");
+        let job_id = ack
+            .split("job ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .expect("the deep ack names its job")
+            .to_string();
+        let (kind, exec_dir) = round_row(&job_id).await;
+        assert_eq!(kind, "research", "a deep round is a research job");
+        assert_eq!(
+            exec_dir, None,
+            "a deep round ignores the place: no exec_dir is recorded"
+        );
+        // The deep investigation is long-running and its completion is never
+        // required: the round this test started is stopped the way the Running
+        // Agents view stops one, so it never outlives the test.
+        crate::research_cancel::cancel_research_run(&job_id).await;
+
+        // A deep-only granted holder is not offered `place` at all; a caller
+        // passing one still succeeds and the round keeps the caller's own
+        // workspace as its execution root.
+        let deep_only = AnalyzeTool::granted(&[AnalyzeDepth::Deep]);
+        assert!(
+            deep_only.parameters_schema()["properties"]
+                .get("place")
+                .is_none(),
+            "a deep-only holder never declares a place"
+        );
+        let ack = dispatch_analyze(
+            &deep_only,
+            &caller,
+            json!({ "message": "deep one", "place": bogus }),
+        )
+        .await
+        .expect("a deep-only holder is not tripped by a place it never declares");
+        assert!(ack.contains("Deep analysis dispatched"), "{ack}");
+        let job_id = ack
+            .split("job ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .expect("the deep ack names its job")
+            .to_string();
+        let (kind, exec_dir) = round_row(&job_id).await;
+        assert_eq!(kind, "research");
+        assert_eq!(
+            exec_dir, None,
+            "the round runs in the caller's own workspace, not the named folder"
+        );
+        crate::research_cancel::cancel_research_run(&job_id).await;
+    }
+
+    /// The same class `send`'s sweep guards, for the depth choice: a holder is
+    /// never told about a depth it does not have (its own note may name the one
+    /// it holds), the `depth` argument exists only where a choice is declared,
+    /// and `place` exists only where it means something. Swept over every holder,
+    /// so a third depth joins the sweep by existing.
+    #[test]
+    fn no_holder_reads_a_depth_it_does_not_have() {
+        for mask in 1u32..(1 << AnalyzeDepth::ALL.len()) {
+            let kinds: Vec<AnalyzeDepth> = AnalyzeDepth::ALL
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                .map(|(_, depth)| *depth)
+                .collect();
+            let tool = AnalyzeTool::granted(&kinds);
+            let declared = kinds.len() > 1;
+            let schema = tool.parameters_schema();
+            let text = format!("{}\n{schema}", tool.description());
+            for depth in AnalyzeDepth::ALL {
+                let labelled = format!("`{}`", depth.as_str());
+                assert!(
+                    !text.contains(&labelled) || kinds.contains(&depth),
+                    "{kinds:?} is told about {labelled}, which it does not have: {text}"
+                );
+            }
+            assert_eq!(
+                schema["properties"].get(AnalyzeDepth::ARG).is_some(),
+                declared,
+                "{kinds:?}"
+            );
+            // The folder belongs to the quick depth alone.
+            assert_eq!(
+                schema["properties"].get("place").is_some(),
+                kinds.contains(&AnalyzeDepth::Quick),
+                "{kinds:?}"
+            );
+        }
     }
 
     /// Seed a caller-owned analyze job with a single roster slot. `outcome`
@@ -3131,7 +3397,7 @@ mod tests {
         let tool = AnalyzeTool::new(DispatchMode::Sync, crate::Role::Engineer);
         let res = crate::agent::CURRENT_TOOL_AGENT_ID
             .scope(Some(pin.to_string()), async {
-                tool.execute(&ws, json!({"analyze": "analyze task"})).await
+                tool.execute(&ws, json!({"message": "analyze task"})).await
             })
             .await;
         crate::shutdown::drain_clear();
@@ -3184,7 +3450,7 @@ mod tests {
             &[crate::ToolCall {
                 id: "call_analyze_f".to_string(),
                 name: "analyze".to_string(),
-                arguments: json!({"analyze": "analyze task"}),
+                arguments: json!({"message": "analyze task"}),
             }],
             None,
         )

@@ -1242,9 +1242,9 @@ impl Dashboard {
                     // Stopping a launch: cancel its agent, mark the branch as
                     // deliberately stopped and drop its pending messages. A
                     // failure is reported as an error toast, not swallowed.
-                    running::StopTarget::CustomLaunch(agent_id) => Task::perform(
+                    running::StopTarget::Launch(agent_id) => Task::perform(
                         async move {
-                            match crate::custom_role::stop(&agent_id).await {
+                            match crate::launch::stop(&agent_id).await {
                                 Ok(()) => {
                                     Ok("Launch stopped — its branch is marked stopped and its \
                                      pending messages were dropped."

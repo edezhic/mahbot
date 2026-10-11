@@ -85,7 +85,7 @@ pub(crate) fn tool_channel() -> String {
 /// Synchronous read of [`CURRENT_TOOL_CUSTOM_LAUNCH`]. Same contract as
 /// [`tool_user_name`]: a tool that dispatches a durable round must read it
 /// before its `tokio::spawn` boundary so the round carries the caller's branch.
-pub(crate) fn tool_custom_launch() -> Option<crate::CustomRoleLaunch> {
+pub(crate) fn tool_custom_launch() -> Option<crate::Launch> {
     CURRENT_TOOL_CUSTOM_LAUNCH
         .try_with(std::clone::Clone::clone)
         .unwrap_or(None)
@@ -96,7 +96,7 @@ tokio::task_local! {
     pub(crate) static CURRENT_TOOL_CHANNEL: String;
     /// The calling agent's DIRECT PARENT INVOCATION grouping key (ticket /
     /// analyze round / research run) — set for the duration of tool execution so
-    /// tools that spawn sub-agents (e.g. implement) can propagate the caller's
+    /// tools that spawn sub-agents (e.g. `send`) can propagate the caller's
     /// group to the Running Agents view. `None` = workspace singleton caller.
     pub(crate) static CURRENT_TOOL_PARENT_KEY: Option<crate::agent::registry::ParentKey>;
     /// The calling agent's DIRECT PARENT INVOCATION human-readable label
@@ -127,10 +127,10 @@ tokio::task_local! {
     pub(crate) static CURRENT_TOOL_AGENT_TRACKING:
         Option<crate::agent::registry::AgentTracking>;
     /// The calling agent's custom-role launch — set for the duration of tool
-    /// execution so a tool that dispatches a durable round (analyze/implement/
-    /// research) carries the caller's branch address into the round's envelope
+    /// execution so a tool that dispatches a durable round (`analyze`/`send`)
+    /// carries the caller's branch address into the round's envelope
     /// and job row. `None` for every built-in role.
-    pub(crate) static CURRENT_TOOL_CUSTOM_LAUNCH: Option<crate::CustomRoleLaunch>;
+    pub(crate) static CURRENT_TOOL_CUSTOM_LAUNCH: Option<crate::Launch>;
 }
 
 /// Maximum number of completed tool rounds before the agent loop bails out.
@@ -419,8 +419,8 @@ fn injected_images_message(
 /// ([`role_tool_specs`]), so the frozen post-deadline replay can never drift from
 /// the live agent's tools (KV-cache byte identity). The caller owns the run-scoped
 /// tracker of the chrome sessions those tools open, which the run's end releases
-/// ([`crate::tools::chrome::ChromeRunSessions::for_run`]). `custom` is the
-/// launch a custom role runs under (its record's tool subset); `None` for every
+/// ([`crate::tools::chrome::ChromeRunSessions::for_run`]). `launch` is the
+/// launch a branch role runs under (its record's tool subset); `None` for every
 /// built-in role.
 #[must_use]
 pub(crate) fn role_tools_and_specs(
@@ -428,13 +428,13 @@ pub(crate) fn role_tools_and_specs(
     ws: &crate::Workspace,
     is_admin: bool,
     chrome_sessions: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
-    custom: Option<&crate::CustomRoleLaunch>,
+    launch: Option<&crate::Launch>,
 ) -> (Vec<Box<dyn Tool>>, Vec<crate::ToolSpec>) {
     // A custom role's tool set is derived from its record's chosen subset of the
     // admin Assistant's tools (at the admin's strength), not from the static
     // per-role factory — every other role keeps `role.tools(...)`.
     let tools: Vec<Box<dyn Tool>> = if role == crate::Role::Custom {
-        crate::Role::custom_role_tools(custom.map(|c| c.tools.as_slice()).unwrap_or_default())
+        crate::Role::custom_role_tools(launch.map(|c| c.tools.as_slice()).unwrap_or_default())
     } else {
         role.tools(ws, is_admin, chrome_sessions)
     }
@@ -546,10 +546,10 @@ impl Agent {
     /// parent is a ticket; callers of analyze/research rounds pass the
     /// question/task text explicitly.
     ///
-    /// `custom` is the custom-role launch this agent runs under (name, authorial
-    /// prompt, tool subset, branch address) — `Some` only for
-    /// [`crate::Role::Custom`]. It is attached to the session so the system
-    /// prompt is assembled from it (see `Session::append_turn_message`).
+    /// `launch` is the launch this agent runs under — a custom role's (name,
+    /// authorial prompt, tool subset, branch address) or a coder branch's
+    /// address. `Some` only for a branch role. It is attached to the session so
+    /// the system prompt is assembled from it (see `Session::append_turn_message`).
     #[must_use]
     #[expect(clippy::too_many_arguments)] // one positional arg per construction field; callers use literals
     pub fn new(
@@ -562,7 +562,7 @@ impl Agent {
         is_admin: bool,
         parent_key: Option<crate::agent::registry::ParentKey>,
         parent_label: Option<String>,
-        custom: Option<crate::CustomRoleLaunch>,
+        launch: Option<crate::Launch>,
     ) -> Self {
         let chrome_sessions = crate::tools::chrome::ChromeRunSessions::for_run(&agent_id);
         let (tools, tool_specs) = role_tools_and_specs(
@@ -570,7 +570,7 @@ impl Agent {
             ws,
             is_admin,
             std::sync::Arc::clone(&chrome_sessions),
-            custom.as_ref(),
+            launch.as_ref(),
         );
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -622,10 +622,10 @@ impl Agent {
         session.attach_transcript(
             crate::session::TRANSCRIPT_REGISTRY.register(agent_id.clone(), generation),
         );
-        // The custom-role launch travels with the session: the prompt is
+        // The launch travels with the session: the prompt is
         // assembled from it at the first turn and the fixed workspace block is
         // re-rendered from it on later turns.
-        session.custom = custom;
+        session.launch = launch;
 
         Self {
             agent_id,
@@ -888,10 +888,10 @@ impl Agent {
             );
         }
 
-        // A custom role also clears the persisted deliberate-stop mark, fail-soft
-        // like the sleep mark above: a fresh launch of a stopped branch
+        // A branch launch also clears the persisted deliberate-stop mark,
+        // fail-soft like the sleep mark above: a fresh launch of a stopped branch
         // re-enables dead-session recovery for it.
-        if self.role == crate::Role::Custom
+        if self.session.launch.is_some()
             && crate::session::store()
                 .get_launch_stopped(&self.agent_id)
                 .await
@@ -979,12 +979,15 @@ impl Agent {
 
     /// Universal deterministic resume-completion: settle the session's last
     /// tool-call frame's result-less calls BEFORE any LLM call, on every
-    /// role/path. Durable sync jobs (analyze/implement) owned by this session
-    /// pin are slot-resumed; every other call is re-executed. Result settlement
-    /// and job terminalization commit in ONE transaction — a crash rolls back
-    /// both, the job stays launched, and the next cycle re-settles
-    /// idempotently. Results settle contiguously after their frame — the
-    /// history stays provider-valid. No-op when nothing is dangling.
+    /// role/path. Durable sync rounds (an `analyze` or `send` call) owned by this
+    /// session pin are slot-resumed; every other call is re-executed. Only the
+    /// rounds the frame itself dispatched are bindable — a pool entry older than
+    /// the frame's own row belongs to an earlier, already-settled frame and is
+    /// abandoned with the settle, never bound. Result settlement and job
+    /// terminalization commit in ONE transaction — a crash rolls back both, the
+    /// job stays launched, and the next cycle re-settles idempotently. Results
+    /// settle contiguously after their frame — the history stays provider-valid.
+    /// No-op when nothing is dangling.
     ///
     /// The single position where dangling calls are completed is intentionally
     /// ungated: a graceful drain mid-call, a hard crash and a stage re-drive all
@@ -1013,22 +1016,40 @@ impl Agent {
             );
 
             let conn = &crate::session::store().conn;
-            // Hoist the owned-jobs lookup: if ANY pending call is
-            // analyze/implement, fetch the caller-owned launched-jobs pool ONCE
-            // before the loop (newest-first). When only non-durable calls are
-            // pending, no jobs query runs at all. The pool is CONSUMED per
-            // call below, so two same-kind calls in one frame bind to two
-            // DISTINCT jobs — and because jobs are newest-first while frame
-            // calls are in dispatch order, each call binds the OLDEST remaining
-            // job (see the rposition below).
-            let has_durable = calls
-                .iter()
-                .any(|c| crate::tools::SyncDurableCore::from_tool_name(&c.name).is_some());
-            let mut owned = if has_durable {
-                crate::jobs::find_owned_launched_jobs(conn, &self.agent_id).await?
-            } else {
-                Vec::new()
+            // The caller-owned launched-jobs pool, fetched ONCE before the loop
+            // (newest-first) and CONSUMED per call below, so two same-kind calls
+            // in one frame bind to two DISTINCT jobs — and because jobs are
+            // newest-first while frame calls are in dispatch order, each call
+            // binds the OLDEST remaining job (see the rposition below).
+            let pool = crate::jobs::find_owned_launched_jobs(conn, &self.agent_id).await?;
+            // Bind only the rounds THIS frame dispatched: the frame row is
+            // written before its calls run (emission-time durability), so its own
+            // rounds are strictly newer than it, while a pool entry left behind by
+            // an earlier frame (an infra-failed dispatch never terminalizes its
+            // row) is older. Binding the older one would settle an old report as
+            // this call's own result. The split is frame OWNERSHIP, not freshness
+            // — the pool query has no age gate.
+            let (pre_frame, mut owned) = match crate::session::store()
+                .last_assistant_created_at(&self.agent_id)
+                .await?
+                .and_then(|frame| crate::db::parse_utc_timestamp(&frame).ok())
+            {
+                Some(frame) => pool.into_iter().partition(|j| {
+                    crate::db::parse_utc_timestamp(&j.created_at).is_ok_and(|c| c < frame)
+                }),
+                // No frame row on record to anchor against (unreachable for a
+                // frame: it is persisted before its calls run): nothing can be
+                // told apart, so NOTHING is bindable and every call is re-run
+                // rather than risk settling another round's report as its result.
+                None => (pool, Vec::new()),
             };
+            if !pre_frame.is_empty() {
+                tracing::info!(
+                    agent_id = %self.agent_id,
+                    count = pre_frame.len(),
+                    "Abandoning launched rounds this frame did not dispatch"
+                );
+            }
 
             let mut pairs: Vec<(String, String)> = Vec::with_capacity(calls.len());
             let mut follow_up: Vec<ChatMessage> = Vec::new();
@@ -1041,15 +1062,17 @@ impl Agent {
             let mut seen_data_uris: Option<std::collections::HashSet<String>> = None;
 
             for call in calls {
-                // Durable-resume attempt for analyze/implement owned jobs: the
+                // Durable-resume attempt for a durable call's owned job: the
                 // JOBS ROW is the source of truth. A terminal job yields content
                 // (terminalized after settlement); a DrainCut stops the whole
                 // completion; a gone job was explicitly abandoned — the call is
-                // not re-executed, it surfaces a short model-facing note.
+                // not re-executed, it surfaces a short model-facing note. The
+                // round kind comes from the call's tool and its choice argument
+                // — never a stored kind matched against the call's name.
                 let mut resumed_content: Option<String> = None;
-                let core = crate::tools::SyncDurableCore::from_tool_name(&call.name);
-                if let (Some(core), Some(pos)) =
-                    (core, owned.iter().rposition(|j| j.kind == call.name))
+                if let Some(core) =
+                    crate::tools::SyncDurableCore::from_call(&call.name, &call.arguments)
+                    && let Some(pos) = owned.iter().rposition(|j| j.kind == core.kind_str())
                 {
                     // `rposition` (not `position`): jobs are newest-first while
                     // frame calls are in dispatch order, so the FIRST call must
@@ -1166,15 +1189,14 @@ impl Agent {
                 follow_up.push(message);
             }
 
-            // Settle + terminalize in ONE transaction: the settle rewrites the
-            // post-frame session rows and the terminalize deletes each resumed
-            // job's row, so a crash rolls back BOTH — the job stays launched
-            // and the next cycle re-settles idempotently (the settle DELETEs
-            // the rows after the frame and reinserts, so re-settling an
-            // already-settled frame is a structural no-op). No orphan sweep is
-            // needed: the settle-succeeded/terminalize-lost crash window is
-            // gone by construction. Every terminalize id also pushed a pair,
-            // so the guard only needs the pairs/follow_up terms.
+            // Settle + terminalize + abandon in ONE transaction: the settle
+            // rewrites the post-frame session rows while the deletes drop the
+            // bound jobs and everything this frame cannot own, so a crash rolls
+            // back BOTH — the jobs stay launched and the next cycle re-settles
+            // idempotently (the settle DELETEs the rows after the frame and
+            // reinserts, so re-settling an already-settled frame is a structural
+            // no-op). Every terminalize id also pushed a pair, so the guard only
+            // needs the pairs/follow_up terms.
             if !pairs.is_empty() || !follow_up.is_empty() {
                 let tx = conn
                     .begin_tx()
@@ -1191,6 +1213,20 @@ impl Agent {
                     )
                     .await
                     .with_context(|| format!("terminalize job {id}"))?;
+                }
+                // Everything this frame cannot own is abandoned with the settle:
+                // the pool's leftovers (bound to no call — a call's round kind is
+                // resolved from the call itself) and the pre-frame rows above,
+                // which no call of this frame dispatched. Repeating a cut-mid-
+                // flight call is the accepted cost; an old report settled as
+                // another call's result is not.
+                for job in pre_frame.iter().chain(owned.iter()) {
+                    tx.execute(
+                        "DELETE FROM jobs WHERE id = ?1",
+                        crate::db::params![job.id.as_str()],
+                    )
+                    .await
+                    .with_context(|| format!("abandon job {}", job.id))?;
                 }
                 tx.commit().await.context("commit settle+terminalize tx")?;
                 // Mirror into the in-memory history only AFTER the durable
@@ -1503,7 +1539,7 @@ impl Agent {
             role: self.role.as_str().to_string(),
             workspace: self.workspace.name.clone(),
         });
-        let custom = self.session.custom.clone();
+        let launch = self.session.launch.clone();
         CURRENT_TOOL_USER_NAME
             .scope(user_name, async {
                 CURRENT_TOOL_CHANNEL
@@ -1519,7 +1555,7 @@ impl Agent {
                                                         CURRENT_TOOL_AGENT_TRACKING
                                                             .scope(agent_tracking, async {
                                                                 CURRENT_TOOL_CUSTOM_LAUNCH
-                                                                    .scope(custom, fut)
+                                                                    .scope(launch, fut)
                                                                     .await
                                                             })
                                                             .await
@@ -1671,7 +1707,7 @@ impl Agent {
                     }
                     Err(e) => {
                         // Drain-cut suspension: the tool's durable work (e.g. a
-                        // sync analyze/implement round) was deliberately left
+                        // sync analyze/coder round) was deliberately left
                         // launched for deterministic resume. The outcome is
                         // marked `suspended` so the tool-result commit SKIPS it
                         // — the call's frame is already durably persisted and
@@ -2818,9 +2854,9 @@ impl Drop for RunEndCleanup {
 /// Returns `(agent, Some(response))` on success.
 /// Returns `(agent, None)` on error (already logged).
 ///
-/// `custom` is the custom-role launch this run executes — `Some` only for
-/// [`crate::Role::Custom`] (the authorial prompt and tool subset taken at
-/// launch, plus the resolved branch address); `None` for every built-in role.
+/// `launch` is the launch this run executes — `Some` for a branch role (a
+/// custom role's authorial prompt and tool subset taken at launch, or a coder
+/// branch's address); `None` for every built-in role.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_agent(
     agent_id: String,
@@ -2838,7 +2874,7 @@ pub(crate) async fn run_agent(
     round: Option<RoundOpts>,
     parent_key: Option<crate::agent::registry::ParentKey>,
     parent_label: Option<String>,
-    custom: Option<crate::CustomRoleLaunch>,
+    launch: Option<crate::Launch>,
 ) -> (Agent, Option<String>) {
     // Unregister from the message router on EVERY exit path, including a
     // panic mid-work (Drop runs during unwind) — a leaked router entry would
@@ -2865,7 +2901,7 @@ pub(crate) async fn run_agent(
         is_admin,
         parent_key,
         parent_label,
-        custom,
+        launch,
     );
     agent.incoming_rx = incoming_rx;
     if let Some(round) = round {
@@ -6077,7 +6113,7 @@ mod tests {
             &[crate::ToolCall {
                 id: "call_analyze_d".to_string(),
                 name: "analyze".to_string(),
-                arguments: serde_json::json!({"analyze": "analyze this"}),
+                arguments: serde_json::json!({"message": "analyze this"}),
             }],
             None,
         )
@@ -6102,7 +6138,7 @@ mod tests {
         );
         let res = crate::agent::CURRENT_TOOL_AGENT_ID
             .scope(Some(pin.to_string()), async {
-                tool.execute(&ws, serde_json::json!({"analyze": "analyze this"}))
+                tool.execute(&ws, serde_json::json!({"message": "analyze this"}))
                     .await
             })
             .await;
@@ -6225,8 +6261,8 @@ mod tests {
     /// frame calls are in dispatch order), so the first frame call carries the
     /// older job's result and the second the newer; each resumed job is
     /// terminalized and its checkpointed outcome settles against its own call
-    /// id. A THIRD launched job for the pin that binds no call stays launched
-    /// (unfinished jobs are never deleted except by explicit abandon).
+    /// id. A THIRD launched job for the pin that binds no call is dropped with the
+    /// settle, so a later, unrelated call can never bind it.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn complete_pending_tool_calls_binds_same_kind_calls_to_distinct_jobs() {
@@ -6245,12 +6281,12 @@ mod tests {
                 crate::ToolCall {
                     id: "call_analyze_g1".to_string(),
                     name: "analyze".to_string(),
-                    arguments: serde_json::json!({"analyze": "analyze task one"}),
+                    arguments: serde_json::json!({"message": "analyze task one"}),
                 },
                 crate::ToolCall {
                     id: "call_analyze_g2".to_string(),
                     name: "analyze".to_string(),
-                    arguments: serde_json::json!({"analyze": "analyze task two"}),
+                    arguments: serde_json::json!({"message": "analyze task two"}),
                 },
             ],
             None,
@@ -6267,12 +6303,22 @@ mod tests {
             .await
             .unwrap();
 
-        // Backdate nothing: the gate is gone. Seed THREE caller-owned analyze
-        // jobs, each with an all-Done roster slot (distinct stored outcomes)
-        // so each resume core replays Terminal with zero LLM calls. The two
-        // frame calls bind the two OLDEST jobs (first call →
+        // The frame row is backdated so all three seeded jobs fall inside the
+        // frame's OWN window (created after it): the pool itself has no age gate,
+        // but a pool entry older than the frame belongs to an earlier frame and
+        // is abandoned with the settle rather than bound. Seed THREE caller-owned
+        // analyze jobs, each with an all-Done roster slot (distinct stored
+        // outcomes) so each resume core replays Terminal with zero LLM calls.
+        // The two frame calls bind the two OLDEST jobs (first call →
         // `two_analyze_job_0`, second → `two_analyze_job_1`);
-        // `two_analyze_job_2` binds no call and stays launched.
+        // `two_analyze_job_2` binds no call and is dropped with the settle.
+        conn.execute(
+            "UPDATE sessions SET created_at = '2024-01-01T00:00:00+00:00' \
+             WHERE agent_id = ?1 AND role = 'assistant'",
+            crate::db::params![pin],
+        )
+        .await
+        .unwrap();
         let jobs: [(&str, &str); 3] = [
             ("two_analyze_job_0", "RESULT_ONE"),
             ("two_analyze_job_1", "RESULT_TWO"),
@@ -6336,9 +6382,9 @@ mod tests {
         );
         assert!(agent.session.pending_tool_frame().is_none());
 
-        // Only the two bound jobs are terminalized; the unbound third job
-        // stays launched (no orphan sweep — unfinished jobs survive unless
-        // explicitly abandoned).
+        // Both bound jobs are terminalized and the third is dropped with the
+        // settle — no call can ever bind it (a call's round kind is resolved from
+        // the call itself), so it must not stay in the pool.
         let jobs = conn
             .query(
                 "SELECT id FROM jobs WHERE caller_agent_id = ?1 AND kind = 'analyze' AND status = 'launched'",
@@ -6346,8 +6392,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(jobs.len(), 1, "only the unbound job remains launched");
-        assert_eq!(jobs[0].get::<String>(0).unwrap(), "two_analyze_job_2");
+        assert!(
+            jobs.is_empty(),
+            "the unbound job is dropped with the settle: a later call must never bind it"
+        );
 
         // Both results settled with the frame's ORIGINAL call ids and the
         // per-call mapping is exact: the FIRST frame call (call_analyze_g1)
@@ -6374,6 +6422,196 @@ mod tests {
             per_call.get("call_analyze_g2").map(String::as_str),
             Some("RESULT_TWO"),
             "second frame call binds the newer job"
+        );
+    }
+
+    /// (f) A frame whose calls bind no job at all still drops the pool's
+    /// leftovers: the launched row of a cut-mid-flight call the tool no longer
+    /// knows is unreachable (nothing matches it by name any more), so it is
+    /// abandoned with the settle instead of staying in the pool for a later,
+    /// unrelated call to bind and settle an old report as its own result. The cut
+    /// call itself is simply repeated — never aliased.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn complete_pending_tool_calls_drops_a_leftover_no_call_can_bind() {
+        let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new());
+        let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/test_ws_leftover_pool");
+        let pin = "leftover_pool_pin";
+        let conn = &crate::session::store().conn;
+
+        // One dangling call to a tool this build does not have.
+        let mut session = Session::default();
+        let frame = assistant_replay_payload(
+            Some(""),
+            &[crate::ToolCall {
+                id: "call_retired".to_string(),
+                name: "retired_tool".to_string(),
+                arguments: serde_json::json!({"message": "old work"}),
+            }],
+            None,
+        )
+        .to_string();
+        session
+            .persist_messages(
+                pin,
+                &[
+                    ChatMessage::user("do the old thing"),
+                    ChatMessage::assistant(frame),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // The launched row that call left behind.
+        crate::jobs::spawn_job(
+            conn,
+            "leftover_job",
+            "old work",
+            &ws.name,
+            "caller-user",
+            "telegram",
+            crate::Role::Engineer,
+            &[crate::jobs::NewAgent {
+                agent_id: "leftover_job_analyst".to_string(),
+                kind: crate::jobs::AgentKind::Analyst,
+                idx: Some(0),
+                task: "old work".to_string(),
+            }],
+            &crate::jobs::SpawnChild::Analyze,
+            Some(pin),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut agent = make_agent_on(vec![], pin, ws);
+        agent.session = session;
+        let settled = agent.complete_pending_tool_calls().await.unwrap();
+        assert!(settled, "the re-executed call settles its own result");
+
+        let jobs = conn
+            .query(
+                "SELECT id FROM jobs WHERE id = 'leftover_job'",
+                crate::db::params![],
+            )
+            .await
+            .unwrap();
+        assert!(
+            jobs.is_empty(),
+            "the unbound launched row is abandoned with the settle, not left for a later call"
+        );
+    }
+
+    /// (g) A pool entry OLDER than the frame belongs to an earlier frame — the
+    /// row an infra-failed dispatch left launched — and this frame's call must
+    /// never bind it: doing so would settle that old round's report as this
+    /// call's own result. It is abandoned with the settle instead, and the call
+    /// runs fresh.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn complete_pending_tool_calls_never_binds_a_job_older_than_its_frame() {
+        let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new());
+        let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/test_ws_frame_window");
+        let pin = "frame_window_pin";
+        let conn = &crate::session::store().conn;
+
+        // One dangling `send` coder call, emitted AFTER the stale round below.
+        let mut session = Session::default();
+        let frame = assistant_replay_payload(
+            Some(""),
+            &[crate::ToolCall {
+                id: "call_coder_now".to_string(),
+                name: "send".to_string(),
+                arguments: serde_json::json!({"message": "the new task", "addressee": "coder"}),
+            }],
+            None,
+        )
+        .to_string();
+        session
+            .persist_messages(
+                pin,
+                &[
+                    ChatMessage::user("code the new task"),
+                    ChatMessage::assistant(frame),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // The leftover of an EARLIER frame: a launched coder round with a stored
+        // outcome, backdated behind the frame row above.
+        crate::jobs::spawn_job(
+            conn,
+            "stale_frame_job",
+            "the old task",
+            &ws.name,
+            "caller-user",
+            "telegram",
+            crate::Role::Engineer,
+            &[crate::jobs::NewAgent {
+                agent_id: "stale_frame_job_coder".to_string(),
+                kind: crate::jobs::AgentKind::Coder,
+                idx: Some(0),
+                task: "the old task".to_string(),
+            }],
+            &crate::jobs::SpawnChild::Implement,
+            Some(pin),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        crate::jobs::write_agent_outcome(
+            conn,
+            "stale_frame_job",
+            "stale_frame_job_coder",
+            crate::jobs::RowStatus::Done,
+            Some("STALE_RESULT"),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs SET created_at = '2024-01-01T00:00:00+00:00' WHERE id = 'stale_frame_job'",
+            crate::db::params![],
+        )
+        .await
+        .unwrap();
+
+        let mut agent = make_agent_on(vec![], pin, ws);
+        agent.session = session;
+        let settled = agent.complete_pending_tool_calls().await.unwrap();
+        assert!(settled, "the call settles a result of its own");
+
+        let mut per_call: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for msg in agent.session.history() {
+            if msg.role != crate::ChatRole::Tool {
+                continue;
+            }
+            let payload: crate::ToolResultPayload = serde_json::from_str(&msg.content).unwrap();
+            per_call.insert(payload.tool_call_id, payload.content);
+        }
+        let content = per_call.get("call_coder_now").expect("the call settles");
+        assert!(
+            !content.contains("STALE_RESULT"),
+            "the earlier frame's report must never become this call's result: {content}"
+        );
+
+        let jobs = conn
+            .query(
+                "SELECT id FROM jobs WHERE caller_agent_id = ?1 AND status = 'launched'",
+                crate::db::params![pin],
+            )
+            .await
+            .unwrap();
+        assert!(
+            jobs.is_empty(),
+            "the pre-frame row is abandoned with the settle, not left for a later call"
         );
     }
 

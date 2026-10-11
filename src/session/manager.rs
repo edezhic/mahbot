@@ -60,11 +60,11 @@ pub(crate) struct Session {
     /// agent (tests, detached sessions). Set by
     /// [`attach_transcript`](Self::attach_transcript) from `Agent::new`.
     transcript: Option<Arc<ArcSwap<TranscriptSnapshot>>>,
-    /// The custom-role launch this session runs under — the authorial
-    /// definition taken at launch plus the resolved branch address. `Some` only
-    /// for a [`Role::Custom`] session; `None` for every built-in role. Set by
-    /// `Agent::new` from the run's launch.
-    pub(crate) custom: Option<crate::CustomRoleLaunch>,
+    /// The launch this session runs under — a custom role's authorial
+    /// definition taken at launch plus the resolved branch address, or a coder
+    /// branch's address. `Some` for a branch session; `None` for every built-in
+    /// role. Set by `Agent::new` from the run's launch.
+    pub(crate) launch: Option<crate::Launch>,
 }
 
 /// Outcome of a [`Session::finalize`] call.
@@ -111,7 +111,7 @@ pub(crate) struct PendingToolFrame {
 
 /// Render the fixed system block a custom role's prompt opens with: this
 /// launch's folder and the system. Nothing else — the role itself is defined by
-/// the administrator's authorial text ([`crate::CustomRoleLaunch::prompt`]),
+/// the administrator's authorial text ([`crate::Launch::prompt`]),
 /// which follows as the second system part. Rendered from
 /// `context/custom_role.md`; a launch in a different folder re-renders this
 /// block (see [`Session::append_turn_message`]).
@@ -210,20 +210,20 @@ impl Session {
                     round_ts,
                     is_admin,
                     user_name,
-                    self.custom.as_ref(),
+                    self.launch.as_ref(),
                 )
                 .await;
 
-                // Batch-write all messages + session context atomically.
+                // Batch-write all messages + session context atomically. A launch
+                // session's leading context block is `msgs` minus the one turn
+                // message, and its length is recorded in the SAME transaction so
+                // a later folder change rebuilds the block from what was WRITTEN,
+                // not from a re-render of live workspace state.
+                let meta =
+                    super::BatchMetadata::context(channel, user_name, &ws.name, role.as_str())
+                        .block_len(self.launch.as_ref().map(|_| msgs.len() - 1));
                 crate::session::store()
-                    .batch_append_with_context(
-                        agent_id,
-                        &msgs,
-                        channel,
-                        user_name,
-                        &ws.name,
-                        role.as_str(),
-                    )
+                    .batch_append_with_context(agent_id, &msgs, meta)
                     .await?;
                 self.history.extend(msgs);
 
@@ -231,52 +231,43 @@ impl Session {
                     Self::persist_active_models_snapshot(agent_id, &snapshot).await;
                 }
             } else {
-                // A custom role's fixed block records the folder the branch was
-                // last launched in; a launch in a different folder must show the
-                // role where it actually works. The authorial text above/below
-                // the block is untouched.
-                if self.custom.is_some() {
-                    let block = custom_role_block(ws);
-                    if self.history.first().map(|m| m.content.as_str()) != Some(block.as_str()) {
-                        // The fixed block is always the session's first row (the
-                        // first turn writes it there, and every compaction puts
-                        // it back at the head), so a targeted rewrite leaves
-                        // `persisted_len` untouched.
-                        crate::session::store()
-                            .rewrite_first_message(agent_id, &block)
-                            .await?;
-                        if let Some(first) = self.history.first_mut() {
-                            first.content = block;
-                        }
-                        // The launch landed in a different folder than the one
-                        // recorded for the branch, so the engine the branch held
-                        // for that folder is now unreferenced — release it (the
-                        // new folder's engine is created on demand and kept for
-                        // as long as the branch works there). Read before the
-                        // append below rewrites the recorded folder.
-                        if let Some(previous) = crate::session::store()
-                            .session_workspace_name(agent_id)
-                            .await
-                            && previous != ws.name
-                        {
-                            crate::search_engine::release_path_named_engine(&previous);
-                        }
-                    }
+                // A launch's folder is named on EVERY use, so the session's
+                // cached opening context block must follow the folder the branch
+                // now works in — a custom role's OR a coder branch's (the block
+                // is the session's leading system run). The conversation after
+                // the block is never touched. The recorded folder is read BEFORE
+                // the append below rewrites it: it is what tells the change from
+                // a repeat use of the same folder.
+                if self.launch.is_some()
+                    && let Some(previous) = crate::session::store()
+                        .session_workspace_name(agent_id)
+                        .await
+                    && previous != ws.name
+                {
+                    // Refreshed for EVERY folder change, including one whose
+                    // previous folder no longer resolves: the block's length was
+                    // recorded when it was written, so nothing about the folder it
+                    // was built for is needed to replace it.
+                    self.refresh_context_block(agent_id, ws, role, ticket, is_admin, user_name)
+                        .await?;
+                    // The launch landed in a different folder than the one
+                    // recorded for the branch, so the engine the branch held for
+                    // that folder is now unreferenced — release it (the new
+                    // folder's engine is created on demand and kept for as long
+                    // as the branch works there).
+                    crate::search_engine::release_path_named_engine(&previous);
                 }
-                // Caching: system prompt is NOT rebuilt on subsequent turns
-                // (see doc comment above). The session DB caches the full
-                // first-turn message set. The only rebuild path is
-                // `apply_summary` below.
+                // Caching: system prompt is NOT rebuilt on every subsequent
+                // turn (see doc comment above). The session DB caches the full
+                // first-turn message set. The rebuild paths are the folder
+                // change just above and `apply_summary` below.
                 let user_msg = crate::session::user_msg_with_ts(&content, round_ts);
                 // Append the user message and update session context atomically.
                 crate::session::store()
                     .append_with_context(
                         agent_id,
                         &user_msg,
-                        channel,
-                        user_name,
-                        &ws.name,
-                        role.as_str(),
+                        super::BatchMetadata::context(channel, user_name, &ws.name, role.as_str()),
                     )
                     .await?;
                 // Refresh the change-detection baseline only after the message
@@ -291,22 +282,28 @@ impl Session {
                 }
                 self.history.push(user_msg);
             }
-            // A custom-role session records its role name and — when the branch
-            // was named — the identifier it continues, on EVERY appending turn,
-            // so the dead-session poller can resume the branch as the same role
-            // without parsing the agent ID. It sits outside the `is_new` branch
-            // so a single failed first-turn write cannot leave the branch
-            // permanently without a recorded role. Log-and-continue like the
-            // snapshot writes above.
-            if let Some(launch) = &self.custom
+            // A branch session records its kind and address — a custom role's
+            // name and the identifier it continues, or a coder branch's `None`
+            // role name and its branch name — on EVERY appending turn, so the
+            // dead-session poller can resume the branch as the same kind without
+            // parsing the agent ID. It sits outside the `is_new` branch so a
+            // single failed first-turn write cannot leave the branch permanently
+            // without a recorded role. Log-and-continue like the snapshot writes
+            // above.
+            if let Some(launch) = &self.launch
                 && let Err(e) = crate::session::store()
-                    .set_custom_role(agent_id, &launch.name, launch.identifier.as_deref())
+                    .set_branch(
+                        agent_id,
+                        (launch.role == Role::Custom).then_some(launch.name.as_str()),
+                        launch.identifier.as_deref(),
+                        launch.reply_to.as_deref(),
+                    )
                     .await
             {
                 tracing::warn!(
                     agent_id = %agent_id,
                     error = %e,
-                    "Failed to record custom-role session metadata"
+                    "Failed to record branch session metadata"
                 );
             }
             // The appended message is durably written above — advance the
@@ -314,6 +311,67 @@ impl Session {
             self.persisted_len = self.history.len();
             self.publish_transcript();
         }
+        Ok(())
+    }
+
+    /// Rebuild a launch session's opening context block for the folder the branch
+    /// now works in — a branch's folder is named on every use, so its cached block
+    /// must follow it (parity with a custom role's branch).
+    ///
+    /// The block is the session's leading system run: the first turn writes it
+    /// there, every compaction rebuilds it, and its length is recorded in the
+    /// same transaction whenever it is written
+    /// (`session_metadata.context_block_len`). This method measures the cached
+    /// block by that recorded length — never by re-rendering the previous
+    /// folder, whose length follows that folder's live state (skills on disk, the
+    /// workspace context, alarms) and could drift after the block was cached. A
+    /// session that predates the record (no released build can be in that state)
+    /// is measured from the history itself, so no path needs the previous folder
+    /// to resolve and no folder change can leave the model reading a stale one.
+    /// The conversation after the block is never touched.
+    async fn refresh_context_block(
+        &mut self,
+        agent_id: &str,
+        ws: &Workspace,
+        role: &Role,
+        ticket: Option<&crate::pipeline::board::Ticket>,
+        is_admin: bool,
+        user_name: &str,
+    ) -> Result<()> {
+        let previous_block_len = crate::session::store()
+            .context_block_len(agent_id)
+            .await
+            .unwrap_or_else(|| {
+                // A branch session recorded before the column existed: its block
+                // is the leading run of system messages, counted from the history
+                // rather than from a folder lookup.
+                self.history
+                    .iter()
+                    .take_while(|message| message.role == ChatRole::System)
+                    .count()
+            })
+            // The recorded length is written with the block it describes, so it
+            // always fits; clamped anyway, so the slice below cannot panic.
+            .min(self.history.len());
+        let (fresh, _) = Self::build_context_messages(
+            ws,
+            role,
+            ticket,
+            is_admin,
+            user_name,
+            self.launch.as_ref(),
+        )
+        .await;
+        let fresh_len = fresh.len();
+        let mut rebuilt = fresh;
+        rebuilt.extend_from_slice(&self.history[previous_block_len..]);
+        // The rewritten block and its length land in one transaction.
+        crate::session::store()
+            .replace_messages(agent_id, &rebuilt, Some(fresh_len))
+            .await?;
+        self.history = rebuilt;
+        self.persisted_len = self.history.len();
+        self.publish_transcript();
         Ok(())
     }
 
@@ -578,9 +636,13 @@ impl Session {
             ticket,
             is_admin,
             user_name,
-            self.custom.as_ref(),
+            self.launch.as_ref(),
         )
         .await;
+        // The leading context block this compaction writes is exactly `compacted`
+        // before the summary message and the retained window are appended; a
+        // launch session records its length in the same transaction.
+        let context_block_len = compacted.len();
 
         // Append conversation summary, then the retained latest turns in
         // chronological order. The in-flight user message is already among
@@ -615,7 +677,11 @@ impl Session {
         // On success, update in-memory history to match. On failure, keep the
         // full in-memory history — next turn reloads from DB and retries.
         if let Err(e) = crate::session::store()
-            .replace_messages(agent_id, &compacted)
+            .replace_messages(
+                agent_id,
+                &compacted,
+                self.launch.as_ref().map(|_| context_block_len),
+            )
             .await
         {
             tracing::error!(
@@ -713,7 +779,7 @@ impl Session {
         ticket: Option<&crate::pipeline::board::Ticket>,
         is_admin: bool,
         user_name: &str,
-        custom: Option<&crate::CustomRoleLaunch>,
+        launch: Option<&crate::Launch>,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
         // A `Role::Custom` session ALWAYS opens with the two-part custom prompt —
         // the fixed workspace block plus the authorial text. A launch that
@@ -727,7 +793,7 @@ impl Session {
             return (
                 vec![
                     ChatMessage::system(custom_role_block(ws)),
-                    ChatMessage::system(custom.map_or("", |launch| launch.prompt.as_str())),
+                    ChatMessage::system(launch.map_or("", |launch| launch.prompt.as_str())),
                 ],
                 ModelSnapshot::default(),
             );
@@ -877,10 +943,10 @@ impl Session {
         round_ts: Option<&str>,
         is_admin: bool,
         user_name: &str,
-        custom: Option<&crate::CustomRoleLaunch>,
+        launch: Option<&crate::Launch>,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
         let (mut msgs, snapshot) =
-            Self::build_context_messages(ws, role, ticket, is_admin, user_name, custom).await;
+            Self::build_context_messages(ws, role, ticket, is_admin, user_name, launch).await;
         msgs.push(crate::session::user_msg_with_ts(msg, round_ts));
         (msgs, snapshot)
     }
@@ -1244,7 +1310,7 @@ fn render_custom_role_lines(roles: &[CustomRole]) -> Option<String> {
         let tools = if role.tools.is_empty() {
             "none".to_string()
         } else {
-            role.tools.join(", ")
+            crate::tools::grants::describe_all(&role.tools).join(", ")
         };
         let _ = writeln!(
             out,
@@ -1681,7 +1747,7 @@ mod tests {
             &[crate::ToolCall {
                 id: call_id.to_string(),
                 name: "analyze".to_string(),
-                arguments: serde_json::json!({"analyze": "analyze task"}),
+                arguments: serde_json::json!({"message": "analyze task"}),
             }],
             None,
         )
@@ -2255,12 +2321,14 @@ mod tests {
     #[tokio::test]
     async fn custom_role_prompt_is_the_fixed_block_plus_the_authorial_text() {
         let ws = crate::workspace::test_ws_named("/data/proj", "/data/proj");
-        let launch = crate::CustomRoleLaunch {
+        let launch = crate::Launch {
+            role: crate::Role::Custom,
             name: "briefer".to_string(),
             identifier: Some("week2".to_string()),
             prompt: "You write the morning brief.\nNothing else.".to_string(),
             tools: vec!["read".to_string()],
             agent_id: "role_briefer:week2".to_string(),
+            reply_to: None,
         };
         let (messages, _) = Session::build_context_messages(
             &ws,
@@ -2276,5 +2344,127 @@ mod tests {
         assert_eq!(messages[0].content, custom_role_block(&ws));
         assert!(messages[0].content.contains("/data/proj"));
         assert_eq!(messages[1].content, launch.prompt);
+    }
+
+    /// A coder branch's folder is named on every use, so its cached opening
+    /// context block follows the folder it now works in: the turn in folder B
+    /// rebuilds the leading block from B, and the conversation rows after the
+    /// block are left untouched.
+    ///
+    /// The block is measured by the length RECORDED when it was written, not by a
+    /// fresh render of the previous folder: folder A's skills appear on disk
+    /// after the block was cached, so re-rendering A here would slice the
+    /// conversation one message too far and drop its first row.
+    #[tokio::test]
+    async fn coder_branch_context_block_follows_the_folder() {
+        // A branch turn: appends one message as the launch's own role.
+        async fn turn(session: &mut Session, agent_id: &str, msg: &str, ws: &Workspace) {
+            session
+                .append_turn_message(
+                    agent_id,
+                    msg,
+                    ws,
+                    &crate::Role::Coder,
+                    None,
+                    "gui",
+                    "tester",
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        // The message count of the block this folder renders right now.
+        async fn block_len(ws: &Workspace, launch: &crate::Launch) -> usize {
+            Session::build_context_messages(
+                ws,
+                &crate::Role::Coder,
+                None,
+                false,
+                "tester",
+                Some(launch),
+            )
+            .await
+            .0
+            .len()
+        }
+
+        crate::util::test::init_test_stores().await;
+        // The recorded folder is the session's own address; a real canonical
+        // path (name == path) keeps the recorded name comparable with the folder
+        // the next turn names.
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+        let path_a = dir_a
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let path_b = dir_b
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let ws_a = crate::workspace::test_ws_named(&path_a, &path_a);
+        let ws_b = crate::workspace::test_ws_named(&path_b, &path_b);
+
+        let agent_id = crate::session::coder_branch_agent_id("feature");
+        let launch = crate::Launch {
+            role: crate::Role::Coder,
+            name: String::new(),
+            identifier: Some("feature".to_string()),
+            prompt: String::new(),
+            tools: Vec::new(),
+            agent_id: agent_id.clone(),
+            reply_to: None,
+        };
+        let block_b = block_len(&ws_b, &launch).await;
+        let mut session = Session {
+            launch: Some(launch),
+            ..Default::default()
+        };
+        session.init(&agent_id).await.unwrap();
+        // Two turns in A: the leading block plus pre-existing conversation rows.
+        turn(&mut session, &agent_id, "first", &ws_a).await;
+        turn(&mut session, &agent_id, "second", &ws_a).await;
+        // A's live context grows AFTER the block was cached: a skill appears in
+        // the folder, so a fresh render of A now counts one message more than the
+        // block that was really written. The switch below must use the recorded
+        // length — a re-render of the previous folder would slice the
+        // conversation one row too far and drop its first row.
+        let skill = dir_a.path().join("skills").join("demo");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "# Instructions\nDo something.").unwrap();
+        assert_eq!(
+            block_len(&ws_a, session.launch.as_ref().unwrap()).await,
+            block_b + 1,
+            "the previous folder's fresh render must differ from the cached block"
+        );
+
+        // A turn in B rebuilds the block; A's path must be gone from the leading
+        // rows, and the earlier conversation rows must survive after the block.
+        turn(&mut session, &agent_id, "third", &ws_b).await;
+
+        let msgs = crate::session::store().load(&agent_id).await;
+        assert_eq!(msgs.len(), block_b + 3, "rebuilt block + three user turns");
+        let leading = &msgs[..block_b];
+        assert!(
+            leading.iter().any(|m| m.content.contains(&path_b)),
+            "the leading block must name the folder the branch now works in"
+        );
+        assert!(
+            !leading.iter().any(|m| m.content.contains(&path_a)),
+            "the old folder must be gone from the leading block"
+        );
+        assert!(
+            msgs[block_b].content.starts_with("first"),
+            "the pre-existing conversation row after the block is untouched"
+        );
+        assert!(
+            msgs[block_b + 1].content.starts_with("second"),
+            "the second earlier row is untouched too"
+        );
     }
 }

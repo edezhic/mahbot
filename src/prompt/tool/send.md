@@ -1,0 +1,1 @@
+Hand one message to exactly one addressee and let it run as its own agent.

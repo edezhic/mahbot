@@ -29,6 +29,11 @@
 //!   via the durable `<custom-role-message>` envelope
 //!   ([`route_custom_role_notify`] / [`route_custom_role_failure`]) — a custom
 //!   role delivers nothing to the owner's channels.
+//! - [`Role::Coder`] responses on a branch job deliver the durable
+//!   `<coder-report>` envelope into the conversation that asked
+//!   ([`route_coder_branch_report`] / [`route_coder_branch_failure`]) — the
+//!   asking custom role's branch when it carried one, else the admin's
+//!   Assistant.
 //! - Other roles deliver to the triggering user's channel bindings (with an
 //!   unregistered-user fallback).
 
@@ -75,11 +80,13 @@ pub enum MessageKind {
     /// Result from an async AnalyzeTool sub-agent, injected back into the caller's
     /// agent session.
     AnalyzeToolResult,
-    /// Result from an async ImplementTool dispatch, injected back into the
-    /// caller's agent session.
+    /// Result from an async single-run coder dispatch (`send` `coder`), injected
+    /// back into the caller's agent session. Also the kind a coder branch's
+    /// report is delivered under (single run or branch).
     ImplementResult,
-    /// Result from an async deep research run (ResearchTool), injected back
-    /// into the calling agent's session. Exactly one envelope per run.
+    /// Result from an async deep analysis run (the `deep` depth of `analyze`),
+    /// injected back into the calling agent's session. Exactly one envelope per
+    /// run.
     ResearchResult,
     /// Comment added to a ticket while an agent is working on it.
     /// Delivered mid-work via the agent's inbox (not a consumer loop).
@@ -107,12 +114,16 @@ pub enum MessageKind {
     /// pending rows deserializable at boot replay.
     #[serde(alias = "ManagerReply")]
     ManagerNotify,
-    /// A custom role's finished answer or its failure, routed into the admin's
-    /// Assistant session (`<custom-role-message>` envelope; the job's workspace
-    /// is the admin's personal one, the folder the launch ran in travels only in
-    /// the envelope's `workspace` attribute). Durable — produced through
-    /// `stamp_and_route`. Deliberately distinct from `UserMessage` so the
-    /// failure-emoji gate (`== UserMessage`) structurally excludes it.
+    /// A custom-role branch's finished answer or its failure, routed into the
+    /// asking conversation (`<custom-role-message>` envelope). Into the admin's
+    /// Assistant session when the branch was the asker (the job's workspace is
+    /// the admin's personal one, the folder the launch ran in travels in
+    /// `originating_workspace`), or into the asking custom role's branch.
+    /// Durable — produced through `stamp_and_route`. Deliberately distinct from
+    /// `UserMessage` so the failure-emoji gate (`== UserMessage`) structurally
+    /// excludes it. (A coder branch's report is the sibling shape under
+    /// [`MessageKind::ImplementResult`], which carries no extra file-delivery
+    /// root.)
     CustomRoleNotify,
 }
 
@@ -148,24 +159,33 @@ pub struct AgentJob {
     /// relaying Assistant sits in the admin's personal workspace.
     #[serde(default)]
     pub originating_workspace: Option<String>,
-    /// The custom-role launch this job runs, when the role is [`Role::Custom`]:
-    /// the authorial definition taken at launch plus the resolved branch
+    /// The branch launch this job runs, when it runs one ([`Role::Custom`] or
+    /// [`Role::Coder`]): the definition taken at launch plus the resolved branch
     /// address. `#[serde(default)]` keeps already-persisted `pending_jobs`
     /// envelopes (which predate the field) decodable at boot replay.
     #[serde(default)]
-    pub custom_role: Option<crate::CustomRoleLaunch>,
-    /// A Manager-bound request dispatched by a custom role: the Manager's
-    /// answer returns into that branch instead of the admin's Assistant (see
-    /// [`route_manager_reply_to_custom`]). `None` for every other job.
+    pub custom_role: Option<crate::Launch>,
+    /// The conversation a forwarded reply must return to, when the job's caller
+    /// was a custom role: the Manager's answer goes back into that branch
+    /// instead of the admin's Assistant (see [`route_manager_reply_to_custom`]).
+    /// A coder branch carries its asker on the launch instead
+    /// ([`crate::Launch::reply_to`]) — one carrier per fact. `None` for every
+    /// other job.
     #[serde(default)]
-    pub reply_to_custom: Option<ManagerReply>,
+    pub reply_to_custom: Option<Asker>,
 }
 
-/// Where a Manager's answer must go when the requesting caller was a custom
-/// role: back into the asking branch, in the folder that turn ran in.
+/// The conversation that asked for a forwarded reply — the asking branch's
+/// launch and the folder its turn ran in, so an answer returns there instead
+/// of the admin's Assistant. Carried durably by the launch
+/// (`crate::Launch::reply_to`) and on the routed job
+/// (`AgentJob::reply_to_custom`) that must deliver into it; a Manager's
+/// answer, a coder branch's report and its failure notice all travel this way.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ManagerReply {
-    pub launch: crate::CustomRoleLaunch,
+pub struct Asker {
+    /// The asking branch's launch — its authorial definition and its resolved
+    /// branch address, so the reply re-enters that same conversation.
+    pub launch: crate::Launch,
     /// The folder the asking turn runs in — the branch's own folder, so the
     /// answer re-enters the same conversation in the same place.
     pub workspace: String,
@@ -320,7 +340,7 @@ pub async fn route_user_message(
     };
 
     // DURABLE kinds = UserMessage (manager-bound), AgentMessage, ManagerNotify,
-    // CustomRoleNotify, AnalyzeToolResult, ResearchResult.
+    // CustomRoleNotify, AnalyzeToolResult, ResearchResult, ImplementResult.
     if job.role == Role::Manager {
         stamp_and_route(job, &agent_id, "manager message").await;
         return;
@@ -374,7 +394,7 @@ fn agent_message_job(
     content: String,
     workspace_name: String,
     user_name: &str,
-    reply_to: Option<ManagerReply>,
+    asker: Option<Asker>,
 ) -> AgentJob {
     let user_name =
         crate::session::normalize_user_name(user_name, "route_agent_message_to_manager")
@@ -390,7 +410,7 @@ fn agent_message_job(
         pending_job_id: None,
         originating_workspace: None,
         custom_role: None,
-        reply_to_custom: reply_to,
+        reply_to_custom: asker,
     }
 }
 
@@ -398,15 +418,15 @@ fn agent_message_job(
 /// session (`MessageKind::AgentMessage`). For a non-custom caller there is no
 /// addressed reply leg — the Manager's response auto-delivers to the admin's
 /// Assistant via [`route_manager_notify`]. A Manager-bound request from a custom
-/// role DOES have one: `reply_to` carries the asking branch, and the answer
+/// role DOES have one: `asker` carries the asking branch, and the answer
 /// re-enters it via [`route_manager_reply_to_custom`].
 pub async fn route_agent_message_to_manager(
     content: String,
     workspace_name: String,
     user_name: String,
-    reply_to: Option<ManagerReply>,
+    asker: Option<Asker>,
 ) {
-    let job = agent_message_job(content, workspace_name, &user_name, reply_to);
+    let job = agent_message_job(content, workspace_name, &user_name, asker);
     let target = crate::jobs::envelope_target(&job);
     stamp_and_route(job, &target, "agent message").await;
 }
@@ -639,7 +659,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                     workspace = %job.workspace_name,
                     "Message router: workspace not found — skipping job",
                 );
-                report_unrunnable_custom_role(&job).await;
+                report_unrunnable_branch(&job).await;
                 continue;
             }
             Err(e) => {
@@ -682,10 +702,11 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         // ── Resolve users for response delivery ───────────────────────
         // Non-Manager roles deliver to the specific triggering user. The
         // Manager has no direct user delivery: its responses relay to the
-        // admin's Assistant via the ManagerNotify envelope below. A custom
-        // role delivers nothing to the owner's channels either — its answer
-        // goes to the admin's Assistant via the CustomRoleNotify envelope.
-        let users: Vec<UserRecord> = if matches!(role, Role::Manager | Role::Custom) {
+        // admin's Assistant via the ManagerNotify envelope below. A custom role
+        // delivers nothing to the owner's channels either — its answer goes to
+        // the admin's Assistant via the CustomRoleNotify envelope. A coder branch
+        // likewise: its report goes into the conversation that asked.
+        let users: Vec<UserRecord> = if matches!(role, Role::Manager | Role::Custom | Role::Coder) {
             Vec::new()
         } else {
             match resolve_single_user(&job.user_name).await {
@@ -740,19 +761,16 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         let is_admin = users
             .first()
             .is_some_and(|user| crate::users::is_admin_name(&user.name));
-        // The Running Agents grouping for this job: a custom-role launch is one
+        // The Running Agents grouping for this job: a branch launch is one
         // conversation keyed by its own agent id, with the display label naming
         // the role and (when named) its branch. Everything else stays
         // ungrouped, exactly as before.
         let (parent_key, parent_label) = match &job.custom_role {
             Some(launch) => (
-                Some(crate::agent::registry::ParentKey::CustomLaunch(
+                Some(crate::agent::registry::ParentKey::Launch(
                     launch.agent_id.clone(),
                 )),
-                Some(crate::custom_role::display_label(
-                    &launch.name,
-                    launch.identifier.as_deref(),
-                )),
+                Some(crate::launch::display_label(launch)),
             ),
             None => (None, None),
         };
@@ -784,10 +802,12 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         let Some(response) = response else {
             // A custom role's failure produces no answer: deliver the durable
             // failure notice to the admin's Assistant — never the emoji, never
-            // anything to the owner. Guarded exactly like the emoji branch: a
-            // deliberately stopped or drained launch stays silent. The two arms
-            // are mutually exclusive: a custom role must NEVER also emit the
-            // generic failure emoji into the owner's channel.
+            // anything to the owner. A coder branch's failure delivers the same
+            // kind of notice into the asking conversation. Guarded exactly like
+            // the emoji branch: a deliberately stopped or drained launch stays
+            // silent. These arms are mutually exclusive with the emoji: neither a
+            // custom role nor a coder branch may EVER emit the generic failure
+            // emoji into the owner's channel.
             if role == Role::Custom {
                 if !agent.is_cancelled() && !crate::shutdown::aborting() {
                     let name = job
@@ -795,7 +815,15 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                         .as_ref()
                         .map(|c| c.name.as_str())
                         .unwrap_or_default();
-                    route_custom_role_failure(name, &job.workspace_name).await;
+                    let identifier = job
+                        .custom_role
+                        .as_ref()
+                        .and_then(|c| c.identifier.as_deref());
+                    route_custom_role_failure(name, &job.workspace_name, identifier).await;
+                }
+            } else if let Some(launch) = coder_branch_launch(&job) {
+                if !agent.is_cancelled() && !crate::shutdown::aborting() {
+                    route_coder_branch_failure(launch, &ws.path).await;
                 }
             }
             // Send emoji error only for UserMessage jobs where the agent truly
@@ -838,6 +866,9 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         // A custom role: the durable <custom-role-message> envelope into the
         // admin's personal Assistant (the folder the launch ran in travels in
         // the envelope's `workspace` attribute).
+        // A coder branch: the durable <coder-report> envelope into the asking
+        // conversation — the asking custom role's branch, or the admin's
+        // Assistant when the assistant asked.
         // Other roles: broadcast to all of the triggering user's channel
         // bindings (or use fallback for unregistered users).
         match role {
@@ -848,12 +879,24 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                 None => route_manager_notify(&response, &job.workspace_name).await,
             },
             Role::Custom => {
-                let name = job
-                    .custom_role
-                    .as_ref()
-                    .map(|c| c.name.as_str())
-                    .unwrap_or_default();
-                route_custom_role_notify(&response, name, &job.workspace_name).await;
+                let launch = job.custom_role.as_ref();
+                let name = launch.map_or("", |c| c.name.as_str());
+                let identifier = launch.and_then(|c| c.identifier.as_deref());
+                route_custom_role_notify(&response, name, &job.workspace_name, identifier).await;
+            }
+            // A Coder job reaches the consumer loop only as a coder branch (a
+            // plain coder sub-agent is run by the dispatching tool, never
+            // routed), so the launch is always there — reporting the absence
+            // rather than dropping the report silently.
+            Role::Coder => {
+                if let Some(launch) = coder_branch_launch(&job) {
+                    route_coder_branch_report(&response, launch, &ws.path).await;
+                } else {
+                    error!(
+                        agent_id = %agent_id,
+                        "Message router: coder job carries no coder-branch launch — report dropped",
+                    );
+                }
             }
             _ => {
                 if users.is_empty() {
@@ -868,12 +911,21 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
     }
 }
 
+/// The launch of a coder-branch job, when the job is one: `Some` only when the
+/// job carries a launch whose role is [`Role::Coder`]. A plain coder sub-agent
+/// never reaches the consumer loop, so this is the branch discriminator.
+fn coder_branch_launch(job: &AgentJob) -> Option<&crate::Launch> {
+    job.custom_role
+        .as_ref()
+        .filter(|launch| launch.role == Role::Coder)
+}
+
 /// Consumer-confirmed delivery: delete the durable pending_jobs row after the
 /// agent ran (at-least-once boundary — the row is created before routing and
 /// reclaimed only here or by boot replay). Also invoked on the
 /// pin-refusal path (a pinned-role envelope with an empty user), the
-/// custom-role refusal path, and an unrunnable custom-role launch
-/// ([`report_unrunnable_custom_role`]): the consumer accept-and-discards the
+/// custom-role refusal path, and an unrunnable branch launch
+/// ([`report_unrunnable_branch`]): the consumer accept-and-discards the
 /// job, and the row is reclaimed here so boot replay does not resurrect it. One
 /// sync retry on failure, then log-and-continue: residual duplicate
 /// re-delivery at next boot is bounded and accepted. Never called on
@@ -907,22 +959,31 @@ async fn confirm_pending_delivery(job: &AgentJob) {
     }
 }
 
-/// Report a custom-role job that cannot run because the folder its launch names
+/// Report a branch job that cannot run because the folder its launch names
 /// is gone — the rule being that an unrunnable launch is reported to the admin's
-/// Assistant, naming the role and the folder it was launched into, never to the
-/// owner directly and never to a guest. The durable pending row is reclaimed
-/// with the notice, because the reported failure IS the delivery.
+/// Assistant (or the asking branch), naming the branch and the folder it ran in,
+/// never to the owner directly and never to a guest. The durable pending row is
+/// reclaimed with the notice, because the reported failure IS the delivery.
 ///
 /// Only the positively-gone case reports: a transient store failure on the
 /// lookup above is not a verdict about the folder, so it keeps the plain skip
 /// (the pending row survives and re-routes). No-op for a built-in role, whose
 /// pending row is deliberately kept so it re-routes when the workspace returns
 /// (see [`confirm_pending_delivery`]).
-async fn report_unrunnable_custom_role(job: &AgentJob) {
+async fn report_unrunnable_branch(job: &AgentJob) {
     let Some(launch) = job.custom_role.as_ref() else {
         return;
     };
-    route_custom_role_failure(&launch.name, &job.workspace_name).await;
+    if launch.role == Role::Coder {
+        route_coder_branch_failure(launch, &job.workspace_name).await;
+    } else {
+        route_custom_role_failure(
+            &launch.name,
+            &job.workspace_name,
+            launch.identifier.as_deref(),
+        )
+        .await;
+    }
     confirm_pending_delivery(job).await;
 }
 
@@ -1037,7 +1098,10 @@ async fn route_manager_notify(response: &str, source_workspace: &str) {
     let content = crate::prompt::substitute(
         &crate::prompt::load_prompt("manager_message.md"),
         &[
-            ("{{workspace}}", source_workspace),
+            (
+                "{{workspace}}",
+                crate::tools::envelope_attr(source_workspace).as_str(),
+            ),
             ("{{message}}", response),
         ],
     );
@@ -1060,39 +1124,45 @@ async fn route_manager_notify(response: &str, source_workspace: &str) {
     stamp_and_route(job, &target, "manager notify envelope").await;
 }
 
+/// A job delivered into the conversation that asked for it instead of the
+/// admin's Assistant: the destination comes from `asker`, the envelope from
+/// `kind`.
+fn branch_job(content: String, asker: &Asker, kind: MessageKind) -> AgentJob {
+    AgentJob {
+        content,
+        workspace_name: asker.workspace.clone(),
+        user_name: crate::users::ADMIN_USER_NAME.to_string(),
+        channel: "gui".to_string(),
+        kind,
+        role: Role::Custom,
+        reply_target: None,
+        pending_job_id: None,
+        originating_workspace: None,
+        custom_role: Some(asker.launch.clone()),
+        reply_to_custom: None,
+    }
+}
+
 /// Deliver a Manager's answer back into the custom-role branch that asked for
-/// it — the mirror image of the analyze/implement/research result envelopes:
+/// it — the mirror image of the analyze and coder result envelopes:
 /// the job carries the branch address (via its launch) and the folder the
 /// asking turn ran in, and is tagged `<manager-message>` because that is the
-/// shape `send_message_to_manager` promises its caller.
-async fn route_manager_reply_to_custom(
-    response: &str,
-    source_workspace: &str,
-    reply: &ManagerReply,
-) {
+/// shape `send`'s `manager` addressee promises its caller.
+async fn route_manager_reply_to_custom(response: &str, source_workspace: &str, asker: &Asker) {
     if response.is_empty() {
         return;
     }
     let content = crate::prompt::substitute(
         &crate::prompt::load_prompt("manager_message.md"),
         &[
-            ("{{workspace}}", source_workspace),
+            (
+                "{{workspace}}",
+                crate::tools::envelope_attr(source_workspace).as_str(),
+            ),
             ("{{message}}", response),
         ],
     );
-    let job = AgentJob {
-        content,
-        workspace_name: reply.workspace.clone(),
-        user_name: crate::users::ADMIN_USER_NAME.to_string(),
-        channel: "gui".to_string(),
-        kind: MessageKind::ManagerNotify,
-        role: Role::Custom,
-        reply_target: None,
-        pending_job_id: None,
-        originating_workspace: None,
-        custom_role: Some(reply.launch.clone()),
-        reply_to_custom: None,
-    };
+    let job = branch_job(content, asker, MessageKind::ManagerNotify);
     let target = crate::jobs::envelope_target(&job);
     stamp_and_route(job, &target, "manager reply envelope").await;
 }
@@ -1124,17 +1194,29 @@ fn custom_role_notify_job(content: String, source_workspace: &str) -> AgentJob {
 /// (`<custom-role-message>` envelope, `MessageKind::CustomRoleNotify`), message
 /// kind durable. `source_workspace` is the folder the launch ran in and travels
 /// in `originating_workspace`, so a file/media reference in the answer is
-/// validated against the folder it was produced in. An empty answer delivers
-/// nothing.
-async fn route_custom_role_notify(response: &str, role_name: &str, source_workspace: &str) {
+/// validated against the folder it was produced in. `identifier` names the
+/// branch when the launch ran on a named one. An empty answer delivers nothing.
+async fn route_custom_role_notify(
+    response: &str,
+    role_name: &str,
+    source_workspace: &str,
+    identifier: Option<&str>,
+) {
     if response.is_empty() {
         return;
     }
     let content = crate::prompt::substitute(
         &crate::prompt::load_prompt("custom_role_message.md"),
         &[
-            ("{{role}}", role_name),
-            ("{{workspace}}", source_workspace),
+            ("{{role}}", crate::tools::envelope_attr(role_name).as_str()),
+            (
+                "{{workspace}}",
+                crate::tools::envelope_attr(source_workspace).as_str(),
+            ),
+            (
+                "{{branch_attr}}",
+                crate::tools::branch_attr(identifier).as_str(),
+            ),
             ("{{message}}", response),
         ],
     );
@@ -1143,16 +1225,95 @@ async fn route_custom_role_notify(response: &str, role_name: &str, source_worksp
     stamp_and_route(job, &target, "custom role notify envelope").await;
 }
 
-/// Deliver the notice that a custom role's launch failed, naming the role and
-/// the folder it ran in. Nothing goes to the owner directly.
-async fn route_custom_role_failure(role_name: &str, source_workspace: &str) {
+/// Deliver the notice that a custom role's launch failed, naming the role, its
+/// branch when it ran on a named one, and the folder it ran in. Nothing goes to
+/// the owner directly.
+async fn route_custom_role_failure(
+    role_name: &str,
+    source_workspace: &str,
+    identifier: Option<&str>,
+) {
     let content = crate::prompt::substitute(
         &crate::prompt::load_prompt("custom_role_failure.md"),
-        &[("{{role}}", role_name), ("{{workspace}}", source_workspace)],
+        &[
+            ("{{role}}", crate::tools::envelope_attr(role_name).as_str()),
+            (
+                "{{workspace}}",
+                crate::tools::envelope_attr(source_workspace).as_str(),
+            ),
+            (
+                "{{branch_attr}}",
+                crate::tools::branch_attr(identifier).as_str(),
+            ),
+        ],
     );
     let job = custom_role_notify_job(content, source_workspace);
     let target = crate::jobs::envelope_target(&job);
     stamp_and_route(job, &target, "custom role failure envelope").await;
+}
+
+/// Deliver a coder branch's finished turn into the conversation that asked for
+/// it: the asking custom role's branch when the launch carries an asker
+/// ([`crate::Launch::reply_to`]), else the admin Assistant's session. Both shapes
+/// carry the `<coder-report>` envelope, naming the folder the turn ran in (its
+/// resolved PATH, not the branch's durable address) and its branch. An empty
+/// answer delivers nothing, and the report gains no file-delivery power the
+/// coder's single-run report does not have.
+async fn route_coder_branch_report(response: &str, launch: &crate::Launch, folder: &str) {
+    if response.is_empty() {
+        return;
+    }
+    let content = crate::tools::build_coder_envelope(
+        "coder_report.md",
+        folder,
+        launch.identifier.as_deref(),
+        response,
+    );
+    route_coder_branch_envelope(content, launch.reply_to.as_deref()).await;
+}
+
+/// Deliver the notice that a coder branch's turn produced no answer, into the
+/// same destination as its report — the failure counterpart of
+/// [`route_coder_branch_report`]. `folder` is the same resolved path the report
+/// names; [`report_unrunnable_branch`] passes the branch's durable address
+/// because no workspace was resolved to run in.
+async fn route_coder_branch_failure(launch: &crate::Launch, folder: &str) {
+    let content = crate::tools::build_coder_envelope(
+        "coder_failure.md",
+        folder,
+        launch.identifier.as_deref(),
+        "",
+    );
+    route_coder_branch_envelope(content, launch.reply_to.as_deref()).await;
+}
+
+/// Route a coder branch's envelope: into the asking custom role's branch when
+/// the caller carried one (mirroring [`route_manager_reply_to_custom`]), else
+/// into the admin's Assistant session (mirroring [`route_custom_role_notify`]).
+/// Neither arm sets `originating_workspace`: a coder report must carry exactly
+/// the file-delivery roots the single-run coder's report carries — its own
+/// delivery workspace alone.
+async fn route_coder_branch_envelope(content: String, asker: Option<&Asker>) {
+    let job = match asker {
+        Some(asker) => branch_job(content, asker, MessageKind::ImplementResult),
+        None => AgentJob {
+            content,
+            // The admin's own personal workspace; the consumer loop re-validates
+            // the pinning invariant, so no re-pinning is needed here.
+            workspace_name: crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "gui".to_string(),
+            kind: MessageKind::ImplementResult,
+            role: Role::Assistant,
+            reply_target: None,
+            pending_job_id: None,
+            originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
+        },
+    };
+    let target = crate::jobs::envelope_target(&job);
+    stamp_and_route(job, &target, "coder branch report envelope").await;
 }
 
 /// Transport-deliver `response` to every channel binding of `users`
@@ -1914,9 +2075,13 @@ mod tests {
         let pending = crate::jobs::list_pending_jobs(conn)
             .await
             .expect("list pending");
+        // Scoped to the rows this test created: the shared global store is
+        // written by parallel tests too (see `src/session/mod.rs`), so a bare
+        // count for the target session would include rows that are not this
+        // test's.
         let matching: Vec<_> = pending
             .iter()
-            .filter(|r| r.target_agent_id == target)
+            .filter(|r| r.target_agent_id == target && !before.contains(&r.id))
             .collect();
         assert_eq!(
             matching.len(),
@@ -2135,5 +2300,135 @@ mod tests {
             crate::jobs::envelope_target(&job),
             crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
         );
+    }
+
+    /// A coder branch's report has the same shape as the single-run coder's: the
+    /// `<coder-report>` envelope names the folder PATH the turn ran in (the
+    /// resolved workspace path, never the branch's durable address) and its
+    /// `branch` when the branch was named, and the delivered job carries NO
+    /// `originating_workspace` — so it gains no `[FILE:...]` root the single run
+    /// lacks. An empty answer delivers nothing.
+    #[tokio::test]
+    #[serial_test::serial(provider)]
+    async fn coder_branch_report_matches_the_single_run_shape() {
+        setup_response_test_infra().await;
+
+        let before: HashSet<String> = crate::jobs::list_pending_jobs(&crate::session::store().conn)
+            .await
+            .expect("list pending")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        let launch = crate::Launch {
+            role: Role::Coder,
+            name: String::new(),
+            identifier: Some("feature".to_string()),
+            prompt: String::new(),
+            tools: Vec::new(),
+            agent_id: crate::session::coder_branch_agent_id("feature"),
+            reply_to: None,
+        };
+        // The branch's durable ADDRESS (what a folder-less branch records) — the
+        // report must name the resolved folder path instead of it.
+        let mut job = make_job(Role::Coder, "personal:admin", "admin", "gui");
+        job.custom_role = Some(launch.clone());
+
+        let assistant_agent = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let mut assistant_rx = register_agent(&assistant_agent);
+        let mut branch_rx = register_agent(&launch.agent_id);
+
+        // No asking custom role: the report lands in the admin's Assistant session.
+        route_coder_branch_report("did the thing", &launch, "/data/folder").await;
+        let delivered = assistant_rx
+            .try_recv()
+            .expect("the report is delivered to the admin's assistant");
+        assert_eq!(delivered.kind, MessageKind::ImplementResult);
+        assert!(
+            delivered
+                .content
+                .contains("<coder-report folder=\"/data/folder\" branch=\"feature\">"),
+            "the report names the folder PATH and the branch: {}",
+            delivered.content
+        );
+        assert!(
+            !delivered.content.contains("personal:admin"),
+            "the branch's durable address must never stand in for the folder path: {}",
+            delivered.content
+        );
+        assert!(
+            delivered.originating_workspace.is_none(),
+            "a coder report carries no extra file-delivery root: {:?}",
+            delivered.originating_workspace
+        );
+
+        // A folder whose name carries a quote or an angle bracket cannot deform
+        // the envelope: the three characters that could end the attribute are
+        // escaped.
+        route_coder_branch_report("did the thing", &launch, "/data/we\"ird<dir>").await;
+        let hostile = assistant_rx
+            .try_recv()
+            .expect("the report is delivered to the admin's assistant");
+        assert!(
+            hostile.content.starts_with(
+                "<coder-report folder=\"/data/we&quot;ird&lt;dir&gt;\" branch=\"feature\">"
+            ),
+            "a model-chosen folder must not be able to deform the envelope: {}",
+            hostile.content
+        );
+
+        // An ordinary name that happens to carry an apostrophe or an ampersand
+        // is NOT distorted: the model is told a folder it can hand back.
+        route_coder_branch_report("did the thing", &launch, "/data/o'brien & co").await;
+        let ordinary = assistant_rx
+            .try_recv()
+            .expect("the report is delivered to the admin's assistant");
+        assert!(
+            ordinary
+                .content
+                .starts_with("<coder-report folder=\"/data/o'brien & co\" branch=\"feature\">"),
+            "a folder name must read back as the folder it names: {}",
+            ordinary.content
+        );
+
+        // An asking custom role's branch: same shape, no extra root either. The
+        // asker travels on the LAUNCH (its single carrier), which is what the
+        // report reads.
+        let asking = crate::Launch {
+            reply_to: Some(Box::new(Asker {
+                launch: launch.clone(),
+                workspace: "role_ws".to_string(),
+            })),
+            ..launch.clone()
+        };
+        route_coder_branch_report("did the thing again", &asking, "/data/folder").await;
+        let re_delivered = branch_rx
+            .try_recv()
+            .expect("the report re-enters the asking branch");
+        assert_eq!(re_delivered.workspace_name, "role_ws");
+        assert!(
+            re_delivered.originating_workspace.is_none(),
+            "the asking-branch arm carries no extra file-delivery root either: {:?}",
+            re_delivered.originating_workspace
+        );
+
+        // An empty answer delivers nothing.
+        route_coder_branch_report("", &launch, "/data/folder").await;
+        assert!(
+            branch_rx.try_recv().is_err(),
+            "an empty answer delivers nothing"
+        );
+
+        unregister_agent(&assistant_agent);
+        unregister_agent(&launch.agent_id);
+
+        let pending = crate::jobs::list_pending_jobs(&crate::session::store().conn)
+            .await
+            .expect("list pending");
+        for row in pending.iter().filter(|r| !before.contains(&r.id)) {
+            crate::jobs::delete_pending_job(&crate::session::store().conn, &row.id)
+                .await
+                .expect("delete pending row");
+        }
     }
 }

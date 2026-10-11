@@ -223,6 +223,14 @@ pub(crate) const CUSTOM_ROLE_AGENT_ID_PREFIX: &str = "role_";
 /// ordinary session lifetime.
 pub(crate) const CUSTOM_ROLE_RUN_AGENT_ID_PREFIX: &str = "rolerun_";
 
+/// Agent-id prefix of a coder branch — `coder_{branch}`. A coder branch is a
+/// continuable conversation like a custom role's branch: it is deliberately NOT
+/// in [`TRANSIENT_AGENT_ID_PREFIXES`] (never TTL-purged) and IS recovered by the
+/// dead-session poller, but it is in the wider [`reserved_agent_id_prefixes`]
+/// union so no direct user id can shadow it. It is NOT in
+/// [`non_user_facing_agent_id_prefixes`]: the branch is user-facing.
+pub(crate) const CODER_BRANCH_AGENT_ID_PREFIX: &str = "coder_";
+
 #[derive(Debug, Clone)]
 pub(crate) struct SessionMetadata {
     pub agent_id: String,
@@ -238,10 +246,11 @@ pub(crate) struct SessionMetadata {
     pub user_name: Option<String>,
     pub workspace_name: Option<String>,
     /// The custom role this session belongs to, when it is a custom-role
-    /// session.
+    /// session; `None` for a coder branch (whose branch name is in
+    /// `custom_identifier`).
     pub custom_role: Option<String>,
-    /// The named branch this custom-role session continues, when the branch
-    /// was named.
+    /// The named branch this continuable session continues, when the branch was
+    /// named — a custom role's identifier, or a coder branch's name.
     pub custom_identifier: Option<String>,
     /// Whether the launch was stopped before it produced anything.
     pub launch_stopped: bool,
@@ -270,11 +279,18 @@ pub(crate) struct SessionContext {
     /// Agent role (e.g. `"engineer"`, `"analyst"`, `"reviewer"`).
     pub role: String,
     /// The custom role this session belongs to, when it is a custom-role
-    /// session.
+    /// session; `None` for a coder branch (whose branch name is in
+    /// `custom_identifier`).
     pub custom_role: Option<String>,
-    /// The named branch the custom-role session continues, when the branch was
-    /// named.
+    /// The named branch this continuable session continues, when the branch was
+    /// named — a custom role's identifier, or a coder branch's name.
     pub custom_identifier: Option<String>,
+    /// The conversation that asked for this branch's launch, when one did — the
+    /// asking custom role's branch and the folder its turn ran in, so a coder
+    /// branch's report returns there (see [`crate::Launch::reply_to`]). `None`
+    /// for an owner- or alarm-started launch, and for every session recorded
+    /// before the `reply_to` column existed.
+    pub reply_to: Option<crate::agent::message_router::Asker>,
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -312,13 +328,48 @@ fn session_metadata_from_row(
 const INSERT_SESSION_ROW: &str =
     "INSERT INTO sessions (agent_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)";
 
+/// The session metadata a message batch writes in the SAME transaction as its
+/// rows: the describing columns (only a batch that also sets them — a session's
+/// first turn) and the leading context block's length (only the batch that wrote
+/// the block).
+#[derive(Clone, Copy, Default)]
+struct BatchMetadata<'a> {
+    context: Option<(&'a str, &'a str, &'a str, &'a str)>,
+    block_len: Option<usize>,
+}
+
+impl<'a> BatchMetadata<'a> {
+    /// A batch that also writes the session's describing columns.
+    const fn context(
+        channel: &'a str,
+        user_name: &'a str,
+        workspace_name: &'a str,
+        role: &'a str,
+    ) -> Self {
+        Self {
+            context: Some((channel, user_name, workspace_name, role)),
+            block_len: None,
+        }
+    }
+
+    /// The length of the leading context block this same batch wrote — `Some`
+    /// only for the batch that wrote the block.
+    const fn block_len(self, len: Option<usize>) -> Self {
+        Self {
+            block_len: len,
+            ..self
+        }
+    }
+}
+
 /// Insert messages into `sessions` and upsert `session_metadata` within an existing transaction.
 /// Shared helper used by [`SessionStore::append_messages`].
 ///
-/// When `context` is `Some((channel, user_name, workspace_name, role))`, the context columns
+/// When `meta.context` is `Some((channel, user_name, workspace_name, role))`, the context columns
 /// are set atomically alongside the messages — closing the atomicity gap of separate
 /// context writes.  This is the preferred path for new sessions
-/// and subsequent turns.
+/// and subsequent turns. `meta.block_len` records the leading context block's
+/// length in that same transaction when the batch wrote the block.
 ///
 /// `replace` selects the denormalized `session_metadata.message_count`
 /// semantics: `false` (append) increments the stored count by the batch
@@ -329,7 +380,7 @@ async fn insert_messages_in_transaction(
     tx: &TxGuard<'_>,
     agent_id: &str,
     messages: &[ChatMessage],
-    context: Option<(&str, &str, &str, &str)>,
+    meta: BatchMetadata<'_>,
     replace: bool,
 ) -> Result<()> {
     let now = db::now();
@@ -353,7 +404,7 @@ async fn insert_messages_in_transaction(
     // (replace). The INSERT branches rely on the `NOT NULL DEFAULT 0`
     // declaration for rows created by other paths (e.g. `set_token_length`).
     let count = i64::try_from(messages.len()).context("message batch exceeds i64")?;
-    match context {
+    match meta.context {
         Some((channel, user_name, workspace_name, role)) => {
             // `created_at` stamps the session_metadata row only on creation
             // (the session's creation timestamp); the update branch below must
@@ -396,6 +447,19 @@ async fn insert_messages_in_transaction(
         }
         None => upsert_message_count(tx, agent_id, count, &now, replace).await?,
     }
+    // A batch that wrote the session's leading context block records its length
+    // in the SAME transaction: a failed write can then never leave a recorded
+    // length that disagrees with the block it describes.
+    if let Some(len) = meta.block_len {
+        let len = i64::try_from(len).context("context block length exceeds i64")?;
+        set_metadata_value_in_tx(
+            tx,
+            agent_id,
+            MetadataColumn::ContextBlockLen,
+            Value::Integer(len),
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -411,6 +475,30 @@ fn message_count_clause(replace: bool) -> &'static str {
     } else {
         "message_count = message_count + ?3"
     }
+}
+
+/// Upsert one `session_metadata` column inside a caller-owned transaction.
+/// `created_at` is stamped only on row creation (never on an existing row).
+async fn set_metadata_value_in_tx(
+    tx: &TxGuard<'_>,
+    agent_id: &str,
+    column: MetadataColumn,
+    value: Value,
+) -> Result<()> {
+    let col = column.as_str();
+    let now = db::now();
+    tx.upsert_row(
+        &format!("UPDATE session_metadata SET {col} = ?1 WHERE agent_id = ?2"),
+        || params![value.clone(), agent_id],
+        &format!(
+            "INSERT INTO session_metadata (agent_id, last_activity, {col}, created_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(agent_id) DO NOTHING"
+        ),
+        params![agent_id, now.as_str(), value.clone(), now.as_str()],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Upsert the context-free `session_metadata` count row: `last_activity` is
@@ -562,9 +650,11 @@ enum MetadataColumn {
     SleepEnded,
     CustomRole,
     CustomIdentifier,
+    ReplyTo,
     LaunchStopped,
     WorkspaceName,
     PersonalChanges,
+    ContextBlockLen,
 }
 
 impl MetadataColumn {
@@ -575,9 +665,11 @@ impl MetadataColumn {
             Self::SleepEnded => "sleep_ended",
             Self::CustomRole => "custom_role",
             Self::CustomIdentifier => "custom_identifier",
+            Self::ReplyTo => "reply_to",
             Self::LaunchStopped => "launch_stopped",
             Self::WorkspaceName => "workspace_name",
             Self::PersonalChanges => "personal_changes",
+            Self::ContextBlockLen => "context_block_len",
         }
     }
 }
@@ -703,12 +795,30 @@ impl SessionStore {
             .is_some()
     }
 
+    /// `created_at` of the session's last assistant message row.
+    ///
+    /// That row is the session's dangling tool-call frame whenever one exists:
+    /// the frame is persisted BEFORE its calls run (emission-time durability)
+    /// and the agent cannot emit another assistant message past an unsettled
+    /// frame. `None` when the session has no assistant row at all.
+    pub(crate) async fn last_assistant_created_at(&self, agent_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_optional(
+                "SELECT created_at FROM sessions \
+                 WHERE agent_id = ?1 AND role = 'assistant' ORDER BY id DESC LIMIT 1",
+                params![agent_id],
+                |row| row.get::<String>(0),
+            )
+            .await
+            .context("read the session's last assistant timestamp")
+    }
+
     async fn append_messages(
         &self,
         agent_id: &str,
         messages: &[ChatMessage],
         replace: bool,
-        context: Option<(&str, &str, &str, &str)>,
+        meta: BatchMetadata<'_>,
     ) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         if replace {
@@ -718,35 +828,26 @@ impl SessionStore {
             )
             .await?;
         }
-        insert_messages_in_transaction(&tx, agent_id, messages, context, replace).await?;
+        insert_messages_in_transaction(&tx, agent_id, messages, meta, replace).await?;
         tx.commit().await?;
         Ok(())
     }
 
     async fn batch_append(&self, agent_id: &str, messages: &[ChatMessage]) -> Result<()> {
-        self.append_messages(agent_id, messages, false, None).await
+        self.append_messages(agent_id, messages, false, BatchMetadata::default())
+            .await
     }
 
-    /// Like [`batch_append`], but also sets session context (`channel`,
-    /// `user_name`, `workspace_name`, `role`) in the same transaction as
-    /// the message insert, eliminating the atomicity gap between message
-    /// persistence and context persistence.
+    /// Like [`batch_append`], but writes `meta` in the same transaction as the
+    /// message insert, eliminating the atomicity gap between the rows and the
+    /// session metadata they belong to.
     async fn batch_append_with_context(
         &self,
         agent_id: &str,
         messages: &[ChatMessage],
-        channel: &str,
-        user_name: &str,
-        workspace_name: &str,
-        role: &str,
+        meta: BatchMetadata<'_>,
     ) -> Result<()> {
-        self.append_messages(
-            agent_id,
-            messages,
-            false,
-            Some((channel, user_name, workspace_name, role)),
-        )
-        .await
+        self.append_messages(agent_id, messages, false, meta).await
     }
 
     /// Like [`batch_append`], but also sets session context in the same transaction.
@@ -754,24 +855,31 @@ impl SessionStore {
         &self,
         agent_id: &str,
         message: &ChatMessage,
-        channel: &str,
-        user_name: &str,
-        workspace_name: &str,
-        role: &str,
+        meta: BatchMetadata<'_>,
     ) -> Result<()> {
-        self.batch_append_with_context(
-            agent_id,
-            std::slice::from_ref(message),
-            channel,
-            user_name,
-            workspace_name,
-            role,
-        )
-        .await
+        self.batch_append_with_context(agent_id, std::slice::from_ref(message), meta)
+            .await
     }
 
-    async fn replace_messages(&self, agent_id: &str, messages: &[ChatMessage]) -> Result<()> {
-        self.append_messages(agent_id, messages, true, None).await
+    /// Rewrite the whole history, recording the leading context block's length in
+    /// the same transaction when this rewrite wrote the block (see
+    /// [`crate::session::Session::refresh_context_block`]).
+    async fn replace_messages(
+        &self,
+        agent_id: &str,
+        messages: &[ChatMessage],
+        block_len: Option<usize>,
+    ) -> Result<()> {
+        self.append_messages(
+            agent_id,
+            messages,
+            true,
+            BatchMetadata {
+                context: None,
+                block_len,
+            },
+        )
+        .await
     }
 
     /// Rewrite the content of the most recent `user`-role message row for the
@@ -800,27 +908,6 @@ impl SessionStore {
         tx.commit().await?;
         if changed == 0 {
             anyhow::bail!("no user message row to rewrite for agent {agent_id}");
-        }
-        Ok(())
-    }
-
-    /// Rewrite the content of the session's FIRST message row for the agent —
-    /// the fixed system block a custom-role session always opens with (the
-    /// first turn writes it there, and every compaction puts it back at the
-    /// head). A single-row positional UPDATE targeting the `MIN(id)` row.
-    pub(crate) async fn rewrite_first_message(&self, agent_id: &str, content: &str) -> Result<()> {
-        let tx = self.conn.begin_tx().await?;
-        let changed = tx
-            .execute(
-                "UPDATE sessions SET content = ?1 WHERE id = (
-                    SELECT MIN(id) FROM sessions WHERE agent_id = ?2
-                )",
-                params![content, agent_id],
-            )
-            .await?;
-        tx.commit().await?;
-        if changed == 0 {
-            anyhow::bail!("no message row to rewrite for agent {agent_id}");
         }
         Ok(())
     }
@@ -1136,8 +1223,8 @@ impl SessionStore {
         let rows = self
             .conn
             .query(
-                "SELECT channel, user_name, workspace_name, role, custom_role, custom_identifier \
-                 FROM session_metadata WHERE agent_id = ?1",
+                "SELECT channel, user_name, workspace_name, role, custom_role, custom_identifier, \
+                 reply_to FROM session_metadata WHERE agent_id = ?1",
                 params![agent_id],
             )
             .await
@@ -1149,6 +1236,11 @@ impl SessionStore {
             let role: Option<String> = row.get(3).ok();
             let custom_role: Option<String> = row.get(4).ok().flatten();
             let custom_identifier: Option<String> = row.get(5).ok().flatten();
+            let reply_to = row
+                .get::<Option<String>>(6)
+                .ok()
+                .flatten()
+                .and_then(|json| serde_json::from_str(&json).ok());
             Some(SessionContext {
                 channel: channel?,
                 user_name: user_name?,
@@ -1156,6 +1248,7 @@ impl SessionStore {
                 role: role?,
                 custom_role,
                 custom_identifier,
+                reply_to,
             })
         })
     }
@@ -1169,22 +1262,9 @@ impl SessionStore {
         column: MetadataColumn,
         value: Value,
     ) -> Result<()> {
-        let col = column.as_str();
-        let now = db::now();
-        // `created_at` is stamped only on row creation (never on an existing row).
-        let created_at = now.clone();
-        self.conn
-            .upsert_row(
-                &format!("UPDATE session_metadata SET {col} = ?1 WHERE agent_id = ?2"),
-                || params![value.clone(), agent_id],
-                &format!(
-                    "INSERT INTO session_metadata (agent_id, last_activity, {col}, created_at) \
-                     VALUES (?1, ?2, ?3, ?4) \
-                     ON CONFLICT(agent_id) DO NOTHING"
-                ),
-                params![agent_id, now.as_str(), value.clone(), created_at.as_str()],
-            )
-            .await?;
+        let tx = self.conn.begin_tx().await?;
+        set_metadata_value_in_tx(&tx, agent_id, column, value).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1345,39 +1425,51 @@ impl SessionStore {
         .is_some_and(|flag| flag == "1")
     }
 
-    /// Record the custom role this session belongs to — the record's name and
-    /// the named branch it continues, if any — so the session can be resumed as
-    /// the same role without parsing the agent ID. Both columns are written in
-    /// ONE upsert, on every appending turn of a custom-role session, so a single
-    /// failed write cannot leave the branch without a recorded role.
-    pub(crate) async fn set_custom_role(
+    /// Record this session's branch kind and address — a custom role's name and
+    /// the named branch it continues, or a coder branch's `None` role name and
+    /// its branch name — plus the conversation that asked for it, so the session
+    /// can be resumed as the same branch without parsing the agent ID. All three
+    /// columns are written in ONE upsert, on every appending turn of a branch
+    /// session, so a single failed write cannot leave the branch without a
+    /// recorded role.
+    ///
+    /// `reply_to` is the asking conversation this launch's work reports back to
+    /// (see [`crate::Launch::reply_to`]); it is stored as JSON, `None` as NULL.
+    pub(crate) async fn set_branch(
         &self,
         agent_id: &str,
-        name: &str,
+        role_name: Option<&str>,
         identifier: Option<&str>,
+        reply_to: Option<&crate::agent::message_router::Asker>,
     ) -> Result<()> {
         let now = db::now();
         let created_at = now.clone();
         let role_col = MetadataColumn::CustomRole.as_str();
         let id_col = MetadataColumn::CustomIdentifier.as_str();
+        let reply_col = MetadataColumn::ReplyTo.as_str();
+        let reply_json = reply_to
+            .map(serde_json::to_string)
+            .transpose()
+            .context("Failed to encode the branch's reply-to")?;
         self.conn
             .upsert_row(
                 &format!(
-                    "UPDATE session_metadata SET {role_col} = ?1, {id_col} = ?2 \
-                     WHERE agent_id = ?3"
+                    "UPDATE session_metadata SET {role_col} = ?1, {id_col} = ?2, {reply_col} = ?3 \
+                     WHERE agent_id = ?4"
                 ),
-                || params![name, identifier, agent_id],
+                || params![role_name, identifier, reply_json.clone(), agent_id],
                 &format!(
                     "INSERT INTO session_metadata \
-                     (agent_id, last_activity, {role_col}, {id_col}, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5) \
+                     (agent_id, last_activity, {role_col}, {id_col}, {reply_col}, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                      ON CONFLICT(agent_id) DO NOTHING"
                 ),
                 params![
                     agent_id,
                     now.as_str(),
-                    name,
+                    role_name,
                     identifier,
+                    reply_json.clone(),
                     created_at.as_str()
                 ],
             )
@@ -1385,8 +1477,8 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Persist the launch-stopped marker (`"1"`) or clear it (`"0"`) for a
-    /// custom-role session whose launch was stopped before it produced anything.
+    /// Persist the launch-stopped marker (`"1"`) or clear it (`"0"`) for a branch
+    /// session whose launch was stopped before it produced anything.
     pub(crate) async fn set_launch_stopped(&self, agent_id: &str, stopped: bool) -> Result<()> {
         let flag = if stopped { "1" } else { "0" };
         self.set_metadata_value(
@@ -1397,7 +1489,7 @@ impl SessionStore {
         .await
     }
 
-    /// Whether a custom-role session's launch was stopped before it produced
+    /// Whether a branch session's launch was stopped before it produced
     /// anything.
     pub(crate) async fn get_launch_stopped(&self, agent_id: &str) -> bool {
         self.get_metadata_value(
@@ -1411,7 +1503,7 @@ impl SessionStore {
     }
 
     /// The workspace address recorded for a session, if any — used to release a
-    /// stopped custom-role branch's launch-folder engine. Best-effort: a failed
+    /// stopped branch's launch-folder engine. Best-effort: a failed
     /// read returns `None` (the engine simply stays registered).
     pub(crate) async fn session_workspace_name(&self, agent_id: &str) -> Option<String> {
         self.get_metadata_value(
@@ -1421,6 +1513,21 @@ impl SessionStore {
             |row| row.get::<Option<String>>(0),
         )
         .await
+    }
+
+    /// The length of the leading context block recorded for a launch session,
+    /// if any — what was WRITTEN when the block was cached. `None` when the
+    /// session predates the column; a failed read or a negative/garbage value
+    /// also returns `None` (the caller falls back to the pre-pinning re-render).
+    pub(crate) async fn context_block_len(&self, agent_id: &str) -> Option<usize> {
+        self.get_metadata_value(
+            agent_id,
+            MetadataColumn::ContextBlockLen,
+            "Failed to read the session's recorded context-block length",
+            |row| row.get::<Option<i64>>(0),
+        )
+        .await
+        .and_then(|len| usize::try_from(len).ok())
     }
 
     /// The branch list of one custom role: every session (`agent_id`) whose
@@ -1537,13 +1644,15 @@ pub(crate) fn non_user_facing_agent_id_prefixes() -> impl Iterator<Item = &'stat
 
 /// The union a **user-facing direct agent id** must never start with: every
 /// non-user-facing prefix ([`non_user_facing_agent_id_prefixes`]) plus
-/// [`CUSTOM_ROLE_AGENT_ID_PREFIX`], which a direct id must also not shadow.
+/// [`CUSTOM_ROLE_AGENT_ID_PREFIX`] and [`CODER_BRANCH_AGENT_ID_PREFIX`], which a
+/// direct id must also not shadow.
 ///
 /// A real user whose name collides with any of these is escaped with a `user_`
 /// prefix by [`safe_user_segment`] — so a user literally named `role` becomes
-/// `user_role`, protecting the start of a custom-role address.
+/// `user_role`, protecting the start of a custom-role or coder-branch address.
 pub(crate) fn reserved_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
-    non_user_facing_agent_id_prefixes().chain(std::iter::once(CUSTOM_ROLE_AGENT_ID_PREFIX))
+    non_user_facing_agent_id_prefixes()
+        .chain([CUSTOM_ROLE_AGENT_ID_PREFIX, CODER_BRANCH_AGENT_ID_PREFIX])
 }
 
 /// Case-insensitive (ASCII) [`str::starts_with`], matching Turso's `LIKE`
@@ -1813,6 +1922,28 @@ pub(crate) fn custom_role_run_agent_id(name: &str) -> String {
     )
 }
 
+/// Construct the agent ID of a coder branch.
+///
+/// Format: `coder_{branch}` — deterministic, so the next message on the same
+/// branch resumes the same session; the branch persists like a direct
+/// conversation (see [`CODER_BRANCH_AGENT_ID_PREFIX`]).
+#[must_use]
+pub(crate) fn coder_branch_agent_id(branch: &str) -> String {
+    format!("{CODER_BRANCH_AGENT_ID_PREFIX}{branch}")
+}
+
+/// Whether `agent_id` addresses a coder branch ([`CODER_BRANCH_AGENT_ID_PREFIX`]).
+#[must_use]
+pub(crate) fn is_coder_branch_agent_id(agent_id: &str) -> bool {
+    agent_id.starts_with(CODER_BRANCH_AGENT_ID_PREFIX)
+}
+
+/// The branch name inside a coder branch's agent id, when the id is one.
+#[must_use]
+pub(crate) fn coder_branch_name(agent_id: &str) -> Option<&str> {
+    agent_id.strip_prefix(CODER_BRANCH_AGENT_ID_PREFIX)
+}
+
 /// Whether a custom role's `name` may not be used: it IS a built-in
 /// agent-address namespace word, or it begins that namespace's address family
 /// (the namespace prefix including its `_`), so the role's id
@@ -1956,7 +2087,7 @@ mod tests {
             .await
             .unwrap();
         store()
-            .replace_messages(&k, &[ChatMessage::user("new")])
+            .replace_messages(&k, &[ChatMessage::user("new")], None)
             .await
             .unwrap();
         let msgs = store().load(&k).await;
@@ -2138,10 +2269,7 @@ mod tests {
             .append_with_context(
                 &agent_id,
                 &ChatMessage::user("hello"),
-                "gui",
-                "alice",
-                "work",
-                "engineer",
+                BatchMetadata::context("gui", "alice", "work", "engineer"),
             )
             .await
             .unwrap();
@@ -2161,10 +2289,7 @@ mod tests {
             .append_with_context(
                 &agent_id,
                 &ChatMessage::user("hello again"),
-                "telegram",
-                "bob",
-                "project-x",
-                "analyst",
+                BatchMetadata::context("telegram", "bob", "project-x", "analyst"),
             )
             .await
             .unwrap();
@@ -2280,10 +2405,7 @@ mod tests {
             .append_with_context(
                 &k,
                 &ChatMessage::user("u1"),
-                "test_channel",
-                "test_user",
-                "test_ws",
-                "engineer",
+                BatchMetadata::context("test_channel", "test_user", "test_ws", "engineer"),
             )
             .await
             .unwrap();
@@ -2361,6 +2483,7 @@ mod tests {
             .replace_messages(
                 &k,
                 &[ChatMessage::system("prompt"), ChatMessage::user("u1")],
+                None,
             )
             .await
             .unwrap();
@@ -2377,6 +2500,7 @@ mod tests {
                     ChatMessage::assistant("a"),
                     ChatMessage::assistant("a2"),
                 ],
+                None,
             )
             .await
             .unwrap();
@@ -2395,10 +2519,7 @@ mod tests {
             .append_with_context(
                 &transient,
                 &ChatMessage::user("u1"),
-                "test_channel",
-                "test_user",
-                "test_ws",
-                "engineer",
+                BatchMetadata::context("test_channel", "test_user", "test_ws", "engineer"),
             )
             .await
             .unwrap();
@@ -2424,10 +2545,7 @@ mod tests {
             .append_with_context(
                 &stale,
                 &ChatMessage::user("u1"),
-                "test_channel",
-                "test_user",
-                "test_ws",
-                "engineer",
+                BatchMetadata::context("test_channel", "test_user", "test_ws", "engineer"),
             )
             .await
             .unwrap();
@@ -2503,10 +2621,7 @@ mod tests {
                 .append_with_context(
                     id,
                     &ChatMessage::user("msg"),
-                    "test_channel",
-                    "test_user",
-                    "test_ws",
-                    "engineer",
+                    BatchMetadata::context("test_channel", "test_user", "test_ws", "engineer"),
                 )
                 .await
                 .unwrap();

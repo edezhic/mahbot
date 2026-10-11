@@ -22,13 +22,12 @@ pub(crate) mod custom;
 pub(crate) mod delegation;
 pub(crate) mod document;
 pub(crate) mod edit;
+pub(crate) mod grants;
 pub(crate) mod image_gen;
 pub(crate) mod implement;
-pub(crate) mod launch_role;
 pub(crate) mod listing;
 pub(crate) mod mahbot_config;
 pub(crate) mod mahbot_debug;
-pub(crate) mod manager_chat;
 pub mod media_catalog;
 pub(crate) mod path;
 pub(crate) mod read;
@@ -36,6 +35,7 @@ pub(crate) mod read_document;
 pub(crate) mod research;
 pub(crate) mod search;
 pub(crate) mod search_archived_tickets;
+pub(crate) mod send;
 pub(crate) mod shell;
 pub(crate) mod sleep;
 pub(crate) mod ticket;
@@ -188,7 +188,7 @@ pub(crate) fn fit_request_body_budget(
 // ── Re-exports ─────────────────────────────────────────────────────────
 
 pub(crate) use alarms::{AddAlarmTool, ListAlarmsTool, RemoveAlarmTool};
-pub(crate) use analyze::{AnalyzeTool, DispatchMode};
+pub(crate) use analyze::{AnalyzeDepth, AnalyzeTool, DispatchMode};
 pub(crate) use chrome::ChromeTool;
 #[cfg(not(target_os = "macos"))]
 pub(crate) use computer::ComputerTool;
@@ -196,15 +196,12 @@ pub(crate) use custom::CustomTool;
 pub(crate) use document::DocumentTool;
 pub(crate) use edit::EditTool;
 pub(crate) use image_gen::ImageGenTool;
-pub(crate) use implement::ImplementTool;
-pub(crate) use launch_role::LaunchRoleTool;
 pub(crate) use mahbot_config::MahbotConfigTool;
 pub(crate) use mahbot_debug::MahbotDebugTool;
-pub(crate) use manager_chat::SendMessageToManagerTool;
 pub(crate) use read::ReadTool;
-pub(crate) use research::ResearchTool;
 pub(crate) use search::SearchTool;
 pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
+pub(crate) use send::{Addressee, SendTool};
 pub(crate) use shell::{ShellMode, ShellTool};
 pub(crate) use sleep::SleepTool;
 pub(crate) use ticket::{
@@ -229,6 +226,18 @@ use crate::util::json::{
     get_str_array, get_usize, wrong_type,
 };
 
+/// The shared `message` argument of the dispatch tools (`analyze`, `send`):
+/// required, and non-empty once trimmed. One rule for both tools, so a holder
+/// gets the same refusal whichever one it calls.
+pub(crate) fn get_dispatch_message(args: &serde_json::Value) -> anyhow::Result<&str> {
+    let message = get_str(args, "message")?;
+    anyhow::ensure!(
+        !message.trim().is_empty(),
+        "usage: the message must not be empty"
+    );
+    Ok(message)
+}
+
 /// Prepend a note about argument normalization so the model can see what was
 /// silently corrected (e.g. flattened fields, XML wrapping).
 pub(crate) fn with_normalization_notes(output: String, notes: &[String]) -> String {
@@ -249,6 +258,44 @@ pub(crate) fn with_note(text: &str, note: &str) -> String {
     }
     out.push_str(note);
     out
+}
+
+/// Refuse a choice-argument value the holder does not offer, naming what it
+/// does. A model can emit a value the declaration never listed, so the choice
+/// axes validate rather than merely unadvertise.
+pub(crate) fn refuse_choice(argument: &str, value: &str, allowed: &[&str]) -> anyhow::Error {
+    anyhow::anyhow!(
+        "usage: `{argument}` must be one of {} — got \"{value}\"",
+        allowed.join(", ")
+    )
+}
+
+/// Resolve a choice argument against the kinds a holder has, in interface
+/// order (narrowest first). An absent (or explicit null) value takes the
+/// narrowest kind; a named value must be one of them — anything else is
+/// refused, never silently narrowed. `held` must not be empty (it is the
+/// holder's declared set, and a holder always has at least one kind).
+pub(crate) fn chosen_kind<T: Copy + PartialEq>(
+    args: &serde_json::Value,
+    argument: &str,
+    held: &[T],
+    spelling: impl Fn(T) -> &'static str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> anyhow::Result<T> {
+    debug_assert!(!held.is_empty(), "a holder always has at least one kind");
+    match args.get(argument) {
+        None | Some(serde_json::Value::Null) => Ok(held[0]),
+        Some(serde_json::Value::String(value)) => parse(value)
+            .filter(|kind| held.contains(kind))
+            .ok_or_else(|| {
+                refuse_choice(
+                    argument,
+                    value,
+                    &held.iter().map(|kind| spelling(*kind)).collect::<Vec<_>>(),
+                )
+            }),
+        Some(other) => Err(wrong_type(argument, "a string", other)),
+    }
 }
 
 /// Build a JSON schema for tool parameters.
@@ -380,7 +427,7 @@ pub(crate) fn internal_fault(cause: &str) -> anyhow::Error {
 /// shutdown/drain. NEVER persisted — the emission-time frame already recorded
 /// the call durably, so the result is simply absent and the universal
 /// resume-completion step re-runs/resumes it. Carried as an `anyhow::Error`
-/// out of the sync analyze/implement dispatch so the caller's tool-execution
+/// out of a sync dispatch (analyze, coder) so the caller's tool-execution
 /// layer can mark the outcome `suspended`.
 #[derive(Debug)]
 pub(crate) struct CallSuspended;
@@ -398,12 +445,11 @@ impl std::error::Error for CallSuspended {}
 
 // ── Sync durable-core glue ──────────────────────────────────────────────
 //
-// The analyze/implement durable lifecycle is mirrored by the two tools
-// (sync dispatch, async dispatch, boot resume, result envelopes). ALL of
+// The two dispatch tools (`analyze`, `send`) share one durable lifecycle —
+// sync dispatch, async dispatch, boot resume, result envelopes — and ALL of
 // that glue lives on [`SyncDurableCore`] so there is exactly one
-// implementation: the per-tool sync wrappers (`run_sync_analyze` /
-// `run_sync_implement`), the async-dispatch tool branches, and the
-// boot-resume rounds delegate to it.
+// implementation: the sync tool paths and the boot-resume rounds both
+// delegate to it.
 
 /// The job-scoped parameters every durable sync core takes. Beyond
 /// `(ws, task)` these are the values the sync wrappers read from the
@@ -429,13 +475,13 @@ pub(crate) struct CoreJobArgs<'a> {
 
 /// The jobs-row fields a fresh dispatch writes. Read ONLY when the call
 /// actually spawns (see [`CoreJobArgs::spawn`]); a resume inserts no row and
-/// carries no record — so a resume can never hand a target's name to the
-/// delivery key.
+/// carries no record — so a resume can never hand the chosen directory's name
+/// to the delivery key.
 pub(crate) struct SpawnRecord<'a> {
     /// The CALLER's own workspace name: the durable delivery/routing key
-    /// (`jobs.workspace_name`). Never the target.
+    /// (`jobs.workspace_name`). Never the chosen directory.
     pub delivery_name: &'a str,
-    /// The target directory the round executes in, when the caller asked for one
+    /// The chosen directory the round executes in, when the caller asked for one
     /// — including one that happens to name the caller's own directory — so the
     /// reply always names the directory really used and a restart resumes into
     /// the same identity. Persisted as `jobs.exec_dir`.
@@ -447,10 +493,10 @@ pub(crate) struct SpawnRecord<'a> {
     /// branch from this snapshot, so the authorial prompt and the tool subset
     /// are as load-bearing as the branch address. `None` for every built-in
     /// caller.
-    pub custom_launch: Option<&'a crate::CustomRoleLaunch>,
+    pub custom_launch: Option<&'a crate::Launch>,
 }
 
-/// The single outcome form of the durable sync cores (analyze/implement):
+/// The single outcome form of the durable sync cores (analyze, coder):
 /// `Terminal` wraps a produced result (Ok or Err — both terminalize with a
 /// durable envelope), `DrainCut` means the round was cut by drain/shutdown —
 /// the job stays status='launched' for resume (boot or live), nothing is
@@ -460,33 +506,64 @@ pub(crate) enum SyncCoreOutcome {
     DrainCut,
 }
 
-/// The sync analyze/implement durable cores, normalized behind one interface
-/// so the sync dispatch, the resume-completion loop and the per-tool wrappers
-/// all reuse a single body.
+/// The sync analyze/coder durable cores, normalized behind one interface so the
+/// sync dispatch, the resume-completion loop and the per-tool wrappers all
+/// reuse a single body. [`Coder`](Self::Coder)'s `jobs.kind` is
+/// [`crate::jobs::SpawnChild::Implement`]'s (`"implement"`).
 #[derive(Copy, Clone)]
 pub(crate) enum SyncDurableCore {
     Analyze,
-    Implement,
+    Coder,
 }
 
 impl SyncDurableCore {
-    /// The log/site label for this core ("Analyze" / "Implement").
+    /// The log/site label for this core ("Analyze" / "Coder").
     #[must_use]
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Analyze => "Analyze",
-            Self::Implement => "Implement",
+            Self::Coder => "Coder",
         }
     }
 
-    /// Resolve a tool name to the corresponding sync durable core.
-    #[must_use]
-    pub(crate) fn from_tool_name(name: &str) -> Option<Self> {
-        match name {
-            "analyze" => Some(Self::Analyze),
-            "implement" => Some(Self::Implement),
-            _ => None,
+    /// The round kind this core's jobs row carries.
+    pub(crate) fn kind_str(self) -> &'static str {
+        match self {
+            Self::Analyze => crate::jobs::SpawnChild::Analyze.kind_str(),
+            Self::Coder => crate::jobs::SpawnChild::Implement.kind_str(),
         }
+    }
+
+    /// Resolve a dangling tool call to the sync durable core that settles it.
+    /// The core is resolved from the tool plus its choice argument, never by
+    /// matching a name against a stored round kind: `analyze`'s sync form is the
+    /// quick round and `send`'s is the single-run coder, so a call that asked for
+    /// another kind (`deep`, `coder_branch`, `manager`, `role`), an unknown
+    /// value, a non-string, or an unknown tool name — a retired tool's included
+    /// — resolves to `None` and is re-executed instead of binding an unrelated
+    /// job. A retired tool name is not resolvable either: history is never
+    /// rewritten, so a cut-mid-flight retired call is simply repeated.
+    #[must_use]
+    pub(crate) fn from_call(name: &str, args: &serde_json::Value) -> Option<Self> {
+        // Each tool's sync form is its narrowest choice: the quick depth, the
+        // coder addressee. An absent (or explicit null) choice is that narrowest
+        // kind — how a call frame that predates the merge reconnects to its
+        // unfinished round.
+        let (core, argument, own_choice) = match name {
+            "analyze" => (
+                Self::Analyze,
+                AnalyzeDepth::ARG,
+                AnalyzeDepth::Quick.as_str(),
+            ),
+            "send" => (Self::Coder, Addressee::ARG, Addressee::Coder.as_str()),
+            _ => return None,
+        };
+        match args.get(argument) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(value)) if value == own_choice => {}
+            Some(_) => return None,
+        }
+        Some(core)
     }
 
     /// Run the durable core — both per-tool bodies return [`SyncCoreOutcome`]
@@ -499,16 +576,33 @@ impl SyncDurableCore {
     ) -> anyhow::Result<SyncCoreOutcome> {
         match self {
             Self::Analyze => crate::tools::analyze::run_analyze_with_job(ws, task, args).await,
-            Self::Implement => {
-                crate::tools::implement::run_implement_with_job(ws, task, args).await
-            }
+            Self::Coder => crate::tools::implement::run_implement_with_job(ws, task, args).await,
+        }
+    }
+
+    /// Abandon this dispatch's own row after the call has already failed: the
+    /// failure IS the call's result, so the model repeats the call and an
+    /// unfinished row left behind would only be bindable by a later, unrelated
+    /// call of the same core — settling a completed round's stored report as
+    /// that call's own result. Never an alias: the call is repeated, not
+    /// reconnected. A drain-cut is the only outcome that keeps the row (see
+    /// [`Self::run_sync_dispatch`]).
+    async fn abandon_failed_dispatch(conn: &crate::db::Connection, job_id: &str, label: &str) {
+        if let Err(e) = crate::jobs::terminalize_job(conn, job_id).await {
+            tracing::warn!(
+                job = %job_id,
+                error = %e,
+                "Failed to abandon the failed {label} dispatch's row",
+            );
         }
     }
 
     /// Shared sync dispatch: read the task-locals the way the two wrappers do
     /// today, generate a fresh job id, run the core as a fresh spawn
     /// (`spawn: Some(..)` — the core writes the jobs row), then
-    /// terminalize-on-terminal / surface [`CallSuspended`] on drain-cut.
+    /// terminalize-on-terminal / surface [`CallSuspended`] on drain-cut. Every
+    /// outcome but a drain-cut abandons the row with the call's own result, so a
+    /// row stays launched only while its call is dangling.
     pub(crate) async fn run_sync_dispatch(
         self,
         ws: &crate::Workspace,
@@ -541,22 +635,20 @@ impl SyncDurableCore {
             caller_agent_id: caller_agent_id.as_deref(),
             fail_on_checkpoint_error: caller_agent_id.is_some(),
         };
-        match self.run(ws, task, args).await? {
+        let outcome = match self.run(ws, task, args).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                Self::abandon_failed_dispatch(conn, &job_id, self.label()).await;
+                return Err(e);
+            }
+        };
+        match outcome {
             SyncCoreOutcome::Terminal(Ok(text)) => {
                 crate::jobs::terminalize_job(conn, &job_id).await?;
                 Ok(text)
             }
             SyncCoreOutcome::Terminal(Err(e)) => {
-                // The round completed with failure — terminalize so a later
-                // resume never re-runs the failed slots/coder forever.
-                if let Err(te) = crate::jobs::terminalize_job(conn, &job_id).await {
-                    tracing::warn!(
-                        job = %job_id,
-                        error = %te,
-                        "Failed to terminalize failed {} job",
-                        self.label(),
-                    );
-                }
+                Self::abandon_failed_dispatch(conn, &job_id, self.label()).await;
                 Err(e)
             }
             SyncCoreOutcome::DrainCut => {
@@ -637,43 +729,44 @@ impl SyncDurableCore {
         }
     }
 
-    /// Lowercase tool name ("analyze" / "implement") — the panic-site tag of the
-    /// async dispatch scaffold.
-    #[must_use]
-    pub(crate) fn tool_name(self) -> &'static str {
-        match self {
-            Self::Analyze => "analyze",
-            Self::Implement => "implement",
-        }
-    }
-
     /// Message kind of the async result envelope routed to the caller.
     #[must_use]
     pub(crate) fn message_kind(self) -> MessageKind {
         match self {
             Self::Analyze => MessageKind::AnalyzeToolResult,
-            Self::Implement => MessageKind::ImplementResult,
+            Self::Coder => MessageKind::ImplementResult,
         }
     }
 
-    /// Build the async `<tag>` envelope message delivered to the caller's agent
-    /// channel for this core's round results (success and failure paths). The
-    /// caller-generated `job_id` is embedded in the envelope body so the
-    /// delivered result is correlatable with the immediate ack placeholder.
-    /// `exec_dir` names the directory the round really ran in, when the caller
-    /// asked for a target.
+    /// Build the async result envelope delivered to the caller's agent channel
+    /// for this core's round results (success and failure paths).
+    ///
+    /// The analyze envelope keeps the caller-generated `job_id` as its first body
+    /// line so the delivered result is correlatable with the immediate ack
+    /// placeholder, and `exec_dir` names the directory the round really ran in
+    /// when the caller asked for one. The coder's envelope is the
+    /// `<coder-report>` — no job id, and the folder the coder worked in: the
+    /// chosen directory when one was given, else the delivery workspace's own
+    /// folder.
     #[must_use]
     pub(crate) fn build_async_message(
         self,
         job_id: &str,
         result: &anyhow::Result<String>,
         exec_dir: Option<&str>,
+        delivery: &crate::Workspace,
     ) -> String {
-        let tag = match self {
-            Self::Analyze => "analyze-tool-result",
-            Self::Implement => "implement-tool-result",
-        };
-        build_async_result_envelope(job_id, result, tag, exec_dir)
+        match self {
+            Self::Analyze => {
+                build_async_result_envelope(job_id, result, "analyze-tool-result", exec_dir)
+            }
+            Self::Coder => build_coder_envelope(
+                "coder_report.md",
+                exec_dir.unwrap_or(&delivery.path),
+                None,
+                &coder_report_text(result),
+            ),
+        }
     }
 
     /// Durable async dispatch (SPAWN → run → CHECKPOINT → COMPLETE): run the
@@ -687,7 +780,7 @@ impl SyncDurableCore {
     /// (errors wrapped in the core's envelope tag) and the job is terminalized.
     ///
     /// `delivery` is the caller's own workspace (the durable delivery key);
-    /// `target`, when present, is the directory the round executes in — the
+    /// `place`, when present, is the directory the round executes in — the
     /// sub-agents' root, context and search key, while delivery stays the
     /// caller's.
     ///
@@ -699,16 +792,16 @@ impl SyncDurableCore {
     pub(crate) async fn dispatch_durable(
         self,
         delivery: &crate::Workspace,
-        target: Option<&crate::Workspace>,
+        place: Option<&crate::Workspace>,
         task: &str,
         caller_role: crate::Role,
         user_name: &str,
         channel: &str,
         job_id: &str,
-        custom: Option<crate::CustomRoleLaunch>,
+        custom: Option<crate::Launch>,
     ) -> Option<AgentJob> {
-        let exec = target.unwrap_or(delivery);
-        let exec_dir = target.map(|t| t.path.as_str());
+        let exec = place.unwrap_or(delivery);
+        let exec_dir = place.map(|p| p.path.as_str());
         let caller_role = caller_role.for_launch(custom.as_ref());
         let result = match self
             .run(
@@ -747,16 +840,16 @@ impl SyncDurableCore {
             Err(e) => Err(e),
         };
         // The round is over: drop the synthetic `dir-…` engine it may have
-        // created (a registered target's own engine is left alone). The
+        // created (a registered place's own engine is left alone). The
         // drain-cut early return above deliberately skips this — that job
         // resumes in the same directory.
-        if let Some(target) = target {
-            crate::tools::delegation::release_exec_engine(target);
+        if let Some(place) = place {
+            crate::tools::delegation::release_exec_engine(place);
         }
         Some(
             crate::jobs::complete_durable_job(
                 job_id,
-                self.build_async_message(job_id, &result, exec_dir),
+                self.build_async_message(job_id, &result, exec_dir, delivery),
                 self.message_kind(),
                 caller_role,
                 user_name,
@@ -769,7 +862,7 @@ impl SyncDurableCore {
     }
 
     /// Boot-resume a durable round: resolve the execution workspace (the
-    /// recorded target directory when the round had one, else the caller's own
+    /// recorded directory when the round had one, else the caller's own
     /// workspace), run the core as a resume (`spawn: None` — it reuses the stored
     /// roster and outcomes and inserts no row) through
     /// [`Self::resume_sync_core`], then terminalize into a durable envelope and
@@ -798,7 +891,7 @@ impl SyncDurableCore {
                     crate::tools::delegation::release_exec_engine(&exec);
                     resumed
                 }
-                // The recorded target directory is gone: the round ends through
+                // The recorded directory is gone: the round ends through
                 // the resume-failure arm below with that plain message — never
                 // left hanging.
                 Err(e) => Err(e),
@@ -815,7 +908,7 @@ impl SyncDurableCore {
                 return;
             }
             // Resume infra failure (roster load / checkpoint) or an unusable
-            // recorded target directory — deliver an error envelope to the
+            // recorded directory — deliver an error envelope to the
             // ORIGINAL caller, exactly like a round-level failure. The job row
             // is still present (the core never terminalizes), so the caller
             // identity can be re-loaded for the route.
@@ -833,7 +926,7 @@ impl SyncDurableCore {
                 let custom = caller.custom_launch.as_deref().cloned();
                 let envelope = crate::jobs::complete_durable_job(
                     job_id,
-                    self.build_async_message(job_id, &Err(e), exec_dir),
+                    self.build_async_message(job_id, &Err(e), exec_dir, delivery),
                     self.message_kind(),
                     caller_role,
                     &caller.user_name,
@@ -862,7 +955,7 @@ impl SyncDurableCore {
         }
         let envelope = crate::jobs::complete_durable_job(
             job_id,
-            self.build_async_message(job_id, &result, exec_dir),
+            self.build_async_message(job_id, &result, exec_dir, delivery),
             self.message_kind(),
             caller_role,
             &caller.user_name,
@@ -874,8 +967,9 @@ impl SyncDurableCore {
         crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
     }
 
-    /// Async dispatch entry of [`crate::tools::analyze::AnalyzeTool`] and
-    /// [`crate::tools::implement::ImplementTool`]: read the caller identity from
+    /// Async dispatch entry of [`crate::tools::analyze::AnalyzeTool`]'s quick
+    /// depth and [`crate::tools::send::SendTool`]'s coder addressee: read the
+    /// caller identity from
     /// the `CURRENT_TOOL_*` task-locals, spawn the core's durable dispatch in the
     /// background, catch its panics, and route the resulting envelope to the
     /// caller's agent channel. The core is the single source of the envelope
@@ -911,11 +1005,11 @@ impl SyncDurableCore {
     /// and it omits the pre-route aborting() guard (at-least-once rationale).
     ///
     /// `delivery` is the caller's own workspace (the durable delivery key);
-    /// `target`, when present, is the directory the round executes in.
+    /// `place`, when present, is the directory the round executes in.
     pub(crate) fn spawn_dispatch(
         self,
         delivery: &crate::Workspace,
-        target: Option<&crate::Workspace>,
+        place: Option<&crate::Workspace>,
         task: &str,
         caller_role: crate::Role,
         job_id: String,
@@ -928,14 +1022,14 @@ impl SyncDurableCore {
         // derivation lives in `dispatch_durable`.
         let custom = crate::agent::tool_custom_launch();
         let (delivery, task) = (delivery.clone(), task.to_string());
-        let target = target.cloned();
+        let place = place.cloned();
         let ws_name = delivery.name.clone();
         tokio::spawn(async move {
-            let exec_dir = target.as_ref().map(|t| t.path.as_str());
+            let exec_dir = place.as_ref().map(|p| p.path.as_str());
             let round = std::panic::AssertUnwindSafe(async {
                 self.dispatch_durable(
                     &delivery,
-                    target.as_ref(),
+                    place.as_ref(),
                     &task,
                     caller_role,
                     &user_name,
@@ -955,11 +1049,10 @@ impl SyncDurableCore {
                 }
                 Err(panic) => {
                     let panic = crate::util::panic_message(&*panic);
-                    let tag = self.tool_name();
-                    tracing::error!(panic = %panic, "{tag} round dispatch panicked");
+                    tracing::error!(panic = %panic, "{} round dispatch panicked", self.label());
                     // The round is over (as a panic): drop the synthetic
                     // `dir-…` engine it may have created before the envelope.
-                    if let Some(exec) = target.as_ref() {
+                    if let Some(exec) = place.as_ref() {
                         crate::tools::delegation::release_exec_engine(exec);
                     }
                     // A custom-role round owns a custom branch address: derive
@@ -968,8 +1061,9 @@ impl SyncDurableCore {
                     AgentJob {
                         content: self.build_async_message(
                             &job_id,
-                            &Err(anyhow::anyhow!("{tag} round dispatch panicked: {panic}")),
+                            &Err(anyhow::anyhow!("dispatch panicked: {panic}")),
                             exec_dir,
+                            &delivery,
                         ),
                         workspace_name: ws_name,
                         user_name,
@@ -995,10 +1089,10 @@ impl SyncDurableCore {
 /// Wrap a sub-agent/tool result in the async `<tag>` envelope delivered to
 /// the caller's agent channel. The `job_id` is embedded as the first body line
 /// so the delivered result is correlatable with the immediate ack placeholder;
-/// when the round ran in a target directory (`exec_dir`), a `Directory:` line
+/// when the round ran in a chosen directory (`exec_dir`), a `Directory:` line
 /// follows it in the same shape so the caller is never in doubt which directory
 /// the round really ran in. Failures carry an explicit marker — findings are
-/// never silently dropped. Shared with the deep research tool.
+/// never silently dropped. Shared with the deep analysis run.
 pub(crate) fn build_async_result_envelope(
     job_id: &str,
     result: &anyhow::Result<String>,
@@ -1020,6 +1114,66 @@ pub(crate) fn build_async_result_envelope(
             format!("<{tag}>\n\nJob: {job_id}{dir_line}\n\nAn error occurred: {e}</{tag}>")
         }
     }
+}
+
+/// A coder's report text — the round's own text, or an explicit failure marker
+/// so a failed round is never silently dropped.
+fn coder_report_text(result: &anyhow::Result<String>) -> String {
+    match result {
+        Ok(text) => text.clone(),
+        Err(e) => {
+            tracing::debug!(error = %e, "coder report failed");
+            format!("An error occurred: {e}")
+        }
+    }
+}
+
+/// Render a branch-report asset (`coder_report.md` / `coder_failure.md`): the
+/// same `<coder-report>` envelope for both, with the folder it happened in and —
+/// only when the turn ran on a named branch — its `branch` attribute. The single
+/// renderer for a coder's report, shared by a single-run dispatch and a coder
+/// branch's turn so the two shapes cannot drift.
+pub(crate) fn build_coder_envelope(
+    asset: &str,
+    folder: &str,
+    branch: Option<&str>,
+    message: &str,
+) -> String {
+    crate::prompt::substitute(
+        &crate::prompt::load_prompt(asset),
+        &[
+            (
+                "{{folder}}",
+                envelope_attr(folder.trim_end_matches(std::path::MAIN_SEPARATOR)).as_str(),
+            ),
+            ("{{branch_attr}}", branch_attr(branch).as_str()),
+            ("{{message}}", message),
+        ],
+    )
+}
+
+/// The `branch="id"` attribute a report envelope carries for a named branch,
+/// empty otherwise — the shape `custom_role_message.md`, `coder_report.md` and
+/// `coder_failure.md` all render through `{{branch_attr}}`.
+pub(crate) fn branch_attr(identifier: Option<&str>) -> String {
+    identifier.map_or_else(String::new, |id| {
+        format!(" branch=\"{}\"", envelope_attr(id))
+    })
+}
+
+/// An attribute value interpolated into an envelope (`<coder-report folder="…">`,
+/// `<manager-message workspace="…">`, `<custom-role-message role="…" workspace="…">`).
+///
+/// The value is usually a folder path the model itself chose, so ONLY the three
+/// characters that could end the attribute or forge an envelope are replaced:
+/// escaping `&` or `'` too would distort an ordinary name — an account called
+/// `o'brien` would become a folder the model is told to trust but that does not
+/// exist, and copying it back into a folder argument would not resolve.
+pub(crate) fn envelope_attr(value: &str) -> String {
+    value
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// A tool call's textual result together with the images it produced — what

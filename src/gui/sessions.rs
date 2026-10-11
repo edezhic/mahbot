@@ -132,10 +132,11 @@ struct CachedSessionItem {
     /// name (may be empty if both are absent).
     title: String,
     /// The custom role this session belongs to, when it is a custom-role
-    /// session — its name titles the row instead of `title`.
+    /// session — its name titles the row instead of `title`. `None` for a coder
+    /// branch.
     custom_role: Option<String>,
-    /// The named branch that custom-role session continues, when the branch was
-    /// named.
+    /// The named branch this continuable session continues, when the branch was
+    /// named — a custom role's identifier, or a coder branch's name.
     custom_identifier: Option<String>,
     /// Pre-formatted message count string.
     msg_count_label: String,
@@ -149,22 +150,37 @@ struct CachedSessionItem {
 impl CachedSessionItem {
     /// The row's title as the list shows it. A custom-role session is titled by
     /// the role it belongs to — and its branch, when the branch was named —
-    /// instead of the user/workspace name every other role shows.
+    /// instead of the user/workspace name every other role shows; a coder branch
+    /// is titled `Coder · <branch>` so it is distinguishable from a single coder
+    /// run.
     fn display_title(&self) -> String {
         match (self.role, self.custom_role.as_deref()) {
             (Some(crate::Role::Custom), Some(name)) => {
                 custom_role_title(name, self.custom_identifier.as_deref())
             }
+            (Some(crate::Role::Coder), None) => match self.custom_identifier.as_deref() {
+                Some(branch) => format!("Coder{}", branch_suffix(branch)),
+                None => self.title.clone(),
+            },
             _ => self.title.clone(),
         }
     }
+}
+
+/// The compact ` · <branch>` suffix a branch row carries, under the same
+/// [`CARD_TITLE_MAX_CHARS`] bound every other row's title has.
+fn branch_suffix(identifier: &str) -> String {
+    format!(
+        " · {}",
+        crate::util::truncate(identifier, CARD_TITLE_BRANCH_MAX_CHARS)
+    )
 }
 
 /// Card title for a custom-role row: the compact `name · branch` spelling under
 /// the same [`CARD_TITLE_MAX_CHARS`] bound every other row's title has. A named
 /// branch keeps its identifier: the role's own name is truncated (a role name
 /// may itself be [`crate::custom_role::MAX_ROLE_NAME_CHARS`] long) so the
-/// suffix always fits. The full [`crate::custom_role::display_label`] wording is
+/// suffix always fits. The full [`crate::launch::display_label`] wording is
 /// used where the surface has room for it — the Running Agents card.
 fn custom_role_title(name: &str, identifier: Option<&str>) -> String {
     let Some(identifier) = identifier else {
@@ -172,8 +188,7 @@ fn custom_role_title(name: &str, identifier: Option<&str>) -> String {
     };
     // The identifier is capped at half the budget, so the rest of the budget is
     // always enough for the separator and a usable share of the name.
-    let identifier = crate::util::truncate(identifier, CARD_TITLE_BRANCH_MAX_CHARS);
-    let suffix = format!(" · {identifier}");
+    let suffix = branch_suffix(identifier);
     let room = CARD_TITLE_MAX_CHARS - suffix.chars().count();
     format!("{}{suffix}", crate::util::truncate(name, room))
 }

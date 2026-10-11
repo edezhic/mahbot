@@ -2647,8 +2647,11 @@ impl SettingsState {
 
     /// The custom-role tool picker: the window's catalogue plus any stored name
     /// this installation cannot serve right now (e.g. `computer` on macOS),
-    /// marked and labelled as unavailable. The record's validators re-check a
-    /// newly marked name on save, so "validated while marking" is structural —
+    /// marked and labelled as unavailable. A catalog tool that has a kind
+    /// vocabulary ([`crate::tools::grants::kinds_of`]) renders one checkbox per
+    /// kind — the tool is granted iff at least one kind is checked — while a
+    /// kindless tool keeps its single checkbox. The record's validators re-check
+    /// a newly marked entry on save, so "validated while marking" is structural —
     /// what can be marked is what a role may be given; an unserviceable name is
     /// still offered because the launch omits it and the record keeps it, so it
     /// must be visible to be removable.
@@ -2657,29 +2660,72 @@ impl SettingsState {
         let unavailable = editor
             .tools
             .iter()
-            .filter(|tool| !editor.catalog.contains(&tool.as_str()));
-        let rows = editor
-            .catalog
+            .map(|entry| crate::tools::grants::tool_name(entry))
+            .filter(|tool| !editor.catalog.contains(tool))
+            .map(str::to_string)
+            .collect::<Vec<String>>();
+        let catalog = editor.catalog.clone();
+        let rows = catalog
             .iter()
             .map(|name| ((*name).to_string(), false))
-            .chain(unavailable.map(|name| (name.clone(), true)));
+            .chain(unavailable.into_iter().map(|name| (name, true)));
         for (label, is_unavailable) in rows {
             let shown = if is_unavailable {
                 format!("{label} (not available here)")
             } else {
                 label.clone()
             };
-            tool_rows = tool_rows.push(
-                checkbox(editor.tools.iter().any(|tool| tool == &label))
-                    .label(shown)
-                    .text_size(theme::TEXT_12)
-                    .style(theme::checkbox_style)
-                    .on_toggle(move |_| {
-                        SettingsMessage::CustomRolesMsg(
-                            custom_roles::CustomRolesMessage::ToggleTool(label.clone()),
-                        )
-                    }),
-            );
+            match (!is_unavailable)
+                .then(|| crate::tools::grants::kinds_of(&label))
+                .flatten()
+            {
+                // A tool with a kind vocabulary: one checkbox per kind, the tool
+                // granted iff at least one kind is checked.
+                Some(vocab) => {
+                    let held = editor.held_kinds(&label);
+                    tool_rows = tool_rows.push(
+                        text(shown)
+                            .size(theme::TEXT_12)
+                            .color(theme::TEXT_SECONDARY),
+                    );
+                    for kind in vocab {
+                        let kind = (*kind).to_string();
+                        let on = held.iter().any(|k| k == &kind);
+                        tool_rows = tool_rows.push(
+                            checkbox(on)
+                                .label(format!("    {kind}"))
+                                .text_size(theme::TEXT_12)
+                                .style(theme::checkbox_style)
+                                .on_toggle({
+                                    let label = label.clone();
+                                    let kind = kind.clone();
+                                    move |_| {
+                                        SettingsMessage::CustomRolesMsg(
+                                            custom_roles::CustomRolesMessage::ToggleToolKind {
+                                                tool: label.clone(),
+                                                kind: kind.clone(),
+                                            },
+                                        )
+                                    }
+                                }),
+                        );
+                    }
+                }
+                // A kindless tool (or an unavailable stored name): one checkbox.
+                None => {
+                    tool_rows = tool_rows.push(
+                        checkbox(editor.tools.iter().any(|tool| tool == &label))
+                            .label(shown)
+                            .text_size(theme::TEXT_12)
+                            .style(theme::checkbox_style)
+                            .on_toggle(move |_| {
+                                SettingsMessage::CustomRolesMsg(
+                                    custom_roles::CustomRolesMessage::ToggleTool(label.clone()),
+                                )
+                            }),
+                    );
+                }
+            }
         }
         column![
             text("Tools")

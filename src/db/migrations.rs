@@ -55,10 +55,14 @@
 //! picker list and in every account's pick. The newest entries are the
 //! custom-role tail `51`–`53` (`custom_roles` plus the custom-role columns on
 //! `session_metadata` and `alarms`), `54`, which adds `jobs.custom_launch`
-//! so a boot resume re-addresses a durable round to its custom branch, and
-//! `55`, which adds `session_metadata.personal_changes`.
+//! so a boot resume re-addresses a durable round to its custom branch, `55`,
+//! which adds `session_metadata.personal_changes`, and `56`, which adds
+//! `session_metadata.reply_to` so a coder branch's report survives a restart,
+//! and `57`, which adds `session_metadata.context_block_len` so a launch
+//! session's cached leading context block is measured from what was written
+//! rather than re-derived from live workspace state.
 //!
-//! Future schema changes resume the chain at id `56` with monotonically
+//! Future schema changes resume the chain at id `58` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -186,7 +190,9 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     custom_role   TEXT,
     custom_identifier TEXT,
     launch_stopped TEXT,
-    personal_changes TEXT
+    personal_changes TEXT,
+    reply_to       TEXT,
+    context_block_len INTEGER
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id             TEXT PRIMARY KEY,
@@ -720,12 +726,21 @@ const CUSTOM_ROLES_TABLE: &str = "CREATE TABLE IF NOT EXISTS custom_roles (
 ///   columns that address an alarm to a custom role (a no-op on fresh installs,
 ///   whose baseline already declares them).
 /// - `54` adds the nullable `jobs.custom_launch` column — the JSON
-///   [`crate::CustomRoleLaunch`] a durable round was dispatched by, so a boot
+///   [`crate::Launch`] a durable round was dispatched by, so a boot
 ///   resume re-addresses the round to the caller's custom branch (a no-op on
 ///   fresh installs, whose baseline already declares it).
 /// - `55` adds the per-user `session_metadata.personal_changes` column — the
 ///   personal-workspace change baseline (a no-op on fresh installs, whose
 ///   baseline already declares it).
+/// - `56` adds the nullable `session_metadata.reply_to` column — the JSON
+///   conversation that asked for a branch's launch (the asking custom role's
+///   branch), so a coder branch's report survives a restart and returns there
+///   (a no-op on fresh installs, whose baseline already declares it).
+/// - `57` adds the nullable `session_metadata.context_block_len` column — the
+///   length of a launch session's cached leading context block, recorded when
+///   the block is written so a later folder change rebuilds it from what was
+///   written rather than from a re-render of live workspace state (a no-op on
+///   fresh installs, whose baseline already declares it).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -887,6 +902,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_session_metadata_personal_changes),
     },
+    Migration {
+        id: "56",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_session_metadata_reply_to),
+    },
+    Migration {
+        id: "57",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_session_metadata_context_block_len),
+    },
 ];
 
 /// Apply the migration catalog to `conn` for one physical database.
@@ -997,7 +1022,7 @@ fn add_chat_history_reply_columns(conn: &Connection) -> BoxFuture<'_, anyhow::Re
 /// recorded).
 async fn run_add_chat_history_reply_columns(conn: &Connection) -> anyhow::Result<()> {
     for column in ["reply_author", "reply_snippet"] {
-        add_column_if_missing(conn, "chat_history", column).await?;
+        add_column_if_missing(conn, "chat_history", column, "TEXT").await?;
     }
     Ok(())
 }
@@ -1014,7 +1039,7 @@ fn add_chat_history_broadcast_id(conn: &Connection) -> BoxFuture<'_, anyhow::Res
 /// idempotent (non-transactional like every Rust body, re-runnable until
 /// recorded).
 async fn run_add_chat_history_broadcast_id(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "chat_history", "broadcast_id").await
+    add_column_if_missing(conn, "chat_history", "broadcast_id", "TEXT").await
 }
 
 fn add_ticket_transition_actor(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1030,8 +1055,8 @@ fn add_ticket_transition_actor(conn: &Connection) -> BoxFuture<'_, anyhow::Resul
 /// like every Rust body, re-runnable until recorded). No backfill — legacy
 /// rows fall back to `"system"` at render time.
 async fn run_add_ticket_transition_actor(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "tickets", "last_transition_actor").await?;
-    add_column_if_missing(conn, "ticket_chronicle", "actor").await
+    add_column_if_missing(conn, "tickets", "last_transition_actor", "TEXT").await?;
+    add_column_if_missing(conn, "ticket_chronicle", "actor", "TEXT").await
 }
 
 fn add_workspaces_maintainer_recommendations(
@@ -1048,7 +1073,7 @@ fn add_workspaces_maintainer_recommendations(
 /// JSON blob of maintainer recommendations:
 /// {"recommendations": [...], "generated_at": RFC3339}.
 async fn run_add_workspaces_maintainer_recommendations(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "workspaces", "maintainer_recommendations").await
+    add_column_if_missing(conn, "workspaces", "maintainer_recommendations", "TEXT").await
 }
 
 /// Return whether `column` exists in `table` (via `PRAGMA table_info`).
@@ -1066,12 +1091,17 @@ async fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::
     Ok(found)
 }
 
-/// Idempotently add a plain `TEXT` column to `table` (Turso has no
+/// Idempotently add a column of SQL type `ty` to `table` (Turso has no
 /// `ADD COLUMN IF NOT EXISTS`): probe with [`column_exists`], then
 /// `ALTER TABLE`. Used by the guarded migration bodies above and below.
-async fn add_column_if_missing(conn: &Connection, table: &str, column: &str) -> anyhow::Result<()> {
+async fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ty: &str,
+) -> anyhow::Result<()> {
     if !column_exists(conn, table, column).await? {
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), ())
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"), ())
             .await
             .with_context(|| format!("Failed to add {table}.{column}"))?;
     }
@@ -1117,8 +1147,8 @@ fn add_jobs_caller_agent_and_session_created_at(
 /// Idempotent, non-transactional like every Rust body (re-runnable until
 /// recorded).
 async fn run_add_jobs_caller_agent_and_session_created_at(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "jobs", "caller_agent_id").await?;
-    add_column_if_missing(conn, "session_metadata", "created_at").await?;
+    add_column_if_missing(conn, "jobs", "caller_agent_id", "TEXT").await?;
+    add_column_if_missing(conn, "session_metadata", "created_at", "TEXT").await?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_jobs_caller_agent \
          ON jobs(caller_agent_id) WHERE caller_agent_id IS NOT NULL;",
@@ -1139,7 +1169,7 @@ fn add_users_image_and_video_models(conn: &Connection) -> BoxFuture<'_, anyhow::
 /// like every Rust body, re-runnable until recorded).
 async fn run_add_users_image_and_video_models(conn: &Connection) -> anyhow::Result<()> {
     for column in ["image_gen_model", "video_model"] {
-        add_column_if_missing(conn, "users", column).await?;
+        add_column_if_missing(conn, "users", column, "TEXT").await?;
     }
     Ok(())
 }
@@ -1156,7 +1186,7 @@ fn add_jobs_mode(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 /// this body is idempotent (non-transactional like every Rust body,
 /// re-runnable until recorded).
 async fn run_add_jobs_mode(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "jobs", "mode").await?;
+    add_column_if_missing(conn, "jobs", "mode", "TEXT").await?;
     // Backfill idempotently: rows created before the column existed map from the
     // caller_agent_id NULL-sentinel (sync = has caller pin, async = NULL).
     conn.execute(
@@ -1182,7 +1212,7 @@ fn add_jobs_exec_dir(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 /// this body is idempotent (non-transactional like every Rust body,
 /// re-runnable until recorded).
 async fn run_add_jobs_exec_dir(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "jobs", "exec_dir").await
+    add_column_if_missing(conn, "jobs", "exec_dir", "TEXT").await
 }
 
 fn add_session_metadata_custom_role(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1198,9 +1228,9 @@ fn add_session_metadata_custom_role(conn: &Connection) -> BoxFuture<'_, anyhow::
 /// idempotent (non-transactional like every Rust body, re-runnable until
 /// recorded).
 async fn run_add_session_metadata_custom_role(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "session_metadata", "custom_role").await?;
-    add_column_if_missing(conn, "session_metadata", "custom_identifier").await?;
-    add_column_if_missing(conn, "session_metadata", "launch_stopped").await
+    add_column_if_missing(conn, "session_metadata", "custom_role", "TEXT").await?;
+    add_column_if_missing(conn, "session_metadata", "custom_identifier", "TEXT").await?;
+    add_column_if_missing(conn, "session_metadata", "launch_stopped", "TEXT").await
 }
 
 fn add_alarms_custom_target(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1215,9 +1245,9 @@ fn add_alarms_custom_target(conn: &Connection) -> BoxFuture<'_, anyhow::Result<(
 /// idempotent (non-transactional like every Rust body, re-runnable until
 /// recorded).
 async fn run_add_alarms_custom_target(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "alarms", "role").await?;
-    add_column_if_missing(conn, "alarms", "identifier").await?;
-    add_column_if_missing(conn, "alarms", "workspace").await
+    add_column_if_missing(conn, "alarms", "role", "TEXT").await?;
+    add_column_if_missing(conn, "alarms", "identifier", "TEXT").await?;
+    add_column_if_missing(conn, "alarms", "workspace", "TEXT").await
 }
 
 fn add_jobs_custom_launch(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1225,13 +1255,13 @@ fn add_jobs_custom_launch(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>
 }
 
 /// Upfill the nullable `jobs.custom_launch` column for databases created
-/// before delta `54` — the JSON [`crate::CustomRoleLaunch`] a durable round was
+/// before delta `54` — the JSON [`crate::Launch`] a durable round was
 /// dispatched by (`NULL` for every built-in caller). Fresh installs get the
 /// column from entry `24`'s `CREATE TABLE`, so the probe makes this a no-op
 /// there. Guarded by [`add_column_if_missing`], so this body is idempotent
 /// (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_jobs_custom_launch(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "jobs", "custom_launch").await
+    add_column_if_missing(conn, "jobs", "custom_launch", "TEXT").await
 }
 
 fn add_session_metadata_personal_changes(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1246,7 +1276,38 @@ fn add_session_metadata_personal_changes(conn: &Connection) -> BoxFuture<'_, any
 /// by [`add_column_if_missing`], so this body is idempotent
 /// (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_session_metadata_personal_changes(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "session_metadata", "personal_changes").await
+    add_column_if_missing(conn, "session_metadata", "personal_changes", "TEXT").await
+}
+
+fn add_session_metadata_reply_to(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_session_metadata_reply_to(conn))
+}
+
+/// Upfill the nullable `session_metadata.reply_to` column for databases created
+/// before delta `56` — the JSON conversation that asked for a branch's launch
+/// (the asking custom role's branch and the folder its turn ran in), so a coder
+/// branch's report survives a restart and returns there. Fresh installs get the
+/// column from entry `24`'s `CREATE TABLE`, so the probe makes this a no-op
+/// there. Guarded by [`add_column_if_missing`], so this body is idempotent
+/// (non-transactional like every Rust body, re-runnable until recorded).
+async fn run_add_session_metadata_reply_to(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "session_metadata", "reply_to", "TEXT").await
+}
+
+fn add_session_metadata_context_block_len(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_session_metadata_context_block_len(conn))
+}
+
+/// Upfill the nullable `session_metadata.context_block_len` column for databases
+/// created before delta `57` — the length of a launch session's cached leading
+/// context block, recorded when the block is written so a later folder change
+/// rebuilds it from what was written rather than from a re-render of live
+/// workspace state. Fresh installs get the column from entry `24`'s
+/// `CREATE TABLE`, so the probe makes this a no-op there. Guarded by
+/// [`add_column_if_missing`], so this body is idempotent (non-transactional like
+/// every Rust body, re-runnable until recorded).
+async fn run_add_session_metadata_context_block_len(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "session_metadata", "context_block_len", "INTEGER").await
 }
 
 fn add_session_metadata_sleep_ended(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1259,7 +1320,7 @@ fn add_session_metadata_sleep_ended(conn: &Connection) -> BoxFuture<'_, anyhow::
 /// [`add_column_if_missing`], so this body is idempotent (non-transactional
 /// like every Rust body, re-runnable until recorded).
 async fn run_add_session_metadata_sleep_ended(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "session_metadata", "sleep_ended").await
+    add_column_if_missing(conn, "session_metadata", "sleep_ended", "TEXT").await
 }
 
 fn add_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1273,7 +1334,7 @@ fn add_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 /// Guarded by [`add_column_if_missing`], so this body is idempotent
 /// (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_alarms_command(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "alarms", "command").await
+    add_column_if_missing(conn, "alarms", "command", "TEXT").await
 }
 
 fn detach_guest_workspaces(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1315,7 +1376,7 @@ fn add_users_granted_tools(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()
 /// like every Rust body, re-runnable until recorded). Holds the JSON array of
 /// custom tool names granted to the user; NULL/empty means no grants.
 async fn run_add_users_granted_tools(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "users", "granted_tools").await
+    add_column_if_missing(conn, "users", "granted_tools", "TEXT").await
 }
 
 fn drop_users_permissions(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1380,7 +1441,7 @@ fn add_alarms_trigger(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 /// like every Rust body, re-runnable until recorded). Holds the alarm's
 /// tool-call trigger: `{"tool": ..., "args": {...}}`.
 async fn run_add_alarms_trigger(conn: &Connection) -> anyhow::Result<()> {
-    add_column_if_missing(conn, "alarms", "trigger").await
+    add_column_if_missing(conn, "alarms", "trigger", "TEXT").await
 }
 
 fn drop_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1904,6 +1965,8 @@ mod tests {
                 "custom_identifier",
                 "launch_stopped",
                 "personal_changes",
+                "reply_to",
+                "context_block_len",
             ],
         ),
         (
@@ -2999,7 +3062,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`55` tail, and converges to the exact current core
+    /// upfills and the `36`–`57` tail, and converges to the exact current core
     /// shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -3027,10 +3090,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-                "54", "55"
+                "54", "55", "56", "57"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–55 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57 tail exactly"
         );
     }
 
@@ -3240,7 +3303,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// reopen (the delta-27 `workspaces` column upfill, the delta-28
     /// `jobs`/`session_metadata` column upfills, the delta-47 `jobs.exec_dir`
     /// column, the delta-54 `jobs.custom_launch` column, the delta-55
-    /// `session_metadata.personal_changes` column, and the
+    /// `session_metadata.personal_changes` column, the delta-56
+    /// `session_metadata.reply_to` column, the delta-57
+    /// `session_metadata.context_block_len` column, and the
     /// delta-51/52/53 tail — `custom_roles` plus the custom-role columns on
     /// `session_metadata` and
     /// `alarms`), and `except_indexes`, whose definitions may be added on
@@ -3325,7 +3390,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     ///
     /// The stage-merge and phase-retirement tail (`44`/`45`/`48`/`49`), the
     /// image-model retirement (`50`) and the custom-role / custom-launch /
-    /// personal-changes columns (`51`–`55`) are a no-op here too: the seeded rows
+    /// personal-changes / context-block-length columns (`51`–`55`/`57`) are a
+    /// no-op here too: the seeded rows
     /// name none of the retired stages and claim no earlier command run, so no job
     /// is deleted, no phase is rewritten and the empty `workspace_contexts` stays
     /// empty, and the seeded `config_kv` row is an unrelated key while the
@@ -3357,7 +3423,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55",
+            "54", "55", "56", "57",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3366,7 +3432,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..55"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -3376,7 +3442,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         // chat_history.broadcast_id (delta 33),
         // tickets/ticket_chronicle (delta 34), jobs.exec_dir (delta 47),
         // jobs.custom_launch (delta 54), session_metadata.personal_changes
-        // (delta 55) and the
+        // (delta 55), session_metadata.reply_to (delta 56),
+        // session_metadata.context_block_len (delta 57) and the
         // custom-role tail (delta 51's `custom_roles` table plus the
         // session_metadata/alarms columns of deltas 52/53)
         // change in shape and the delta-28
@@ -3429,10 +3496,12 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_sm_cols.push("custom_identifier".to_string());
         expected_sm_cols.push("launch_stopped".to_string());
         expected_sm_cols.push("personal_changes".to_string());
+        expected_sm_cols.push("reply_to".to_string());
+        expected_sm_cols.push("context_block_len".to_string());
         assert_eq!(
             after_sm_cols["session_metadata"], expected_sm_cols,
             "reopen must append exactly created_at/sleep_ended/custom_role/custom_identifier/\
-             launch_stopped/personal_changes to session_metadata columns"
+             launch_stopped/personal_changes/reply_to/context_block_len to session_metadata columns"
         );
         let after_users_cols = column_sets(&conn, &["users"]).await;
         let mut expected_users_cols = before.cols["users"].clone();
@@ -3580,7 +3649,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
     /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
     /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
-    /// entries `36`–`55`: the data migrations (detaching guests from
+    /// entries `36`–`57`: the data migrations (detaching guests from
     /// shared workspaces, rewriting the legacy `DeepSeek` routing slug,
     /// deleting the command-armed alarm rows, rewriting the retired
     /// `in_review`/`in_qa` stages to `verification`, invalidating the
@@ -3592,7 +3661,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `alarms.command` drop that retire the command-armed alarm feature, the
     /// custom-role tail (`custom_roles` plus the `session_metadata` and
     /// `alarms` columns), and the `jobs.exec_dir` / `jobs.custom_launch` /
-    /// `session_metadata.personal_changes` columns.
+    /// `session_metadata.personal_changes` / `session_metadata.reply_to` /
+    /// `session_metadata.context_block_len` columns.
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
@@ -3697,7 +3767,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55",
+            "54", "55", "56", "57",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3706,7 +3776,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..55"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57"
         );
 
         let after_users_cols = column_names(&conn, "users").await;

@@ -34,7 +34,7 @@ You have a couple of tools to gather context from the board:
 
 # Operating Loop
 
-Prefer forward motion. For every user message, ticket update, analysis/research result or board notification:
+Prefer forward motion. For every user message, ticket update, analysis result or board notification:
 
 1. Understand what the user wants or what changed. If there is a new user request - make sure to understand it clearly, avoid assuming any potential product decisions.
 2. If any context is missing - make sure to gather it from tickets, analysis or the user.

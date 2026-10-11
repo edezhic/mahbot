@@ -40,6 +40,9 @@ pub(crate) mod embedder;
 pub(crate) mod git;
 pub mod gui;
 pub mod jobs;
+/// Launching and stopping a continuable branch — a custom role's, or a coder
+/// branch's.
+pub(crate) mod launch;
 /// Legacy binary Office reading (Word/Excel/PowerPoint): the CFB-container arm
 /// of the shared document converter ([`crate::document`]).
 pub(crate) mod legacy;
@@ -755,34 +758,59 @@ pub enum Role {
     Custom,
 }
 
-/// A custom role launch: the authorial definition as it stood when the launch
+/// A launch: one continuable branch of a custom role, or a coder branch. For a
+/// custom role it carries the authorial definition as it stood when the launch
 /// was created — a later edit of the record takes effect on the NEXT launch —
-/// together with the resolved branch address this launch runs under.
+/// for a coder branch the definition fields are empty.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CustomRoleLaunch {
-    /// The custom role's name.
+pub struct Launch {
+    /// The role the branch runs as: `custom` for an administrator-defined role,
+    /// `coder` for a coder branch. Absent in envelopes stored before the field
+    /// existed — those can only be custom-role launches.
+    #[serde(default = "Launch::custom_role_default")]
+    pub role: Role,
+    /// The custom role's name. Empty for a coder branch.
     pub name: String,
     /// The branch identifier this launch continues, when the branch was named.
     /// `None` for an unnamed branch (the record's default branch or a one-off run).
     #[serde(default)]
     pub identifier: Option<String>,
-    /// The authorial prompt text, taken at launch.
+    /// The authorial prompt text, taken at launch. Empty for a coder branch.
     pub prompt: String,
     /// The chosen subset of the admin Assistant's tool names, taken at launch.
+    /// Empty for a coder branch.
     pub tools: Vec<String>,
-    /// The resolved session/branch address (`role_{name}`, `role_{name}:{id}`
-    /// or `rolerun_{name}:{suffix}`).
+    /// The resolved session/branch address (`role_{name}`, `role_{name}:{id}`,
+    /// `rolerun_{name}:{suffix}` or `coder_{branch}`).
     pub agent_id: String,
+    /// The conversation that asked for this launch's work — the asking custom
+    /// role's branch, whose folder is `workspace`, so the report returns into
+    /// that branch instead of the admin's Assistant. It is PER-LAUNCH: each use
+    /// names its asker, so a later use with a different asker overrides it.
+    /// `None` for a launch the owner or an alarm started. Boxed because the asker
+    /// itself holds a [`crate::Launch`] — the pair would otherwise be infinitely
+    /// sized. `#[serde(default)]` keeps envelopes stored before the field existed
+    /// decodable.
+    #[serde(default)]
+    pub reply_to: Option<Box<crate::agent::message_router::Asker>>,
+}
+
+impl Launch {
+    /// The role of a launch stored before the `role` field existed: only a
+    /// custom-role launch could have written such an envelope.
+    fn custom_role_default() -> Role {
+        Role::Custom
+    }
 }
 
 impl Role {
-    /// The role a dispatched round belongs to: a round carrying a custom-role
-    /// launch belongs to [`Role::Custom`] whatever the tool's own construction
-    /// role was — the launch is the address authority, and the round's job row
-    /// and result envelope must say so.
+    /// The role a dispatched round belongs to: a round carrying a launch runs
+    /// as the launch's own role whatever the tool's construction role was — the
+    /// launch is the address authority, and the round's job row and result
+    /// envelope must say so.
     #[must_use]
-    pub(crate) fn for_launch(self, custom: Option<&CustomRoleLaunch>) -> Self {
-        if custom.is_some() { Self::Custom } else { self }
+    pub(crate) fn for_launch(self, launch: Option<&Launch>) -> Self {
+        launch.map_or(self, |launch| launch.role)
     }
 }
 

@@ -1,8 +1,9 @@
-//! ResearchTool — deep multi-round research orchestrator used by the
-//! admin's Assistant.
+//! The deep-analysis arm of [`AnalyzeTool`](super::analyze::AnalyzeTool) (its
+//! `deep` depth): the multi-round research orchestrator used by the admin's
+//! Assistant and any custom role granted the depth.
 //!
-//! Unlike [`AnalyzeTool`](super::analyze::AnalyzeTool) (one round of parallel analysts
-//! for quick clarification), the pipeline is: round 0 decomposes the question
+//! Unlike `quick` (one round of parallel analysts for quick clarification), the
+//! pipeline is: round 0 decomposes the question
 //! via three independent plans merged by id-based coverage; round 1 runs one
 //! analyst per sub-question (high-risk items get a decorrelated second
 //! angle); conditional gap rounds with shrinking width follow, each targeting
@@ -43,13 +44,11 @@ use crate::tools::analyze::{
     extract_query_telemetry_from_history, load_analyst_angles, max_confidence, normalize_claim,
     round_timeout,
 };
-use crate::tools::{Tool, build_async_result_envelope};
+use crate::tools::build_async_result_envelope;
 use crate::{ChatMessage, ChatRequest, ChatRequestMeta, Role, ToolSpec, Workspace};
 use anyhow::Result;
-use async_trait::async_trait;
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -393,133 +392,94 @@ impl ResearchBudget {
     }
 }
 
-// ── Tool ─────────────────────────────────────────────────────────────────
+// ── Deep-analysis dispatch ────────────────────────────────────────────────
 
-pub struct ResearchTool {
-    /// The role of the calling agent (the admin's Assistant) — set via
-    /// [`ResearchTool::new`].
-    caller_role: Role,
-}
+/// Dispatch a deep analysis run — the `deep` depth of [`AnalyzeTool`]. It is the
+/// admin Assistant's (and any custom role's granted) long-running arm: decompose
+/// the question, run multiple analyst rounds targeting only the remaining gaps,
+/// and deliver one consolidated, source-cited report. Spawns the resumable run in
+/// the background and returns the dispatch acknowledgement; exactly one report
+/// envelope is delivered to the caller when the run completes.
+pub(crate) fn dispatch_deep_analysis(ws: &Workspace, question: &str, caller_role: Role) -> String {
+    // Read user context from task-locals BEFORE tokio::spawn so the single
+    // result envelope carries the correct user identity. The job id is generated
+    // here (before the spawn) so the immediate ack placeholder and the delivered
+    // envelope reference one identical id.
+    let ws = ws.clone();
+    let question = question.to_string();
+    let user_name = crate::agent::tool_user_name();
+    let channel = crate::agent::tool_channel();
+    // Read the caller's launch synchronously before the spawn (task-local
+    // contract): the round's envelope and job row must carry the custom branch
+    // when the caller is a custom role.
+    let custom = crate::agent::tool_custom_launch();
+    let job_id = crate::generate_id();
+    let ack = format!(
+        "Deep analysis dispatched (job {job_id}). One report will arrive when the run completes."
+    );
 
-impl ResearchTool {
-    #[must_use]
-    pub const fn new(caller_role: Role) -> Self {
-        Self { caller_role }
-    }
-}
-
-#[async_trait]
-impl Tool for ResearchTool {
-    fn name(&self) -> &'static str {
-        "research"
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        super::tool_params_schema(
-            &json!({
-                "question": {
-                    "type": "string",
-                    "description": "The deep research question to investigate"
+    tokio::spawn(async move {
+        // Catch panics so the caller ALWAYS receives the single result envelope
+        // — a panic in the dispatch task would otherwise leave the caller waiting
+        // forever on a result that can never arrive.
+        let run = std::panic::AssertUnwindSafe(async {
+            dispatch_durable_research(
+                &ws,
+                &question,
+                caller_role,
+                user_name.clone(),
+                channel.clone(),
+                &job_id,
+                custom.clone(),
+            )
+            .await
+        })
+        .catch_unwind()
+        .await;
+        let envelope = match run {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => {
+                // Shutdown/drain abort OR manual cancel: no envelope is routed
+                // now. An abort keeps the run alive for the next boot's resume
+                // (the result and artifacts arrive at the real terminalization);
+                // a manual cancel stops the run permanently (the cancelled-run
+                // handoff dispatches the cleanup agent — nothing is delivered).
+                tracing::info!(
+                    "Deep analysis run ended without delivery (aborted or manually cancelled)"
+                );
+                return;
+            }
+            Err(panic) => {
+                let panic = crate::util::panic_message(&*panic);
+                tracing::error!(panic = %panic, "deep analysis dispatch panicked");
+                AgentJob {
+                    content: build_async_research_message(
+                        &job_id,
+                        &Err(anyhow::anyhow!("deep analysis dispatch panicked: {panic}")),
+                    ),
+                    workspace_name: ws.name.clone(),
+                    user_name,
+                    channel,
+                    kind: MessageKind::ResearchResult,
+                    role: caller_role.for_launch(custom.as_ref()),
+                    reply_target: None,
+                    pending_job_id: Some(job_id),
+                    originating_workspace: None,
+                    custom_role: custom,
+                    reply_to_custom: None,
                 }
-            }),
-            &["question"],
-        )
-    }
+            }
+        };
 
-    /// The orchestrator only reads evidence and spawns analysts — it never
-    /// mutates the workspace, so it may run inside a parallel tool group.
-    fn side_effects(&self) -> bool {
-        false
-    }
+        // Route exactly one final envelope to the caller's agent channel (the
+        // completion helper's own copy — persisted and routed copies can never
+        // drift). A drain in progress may drop the routed copy (the consumer has
+        // stopped pulling), but the pending row survives for boot replay —
+        // at-least-once.
+        message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
+    });
 
-    async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        // Used by the admin's Assistant — `caller_role` is threaded through so
-        // the single result envelope routes back to the correct caller session.
-        let question = super::get_str(&args, "question")?;
-
-        // Read user context from task-locals BEFORE tokio::spawn so the
-        // single result envelope carries the correct user identity. The job id
-        // is generated here (before the spawn) so the immediate ack
-        // placeholder and the delivered envelope reference one identical id.
-        let ws = ws.clone();
-        let question = question.to_string();
-        let caller_role = self.caller_role;
-        let user_name = crate::agent::tool_user_name();
-        let channel = crate::agent::tool_channel();
-        // Read the caller's custom-role launch synchronously before the spawn
-        // (task-local contract): the round's envelope and job row must carry the
-        // custom branch when the caller is a custom role.
-        let custom = crate::agent::tool_custom_launch();
-        let job_id = crate::generate_id();
-        let ack = format!(
-            "Deep research dispatched (job {job_id}). One report will be delivered when the run completes."
-        );
-
-        tokio::spawn(async move {
-            // Catch panics so the caller ALWAYS receives the single result
-            // envelope — a panic in the dispatch task would otherwise leave
-            // the caller waiting forever on a result that can never arrive.
-            let run = std::panic::AssertUnwindSafe(async {
-                dispatch_durable_research(
-                    &ws,
-                    &question,
-                    caller_role,
-                    user_name.clone(),
-                    channel.clone(),
-                    &job_id,
-                    custom.clone(),
-                )
-                .await
-            })
-            .catch_unwind()
-            .await;
-            let envelope = match run {
-                Ok(Some(envelope)) => envelope,
-                Ok(None) => {
-                    // Shutdown/drain abort OR manual cancel: no envelope is
-                    // routed now. An abort keeps the run alive for the next
-                    // boot's resume (the result and artifacts arrive at the
-                    // real terminalization); a manual cancel stops the run
-                    // permanently (the cancelled-run handoff dispatches the
-                    // cleanup agent — nothing is delivered). The distinction
-                    // is logged by the dispatch path/terminalization tail
-                    tracing::info!(
-                        "Research run ended without delivery (aborted or manually cancelled)"
-                    );
-                    return;
-                }
-                Err(panic) => {
-                    let panic = crate::util::panic_message(&*panic);
-                    tracing::error!(panic = %panic, "research dispatch panicked");
-                    AgentJob {
-                        content: build_async_research_message(
-                            &job_id,
-                            &Err(anyhow::anyhow!("research dispatch panicked: {panic}")),
-                        ),
-                        workspace_name: ws.name.clone(),
-                        user_name,
-                        channel,
-                        kind: MessageKind::ResearchResult,
-                        role: caller_role.for_launch(custom.as_ref()),
-                        reply_target: None,
-                        pending_job_id: Some(job_id),
-                        originating_workspace: None,
-                        custom_role: custom,
-                        reply_to_custom: None,
-                    }
-                }
-            };
-
-            // Route exactly one final envelope to the caller's agent channel
-            // (the completion helper's own copy — persisted and routed copies
-            // can never drift). A drain in progress may drop the routed copy
-            // (the consumer has stopped pulling), but the pending row survives
-            // for boot replay — at-least-once.
-            message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
-        });
-
-        Ok(ack)
-    }
+    ack
 }
 
 /// Durable deep-research dispatch: SPAWN the job (one tx) → run the resumable
@@ -530,7 +490,7 @@ impl Tool for ResearchTool {
 /// cannot drift. Returns `None` on a shutdown/drain abort AND on a manual
 /// cancel — the abort keeps the run alive for boot resume, the cancel stops
 /// the run permanently (cleanup handoff, nothing delivered). The `job_id` is
-/// caller-generated (created in [`ResearchTool::execute`] BEFORE the spawn) so
+/// caller-generated (created in [`dispatch_deep_analysis`] BEFORE the spawn) so
 /// the immediate ack and the delivered envelope share one id.
 async fn dispatch_durable_research(
     ws: &Workspace,
@@ -539,7 +499,7 @@ async fn dispatch_durable_research(
     user_name: String,
     channel: String,
     job_id: &str,
-    custom: Option<crate::CustomRoleLaunch>,
+    custom: Option<crate::Launch>,
 ) -> Option<AgentJob> {
     // The run's cancel signal lives for the whole invocation — fresh dispatch
     // and its terminalization tail. A manual cancel from the Running Agents
@@ -647,7 +607,7 @@ async fn write_terminalization_artifacts(job_id: &str, delivered: &str, state: &
 /// dispatches the cleanup agent; the folder is released only by the cleanup
 /// tail).
 /// The caller routes the returned envelope (fresh: via
-/// [`ResearchTool::execute`]; resume: directly), so routing always happens
+/// [`dispatch_deep_analysis`]; resume: directly), so routing always happens
 /// after the cleanup row exists.
 #[expect(clippy::too_many_arguments)]
 async fn terminalize_research(
@@ -659,7 +619,7 @@ async fn terminalize_research(
     user_name: &str,
     channel: &str,
     spawned: bool,
-    custom: Option<crate::CustomRoleLaunch>,
+    custom: Option<crate::Launch>,
 ) -> Option<AgentJob> {
     // Manual-cancel gate BEFORE any artifact is written: a cancel that landed
     // after the orchestrator's last boundary check (mid-terminalization) must
@@ -797,12 +757,13 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
     crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
 }
 
-/// Build the `<research-result>` envelope message for the async research
-/// dispatch. Follows the analyze convention: the caller-generated `job_id` is
-/// embedded so the delivered report is correlatable with the immediate ack,
-/// and failures are wrapped with an explicit marker, never silently dropped.
+/// Build the `<analyze-tool-result>` envelope for the deep-analysis dispatch —
+/// the same tag both analysis depths use. Follows the analyze convention: the
+/// caller-generated `job_id` is embedded so the delivered report is correlatable
+/// with the immediate ack, and failures are wrapped with an explicit marker, never
+/// silently dropped.
 fn build_async_research_message(job_id: &str, result: &anyhow::Result<String>) -> String {
-    build_async_result_envelope(job_id, result, "research-result", None)
+    build_async_result_envelope(job_id, result, "analyze-tool-result", None)
 }
 
 // ── Evidence accumulation ────────────────────────────────────────────────
@@ -3583,6 +3544,7 @@ async fn run_deep_research(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn claim(claim: &str, source: &str, confidence: &str) -> Claim {
         Claim {
@@ -3614,13 +3576,13 @@ mod tests {
             "job123",
             &Err(anyhow::anyhow!("all decomposition analysts failed")),
         );
-        assert!(envelope.contains("<research-result>"), "{envelope}");
+        assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
         assert!(
             envelope.contains("An error occurred: all decomposition analysts failed"),
             "{envelope}"
         );
         assert!(
-            envelope.ends_with("</research-result>"),
+            envelope.ends_with("</analyze-tool-result>"),
             "envelope must close: {envelope}"
         );
     }

@@ -45,9 +45,9 @@ static NEXT_ENTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
 ///   round plus its consolidation LLM call (members share the round key).
 /// - [`Research`](ParentKey::Research) — all sub-agents and orchestrator LLM
 ///   calls of one research run (members share the durable research job id).
-/// - [`CustomLaunch`](ParentKey::CustomLaunch) — one custom-role launch, keyed
-///   by the launch's agent id (one launch is one conversation, so the id is the
-///   group key).
+/// - [`Launch`](ParentKey::Launch) — one branch launch (a custom role's or a coder
+///   branch's), keyed by the launch's agent id (one launch is one conversation,
+///   so the id is the group key).
 ///
 /// `None` means the work item is a workspace singleton (manager / maintainer /
 /// discovery / direct chat) or — for non-agent calls — genuinely
@@ -57,7 +57,7 @@ pub enum ParentKey {
     Ticket(String),
     AnalyzeRound(String),
     Research(String),
-    CustomLaunch(String),
+    Launch(String),
 }
 
 /// One tool call in the GUI's session-ledger projection (`session_view`) —

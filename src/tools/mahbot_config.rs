@@ -69,13 +69,16 @@ fn read_behavior(args: &serde_json::Value) -> anyhow::Result<Option<CustomRoleBe
     }
 }
 
-/// Render a custom role's chosen tool subset for a human: the names joined, or
-/// "none" for the empty subset.
+/// Render a custom role's chosen tool subset for a human: the entries joined, or
+/// "none" for the empty subset. Each entry is spelled with the kinds it holds
+/// ([`crate::tools::grants::describe_all`]), so a bare entry shows the narrowest
+/// kind it implies rather than nothing.
 fn format_tools(tools: &[String]) -> String {
-    if tools.is_empty() {
+    let described = crate::tools::grants::describe_all(tools);
+    if described.is_empty() {
         "none".to_string()
     } else {
-        tools.join(", ")
+        described.join(", ")
     }
 }
 
@@ -138,7 +141,7 @@ impl Tool for MahbotConfigTool {
                 "tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "(create_custom_role / update_custom_role) The chosen subset of your own tools' names; the same names the tool list uses. A name that is not one of your tools is refused. Omit for no tools."
+                    "description": "(create_custom_role / update_custom_role) The chosen subset of your own tools: each entry is a tool name, optionally `name:kind1,kind2` for a tool with kinds (`analyze:quick,deep`, `send:coder,coder_branch,manager,role`); a bare name grants the tool's narrowest kind. An unknown name, an unknown kind and a duplicate are refused. Omit for no tools."
                 },
                 "behavior": {
                     "type": "string",
@@ -660,6 +663,35 @@ mod tests {
         assert!(
             err.contains("only guest accounts can be created"),
             "the reserved admin name must be refused, got: {err}"
+        );
+    }
+
+    /// The assistant's config surface prints a role's kind grants: a bare entry
+    /// is spelled with the narrowest kind it implies, and an explicit
+    /// `tool:k1,k2` entry reads back exactly as it is stored.
+    #[tokio::test]
+    async fn list_custom_roles_shows_the_kinds_a_role_holds() {
+        crate::util::test::init_test_stores().await;
+        let tool = MahbotConfigTool;
+        let ws = test_ws("/tmp/test_ws");
+
+        crate::custom_role::create(
+            "kind_grants_probe",
+            "you hold kinds",
+            &["analyze".to_string(), "send:coder,manager".to_string()],
+            CustomRoleBehavior::Continuous,
+        )
+        .await
+        .unwrap();
+
+        let out = tool
+            .execute(&ws, json!({ "action": "list_custom_roles" }))
+            .await
+            .unwrap();
+        assert!(out.contains("kind_grants_probe"), "{out}");
+        assert!(
+            out.contains("tools: analyze:quick, send:coder,manager"),
+            "the listing spells a bare entry's narrowest kind and keeps the stored kinds: {out}"
         );
     }
 }

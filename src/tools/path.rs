@@ -295,9 +295,8 @@ fn unrestricted_write_refusal(
         .map(|(name, _)| {
             anyhow::anyhow!(
                 "forbidden: cannot write to {requested}: it is inside the registered project \
-                 workspace '{name}' — hint: work in a project goes through that project's manager \
-                 (`send_message_to_manager`); the admin's own workspace and any unregistered \
-                 directory stay writable"
+                 workspace '{name}' — hint: work in a project belongs to that project's manager; \
+                 the admin's own workspace and any unregistered directory stay writable"
             )
         })
 }

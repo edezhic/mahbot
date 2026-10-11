@@ -1,0 +1,1 @@
+Start an administrator-defined custom role named by `name` (it must exist). Its answer arrives as a `<custom-role-message>` naming the role, its branch when it has one, and the folder it ran in. A named `branch` continues that branch; otherwise the role's own behaviour applies.

@@ -264,12 +264,12 @@ use crate::config::CONFIG;
 use crate::tools::ComputerTool;
 use crate::tools::path::PathAccess;
 use crate::tools::{
-    AddAlarmTool, AddCommentTool, AnalyzeTool, ChromeTool, CreateTicketTool, CustomTool,
-    DispatchMode, DocumentTool, EditTool, GetTicketTool, ImageGenTool, ImplementTool,
-    LaunchRoleTool, ListAlarmsTool, ListTicketsTool, MahbotConfigTool, MahbotDebugTool, ReadTool,
-    RemoveAlarmTool, ResearchTool, SearchArchivedTicketsTool, SearchTool, SendMessageToManagerTool,
-    ShellMode, ShellTool, SleepTool, UpdateTicketTool, VideoEditTool, VideoGenTool,
-    WebSearchBackend, WebSearchTool, WorkspaceControlTool,
+    AddAlarmTool, AddCommentTool, Addressee, AnalyzeDepth, AnalyzeTool, ChromeTool,
+    CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool, GetTicketTool,
+    ImageGenTool, ListAlarmsTool, ListTicketsTool, MahbotConfigTool, MahbotDebugTool, ReadTool,
+    RemoveAlarmTool, SearchArchivedTicketsTool, SearchTool, SendTool, ShellMode, ShellTool,
+    SleepTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
+    WorkspaceControlTool,
 };
 
 impl Role {
@@ -321,15 +321,15 @@ impl Role {
     /// gets except `web_search`, which [`Role::tools`] appends afterwards.
     ///
     /// `is_admin` widens the set exactly as it does for the Assistant: the
-    /// admin-only shell / implement / research / launch_role / computer / config
+    /// admin-only shell / send / computer / config
     /// / pipeline tools, whose access level and `analyze` flavour also follow it.
     fn assistant_core_tools(is_admin: bool) -> Vec<Box<dyn Tool>> {
-        // The optional `target` argument belongs to the admin's Assistant and
-        // to any custom role that takes this very set from the admin's tool
-        // catalogue: a guest's round always runs in its own workspace, and any
-        // `target` it passes is inert.
+        // The optional `place` argument belongs to the admin's Assistant: a
+        // guest's round always runs in its own workspace, and a custom role's
+        // dispatch tools are rebuilt from its own grants
+        // ([`Role::custom_role_tools`]), never taken from this set.
         let analyze = if is_admin {
-            AnalyzeTool::targeted(Role::Assistant)
+            AnalyzeTool::admin(Role::Assistant)
         } else {
             AnalyzeTool::new(DispatchMode::Async, Role::Assistant)
         };
@@ -369,13 +369,9 @@ impl Role {
         t.push(Box::new(ReadTool::new(file_access)));
         if is_admin {
             t.push(Box::new(ShellTool::new(ShellMode::Full)));
-            t.push(Box::new(ImplementTool::targeted(Role::Assistant)));
-            t.push(Box::new(ResearchTool::new(Role::Assistant)));
-            // Launch an administrator-defined custom role (or another one):
-            // since `custom_role_tools`/`custom_role_tool_catalog` derive from
-            // this admin set, a role that chooses `launch_role` can start other
-            // roles — that is intended.
-            t.push(Box::new(LaunchRoleTool));
+            // The coder and the branch surface, and the Manager/custom-role
+            // addressees — one tool, chosen per call.
+            t.push(Box::new(SendTool::admin(Role::Assistant)));
             // The admin's session is a trusted local session, so the
             // Assistant can also observe/act on the local GUI directly
             // (gated per-run by the accessibility grant at agent
@@ -385,10 +381,6 @@ impl Role {
             // (see `tools/computer/macos.rs`).
             #[cfg(not(target_os = "macos"))]
             t.push(Box::new(ComputerTool));
-            // Assistant→Manager channel (the admin's Assistant only):
-            // address the Manager of a project workspace. The
-            // Manager's messages auto-deliver back (see message_router).
-            t.push(Box::new(SendMessageToManagerTool));
             // The admin config surface: the merged `mahbot_config`
             // setup tool and the read-only DB query tool. The admin's
             // Assistant is now the single user-facing role, so these
@@ -413,9 +405,9 @@ impl Role {
     /// from any workspace.
     ///
     /// `is_admin` says whether the triggering account is the admin. It only
-    /// widens the Assistant's toolset: `shell`, `implement`, `research`,
-    /// `launch_role`, `computer`, `mahbot_config`, `mahbot_debug`,
-    /// `workspace_control` and the Assistant↔Manager chat tools are added.
+    /// widens the Assistant's toolset: `shell`, `send`,
+    /// `computer`, `mahbot_config`, `mahbot_debug` and
+    /// `workspace_control` are added.
     /// Every other role's toolset is byte-identical regardless of its value.
     /// `computer` exists only where the capability does: on macOS it is
     /// withdrawn, so the admin's toolset there has no such tool (see
@@ -438,10 +430,7 @@ impl Role {
                     DispatchMode::Sync,
                     Role::Engineer,
                 )));
-                t.push(Box::new(ImplementTool::new(
-                    DispatchMode::Sync,
-                    Role::Engineer,
-                )));
+                t.push(Box::new(SendTool::engineer()));
                 t
             }
             Role::Manager => {
@@ -519,7 +508,16 @@ impl Role {
 
     /// The tool set of a custom role: the subset of the admin Assistant's core
     /// tools (at the admin's own strength) named by the role's record, plus the
-    /// configured `web_search`.
+    /// configured `web_search` and the granted dispatch tools with their kinds.
+    ///
+    /// Each stored entry is `"tool"` (its narrowest kind) or `"tool:kind1,kind2"`
+    /// (see [`crate::tools::grants`]). The two dispatch tools (`analyze`, `send`)
+    /// are never taken from the static admin set — they are rebuilt from the
+    /// grants so a role gets exactly its granted depths/addressees.
+    ///
+    /// The read is lenient ([`crate::tools::grants::parse_lossy`]): a stored
+    /// entry the grammar refuses drops itself alone, so it cannot cost the role
+    /// the rest of its tool set.
     ///
     /// A chosen tool the installation cannot serve right now (a platform-gated
     /// or configuration-dependent tool) is simply absent from the built list —
@@ -527,10 +525,46 @@ impl Role {
     /// serve. The caller applies `is_advertised()` to the result (as
     /// [`crate::agent::role_tools_and_specs`] does for every role).
     #[must_use]
-    pub(crate) fn custom_role_tools(names: &[String]) -> Vec<Box<dyn Tool>> {
-        let mut tools = Self::assistant_core_tools(true);
-        Self::add_web_search_tool(&mut tools);
-        tools.retain(|tool| names.iter().any(|name| name == tool.name()));
+    pub(crate) fn custom_role_tools(entries: &[String]) -> Vec<Box<dyn Tool>> {
+        // One unparsable stored entry drops itself alone, never the record's
+        // whole tool set.
+        let grants = crate::tools::grants::parse_lossy(entries);
+        let granted: Vec<&str> = grants.iter().map(|grant| grant.tool.as_str()).collect();
+        let mut tools: Vec<Box<dyn Tool>> = Self::assistant_core_tools(true)
+            .into_iter()
+            // The dispatch tools are rebuilt from their grants below, never taken
+            // from the static admin set (the grants carry the kinds).
+            .filter(|tool| crate::tools::grants::kinds_of(tool.name()).is_none())
+            .filter(|tool| granted.contains(&tool.name()))
+            .collect();
+        // `web_search` is not part of the static admin set, and its presence
+        // depends on the configured provider.
+        if granted.contains(&"web_search") {
+            Self::add_web_search_tool(&mut tools);
+        }
+        for grant in &grants {
+            match grant.tool.as_str() {
+                "analyze" => {
+                    tools.push(Box::new(AnalyzeTool::granted(
+                        &grant
+                            .kinds
+                            .iter()
+                            .filter_map(|kind| AnalyzeDepth::parse(kind))
+                            .collect::<Vec<_>>(),
+                    )));
+                }
+                "send" => {
+                    tools.push(Box::new(SendTool::granted(
+                        &grant
+                            .kinds
+                            .iter()
+                            .filter_map(|kind| Addressee::parse(kind))
+                            .collect::<Vec<_>>(),
+                    )));
+                }
+                _ => {}
+            }
+        }
         tools
     }
 
@@ -700,6 +734,73 @@ mod tests {
         chosen_names.sort_unstable();
         assert_eq!(chosen_names, vec!["read", "sleep"]);
         assert!(Role::custom_role_tools(&[]).is_empty());
+
+        // Kinds: a granted dispatch tool is built with exactly the kinds the
+        // entry names, and every kind the holder does not have is absent from
+        // its declared interface.
+        let granted = |entries: &[&str]| {
+            let entries: Vec<String> = entries.iter().map(|s| (*s).to_string()).collect();
+            Role::custom_role_tools(&entries)
+        };
+        let props =
+            |tools: &[Box<dyn Tool>], name: &str| -> serde_json::Map<String, serde_json::Value> {
+                let tool = tools
+                    .iter()
+                    .find(|t| t.name() == name)
+                    .unwrap_or_else(|| panic!("'{name}' must build"));
+                tool.parameters_schema()["properties"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+            };
+        let deep = granted(&["analyze:deep"]);
+        let analyze = props(&deep, "analyze");
+        assert!(
+            analyze.get("depth").is_none(),
+            "a one-depth analyze declares no choice: {analyze:?}"
+        );
+        assert!(
+            analyze.get("place").is_none(),
+            "the deep depth takes no folder: {analyze:?}"
+        );
+        let both = granted(&["analyze:quick,deep"]);
+        assert_eq!(
+            props(&both, "analyze")["depth"]["enum"],
+            serde_json::json!(["quick", "deep"])
+        );
+        let coders = granted(&["send:coder,coder_branch"]);
+        let send = props(&coders, "send");
+        assert_eq!(
+            send["addressee"]["enum"],
+            serde_json::json!(["coder", "coder_branch"]),
+            "only the granted addressees are offered: {send:?}"
+        );
+        assert!(
+            !send.contains_key("name"),
+            "no `role` kind, no `name`: {send:?}"
+        );
+        assert!(
+            send.contains_key("branch"),
+            "`coder_branch` takes a branch name: {send:?}"
+        );
+        let branch_only = granted(&["send:coder_branch"]);
+        let send = props(&branch_only, "send");
+        assert!(
+            send.get("addressee").is_none() && send.contains_key("branch"),
+            "a coder_branch-only holder declares no choice and requires its branch — the \
+             continuing kind does not imply the single run: {send:?}"
+        );
+        let manager = granted(&["send:manager"]);
+        let send = props(&manager, "send");
+        assert!(
+            send.get("addressee").is_none() && send.get("place").is_some(),
+            "a one-addressee manager-only send declares no choice but requires its project: {send:?}"
+        );
+        let bare = granted(&["send"]);
+        assert!(
+            props(&bare, "send").get("addressee").is_none(),
+            "a bare entry is the narrowest kind — a one-kind holder declares no choice"
+        );
     }
 
     #[test]
@@ -797,24 +898,37 @@ mod tests {
     }
 
     #[test]
-    fn manager_does_not_advertise_research() {
-        // Acceptance pin: the Manager has no `research` grant — deep research
-        // runs are dispatched by the admin's Assistant only (pinned
-        // in `assistant_toolset_gates_admin_tools`). The Manager's
-        // single delegation path is `analyze`.
+    fn manager_has_quick_analyze_and_no_send() {
+        // Acceptance pin: the Manager's single delegation path is a `quick`
+        // `analyze` — a deep analysis and every `send` addressee belong to the
+        // admin's Assistant. The Manager's analyze declares no `depth` choice
+        // (it holds only `quick`) and no `place`.
         let tools =
             crate::Role::Manager.tools(&crate::workspace::test_ws("test"), false, test_sessions());
+        let analyze = tools
+            .iter()
+            .find(|t| t.name() == "analyze")
+            .expect("the Manager holds `analyze`");
+        let props = analyze.parameters_schema()["properties"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
         assert!(
-            !tools.iter().any(|t| t.name() == "research"),
-            "Manager toolset must not contain 'research'"
+            !props.contains_key("depth"),
+            "a single-depth analyze must not declare `depth`: {props:?}"
+        );
+        assert!(!props.contains_key("place"), "the Manager has no `place`");
+        assert!(
+            !tools.iter().any(|t| t.name() == "send"),
+            "Manager toolset must not contain 'send'"
         );
     }
 
     #[test]
     fn assistant_toolset_gates_admin_tools() {
         // The Assistant toolset must differ by whether the triggering account
-        // is the admin: a guest's Assistant has no shell/implement/research/
-        // launch_role/computer, the admin's does. A guest gets the workspace-only
+        // is the admin: a guest's Assistant has no shell/send/computer, the
+        // admin's does. A guest gets the workspace-only
         // read access; the admin's reaches the machine.
         let ws = crate::workspace::test_ws("test");
         let guest = crate::Role::Assistant.tools(&ws, false, test_sessions());
@@ -823,9 +937,9 @@ mod tests {
         // `computer` is admin-only where the capability exists at all; on macOS
         // it is withdrawn entirely (see `tools/computer/macos.rs`).
         let admin_only: &[&str] = if cfg!(target_os = "macos") {
-            &["shell", "implement", "research", "launch_role"]
+            &["shell", "send"]
         } else {
-            &["shell", "implement", "research", "launch_role", "computer"]
+            &["shell", "send", "computer"]
         };
         for &name in admin_only {
             assert!(
@@ -899,38 +1013,37 @@ mod tests {
             );
         }
 
-        // The optional `target` delegation argument is the admin's alone: the
-        // admin's `analyze` and `implement` advertise it, the guest's `analyze`
-        // (the guest has no `implement`) does not.
-        let advertises_target = |tools: &[Box<dyn Tool>], name: &str| {
+        // The optional `place` delegation argument is the admin's alone: the
+        // admin's `analyze` and `send` advertise it, the guest's `analyze`
+        // (the guest has no `send`) does not.
+        let advertises_place = |tools: &[Box<dyn Tool>], name: &str| {
             tools.iter().find(|t| t.name() == name).is_some_and(|t| {
                 t.parameters_schema()["properties"]
                     .as_object()
-                    .is_some_and(|props| props.contains_key("target"))
+                    .is_some_and(|props| props.contains_key("place"))
             })
         };
         assert!(
-            advertises_target(&admin, "analyze"),
-            "the admin's Assistant analyze must advertise `target`"
+            advertises_place(&admin, "analyze"),
+            "the admin's Assistant analyze must advertise `place`"
         );
         assert!(
-            advertises_target(&admin, "implement"),
-            "the admin's Assistant implement must advertise `target`"
+            advertises_place(&admin, "send"),
+            "the admin's Assistant send must advertise `place`"
         );
         assert!(
-            !advertises_target(&guest, "analyze"),
-            "a guest's Assistant analyze must not advertise `target`"
+            !advertises_place(&guest, "analyze"),
+            "a guest's Assistant analyze must not advertise `place`"
         );
     }
 
     #[test]
     fn admin_only_tools_only_in_admin_assistant() {
         // Acceptance pin: the admin's administrative tools — the merged
-        // `mahbot_config` setup tool, the read-only `mahbot_debug` query tool,
+        // `mahbot_config` setup tool, the read-only `mahbot_debug` query tool and
         // `workspace_control` (the registered workspaces' pipeline
-        // pause/resume/list) and `launch_role` (start an administrator-defined
-        // custom role) — live in the admin's Assistant's own static tool set and
-        // in no other role's static set. A guest's Assistant and every other
+        // pause/resume/list) — live in the admin's Assistant's own static tool set
+        // and in no other role's static set. A guest's Assistant and every other
         // role must never advertise any of them here. (A custom role may
         // additionally choose them from the catalogue derived from that admin
         // set, `assistant_core_tools(true)`, which this static-set pin does not
@@ -943,12 +1056,7 @@ mod tests {
                     .iter()
                     .map(|t| t.name())
                     .collect();
-                for name in [
-                    "mahbot_config",
-                    "mahbot_debug",
-                    "workspace_control",
-                    "launch_role",
-                ] {
+                for name in ["mahbot_config", "mahbot_debug", "workspace_control"] {
                     let has = names.contains(&name);
                     if role == crate::Role::Assistant && is_admin {
                         assert!(has, "the admin's Assistant must advertise `{name}`");
@@ -1084,32 +1192,35 @@ mod tests {
     }
 
     #[test]
-    fn manager_chat_tools_only_in_admin_assistant() {
-        // Acceptance pin: the Assistant→Manager send tool lives in the admin's
-        // Assistant's own static tool set and in no other role's. Every other
-        // role (and a guest's Assistant) never communicates with a Manager
-        // directly. (A custom role may choose `send_message_to_manager` from the
-        // catalogue derived from that admin set.)
+    fn manager_addressee_only_in_the_admin_assistants_send() {
+        // Acceptance pin: the Manager and custom-role addressees belong to the
+        // admin's Assistant's `send` (and any custom role it grants them to). The
+        // Engineer's `send` addresses a coder only — it must not offer the
+        // `addressee` choice, `name` or the manager addressee.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
             for is_admin in [false, true] {
-                let names: Vec<&str> = role
+                let Some(send) = role
                     .tools(&ws, is_admin, test_sessions())
-                    .iter()
-                    .map(|t| t.name())
-                    .collect();
-                let name = "send_message_to_manager";
-                let has = names.contains(&name);
-                if role == crate::Role::Assistant && is_admin {
-                    assert!(has, "the admin's Assistant must advertise `{name}`");
-                } else {
-                    assert!(
-                        !has,
-                        "{}{} must not advertise `{name}`",
-                        role.as_str(),
-                        if is_admin { " (admin)" } else { "" }
-                    );
-                }
+                    .into_iter()
+                    .find(|t| t.name() == "send")
+                else {
+                    continue;
+                };
+                let props = send.parameters_schema()["properties"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                let holder_is_admin_assistant = role == crate::Role::Assistant && is_admin;
+                let offers_manager_or_role =
+                    props.contains_key("addressee") && props.contains_key("name");
+                assert_eq!(
+                    offers_manager_or_role,
+                    holder_is_admin_assistant,
+                    "{}{} send addressee surface",
+                    role.as_str(),
+                    if is_admin { " (admin)" } else { "" }
+                );
             }
         }
     }

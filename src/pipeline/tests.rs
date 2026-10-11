@@ -2832,7 +2832,7 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
         &[crate::ToolCall {
             id: "call_stage_analyze".to_string(),
             name: "analyze".to_string(),
-            arguments: serde_json::json!({"analyze": "stage analysis"}),
+            arguments: serde_json::json!({"message": "stage analysis"}),
         }],
         None,
     )

@@ -115,7 +115,8 @@ pub(crate) enum AgentKind {
     Reviewer,
     Tester,
     Engineer,
-    /// Single coder sub-agent for the durable async ImplementTool dispatch.
+    /// Single coder sub-agent for the durable async coder round (`send`'s
+    /// `coder` addressee).
     Coder,
     Sanitation,
 }
@@ -166,9 +167,13 @@ pub(crate) struct JobRow {
     /// Explicit dispatch mode (see [`JobMode`]) — the discriminator that
     /// replaces the NULL-sentinel overload of `caller_agent_id`.
     mode: JobMode,
-    /// The absolute directory a targeted delegation round runs in; `None` = the
-    /// caller's own workspace (`workspace_name`).
+    /// The absolute folder a delegated round runs in; `None` = the caller's own
+    /// workspace (`workspace_name`).
     pub exec_dir: Option<String>,
+    /// The row's `created_at` — the anchor the caller's resume-completion step
+    /// compares against its own frame row to tell a round THIS frame dispatched
+    /// from the leftover of an earlier one.
+    pub created_at: String,
 }
 
 /// A row of the `agents` table. Carries the slot `idx` (in addition to the
@@ -204,6 +209,7 @@ crate::columns! {
         CALLER_AGENT_ID => "caller_agent_id",
         MODE            => "mode",
         EXEC_DIR        => "exec_dir",
+        CREATED_AT      => "created_at",
     }
 }
 
@@ -216,6 +222,7 @@ fn job_row_from(row: &Row) -> anyhow::Result<JobRow> {
         ticket_id: row.get(COL_JOB_TICKET_ID)?,
         caller_agent_id: row.get(COL_JOB_CALLER_AGENT_ID)?,
         exec_dir: row.get(COL_JOB_EXEC_DIR)?,
+        created_at: row.get(COL_JOB_CREATED_AT)?,
         // Defensive fallback: the migration backfills every row, so a NULL or
         // bogus value here is a legacy edge — treat it as async rather than
         // dropping the job at boot.
@@ -401,7 +408,7 @@ pub(crate) async fn spawn_job(
     child: &SpawnChild,
     caller_agent_id: Option<&str>,
     exec_dir: Option<&str>,
-    custom_launch: Option<&crate::CustomRoleLaunch>,
+    custom_launch: Option<&crate::Launch>,
 ) -> Result<()> {
     let tx = conn.begin_tx().await?;
     insert_job_tx(
@@ -441,7 +448,7 @@ async fn insert_job_tx(
     child: &SpawnChild,
     caller_agent_id: Option<&str>,
     exec_dir: Option<&str>,
-    custom_launch: Option<&crate::CustomRoleLaunch>,
+    custom_launch: Option<&crate::Launch>,
 ) -> Result<()> {
     let kind = child.kind_str();
     let ticket_id = child_ticket_id(child);
@@ -622,7 +629,7 @@ pub(crate) async fn complete_durable_job(
     user_name: &str,
     channel: &str,
     workspace_name: &str,
-    custom: Option<crate::CustomRoleLaunch>,
+    custom: Option<crate::Launch>,
 ) -> AgentJob {
     let mut envelope = AgentJob {
         content,
@@ -787,9 +794,12 @@ pub(crate) async fn abandon_workspace_research_runs(workspace_name: &str) -> Res
 /// Launched sync analyze/implement jobs owned by `caller_agent_id` (the
 /// caller's stable session pin), newest first, awaiting deterministic resume
 /// by the caller's universal resume-completion step. There is no freshness
-/// gate: unfinished jobs are never deleted except by explicit abandon (the
-/// /clear abandon path terminalizes a cleared session's jobs, which is what
-/// previously made the fresh-cycle gate necessary).
+/// gate on the pool itself: a job is never dropped for being old, only by
+/// explicit abandon (the /clear abandon path terminalizes a cleared session's
+/// jobs, which is what previously made the fresh-cycle gate necessary). The
+/// caller scopes its BINDING to its own dangling frame ([`JobRow::created_at`]
+/// against the frame row), so a pool entry that frame did not dispatch is
+/// abandoned rather than bound.
 pub(crate) async fn find_owned_launched_jobs(
     conn: &Connection,
     caller_agent_id: &str,
@@ -1063,7 +1073,7 @@ pub(crate) struct JobCaller {
     /// resume uses it to address the custom branch instead of a fabricated
     /// built-in address. Boxed so the caller payload stays small enough for the
     /// resume-outcome enums.
-    pub custom_launch: Option<Box<crate::CustomRoleLaunch>>,
+    pub custom_launch: Option<Box<crate::Launch>>,
 }
 
 /// Discriminated resume preamble so sync callers never mistake a gone job

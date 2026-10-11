@@ -233,7 +233,7 @@ pub(crate) async fn delete(name: &str) -> Result<()> {
         }
     };
     for agent_id in &branches {
-        if let Err(e) = stop(agent_id).await {
+        if let Err(e) = crate::launch::stop(agent_id).await {
             tracing::warn!(
                 role = %name,
                 agent_id = %agent_id,
@@ -263,155 +263,6 @@ pub(crate) async fn delete(name: &str) -> Result<()> {
     Ok(())
 }
 
-// ── Launch ────────────────────────────────────────────────────────────────
-
-/// Build the durable launch envelope for a custom role — the shape every launch
-/// path (a user command, an alarm) shares.
-fn launch_job(
-    content: String,
-    workspace_name: String,
-    launch: crate::CustomRoleLaunch,
-) -> crate::agent::message_router::AgentJob {
-    crate::agent::message_router::AgentJob {
-        content,
-        workspace_name,
-        user_name: crate::users::ADMIN_USER_NAME.to_string(),
-        channel: "gui".to_string(),
-        kind: crate::agent::message_router::MessageKind::UserMessage,
-        role: crate::Role::Custom,
-        reply_target: None,
-        pending_job_id: None,
-        originating_workspace: None,
-        custom_role: Some(launch),
-        reply_to_custom: None,
-    }
-}
-
-/// Launch `name`'s custom role with `message` as the launch message.
-///
-/// `identifier` selects a continuable named branch; without one the record's
-/// behaviour decides (one common branch, or a one-off run). `workspace` names a
-/// registered workspace, a `personal:{user}` workspace or any folder on the
-/// machine; `None` runs in the owner's personal folder, exactly as the owner's
-/// Assistant does. The launch is persisted as a durable envelope BEFORE it is
-/// routed, so it survives a restart. Returns a one-line confirmation for the caller.
-pub(crate) async fn launch(
-    name: &str,
-    message: &str,
-    identifier: Option<&str>,
-    workspace: Option<&str>,
-) -> Result<String> {
-    anyhow::ensure!(
-        !message.trim().is_empty(),
-        "usage: the launch message must not be empty"
-    );
-    let role = get(name)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no custom role named '{name}'"))?;
-
-    // An explicit empty/whitespace identifier counts as absent.
-    let identifier = identifier.map(str::trim).filter(|id| !id.is_empty());
-    if let Some(id) = identifier {
-        validate_identifier(id)?;
-    }
-
-    // Resolve the workspace address: `None` (or empty/whitespace) runs in the
-    // owner's personal folder; a named value must resolve to a registered
-    // workspace, a `personal:{user}` key or an absolute path.
-    let workspace_name = match workspace.map(str::trim).filter(|w| !w.is_empty()) {
-        None => crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
-        Some(raw) => resolve_launch_workspace(raw).await?,
-    };
-
-    // Resolve the branch address: an explicit identifier resumes/creates that
-    // named branch; otherwise the record's behaviour picks between the one
-    // common branch and a fresh one-off run.
-    let agent_id = match identifier {
-        Some(id) => crate::session::custom_role_agent_id(name, Some(id)),
-        None => match role.behavior {
-            CustomRoleBehavior::Continuous => crate::session::custom_role_agent_id(name, None),
-            CustomRoleBehavior::OneOff => crate::session::custom_role_run_agent_id(name),
-        },
-    };
-
-    let launch = crate::CustomRoleLaunch {
-        name: name.to_string(),
-        identifier: identifier.map(str::to_string),
-        prompt: role.prompt,
-        tools: role.tools,
-        agent_id: agent_id.clone(),
-    };
-    let job = launch_job(message.to_string(), workspace_name.clone(), launch);
-
-    // Durable delivery: the envelope is persisted BEFORE it is routed, so a
-    // restart between the two replays it at boot.
-    crate::agent::message_router::stamp_and_route(job, &agent_id, "custom role launch").await;
-
-    Ok(format!(
-        "custom role '{name}' launched on branch {agent_id} in {workspace_name}"
-    ))
-}
-
-/// How a custom role launch is named in the lists: the role's name, plus the
-/// branch identifier when the branch was named.
-pub(crate) fn display_label(name: &str, identifier: Option<&str>) -> String {
-    match identifier {
-        Some(id) => format!("Custom role \"{name}\" — branch \"{id}\""),
-        None => format!("Custom role \"{name}\""),
-    }
-}
-
-/// Stop one custom-role launch: cancel the running agent, mark the branch as
-/// deliberately stopped (so automatic recovery never restarts it), drop the
-/// launch's deferred envelopes (so boot replay does not replay them) and release
-/// the engine of the folder it worked in (see
-/// [`crate::search_engine::release_path_named_engine`]).
-///
-/// The persisted mark — not the in-memory cancel signal — is what survives a
-/// restart; a later explicit launch of the same branch clears it
-/// (`Agent::work`).
-///
-/// A stop cancels the launch's own agent only: a durable round it had already
-/// dispatched (analyze/implement/research) keeps running, and its result
-/// arrives later as a new turn of the branch.
-pub(crate) async fn stop(agent_id: &str) -> Result<()> {
-    crate::agent::registry::AGENT_REGISTRY.cancel_by_parent_key(
-        &crate::agent::registry::ParentKey::CustomLaunch(agent_id.to_string()),
-    );
-    crate::session::store()
-        .set_launch_stopped(agent_id, true)
-        .await?;
-    crate::jobs::delete_pending_jobs_for(agent_id).await?;
-    // The branch is going away, so release the engine of the folder it last
-    // worked in: nothing else keeps it alive (see
-    // `crate::search_engine::release_path_named_engine`). Best-effort — a failed
-    // read just leaves it registered.
-    if let Some(workspace) = crate::session::store()
-        .session_workspace_name(agent_id)
-        .await
-    {
-        crate::search_engine::release_path_named_engine(&workspace);
-    }
-    Ok(())
-}
-
-/// Resolve a launch's `workspace` argument into the workspace ADDRESS stored
-/// with the launch — the resolved workspace's own name: a registered workspace
-/// keeps its name (whether the launch named it by name or by its folder),
-/// `personal:{user}` its key, and any other folder its canonical absolute path
-/// ([`crate::workspace::synthesize_from_path`] names a path workspace by the
-/// path itself, so all three are durable keys
-/// [`crate::users::resolve_workspace`] can resolve back).
-pub(crate) async fn resolve_launch_workspace(raw: &str) -> Result<String> {
-    let ws = crate::users::resolve_workspace(raw).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "usage: the workspace must be a registered workspace name or an absolute path \
-             to an existing directory"
-        )
-    })?;
-    Ok(ws.name)
-}
-
 /// Validate a custom role's name: non-empty, within
 /// [`MAX_ROLE_NAME_CHARS`], every char ASCII alphanumeric / `_` / `-`, the
 /// first char an ASCII letter, and not colliding with a built-in agent
@@ -438,6 +289,13 @@ pub(crate) fn validate_identifier(identifier: &str) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid custom role branch: {e}"))
 }
 
+/// Validate a coder branch name: the same charset and length rule as a custom
+/// role identifier, with a wording of its own.
+pub(crate) fn validate_coder_branch(branch: &str) -> Result<()> {
+    validate_segment(branch, MAX_ROLE_IDENTIFIER_CHARS, "a branch")
+        .map_err(|e| anyhow::anyhow!("invalid coder branch: {e}"))
+}
+
 /// Shared charset/length check for a name or an identifier.
 fn validate_segment(value: &str, max_chars: usize, what: &str) -> Result<()> {
     anyhow::ensure!(!value.is_empty(), "{what} must not be empty");
@@ -455,8 +313,10 @@ fn validate_segment(value: &str, max_chars: usize, what: &str) -> Result<()> {
 }
 
 /// Validate a tool subset a caller wrote, against the catalog of what a custom
-/// role may be given ([`crate::Role::custom_role_tool_catalog`]); an empty
-/// subset is allowed and a repeated name is not.
+/// role may be given ([`crate::Role::custom_role_tool_catalog`]). Each entry is
+/// `"tool"` (the tool with its narrowest kind) or `"tool:kind1,kind2"` (see
+/// [`crate::tools::grants`]); an empty subset is allowed, an unknown tool name,
+/// an unknown kind and a tool named twice are not.
 ///
 /// Names the record ALREADY holds are exempt from the catalog check: a tool the
 /// running installation cannot serve right now (e.g. `computer` on macOS) stays
@@ -464,12 +324,18 @@ fn validate_segment(value: &str, max_chars: usize, what: &str) -> Result<()> {
 /// never drop it.
 pub(crate) fn validate_tools_against(tools: &[String], held: &[String]) -> Result<()> {
     let catalog = crate::Role::custom_role_tool_catalog();
-    let mut seen = std::collections::HashSet::new();
-    for tool in tools {
-        anyhow::ensure!(seen.insert(tool), "tool '{tool}' is named twice");
+    // parse() validates the grammar: an unknown kind, a kind on a kindless tool,
+    // a kind named twice on one tool, and a tool named twice.
+    let grants = crate::tools::grants::parse(tools)?;
+    let held: Vec<&str> = held
+        .iter()
+        .map(|entry| crate::tools::grants::tool_name(entry))
+        .collect();
+    for grant in &grants {
         anyhow::ensure!(
-            held.contains(tool) || catalog.contains(&tool.as_str()),
-            "unknown tool '{tool}' for a custom role"
+            held.contains(&grant.tool.as_str()) || catalog.contains(&grant.tool.as_str()),
+            "unknown tool '{}' for a custom role",
+            grant.tool
         );
     }
     Ok(())
@@ -478,6 +344,43 @@ pub(crate) fn validate_tools_against(tools: &[String], held: &[String]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stored grant grammar: a tool name, or `tool:kind1,kind2`. A bare name
+    /// is the tool's narrowest kind; an unknown kind, a kind on a tool that has
+    /// no kinds, an unknown tool and a tool named twice are all refused.
+    #[test]
+    fn validate_tools_against_reads_the_kind_grammar() {
+        let entries =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|s| (*s).to_string()).collect() };
+        assert!(
+            validate_tools_against(&entries(&["analyze:quick,deep", "send:coder"]), &[]).is_ok()
+        );
+        assert!(validate_tools_against(&entries(&["analyze", "send", "read"]), &[]).is_ok());
+        assert!(
+            validate_tools_against(&entries(&["analyze:sideways"]), &[]).is_err(),
+            "an unknown kind is refused"
+        );
+        assert!(
+            validate_tools_against(&entries(&["read:quick"]), &[]).is_err(),
+            "a kind on a tool that has no kinds is refused"
+        );
+        assert!(
+            validate_tools_against(&entries(&["not-a-tool"]), &[]).is_err(),
+            "an unknown tool is refused"
+        );
+        assert!(
+            validate_tools_against(&entries(&["read", "read"]), &[]).is_err(),
+            "a tool named twice is refused"
+        );
+        assert!(
+            validate_tools_against(&entries(&["analyze:quick", "analyze:deep"]), &[]).is_err(),
+            "the same tool split across two entries is refused too"
+        );
+        assert!(
+            validate_tools_against(&entries(&["gone"]), &entries(&["gone"])).is_ok(),
+            "a name the record already holds stays valid"
+        );
+    }
 
     #[test]
     fn validate_name_accepts_a_good_name_and_rejects_the_rest() {
@@ -547,12 +450,14 @@ mod tests {
             reply_target: None,
             pending_job_id: None,
             originating_workspace: None,
-            custom_role: Some(crate::CustomRoleLaunch {
+            custom_role: Some(crate::Launch {
+                role: crate::Role::Custom,
                 name: "stopper".to_string(),
                 identifier: Some("night".to_string()),
                 prompt: "prompt".to_string(),
                 tools: Vec::new(),
                 agent_id: branch.clone(),
+                reply_to: None,
             }),
             reply_to_custom: None,
         };
@@ -560,7 +465,7 @@ mod tests {
             .await
             .unwrap();
 
-        stop(&branch).await.unwrap();
+        crate::launch::stop(&branch).await.unwrap();
 
         assert!(crate::session::store().get_launch_stopped(&branch).await);
         let left = crate::jobs::list_pending_jobs(&crate::session::store().conn)

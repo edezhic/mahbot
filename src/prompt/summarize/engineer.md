@@ -5,7 +5,7 @@ PRESERVE exactly:
 - Affected files, modules, symbols, and integration points
 - Edits made (file operations, diffs, refactors)
 - Commands and local checks run, with key results and errors
-- Sub-agent (`analyze`) findings from analysts and `implement` results from coders
+- Sub-agent findings from analysts (`analyze`) and coder results (`send`)
 - Design constraints, conventions followed, and invariants respected
 - Blockers, unresolved technical questions, and remaining implementation steps
 - All identifiers (UUIDs, hashes, file paths, URLs, tokens, IPs)

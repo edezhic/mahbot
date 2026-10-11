@@ -288,8 +288,8 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         }
 
         // ── Condition 5: a deliberately stopped launch stays stopped ──────
-        // A custom-role launch stopped before it produced anything must never
-        // be auto-restarted. It does NOT consume retry budget — clean up any
+        // A branch launch stopped before it produced anything must never be
+        // auto-restarted. It does NOT consume retry budget — clean up any
         // stale tracker entry and skip; a later fresh launch re-enables
         // recovery by clearing the mark (see `Agent::work`).
         if session.launch_stopped {
@@ -341,8 +341,9 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         // User/Tool tails stay exempt: answering a pending user prompt matches
         // normal direct-chat behavior, which a workspace pause does not freeze.
         // A custom role is exempt too: a workspace pause freezes only launches
-        // tied to a ticket, never a custom role's branch.
-        if needs_pause_guard && role != Role::Custom {
+        // tied to a ticket, never a continuable branch (a custom role's or a coder
+        // branch's).
+        if needs_pause_guard && !is_continuable_branch(role, agent_id) {
             match crate::workspace::get_by_name(&ctx.workspace_name).await {
                 Ok(Some(ws)) if ws.paused => {
                     tracing::debug!(
@@ -412,8 +413,9 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
 
     // A custom-role branch is resumable only while its record still exists: the
     // record owns the authorial prompt and the tool subset, so a deleted role
-    // leaves nothing to run. Abandon the branch permanently in that case.
-    let custom_role = if role == Role::Custom {
+    // leaves nothing to run. Abandon the branch permanently in that case. A coder
+    // branch carries no record — its branch name is enough to rebuild the launch.
+    let launch = if role == Role::Custom {
         let Some(name) = ctx.custom_role.as_deref() else {
             tracing::warn!(
                 agent_id = %agent_id,
@@ -422,12 +424,14 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
             return false;
         };
         match crate::custom_role::get(name).await {
-            Ok(Some(record)) => Some(crate::CustomRoleLaunch {
+            Ok(Some(record)) => Some(crate::Launch {
+                role: Role::Custom,
                 name: name.to_string(),
                 identifier: ctx.custom_identifier.clone(),
                 prompt: record.prompt,
                 tools: record.tools,
                 agent_id: agent_id.to_string(),
+                reply_to: None,
             }),
             Ok(None) => {
                 tracing::warn!(
@@ -449,6 +453,25 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
                 return true;
             }
         }
+    } else if role == Role::Coder && crate::session::is_coder_branch_agent_id(agent_id) {
+        // The branch name is the recorded identifier, or — when that write
+        // failed — the agent id's own suffix, which is the same name.
+        let branch = ctx
+            .custom_identifier
+            .clone()
+            .or_else(|| crate::session::coder_branch_name(agent_id).map(str::to_string));
+        Some(crate::Launch {
+            role: Role::Coder,
+            name: String::new(),
+            identifier: branch,
+            prompt: String::new(),
+            tools: Vec::new(),
+            agent_id: agent_id.to_string(),
+            // The conversation that asked for this branch's work, so its report
+            // returns there instead of the admin's Assistant (an absent/NULL
+            // column leaves it `None`, as for every existing session).
+            reply_to: ctx.reply_to.clone().map(Box::new),
+        })
     } else {
         None
     };
@@ -481,7 +504,10 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
         reply_target: None,
         pending_job_id: None,
         originating_workspace: None,
-        custom_role,
+        custom_role: launch,
+        // A recovered coder branch's asker travels on its launch above
+        // (`Launch::reply_to`), read by the report path; this field's remaining
+        // user is the Manager leg.
         reply_to_custom: None,
     };
 
@@ -489,10 +515,22 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
     true
 }
 
+/// Whether a dead session is a continuable branch — a custom role's or a coder
+/// branch's. Such a session is exempt from the workspace-pause guard: a pause
+/// freezes only launches tied to a ticket, never a branch.
+fn is_continuable_branch(role: Role, agent_id: &str) -> bool {
+    match role {
+        Role::Custom => true,
+        Role::Coder => crate::session::is_coder_branch_agent_id(agent_id),
+        _ => false,
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    use super::super::BatchMetadata;
     use super::*;
     use crate::Tool;
 
@@ -509,6 +547,7 @@ mod tests {
             role: crate::Role::Custom.as_str().to_string(),
             custom_role: None,
             custom_identifier: None,
+            reply_to: None,
         };
         assert!(
             !attempt_recovery("role_test_launchless", &ctx, Role::Custom).await,
@@ -521,6 +560,58 @@ mod tests {
         assert!(
             !attempt_recovery("role_test_ghost", &deleted, Role::Custom).await,
             "a branch whose custom role was deleted is permanently un-recoverable"
+        );
+    }
+
+    /// A coder branch survives a restart: the poller rebuilds its launch from the
+    /// recorded branch name — no role record is needed — and re-routes the
+    /// unfinished turn with the conversation that asked restored, so the report
+    /// returns there instead of the admin's Assistant.
+    #[tokio::test]
+    async fn attempt_recovery_rebuilds_a_coder_branch_with_its_asker() {
+        crate::util::test::init_management_test_stores().await;
+        let branch = crate::session::coder_branch_agent_id("night");
+        let asker_folder = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
+        let ctx = SessionContext {
+            channel: "gui".to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            workspace_name: asker_folder.clone(),
+            role: Role::Coder.as_str().to_string(),
+            custom_role: None,
+            custom_identifier: Some("night".to_string()),
+            reply_to: Some(crate::agent::message_router::Asker {
+                launch: crate::Launch {
+                    role: Role::Custom,
+                    name: "briefer".to_string(),
+                    identifier: Some("hourly".to_string()),
+                    prompt: "you brief".to_string(),
+                    tools: Vec::new(),
+                    agent_id: crate::session::custom_role_agent_id("briefer", Some("hourly")),
+                    reply_to: None,
+                },
+                workspace: asker_folder,
+            }),
+        };
+        let mut rx = crate::agent::message_router::register_agent(&branch);
+        assert!(
+            attempt_recovery(&branch, &ctx, Role::Coder).await,
+            "a coder branch is recoverable"
+        );
+        let job = rx.try_recv().expect("the retry job is routed");
+        assert_eq!(job.kind, MessageKind::RecoveryRetry);
+        assert_eq!(job.role, Role::Coder);
+        let launch = job
+            .custom_role
+            .expect("a coder branch's job carries its launch");
+        assert_eq!(launch.role, Role::Coder);
+        assert_eq!(launch.identifier.as_deref(), Some("night"));
+        assert_eq!(
+            launch
+                .reply_to
+                .as_ref()
+                .map(|reply| reply.launch.name.as_str()),
+            Some("briefer"),
+            "the asking conversation is restored, so the report returns there"
         );
     }
 
@@ -683,7 +774,7 @@ mod tests {
             &[crate::ToolCall {
                 id: "call_analyze_e2e".to_string(),
                 name: "analyze".to_string(),
-                arguments: serde_json::json!({"analyze": "analyze this"}),
+                arguments: serde_json::json!({"message": "analyze this"}),
             }],
             None,
         )
@@ -696,7 +787,7 @@ mod tests {
                     crate::ChatMessage::assistant(frame),
                 ],
                 false,
-                Some(("gui", "e2e_user", ws.name.as_str(), "engineer")),
+                BatchMetadata::context("gui", "e2e_user", ws.name.as_str(), "engineer"),
             )
             .await
             .unwrap();
@@ -719,7 +810,7 @@ mod tests {
         );
         let res = crate::agent::CURRENT_TOOL_AGENT_ID
             .scope(Some(agent_id.to_string()), async {
-                tool.execute(ws, serde_json::json!({"analyze": "analyze this"}))
+                tool.execute(ws, serde_json::json!({"message": "analyze this"}))
                     .await
             })
             .await;
@@ -1051,7 +1142,7 @@ mod tests {
                     crate::ChatMessage::tool_result("call_sleep", "Zzz..."),
                 ],
                 false,
-                Some(("gui", "e2e_user", ws.name.as_str(), "assistant")),
+                BatchMetadata::context("gui", "e2e_user", ws.name.as_str(), "assistant"),
             )
             .await
             .unwrap();

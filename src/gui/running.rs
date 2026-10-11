@@ -1,6 +1,6 @@
 //! "Running Agents" dashboard page — a live view of every currently-running
 //! agent and in-flight non-agent LLM work, grouped by WORKSPACE, then by
-//! DIRECT PARENT INVOCATION (ticket / analyze round / research run / custom-role
+//! DIRECT PARENT INVOCATION (ticket / analyze round / research run / branch
 //! launch / workspace singleton / unattributable orchestrator calls).
 //!
 //! The view is read-only: at render time it reads the in-memory registries
@@ -94,13 +94,13 @@ const MAX_GROUP_LABEL_CHARS: usize = 104;
 /// tooltip holds one short line of explanatory text.
 const MAX_METRIC_TOOLTIP_WIDTH: f32 = 360.0;
 
-/// What a Running-Agents stop action stops: a research run or one custom-role
+/// What a Running-Agents stop action stops: a research run or one branch
 /// launch. Carried by the messages and the confirmation state; never rendered
 /// as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StopTarget {
     Research(String),
-    CustomLaunch(String),
+    Launch(String),
 }
 
 /// Messages emitted by the Running Agents page.
@@ -110,7 +110,7 @@ pub(crate) enum StopTarget {
 /// beyond the pending confirmation itself.
 #[derive(Debug, Clone)]
 pub(crate) enum RunningMessage {
-    /// Stop button pressed on a research-run or custom-role group header.
+    /// Stop button pressed on a research-run or branch group header.
     /// Carries the target whose key (run key / launch agent id) is NEVER
     /// rendered as text; the button action alone carries it.
     StopRequest(StopTarget),
@@ -131,7 +131,7 @@ pub(crate) enum RunningMessage {
 /// The page is observational — it reads the live in-memory registries and
 /// renders directly into the dashboard's [`Message`] type; its only
 /// self-emitted messages are the manual-stop flow for research runs and
-/// custom-role launches ([`RunningMessage`]) and the card expand/collapse
+/// branch launches ([`RunningMessage`]) and the card expand/collapse
 /// toggle. `workspaces` is the dashboard's registered-workspace map (name →
 /// info) — used only to mark unregistered/ephemeral workspace sections with the
 /// "(external)" suffix. Everything else comes from the live in-memory
@@ -150,7 +150,7 @@ pub(crate) fn view(
     let calls = crate::agent::registry::NON_AGENT_CALLS.list();
 
     // Workspace-first sections: each section holds its groups, groups
-    // sorted by kind (tickets → analyze rounds → research runs → custom-role
+    // sorted by kind (tickets → analyze rounds → research runs → branch
     // launches → singletons → unattributed), sections alphabetically by name.
     let sections = build_sections(build_groups(&agents, &calls), workspaces);
 
@@ -210,7 +210,7 @@ enum GroupKind {
     Ticket,
     AnalyzeRound,
     Research,
-    CustomRole,
+    Launch,
     Singleton,
     Unattributed,
 }
@@ -256,7 +256,7 @@ impl DisplayGroup {
             GroupKind::Ticket => 0,
             GroupKind::AnalyzeRound => 1,
             GroupKind::Research => 2,
-            GroupKind::CustomRole => 3,
+            GroupKind::Launch => 3,
             GroupKind::Singleton => 4,
             GroupKind::Unattributed => 5,
         };
@@ -271,7 +271,7 @@ fn parent_group_kind(parent: &ParentKey) -> GroupKind {
         ParentKey::Ticket(_) => GroupKind::Ticket,
         ParentKey::AnalyzeRound(_) => GroupKind::AnalyzeRound,
         ParentKey::Research(_) => GroupKind::Research,
-        ParentKey::CustomLaunch(_) => GroupKind::CustomRole,
+        ParentKey::Launch(_) => GroupKind::Launch,
     }
 }
 
@@ -280,9 +280,7 @@ fn parent_group_kind(parent: &ParentKey) -> GroupKind {
 fn parent_group_key(parent: &ParentKey) -> &str {
     match parent {
         ParentKey::Ticket(id) => id,
-        ParentKey::AnalyzeRound(key) | ParentKey::Research(key) | ParentKey::CustomLaunch(key) => {
-            key
-        }
+        ParentKey::AnalyzeRound(key) | ParentKey::Research(key) | ParentKey::Launch(key) => key,
     }
 }
 
@@ -292,7 +290,7 @@ fn parent_group_key(parent: &ParentKey) -> &str {
 ///   ticket parent.
 /// - Analyze rounds: agents + calls sharing an [`ParentKey::AnalyzeRound`] key.
 /// - Research runs: agents + calls sharing an [`ParentKey::Research`] key.
-/// - Custom-role launches: agents + calls sharing a [`ParentKey::CustomLaunch`]
+/// - Branch launches: agents + calls sharing a [`ParentKey::Launch`]
 ///   key (the launch's agent id).
 /// - Workspace singletons: agents with no parent key (manager / maintainer /
 ///   discovery / direct chat).
@@ -303,17 +301,17 @@ fn parent_group_key(parent: &ParentKey) -> &str {
 /// keys are scoped to one workspace, so the extra component closes any
 /// cross-workspace key collision (e.g. two concurrent sync analyze rounds in
 /// different workspaces drawing the same short NanoID suffix). Research and
-/// custom-role groups are matched on (kind, key) alone because a run/launch
+/// branch-launch groups are matched on (kind, key) alone because a run/launch
 /// moves between workspaces:
 /// - a research run's coder round executes in an EPHEMERAL per-run workspace
 ///   whose name IS the run key (job_id) while its analysts and orchestrator
 ///   calls run in the real workspace — a workspace component would split the
 ///   group;
-/// - a custom role's workspace is a property of the LAUNCH, not of the branch,
-///   so a branch launched into a different folder keeps one group: a
-///   custom-launch group is keyed by the branch address alone, so a member
-///   whose recorded workspace differs must join the existing group instead of
-///   splitting into a second section.
+/// - a branch launch's folder is a property of the LAUNCH, not of the branch
+///   identity, so a branch (a custom role's or a coder's) pointed at a
+///   different folder keeps one group: a launch group is keyed by the branch
+///   address alone, so a member whose recorded workspace differs must join the
+///   existing group instead of splitting into a second section.
 ///
 /// The run key / launch agent id is a durable unique id, so (kind, key) stays
 /// unique across workspaces; the group's displayed workspace is resolved to the
@@ -324,7 +322,7 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
     let find_group =
         |kind: GroupKind, key: &str, workspace: &str, groups: &mut Vec<DisplayGroup>| -> usize {
             let research = kind == GroupKind::Research;
-            let workspace_agnostic = research || kind == GroupKind::CustomRole;
+            let workspace_agnostic = research || kind == GroupKind::Launch;
             if let Some(idx) = groups.iter().position(|g| {
                 g.kind == kind && g.key == key && (workspace_agnostic || g.workspace == workspace)
             }) {
@@ -419,7 +417,7 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
 /// Sections are ordered alphabetically by their resolved label (deterministic
 /// — activity-based ordering would flicker as agents come and go); within a
 /// section, groups keep the canonical kind order (tickets → analyze rounds →
-/// research runs → custom-role launches → singletons → unattributed) via
+/// research runs → branch launches → singletons → unattributed) via
 /// [`DisplayGroup::sort_key`].
 fn build_sections(
     groups: Vec<DisplayGroup>,
@@ -473,8 +471,9 @@ fn render_section(
 ///   or the synthesis call), the key becomes the sole label.
 /// - Analyze/research groups: the truncated question/task text; a generic
 ///   fallback when no label was captured. The raw NanoID key is NEVER shown.
-/// - Custom-role launches: the display label built at spawn (role name plus
-///   the branch identifier when named); a generic fallback when absent.
+/// - Branch launches: the display label built at spawn (a custom role's name
+///   plus its branch identifier when named, or a coder branch's own label); a
+///   generic fallback when absent.
 /// - Singleton/unattributed groups: generic labels — their workspace name is
 ///   already the section grouping, so repeating it would be redundant.
 fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
@@ -497,11 +496,11 @@ fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
             ),
             None,
         ),
-        GroupKind::CustomRole => (
+        GroupKind::Launch => (
             group
                 .label
                 .as_deref()
-                .map_or_else(|| "Custom role".to_string(), str::to_string),
+                .map_or_else(|| "Launch".to_string(), str::to_string),
             None,
         ),
         GroupKind::Singleton => ("Standalone".to_string(), None),
@@ -545,13 +544,13 @@ fn render_group(
         );
     }
     // Manual stop: danger-styled button on RESEARCH-run group headers ("Cancel
-    // run" — the run is removed permanently) and on CUSTOM-ROLE launch headers
+    // run" — the run is removed permanently) and on BRANCH launch headers
     // ("Stop launch" — the branch is marked stopped, not erased). The group key
     // (run key / launch agent id) is carried by the message, never rendered as
     // text.
     let stop = match group.kind {
         GroupKind::Research => Some(("Cancel run", StopTarget::Research(group.key.clone()))),
-        GroupKind::CustomRole => Some(("Stop launch", StopTarget::CustomLaunch(group.key.clone()))),
+        GroupKind::Launch => Some(("Stop launch", StopTarget::Launch(group.key.clone()))),
         _ => None,
     };
     if let Some((label, target)) = stop {
@@ -589,7 +588,7 @@ fn render_group(
 }
 
 /// Build the manual-stop confirmation dialog for a research run or a
-/// custom-role launch, mirroring the board's ticket-cancel pattern:
+/// branch launch, mirroring the board's ticket-cancel pattern:
 /// consequences listed, danger confirm button, Keep/Dismiss (and Escape/
 /// backdrop) to close with no effect.
 ///
@@ -613,7 +612,7 @@ fn stop_confirm_dialog(target: &StopTarget) -> Element<'static, RunningMessage> 
             "Keep run",
             "Cancel run",
         ),
-        StopTarget::CustomLaunch(_) => (
+        StopTarget::Launch(_) => (
             "Stop this launch?",
             &[
                 "Confirming will:",
