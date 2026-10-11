@@ -106,11 +106,12 @@ impl Tool for MahbotConfigTool {
                         "(add_user / create_custom_role / update_custom_role / \
                          delete_custom_role) For a new user: their display name, which is also the \
                          name of their personal workspace folder, so it must be one every platform \
-                         the service runs on can create: {}. For a custom role: the role's name — \
-                         short, ASCII letters, digits, '_' and '-' only, starting with a letter, \
-                         and not colliding with a built-in agent namespace (so not `ticket`, \
-                         `maintainer`, `manager`, `role`, ...).",
-                        crate::util::folder_name::RULE_SUMMARY
+                         the service runs on can create: {}. {} For a custom role: the role's \
+                         name — short, ASCII letters, digits, '_' and '-' only, starting with a \
+                         letter, and not colliding with a built-in agent namespace (so not \
+                         `ticket`, `maintainer`, `manager`, `role`, ...).",
+                        crate::util::folder_name::RULE_SUMMARY,
+                        crate::users::NAME_COLLISION_RULE
                     )
                 },
                 "prompt": {
@@ -214,7 +215,8 @@ impl MahbotConfigTool {
         // before any store access — whether this action creates the account or
         // only finishes binding one. A name that would become a new account's
         // folder is checked by `add_user`, which refuses it before its row
-        // exists; a name that already identifies one is never re-judged there.
+        // exists — the folder rule and the case/composition collision alike; a
+        // name that already identifies one is never re-judged there.
         crate::users::refuse_admin_name(name)?;
 
         let store = crate::users::store();
@@ -611,6 +613,37 @@ mod tests {
         assert!(
             err.contains("only guest accounts can be created"),
             "the reserved admin name must be refused, got: {err}"
+        );
+    }
+
+    /// The account-naming rule reaches this path too: a name that, ignoring
+    /// case, is an existing account's is refused by `add_user`, before any row
+    /// or folder exists for it.
+    #[tokio::test]
+    async fn add_user_refuses_a_name_an_existing_account_matches_ignoring_case() {
+        crate::util::test::init_test_stores().await;
+        let tool = MahbotConfigTool;
+        let ws = test_ws("/tmp/test_ws");
+        crate::users::store().add_user("CaseGuest").await.unwrap();
+
+        let err = tool
+            .execute(
+                &ws,
+                json!({ "action": "add_user", "name": "caseguest", "telegram": "@case_guest" }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&crate::users::name_taken_message("caseguest")),
+            "a colliding name must be refused the way an exact duplicate is, got: {err}"
+        );
+        assert!(
+            !crate::users::store()
+                .user_exists("caseguest")
+                .await
+                .unwrap(),
+            "a refused name must not leave an account row"
         );
     }
 

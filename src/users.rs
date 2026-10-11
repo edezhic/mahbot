@@ -9,14 +9,21 @@
 //!   account holds at most one Telegram binding, so the two are alternatives.
 //!
 //! Account identity is independent of any external channel. Changing a Telegram
-//! `@username` does not affect the account's identity. Accounts are created via
-//! the GUI dashboard, and channels are bound explicitly.
+//! `@username` does not affect the account's identity. Accounts are created from
+//! the desktop's Settings → Users page or by the assistant's `mahbot_config`
+//! tool, and channels are bound explicitly.
 //!
 //! ## Accounts
 //!
 //! The admin is the one account named [`ADMIN_USER_NAME`] ([`is_admin_name`]);
 //! every other account is a guest. Every account routes to the single
 //! Assistant, so no account stores an agent-role selection.
+//!
+//! A name is the account's identity AND the name of its personal-workspace
+//! folder, so a name about to become a new account is refused when an existing
+//! account's or the admin's name is the same once case and Unicode composition
+//! are ignored ([`NAME_COLLISION_RULE`]). Only a genuinely new name is judged —
+//! an account that is already stored keeps its name.
 //!
 //! ## Personal workspaces
 //!
@@ -36,6 +43,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use tracing::{error, warn};
+use unicase::UniCase;
+use unicode_normalization::UnicodeNormalization;
 
 /// Sentinel that `extract_sender_user_name` (src/channels/telegram.rs)
 /// substitutes for Telegram senders without an @username. It is no nickname
@@ -215,10 +224,13 @@ impl UserStore {
 
     /// Create an account: the seeding path for the admin, and the path
     /// user-facing callers use for guests — those must refuse the reserved
-    /// admin name first ([`refuse_admin_name`]). Also creates the personal
-    /// workspace directory under `~/.mahbot/userspaces/<name>/` with `git init`
-    /// (non-fatal on failure, but reported). Idempotent — re-adding an existing
-    /// account preserves its stored preferences.
+    /// admin name first ([`refuse_admin_name`]). A name about to become a new
+    /// account must also pass the collision rule
+    /// ([`UserStore::refuse_colliding_name`]) — the reserved admin name itself
+    /// is exempt. Also creates the personal workspace directory under
+    /// `~/.mahbot/userspaces/<name>/` with `git init` (non-fatal on failure, but
+    /// reported). Idempotent — re-adding an existing account preserves its
+    /// stored preferences.
     pub async fn add_user(&self, name: &str) -> Result<()> {
         // Only a name that becomes a new account's own folder has to satisfy
         // the folder rule: an account that is already stored keeps the name it
@@ -227,6 +239,12 @@ impl UserStore {
         // rule the moment it is about to create one.
         if !self.user_exists(name).await? {
             validate_folder_name(name)?;
+            // The admin's own name is exempt: bootstrapping the owner account
+            // must never fail, and every user-facing path refuses that name
+            // before reaching the store ([`refuse_admin_name`]).
+            if !is_admin_name(name) {
+                self.refuse_colliding_name(name).await?;
+            }
         }
         self.conn
             .execute(
@@ -239,6 +257,31 @@ impl UserStore {
         // — the account still exists either way.
         if let Err(e) = ensure_personal_workspace(name).await {
             self.report_personal_workspace_failure(name, &e).await;
+        }
+        Ok(())
+    }
+
+    /// Refuse a name about to become a NEW account when, with case and Unicode
+    /// composition ignored, it is an existing account's or the admin's name:
+    /// macOS resolves such spellings to one and the same personal-workspace
+    /// folder, and Windows — case-insensitive by default — the case difference
+    /// alone, so the new account would read and write the other's files.
+    ///
+    /// The comparison covers every stored name plus the reserved admin name,
+    /// whose row [`UserStore::ensure_admin_user`] may not have seeded yet. The
+    /// rule is the same on every platform — it is about which account is meant,
+    /// not about the volume this process happens to run on.
+    async fn refuse_colliding_name(&self, name: &str) -> Result<()> {
+        let key = caseless_name_key(name);
+        // A stored name byte-identical to this one is the idempotent re-add of
+        // an account that already exists — the one thing this rule never judges
+        // — so it is no collision however the two reads interleave. The reserved
+        // admin name is in the set whether or not its row exists.
+        let collides = std::iter::once(ADMIN_USER_NAME)
+            .chain(self.user_names().await?.iter().map(String::as_str))
+            .any(|existing| existing != name && caseless_name_key(existing) == key);
+        if collides {
+            anyhow::bail!("{}", name_taken_message(name));
         }
         Ok(())
     }
@@ -342,6 +385,20 @@ impl UserStore {
             .query("SELECT 1 FROM users WHERE name = ?1", db::params![name])
             .await?;
         Ok(!rows.is_empty())
+    }
+
+    /// Every stored account name, byte-exact as stored — what a name about to
+    /// become a new account is compared against.
+    async fn user_names(&self) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query("SELECT name FROM users", db::params![])
+            .await?;
+        let mut names = Vec::with_capacity(rows.len());
+        for row in rows {
+            names.push(row.get::<String>(0)?);
+        }
+        Ok(names)
     }
 
     // ── Channel bindings ──────────────────────────────────────
@@ -895,6 +952,8 @@ pub(crate) fn is_admin_name(name: &str) -> bool {
 /// Refuse the reserved admin name on a user-facing account path: only
 /// [`UserStore::ensure_admin_user`] may create the admin account, and the name
 /// IS the admin marker, so binding a channel to it would address the admin.
+/// [`UserStore::add_user`] exempts the same name from the collision rule, for
+/// that one seeding path.
 pub(crate) fn refuse_admin_name(name: &str) -> Result<()> {
     if is_admin_name(name) {
         anyhow::bail!(
@@ -902,6 +961,30 @@ pub(crate) fn refuse_admin_name(name: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The other half of the account-name rule, in the words the surfaces that
+/// propose a name use (the desktop's add-user dialog and the account-adding
+/// tool): the name of a new account is refused when another account or the
+/// admin already holds it once case and Unicode composition are ignored.
+pub(crate) const NAME_COLLISION_RULE: &str = "A new account's name is also refused when another \
+     account or the admin already has it, ignoring case and Unicode composition — on macOS those \
+     spellings are one folder, on Windows a case difference alone already is.";
+
+/// The message every taken-name refusal carries — the exact duplicate and the
+/// case/composition collision alike, so a surface reports both the same way.
+pub(crate) fn name_taken_message(name: &str) -> String {
+    format!("A user named '{name}' already exists")
+}
+
+/// The form two account names collide in: `NFD(toCasefold(NFD(name)))`, the
+/// canonical caseless matching of the Unicode standard — what
+/// [`UserStore::refuse_colliding_name`] judges by. Folding is the *full* one, so
+/// `ß` and `ss` (and a three-character `ﬃ` and `ffi`) are one key; decomposition
+/// is canonical, so composed and decomposed accents are one key.
+fn caseless_name_key(name: &str) -> String {
+    let decomposed: String = name.nfd().collect();
+    UniCase::new(decomposed).to_folded_case().nfd().collect()
 }
 
 /// Refuse a name the account's personal-workspace folder cannot be built from.
@@ -920,7 +1003,9 @@ fn validate_folder_name(name: &str) -> Result<()> {
 
 /// Both guards, for a name that is about to become a new account: the reserved
 /// admin name ([`refuse_admin_name`]) and the folder rule
-/// ([`validate_folder_name`]).
+/// ([`validate_folder_name`]). The third — the collision with an existing name
+/// ([`NAME_COLLISION_RULE`]) — needs the store, and lives in
+/// [`UserStore::add_user`], the funnel every creation path goes through.
 pub(crate) fn validate_new_user_name(name: &str) -> Result<()> {
     refuse_admin_name(name)?;
     validate_folder_name(name)
@@ -1656,6 +1741,149 @@ mod tests {
             !userspaces_root().join("../evil").exists(),
             "a parent reference must not escape the userspaces root"
         );
+    }
+
+    /// A new name that is an existing account's or the admin's name once case
+    /// and Unicode composition are ignored is refused the way an exact
+    /// duplicate is, and leaves nothing behind: no row, no folder.
+    #[tokio::test]
+    async fn add_user_refuses_a_name_an_existing_one_matches_ignoring_case_and_composition() {
+        let (store, _dir) = crate::open_test_store!(UserStore, "user");
+        // Names no other test holds: the userspaces root is shared by every test
+        // in this process, and a folder another test created first would be the
+        // one this test's assertions read back.
+        let composed = "Caf\u{e9}Collide";
+        let decomposed = "Cafe\u{301}Collide";
+        let ligature = "Liga\u{fb03}Collide";
+        store.add_user("AliceCollide").await.unwrap();
+        store.add_user(composed).await.unwrap();
+        store.add_user("stra\u{df}eCollide").await.unwrap();
+        store.add_user(ligature).await.unwrap();
+
+        // Every difference the comparison must ignore: case, Unicode
+        // composition, and the full case folding this volume itself applies —
+        // `ß` and `ss` are one letter, and so are a three-character fold's
+        // `ﬃ` and `ffi`; plus the admin's own name.
+        for colliding in [
+            "alicecollide",
+            "ALICECOLLIDE",
+            decomposed,
+            "Admin",
+            "ADMIN",
+            "STRASSECOLLIDE",
+            "strassecollide",
+            "LigaffiCollide",
+        ] {
+            let err = store.add_user(colliding).await.unwrap_err().to_string();
+            assert_eq!(
+                err,
+                name_taken_message(colliding),
+                "a colliding name must be refused like an exact duplicate"
+            );
+            assert!(
+                !store.user_exists(colliding).await.unwrap(),
+                "a refused name must not leave an account row"
+            );
+        }
+
+        // Nothing half-created: no row (asserted above), and no folder of its
+        // own. On this case-insensitive volume a folder created for a refused
+        // spelling would BE the accepted account's folder, so what is checked
+        // here is the entry names — the accepted spellings kept verbatim, and no
+        // refused spelling an entry, which is what a case-sensitive host shows.
+        let folders = userspace_folder_names();
+        for accepted in ["AliceCollide", composed, "stra\u{df}eCollide", ligature] {
+            assert!(
+                folders.iter().any(|folder| folder == accepted),
+                "'{accepted}' must keep the folder it was created with: {folders:?}"
+            );
+        }
+        for refused in [
+            "ALICECOLLIDE",
+            decomposed,
+            "strassecollide",
+            "LigaffiCollide",
+        ] {
+            assert!(
+                !folders.iter().any(|folder| folder == refused),
+                "'{refused}' must not be a folder: {folders:?}"
+            );
+        }
+
+        // Only the equivalences the volume itself applies are ignored: a name
+        // matching nothing under them is still accepted, verbatim, and gets its
+        // folder like any other.
+        store.add_user("AliceCollide2").await.unwrap();
+        assert!(
+            userspace_folder_names()
+                .iter()
+                .any(|folder| folder == "AliceCollide2"),
+            "an accepted name keeps its account and its folder"
+        );
+    }
+
+    /// The owner's own name is never refused and a stored account is never
+    /// re-judged: the reserved name is refused for a case variant that is not
+    /// the owner even with no row of its own to compare against, bootstrapping
+    /// the owner succeeds beside a guest holding such a variant, and completing
+    /// that stored guest is accepted — the rule judges only names it is about to
+    /// create.
+    #[tokio::test]
+    async fn add_user_never_refuses_the_admin_or_a_stored_name() {
+        let (store, _dir) = crate::open_test_store!(UserStore, "user");
+        // The store's own bring-up seeded the owner; the rule is judged for it
+        // exactly when its row is absent.
+        store.delete_user(ADMIN_USER_NAME).await.unwrap();
+
+        // A case variant of the reserved name is not the owner, and is refused
+        // by the reserved name itself — which is in the comparison set whether or
+        // not its row exists.
+        let err = store.add_user("Admin").await.unwrap_err().to_string();
+        assert_eq!(
+            err,
+            name_taken_message("Admin"),
+            "the reserved owner name must collide even with no row of its own"
+        );
+
+        // A pre-existing installation can hold a guest whose name is a case
+        // variant of the owner's, inserted directly because `add_user` now
+        // refuses to create it — which is the point.
+        store
+            .conn
+            .execute(
+                "INSERT INTO users (name) VALUES (?1)",
+                crate::db::params!["ADMIN"],
+            )
+            .await
+            .unwrap();
+
+        // Bootstrap beside it: the reserved name is exempt, so the owner row is
+        // created rather than refused, and the start-up is never blocked.
+        store.ensure_admin_user().await.unwrap();
+        assert!(
+            store.user_exists(ADMIN_USER_NAME).await.unwrap(),
+            "bootstrapping the owner account must never be blocked by the rule"
+        );
+
+        store.add_user("ADMIN").await.unwrap();
+        assert!(
+            store.user_exists("ADMIN").await.unwrap(),
+            "a stored name is completed, not re-judged"
+        );
+    }
+
+    /// The personal-folder names present in the userspaces root, spelled as the
+    /// filesystem stores them.
+    fn userspace_folder_names() -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(userspaces_root()) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     /// A name that already identifies an account is never re-judged: an account

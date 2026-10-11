@@ -1538,12 +1538,15 @@ impl SettingsState {
                         // Reject a duplicate name here too: the Settings bypass has no
                         // way to complete a leftover unbound row, so a duplicate would
                         // silently no-op (INSERT OR IGNORE) while reporting success.
+                        // A name that only matches by case or Unicode composition
+                        // passes this and is refused by `add_user`, with the same
+                        // message.
                         if store
                             .user_exists(&sender)
                             .await
                             .map_err(|e| e.to_string())?
                         {
-                            return Err(format!("A user named '{sender}' already exists"));
+                            return Err(crate::users::name_taken_message(&sender));
                         }
                         store.add_user(&sender).await.map_err(|e| e.to_string())?;
                         Ok(())
@@ -2932,8 +2935,9 @@ impl SettingsState {
         let mut middle = Column::new().push(
             text(format!(
                 "The name is also the folder of this account's personal workspace, so it must be \
-                 one every platform can create: {}.",
-                crate::util::folder_name::RULE_SUMMARY
+                 one every platform can create: {}. {}",
+                crate::util::folder_name::RULE_SUMMARY,
+                crate::users::NAME_COLLISION_RULE
             ))
             .size(theme::TEXT_11)
             .color(theme::TEXT_SECONDARY),
