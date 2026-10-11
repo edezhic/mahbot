@@ -13,9 +13,9 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 
-const GET_TICKET_DESC_MAX: usize = 500;
-const GET_TICKET_COMMENT_MAX: usize = 200;
-const GET_TICKET_LAST_N_FULL: usize = 3;
+pub(crate) const GET_TICKET_DESC_MAX: usize = 500;
+pub(crate) const GET_TICKET_COMMENT_MAX: usize = 200;
+pub(crate) const GET_TICKET_LAST_N_FULL: usize = 3;
 
 // ── Ticket ID resolution ─────────────────────────────────────────
 
@@ -53,7 +53,10 @@ fn resolve_any_ticket_id(ws_name: &str, raw: &str) -> Result<String> {
 /// `Some(prefix)` for a well-formed `{prefix}-{seq}` argument, in which case
 /// `id` is `raw` trimmed, i.e. the full prefixed ticket ID. The prefix shape
 /// mirrors `workspace::validate_name` ([a-zA-Z_]+ starting with a letter).
-fn parse_ticket_id(raw: &str) -> Result<(Option<&str>, &str)> {
+///
+/// Shared with the admin's `workspace` tool, which accepts only the full
+/// `<workspace>-<number>` spelling and refuses every other one.
+pub(crate) fn parse_ticket_id(raw: &str) -> Result<(Option<&str>, &str)> {
     let id = raw.trim();
     anyhow::ensure!(!id.is_empty(), "Ticket ID must not be empty");
     let seq_ok = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());

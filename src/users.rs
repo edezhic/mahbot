@@ -1164,10 +1164,11 @@ pub(crate) async fn resolve_selected_workspace_name(user_name: &str) -> Option<S
 /// `workspaces` rows, and a legacy row carrying a `personal:{user}` name is
 /// filtered out.
 ///
-/// Three consumers: the active-workspace switcher (the choices), the Assistant's
-/// `workspace_control list` (the same set, reported with each row's status and
-/// pause state), and the admin's write policy, which refuses a write inside any
-/// of them.
+/// Four consumers: the active-workspace switcher (the choices, and whether it
+/// exists at all — [`workspace_switcher_available`]), the Assistant's `workspace`
+/// tool (the whole set for `list` / `board` / `pause` / `resume`, and the set a
+/// ticket id's workspace prefix must belong to), and the admin's write policy,
+/// which refuses a write inside any of them.
 pub async fn registered_workspaces() -> Result<Vec<Workspace>> {
     let store = crate::workspace::WORKSPACES
         .get()

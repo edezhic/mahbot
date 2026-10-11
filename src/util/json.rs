@@ -83,6 +83,19 @@ pub(crate) fn get_opt_str<'a>(val: &'a Value, key: &str) -> Option<&'a str> {
     val.get(key).and_then(Value::as_str)
 }
 
+/// Extract an optional string field, distinguishing absent (or explicit null)
+/// from a present value: the deliberately silent [`get_opt_str`] would let a
+/// wrong-typed value masquerade as absent, so a present non-string is refused.
+pub(crate) fn get_opt_str_strict<'a>(val: &'a Value, key: &str) -> anyhow::Result<Option<&'a str>> {
+    match val.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| wrong_type(key, "a string", v)),
+    }
+}
+
 /// Extract a boolean field with default value.
 ///
 /// Absent or null yields `default`; a present non-boolean is a usage error.

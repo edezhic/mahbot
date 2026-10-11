@@ -1181,6 +1181,22 @@ impl Dashboard {
     /// Process a Settings message, optionally reloading the workspace map when
     /// workspaces are added or deleted.
     fn process_settings_message(&mut self, msg: settings::SettingsMessage) -> Task<Message> {
+        // Activation is the Dashboard's own write and feedback, never the
+        // Settings state's (see `activate_workspace`).
+        if let settings::SettingsMessage::ActivateWorkspace(name) = msg {
+            return self.activate_workspace(&name);
+        }
+        // Registering activates the new workspace on every path (the `workspace`
+        // tool's own `add` does the same). The row is seeded into the shared map
+        // so the picker renders it at once and the activation's own map-guard
+        // sees the workspace it just created; the reload this message already
+        // triggers below is what confirms it.
+        let activation = if let settings::SettingsMessage::AddWorkspaceResult(Ok(ws)) = &msg {
+            self.workspaces.insert(ws.name.clone(), ws.clone());
+            Some(self.activate_workspace(&ws.name))
+        } else {
+            None
+        };
         // Any successful Settings-side workspace mutation (add, delete,
         // reanalyze, diagnostics/notes edits) refreshes the shared
         // workspace map from one full DB read — the map is the single source
@@ -1200,11 +1216,14 @@ impl Dashboard {
         );
 
         let settings_task = self.settings_state.update(msg).map(Message::Settings);
-
-        if needs_global_reload {
+        let tail = if needs_global_reload {
             Task::batch([settings_task, self.reload_workspace_map()])
         } else {
             settings_task
+        };
+        match activation {
+            Some(activation) => Task::batch([tail, activation]),
+            None => tail,
         }
     }
 
@@ -1874,8 +1893,8 @@ impl Dashboard {
 
     /// Apply a workspace selection in memory and broadcast it to all pages,
     /// without writing the DB. Used where the DB write happened (or happens)
-    /// elsewhere — the footer picker's [`Self::select_workspace`] and the
-    /// read-back in the `Message::ActiveWorkspaceSynced` arm.
+    /// elsewhere — [`Self::switch_workspace`] and the read-back in the
+    /// `Message::ActiveWorkspaceSynced` arm.
     fn apply_workspace_selection(&mut self, name: &str) -> Task<Message> {
         // Git state is cleared and eagerly refreshed below via
         // propagate_workspace_selection → set_workspace_path.
@@ -1883,38 +1902,98 @@ impl Dashboard {
         self.propagate_workspace_selection(name)
     }
 
-    /// Canonical entry point for workspace switching in the dashboard: applies
-    /// the selection in memory and persists it as the admin's
-    /// `users.selected_workspace` (the DB is the single source of truth; a
-    /// personal selection stores NULL). The DB write is best-effort — failures
-    /// are logged, the GUI selection still applies.
-    ///
-    /// A name missing from the workspace map is never persisted: the picker
-    /// renders from the map, so a reload that dropped the picked name between
-    /// render and click must not write a dangling value into the DB. The
-    /// in-memory selection still applies; the DB read-back decides if it stands.
-    fn select_workspace(&mut self, name: &str) -> Task<Message> {
+    /// The one workspace-switch path, shared by the footer picker, the Settings
+    /// projects list and the Settings add form: apply `name` in memory — so a
+    /// completion landing after a newer pick can never revert it — and persist it
+    /// through a [`Self::selection_persistable`]-guarded write.
+    fn switch_workspace(
+        &mut self,
+        name: &str,
+        feedback: fn(Result<String, String>) -> Message,
+    ) -> Task<Message> {
         let propagate = self.apply_workspace_selection(name);
-        let known = crate::users::is_personal_workspace(name) || self.workspaces.contains_key(name);
         // Supersedes any in-flight read-back (see `active_workspace_gen`).
         self.active_workspace_gen += 1;
-        let db_write = known.then(|| {
-            let ws = name.to_string();
-            Task::perform(
-                async move {
-                    if let Err(e) = users::set_selected_workspace_field(
-                        crate::users::ADMIN_USER_NAME.to_string(),
-                        ws,
-                    )
-                    .await
-                    {
-                        tracing::warn!(error = %e, "Failed to persist workspace selection");
-                    }
-                },
-                |()| Message::Nop,
-            )
-        });
-        Task::batch(std::iter::once(propagate).chain(db_write))
+        let write = self
+            .selection_persistable(name)
+            .then(|| Self::persist_active_workspace(name.to_string(), feedback));
+        Task::batch(std::iter::once(propagate).chain(write))
+    }
+
+    /// Whether a pick may be written to the DB: a shared name only when the
+    /// loaded map carries it — the map can drop one between render and click, and
+    /// the DB must not gain a dangling value (the in-memory selection still
+    /// applies; the read-back decides if it stands). A personal space is always
+    /// writable: the map holds registered workspaces only and so never carries
+    /// one, and the write stores NULL — the product's own "no shared workspace
+    /// selected", from which it computes the personal workspace on the fly.
+    fn selection_persistable(&self, name: &str) -> bool {
+        crate::users::is_personal_workspace(name) || self.workspaces.contains_key(name)
+    }
+
+    /// Persist `name` as the admin's active workspace. A failure is always logged
+    /// here; `feedback` decides what the caller hears on top of that — the footer
+    /// picker drops it (`Message::Nop`), the Settings side turns it into a toast.
+    fn persist_active_workspace(
+        name: String,
+        feedback: fn(Result<String, String>) -> Message,
+    ) -> Task<Message> {
+        Task::perform(
+            async move {
+                users::set_selected_workspace_field(
+                    crate::users::ADMIN_USER_NAME.to_string(),
+                    name.clone(),
+                )
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(error = %e, "Failed to persist workspace selection");
+                })
+                .map(|()| name)
+            },
+            feedback,
+        )
+    }
+
+    /// The footer picker's switch: [`Self::switch_workspace`] with logging-only
+    /// feedback — a failed write here is logged, not toasted.
+    fn select_workspace(&mut self, name: &str) -> Task<Message> {
+        self.switch_workspace(name, |_| Message::Nop)
+    }
+
+    /// Make a workspace the active one from the Settings side — the projects
+    /// list's make-active action and the add form's automatic activation. Same
+    /// switch path as the picker, but the Settings section's own feedback: the
+    /// no-op of asking for the workspace that is already active, and a failed
+    /// write reported rather than only logged.
+    fn activate_workspace(&mut self, name: &str) -> Task<Message> {
+        if self.active_workspace_name_ref() == Some(name) {
+            // Reported through the same toast vocabulary as every other
+            // activation outcome (see `activation_toast`).
+            let already = ToastMessage::Warning(format!("Workspace '{name}' is already active."));
+            return self.push_toast_msg(&already);
+        }
+        self.switch_workspace(name, Self::activation_feedback)
+    }
+
+    /// The activation write's feedback, through the Settings section's own toast
+    /// message (intercepted by [`Message::as_toast`]) rather than a message of
+    /// its own — so a failure carries the same `Failed: …` wording as the
+    /// section's other error toasts.
+    fn activation_feedback(outcome: Result<String, String>) -> Message {
+        Message::Settings(settings::SettingsMessage::WorkspaceMsg(
+            workspaces::WorkspacesMessage::Toast(Self::activation_toast(outcome)),
+        ))
+    }
+
+    /// What the Settings project list reports for a completed activation write:
+    /// the write's success, or its failure. The already-active no-op is not a
+    /// write and so is not one of these outcomes —
+    /// [`Self::activate_workspace`] reports it itself, as a warning.
+    fn activation_toast(outcome: Result<String, String>) -> ToastMessage {
+        match outcome {
+            Ok(name) => ToastMessage::SuccessMsg(format!("Active workspace: {name}")),
+            Err(e) => ToastMessage::Error(e),
+        }
     }
 
     /// Propagate the global workspace selection to the Home page, then push the
@@ -2045,18 +2124,20 @@ impl Dashboard {
     /// Return the selected shared-workspace name, or `None` if the "Personal"
     /// workspace is selected (no shared workspace).
     fn active_workspace_name(&self) -> Option<String> {
-        match self.selected_workspace_name.as_deref() {
-            Some(n) if !crate::users::is_personal_workspace(n) => Some(n.to_string()),
-            _ => None,
-        }
+        self.active_workspace_name_ref().map(str::to_string)
+    }
+
+    /// Borrowed counterpart of [`Self::active_workspace_name`]: view code cannot
+    /// lend the borrowed page an owned `String`.
+    fn active_workspace_name_ref(&self) -> Option<&str> {
+        self.selected_workspace_name
+            .as_deref()
+            .filter(|n| !crate::users::is_personal_workspace(n))
     }
 
     /// Returns `true` when a shared (non-Personal) workspace is selected.
-    /// Avoids the allocation of [`active_workspace_name`] for presence-only checks.
     fn has_active_workspace(&self) -> bool {
-        self.selected_workspace_name
-            .as_deref()
-            .is_some_and(|n| !crate::users::is_personal_workspace(n))
+        self.active_workspace_name_ref().is_some()
     }
 
     /// Whether a dashboard-level overlay modal is open over the current page.
@@ -2173,10 +2254,12 @@ impl Dashboard {
                     unresolved_workspace_page(Page::Editor)
                 }
             }
-            Page::Settings => self
-                .settings_state
-                .view(self.workspaces_error.as_deref())
-                .map(Message::Settings),
+            Page::Settings => {
+                let active = self.active_workspace_name_ref();
+                self.settings_state
+                    .view(self.workspaces_error.as_deref(), active)
+                    .map(Message::Settings)
+            }
             Page::RunningAgents => running::view(
                 &self.workspaces,
                 self.pending_stop.as_ref(),
@@ -3092,7 +3175,7 @@ impl Dashboard {
             // workspace as a static label (140px, matching the dropdown's
             // footprint so the footer chrome doesn't shift).
             let sole = &options[0];
-            let label = if self.active_workspace_name().as_deref() == Some(sole.value.as_str()) {
+            let label = if self.active_workspace_name_ref() == Some(sole.value.as_str()) {
                 sole.label.clone()
             } else {
                 "Select workspace".to_string()
@@ -4028,6 +4111,52 @@ mod tests {
         // DB says otherwise.
         let _ = dash.update(reloaded(HashMap::from([("ws1".to_string(), ws("ws1"))])));
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("late"));
+    }
+
+    /// The Settings activation: asking for the workspace that is already active
+    /// changes nothing and says so, and any other pick applies in memory at once
+    /// — superseding any in-flight read-back — while a name the loaded map does
+    /// not carry still applies but is not persisted.
+    #[test]
+    fn activate_workspace_applies_at_once_and_no_ops_the_active_one() {
+        let mut dash = ready_dashboard();
+        dash.workspaces = HashMap::from([
+            ("ws1".to_string(), ws("ws1")),
+            ("ws2".to_string(), ws("ws2")),
+        ]);
+        dash.selected_workspace_name = Some("ws1".to_string());
+
+        let generation = dash.active_workspace_gen;
+        let _ = dash.activate_workspace("ws1");
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
+        assert_eq!(
+            dash.active_workspace_gen, generation,
+            "the already-active no-op must not supersede anything"
+        );
+        assert!(
+            dash.toasts
+                .last()
+                .is_some_and(|t| t.message.contains("already active")),
+            "the no-op must say so: {:?}",
+            dash.toasts
+        );
+
+        let _ = dash.activate_workspace("ws2");
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws2"));
+        assert_eq!(dash.active_workspace_gen, generation + 1);
+
+        // Not in the map: applied in memory (the DB read-back decides), nothing
+        // is written.
+        let _ = dash.activate_workspace("late");
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("late"));
+        assert_eq!(dash.active_workspace_gen, generation + 2);
+
+        // What may be written: a shared name only when the map carries it, a
+        // personal space always (the map never carries one, and it is stored as
+        // NULL — the product's own "no shared workspace selected").
+        assert!(dash.selection_persistable("personal:admin"));
+        assert!(dash.selection_persistable("ws2"));
+        assert!(!dash.selection_persistable("late"));
     }
 
     #[test]

@@ -269,7 +269,7 @@ use crate::tools::{
     ImageGenTool, ListAlarmsTool, ListTicketsTool, MahbotConfigTool, MahbotDebugTool, ReadTool,
     RemoveAlarmTool, SearchArchivedTicketsTool, SearchTool, SendTool, ShellMode, ShellTool,
     SleepTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
-    WorkspaceControlTool,
+    WorkspaceTool,
 };
 
 impl Role {
@@ -387,12 +387,9 @@ impl Role {
             // migrated over from the removed Support role.
             t.push(Box::new(MahbotConfigTool));
             t.push(Box::new(MahbotDebugTool));
-            // The admin's project-pipeline control: freeze/unfreeze a
-            // named workspace's pipeline and list the registered
-            // workspaces with their pause state. The one project action
-            // the Assistant performs itself instead of forwarding to
-            // the Manager (see `role/assistant_admin.md`).
-            t.push(Box::new(WorkspaceControlTool));
+            // The admin's own project view: list / add / board / ticket /
+            // comment / pause / resume over the registered workspaces.
+            t.push(Box::new(WorkspaceTool));
         }
         t
     }
@@ -407,7 +404,7 @@ impl Role {
     /// `is_admin` says whether the triggering account is the admin. It only
     /// widens the Assistant's toolset: `shell`, `send`,
     /// `computer`, `mahbot_config`, `mahbot_debug` and
-    /// `workspace_control` are added.
+    /// `workspace` are added.
     /// Every other role's toolset is byte-identical regardless of its value.
     /// `computer` exists only where the capability does: on macOS it is
     /// withdrawn, so the admin's toolset there has no such tool (see
@@ -1041,13 +1038,13 @@ mod tests {
     fn admin_only_tools_only_in_admin_assistant() {
         // Acceptance pin: the admin's administrative tools — the merged
         // `mahbot_config` setup tool, the read-only `mahbot_debug` query tool and
-        // `workspace_control` (the registered workspaces' pipeline
-        // pause/resume/list) — live in the admin's Assistant's own static tool set
-        // and in no other role's static set. A guest's Assistant and every other
-        // role must never advertise any of them here. (A custom role may
-        // additionally choose them from the catalogue derived from that admin
-        // set, `assistant_core_tools(true)`, which this static-set pin does not
-        // cover.)
+        // `workspace` (the assistant's own project view: list / add / board /
+        // ticket / comment / pause / resume) — live in the admin's Assistant's own
+        // static tool set and in no other role's static set. A guest's Assistant
+        // and every other role must never advertise any of them here. (A custom
+        // role may additionally choose them from the catalogue derived from that
+        // admin set, `assistant_core_tools(true)`, which this static-set pin does
+        // not cover.)
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
             for is_admin in [false, true] {
@@ -1056,7 +1053,7 @@ mod tests {
                     .iter()
                     .map(|t| t.name())
                     .collect();
-                for name in ["mahbot_config", "mahbot_debug", "workspace_control"] {
+                for name in ["mahbot_config", "mahbot_debug", "workspace"] {
                     let has = names.contains(&name);
                     if role == crate::Role::Assistant && is_admin {
                         assert!(has, "the admin's Assistant must advertise `{name}`");

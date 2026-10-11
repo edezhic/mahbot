@@ -266,7 +266,7 @@ pub struct Workspace {
     /// by a `mahbot paused` launch, which pauses every registered workspace
     /// before the poll loop starts.
     /// Lifted via the normal unpause path (GUI toggle, the admin's
-    /// `workspace_control` chat tool, or rediscovery; the nightly loop skips
+    /// `workspace` chat tool, or rediscovery; the nightly loop skips
     /// paused workspaces). A discovery already in flight when the pause lands
     /// clears it on completion without checking who set it: the round stopped by
     /// that failure replays once and freezes the workspace again — see

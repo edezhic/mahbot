@@ -1,9 +1,10 @@
 //! Merged admin config tool — one `mahbot_config` action dispatcher for the
-//! five setup actions previously exposed as separate Support tools
-//! (`setup_telegram_bot`, `bind_telegram`, `add_workspace`, `add_user`,
-//! `setup_web_search`) plus the per-user custom-tool grants
-//! (`grant_tool` / `revoke_tool` / `list_grants`). It is now the admin's
-//! Assistant's sole configuration surface (the Support role is gone).
+//! four setup actions previously exposed as separate Support tools
+//! (`setup_telegram_bot`, `bind_telegram`, `add_user`, `setup_web_search`) plus
+//! the per-user custom-tool grants (`grant_tool` / `revoke_tool` /
+//! `list_grants`). It is now the admin's Assistant's sole configuration surface
+//! (the Support role is gone). Registering a workspace is not one of its
+//! actions — that lives in the `workspace` tool.
 use crate::config::{
     CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
     CONFIG_KEY_WEB_SEARCH_PROVIDER,
@@ -14,13 +15,6 @@ use crate::{Tool, Workspace};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use serde_json::json;
-
-/// The user configuration operates as, derived from the personal workspace it
-/// runs in (`personal:<user>`). The Assistant always operates in a personal
-/// workspace, so this resolves to the admin without a separate identity lookup.
-fn acting_user(ws: &Workspace) -> &str {
-    crate::users::personal_user_name(&ws.name).unwrap_or(crate::users::ADMIN_USER_NAME)
-}
 
 fn err(msg: impl Into<String>) -> anyhow::Error {
     anyhow!(msg.into())
@@ -38,19 +32,6 @@ fn get_binding_value(args: &serde_json::Value, key: &str) -> anyhow::Result<Stri
     }
 }
 
-/// Read an optional string field, distinguishing absent (or explicit null) from
-/// a present value. The deliberately silent [`super::get_opt_str`] would let a
-/// wrong-typed value masquerade as absent, so a present non-string is refused.
-fn optional_str<'a>(args: &'a serde_json::Value, key: &str) -> anyhow::Result<Option<&'a str>> {
-    match args.get(key) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(v) => Ok(Some(
-            v.as_str()
-                .ok_or_else(|| super::wrong_type(key, "a string", v))?,
-        )),
-    }
-}
-
 /// Read the optional `tools` field as a name list; absent (or explicit null)
 /// yields [`Option::None`], a present value is validated as an array of strings.
 fn optional_tools(args: &serde_json::Value) -> anyhow::Result<Option<Vec<String>>> {
@@ -63,7 +44,7 @@ fn optional_tools(args: &serde_json::Value) -> anyhow::Result<Option<Vec<String>
 /// Read the optional `behavior` field; absent (or explicit null) yields
 /// [`Option::None`], a present value must be `continuous` or `one_off`.
 fn read_behavior(args: &serde_json::Value) -> anyhow::Result<Option<CustomRoleBehavior>> {
-    match optional_str(args, "behavior")? {
+    match super::get_opt_str_strict(args, "behavior")? {
         None => Ok(None),
         Some(value) => Ok(Some(CustomRoleBehavior::parse(value)?)),
     }
@@ -99,7 +80,6 @@ impl Tool for MahbotConfigTool {
                     "enum": [
                         "setup_telegram_bot",
                         "bind_telegram",
-                        "add_workspace",
                         "add_user",
                         "setup_web_search",
                         "grant_tool",
@@ -123,9 +103,8 @@ impl Tool for MahbotConfigTool {
                 "name": {
                     "type": "string",
                     "description": format!(
-                        "(add_workspace / add_user / create_custom_role / update_custom_role / \
-                         delete_custom_role) For a workspace: a short unique name (used in ticket \
-                         ids and the GUI). For a new user: their display name, which is also the \
+                        "(add_user / create_custom_role / update_custom_role / \
+                         delete_custom_role) For a new user: their display name, which is also the \
                          name of their personal workspace folder, so it must be one every platform \
                          the service runs on can create: {}. For a custom role: the role's name — \
                          short, ASCII letters, digits, '_' and '-' only, starting with a letter, \
@@ -156,10 +135,6 @@ impl Tool for MahbotConfigTool {
                     "type": "string",
                     "description": "(grant_tool / revoke_tool) The custom tool's name — the file name without its extension of a script in the `shared` folder of the admin's personal workspace."
                 },
-                "path": {
-                    "type": "string",
-                    "description": "(add_workspace) Absolute path to the project directory to manage."
-                },
                 "telegram": {
                     "type": "string",
                     "description": "(add_user) The new user's Telegram @username (with or without the leading @), or their numeric Telegram id."
@@ -181,12 +156,11 @@ impl Tool for MahbotConfigTool {
         false
     }
 
-    async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
+    async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         let action = super::get_str(&args, "action")?;
         match action {
             "setup_telegram_bot" => self.exec_setup_telegram_bot(args).await,
             "bind_telegram" => self.exec_bind_telegram(args).await,
-            "add_workspace" => self.exec_add_workspace(ws, args).await,
             "add_user" => self.exec_add_user(args).await,
             "setup_web_search" => self.exec_setup_web_search(args).await,
             "grant_tool" => self.exec_grant_tool(args).await,
@@ -198,7 +172,7 @@ impl Tool for MahbotConfigTool {
             "delete_custom_role" => self.exec_delete_custom_role(args).await,
             other => Err(err(format!(
                 "unknown action '{other}' — expected one of: setup_telegram_bot, bind_telegram, \
-                 add_workspace, add_user, setup_web_search, grant_tool, revoke_tool, list_grants, \
+                 add_user, setup_web_search, grant_tool, revoke_tool, list_grants, \
                  create_custom_role, update_custom_role, list_custom_roles, delete_custom_role"
             ))),
         }
@@ -229,28 +203,6 @@ impl MahbotConfigTool {
             "Bound Telegram {} to your account. Messages sent to the bot from that account \
              will now be routed to you.",
             crate::users::describe_telegram_binding(&identifier)
-        ))
-    }
-
-    async fn exec_add_workspace(
-        &self,
-        ws: &Workspace,
-        args: serde_json::Value,
-    ) -> anyhow::Result<String> {
-        let name = super::get_str(&args, "name")?;
-        let path = super::get_str(&args, "path")?;
-
-        let store = crate::workspace::store();
-        store.add(name, path).await?;
-
-        crate::users::store()
-            .set_selected_workspace(acting_user(ws), Some(name))
-            .await?;
-
-        Ok(format!(
-            "Registered workspace '{name}' at {path} and switched your active workspace to it. \
-             The workspace is being picked up — if the LLM provider is configured the pipeline \
-             will claim and discover it shortly."
         ))
     }
 
@@ -436,7 +388,7 @@ impl MahbotConfigTool {
 
     async fn exec_update_custom_role(&self, args: serde_json::Value) -> anyhow::Result<String> {
         let name = super::get_str(&args, "name")?;
-        let prompt = optional_str(&args, "prompt")?;
+        let prompt = super::get_opt_str_strict(&args, "prompt")?;
         let tools = optional_tools(&args)?;
         let behavior = read_behavior(&args)?;
         anyhow::ensure!(
@@ -499,7 +451,6 @@ mod tests {
         for action in [
             "setup_telegram_bot",
             "bind_telegram",
-            "add_workspace",
             "add_user",
             "setup_web_search",
             "grant_tool",
@@ -552,7 +503,6 @@ mod tests {
         assert!(
             err.contains("setup_telegram_bot")
                 && err.contains("bind_telegram")
-                && err.contains("add_workspace")
                 && err.contains("add_user")
                 && err.contains("setup_web_search")
                 && err.contains("grant_tool")
@@ -574,8 +524,6 @@ mod tests {
         let cases: Vec<(serde_json::Value, &str)> = vec![
             (json!({ "action": "setup_telegram_bot" }), "token"),
             (json!({ "action": "bind_telegram" }), "handle"),
-            (json!({ "action": "add_workspace", "name": "x" }), "path"),
-            (json!({ "action": "add_workspace", "path": "/x" }), "name"),
             (json!({ "action": "add_user", "telegram": "@a" }), "name"),
             (json!({ "action": "add_user", "name": "x" }), "telegram"),
             (json!({ "action": "setup_web_search" }), "provider"),

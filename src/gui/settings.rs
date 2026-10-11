@@ -321,6 +321,9 @@ pub enum SettingsMessage {
     SubmitAddWorkspace,
     /// Result of workspace add.
     AddWorkspaceResult(Result<Workspace, String>),
+    /// Make a registered workspace the account's active one (see
+    /// `Dashboard::activate_workspace`).
+    ActivateWorkspace(String),
     // ── User management (sub-messages) ──────────────────────────
     /// Wrapped user message.
     UserMsg(users::UsersMessage),
@@ -1476,6 +1479,10 @@ impl SettingsState {
                 let name = self.add_workspace_name.text();
                 let path = self.add_workspace_path.text();
                 Task::perform(
+                    // Registering activates the new workspace: the Dashboard
+                    // turns this result into the active one (see
+                    // `process_settings_message`), so the registration is all
+                    // this task does.
                     async move {
                         crate::workspace::store()
                             .add(&name, &path)
@@ -1497,6 +1504,9 @@ impl SettingsState {
                     workspaces::WorkspacesMessage::Toast(super::ToastMessage::Error(e)),
                 ))
             }
+            // Intercepted by the Dashboard, which owns the active-workspace
+            // write and its feedback (like `workspaces::WorkspacesMessage::Toast`).
+            SettingsMessage::ActivateWorkspace(_) => Task::none(),
 
             // ── User messages ───────────────────────────────────
             SettingsMessage::UserMsg(msg) => {
@@ -1677,9 +1687,10 @@ impl SettingsState {
     pub fn view<'a>(
         &'a self,
         workspace_map_error: Option<&'a str>,
+        active_workspace: Option<&'a str>,
     ) -> Element<'a, SettingsMessage> {
         // Workspace management section (right column).
-        let ws_section = self.workspaces_section(workspace_map_error);
+        let ws_section = self.workspaces_section(workspace_map_error, active_workspace);
 
         // User management section (right column, below workspaces)
         let us_section = self.users_section();
@@ -1768,11 +1779,13 @@ impl SettingsState {
     ///
     /// `map_error` is the Dashboard's workspace-map read failure, passed in so
     /// the footer picker and this list render one state bit rather than two
-    /// copies of it.
+    /// copies of it. `active_workspace` is the Dashboard's live selection, so
+    /// each card can show and set it.
     #[expect(clippy::too_many_lines)]
     fn workspaces_section<'a>(
         &'a self,
         map_error: Option<&'a str>,
+        active_workspace: Option<&'a str>,
     ) -> Element<'a, SettingsMessage> {
         let ws = &self.workspaces_state;
 
@@ -1897,6 +1910,25 @@ impl SettingsState {
                                 theme::button_text,
                                 tooltip::Position::Top,
                             ));
+                            // Activation control — doubles as the active marker.
+                            let activate = SettingsMessage::ActivateWorkspace(ws_item.name.clone());
+                            left = left.push(if active_workspace == Some(ws_item.name.as_str()) {
+                                widgets::tooltip_hint(
+                                    button(
+                                        text("Active").size(theme::TEXT_11).color(theme::ACCENT),
+                                    )
+                                    .style(theme::button_secondary)
+                                    .on_press(activate),
+                                    "This workspace is the active one",
+                                )
+                            } else {
+                                widgets::tooltip_hint(
+                                    button(text("Make active").size(theme::TEXT_11))
+                                        .style(theme::button_secondary)
+                                        .on_press(activate),
+                                    "Make this the active workspace",
+                                )
+                            });
                             left
                         },
                     ]

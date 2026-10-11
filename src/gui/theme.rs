@@ -208,7 +208,7 @@ pub fn diagnostics_icon() -> iced::widget::Text<'static, iced::Theme, iced::Rend
 /// icon: the joint-verdict stage names (resolved via the shared
 /// [`crate::pipeline::verdict::stage_role`] inverse mapping, which also carries
 /// the retired stages' labels that historical comments keep), the canonical
-/// agent names "engineer"/"manager"/"sanitation", and "diagnostics"
+/// agent names "engineer"/"manager"/"sanitation"/"assistant", and "diagnostics"
 /// (stethoscope, [`TEXT_PRIMARY`] tint). Legacy or unexpected values (e.g. old
 /// suffixed labels like "analyst_1", "system", "user:{name}") intentionally
 /// return `None`.
@@ -234,6 +234,7 @@ pub fn comment_author_icon(
         "engineer" => Some(icon_for(crate::Role::Engineer)),
         "manager" => Some(icon_for(crate::Role::Manager)),
         "sanitation" => Some(icon_for(crate::Role::Sanitation)),
+        "assistant" => Some(icon_for(crate::Role::Assistant)),
         "diagnostics" => Some((diagnostics_icon(), TEXT_PRIMARY)),
         _ => None,
     }
@@ -1419,6 +1420,7 @@ mod tests {
             "engineer",
             "manager",
             "sanitation",
+            "assistant",
             "diagnostics",
         ] {
             assert!(

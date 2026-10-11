@@ -94,6 +94,15 @@ impl Drop for ProbeFile {
 // process-global state of their own (unique workspace/job ids against the
 // shared test store), e.g. the jobs boot-recovery and research-cancel tests.
 
+/// The process-global store lock: tests that write the shared `OnceCell` stores
+/// hold it for their whole body, so no two of them touch the same rows at once.
+/// Async-aware, so a guard may be held across `.await` points.
+///
+/// Taken by the pipeline suite in the tests that drive the shared stores, and by
+/// the `workspace` tool's pause tests, which write workspace rows there. Its
+/// fleet-wide test drives a store of its own and needs no lock.
+pub(crate) static STORE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ── Retry-policy guard for scoped-retry tests ──────────────
 
 /// RAII guard restoring the previous test retry-policy override on drop.

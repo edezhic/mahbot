@@ -42,7 +42,7 @@ pub(crate) mod ticket;
 pub(crate) mod video_edit;
 pub(crate) mod video_gen;
 pub(crate) mod web_search;
-pub(crate) mod workspace_control;
+pub(crate) mod workspace;
 
 /// Maximum file size for edit and search tool operations and the dashboard editor
 /// (10 MB), and the read tool's cap for any read that is not a document container;
@@ -210,7 +210,7 @@ pub(crate) use ticket::{
 pub(crate) use video_edit::VideoEditTool;
 pub(crate) use video_gen::VideoGenTool;
 pub(crate) use web_search::{WebSearchBackend, WebSearchTool};
-pub(crate) use workspace_control::WorkspaceControlTool;
+pub(crate) use workspace::WorkspaceTool;
 
 use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::{Tool, Workspace};
@@ -222,8 +222,8 @@ use std::time::{Duration, Instant};
 // ── JSON helpers ─────────────────────────────────────────────────────────
 
 use crate::util::json::{
-    get_bool, get_object, get_opt_bool, get_opt_i64, get_opt_str, get_opt_u64, get_str,
-    get_str_array, get_usize, wrong_type,
+    get_bool, get_object, get_opt_bool, get_opt_i64, get_opt_str, get_opt_str_strict, get_opt_u64,
+    get_str, get_str_array, get_usize, wrong_type,
 };
 
 /// The shared `message` argument of the dispatch tools (`analyze`, `send`):
@@ -1437,7 +1437,9 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
     // take a "path" simply ignore the extra key — except the document tool, whose
     // contract refuses every argument an action does not take: an alias is left
     // as the caller wrote it, so a refusal names that spelling rather than a
-    // "path" the caller never passed.
+    // "path" the caller never passed. The `workspace` tool keeps the alias (its
+    // `add` takes the path); its `pause` / `resume` refuse a stray field, but by
+    // that tool's own address rule rather than by the key's name.
     if name != "document" {
         for &alias in PATH_ALIAS_KEYS {
             remap_arg_key(obj, alias, "path");
@@ -1454,7 +1456,7 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
             remap_arg_key(obj, "cmd", "command");
             remap_arg_key(obj, "script", "command");
         }
-        "get_ticket" | "update_ticket" | "add_comment" => {
+        "get_ticket" | "update_ticket" | "add_comment" | "workspace" => {
             remap_arg_key(obj, "id", "ticket_id");
             remap_arg_key(obj, "ticket", "ticket_id");
         }
@@ -1899,6 +1901,10 @@ mod tests {
         assert_eq!(name, "get_ticket");
         assert_eq!(args["ticket_id"], "mahbot-1");
 
+        let (name, args) = normalize_tool_call("workspace", serde_json::json!({"id": "ws-1"}));
+        assert_eq!(name, "workspace");
+        assert_eq!(args["ticket_id"], "ws-1");
+
         // "read" tool: file/filename → path
         let (name, args) = normalize_tool_call("read", serde_json::json!({"file": "src/main.rs"}));
         assert_eq!(name, "read");
@@ -1992,7 +1998,9 @@ mod tests {
     /// The document tool is the one exemption: it declares and enforces its own
     /// argument names, so an alias is left as the caller wrote it and refused by
     /// that name instead of being remapped into a `"path"` two of its actions do
-    /// not take.
+    /// not take. Remapped alias and ignored-or-refused extra key are separate
+    /// things: `workspace` takes the alias for its `add` while refusing a stray
+    /// field on `pause` / `resume` (`tools::workspace::a_misspelled_address_…`).
     #[test]
     fn normalize_tool_call_remaps_all_path_aliases() {
         for &alias in PATH_ALIAS_KEYS {

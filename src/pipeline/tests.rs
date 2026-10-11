@@ -6,19 +6,16 @@
 //! tests drive the real phase bodies (analysis / development /
 //! verification / sanitation) and the puller through a scripted
 //! [`FakeProvider`](crate::util::test::FakeProvider), so they are isolated from
-//! the live model. Global-DB tests are serialized behind [`TEST_LOCK`] because
-//! every global store shares one test root; isolated-store tests run freely.
+//! the live model. Global-DB tests are serialized behind
+//! [`STORE_LOCK`](crate::util::test::STORE_LOCK) because every global store
+//! shares one test root; isolated-store tests run freely.
 
 use crate::pipeline::board::{BoardStore, Ticket, TicketPhase};
 use crate::util::test::{
-    create_test_workspace, expect_ticket, expect_ticket_phase, init_management_test_stores,
-    make_ticket,
+    STORE_LOCK, create_test_workspace, expect_ticket, expect_ticket_phase,
+    init_management_test_stores, make_ticket,
 };
 use crate::{Workspace, WorkspaceStatus};
-
-/// Serializes tests that mutate the global stores (they share the test DB).
-/// Async-aware so the guard may be held across `.await` points safely.
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn ws_named(name: &str) -> Workspace {
     crate::workspace::test_ws_named("/tmp/ws", name)
@@ -413,7 +410,7 @@ async fn claim_probes_agree_with_claim_outcomes() {
 /// test DB because `jobs.ticket_id` references the `tickets` table.
 #[tokio::test]
 async fn phase_job_is_unique_and_terminalizes() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/jobs_ws", "jobs_ws").await;
@@ -501,7 +498,7 @@ async fn phase_machine_classifications_are_consistent() {
 /// for a live (Ready) workspace.
 #[tokio::test]
 async fn run_claim_pipeline_claims_new_work() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/launch_ws", "launch_ws").await;
@@ -533,7 +530,7 @@ async fn run_claim_pipeline_claims_new_work() {
 /// backfilled. The breaker trip carries only its own failure notice.
 #[tokio::test]
 async fn every_third_bounce_notifies_manager() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let ws = create_test_workspace("/tmp/bounce_notice_ws", "bounce_notice_ws").await;
     crate::workspace::store()
@@ -637,7 +634,7 @@ async fn bounce_once(ws: &Workspace, bounce_count: i64) -> Ticket {
 /// increments the bounce counter (no breaker trip, no workspace pause).
 #[tokio::test]
 async fn bounce_to_development_returns_ticket_without_tripping() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/bounce_ws", "bounce_ws").await;
@@ -698,7 +695,7 @@ async fn bounce_to_development_returns_ticket_without_tripping() {
 /// phase job is deleted, and no bounce count is consumed further.
 #[tokio::test]
 async fn bounce_breaker_trips_to_failed() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/trip_ws", "trip_ws").await;
@@ -778,7 +775,7 @@ async fn bounce_breaker_trips_to_failed() {
 #[serial_test::serial(drain)]
 #[tokio::test]
 async fn reset_phase_attempt_destroys_attempt_and_pauses() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/reset_ws", "reset_ws").await;
@@ -849,7 +846,7 @@ async fn reset_phase_attempt_destroys_attempt_and_pauses() {
 /// pause the workspace, while still deleting the phase job.
 #[tokio::test]
 async fn reset_phase_attempt_analysis_does_not_pause() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/analysis_ws", "analysis_ws").await;
@@ -1104,7 +1101,7 @@ async fn probe_then_claim_queued(store: &BoardStore, ws: &Workspace) -> (bool, O
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_commit() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
@@ -1322,7 +1319,7 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn a_roster_without_a_tester_row_is_not_resumed_as_a_round() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
@@ -1390,7 +1387,7 @@ async fn a_roster_without_a_tester_row_is_not_resumed_as_a_round() {
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn passed_verification_round_records_the_reviewed_content() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
@@ -1525,7 +1522,7 @@ async fn passed_verification_round_records_the_reviewed_content() {
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn verification_round_merges_the_project_commands_into_one_result() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
@@ -1705,7 +1702,7 @@ async fn run_verification_round(
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn analysis_escalation_and_blocker_verification() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/escalation_ws", "escalation_ws").await;
@@ -1784,7 +1781,7 @@ async fn analysis_escalation_and_blocker_verification() {
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/resume_analysis_ws", "resume_analysis_ws").await;
@@ -1909,7 +1906,7 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/resume_escalation_ws", "resume_escalation_ws").await;
@@ -2097,7 +2094,7 @@ async fn verification_dynamic_count_calibration() {
         DEFAULT_REVIEW_COUNT_HIGH_CHURN, DEFAULT_REVIEW_COUNT_LOW_CHURN,
         DEFAULT_REVIEW_COUNT_TINY_CHURN, review_agent_count, review_base_from_signals,
     };
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
@@ -2188,7 +2185,7 @@ async fn verification_dynamic_count_calibration() {
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
@@ -2274,7 +2271,7 @@ async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/reset_round_ws", "reset_round_ws").await;
@@ -2471,7 +2468,7 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/hard_analysis_ws", "hard_analysis_ws").await;
@@ -2550,7 +2547,7 @@ async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn cancel_requested_engineer_goes_to_cancelled() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/cancel_ws", "cancel_ws").await;
@@ -2627,7 +2624,7 @@ async fn cancel_requested_engineer_goes_to_cancelled() {
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/pause_resume_ws", "pause_resume_ws").await;
@@ -2731,7 +2728,7 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn failure_freeze_while_paused_stops_in_flight_ticket_agent() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/freeze_while_paused_ws", "freeze_while_paused_ws").await;
@@ -2797,7 +2794,7 @@ async fn failure_freeze_while_paused_stops_in_flight_ticket_agent() {
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn stage_re_drive_completes_dangling_calls_before_model_round() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/stage_re_drive_ws", "stage_re_drive_ws").await;
@@ -2949,7 +2946,7 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
 async fn sanitation_commit_failure_stops_round_and_freezes_workspace() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
     let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
@@ -3075,7 +3072,7 @@ async fn sanitation_commit_failure_stops_round_and_freezes_workspace() {
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn unsettled_or_frozen_workspace_skips_claims_and_dispatch() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
 
