@@ -15,13 +15,11 @@
 //!    (everything already durable) and is surfaced to the caller to log
 
 use std::fmt::Write;
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use futures_util::future::join_all;
-use ignore::WalkBuilder;
 
 use crate::pipeline::board::BOARD;
 use crate::prompt::{build_workspace_context, format_ticket_block, load_prompt, substitute};
@@ -190,9 +188,10 @@ impl Session {
             // turn's machine change-info (a first turn's system prompt holds the
             // models instead, so the snapshot write below stays on its first-turn
             // path), then the personal-workspace report at the very head, ahead of it.
-            // The first-turn `<personal-files>` listing cannot stand in for the
-            // report: it hides hidden entries, stops at a cap, and a session truncated
-            // from the Sessions page takes this path with its baseline intact.
+            // The session-start `<personal-files>` block cannot stand in for the
+            // report: it is a shape — folder names with counts, never a path — so it
+            // cannot say what the user just touched, and a session truncated from
+            // the Sessions page takes this path with its baseline intact.
             let (content, new_snapshot) = if !is_new && matches!(role, Role::Assistant) {
                 Self::prepend_model_change(agent_id, msg, user_name).await
             } else {
@@ -749,7 +748,8 @@ impl Session {
     ///                          admin's Assistant); substituted (always)
     /// skills                 — if any skills exist in the workspace
     /// alarms                 — Assistant only, when the user has active alarms
-    /// personal_files         — Assistant only, when the personal workspace has files
+    /// personal_files         — Assistant only, when the personal folder shows
+    ///                          something of the user's
     /// workspaces             — the admin's Assistant only, when workspaces are registered
     /// custom_tools           — Assistant only, always (the catalogue, or the
     ///                          brief "nothing available" form)
@@ -888,10 +888,11 @@ impl Session {
             msgs.push(ChatMessage::system(skills::skills_to_prompt(&skills, ws)));
         }
         // Assistant sessions carry the user's alarm snapshot, the personal
-        // workspace file listing, the registered workspace list (the admin's
-        // Assistant only), the custom-tool catalogue and the custom-role
-        // listing (the admin's Assistant only) — the same snapshot-at-session-
-        // start contract as the board block below.
+        // folder's shape (its immediate child folders with their file counts —
+        // never a path), the registered workspace list (the admin's Assistant
+        // only), the custom-tool catalogue and the custom-role listing (the
+        // admin's Assistant only) — the same snapshot-at-session-start contract
+        // as the board block below.
         if matches!(role, Role::Assistant) {
             let ((alarms, workspaces, personal_files, custom_roles), custom_tools) = tokio::join!(
                 fetch_assistant_context(user_name, is_admin),
@@ -1115,8 +1116,8 @@ const MAX_WORKSPACE_SUMMARY_CHARS: usize = 1000;
 /// an uninitialized store (`ALARMS.get()` / `WORKSPACES.get()` /
 /// `CUSTOM_ROLES.get()` returning `None`) or a read error yields empty data, so
 /// the corresponding block is omitted — same contract as `build_board_context`.
-/// The alarm fetch, the workspace fetch, the personal-files walk and the
-/// custom-role listing (the admin's Assistant only) run concurrently, and the
+/// The alarm fetch, the workspace fetch, the personal-folder picture walk and
+/// the custom-role listing (the admin's Assistant only) run concurrently, and the
 /// per-workspace general-context reads are batched via `join_all`.
 async fn fetch_assistant_context(
     user_name: &str,
@@ -1195,11 +1196,11 @@ fn workspace_frame_key(role: Role, is_admin: bool) -> &'static str {
 
 /// Compose the Assistant-only system-prompt blocks from pre-fetched data.
 /// Pure and fail-open: each block is omitted entirely when its content is
-/// empty, the personal-files listing is supplied pre-rendered (`None` when
-/// the workspace is empty or unlistable), and the workspace list and the
-/// custom-role listing appear only for the admin's Assistant. Order: alarms →
-/// personal files → workspaces → custom tools → custom roles — the custom-tool
-/// block being the one an Assistant always gets, because
+/// empty, the personal-folder picture is supplied pre-rendered (`None` when the
+/// folder shows nothing of the user's or cannot be walked), and the workspace
+/// list and the custom-role listing appear only for the admin's Assistant.
+/// Order: alarms → personal files → workspaces → custom tools → custom roles —
+/// the custom-tool block being the one an Assistant always gets, because
 /// [`crate::tools::custom::context_block`] renders the brief "nothing
 /// available" form rather than nothing, while the custom-role block is omitted
 /// entirely when no roles exist. The caller gates on `role == Assistant`
@@ -1222,7 +1223,7 @@ fn assistant_context_blocks(
     if let Some(lines) = personal_files {
         blocks.push(substitute(
             &load_prompt("context/personal_files.md"),
-            &[("{{files}}", lines)],
+            &[("{{folders}}", lines)],
         ));
     }
     if is_admin && let Some(lines) = render_workspace_lines(workspaces) {
@@ -1337,87 +1338,25 @@ fn role_prompt_excerpt(prompt: &str) -> String {
     )
 }
 
-/// Hard entry cap for the `<personal-files>` listing — the walk stops once
-/// exceeded (an exact "N more" count would require an unbounded walk).
-const MAX_PERSONAL_FILE_ENTRIES: usize = 200;
-
-/// Secondary stop condition on the rendered `<personal-files>` size, in bytes.
-const MAX_PERSONAL_FILES_BYTES: usize = 6 * 1024;
-
-/// List the user's personal-workspace files for the `<personal-files>` block.
-/// The path is the canonical `userspaces/<user>` resolution — the same
-/// directory the Assistant session is pinned to — so a blank or synthetic
-/// user name omits the block entirely instead of listing the userspaces root
-/// or other users' files. `None` also when the workspace has no listable
-/// files or the walk fails (fail-open, like the other blocks). The walk runs
-/// on the blocking pool so a large workspace never stalls the executor.
+/// The session-start `<personal-files>` picture for the user's personal folder:
+/// the folder's immediate child folders with the number of files beneath each
+/// plus the files sitting directly in the folder — the same file material the
+/// change report watches (see [`crate::session::personal_changes`]), rendered
+/// without a single path. `None` when the name cannot address a folder, the
+/// folder does not exist yet, it shows nothing of the user's, or it cannot be
+/// walked (fail-open, like the other blocks). The walk runs on the blocking pool
+/// so a large folder never stalls the executor.
 async fn fetch_personal_files(user_name: &str) -> Option<String> {
     if !crate::users::is_valid_personal_user_name(user_name) {
         return None;
     }
     let root = crate::users::personal_workspace_path(user_name);
-    let listed = tokio::task::spawn_blocking(move || walk_personal_files(&root))
-        .await
-        .ok()?;
-    render_personal_file_lines(listed)
-}
-
-/// Walk the personal workspace and collect up to `MAX_PERSONAL_FILE_ENTRIES + 1`
-/// relative file paths (directories are implied by the paths and skipped).
-/// Ripgrep defaults apply: hidden entries (`.git/`, `.DS_Store`, all dotfiles —
-/// including the hidden `.compaction` dump dir) are skipped, and `generated/`
-/// / `uploads/` directories are pruned at the entry level so large media
-/// trees are never traversed. Symlinks are not followed.
-fn walk_personal_files(root: &Path) -> Vec<String> {
-    let cap = MAX_PERSONAL_FILE_ENTRIES + 1;
-    let mut out = Vec::new();
-    for entry in WalkBuilder::new(root)
-        .filter_entry(|e| {
-            e.depth() == 0
-                || !e.file_type().is_some_and(|t| t.is_dir())
-                || !matches!(e.file_name().to_str(), Some("generated" | "uploads"))
-        })
-        .build()
-        .flatten()
-    {
-        if entry.depth() == 0 || entry.file_type().is_some_and(|t| t.is_dir()) {
-            continue; // the workspace root itself, and directories (implied)
-        }
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        out.push(rel.display().to_string());
-        if out.len() >= cap {
-            break;
-        }
-    }
-    out
-}
-
-/// Render the byte-sorted relative paths for the `<personal-files>` block —
-/// directories are implied by the paths. Stops at the entry cap or the byte
-/// budget and appends a truncation tail; `None` when nothing remains.
-fn render_personal_file_lines(mut paths: Vec<String>) -> Option<String> {
-    if paths.is_empty() {
-        return None;
-    }
-    paths.sort();
-    let mut out = String::new();
-    let mut shown = 0;
-    for path in &paths {
-        if shown == MAX_PERSONAL_FILE_ENTRIES
-            || out.len() + path.len() + 1 > MAX_PERSONAL_FILES_BYTES
-        {
-            break;
-        }
-        out.push_str(path);
-        out.push('\n');
-        shown += 1;
-    }
-    if shown < paths.len() {
-        out.push_str("…listing truncated; use the read tool for the full picture");
-    }
-    Some(out.trim_end().to_string())
+    tokio::task::spawn_blocking(move || {
+        crate::session::personal_changes::personal_folder_picture(&root)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Try to find a stored workspace context for the given workspace and role.
@@ -2061,7 +2000,7 @@ mod tests {
             crate::workspace::test_ws_named("/tmp/proj", "proj"),
             Some("summary".to_string()),
         )];
-        let files = Some("MEMORY.md\nnotes/projects.md");
+        let files = Some("- album/ — 2 files\n2 files directly in the folder");
         let custom = "<custom-tools>\n- weather\n</custom-tools>";
 
         // Guest's Assistant: alarms + personal files + custom tools, no
@@ -2161,34 +2100,9 @@ mod tests {
         assert!(role_block(true, &[]).is_none());
     }
 
-    /// Personal-files walk: hidden entries and `generated/` / `uploads/`
-    /// directories never appear, while regular nested files do. An absent
-    /// workspace yields an empty listing.
-    #[test]
-    fn personal_files_walk_prunes_excluded_dirs() {
-        let root = tempfile::tempdir().expect("tempdir");
-        std::fs::write(root.path().join("MEMORY.md"), "m").expect("write");
-        std::fs::create_dir_all(root.path().join("notes")).expect("mkdir");
-        std::fs::write(root.path().join("notes/topic.md"), "t").expect("write");
-        std::fs::create_dir_all(root.path().join("generated")).expect("mkdir");
-        std::fs::write(root.path().join("generated/big.bin"), "b").expect("write");
-        std::fs::create_dir_all(root.path().join(".git")).expect("mkdir");
-        std::fs::write(root.path().join(".git/config"), "c").expect("write");
-
-        let listed = walk_personal_files(root.path());
-        assert!(listed.contains(&"MEMORY.md".to_string()));
-        assert!(listed.contains(&Path::new("notes").join("topic.md").display().to_string()));
-        assert!(!listed.iter().any(|p| p.contains("generated")));
-        assert!(!listed.iter().any(|p| p.contains(".git")));
-        // Directories are implied by the file paths, never listed themselves.
-        assert!(!listed.iter().any(|p| p == "notes"));
-
-        assert!(walk_personal_files(&root.path().join("absent")).is_empty());
-    }
-
     /// Path-safety guard: blank or synthetic user names (path separators,
     /// dot segments) never resolve to a workspace — the block is omitted
-    /// instead of listing the userspaces root or another user's files.
+    /// instead of picturing the userspaces root or another user's folders.
     #[tokio::test]
     async fn personal_files_fetch_rejects_synthetic_names() {
         for name in ["", "  ", ".", "..", "a/b", "a\\b"] {
@@ -2196,27 +2110,24 @@ mod tests {
         }
     }
 
-    /// Personal-files rendering: byte-sorted output stopped by the entry cap
-    /// or the byte budget, both appending a truncation tail; an empty listing
-    /// renders as `None`.
-    #[test]
-    fn personal_files_render_caps_budgets_and_sorts() {
-        let paths: Vec<String> = (0..MAX_PERSONAL_FILE_ENTRIES + 50)
-            .map(|i| format!("f{i:03}.txt"))
-            .collect();
-        let rendered = render_personal_file_lines(paths).expect("render");
-        let lines: Vec<&str> = rendered.lines().collect();
-        assert_eq!(lines.len(), MAX_PERSONAL_FILE_ENTRIES + 1); // entries + tail
-        assert!(lines[0] < lines[1]);
-        assert!(rendered.ends_with("use the read tool for the full picture"));
+    /// Through the real session-start path: the block is built from the
+    /// `userspaces/<name>` folder the Assistant is pinned to, and a folder with
+    /// nothing of the user's yields no block at all.
+    #[tokio::test]
+    async fn personal_files_fetch_pictures_the_users_own_folder() {
+        let folder = crate::users::personal_workspace_path("manager_picture_user");
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(folder.join("album/deep")).expect("mkdir");
+        std::fs::write(folder.join("album/deep/a.txt"), "one").expect("write");
+        std::fs::write(folder.join("top.txt"), "one").expect("write");
 
-        // Byte budget stops the listing before the entry cap is reached.
-        let long = "x".repeat(MAX_PERSONAL_FILES_BYTES / 2);
-        let rendered =
-            render_personal_file_lines(vec![long.clone(), long.clone(), long]).expect("render");
-        assert_eq!(rendered.lines().count(), 2); // one entry + tail
+        let block = fetch_personal_files("manager_picture_user")
+            .await
+            .expect("a picture");
+        assert_eq!(block, "- album/ — 1 file\n1 file directly in the folder");
 
-        assert!(render_personal_file_lines(Vec::new()).is_none());
+        std::fs::remove_dir_all(&folder).expect("rmdir");
+        assert!(fetch_personal_files("manager_picture_user").await.is_none());
     }
 
     /// Alarm line rendering: a periodic interval is annotated, the trigger is

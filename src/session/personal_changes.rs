@@ -19,6 +19,11 @@
 //! its end; content is read only for the files whose stamp moved. The folder's
 //! first observation, which does read every file once, does not ([`establish`]),
 //! and while it runs the account gets no block at all.
+//!
+//! The session-start `<personal-files>` picture ([`personal_folder_picture`]) is
+//! built from the same walk predicate ([`is_skipped`]) as the report, so the two
+//! blocks can never describe different material; it costs one metadata-only walk
+//! and never reads a file's contents.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -98,17 +103,17 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 /// pruned at any depth: the `.git` repository metadata, the `.compaction` store
 /// and macOS's `.DS_Store`. A user's own dotfile — `.env`, `.gitignore`,
 /// `.config/` — is the user's material and a hand edit to it must be reported;
-/// the sibling `<personal-files>` listing hides all hidden entries, so a
-/// dotfile can legitimately appear in this block without appearing there. The
-/// product's own things at the workspace root (`MEMORY.md` and the `generated/`,
-/// `uploads/` and `notes/` directories) are never watched either.
+/// the product's own things at the workspace root (`MEMORY.md` and the
+/// `generated/`, `uploads/` and `notes/` directories) are never watched either.
 ///
-/// This set — not the sibling enumerations (`walk_personal_files`,
-/// [`crate::tools::custom`], `research_cleanup`) — decides what is watched, and it
-/// deliberately differs from them: the listing also shows `MEMORY.md` and
-/// `notes/`, and `shared/` is product material only in the folder that holds the
-/// custom-tool catalogue ([`is_owner_personal_folder`]). They are named here so a new
-/// product-owned path lands in both places.
+/// This predicate is the single definition of the user's file material inside a
+/// personal folder — the report ([`scan`]) and the session-start picture
+/// ([`personal_folder_picture`]) both walk through it, so the two can never
+/// describe different material. The `shared/` catalogue
+/// ([`is_owner_personal_folder`]) is product material only in the folder that
+/// holds it, and the sibling enumerations ([`crate::tools::custom`],
+/// `research_cleanup`) are named here so a new product-owned path lands in both
+/// places.
 fn is_skipped(entry: &ignore::DirEntry, owner_folder: bool) -> bool {
     if entry.depth() == 0 {
         return false; // the watched root itself
@@ -139,6 +144,109 @@ fn is_skipped(entry: &ignore::DirEntry, owner_folder: bool) -> bool {
         }
     }
     false
+}
+
+/// Hard cap on how many child folders the session-start picture names; the rest
+/// are summarized as a count, so the block never grows with the folder's size.
+const MAX_PICTURED_FOLDERS: usize = 40;
+
+/// The session-start picture of `root`: the folders sitting directly inside it,
+/// each with the number of files it holds at any depth, plus how many files sit
+/// directly in the folder itself. No path is ever named, and the walk reads no
+/// file's contents — metadata alone.
+///
+/// The material counted is exactly what the change report watches: the same
+/// walk, the same predicate ([`is_skipped`]) and the same settings as [`scan`].
+/// `None` when `root` does not exist yet (personal folders are created lazily),
+/// when it cannot be opened, or when it holds nothing of the user's — so the
+/// block is silent rather than empty. A walk error deeper inside warns and
+/// continues, leaving the counts what could be counted.
+pub(crate) fn personal_folder_picture(root: &Path) -> Option<String> {
+    if let Err(e) = std::fs::read_dir(root) {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return None; // not created yet is not a fault
+        }
+        tracing::warn!(root = %root.display(), error = %e, "personal-workspace folder unreadable");
+        return None;
+    }
+    let owner_folder = is_owner_personal_folder(root);
+    let mut folders: BTreeMap<String, usize> = BTreeMap::new();
+    let mut root_files = 0usize;
+    for result in WalkBuilder::new(root)
+        .standard_filters(false)
+        .follow_links(false)
+        .filter_entry(move |entry| !is_skipped(entry, owner_folder))
+        .build()
+    {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(e) => {
+                // The folder itself was probed readable above, so an error here
+                // is about one path: the other folders are still pictured.
+                tracing::warn!(error = %e, "personal-workspace walk error");
+                continue;
+            }
+        };
+        if entry.depth() == 0 {
+            continue; // the folder itself
+        }
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let Some(rel) = rel.to_str() else {
+            continue; // a non-UTF-8 path is not material the report carries either
+        };
+        let Ok(meta) = std::fs::metadata(path).or_else(|_| std::fs::symlink_metadata(path)) else {
+            continue; // an entry whose metadata cannot be read is not counted
+        };
+        if meta.is_dir() {
+            // A real immediate child directory is the user's folder even when
+            // nothing countable sits inside it; a link to a directory is neither
+            // recorded nor descended into (the walk never follows one).
+            if entry.depth() == 1 && entry.file_type().is_some_and(|t| t.is_dir()) {
+                folders.entry(rel.to_string()).or_default();
+            }
+            continue;
+        }
+        match rel.split_once(std::path::MAIN_SEPARATOR) {
+            Some((folder, _)) => *folders.entry(folder.to_string()).or_default() += 1,
+            None => root_files += 1,
+        }
+    }
+    if folders.is_empty() && root_files == 0 {
+        return None; // only kept-aside areas, or nothing at all
+    }
+    Some(render_personal_folder_lines(&folders, root_files))
+}
+
+/// "1 file" / "3 files" — the plural a count line needs.
+fn counted(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+/// Render the picture: one `- <name>/ — <n> files` line per folder, name-sorted
+/// and at most [`MAX_PICTURED_FOLDERS`] of them, the folders left out summarized
+/// as a count, and finally how many files sit directly in the folder.
+fn render_personal_folder_lines(folders: &BTreeMap<String, usize>, root_files: usize) -> String {
+    let mut out = String::new();
+    for (name, count) in folders.iter().take(MAX_PICTURED_FOLDERS) {
+        let _ = writeln!(out, "- {name}/ — {}", counted(*count, "file"));
+    }
+    let left = folders.len().saturating_sub(MAX_PICTURED_FOLDERS);
+    if left > 0 {
+        let _ = writeln!(out, "…and {} not named", counted(left, "folder"));
+    }
+    let _ = write!(
+        out,
+        "{} directly in the folder",
+        counted(root_files, "file")
+    );
+    out
 }
 
 /// The path below the userspaces root when `path` lies inside it, `None` when it
@@ -1485,5 +1593,188 @@ mod tests {
             .unwrap();
         let _ = std::fs::remove_dir_all(&folder);
         let _ = std::fs::remove_dir_all(&project_dir);
+    }
+
+    /// The session-start picture counts exactly the material the report watches:
+    /// a parallel [`scan`] of the same root names the same immediate-child
+    /// folders with the same counts, and the files it carries at the root are the
+    /// direct count — the block and the report can never describe different
+    /// material.
+    #[test]
+    fn personal_folder_picture_counts_exactly_what_the_report_watches() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // Not the owner's own folder, so `shared/` here is the user's own
+        // material: the catalogue name is pruned in the owner's folder alone.
+        assert!(!is_owner_personal_folder(root));
+        for dir in [
+            ".git",
+            ".compaction",
+            "generated",
+            "uploads",
+            "notes",
+            "album/deep",
+            "album",
+            ".config",
+            "empty",
+            "shared",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        // Kept-aside material: never named and never counted.
+        for path in [
+            ".git/config",
+            ".compaction/dump.md",
+            "generated/big.bin",
+            "uploads/u.png",
+            "notes/topic.md",
+            "MEMORY.md",
+            ".DS_Store",
+            "album/.DS_Store",
+        ] {
+            std::fs::write(root.join(path), "one").unwrap();
+        }
+        // The user's own material — dotfiles and dotfolders included, and the
+        // `.gitignore` hides nothing because the walk ignores ignore rules.
+        std::fs::write(root.join(".gitignore"), "secret.txt\n").unwrap();
+        for path in [
+            "album/one.jpg",
+            "album/deep/two.jpg",
+            ".config/settings.toml",
+            "shared/s.txt",
+            "top.txt",
+            ".env",
+            "secret.txt",
+        ] {
+            std::fs::write(root.join(path), "one").unwrap();
+        }
+        // A link to a directory is neither named nor descended into — the report
+        // records no material behind one either.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("album"), root.join("linked")).unwrap();
+
+        let picture = personal_folder_picture(root).expect("picture");
+        let snapshot = scan(root, None, Scan::Refresh).expect("the report's own walk");
+        let mut watched: BTreeMap<String, usize> = BTreeMap::new();
+        let mut watched_direct = 0usize;
+        for key in snapshot.keys() {
+            match key.split_once(std::path::MAIN_SEPARATOR) {
+                Some((folder, _)) => *watched.entry(folder.to_string()).or_default() += 1,
+                None => watched_direct += 1,
+            }
+        }
+
+        let count_of = |rest: &str| {
+            rest.split_once(' ')
+                .expect("a count and a noun")
+                .0
+                .parse::<usize>()
+                .expect("a number")
+        };
+        let mut pictured: BTreeMap<String, usize> = BTreeMap::new();
+        let mut pictured_direct = 0usize;
+        for line in picture.lines() {
+            if let Some(rest) = line.strip_prefix("- ") {
+                let (name, count) = rest.split_once("/ — ").expect("a folder line");
+                pictured.insert(name.to_string(), count_of(count));
+            } else {
+                let direct = line
+                    .split_once(" directly in the folder")
+                    .expect("the direct-file line");
+                pictured_direct = count_of(direct.0);
+            }
+        }
+
+        assert_eq!(watched_direct, 4, "{snapshot:?}");
+        assert_eq!(pictured_direct, watched_direct);
+        // The empty folder is the user's folder although the report records no
+        // material in it (directories are implied by the paths below them).
+        assert_eq!(pictured.get("empty"), Some(&0));
+        assert_eq!(pictured.len(), watched.len() + 1);
+        for (folder, count) in &watched {
+            assert_eq!(pictured.get(folder), Some(count), "{folder} in {picture}");
+        }
+        for hidden in [
+            "generated",
+            "uploads",
+            "notes",
+            ".git",
+            ".compaction",
+            "MEMORY.md",
+            "linked",
+        ] {
+            assert!(!picture.contains(hidden), "{hidden} in {picture}");
+        }
+    }
+
+    /// The picture names at most [`MAX_PICTURED_FOLDERS`] folders, summarizes the
+    /// rest as a count, and stays byte-stable across walks; material added deep
+    /// inside a folder moves that folder's count without changing the block's
+    /// shape.
+    #[test]
+    fn personal_folder_picture_bounds_names_and_is_stable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let total = MAX_PICTURED_FOLDERS + 3;
+        // Created out of order: the picture comes out name-sorted regardless.
+        for i in 0..total {
+            std::fs::create_dir(root.join(format!("f{:03}", (i * 7) % total))).unwrap();
+        }
+        std::fs::write(root.join("top.txt"), "one").unwrap();
+        std::fs::create_dir(root.join("f000/deep")).unwrap();
+        std::fs::write(root.join("f000/deep/a.txt"), "one").unwrap();
+
+        let picture = personal_folder_picture(root).expect("picture");
+        let lines: Vec<&str> = picture.lines().collect();
+        assert_eq!(lines.len(), MAX_PICTURED_FOLDERS + 2, "{picture}");
+        assert_eq!(lines[0], "- f000/ — 1 file");
+        for (i, line) in lines.iter().enumerate().take(MAX_PICTURED_FOLDERS).skip(1) {
+            assert_eq!(*line, format!("- f{i:03}/ — 0 files"));
+        }
+        assert_eq!(lines[MAX_PICTURED_FOLDERS], "…and 3 folders not named");
+        assert_eq!(
+            lines[MAX_PICTURED_FOLDERS + 1],
+            "1 file directly in the folder"
+        );
+        assert_eq!(
+            personal_folder_picture(root).as_deref(),
+            Some(picture.as_str()),
+            "two walks over an unchanged folder must agree byte for byte"
+        );
+
+        std::fs::create_dir(root.join("f001/nested")).unwrap();
+        std::fs::write(root.join("f001/nested/b.txt"), "one").unwrap();
+        std::fs::write(root.join("f001/nested/c.txt"), "one").unwrap();
+        let grown = personal_folder_picture(root).expect("picture");
+        assert_eq!(
+            grown.lines().count(),
+            picture.lines().count(),
+            "a changed count must not change the block's shape: {grown}"
+        );
+        assert!(grown.contains("- f001/ — 2 files"), "{grown}");
+    }
+
+    /// No material of the user's means no block: a folder that does not exist yet
+    /// (personal folders are created lazily), one holding only kept-aside areas,
+    /// and — unlike those — a folder holding only an empty child folder, which is
+    /// still the user's own and is pictured at zero.
+    #[test]
+    fn personal_folder_picture_is_absent_without_user_material() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        assert!(personal_folder_picture(&root.join("absent")).is_none());
+
+        let kept_aside = root.join("kept-aside");
+        std::fs::create_dir_all(kept_aside.join(".git")).unwrap();
+        std::fs::write(kept_aside.join(".git/config"), "one").unwrap();
+        std::fs::write(kept_aside.join("MEMORY.md"), "one").unwrap();
+        assert!(personal_folder_picture(&kept_aside).is_none());
+
+        let only_empty = root.join("only-empty");
+        std::fs::create_dir_all(only_empty.join("album")).unwrap();
+        assert_eq!(
+            personal_folder_picture(&only_empty).as_deref(),
+            Some("- album/ — 0 files\n0 files directly in the folder")
+        );
     }
 }

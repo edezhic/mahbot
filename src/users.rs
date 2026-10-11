@@ -1074,9 +1074,9 @@ fn fallback_storage_root() -> PathBuf {
 
 /// Whether `user_name` may be used to resolve a personal-workspace path:
 /// non-empty, no path separators, not a dot entry. Containment, on both sides
-/// of the filesystem: the read-side callers (the `<personal-files>` listing, the
-/// compaction dump and the personal-workspace change report) apply it before
-/// touching an existing account's folder, and [`ensure_personal_workspace`]
+/// of the filesystem: the read-side callers (the session-start `<personal-files>`
+/// picture, the compaction dump and the personal-workspace change report) apply it
+/// before touching an existing account's folder, and [`ensure_personal_workspace`]
 /// applies it before creating one, so a stored name can never address the
 /// userspaces root or another account's directory. A name coming in for a new
 /// account is refused outright by [`validate_folder_name`], which is the

@@ -30,8 +30,9 @@ use crate::{ChatMessage, ChatRole, Role};
 /// Directory name (inside the role-appropriate dump root) holding compaction
 /// dumps. For the Assistant this is a hidden dir in the user's personal
 /// workspace; for every other role a plain dir under the pinned agent temp
-/// root. Hidden-dir skips (personal-files walk, ripgrep defaults) already
-/// keep it out of listings.
+/// root. `personal_changes::is_skipped` prunes it at any depth, so neither the
+/// session-start picture nor the change report shows it, and ripgrep defaults
+/// keep it out of search results.
 const DUMP_DIR_NAME: &str = ".compaction";
 
 /// Dump the messages this compaction deletes to a `.md` file.
