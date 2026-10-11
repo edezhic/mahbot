@@ -8,6 +8,7 @@ mod compaction_dump;
 pub mod dead_session;
 pub(crate) mod image_strip;
 mod manager;
+pub(crate) mod personal_changes;
 pub(crate) mod transcript;
 pub(crate) use manager::FinalizeOutcome;
 pub(crate) use manager::RewriteOutcome;
@@ -563,6 +564,7 @@ enum MetadataColumn {
     CustomIdentifier,
     LaunchStopped,
     WorkspaceName,
+    PersonalChanges,
 }
 
 impl MetadataColumn {
@@ -575,6 +577,7 @@ impl MetadataColumn {
             Self::CustomIdentifier => "custom_identifier",
             Self::LaunchStopped => "launch_stopped",
             Self::WorkspaceName => "workspace_name",
+            Self::PersonalChanges => "personal_changes",
         }
     }
 }
@@ -1186,7 +1189,8 @@ impl SessionStore {
     }
 
     /// Read one `session_metadata` column via `map`. `None` if the row is
-    /// missing, the column is NULL, or the read fails (logged via `warn_context`).
+    /// missing, the column is NULL, or the read fails (logged via `warn_context`) —
+    /// see [`Self::get_metadata_row`] when the three cases must be told apart.
     async fn get_metadata_value<X>(
         &self,
         agent_id: &str,
@@ -1197,10 +1201,27 @@ impl SessionStore {
     where
         X: Send + 'static,
     {
+        self.get_metadata_row(agent_id, column, warn_context, map)
+            .await
+            .flatten()
+    }
+
+    /// [`Self::get_metadata_value`] without the flattening: `None` is a missing
+    /// row, `Some(None)` a NULL column, `Some(Some(_))` a value.
+    async fn get_metadata_row<X>(
+        &self,
+        agent_id: &str,
+        column: MetadataColumn,
+        warn_context: &str,
+        map: impl FnOnce(&Row) -> std::result::Result<Option<X>, ::turso::Error> + Send + 'static,
+    ) -> Option<Option<X>>
+    where
+        X: Send + 'static,
+    {
         let col = column.as_str();
         let sql = format!("SELECT {col} FROM session_metadata WHERE agent_id = ?1");
         match self.conn.query_optional(&sql, params![agent_id], map).await {
-            Ok(value) => value.flatten(),
+            Ok(value) => value,
             Err(e) => {
                 tracing::warn!(agent_id = %agent_id, error = %e, "{warn_context}");
                 None
@@ -1225,6 +1246,42 @@ impl SessionStore {
             agent_id,
             MetadataColumn::ActiveModels,
             "Failed to read active-models snapshot",
+            |row| row.get::<Option<String>>(0),
+        )
+        .await
+    }
+
+    /// Persist the personal-workspace change baseline (JSON: relative path →
+    /// size/mtime/content-digest) for the Assistant's session. Update-only —
+    /// unlike [`SessionStore::set_metadata_value`] it deliberately never
+    /// inserts, so a refresh can never create a context-less `session_metadata`
+    /// row (a `/clear` landing between the refresh's read and this write would
+    /// otherwise leave a skeleton row in the sessions list).
+    pub(crate) async fn update_personal_changes(&self, agent_id: &str, state: &str) -> Result<()> {
+        let col = MetadataColumn::PersonalChanges.as_str();
+        self.conn
+            .execute(
+                &format!("UPDATE session_metadata SET {col} = ?1 WHERE agent_id = ?2"),
+                params![state, agent_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Read the personal-workspace change baseline (JSON: relative path →
+    /// size/mtime/content-digest) for the Assistant's session.
+    ///
+    /// `None` means there is no session row at all: the baseline can never be
+    /// written for it ([`SessionStore::update_personal_changes`] never inserts),
+    /// so a refresh must not walk the folder for it. `Some(None)` is a row whose
+    /// column is still NULL — a session predating the baseline — and
+    /// `Some(Some(…))` a stored one; both mean "no block to render". A read
+    /// error reads as `None` after a warning, failing the block open.
+    pub(crate) async fn personal_changes_baseline(&self, agent_id: &str) -> Option<Option<String>> {
+        self.get_metadata_row(
+            agent_id,
+            MetadataColumn::PersonalChanges,
+            "Failed to read personal-changes baseline",
             |row| row.get::<Option<String>>(0),
         )
         .await

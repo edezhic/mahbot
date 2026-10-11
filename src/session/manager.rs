@@ -185,9 +185,24 @@ impl Session {
         if !msg.is_empty() {
             let is_new = self.history.is_empty();
 
+            // The one composition point for both branches below: a later Assistant
+            // turn's machine change-info (a first turn's system prompt holds the
+            // models instead, so the snapshot write below stays on its first-turn
+            // path), then the personal-workspace report at the very head, ahead of it.
+            // The first-turn `<personal-files>` listing cannot stand in for the
+            // report: it hides hidden entries, stops at a cap, and a session truncated
+            // from the Sessions page takes this path with its baseline intact.
+            let (content, new_snapshot) = if !is_new && matches!(role, Role::Assistant) {
+                Self::prepend_model_change(agent_id, msg, user_name).await
+            } else {
+                (msg.to_string(), None)
+            };
+            let content =
+                crate::session::personal_changes::prepend_changes(&content, ws, role).await;
+
             if is_new {
                 let (msgs, snapshot) = Self::build_turn_messages(
-                    msg,
+                    &content,
                     ws,
                     role,
                     ticket,
@@ -251,11 +266,6 @@ impl Session {
                 // (see doc comment above). The session DB caches the full
                 // first-turn message set. The only rebuild path is
                 // `apply_summary` below.
-                let (content, new_snapshot) = if matches!(role, Role::Assistant) {
-                    Self::prepend_model_change(agent_id, msg, user_name).await
-                } else {
-                    (msg.to_string(), None)
-                };
                 let user_msg = crate::session::user_msg_with_ts(&content, round_ts);
                 // Append the user message and update session context atomically.
                 crate::session::store()

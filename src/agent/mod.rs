@@ -651,6 +651,7 @@ impl Agent {
             failure: None,
             failure_class: None,
             sleep_ended: false,
+            turn_recorded: false,
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
@@ -853,6 +854,11 @@ impl Agent {
     /// Run a complete agent turn: initialize session, work loop (with shutdown
     /// cancellation), finalize session.
     pub async fn work(&mut self, msg: &str, resume: bool) -> anyhow::Result<String> {
+        // Whether this turn's user message lands decides whether the turn may
+        // advance a personal folder's change baseline at its end (the report
+        // rides that message); see `session::personal_changes::refresh_after_turn`.
+        // Cleared first, so no early return can carry a previous turn's answer.
+        self.turn_recorded = false;
         // Load the session WITHOUT appending the turn message: the universal
         // completion below must settle any dangling tool calls BEFORE the new
         // message lands (results insert directly after their frame, so the
@@ -910,6 +916,8 @@ impl Agent {
             self.complete_pending_tool_calls().await?
         };
 
+        // A turn that recorded no user message (an empty-message recovery retry)
+        // leaves `turn_recorded` false, so it advances no baseline.
         if !msg.is_empty() {
             self.session
                 .append_turn_message(
@@ -924,6 +932,7 @@ impl Agent {
                     self.is_admin,
                 )
                 .await?;
+            self.turn_recorded = true;
         }
 
         // Pre-maybe_summarize drain check: a fresh dispatch that starts during
@@ -2871,6 +2880,17 @@ pub(crate) async fn run_agent(
     );
     let result = agent.work(message, resume).await;
 
+    // Absorb the product's own writes into a personal folder before the turn
+    // ends, or a later change report would blame the user for them. Every turn
+    // that returns — Ok, error, cancel or drain — passes here; the gate is the
+    // module's, and matches the report's (see `personal_changes`).
+    crate::session::personal_changes::refresh_after_turn(
+        &agent.role,
+        &agent.workspace,
+        agent.turn_recorded,
+    )
+    .await;
+
     // A completed Ok result is kept regardless of cancel cause — the token may
     // have fired just as work() finished; downstream finalizers are the
     // authority on how a cancelled run's result is used.
@@ -3092,6 +3112,7 @@ mod tests {
             failure: None,
             failure_class: None,
             sleep_ended: false,
+            turn_recorded: false,
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),

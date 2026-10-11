@@ -1,0 +1,1489 @@
+//! Between-turns change report for a user's personal workspace: what was added,
+//! changed or removed there between turns, at the head of the message every
+//! Assistant turn answers ([`prepend_changes`]) — an alarm's, a notice's or a
+//! delegation's turn included — so it never answers from stale knowledge.
+//!
+//! The observed state lives in the Assistant's own `session_metadata` row
+//! ([`crate::session::assistant_agent_id`]) — never inside the watched folder,
+//! which stays the user's alone. [`refresh_after_turn`] rewrites it at the end of
+//! the Assistant's own turn, so what it absorbs is everything that moved during
+//! that turn: the product's own writes, and equally an edit the user made while
+//! the turn was running. Telling writers apart — a raw shell command included —
+//! would cost more than that window is worth, and the block never claims the user
+//! made a change; between turns the report is exact.
+//!
+//! Cost: one plain walk per observation, carrying size and mtime across turns so
+//! an unchanged file is never read ([`scan`] says what is read, [`diff`] what that
+//! decides). A walk of a personal folder holding tens of thousands of entries
+//! measures ~0.12–0.15 s, and a turn pays for one on the reply path plus one at
+//! its end; content is read only for the files whose stamp moved. The folder's
+//! first observation, which does read every file once, does not ([`establish`]),
+//! and while it runs the account gets no block at all.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::util::UnwrapPoison;
+use crate::{Role, Workspace};
+
+/// One entry's fingerprint. `digest` is `None` for an entry whose content was not
+/// read (a newly seen path on the report path) or could not be (above
+/// [`HASH_MAX_BYTES`], an I/O error, or an entry that is not a regular file);
+/// [`diff`] says what that means.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileState {
+    size: u64,
+    mtime_ns: i64,
+    digest: Option<u64>,
+}
+
+/// Relative path → fingerprint. `BTreeMap` keeps the serialized JSON stable so
+/// "did anything move?" is a string comparison.
+type Snapshot = BTreeMap<String, FileState>;
+
+/// Files at or below this size are read and hashed whole; a larger one is judged
+/// by its stamp alone, so a folder's multi-gigabyte blobs are never read at all.
+/// The price is that a mere touch of such a file reports as a change — the
+/// lesser evil against never noticing a real edit deep inside one we never read.
+const HASH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read buffer for streaming a file through the hasher.
+const READ_BUFFER_BYTES: usize = 64 * 1024;
+
+/// A stamp the platform refused to report (a file older than the epoch, or one
+/// whose stamp does not fit). It is not a fact about the file, so it can never
+/// decide a comparison: such a file is read and its content decides.
+const STAMP_UNKNOWN: i64 = i64::MIN;
+
+/// Hash the whole content of `path` — never the mtime or the size. The first 8
+/// bytes of SHA-256 are the digest: 64 bits tells one revision of a file from
+/// another far beyond what a folder can hold, and keeps the stored baseline
+/// small. `None` on any I/O error.
+fn digest_of(path: &Path) -> Option<u64> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; READ_BUFFER_BYTES];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    Some(u64::from_be_bytes(head))
+}
+
+/// A file's mtime as nanoseconds since the epoch, or [`STAMP_UNKNOWN`] when the
+/// platform reports none (a stamp before 1970, or one outside `i64`).
+fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
+        .unwrap_or(STAMP_UNKNOWN)
+}
+
+/// Whether the walker should skip `entry` (and, for a directory, its whole
+/// subtree). Only what the product or the OS keeps in the personal folder is
+/// pruned at any depth: the `.git` repository metadata, the `.compaction` store
+/// and macOS's `.DS_Store`. A user's own dotfile — `.env`, `.gitignore`,
+/// `.config/` — is the user's material and a hand edit to it must be reported;
+/// the sibling `<personal-files>` listing hides all hidden entries, so a
+/// dotfile can legitimately appear in this block without appearing there. The
+/// product's own things at the workspace root (`MEMORY.md` and the `generated/`,
+/// `uploads/` and `notes/` directories) are never watched either.
+///
+/// This set — not the sibling enumerations (`walk_personal_files`,
+/// [`crate::tools::custom`], `research_cleanup`) — decides what is watched, and it
+/// deliberately differs from them: the listing also shows `MEMORY.md` and
+/// `notes/`, and `shared/` is product material only in the folder that holds the
+/// custom-tool catalogue ([`is_owner_personal_folder`]). They are named here so a new
+/// product-owned path lands in both places.
+fn is_skipped(entry: &ignore::DirEntry, owner_folder: bool) -> bool {
+    if entry.depth() == 0 {
+        return false; // the watched root itself
+    }
+    let Some(name) = entry.file_name().to_str() else {
+        return false;
+    };
+    if name == ".DS_Store" {
+        return true;
+    }
+    if matches!(name, ".git" | ".compaction") && entry.file_type().is_some_and(|t| t.is_dir()) {
+        return true;
+    }
+    if entry.depth() == 1 {
+        if name == "MEMORY.md" {
+            return true;
+        }
+        if entry.file_type().is_some_and(|t| t.is_dir()) {
+            if matches!(name, "generated" | "uploads" | "notes") {
+                return true;
+            }
+            // The product's custom-tool catalogue lives in the owner's own
+            // folder alone; in anyone else's personal folder the name `shared/`
+            // is that user's own material, whose edits must be reported.
+            if name == "shared" && owner_folder {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The path below the userspaces root when `path` lies inside it, `None` when it
+/// does not. Both sides are compared canonically
+/// ([`crate::stored_workspace_path`]): this relates a [`Workspace`]'s stored path
+/// — canonical, and possibly behind a symlink — to the userspaces tree, and
+/// `Path::starts_with` is lexical, so a storage root behind a symlink (macOS's
+/// `/tmp` → `/private/tmp`, a symlinked `HOME`) would never match a raw prefix.
+fn under_userspaces(path: &Path) -> Option<PathBuf> {
+    let root = crate::stored_workspace_path(&crate::users::userspaces_root());
+    crate::stored_workspace_path(path)
+        .strip_prefix(root)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+/// The account whose personal folder `path` is or lies in — the folder itself or
+/// anything under it (a delegated round, a targeted project round and a
+/// custom-role launch all work below it, and a registered workspace placed inside
+/// one counts too): the first component below the userspaces root, which is the
+/// name [`crate::users::personal_workspace_path`] builds every personal folder
+/// from.
+fn personal_account_in(path: &Path) -> Option<String> {
+    under_userspaces(path)?
+        .components()
+        .next()?
+        .as_os_str()
+        .to_str()
+        .map(str::to_string)
+}
+
+/// Whether `root` is the owner's own personal folder — the one that holds the
+/// product's custom-tool catalogue ([`crate::tools::custom`]), so that its
+/// `shared/` is product material rather than the user's.
+///
+/// [`crate::users::personal_workspace_path`] builds every personal folder by
+/// joining [`crate::users::userspaces_root`] with the account's name, and a walk's
+/// root is always what that join returned, so undoing the join names the account
+/// the walked folder belongs to. The comparison is component-wise
+/// ([`Path::strip_prefix`]) — a trailing separator or a `.` component decides
+/// nothing — and the account is tested with the product's single account test
+/// ([`crate::users::is_admin_name`]). Only the owner's own folder counts: no
+/// folder named after the owner anywhere else, and none below the real one, is
+/// the product's, and a guest's own `shared/` stays watched.
+///
+/// The path is taken as it stands rather than canonically
+/// ([`under_userspaces`]), and deliberately: canonicalizing moves an account
+/// folder that is itself a link out of the userspaces tree, which would stop
+/// pruning the catalogue that does live there (the walk follows such a root).
+fn is_owner_personal_folder(root: &Path) -> bool {
+    let Ok(rel) = root.strip_prefix(crate::users::userspaces_root()) else {
+        return false;
+    };
+    let mut parts = rel.components();
+    let account = parts.next().and_then(|c| c.as_os_str().to_str());
+    parts.next().is_none() && account.is_some_and(crate::users::is_admin_name)
+}
+
+/// Dig the offending path out of an `ignore` walk error. The path lives in the
+/// public `WithPath` variant, wrapped by `WithLineNumber`/`WithDepth`; `ignore`
+/// 0.4.33 exposes no `path()` accessor of its own.
+fn error_path(err: &ignore::Error) -> Option<&Path> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithLineNumber { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            error_path(err)
+        }
+        _ => None,
+    }
+}
+
+/// Copy `rel`'s previous state — and, when it is a directory prefix, every
+/// previous entry beneath it — into `out`, unchanged. Used wherever the walk
+/// could not observe an entry at all, so a transient error can never read as the
+/// user deleting files, and a later successful observation still reports the real
+/// change. The snapshot is a sorted `BTreeMap`, so the `rel/` subtree is one
+/// contiguous `range`.
+fn freeze(previous: Option<&Snapshot>, rel: &str, out: &mut Snapshot) {
+    let Some(previous) = previous else {
+        return;
+    };
+    if let Some(state) = previous.get(rel) {
+        out.insert(rel.to_string(), state.clone());
+    }
+    // Keys beginning with `rel/` sort contiguously between `rel/` and `rel0`
+    // ('0' is the byte just past '/'), so the range cannot spill into a sibling
+    // like `rel.txt`.
+    for (path, state) in previous.range(format!("{rel}/")..format!("{rel}0")) {
+        out.insert(path.clone(), state.clone());
+    }
+}
+
+/// `workspace`'s personal account, when the turn ran in a personal folder —
+/// the folder itself, or anything under it (a delegated round, a targeted
+/// project round and a custom-role launch all work under a path-derived
+/// workspace, and a registered workspace placed inside one counts too). `None`
+/// for a workspace that is neither inside the userspaces root nor named after a
+/// personal workspace, which is what leaves an ordinary project workspace
+/// untouched.
+///
+/// Where the turn actually worked decides first — that is where its writes
+/// landed — and the personal name is the fallback, for a folder the product
+/// reaches through a symlink of its own. [`personal_account_of`] is what refuses
+/// a name that cannot address a folder.
+fn personal_user_of(workspace: &Workspace) -> Option<String> {
+    personal_account_in(Path::new(&workspace.path))
+        .or_else(|| crate::users::personal_user_name(&workspace.name).map(str::to_string))
+}
+
+/// What one scan is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scan {
+    /// The turn's report: nothing is stored, so only what [`diff`] consults is read.
+    Report,
+    /// A refresh: every entry it keeps is fingerprinted, so a later touch stays
+    /// decidable.
+    Refresh,
+    /// The establishment's walk ([`establish`]). The same as [`Scan::Refresh`],
+    /// with the two liberties only a walk that is off the reply path may take: an
+    /// unreadable baseline is re-fingerprinted from scratch rather than handed
+    /// back, and the walk gives up on a forced stop instead of holding the exit
+    /// for a folder-wide read.
+    Whole,
+}
+
+impl Scan {
+    /// Whether the walk's result is stored (a report's is not).
+    fn stores(self) -> bool {
+        !matches!(self, Self::Report)
+    }
+}
+
+/// Walk `root` and fingerprint every entry the folder holds, reusing a stored
+/// digest when the size and a reported stamp both match exactly. `None` when
+/// `root` is not a readable directory or a walk error's path cannot be recovered
+/// (fail-open); every other entry the walk could not observe keeps its previous
+/// state ([`freeze`]).
+///
+/// Directories are not entries of their own — a directory is implied by the paths
+/// below it — so an added empty directory is not reported. The walk never descends
+/// into a symlink either, which leaves the files behind a directory link out of
+/// the snapshot: replacing a real directory with a link to one therefore reports
+/// the files that were there as removed.
+///
+/// `mode` decides what is read ([`Scan`]) and nothing else. The ignore machinery
+/// is deliberately DISABLED (`standard_filters(false)`) so a user's own
+/// `.gitignore` or global ignore file can never hide their files.
+fn scan(root: &Path, previous: Option<&Snapshot>, mode: Scan) -> Option<Snapshot> {
+    let stores = mode.stores();
+    if std::fs::read_dir(root).is_err() {
+        // Fail open — no report, no baseline, and never a blocked turn.
+        tracing::warn!(root = %root.display(), "personal-workspace folder unreadable");
+        return None;
+    }
+    let mut out = Snapshot::new();
+    let whole_walk = mode == Scan::Whole;
+    let owner_folder = is_owner_personal_folder(root);
+    // Cloned once: the loop below runs per entry, and a whole-folder walk on a
+    // large folder would clone the token tens of thousands of times.
+    let stop = crate::shutdown::shutdown_token();
+    for result in WalkBuilder::new(root)
+        .standard_filters(false)
+        .follow_links(false)
+        .filter_entry(move |entry| !is_skipped(entry, owner_folder))
+        .build()
+    {
+        // A forced stop gives up a whole-folder walk rather than hold the exit for
+        // a folder-wide read. The token, not `aborting()`: a graceful drain exists
+        // to let in-flight work finish, and the drain's own watch fires the token
+        // as soon as the foreground work drains.
+        if whole_walk && stop.is_cancelled() {
+            return None;
+        }
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(e) => {
+                // A root-level walk error means the folder itself went
+                // unreadable after the probe — fail open (no report), not a
+                // half-walk that would look like mass deletion.
+                if e.depth() == Some(0) {
+                    return None;
+                }
+                // A deeper error misses that path (for a directory: its whole
+                // subtree) — freeze it.
+                let Some(rel) = error_path(&e)
+                    .and_then(|path| path.strip_prefix(root).ok())
+                    .and_then(Path::to_str)
+                else {
+                    // The path is unrecoverable, so what was missed is
+                    // unknowable — fail open rather than report a partial walk.
+                    tracing::warn!(error = %e, "personal-workspace walk error without a path");
+                    return None;
+                };
+                tracing::warn!(
+                    path = %rel,
+                    error = %e,
+                    "personal-workspace walk error — freezing its previous state"
+                );
+                freeze(previous, rel, &mut out);
+                continue;
+            }
+        };
+        if entry.depth() == 0 {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let Some(rel) = rel.to_str() else {
+            continue; // a non-UTF-8 path cannot be listed or diffed
+        };
+        // `std::fs::metadata` follows symlinks (the walker does not descend
+        // into them), matching the read tool: a symlinked file is fingerprinted
+        // by what it points at. A symlink whose target is gone falls back to the
+        // link itself — the entry the folder now holds — so the user's
+        // replacement of a file is reported rather than silently missed.
+        let meta = std::fs::metadata(path).or_else(|_| std::fs::symlink_metadata(path));
+        let Ok(meta) = meta else {
+            tracing::warn!(
+                path = %path.display(),
+                "personal-workspace entry metadata unreadable — freezing its previous state"
+            );
+            freeze(previous, rel, &mut out);
+            continue;
+        };
+        if meta.is_dir() {
+            continue; // directories are implied by the paths below them
+        }
+        let size = meta.len();
+        let mtime = mtime_ns(&meta);
+        let digest = if meta.is_file() {
+            match previous.and_then(|prev| prev.get(rel)) {
+                // An unchanged, reported stamp means the same bytes: reuse it.
+                Some(prev)
+                    if prev.size == size && prev.mtime_ns == mtime && mtime != STAMP_UNKNOWN =>
+                {
+                    prev.digest
+                }
+                // A report keeps nothing, and `diff` consults no digest for a path
+                // it has never seen (`added`) or one whose size moved (`changed`).
+                None if !stores => None,
+                Some(prev) if !stores && prev.size != size => None,
+                // Above the cap the stamp is all there is to compare.
+                _ if size > HASH_MAX_BYTES => None,
+                // Everything else — a stamp that moved under an unchanged size, and
+                // a stamp the platform will not report at all — is decided by the
+                // content, the only thing here that can decide it.
+                _ => digest_of(path),
+            }
+        } else {
+            // A FIFO, a device or a socket is never opened, hashed or waited on;
+            // its own stamp is all the walk has to offer, and recording it still
+            // reports the user replacing a file with one.
+            None
+        };
+        out.insert(
+            rel.to_string(),
+            FileState {
+                size,
+                mtime_ns: mtime,
+                digest,
+            },
+        );
+    }
+    Some(out)
+}
+
+/// The three sorted change classes between two snapshots.
+#[derive(Debug, Default)]
+struct Changes {
+    added: Vec<String>,
+    changed: Vec<String>,
+    removed: Vec<String>,
+}
+
+/// Classify `current` against `previous`; a rename therefore shows as removed +
+/// added. A path present in both is `changed` when its size differs — airtight,
+/// no digest needed — or when it cannot be shown to hold the same bytes: its
+/// stamp moved, or the platform reports no stamp for it at all, and its digest
+/// says otherwise. Equal digests mean a touch (nothing reported); a digest
+/// missing on either side (above [`HASH_MAX_BYTES`], an entry that is not a
+/// regular file, or one that failed to read) cannot be compared, and such a file
+/// is reported rather than silently never — a stamp that moved is the most a
+/// stamp-only entry can offer. An entry above the cap under an unreportable stamp
+/// is the one case with neither evidence to compare, and it follows the same
+/// preference: reported, because missing a real edit is the worse failure.
+/// Iterating the `BTreeMap`s keeps each list sorted.
+fn diff(previous: &Snapshot, current: &Snapshot) -> Changes {
+    let mut changes = Changes::default();
+    for (path, cur) in current {
+        match previous.get(path) {
+            None => changes.added.push(path.clone()),
+            Some(prev) => {
+                let same_content = matches!(
+                    (prev.digest, cur.digest),
+                    (Some(before), Some(after)) if before == after
+                );
+                let moved = prev.mtime_ns != cur.mtime_ns
+                    || prev.mtime_ns == STAMP_UNKNOWN
+                    || cur.mtime_ns == STAMP_UNKNOWN;
+                if prev.size != cur.size || (moved && !same_content) {
+                    changes.changed.push(path.clone());
+                }
+            }
+        }
+    }
+    for path in previous.keys() {
+        if !current.contains_key(path) {
+            changes.removed.push(path.clone());
+        }
+    }
+    changes
+}
+
+/// Hard entry cap across all three classes; the tail summarizes the rest.
+const MAX_LISTED_ENTRIES: usize = 40;
+
+/// Secondary stop condition on the rendered block size, in bytes.
+const MAX_BLOCK_BYTES: usize = 2 * 1024;
+
+/// Render the change block, or `None` when nothing changed. Classes render in
+/// the order added → changed → removed, one per line, stopping at the entry or
+/// byte cap; everything left out is summarized by a final `…and N more` line.
+fn render(changes: &Changes) -> Option<String> {
+    let groups = [
+        ("added: ", &changes.added),
+        ("changed: ", &changes.changed),
+        ("removed: ", &changes.removed),
+    ];
+    let total: usize = groups.iter().map(|(_, list)| list.len()).sum();
+    if total == 0 {
+        return None;
+    }
+
+    let mut lines = String::new();
+    let mut shown = 0usize;
+    let mut capped = false;
+    for (label, list) in groups {
+        let mut names: Vec<&str> = Vec::new();
+        let mut cost = lines.len();
+        for name in list {
+            if shown >= MAX_LISTED_ENTRIES {
+                capped = true;
+                break;
+            }
+            let add = name.len() + if names.is_empty() { label.len() } else { 2 };
+            if cost + add > MAX_BLOCK_BYTES {
+                capped = true;
+                break;
+            }
+            cost += add;
+            names.push(name);
+            shown += 1;
+        }
+        if !names.is_empty() {
+            let _ = writeln!(lines, "{label}{}", names.join(", "));
+        }
+        if capped {
+            break;
+        }
+    }
+    if total > shown {
+        let _ = write!(lines, "…and {} more", total - shown);
+    }
+
+    let asset = crate::prompt::load_prompt("context/personal_changes.md");
+    Some(crate::prompt::substitute(
+        &asset,
+        &[("{{changes}}", lines.trim_end())],
+    ))
+}
+
+/// Prepend the between-turns change report for `workspace`'s personal folder to
+/// the Assistant's user message `msg`; `msg` comes back unchanged for every other
+/// role, and whenever there is nothing to say: no personal folder, no baseline (or
+/// no session row at all), nothing changed, or an unresolvable/unwalkable folder —
+/// fail-open throughout. This is the only gate and the only prepend site the
+/// message-append path uses, and it resolves the folder exactly like
+/// [`refresh_after_turn`], so the block can only ever describe a folder whose
+/// baseline is also the one being advanced.
+pub(crate) async fn prepend_changes(msg: &str, workspace: &Workspace, role: &Role) -> String {
+    if !matches!(role, Role::Assistant) {
+        return msg.to_string();
+    }
+    let Some(user_name) = personal_account_of(workspace) else {
+        return msg.to_string();
+    };
+    // The folder's first observation is still walking, or a turn that ended
+    // during it has not been absorbed yet: report nothing rather than a delta
+    // from a baseline that is not settled (see `establish`).
+    if ESTABLISHING.lock().unwrap_poison().contains_key(&user_name) {
+        return msg.to_string();
+    }
+    let agent_id = crate::session::assistant_agent_id(&user_name);
+    // `None` and `NULL` (no session row, no baseline yet, or a read error) mean
+    // there is nothing to compare against — never fabricate a report from one.
+    let Some(Some(stored)) = crate::session::store()
+        .personal_changes_baseline(&agent_id)
+        .await
+    else {
+        return msg.to_string();
+    };
+    let root = crate::users::personal_workspace_path(&user_name);
+    // Decoding the baseline, walking the folder and reading what moved all run on
+    // the blocking pool: the baseline is megabytes of JSON and the walk is I/O.
+    let scanned = tokio::task::spawn_blocking(move || {
+        let previous: Snapshot = match serde_json::from_str(&stored) {
+            Ok(previous) => previous,
+            Err(e) => {
+                tracing::warn!(%e, "Unparseable personal-changes baseline — skipping the report");
+                return None;
+            }
+        };
+        let current = scan(&root, Some(&previous), Scan::Report)?;
+        Some(diff(&previous, &current))
+    })
+    .await;
+    let Some(Some(changes)) = scanned.ok() else {
+        return msg.to_string();
+    };
+    match render(&changes) {
+        Some(block) => format!("{block}\n\n{msg}"),
+        None => msg.to_string(),
+    }
+}
+
+/// Absorb into the baseline whatever the product itself did inside a personal
+/// workspace, so a later report cannot blame the user for it.
+///
+/// Gated exactly like the report it serves: only the Assistant's own turn counts
+/// ([`Role::Assistant`]), only one whose user message was recorded (an
+/// undelivered report must leave its changes pending rather than swallow them),
+/// and only when the turn ran in that user's personal folder. A delegated round
+/// or a custom-role launch that happens to run in the folder therefore advances
+/// nothing — absorbing a hand edit the user made between messages would be
+/// worse than letting such a round's own writes surface in the next block.
+pub(crate) async fn refresh_after_turn(role: &Role, workspace: &Workspace, recorded: bool) {
+    if !recorded || !matches!(role, Role::Assistant) {
+        return;
+    }
+    let Some(user_name) = personal_account_of(workspace) else {
+        return;
+    };
+    refresh(&user_name).await;
+}
+
+/// The account a turn's change report and baseline concern: the owner of the
+/// personal folder that turn ran in ([`personal_user_of`]), refused when the name
+/// cannot address a folder. `None` for a turn that ran in no personal folder,
+/// which is what leaves an ordinary project workspace untouched.
+fn personal_account_of(workspace: &Workspace) -> Option<String> {
+    let user_name = personal_user_of(workspace)?;
+    crate::users::is_valid_personal_user_name(&user_name).then_some(user_name)
+}
+
+/// Refresh the stored baseline for `user_name`'s personal workspace; the name
+/// comes from [`personal_account_of`], so it can address a folder. The write is
+/// update-only, so an account with no Assistant metadata row yet is never given
+/// a phantom one — and, since that write is what the walk exists for, such an
+/// account is not walked at all. An unwalkable folder is a silent no-op and the
+/// DB write is skipped when nothing moved. A baseline that is NULL or unreadable
+/// is the case whose walk is not paid here: it hands off to [`establish`].
+///
+/// Two turns in the same folder (an alarm overlapping a user turn) can interleave
+/// their read-write here. Either write is a fresh observation of the same folder,
+/// so the loser costs a few milliseconds of staleness, not a wrong report.
+async fn refresh(user_name: &str) {
+    // A turn ending while the folder's first observation is still running is
+    // absorbed by that observation's own next walk (see `establish`), so the walk
+    // is not paid for here as well.
+    if request_another_walk(user_name) {
+        return;
+    }
+    let agent_id = crate::session::assistant_agent_id(user_name);
+    // `None` is no session row at all: the baseline could never be recorded, so
+    // there is nothing to walk for.
+    let Some(stored) = crate::session::store()
+        .personal_changes_baseline(&agent_id)
+        .await
+    else {
+        return;
+    };
+    if stored.is_none() {
+        establish(user_name, agent_id);
+        return;
+    }
+    match observe(
+        crate::users::personal_workspace_path(user_name),
+        stored,
+        Scan::Refresh,
+    )
+    .await
+    {
+        Observation::Fresh(json) => store_baseline(user_name, &agent_id, &json).await,
+        Observation::Settled => {}
+        Observation::Unusable => establish(user_name, agent_id),
+    }
+}
+
+/// Fingerprint `user_name`'s folder for the first time — the one observation
+/// that reads and hashes every file it keeps — off the reply path: the user
+/// never waits for it, and no block is rendered while it runs (see
+/// [`prepend_changes`]). A change made during that short window is absorbed
+/// silently, the same accepted class as the one an in-flight turn absorbs.
+///
+/// [`ESTABLISHING`] carries that window: it marks the account as being observed,
+/// keeps a burst of turns from stacking identical whole-folder walks, and records
+/// that a turn ended since the last walk — such a turn's own writes are not in
+/// that observation, so one more (incremental) observation runs before the window
+/// closes, and the product's writes never reach the next block.
+///
+/// A baseline write that keeps failing (a broken store) leaves the baseline NULL,
+/// so every later turn retries this observation — off the reply path, logged, and
+/// still silent: the only price is a background walk per turn until a write
+/// lands, and recovery is automatic once one does.
+fn establish(user_name: &str, agent_id: String) {
+    let user_name = user_name.to_string();
+    let root = crate::users::personal_workspace_path(&user_name);
+    // The guard is built here, next to the insert that sets the mark, and moved
+    // into the task below — see [`Establishing`] for what that guarantees.
+    let establishing = {
+        let mut establishing = ESTABLISHING.lock().unwrap_poison();
+        // Already observing: this turn's writes are not in the last walk, so ask
+        // for one more (see the loop below) instead of walking here as well. Both
+        // happen under one lock, so two turns cannot both start an observation.
+        if let Some(in_flight) = establishing.get_mut(&user_name) {
+            in_flight.again = true;
+            return;
+        }
+        let owner = NEXT_OWNER.fetch_add(1, Ordering::Relaxed);
+        establishing.insert(
+            user_name.clone(),
+            InFlight {
+                again: false,
+                owner,
+            },
+        );
+        Establishing {
+            user_name: user_name.clone(),
+            owner,
+        }
+    };
+    tokio::spawn(async move {
+        // Holding the guard for the task's lifetime keeps the mark set until this
+        // observation really ends, and its owner is the only mark this task may
+        // close.
+        let owner = establishing.owner;
+        // What the caller read may have moved on since (a predecessor stored its
+        // observation, or another turn's establishment did): comparing against what
+        // is stored NOW keeps a folder already observed on the incremental walk and
+        // leaves the whole-folder read — through an unreadable baseline included —
+        // to the case it is for, a folder nobody has observed yet.
+        let Some(mut previous) = crate::session::store()
+            .personal_changes_baseline(&agent_id)
+            .await
+        else {
+            return; // no metadata row: there would be nothing to record
+        };
+        loop {
+            // A walk that stores nothing (an unwalkable folder, or one that moved in
+            // no way the baseline does not already record) still owes the window its
+            // last check: a turn that ended while it ran has writes this observation
+            // does not hold.
+            if let Observation::Fresh(json) =
+                observe(root.clone(), previous.clone(), Scan::Whole).await
+            {
+                store_baseline(&user_name, &agent_id, &json).await;
+                previous = Some(json);
+            }
+            if !take_again_or_finish(&user_name, owner) {
+                return;
+            }
+        }
+    });
+}
+
+/// An account's first observation being in flight, and whether a turn has ended
+/// since its last walk. While an account is in here the block stays silent for it
+/// (see [`prepend_changes`]).
+struct InFlight {
+    /// A turn ended since the last walk, so one more observation is owed.
+    again: bool,
+    /// Which observation set the mark (see [`Establishing`]).
+    owner: u64,
+}
+
+/// Accounts being observed right now.
+static ESTABLISHING: std::sync::Mutex<BTreeMap<String, InFlight>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Hands each observation the token that owns its [`ESTABLISHING`] mark.
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(0);
+
+/// Whether an observation of `user_name` is in flight; if it is, record that a
+/// turn has ended since its last walk — those writes are not in it, so it runs one
+/// more before the window closes.
+fn request_another_walk(user_name: &str) -> bool {
+    let mut establishing = ESTABLISHING.lock().unwrap_poison();
+    match establishing.get_mut(user_name) {
+        Some(in_flight) => {
+            in_flight.again = true;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Under one lock: `true` while `owner`'s observation must keep observing — a turn
+/// ended since its last walk, and the request is consumed — and `false` when the
+/// window can close, which also clears the mark so the block resumes for the
+/// account. Taking the request and clearing the mark together is what keeps a turn
+/// ending in between from being lost; a mark another observation owns is left
+/// alone, exactly as in [`Establishing`].
+fn take_again_or_finish(user_name: &str, owner: u64) -> bool {
+    let mut establishing = ESTABLISHING.lock().unwrap_poison();
+    match establishing.get_mut(user_name) {
+        Some(in_flight) if in_flight.owner != owner => false,
+        Some(in_flight) if in_flight.again => {
+            in_flight.again = false;
+            true
+        }
+        Some(_) => {
+            establishing.remove(user_name);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Clears the [`ESTABLISHING`] mark it set however the observation ends — the
+/// window closing normally, an early return, a panic, or a runtime that drops the
+/// spawned future without ever polling it — or the account would stay silent and
+/// never get a baseline.
+struct Establishing {
+    user_name: String,
+    owner: u64,
+}
+
+impl Drop for Establishing {
+    fn drop(&mut self) {
+        let mut establishing = ESTABLISHING.lock().unwrap_poison();
+        // A later observation for the same account may already own a fresh mark
+        // by now: that one is not this guard's to clear.
+        if establishing
+            .get(&self.user_name)
+            .is_some_and(|in_flight| in_flight.owner == self.owner)
+        {
+            establishing.remove(&self.user_name);
+        }
+    }
+}
+
+/// One observation attempt's outcome.
+enum Observation {
+    /// An observation to store as the baseline.
+    Fresh(String),
+    /// Nothing to store: the folder could not be walked, or it moved in no way
+    /// the stored baseline does not already record.
+    Settled,
+    /// The stored baseline cannot be read, so the folder has to be fingerprinted
+    /// from scratch — the one observation that must not happen on the reply path.
+    Unusable,
+}
+
+/// Walk `root` and return the observation to store.
+///
+/// `stored` is the baseline the walk compares against; `None` is a NULL column
+/// (a session predating the baseline), whose empty previous snapshot makes this
+/// the folder's first observation.
+async fn observe(root: PathBuf, stored: Option<String>, mode: Scan) -> Observation {
+    // Decoding the baseline, walking the folder and re-encoding what the walk
+    // found all run on the blocking pool: the baseline is megabytes of JSON.
+    tokio::task::spawn_blocking(move || {
+        let previous: Snapshot = match stored.as_deref() {
+            None => Snapshot::new(),
+            Some(stored) => match serde_json::from_str(stored) {
+                Ok(previous) => previous,
+                Err(e) => {
+                    // An unreadable baseline means the folder has to be
+                    // fingerprinted from scratch — which only the establishment's
+                    // walk may pay ([`Scan::Whole`]); a refresh hands the case back
+                    // to it instead of reading the whole folder on the reply path.
+                    tracing::warn!(%e, "Unreadable personal-changes baseline");
+                    if mode != Scan::Whole {
+                        return Observation::Unusable;
+                    }
+                    Snapshot::new()
+                }
+            },
+        };
+        // `None` is an unwalkable folder (already warned about inside `scan`).
+        let Some(current) = scan(&root, Some(&previous), mode) else {
+            return Observation::Settled;
+        };
+        let json = match serde_json::to_string(&current) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!(%e, "Failed to serialize personal-changes baseline");
+                return Observation::Settled;
+            }
+        };
+        if stored.as_deref() == Some(json.as_str()) {
+            Observation::Settled
+        } else {
+            Observation::Fresh(json)
+        }
+    })
+    .await
+    .unwrap_or(Observation::Settled)
+}
+
+/// Store one observation as `user_name`'s baseline.
+async fn store_baseline(user_name: &str, agent_id: &str, json: &str) {
+    if let Err(e) = crate::session::store()
+        .update_personal_changes(agent_id, json)
+        .await
+    {
+        tracing::warn!(
+            user = %user_name,
+            error = %e,
+            "Failed to persist personal-changes baseline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::params;
+
+    /// The folder's first observation runs off the reply path, so its baseline
+    /// lands a moment after the refresh that started it returns — and until that
+    /// observation has closed, the block stays silent for the account. A walk a
+    /// forced stop abandoned leaves no baseline behind, and re-driving the refresh
+    /// once nothing is in flight is what the next turn does.
+    async fn wait_for_baseline(user: &str) -> Option<String> {
+        let agent_id = crate::session::assistant_agent_id(user);
+        for _ in 0..200 {
+            // While the observation is in flight, waiting is all this may do: a
+            // refresh here would ask it for another walk and perturb the state
+            // under test.
+            if ESTABLISHING.lock().unwrap_poison().contains_key(user) {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                continue;
+            }
+            if let Some(Some(json)) = crate::session::store()
+                .personal_changes_baseline(&agent_id)
+                .await
+            {
+                return Some(json);
+            }
+            refresh(user).await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    #[test]
+    fn scan_diff_classifies_added_changed_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        for (name, body) in [
+            ("a.txt", "aaa"),
+            ("b.txt", "bbb"),
+            ("c.txt", "ccc"),
+            ("d.txt", "ddd"),
+        ] {
+            std::fs::write(root.join(name), body).unwrap();
+        }
+        let before = scan(root, None, Scan::Refresh).unwrap();
+
+        // Let the mtime clock advance so a rewrite is observable even on a
+        // coarse filesystem.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        std::fs::write(root.join("a.txt"), "aaa-edited").unwrap(); // content changed
+        std::fs::write(root.join("b.txt"), "bbb").unwrap(); // identical bytes (touch)
+        std::fs::write(root.join("e.txt"), "eee").unwrap(); // new
+        std::fs::rename(root.join("c.txt"), root.join("c2.txt")).unwrap(); // rename
+        std::fs::remove_file(root.join("d.txt")).unwrap(); // delete
+
+        let after = scan(root, Some(&before), Scan::Refresh).unwrap();
+        let changes = diff(&before, &after);
+        assert_eq!(
+            changes.added,
+            vec!["c2.txt".to_string(), "e.txt".to_string()]
+        );
+        assert_eq!(changes.changed, vec!["a.txt".to_string()]);
+        assert_eq!(
+            changes.removed,
+            vec!["c.txt".to_string(), "d.txt".to_string()]
+        );
+
+        // The report's scan stores nothing, so it reads only what `diff`
+        // consults: a size change decides on the size alone, while the one
+        // identical-size rewrite (b.txt) is read to tell a touch from an edit.
+        let report = scan(root, Some(&before), Scan::Report).unwrap();
+        let report_changes = diff(&before, &report);
+        assert_eq!(report_changes.changed, vec!["a.txt".to_string()]);
+        assert_eq!(
+            report["a.txt"].digest, None,
+            "a size change must not cost a read on the report path"
+        );
+        assert!(
+            report["b.txt"].digest.is_some(),
+            "an identical-size rewrite must still be read"
+        );
+
+        // A folder the walk cannot even open is fail-open: no report, no
+        // baseline, never a blocked turn.
+        assert!(scan(&root.join("gone"), None, Scan::Refresh).is_none());
+    }
+
+    /// A stamp the platform will not report can never decide a comparison, so
+    /// such a file is settled by its content: a same-size edit under one is
+    /// reported, and an untouched file is not — the sentinel is not a stamp that
+    /// "did not move".
+    #[test]
+    fn scan_reads_a_file_whose_stamp_the_platform_will_not_report() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let file = root.join("old.txt");
+        std::fs::write(&file, "one").unwrap();
+
+        // A stamp before the epoch is the one such mtime a filesystem will
+        // actually hold; where it refuses, there is nothing to exercise.
+        let before_epoch = std::time::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap();
+        let handle = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        if handle.set_modified(before_epoch).is_err() {
+            return;
+        }
+        let before = scan(root, None, Scan::Refresh).unwrap();
+        if before["old.txt"].mtime_ns != STAMP_UNKNOWN {
+            return; // the platform would not store a pre-epoch stamp
+        }
+        assert!(before["old.txt"].digest.is_some());
+        // Same size, same (unreportable) stamp, different bytes.
+        std::fs::write(&file, "two").unwrap();
+        handle.set_modified(before_epoch).unwrap();
+        let after = scan(root, Some(&before), Scan::Refresh).unwrap();
+        assert_eq!(after["old.txt"].mtime_ns, STAMP_UNKNOWN);
+        assert_eq!(
+            diff(&before, &after).changed,
+            vec!["old.txt".to_string()],
+            "content must decide when the stamp cannot"
+        );
+    }
+
+    #[test]
+    fn scan_watches_user_dotfiles_but_skips_product_owned_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        for dir in [
+            ".git",
+            ".compaction",
+            "generated",
+            "uploads",
+            "shared",
+            "notes",
+            ".config",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let skipped = [
+            ".git/config",
+            ".compaction/c.txt",
+            "generated/g.txt",
+            "uploads/u.txt",
+            "notes/n.txt",
+            ".DS_Store",
+            "MEMORY.md",
+        ];
+        // `shared/` belongs to the product in the owner's own folder alone: in any
+        // other root that name is the user's own material (see the dedicated
+        // catalogue test below).
+        let watched = [
+            ".env",
+            ".gitignore",
+            ".config/settings.toml",
+            "keep.txt",
+            "shared/s.txt",
+        ];
+        for path in skipped.iter().chain(watched.iter()) {
+            std::fs::write(root.join(path), "one").unwrap();
+        }
+
+        let before = scan(root, None, Scan::Refresh).unwrap();
+        assert_eq!(
+            before.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                ".config/settings.toml".to_string(),
+                ".env".to_string(),
+                ".gitignore".to_string(),
+                "keep.txt".to_string(),
+                "shared/s.txt".to_string(),
+            ],
+            "only product/OS-owned entries must be hidden"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for path in skipped.iter().chain(watched.iter()) {
+            std::fs::write(root.join(path), "two-longer").unwrap();
+        }
+
+        let after = scan(root, Some(&before), Scan::Refresh).unwrap();
+        assert_eq!(
+            after.keys().cloned().collect::<Vec<_>>(),
+            before.keys().cloned().collect::<Vec<_>>(),
+            "skipped entries must never enter the snapshot"
+        );
+        let changes = diff(&before, &after);
+        assert!(changes.added.is_empty());
+        assert!(changes.removed.is_empty());
+        assert_eq!(changes.changed.len(), watched.len(), "{changes:?}");
+        for path in watched {
+            assert!(changes.changed.contains(&path.to_string()), "missed {path}");
+        }
+    }
+
+    /// The catalogue decision ([`is_owner_personal_folder`]): `shared/` is product
+    /// material in the owner's own personal folder alone — the folder the product
+    /// resolves from the owner's account — so the product's writes into the
+    /// catalogue never reach the block, while a folder that merely carries the
+    /// owner's name (anywhere but the userspaces root, or below the real folder)
+    /// and a guest's own `shared/` stay the user's material.
+    #[test]
+    fn scan_prunes_shared_in_the_owners_own_folder_alone() {
+        let owner = crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME);
+        // The decision itself, on the shapes a walk's root can be: the owner's own
+        // folder — spelled as the product builds it, or with a `.` component
+        // appended, since the comparison is component-wise — and nothing else.
+        assert!(is_owner_personal_folder(&owner));
+        assert!(is_owner_personal_folder(&owner.join(".")));
+        assert!(!is_owner_personal_folder(&crate::users::userspaces_root()));
+        assert!(!is_owner_personal_folder(&owner.join("nested")));
+        let outside = tempfile::TempDir::new().unwrap();
+        assert!(!is_owner_personal_folder(outside.path()));
+
+        // The owner's own folder: its `shared/` is the product's catalogue.
+        let catalogue = owner.join("shared");
+        std::fs::create_dir_all(&catalogue).unwrap();
+        // Non-runnable extensions: the probes must be invisible to the custom-tool
+        // discovery other tests run against this shared folder.
+        let catalogue_probe = crate::util::test::ProbeFile(catalogue.join("installed_probe.txt"));
+        let personal_probe = crate::util::test::ProbeFile(owner.join("personal_changes_probe.txt"));
+        std::fs::write(&catalogue_probe.0, "one").unwrap();
+        std::fs::write(&personal_probe.0, "one").unwrap();
+
+        let owner_snapshot = scan(&owner, None, Scan::Refresh).unwrap();
+        assert!(
+            owner_snapshot.contains_key("personal_changes_probe.txt"),
+            "the owner's own material stays watched: {owner_snapshot:?}"
+        );
+        assert!(
+            !owner_snapshot
+                .keys()
+                .any(|path| path.starts_with("shared/")),
+            "the catalogue is the product's own: {owner_snapshot:?}"
+        );
+
+        // A guest's own folder keeps its `shared/`.
+        let guest = crate::users::userspaces_root().join("pc_shared_guest");
+        std::fs::create_dir_all(guest.join("shared")).unwrap();
+        std::fs::write(guest.join("shared/own.txt"), "one").unwrap();
+        let guest_snapshot = scan(&guest, None, Scan::Refresh).unwrap();
+        assert_eq!(
+            guest_snapshot.keys().cloned().collect::<Vec<_>>(),
+            vec!["shared/own.txt".to_string()],
+            "another account's `shared/` is that account's own material"
+        );
+        std::fs::remove_dir_all(&guest).unwrap();
+
+        // A folder that merely carries the owner's name is not the product's own.
+        let lookalike = outside.path().join(crate::users::ADMIN_USER_NAME);
+        std::fs::create_dir_all(lookalike.join("shared")).unwrap();
+        std::fs::write(lookalike.join("shared/own.txt"), "one").unwrap();
+        let lookalike_snapshot = scan(&lookalike, None, Scan::Refresh).unwrap();
+        assert_eq!(
+            lookalike_snapshot.keys().cloned().collect::<Vec<_>>(),
+            vec!["shared/own.txt".to_string()],
+            "only the product's own folder holds the catalogue"
+        );
+    }
+
+    #[test]
+    fn render_caps_listed_entries_and_summarizes_the_rest() {
+        let changes = Changes {
+            added: (0..100).map(|i| format!("f{i:03}.txt")).collect(),
+            changed: Vec::new(),
+            removed: Vec::new(),
+        };
+        let block = render(&changes).unwrap();
+        assert!(block.contains("…and 60 more"), "tail missing: {block}");
+        assert!(
+            !block.contains("\n\n"),
+            "a truncated block must not carry a stray blank line: {block}"
+        );
+        let listed = block
+            .lines()
+            .find_map(|line| line.strip_prefix("added: "))
+            .unwrap()
+            .split(", ")
+            .count();
+        assert_eq!(listed, MAX_LISTED_ENTRIES);
+
+        // The untruncated form ends exactly like the truncated one.
+        let short = render(&Changes {
+            added: vec!["a.txt".to_string()],
+            ..Changes::default()
+        })
+        .unwrap();
+        assert!(
+            short.ends_with("a.txt\n</personal-changes>"),
+            "unexpected block tail: {short}"
+        );
+    }
+
+    /// An entry the walk cannot stat at all keeps its previous state instead of
+    /// reading as a deletion, and the `rel/` range copy takes its whole subtree
+    /// with it without spilling into a sibling that merely shares the prefix.
+    #[test]
+    fn freeze_keeps_the_prefix_subtree_and_no_sibling() {
+        let mut previous = Snapshot::new();
+        for path in ["dir", "dir/a.txt", "dir/sub/b.txt", "dir.txt", "other.txt"] {
+            previous.insert(
+                path.to_string(),
+                FileState {
+                    size: 1,
+                    mtime_ns: 2,
+                    digest: Some(3),
+                },
+            );
+        }
+        let mut out = Snapshot::new();
+        freeze(Some(&previous), "dir", &mut out);
+        assert_eq!(
+            out.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "dir".to_string(),
+                "dir/a.txt".to_string(),
+                "dir/sub/b.txt".to_string(),
+            ],
+            "the frozen prefix must take its subtree, and only it"
+        );
+
+        // With no previous observation there is nothing to keep.
+        let mut fresh = Snapshot::new();
+        freeze(None, "dir", &mut fresh);
+        assert!(fresh.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_reports_a_file_replaced_by_a_dangling_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("gone.txt"), "here").unwrap();
+        let before = scan(root, None, Scan::Refresh).unwrap();
+        assert!(before.contains_key("gone.txt"));
+
+        // Replaced by a dangling symlink: `metadata` (which follows the link)
+        // fails, so the link itself — the entry the folder now holds — is what the
+        // walk records. Never followed, and the replacement is reported rather
+        // than silently frozen away.
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        std::os::unix::fs::symlink("x", root.join("gone.txt")).unwrap();
+
+        let after = scan(root, Some(&before), Scan::Refresh).unwrap();
+        assert_eq!(
+            after["gone.txt"].digest, None,
+            "a broken link is never followed"
+        );
+        let changes = diff(&before, &after);
+        assert_eq!(changes.changed, vec!["gone.txt".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_never_opens_a_fifo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("ok.txt"), "ok").unwrap();
+        let fifo = root.join("pipe");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path; `mkfifo` only mints
+        // the node.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+
+        // A regression that opens the FIFO blocks in `File::open` forever; the
+        // timeout turns that hang into a failure instead of a stuck suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = root.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(scan(&root, None, Scan::Refresh));
+        });
+        let snapshot = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a FIFO must not block the scan")
+            .expect("the folder is readable");
+        assert!(snapshot.contains_key("ok.txt"));
+        let pipe = snapshot
+            .get("pipe")
+            .expect("a FIFO is an entry the folder holds and must be observed");
+        assert_eq!(pipe.digest, None, "a FIFO must never be hashed");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(personal_changes)]
+    async fn refresh_and_prepend_round_trip() {
+        crate::util::test::init_test_stores().await;
+        let user = "pc_e2e_user";
+        let agent_id = crate::session::assistant_agent_id(user);
+        let conn = &crate::session::store().conn;
+        conn.execute(
+            "DELETE FROM session_metadata WHERE agent_id = ?1",
+            params![agent_id.clone()],
+        )
+        .await
+        .unwrap();
+        let root = crate::users::personal_workspace_path(user);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        let personal = crate::users::personal_workspace_struct(user);
+
+        // No metadata row: prepend is a no-op and refresh must not create one.
+        assert_eq!(
+            prepend_changes("hi", &personal, &Role::Assistant).await,
+            "hi"
+        );
+        refresh(user).await;
+        let rows: i64 = conn
+            .query(
+                "SELECT COUNT(*) FROM session_metadata WHERE agent_id = ?1",
+                params![agent_id.clone()],
+            )
+            .await
+            .unwrap()[0]
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(rows, 0, "refresh must not create a phantom metadata row");
+
+        let now = crate::db::now();
+        conn.execute(
+            "INSERT INTO session_metadata (agent_id, last_activity, user_name, workspace_name, role, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'assistant', ?2)",
+            params![agent_id.clone(), now, user, format!("personal:{user}")],
+        )
+        .await
+        .unwrap();
+
+        // The first refresh establishes the baseline silently, off the reply
+        // path.
+        refresh(user).await;
+        assert_eq!(
+            prepend_changes("hi", &personal, &Role::Assistant).await,
+            "hi"
+        );
+        let stored = wait_for_baseline(user)
+            .await
+            .expect("the folder's first observation must land");
+        assert!(stored.contains("a.txt"), "{stored}");
+
+        // A hand edit is reported at the head of the next message.
+        std::fs::write(root.join("a.txt"), "an edited body").unwrap();
+        std::fs::write(root.join("b.txt"), "brand new").unwrap();
+        let msg = prepend_changes("hello", &personal, &Role::Assistant).await;
+        assert!(
+            msg.ends_with("hello"),
+            "original message must stay at the tail: {msg}"
+        );
+        assert!(
+            msg.starts_with("<personal-changes>"),
+            "block shell missing: {msg}"
+        );
+        assert!(msg.contains("changed: a.txt"), "missed change: {msg}");
+        assert!(msg.contains("added: b.txt"), "missed addition: {msg}");
+
+        // The turn's own writes land after the report, so the refresh that
+        // closes the turn absorbs them and the next message carries nothing.
+        std::fs::write(root.join("written-by-the-turn.md"), "product output").unwrap();
+        refresh(user).await;
+        assert_eq!(
+            prepend_changes("hello", &personal, &Role::Assistant).await,
+            "hello"
+        );
+
+        // A workspace in no personal folder (a project one), a name that cannot
+        // address a folder, and an account with no metadata row are all no-ops.
+        let outside = std::env::temp_dir();
+        let project = Workspace::ephemeral_run("project-ws", &outside);
+        assert_eq!(prepend_changes("x", &project, &Role::Assistant).await, "x");
+        let mut unnameable = Workspace::ephemeral_run("dir-x", &outside);
+        unnameable.name = "personal:bad/name".to_string();
+        assert_eq!(
+            prepend_changes("x", &unnameable, &Role::Assistant).await,
+            "x"
+        );
+        // The role gate is the module's, so a first turn and a later one cannot
+        // drift: only the Assistant's own turns carry the block.
+        assert_eq!(
+            prepend_changes("x", &personal, &Role::Manager).await,
+            "x",
+            "only the Assistant's turns carry the report"
+        );
+        assert_eq!(
+            prepend_changes(
+                "x",
+                &crate::users::personal_workspace_struct("pc_e2e_absent_user"),
+                &Role::Assistant,
+            )
+            .await,
+            "x"
+        );
+
+        conn.execute(
+            "DELETE FROM session_metadata WHERE agent_id = ?1",
+            params![agent_id],
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file above the hash cap is decided by its stamp alone, so a same-size
+    /// edit deep inside it — both ends byte-identical — is still reported.
+    #[test]
+    fn diff_reports_an_oversized_file_by_its_stamp() {
+        use std::io::{Seek, SeekFrom, Write as _};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let big = root.join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(HASH_MAX_BYTES + 1)
+            .unwrap();
+
+        let before = scan(root, None, Scan::Refresh).unwrap();
+        assert_eq!(
+            before["big.bin"].digest, None,
+            "an oversized file is never read"
+        );
+        assert_eq!(before["big.bin"].size, HASH_MAX_BYTES + 1);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut file = std::fs::OpenOptions::new().write(true).open(&big).unwrap();
+        file.seek(SeekFrom::Start(HASH_MAX_BYTES / 2)).unwrap();
+        file.write_all(b"x").unwrap();
+
+        let after = scan(root, Some(&before), Scan::Refresh).unwrap();
+        assert_eq!(diff(&before, &after).changed, vec!["big.bin".to_string()]);
+    }
+
+    /// The refresh gate: a turn's workspace resolves to the personal account
+    /// whose folder it ran in — by path for anything inside it, by the personal
+    /// name otherwise — and to nothing for a workspace outside the userspaces
+    /// root.
+    #[tokio::test]
+    #[serial_test::serial(personal_changes)]
+    async fn refresh_after_turn_resolves_the_owned_personal_folder() {
+        crate::util::test::init_test_stores().await;
+        let root = crate::users::userspaces_root();
+        let folder = root.join("pc_gate_user");
+        let inner = folder.join("delegated");
+        std::fs::create_dir_all(&inner).unwrap();
+        let project_dir = root.join("..").join("pc_gate_project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let own = crate::users::personal_workspace_struct("pc_gate_user");
+        assert_eq!(personal_user_of(&own).as_deref(), Some("pc_gate_user"));
+
+        // Both sides are compared canonically, so a storage root behind a
+        // symlink (macOS temp dirs are) still resolves.
+        let delegated = Workspace::ephemeral_run("dir-delegated-0", &inner);
+        assert_eq!(
+            personal_user_of(&delegated).as_deref(),
+            Some("pc_gate_user")
+        );
+        let project = Workspace::from_path(&project_dir);
+        assert_eq!(
+            personal_user_of(&project),
+            None,
+            "a registered project workspace is not watched"
+        );
+
+        // A personal workspace whose folder the product reaches through a
+        // symlink of its own falls back to the personal name.
+        let mut linked = Workspace::ephemeral_run("dir-linked-0", &project_dir);
+        linked.name = crate::users::personal_workspace_name("pc_gate_user");
+        assert_eq!(personal_user_of(&linked).as_deref(), Some("pc_gate_user"));
+
+        // The gate's effect: only a turn that ran in the folder advances its
+        // baseline, and the write lands on that folder's own account.
+        let agent_id = crate::session::assistant_agent_id("pc_gate_user");
+        crate::session::store()
+            .conn
+            .execute(
+                "INSERT INTO session_metadata (agent_id, last_activity, user_name, role, created_at) \
+                 VALUES (?1, ?2, ?3, 'assistant', ?2)",
+                params![agent_id.clone(), crate::db::now(), "pc_gate_user"],
+            )
+            .await
+            .unwrap();
+        std::fs::write(inner.join("hand.txt"), "hand written").unwrap();
+        refresh_after_turn(&crate::Role::Assistant, &delegated, true).await;
+        let stored = wait_for_baseline("pc_gate_user")
+            .await
+            .expect("a turn inside the folder stores its baseline");
+        assert!(stored.contains("delegated/hand.txt"), "{stored}");
+
+        // A round that ran in the folder but was not the Assistant's own
+        // recorded turn — a delegation or a custom-role launch — must advance
+        // nothing, or a hand edit would be swallowed for good; such a round's
+        // own writes surface in the next block instead.
+        std::fs::write(inner.join("hand.txt"), "hand edited again").unwrap();
+        refresh_after_turn(&crate::Role::Custom, &delegated, true).await;
+        refresh_after_turn(&crate::Role::Assistant, &delegated, false).await;
+        let personal = crate::users::personal_workspace_struct("pc_gate_user");
+        let report = prepend_changes("x", &personal, &Role::Assistant).await;
+        assert!(report.contains("changed: delegated/hand.txt"), "{report}");
+
+        // A turn outside the folder leaves that baseline as it was.
+        std::fs::remove_file(inner.join("hand.txt")).unwrap();
+        refresh_after_turn(&crate::Role::Assistant, &project, true).await;
+        assert_eq!(
+            crate::session::store()
+                .personal_changes_baseline(&agent_id)
+                .await
+                .flatten()
+                .as_deref(),
+            Some(stored.as_str())
+        );
+
+        crate::session::store()
+            .conn
+            .execute(
+                "DELETE FROM session_metadata WHERE agent_id = ?1",
+                params![agent_id],
+            )
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&folder);
+        let _ = std::fs::remove_dir_all(&project_dir);
+    }
+}

@@ -989,12 +989,13 @@ fn fallback_storage_root() -> PathBuf {
 
 /// Whether `user_name` may be used to resolve a personal-workspace path:
 /// non-empty, no path separators, not a dot entry. Containment, on both sides
-/// of the filesystem: the read-side callers (the `<personal-files>` listing and
-/// the compaction dump) apply it before touching an existing account's folder,
-/// and [`ensure_personal_workspace`] applies it before creating one, so a
-/// stored name can never address the userspaces root or another account's
-/// directory. A name coming in for a new account is refused outright by
-/// [`validate_folder_name`], which is the stricter cross-platform rule.
+/// of the filesystem: the read-side callers (the `<personal-files>` listing, the
+/// compaction dump and the personal-workspace change report) apply it before
+/// touching an existing account's folder, and [`ensure_personal_workspace`]
+/// applies it before creating one, so a stored name can never address the
+/// userspaces root or another account's directory. A name coming in for a new
+/// account is refused outright by [`validate_folder_name`], which is the
+/// stricter cross-platform rule.
 #[must_use]
 pub(crate) fn is_valid_personal_user_name(user_name: &str) -> bool {
     !user_name.trim().is_empty()

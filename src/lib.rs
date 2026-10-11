@@ -901,6 +901,12 @@ pub struct Agent {
     pub(crate) failure_class: Option<crate::retry::FailureClass>,
     /// Whether the turn ended via a successful `sleep` call.
     pub(crate) sleep_ended: bool,
+    /// Whether this turn's user message was recorded (a non-empty message whose
+    /// append succeeded). The turn's personal-workspace change report rides that
+    /// message, so a turn that recorded none must not advance the folder's
+    /// baseline — its changes stay pending for the next recorded message. Read by
+    /// [`crate::agent::run_agent`], set in [`crate::Agent::work`].
+    pub(crate) turn_recorded: bool,
     /// Agent-scoped registry of background shell sessions (Full shell roles
     /// only). Live sessions are force-killed on agent teardown ([`Drop`]) —
     /// see [`crate::tools::shell::BackgroundSessions`]. Reachable from the
