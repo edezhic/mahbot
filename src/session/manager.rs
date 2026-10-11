@@ -30,6 +30,7 @@ use crate::workspace::{WORKSPACES, truncate_workspace_notes};
 
 use crate::agent::skills;
 use crate::alarms::Alarm;
+use crate::custom_role::{CUSTOM_ROLES, CustomRole};
 use crate::tools::active_models::{ModelKind, ModelSnapshot};
 use crate::{ChatMessage, ChatRole, Role, Workspace};
 
@@ -686,6 +687,7 @@ impl Session {
     /// workspaces             — the admin's Assistant only, when workspaces are registered
     /// custom_tools           — Assistant only, always (the catalogue, or the
     ///                          brief "nothing available" form)
+    /// custom_roles           — the admin's Assistant only, when roles are defined
     /// board_context          — Manager role only, when active tickets exist
     /// ticket_block           — when a ticket is assigned to this session
     /// ```
@@ -702,8 +704,9 @@ impl Session {
     /// nothing else: the fixed [`custom_role_block`] first and the launch's
     /// authorial text (taken at session start) second. Everything the built-in
     /// roles receive — workspace boilerplate, skills, notes, alarms/board/ticket
-    /// context, personal files, custom tools, active models — is deliberately
-    /// absent, because the administrator's own words are the whole definition.
+    /// context, personal files, custom tools, custom-role listing, active models
+    /// — is deliberately absent, because the administrator's own words are the
+    /// whole definition.
     async fn build_context_messages(
         ws: &Workspace,
         role: &Role,
@@ -820,10 +823,11 @@ impl Session {
         }
         // Assistant sessions carry the user's alarm snapshot, the personal
         // workspace file listing, the registered workspace list (the admin's
-        // Assistant only) and the custom-tool catalogue — the same snapshot-at-
-        // session-start contract as the board block below.
+        // Assistant only), the custom-tool catalogue and the custom-role
+        // listing (the admin's Assistant only) — the same snapshot-at-session-
+        // start contract as the board block below.
         if matches!(role, Role::Assistant) {
-            let ((alarms, workspaces, personal_files), custom_tools) = tokio::join!(
+            let ((alarms, workspaces, personal_files, custom_roles), custom_tools) = tokio::join!(
                 fetch_assistant_context(user_name, is_admin),
                 crate::tools::custom::context_block(user_name, is_admin),
             );
@@ -832,6 +836,7 @@ impl Session {
                 &alarms,
                 &workspaces,
                 personal_files.as_deref(),
+                &custom_roles,
                 &custom_tools,
             ) {
                 msgs.push(ChatMessage::system(&block));
@@ -850,7 +855,7 @@ impl Session {
     /// current turn.
     /// Returns messages: [role_description, onboarding_guide?, active_models_opts?,
     /// workspace_boilerplate, skills?, alarms?, personal_files?, workspaces?,
-    /// custom_tools, board_context?, ticket_block?, user_msg]
+    /// custom_tools, custom_roles?, board_context?, ticket_block?, user_msg]
     /// plus the rendered active-models snapshot (Assistant only; `Default` when
     /// no block injected).
     ///
@@ -1035,21 +1040,27 @@ async fn build_board_context(ws: &Workspace, role: &Role) -> Option<String> {
     Some(output)
 }
 
-// ── Assistant context blocks (alarms + files + workspaces + custom tools) ──
+// ── Assistant context blocks (alarms + files + workspaces + tools + roles) ──
 
 /// Upper char bound for a workspace's collapsed discovery-summary line.
 const MAX_WORKSPACE_SUMMARY_CHARS: usize = 1000;
 
 /// Fetch the data for the Assistant's context blocks. Fail-open per store:
-/// an uninitialized store (`ALARMS.get()` / `WORKSPACES.get()` returning
-/// `None`) or a read error yields empty data, so the corresponding block is
-/// omitted — same contract as `build_board_context`. The alarm fetch, the
-/// workspace fetch and the personal-files walk run concurrently, and the
+/// an uninitialized store (`ALARMS.get()` / `WORKSPACES.get()` /
+/// `CUSTOM_ROLES.get()` returning `None`) or a read error yields empty data, so
+/// the corresponding block is omitted — same contract as `build_board_context`.
+/// The alarm fetch, the workspace fetch, the personal-files walk and the
+/// custom-role listing (the admin's Assistant only) run concurrently, and the
 /// per-workspace general-context reads are batched via `join_all`.
 async fn fetch_assistant_context(
     user_name: &str,
     is_admin: bool,
-) -> (Vec<Alarm>, Vec<(Workspace, Option<String>)>, Option<String>) {
+) -> (
+    Vec<Alarm>,
+    Vec<(Workspace, Option<String>)>,
+    Option<String>,
+    Vec<CustomRole>,
+) {
     let alarms = async {
         if crate::alarms::ALARMS.get().is_none() {
             return Vec::new();
@@ -1085,7 +1096,23 @@ async fn fetch_assistant_context(
         .collect::<Vec<_>>();
         registered.into_iter().zip(summaries).collect()
     };
-    tokio::join!(alarms, workspaces, fetch_personal_files(user_name))
+    let custom_roles = async {
+        if !is_admin {
+            return Vec::new();
+        }
+        // The store may not be up yet mid-boot: a missing store omits the
+        // block instead of panicking (fail-open, like the sibling blocks).
+        if CUSTOM_ROLES.get().is_none() {
+            return Vec::new();
+        }
+        crate::custom_role::list().await.unwrap_or_default()
+    };
+    tokio::join!(
+        alarms,
+        workspaces,
+        fetch_personal_files(user_name),
+        custom_roles
+    )
 }
 
 /// The workspace-frame asset for a role: the admin's Assistant is not confined
@@ -1103,17 +1130,20 @@ fn workspace_frame_key(role: Role, is_admin: bool) -> &'static str {
 /// Compose the Assistant-only system-prompt blocks from pre-fetched data.
 /// Pure and fail-open: each block is omitted entirely when its content is
 /// empty, the personal-files listing is supplied pre-rendered (`None` when
-/// the workspace is empty or unlistable), and the workspace list appears only
-/// for the admin's Assistant. Order: alarms → personal files → workspaces →
-/// custom tools — the last being the one an Assistant always gets, because
+/// the workspace is empty or unlistable), and the workspace list and the
+/// custom-role listing appear only for the admin's Assistant. Order: alarms →
+/// personal files → workspaces → custom tools → custom roles — the custom-tool
+/// block being the one an Assistant always gets, because
 /// [`crate::tools::custom::context_block`] renders the brief "nothing
-/// available" form rather than nothing. The caller gates on `role == Assistant`
+/// available" form rather than nothing, while the custom-role block is omitted
+/// entirely when no roles exist. The caller gates on `role == Assistant`
 /// (before fetching).
 fn assistant_context_blocks(
     is_admin: bool,
     alarms: &[Alarm],
     workspaces: &[(Workspace, Option<String>)],
     personal_files: Option<&str>,
+    custom_roles: &[CustomRole],
     custom_tools: &str,
 ) -> Vec<String> {
     let mut blocks = Vec::new();
@@ -1137,6 +1167,12 @@ fn assistant_context_blocks(
     }
     if !custom_tools.is_empty() {
         blocks.push(custom_tools.to_string());
+    }
+    if is_admin && let Some(lines) = render_custom_role_lines(custom_roles) {
+        blocks.push(substitute(
+            &load_prompt("context/custom_roles.md"),
+            &[("{{roles}}", &lines)],
+        ));
     }
     blocks
 }
@@ -1188,6 +1224,51 @@ fn render_workspace_lines(workspaces: &[(Workspace, Option<String>)]) -> Option<
         }
     }
     (!out.is_empty()).then(|| out.trim_end().to_string())
+}
+
+/// Upper char bound for a role's collapsed prompt opening. Only the opening is
+/// quoted — the role's full prompt is its own, read at launch time.
+const MAX_ROLE_EXCERPT_CHARS: usize = 500;
+
+/// Render one entry per custom role: name, behaviour token (the stored one the
+/// role's own listing and creation use) and the administrator's chosen tool set
+/// on the first line, the opening of the role's authored prompt on the second.
+/// `None` when no roles are defined — unlike the custom-tool catalogue, this
+/// block is omitted rather than rendered empty.
+fn render_custom_role_lines(roles: &[CustomRole]) -> Option<String> {
+    if roles.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for role in roles {
+        let tools = if role.tools.is_empty() {
+            "none".to_string()
+        } else {
+            role.tools.join(", ")
+        };
+        let _ = writeln!(
+            out,
+            "- {} (behaviour: {}, tools: {tools})",
+            role.name,
+            role.behavior.as_str(),
+        );
+        let _ = writeln!(out, "  {}", role_prompt_excerpt(&role.prompt));
+    }
+    Some(out.trim_end().to_string())
+}
+
+/// The opening of a role's authored prompt: whitespace (line breaks, headings)
+/// collapsed to single spaces, credential-scrubbed like the other admin-authored
+/// text that enters a prompt, then cut to [`MAX_ROLE_EXCERPT_CHARS`] on a char
+/// boundary (a role's text may be Russian) with an ellipsis when shortened. The
+/// text is the administrator's own — never a model-written summary, never the
+/// rendered launch prompt.
+fn role_prompt_excerpt(prompt: &str) -> String {
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::util::truncate(
+        &crate::util::scrub_credentials(&collapsed),
+        MAX_ROLE_EXCERPT_CHARS,
+    )
 }
 
 /// Hard entry cap for the `<personal-files>` listing — the walk stops once
@@ -1888,12 +1969,13 @@ mod tests {
     }
 
     /// Pure gating of the Assistant context blocks: a guest's Assistant gets
-    /// the alarms, personal-files and custom-tool blocks (the workspace list is
-    /// the admin's only); the admin's Assistant gets the first three in
-    /// alarms → personal files → workspaces order plus the custom-tool block
-    /// last; empty data omits the conditional blocks, while the custom-tool
-    /// block is always present (its "nothing available" form is rendered
-    /// upstream). (Role gating lives at the call site.)
+    /// the alarms, personal-files and custom-tool blocks (the workspace list and
+    /// the custom-role listing are the admin's only); the admin's Assistant gets
+    /// the first three in alarms → personal files → workspaces order plus the
+    /// custom-tool block last; empty data omits the conditional blocks, while
+    /// the custom-tool block is always present (its "nothing available" form is
+    /// rendered upstream) and the custom-role block is omitted when no roles
+    /// exist. (Role gating lives at the call site.)
     #[test]
     fn assistant_blocks_gating() {
         let alarm = Alarm {
@@ -1923,6 +2005,7 @@ mod tests {
             std::slice::from_ref(&alarm),
             &workspaces,
             files,
+            &[],
             custom,
         );
         assert_eq!(blocks.len(), 3);
@@ -1938,6 +2021,7 @@ mod tests {
             std::slice::from_ref(&alarm),
             &workspaces,
             files,
+            &[],
             custom,
         );
         assert_eq!(blocks.len(), 4);
@@ -1948,9 +2032,67 @@ mod tests {
 
         // Empty data omits the conditional blocks but never the custom tools.
         assert_eq!(
-            assistant_context_blocks(true, &[], &[], None, custom),
+            assistant_context_blocks(true, &[], &[], None, &[], custom),
             vec![custom.to_string()]
         );
+    }
+
+    /// The custom-role listing: empty roles render nothing, one entry per role
+    /// carries the name, stored behaviour token and tool set, and each role's
+    /// prompt opening collapses to a single line and is cut on a char boundary
+    /// with an ellipsis. The composed block reaches the admin's Assistant only.
+    #[test]
+    fn custom_role_block_lists_roles() {
+        use crate::custom_role::{CustomRole, CustomRoleBehavior};
+
+        assert!(render_custom_role_lines(&[]).is_none());
+
+        let roles = vec![
+            CustomRole {
+                name: "auditor".to_string(),
+                prompt: "You audit.\n\n## Rules\nBe thorough.".to_string(),
+                tools: vec!["read_file".to_string(), "grep".to_string()],
+                behavior: CustomRoleBehavior::Continuous,
+            },
+            CustomRole {
+                name: "runner".to_string(),
+                prompt: "Run once.".to_string(),
+                tools: Vec::new(),
+                behavior: CustomRoleBehavior::OneOff,
+            },
+        ];
+        let rendered = render_custom_role_lines(&roles).expect("roles render");
+        assert!(rendered.contains("auditor"));
+        assert!(rendered.contains("behaviour: continuous"));
+        assert!(rendered.contains("tools: read_file, grep"));
+        assert!(rendered.contains("runner"));
+        assert!(rendered.contains("behaviour: one_off"));
+        assert!(rendered.contains("tools: none"));
+        // The multi-line prompt collapses onto its single continuation line.
+        assert!(rendered.contains("  You audit. ## Rules Be thorough."));
+
+        // A long multi-line Cyrillic prompt is cut on a char boundary with an
+        // ellipsis.
+        let long = "Правило номер один и его подробное описание,\n".repeat(40);
+        let excerpt = role_prompt_excerpt(&long);
+        assert!(excerpt.ends_with('…'));
+        assert!(excerpt.chars().count() <= MAX_ROLE_EXCERPT_CHARS + 1);
+        assert!(!excerpt.contains('\n'));
+
+        // Composed end to end: the admin's Assistant gets the block, a guest's
+        // gets none (it cannot launch roles), and no roles means no block.
+        let role_block = |is_admin: bool, roles: &[CustomRole]| {
+            assistant_context_blocks(is_admin, &[], &[], None, roles, "<custom-tools>")
+                .into_iter()
+                .find(|block| block.contains("<available-custom-roles>"))
+        };
+        let listing = role_block(true, &roles).expect("the admin's Assistant gets the listing");
+        assert!(listing.contains("auditor") && listing.contains("runner"));
+        assert!(
+            listing.contains("behaviour: continuous") && listing.contains("behaviour: one_off")
+        );
+        assert!(role_block(false, &roles).is_none());
+        assert!(role_block(true, &[]).is_none());
     }
 
     /// Personal-files walk: hidden entries and `generated/` / `uploads/`
