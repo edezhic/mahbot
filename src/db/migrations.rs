@@ -60,9 +60,11 @@
 //! `session_metadata.reply_to` so a coder branch's report survives a restart,
 //! and `57`, which adds `session_metadata.context_block_len` so a launch
 //! session's cached leading context block is measured from what was written
-//! rather than re-derived from live workspace state.
+//! rather than re-derived from live workspace state. `58` adds the
+//! `tool_calls.source` column — the marker that tells a call a command-line
+//! operation performed from an agent's own.
 //!
-//! Future schema changes resume the chain at id `58` with monotonically
+//! Future schema changes resume the chain at id `59` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -378,6 +380,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id       TEXT NOT NULL,
     role           TEXT NOT NULL,
+    source         TEXT NOT NULL DEFAULT 'agent',
     tool_name      TEXT NOT NULL,
     arguments      TEXT NOT NULL DEFAULT '{}',
     duration_ms    INTEGER NOT NULL DEFAULT 0,
@@ -741,6 +744,10 @@ const CUSTOM_ROLES_TABLE: &str = "CREATE TABLE IF NOT EXISTS custom_roles (
 ///   the block is written so a later folder change rebuilds it from what was
 ///   written rather than from a re-render of live workspace state (a no-op on
 ///   fresh installs, whose baseline already declares it).
+/// - `58` adds the `tool_calls.source` column — which surface performed a
+///   recorded call (`agent` or `cli`), so a change a command-line operation
+///   made is distinguishable from one the assistant made (a no-op on fresh
+///   installs, whose baseline already declares it).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -911,6 +918,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "57",
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_session_metadata_context_block_len),
+    },
+    Migration {
+        id: "58",
+        target: TargetDb::Logs,
+        body: MigrationBody::Rust(add_tool_calls_source),
     },
 ];
 
@@ -1307,6 +1319,27 @@ fn add_session_metadata_context_block_len(conn: &Connection) -> BoxFuture<'_, an
 /// every Rust body, re-runnable until recorded).
 async fn run_add_session_metadata_context_block_len(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "session_metadata", "context_block_len", "INTEGER").await
+}
+
+fn add_tool_calls_source(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_tool_calls_source(conn))
+}
+
+/// Upfill the `tool_calls.source` column for databases created before delta
+/// `58` — which surface performed the recorded call (`agent` or `cli`), so a
+/// change a command-line operation made is distinguishable from one the
+/// assistant made. Fresh installs get the column (with its `agent` default)
+/// from entry `26`'s `CREATE TABLE`, so the probe makes this a no-op there.
+/// Guarded by [`add_column_if_missing`], so this body is idempotent
+/// (non-transactional like every Rust body, re-runnable until recorded).
+async fn run_add_tool_calls_source(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(
+        conn,
+        "tool_calls",
+        "source",
+        "TEXT NOT NULL DEFAULT 'agent'",
+    )
+    .await
 }
 
 fn add_session_metadata_sleep_ended(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -2168,6 +2201,7 @@ mod tests {
                 "id",
                 "agent_id",
                 "role",
+                "source",
                 "tool_name",
                 "arguments",
                 "duration_ms",
@@ -3096,8 +3130,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         );
     }
 
-    /// A fresh logs store runs the baseline (`26`) plus the delta `35`
-    /// upfill and converges to the exact current logs shape
+    /// A fresh logs store runs the baseline (`26`) plus the delta `35` and
+    /// delta `58` upfills and converges to the exact current logs shape
     /// (logs/tool_calls/llm_requests/llm_failures + grep_telemetry).
     #[tokio::test]
     async fn fresh_logs_install_converges_to_expected_shape() {
@@ -3125,14 +3159,14 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         applied.sort();
         assert_eq!(
             applied,
-            vec!["26".to_string(), "35".to_string()],
-            "fresh logs applies baseline 26 + delta 35 exactly"
+            vec!["26".to_string(), "35".to_string(), "58".to_string()],
+            "fresh logs applies baseline 26 + delta 35 + delta 58 exactly"
         );
     }
 
     /// The common upgrade path: a database that already applied the logs
     /// baseline (`26`) — no `llm_failures` — gains the table through delta
-    /// `35` on reopen.
+    /// `35` on reopen (and the `tool_calls.source` column through delta `58`).
     #[tokio::test]
     async fn baseline_logs_db_gains_llm_failures_via_delta_35() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3161,8 +3195,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         applied.sort();
         assert_eq!(
             applied,
-            vec!["26".to_string(), "35".to_string()],
-            "reopen must record exactly 26 + 35"
+            vec!["26".to_string(), "35".to_string(), "58".to_string()],
+            "reopen must record exactly 26 + 35 + 58"
         );
         let (_, cols) = EXPECTED_LOGS_TABLE_COLUMNS
             .iter()
@@ -3548,10 +3582,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     }
 
     /// The logs fleet-wide boot-safety pin: an old-catalog logs store (ids
-    /// `8`/`9`/`14`) reopens through the logs baseline (`26`) and the delta
-    /// `35` upfill — everything except the new `llm_failures` table (and its
-    /// indexes) is unchanged, and the upfill lands the new table on existing
-    /// installs.
+    /// `8`/`9`/`14`) reopens through the logs baseline (`26`), the delta `35`
+    /// upfill and the delta `58` column upfill — everything except the new
+    /// `llm_failures` table (and its indexes) and the appended
+    /// `tool_calls.source` column is unchanged, and the upfill lands the new
+    /// table on existing installs.
     #[tokio::test]
     async fn old_catalog_logs_db_reopens_as_noop() {
         const NEW_TABLE: &str = "llm_failures";
@@ -3560,10 +3595,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "idx_llm_failures_operation_id",
             "idx_llm_failures_failure_class",
         ];
-        // `llm_failures` does not exist in the old-catalog shape — exclude it
-        // (and its indexes) from the unchanged-reopen comparison; its arrival
-        // on reopen is asserted below. Row counts are compared over the tables
-        // that exist on both sides.
+        // `llm_failures` does not exist in the old-catalog shape, and delta `58`
+        // appends a column to `tool_calls` — exclude both from the
+        // unchanged-reopen comparison; their arrival on reopen is asserted
+        // below. Row counts are compared over the tables that exist on both
+        // sides.
         let counts_tables: Vec<&str> = expected_logs_domain_tables()
             .into_iter()
             .filter(|n| *n != NEW_TABLE)
@@ -3589,6 +3625,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let before_ids = applied_ids(&conn).await;
         let before_tables = table_defs(&conn).await;
         let before_indexes = index_defs(&conn).await;
+        let before_tool_calls_cols = column_names(&conn, "tool_calls").await;
         let before_counts = table_row_counts(&conn, &counts_tables).await;
 
         run_migrations(&conn, TargetDb::Logs)
@@ -3598,18 +3635,20 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         expected_ids.push("26".to_string());
         expected_ids.push("35".to_string());
+        expected_ids.push("58".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "logs reopen must record exactly old ids ∪ 26 ∪ 35"
+            "logs reopen must record exactly old ids ∪ 26 ∪ 35 ∪ 58"
         );
 
         assert_eq!(
-            without(&table_defs(&conn).await, &[NEW_TABLE]),
-            without(&before_tables, &[NEW_TABLE]),
-            "logs table DDL (except {NEW_TABLE}) must be unchanged on reopen"
+            without(&table_defs(&conn).await, &[NEW_TABLE, "tool_calls"]),
+            without(&before_tables, &[NEW_TABLE, "tool_calls"]),
+            "logs table DDL (except {NEW_TABLE} and the delta-58 tool_calls column) must be \
+             unchanged on reopen"
         );
         assert_eq!(
             without(&index_defs(&conn).await, &NEW_INDEXES),
@@ -3620,6 +3659,17 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             table_row_counts(&conn, &counts_tables).await,
             before_counts,
             "logs row counts must be unchanged on reopen"
+        );
+
+        // Delta `58` must land the call-source discriminator on existing
+        // installs — appended by the `ALTER` (a fresh install's baseline
+        // declares it after `role` instead).
+        let mut expected_cols = before_tool_calls_cols;
+        expected_cols.push("source".to_string());
+        assert_eq!(
+            column_names(&conn, "tool_calls").await,
+            expected_cols,
+            "delta 58 must append source to tool_calls"
         );
 
         // Delta `35` must land the per-attempt failure trail on existing

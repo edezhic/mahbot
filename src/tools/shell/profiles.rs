@@ -227,15 +227,23 @@ pub(super) static GEN_FALLBACK: LazyLock<Profile> = LazyLock::new(|| {
         .max(200)
 });
 
+/// The product's own answer surfaces: `mahbot chrome` emits exactly ONE line of
+/// JSON (the OutEnvelope) and the `config`/`workspace` families answer in prose —
+/// a per-line cap would truncate the envelope mid-JSON into invalid JSON, or
+/// shred a long prose line, and head/tail would cut either answer short. No cap
+/// of any kind for them; each answer is byte-bounded by the product's own limits.
+/// The family words come from the CLI registry, so a family added there cannot
+/// silently lose this profile.
+fn product_surface_profile() -> Profile {
+    let families = crate::cli::family_words().collect::<Vec<_>>().join("|");
+    Profile::new(&format!(r"^mahbot\s+(?:chrome|{families})\b"))
+}
+
 /// Compiled profiles, built once on first access.
 pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
     vec![
         // ── General shell ────────────────────────────────────────────────
-        // The `mahbot chrome` CLI emits exactly ONE line of JSON (the
-        // OutEnvelope); a per-line cap would truncate it mid-envelope into
-        // invalid JSON and drop the page content. No line cap — the envelope
-        // is byte-bounded by the chrome module's own content cap.
-        Profile::new(r"^mahbot\s+chrome\b"),
+        product_surface_profile(),
         Profile::new(r"^df\b").max_line_len(80).max(20),
         // Simple utilities: strip blanks, truncate long lines, cap at 50
         small_util(r"^(?:du|shellcheck|stat|ps|rustc)\b", 50),

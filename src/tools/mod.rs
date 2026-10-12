@@ -1639,6 +1639,37 @@ fn remap_arg_key(obj: &mut serde_json::Map<String, serde_json::Value>, from: &st
     }
 }
 
+/// A tool's answer to one operation, with the flag a frontend that must treat a
+/// partly carried-out operation as a failure reads.
+///
+/// The agent path reads only [`text`](Self::text) (through [`Tool::execute`]);
+/// the command line reads `partial` too, because it must exit non-zero when
+/// part of what it asked for did not happen. `partial` is the tool's own honest
+/// report — the text names the part that did not succeed — and is never
+/// inferred from the wording.
+pub(crate) struct ToolAnswer {
+    pub text: String,
+    pub partial: bool,
+}
+
+impl ToolAnswer {
+    /// The whole operation was carried out.
+    pub(crate) fn done(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            partial: false,
+        }
+    }
+
+    /// Part of the operation did not succeed, as `text` says.
+    pub(crate) fn partial(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            partial: true,
+        }
+    }
+}
+
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
 ///
 /// Tool-name aliases are resolved via `normalize_tool_name` so that all

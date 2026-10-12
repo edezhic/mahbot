@@ -686,10 +686,11 @@ fn dump_one_store(file_path: &Path, label: &str) -> Result<()> {
 /// Run one read-only SQL query through the instance's debug IPC endpoint,
 /// returning the response or the endpoint's error.
 async fn ipc_query_readonly(root: &Path, store: &str, sql: &str) -> Result<ipc::QueryResponse> {
-    let req = ipc::QueryRequest {
+    let req = ipc::IpcRequest {
         store: store.to_string(),
         sql: sql.to_string(),
         params: Vec::new(),
+        call: None,
     };
     let resp = ipc::ipc_query_with_wait(root, &req).await?;
     if let Some(err) = &resp.error {
@@ -1814,6 +1815,7 @@ mod tests {
                 "j1",
                 "Engineer",
                 "ws1",
+                crate::stats::CallSource::Agent,
                 &[crate::ToolCallRecord {
                     tool_name: "read".to_string(),
                     arguments: "{}".to_string(),

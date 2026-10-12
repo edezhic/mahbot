@@ -28,6 +28,10 @@ pub mod bench_openrouter;
 pub mod boot;
 pub mod channels;
 pub(crate) mod chrome;
+/// Command-line frontends onto the running product: the operation channel the
+/// `mahbot` CLI carries into the live instance, and the instance side that
+/// executes it.
+pub mod cli;
 pub mod config;
 pub mod config_db;
 pub(crate) mod consensus;
@@ -1233,6 +1237,21 @@ pub(crate) trait Tool: Send + Sync {
         ws: &crate::Workspace,
         args: serde_json::Value,
     ) -> anyhow::Result<String>;
+
+    /// The tool's answer to one operation, with the flag a frontend that must
+    /// treat a partly carried-out operation as a failure reads. The default is
+    /// the tool's plain `execute` answer and never partial; a tool whose
+    /// operation can be carried out in part overrides it.
+    async fn execute_answer(
+        &self,
+        ws: &crate::Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<crate::tools::ToolAnswer> {
+        Ok(crate::tools::ToolAnswer {
+            text: self.execute(ws, args).await?,
+            partial: false,
+        })
+    }
 
     fn spec(&self) -> ToolSpec {
         ToolSpec {

@@ -11,6 +11,7 @@ use serde_json::json;
 use std::fmt::Write as _;
 
 use crate::pipeline::board::{TicketPhase, store as board_store};
+use crate::tools::ToolAnswer;
 use crate::tools::ticket::{GET_TICKET_COMMENT_MAX, GET_TICKET_DESC_MAX, GET_TICKET_LAST_N_FULL};
 use crate::workspace::WorkspaceStore;
 use crate::{Role, Tool, Workspace, WorkspaceStatus};
@@ -86,32 +87,53 @@ impl Tool for WorkspaceTool {
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
+        Ok(self.answer(args).await?.text)
+    }
+
+    async fn execute_answer(
+        &self,
+        _ws: &Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<ToolAnswer> {
+        self.answer(args).await
+    }
+}
+
+impl WorkspaceTool {
+    /// The one action dispatch both faces of the tool go through: `execute`
+    /// renders it to its text (so an agent's view is unchanged) and
+    /// [`Tool::execute_answer`] hands it over with the partiality flag a
+    /// command-line caller reads. There is no second code path to drift from
+    /// this one.
+    async fn answer(&self, args: serde_json::Value) -> anyhow::Result<ToolAnswer> {
         match super::get_str(&args, "action")? {
-            "list" => list_workspaces(super::get_opt_str_strict(&args, "workspace")?).await,
+            "list" => Ok(ToolAnswer::done(
+                list_workspaces(super::get_opt_str_strict(&args, "workspace")?).await?,
+            )),
             "add" => add_workspace(&args).await,
-            "pause" => set_pipeline_paused(write_address(&args, "pause")?, true).await,
-            "resume" => set_pipeline_paused(write_address(&args, "resume")?, false).await,
-            "board" => {
+            "pause" => pause_or_resume(write_address(&args, "pause")?, true).await,
+            "resume" => pause_or_resume(write_address(&args, "resume")?, false).await,
+            "board" => Ok(ToolAnswer::done(
                 list_board(
                     super::get_opt_str_strict(&args, "workspace")?,
                     super::get_opt_str_strict(&args, "phase")?,
                 )
-                .await
-            }
-            "ticket" => {
+                .await?,
+            )),
+            "ticket" => Ok(ToolAnswer::done(
                 show_ticket(
                     super::get_str(&args, "ticket_id")?,
                     super::get_bool(&args, "full", false)?,
                 )
-                .await
-            }
-            "comment" => {
+                .await?,
+            )),
+            "comment" => Ok(ToolAnswer::done(
                 add_note(
                     super::get_str(&args, "ticket_id")?,
                     super::get_str(&args, "content")?,
                 )
-                .await
-            }
+                .await?,
+            )),
             other => Err(anyhow!(
                 "unknown action '{other}' — expected one of: list, add, pause, resume, board, ticket, comment"
             )),
@@ -257,7 +279,11 @@ async fn list_workspaces(only: Option<&str>) -> anyhow::Result<String> {
 /// Register a workspace and make it the admin's active one — registering and
 /// activating are one rule on every path (the desktop's own add form does the
 /// same), so a newly registered project is the one the desktop works with.
-async fn add_workspace(args: &serde_json::Value) -> anyhow::Result<String> {
+///
+/// PARTIAL exactly when the registration succeeded but the activation write did
+/// not: the workspace is registered either way, and the answer already says
+/// which half happened.
+async fn add_workspace(args: &serde_json::Value) -> anyhow::Result<ToolAnswer> {
     let name = super::get_str(args, "name")?;
     let path = super::get_str(args, "path")?;
     crate::workspace::store().add(name, path).await?;
@@ -268,15 +294,15 @@ async fn add_workspace(args: &serde_json::Value) -> anyhow::Result<String> {
         .set_selected_workspace(crate::users::ADMIN_USER_NAME, Some(name))
         .await
     {
-        Ok(()) => Ok(format!(
+        Ok(()) => Ok(ToolAnswer::done(format!(
             "Registered workspace '{name}' at {path} and made it your active workspace. \
              The workspace is being picked up — if the model provider is configured its first \
              discovery pass will start shortly."
-        )),
-        Err(e) => Ok(format!(
+        ))),
+        Err(e) => Ok(ToolAnswer::partial(format!(
             "Registered workspace '{name}' at {path}, but making it your active workspace \
              failed: {e} — activate it from the desktop's own workspace list."
-        )),
+        ))),
     }
 }
 
@@ -309,9 +335,11 @@ fn pipeline_change(ws: &Workspace, paused: bool) -> PipelineChange {
 
 /// Pause or resume the named workspace's pipeline, or every registered
 /// workspace at once when no name was given.
-async fn set_pipeline_paused(name: Option<&str>, paused: bool) -> anyhow::Result<String> {
+async fn pause_or_resume(name: Option<&str>, paused: bool) -> anyhow::Result<ToolAnswer> {
     match name {
-        Some(name) => set_one_pipeline_paused(name, paused).await,
+        Some(name) => Ok(ToolAnswer::done(
+            set_one_pipeline_paused(name, paused).await?,
+        )),
         None => set_all_pipelines_paused(paused).await,
     }
 }
@@ -354,13 +382,27 @@ async fn set_one_pipeline_paused(name: &str, paused: bool) -> anyhow::Result<Str
 ///
 /// Never [`WorkspaceStore::pause_all`](crate::workspace::WorkspaceStore::pause_all):
 /// that would also pause not-ready rows and the discovery's own analysis pause.
+///
+/// PARTIAL exactly when the requested state was not reached for a workspace: a
+/// write that failed (the rows written before it are real, so the fleet-wide form
+/// did not do the whole of what was asked) or a workspace skipped as not ready
+/// (its pipeline was not paused/resumed, and the answer above says so). A
+/// workspace already in the requested state leaves the operation whole — the
+/// state the caller asked for holds.
+///
+/// The not-ready skip counts in BOTH directions on purpose, `resume` included,
+/// where a pending workspace is not paused anyway: the named form refuses a
+/// not-ready workspace the same way in both directions ("only a ready workspace
+/// has a pipeline to pause or resume" — its flag is the discovery's own analysis
+/// pause, not a freeze of running work), and one rule for both forms is what
+/// keeps them from disagreeing about the same workspace.
 async fn set_pipelines_paused(
     store: &WorkspaceStore,
     workspaces: &[Workspace],
     paused: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<ToolAnswer> {
     if workspaces.is_empty() {
-        return Ok(NO_WORKSPACE.to_string());
+        return Ok(ToolAnswer::done(NO_WORKSPACE));
     }
     let header = if paused {
         "Paused every registered workspace where possible:"
@@ -368,9 +410,13 @@ async fn set_pipelines_paused(
         "Resumed every registered workspace where possible:"
     };
     let mut out = format!("{header}\n");
+    let mut incomplete = false;
     for ws in workspaces {
         let line = match pipeline_change(ws, paused) {
+            // The caller asked for every registered workspace; this one was left
+            // untouched, so the call is not the whole of what was asked.
             PipelineChange::NotReady => {
+                incomplete = true;
                 format!("- {}: skipped — not ready ({})", ws.name, ws.status)
             }
             PipelineChange::Already if paused => format!("- {}: already paused", ws.name),
@@ -380,17 +426,25 @@ async fn set_pipelines_paused(
                 Ok(()) => format!("- {}: resumed", ws.name),
                 // Reported like every other outcome: the rows written before a
                 // failure are real, so the report must cover each workspace.
-                Err(e) => format!("- {}: failed — {e}", ws.name),
+                Err(e) => {
+                    incomplete = true;
+                    format!("- {}: failed — {e}", ws.name)
+                }
             },
         };
         let _ = writeln!(out, "{line}");
     }
-    Ok(out.trim_end().to_string())
+    let report = out.trim_end().to_string();
+    Ok(if incomplete {
+        ToolAnswer::partial(report)
+    } else {
+        ToolAnswer::done(report)
+    })
 }
 
 /// Every registered workspace at once: the global store and the set it must
 /// cover.
-async fn set_all_pipelines_paused(paused: bool) -> anyhow::Result<String> {
+async fn set_all_pipelines_paused(paused: bool) -> anyhow::Result<ToolAnswer> {
     let workspaces = crate::users::registered_workspaces().await?;
     set_pipelines_paused(crate::workspace::store(), &workspaces, paused).await
 }
@@ -667,10 +721,22 @@ mod tests {
         let reply = set_pipelines_paused(&store, &workspaces, true)
             .await
             .expect("pause all");
-        assert!(reply.contains("- ws_fleet: paused"), "got: {reply}");
         assert!(
-            reply.contains("- ws_fleet_pending: skipped — not ready (pending)"),
-            "got: {reply}"
+            reply.text.contains("- ws_fleet: paused"),
+            "got: {}",
+            reply.text
+        );
+        assert!(
+            reply
+                .text
+                .contains("- ws_fleet_pending: skipped — not ready (pending)"),
+            "got: {}",
+            reply.text
+        );
+        assert!(
+            reply.partial,
+            "a workspace the call left untouched makes the fleet call partial: {}",
+            reply.text
         );
         assert!(
             store
@@ -696,13 +762,22 @@ mod tests {
         let reply = set_pipelines_paused(&store, &workspaces, false)
             .await
             .expect("resume all");
-        assert!(reply.contains("- ws_fleet: resumed"), "got: {reply}");
+        assert!(
+            reply.text.contains("- ws_fleet: resumed"),
+            "got: {}",
+            reply.text
+        );
+        assert!(
+            reply.partial,
+            "the not-ready workspace is left untouched by the resume too: {}",
+            reply.text
+        );
 
         // Nothing registered: the same plain wording `list` uses.
         let reply = set_pipelines_paused(&store, &[], true)
             .await
             .expect("empty set");
-        assert_eq!(reply, NO_WORKSPACE);
+        assert_eq!(reply.text, NO_WORKSPACE);
     }
 
     /// The unnamed form of `pause` / `resume` is the fleet-wide write, so it may

@@ -582,6 +582,11 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// full disk). The subcommand CLIs that always run with wired stdio (the `debug`
 /// verb's own usage and argument errors, chrome, the benchmark) still print through
 /// the macros: a failed write there can only reach a caller that stopped reading.
+/// `mahbot config …` and `mahbot workspace …` print the product's answer and their
+/// own diagnostics through these two writers too: their exit code, not the delivered
+/// text, reports whether the operation was carried out, so a reader that closed the
+/// pipe (a script piping the answer into `head`) or a terminated one must not turn a
+/// carried-out operation into a crash — a failed write is discarded, never panicked on.
 ///
 /// A windowed launch may also have been given no standard streams at all (its parent
 /// passed none): the library discards a write to an absent handle itself
@@ -1478,6 +1483,89 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+/// The marker a value the caller handed over as a secret is replaced with.
+const REDACTED_MARKER: &str = "[REDACTED]";
+
+/// Replace every `secrets` entry found in `input` with [`REDACTED_MARKER`].
+///
+/// Exists in addition to [`scrub_credentials`]: that one recognises
+/// credential-shaped text by *key name* and deliberately keeps a four-character
+/// prefix of the value for context, while a value the caller itself handed over
+/// (a token it passed to a tool, an API key it configured) is known exactly and
+/// must not survive even in part — nor does it need the shared regex to
+/// recognise it, which would leave a bare value under an unknown key (e.g.
+/// `{"key": "..."}`) untouched. Empty values are skipped: replacing `""` would
+/// intersperse the marker at every character boundary.
+///
+/// Every spelling of a value is removed: the value itself; its JSON-escaped body
+/// when it differs (inside a JSON blob — the serialized tool arguments, a tool
+/// echoing them back — a quote, a backslash or a control character is written as
+/// an escape sequence, so the escaped spelling leaks on its own); and its
+/// percent-encoded form in either hex case (a value that reaches a URL — a
+/// request URL quoted back in an error, a query parameter — is written encoded
+/// as soon as it holds anything but unreserved characters). These are the
+/// renderings a value reaches a surface through, and nothing re-encodes an
+/// already-encoded rendering.
+///
+/// The replace runs over the whole input, so a very short value (a mistyped
+/// one-character token, say) is removed wherever it occurs — which can mangle the
+/// product's own wording around it. Accepted: a value the caller declared secret
+/// must not survive in any form (fail-closed).
+#[must_use]
+pub(crate) fn redact_secrets(input: &str, secrets: &[String]) -> String {
+    let mut out = input.to_string();
+    for secret in secrets {
+        if secret.is_empty() {
+            continue;
+        }
+        out = out.replace(secret.as_str(), REDACTED_MARKER);
+        let escaped = serde_json::Value::String(secret.clone()).to_string();
+        let escaped = escaped
+            .strip_prefix('"')
+            .and_then(|body| body.strip_suffix('"'))
+            .unwrap_or(&escaped);
+        if escaped != secret {
+            out = out.replace(escaped, REDACTED_MARKER);
+        }
+        for encoded in percent_encoded(secret) {
+            out = out.replace(&encoded, REDACTED_MARKER);
+        }
+    }
+    out
+}
+
+/// The percent-encoded spellings of a value, in the upper- and lowercase hex a
+/// URL renderer may use — empty when the value is already URL-safe, which is the
+/// usual case for the tokens these commands take.
+fn percent_encoded(secret: &str) -> Vec<String> {
+    fn encode(secret: &str, upper: bool) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::with_capacity(secret.len());
+        for byte in secret.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                out.push(char::from(byte));
+            } else if upper {
+                let _ = write!(out, "%{byte:02X}");
+            } else {
+                let _ = write!(out, "%{byte:02x}");
+            }
+        }
+        out
+    }
+
+    let upper = encode(secret, true);
+    if upper == secret {
+        return Vec::new();
+    }
+    let lower = encode(secret, false);
+    if lower == upper {
+        vec![upper]
+    } else {
+        vec![upper, lower]
+    }
+}
+
 /// Extract a provider error detail string from an error-body JSON value with
 /// a conservative cascade over the envelope fields providers actually use.
 ///
@@ -1866,7 +1954,7 @@ mod truncate_tests {
 
 #[cfg(test)]
 mod scrub_tests {
-    use super::scrub_credentials;
+    use super::{REDACTED_MARKER, percent_encoded, redact_secrets, scrub_credentials};
 
     #[test]
     fn scrub_redacts_credentials() {
@@ -1975,6 +2063,66 @@ mod scrub_tests {
         for &(name, input) in CASES {
             assert_eq!(scrub_credentials(input), input, "{name}");
         }
+    }
+
+    #[test]
+    fn redact_secrets_removes_values_whole() {
+        // A known value is gone entirely — no prefix survives (unlike
+        // `scrub_credentials`, which keeps four characters for context).
+        assert_eq!(
+            redact_secrets(
+                r#"{"token":"123456:AAHsecret"}"#,
+                &["123456:AAHsecret".to_string()]
+            ),
+            format!(r#"{{"token":"{REDACTED_MARKER}"}}"#)
+        );
+        // Under the length the shared regex requires, and under a key it does
+        // not know — the value is still removed.
+        assert_eq!(
+            redact_secrets("key=abc", &["abc".to_string()]),
+            format!("key={REDACTED_MARKER}")
+        );
+        // An empty secret is a no-op (replacing it would shred the input).
+        assert_eq!(redact_secrets("unchanged", &[String::new()]), "unchanged");
+        // A value carrying a quote, a backslash and a newline is written ESCAPED
+        // inside a JSON blob — exactly how the recorded tool arguments carry it —
+        // so its literal spelling never matches and the escaped one must go too.
+        let secret = "quo\"te\\back\nline";
+        let serialized = serde_json::json!({ "token": secret }).to_string();
+        assert!(
+            serialized.contains(r#"\""#)
+                && serialized.contains(r"\\")
+                && serialized.contains(r"\n"),
+            "the case only bites when the value is really escaped: {serialized}"
+        );
+        assert_eq!(
+            redact_secrets(&serialized, &[secret.to_string()]),
+            format!(r#"{{"token":"{REDACTED_MARKER}"}}"#)
+        );
+        // A value that reaches a URL is written percent-encoded there, in either
+        // hex case: the spelling a request URL or a query parameter carries must
+        // not survive its literal form being gone.
+        let key = "a/+b=c d";
+        let encoded = "a%2F%2Bb%3Dc%20d";
+        assert_eq!(
+            redact_secrets(
+                &format!("https://api.example/?key={encoded}"),
+                &[key.to_string()]
+            ),
+            format!("https://api.example/?key={REDACTED_MARKER}")
+        );
+        assert_eq!(
+            redact_secrets(
+                &format!("https://api.example/?key={}", encoded.to_lowercase()),
+                &[key.to_string()]
+            ),
+            format!("https://api.example/?key={REDACTED_MARKER}"),
+            "hex may be written lowercase"
+        );
+        assert!(
+            percent_encoded("abc-._~123").is_empty(),
+            "a URL-safe value has no second spelling"
+        );
     }
 }
 

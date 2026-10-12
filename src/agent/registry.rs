@@ -620,6 +620,7 @@ pub(crate) fn call_kind_label(kind: &str) -> &'static str {
         "research_wrap_up" => "Research wrap-up",
         "research_orchestrator" => "Research orchestrator",
         "media_transcription" => "Media transcription",
+        "cli_command" => "Command line",
         _ => "Other LLM work",
     }
 }
@@ -923,6 +924,7 @@ mod tests {
             "research_wrap_up",
             "research_orchestrator",
             "media_transcription",
+            "cli_command",
         ] {
             let label = call_kind_label(kind);
             assert_ne!(

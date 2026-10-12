@@ -403,10 +403,11 @@ fn read_config_kv_inner(storage_root: &Path, key: &str) -> anyhow::Result<Option
     // Routing, and why it is fail-closed, is in the caller's doc.
     match crate::util::lock::instance_lock_state_settled(storage_root) {
         InstanceLockState::Held => {
-            let req = crate::db::ipc::QueryRequest {
+            let req = crate::db::ipc::IpcRequest {
                 store: "core".to_string(),
                 sql: "SELECT value FROM config_kv WHERE key = ?1".to_string(),
                 params: vec![crate::db::ipc::WireValue::Text(key.to_string())],
+                call: None,
             };
             let resp = crate::db::ipc::ipc_query_sync(storage_root, &req)?;
             if let Some(err) = &resp.error {

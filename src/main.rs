@@ -40,25 +40,6 @@ const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-
 /// JetBrainsMono-Italic.ttf embedded for italic narration text in the Iced dashboard.
 const JETBRAINS_MONO_ITALIC_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Italic.ttf");
 
-/// Top-level `--help` text. Lists only the public entry points (hidden
-/// internals like `__grep-engine` are excluded). Printed through
-/// `util::print_stdout`, which adds the terminating newline.
-const TOP_LEVEL_USAGE: &str = "\
-mahbot — autonomous agentic engineering system with a GUI dashboard daemon
-
-Usage:
-  mahbot                 Launch the GUI dashboard daemon
-  mahbot paused          Launch the daemon with every registered workspace
-                         paused (no ticket is claimed or advanced)
-  mahbot chrome <args>   Browser automation CLI over the shared chrome core
-  mahbot debug           Read-only SQL query tool against the live stores
-  mahbot bench-openrouter <args>
-                         Standalone OpenRouter provider benchmark
-
-Options:
-  -h, --help             Print this help and exit
-  -V, --version          Print the version and exit";
-
 /// INFO-log retention window (hours): the log-cleanup loop deletes INFO
 /// entries older than this. Independent of the session-purge cutoff.
 const LOG_RETENTION_HOURS: i64 = 8;
@@ -76,7 +57,12 @@ async fn bootstrap_mahbot_safe(start_paused: bool) -> Result<LogStore, String> {
         .await
     {
         Ok(Ok(store)) => Ok(store),
-        Ok(Err(e)) => Err(format!("{e:#}")),
+        Ok(Err(e)) => {
+            // A boot that failed can never serve command-line operations, and a
+            // frontend must not hang forever waiting for one.
+            mahbot::cli::mark_unavailable();
+            Err(format!("{e:#}"))
+        }
         Err(payload) => {
             let message = mahbot::util::panic_message(&*payload);
             // Recorded like any other start-up failure; the error it returns is
@@ -85,6 +71,7 @@ async fn bootstrap_mahbot_safe(start_paused: bool) -> Result<LogStore, String> {
                 "bootstrap",
                 mahbot::boot::startup_panic_error(&message),
             );
+            mahbot::cli::mark_unavailable();
             Err(format!("{boot_error:#}"))
         }
     }
@@ -158,6 +145,11 @@ async fn bootstrap_mahbot(start_paused: bool) -> Result<LogStore> {
     }
 
     spawn_background_tasks(log_store.clone());
+
+    // The instance is the whole product from here, so command-line operations
+    // may be served (an operation is a side effect that may route into the
+    // message pipeline, which must not land in a half-built instance).
+    mahbot::cli::mark_ready();
 
     info!(
         version = mahbot::self_update::VERSION,
@@ -675,9 +667,25 @@ async fn shutdown_after_dashboard() {
     mahbot::db::checkpoint::checkpoint_all_databases().await;
 }
 
+// The verb ladder is deliberately one function: every entry point the process
+// can be launched as is visible in one place, in dispatch order.
+#[expect(clippy::too_many_lines)]
 fn main() -> Result<()> {
     mahbot::shutdown::install_fatal_signal_handlers();
     mahbot::shutdown::install_panic_hook();
+
+    // An argument the process cannot read as text can name no entry point and
+    // fill no value, and it must not be echoed either — the caller may have
+    // passed a secret with a mistyped byte. It is refused as the command line's
+    // own misuse here, before the verb ladder reads anything: the text-only
+    // reader the ladder uses would panic, which would both leave the four exit
+    // classes a script reads and print the very bytes that were passed.
+    if std::env::args_os()
+        .skip(1)
+        .any(|arg| arg.to_str().is_none())
+    {
+        std::process::exit(mahbot::cli::refuse_non_text_argument());
+    }
 
     // Debug subcommand: run SQL query directly, skip all GUI/instance setup.
     // Must be checked before lock acquisition so the debug tool can query
@@ -743,6 +751,20 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // `mahbot config …` / `mahbot workspace …`: the command line's frontends onto
+    // the product's own tools. Dispatched before lock acquisition and temp-root
+    // init like the other CLIs — the operations run IN the instance, which holds
+    // the lock, and this process never opens one of its stores.
+    if let Some(word) = std::env::args().nth(1)
+        && let Some(cli) = mahbot::cli::family(&word)
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let args = std::env::args().skip(2).collect::<Vec<_>>();
+        std::process::exit(rt.block_on(mahbot::cli::run(cli, &args)));
+    }
+
     // Top-level help/version flags: print and exit before temp-root init and
     // lock acquisition, so they work while an instance holds the lock (and when
     // it doesn't — without this they would boot the GUI).
@@ -750,7 +772,7 @@ fn main() -> Result<()> {
     // (`mahbot chrome -h` etc.) keep routing to their own CLI handlers.
     match std::env::args().nth(1).as_deref() {
         Some("-h" | "--help") => {
-            mahbot::util::print_stdout(TOP_LEVEL_USAGE);
+            mahbot::util::print_stdout(mahbot::cli::TOP_LEVEL_USAGE);
             return Ok(());
         }
         Some("-V" | "--version") => {
@@ -784,8 +806,8 @@ fn main() -> Result<()> {
     // (`/tmp/mahbot`, mode 0700; `<user temp>\mahbot` on Windows) and pin the
     // platform's temp variables to it — BEFORE any temp use (config, logs,
     // stores, shell children). The debug, __grep-engine, __env-dump,
-    // bench-openrouter, chrome and help/version dispatches above must NOT create
-    // the root (they exit before this point).
+    // bench-openrouter, chrome, config/workspace and help/version dispatches
+    // above must NOT create the root (they exit before this point).
     mahbot::temp::init_temp_root().map_err(|e| {
         mahbot::boot::record_launch_failure(&storage_root, "temp::init_temp_root", e)
     })?;

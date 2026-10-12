@@ -286,8 +286,8 @@ fn test_pad_constant_empty_third_input() -> Result<()> {
     Ok(())
 }
 
-/// Pad constant mode with a PROVIDED non-zero pad value: honored (the fork
-/// silently dropped it; the ticket requires it not be dropped).
+/// Pad constant mode with a PROVIDED non-zero pad value: honored (the fork it
+/// came from silently dropped a provided value, so this stays pinned).
 #[test]
 fn test_pad_constant_provided_value() -> Result<()> {
     let pad_node = node_attrs(

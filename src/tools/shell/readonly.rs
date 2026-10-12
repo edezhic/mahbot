@@ -871,6 +871,80 @@ fn walk_command<'a>(
     check_words(&mut words_refs, state, flags, &words)
 }
 
+/// The product's own executable, named exactly as `Cargo.toml`'s package (and
+/// its `[[bin]]`) spells it, so a rename moves the rule with the manifest
+/// instead of leaving a stale literal behind. The verb comparison is made
+/// against the dispatch basename the path spelling was already reduced to and
+/// folded by ([`windows::dispatch_word`] lowercases the stem and drops a verb
+/// extension on the Windows platform), so `mahbot`, `MAHBOT.EXE` and
+/// `mahbot.exe` all arrive as this one value.
+const PRODUCT_BINARY: &str = env!("CARGO_PKG_NAME");
+
+/// The product binary's second words that only read — the whole of what a
+/// read-only shell may ask the product itself for. Case-sensitive everywhere:
+/// the binary compares its own `argv[1]` the same way, so `mahbot DEBUG` is a
+/// daemon launch rather than the debug command (see [`check_product_segment`]).
+const PRODUCT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
+    // The documented read-only query surface ([`crate::db::debug`]): a
+    // read-only store query or a schema dump.
+    "debug",
+    // How this shell's own grep serving rewrites a search: on unix a refused
+    // rewrite silently falls back to the system `grep`, on Windows it becomes a
+    // tool error, so the verb must stay runnable in this mode.
+    "__grep-engine",
+    // How the product's own environment read spawns its child dumper ([`crate::shell_env`])
+    // — a call that only prints what it inherited and changes nothing.
+    "__env-dump",
+    // Informational flags — no command line behind them.
+    "-h",
+    "--help",
+    "-V",
+    "--version",
+];
+
+/// The verdict for the product's own binary: only its read-only forms run.
+///
+/// `mahbot` means the product itself. Its other command lines change it, drive
+/// it or restart it, and its `mahbot config …` / `mahbot workspace …` families
+/// carry the owner's own configuration and workspace authority — the authority
+/// the roles holding those tools already have — so a read-only shell must not
+/// be a way around those roles' permissions. `second` is the word right after
+/// the verb (the only place a subcommand can stand; scanning the list instead
+/// would admit `mahbot foo debug`), `None` for a bare `mahbot`, which is a
+/// daemon launch and is refused with the rest.
+///
+/// `mahbot chrome …` is refused with those, deliberately: the CLI drives and
+/// stops sessions in the LIVE daemon by name, while the chrome tool a role
+/// holds works in a per-run namespace of its own — so the tool, not this shell
+/// route, is what such a role uses (the read-only banner lists the refusal).
+fn check_product_segment(segment: &str, second: Option<&str>) -> Result<(), String> {
+    if second.is_some_and(|word| PRODUCT_READ_ONLY_SUBCOMMANDS.contains(&word)) {
+        return Ok(());
+    }
+    // The admitted forms are spelled from the table itself, so the denial can
+    // never teach a form the table no longer holds.
+    let allowed = PRODUCT_READ_ONLY_SUBCOMMANDS
+        .iter()
+        .map(|word| format!("`{PRODUCT_BINARY} {word}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let called = second.map_or_else(
+        || format!("`{PRODUCT_BINARY}`"),
+        |word| format!("`{PRODUCT_BINARY} {word}`"),
+    );
+    reject(
+        segment,
+        &format!(
+            "{called} is the product's own binary, and not one of its read-only forms ({allowed}). \
+             Its other command lines change the product, drive it or restart it, and its \
+             `config`/`workspace` families carry the owner's own configuration and workspace \
+             authority — the same authority the roles holding those tools already have, so a \
+             read-only shell must not be a way around them."
+        ),
+        "use `mahbot debug` for read-only data, and leave anything that changes or drives the product to the assistant.",
+    )
+}
+
 /// The ported segment validator: verb resolution (cd/eval/prefix routing),
 /// temp bindings, and the mutator/git/flag dispatch. Operates on the
 /// AST-reconstructed words; redirects and substitutions are validated by the
@@ -995,6 +1069,12 @@ fn check_words(
     let Some((cmd_idx, first_word, cmd_words)) = super::command_word_from_segment(&segment) else {
         return Ok(());
     };
+    // The word AFTER the verb word — the only position a subcommand can stand
+    // in, and the product-binary rule below reads it positionally (a scan of the
+    // list would admit `mahbot foo debug`). Taken here, as an owned word,
+    // because `segment` is rebuilt below when a variable verb resolves and
+    // re-splitting the rebuilt text is a different reading than the AST words'.
+    let verb_successor: Option<String> = cmd_words.get(cmd_idx + 1).map(|w| (*w).to_string());
     // A path-spelled verb dispatches on its derived basename (`'/usr/bin/git'`
     // routes like `git`), but a variable is only ever resolved from the RAW
     // spelling of the word: a balanced single-quoted word is a literal command
@@ -1046,6 +1126,15 @@ fn check_words(
     // 'mktemp' creates a temp directory and outputs its path — always allowed.
     if first_word == "mktemp" {
         return Ok(());
+    }
+
+    // The product's own binary: only its read-only forms run (see
+    // [`check_product_segment`]). Judged on `first_word`, the already-folded
+    // dispatch basename, so a path-spelled call (`'/opt/mahbot dir/bin/mahbot'
+    // __grep-engine …`, the spelling this shell's own grep rewrite carries) is
+    // no way around the rule.
+    if first_word == PRODUCT_BINARY {
+        return check_product_segment(&segment, verb_successor.as_deref());
     }
 
     // Temp-gated mutator dispatch (scratch, temp, unconditional).
@@ -6657,6 +6746,41 @@ mod tests {
             // residual — the guard is not contorted for it.
             ("'/usr/bin/'git' status", false),
             (r"'/opt/it'\''s/mahbot' --version", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// The product's own binary is judged by its own rule: only its read-only
+    /// second words run, everything else — a daemon launch, the chrome frontend,
+    /// the configuration/workspace families, a bench binary — is refused. The
+    /// second word is read POSITIONALLY, so `mahbot foo debug` is a refusal too,
+    /// and the comparison is case-sensitive on every platform (the binary
+    /// compares its own `argv[1]` the same way, so `mahbot DEBUG` launches the
+    /// daemon rather than querying). The path-spelled row is the spelling this
+    /// shell's own grep rewrite carries, so it must keep working.
+    #[cfg(unix)]
+    #[test]
+    fn product_binary_runs_only_its_read_only_forms() {
+        let cases = [
+            ("mahbot", false),
+            ("mahbot paused", false),
+            ("mahbot chrome status", false),
+            ("mahbot config add-user --name bob", false),
+            ("mahbot workspace pause", false),
+            ("mahbot bench-openrouter", false),
+            ("mahbot DEBUG", false),     // a daemon launch, not `debug`
+            ("mahbot foo debug", false), // the verb's own next word is the one read
+            ("mahbot -V", true),
+            ("mahbot --help", true),
+            ("mahbot debug", true),
+            ("mahbot debug --db core \"SELECT 1\"", true),
+            ("mahbot __grep-engine '{\"x\":1}'", true),
+            ("mahbot __env-dump", true),
+            (
+                "'/opt/mahbot dir/bin/mahbot' __grep-engine '{\"x\":1}'",
+                true,
+            ),
         ];
 
         run_cases(&cases);

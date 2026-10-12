@@ -31,6 +31,49 @@ crate::columns! {
     }
 }
 
+/// Which surface performed a recorded tool call: an agent's own run, or a
+/// command-line operation the product carried out for its owner.
+///
+/// Kept as its own `tool_calls.source` column rather than inferred from
+/// `agent_id`/`role`: those two are a naming convention (a custom role could be
+/// named `cli`), while `source` is the explicit provenance marker a reader or a
+/// later consumer can rely on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CallSource {
+    Agent,
+    CommandLine,
+}
+
+impl CallSource {
+    /// The `tool_calls.source` value. `cli` is the machine-readable marker that
+    /// makes a change a script made distinguishable from one the assistant
+    /// made — the two rows are otherwise identical.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::CommandLine => "cli",
+        }
+    }
+}
+
+/// Maximum length of serialized arguments stored in per-call stats.
+/// Longer arguments are truncated at a UTF-8-safe boundary.
+const MAX_STATS_ARG_LENGTH: usize = 500;
+
+/// The `arguments` text one tool call is recorded with: the arguments
+/// serialized, the caller's own secrets removed, credential-shaped text
+/// scrubbed, then capped to [`MAX_STATS_ARG_LENGTH`].
+///
+/// The value redaction runs FIRST: [`crate::util::scrub_credentials`] keeps a
+/// four-character prefix of what it redacts, which must not happen to a value
+/// the caller handed over as a secret.
+pub(crate) fn recorded_arguments(args: &serde_json::Value, secrets: &[String]) -> String {
+    let serialized = serde_json::to_string(args).expect("Value is always serializable");
+    let redacted = crate::util::redact_secrets(&serialized, secrets);
+    let scrubbed = crate::util::scrub_credentials(&redacted);
+    crate::util::truncate_bytes(&scrubbed, MAX_STATS_ARG_LENGTH).to_string()
+}
+
 /// A single tool error entry queried from the DB.
 #[derive(Debug, Clone)]
 pub struct ToolErrorEntry {
@@ -129,12 +172,13 @@ impl crate::logs::LogStore {
             .context("Failed to clear failed tool calls")
     }
 
-    /// Write a batch of per-call tool records for a single agent flush.
+    /// Write a batch of per-call tool records for a single flush.
     pub(crate) async fn flush_batch(
         &self,
         agent_id: &str,
         role: &str,
         workspace: &str,
+        source: CallSource,
         stats: &[crate::ToolCallRecord],
     ) -> Result<()> {
         if stats.is_empty() {
@@ -146,11 +190,12 @@ impl crate::logs::LogStore {
         for record in stats {
             tx.execute(
                 "INSERT INTO tool_calls \
-                 (agent_id, role, tool_name, arguments, duration_ms, success, error_message, workspace, recorded_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (agent_id, role, source, tool_name, arguments, duration_ms, success, error_message, workspace, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 db::params![
                     agent_id,
                     role,
+                    source.as_str(),
                     record.tool_name.clone(),
                     record.arguments.clone(),
                     record.duration_ms,
@@ -656,6 +701,29 @@ fn build_tool_error_filter(query: &ToolErrorQuery) -> (String, Vec<db::Value>) {
 mod tests {
     use super::*;
 
+    /// `recorded_arguments` closes the two leak paths: (a) the value the caller
+    /// handed over as a secret is gone entirely, under a key the shared scrubber
+    /// may or may not know, and (b) not even the first four characters of a
+    /// handed-over secret survive the scrubber's context prefix.
+    #[test]
+    fn recorded_arguments_closes_both_leak_paths() {
+        let key = "sk-1234567890abcdef";
+        let args = serde_json::json!({"action": "setup_web_search", "key": key});
+        let recorded = recorded_arguments(&args, &[key.to_string()]);
+        assert!(
+            !recorded.contains(key),
+            "the caller's key must be gone: {recorded}"
+        );
+
+        let token = "123456:AAHsecret";
+        let args = serde_json::json!({"action": "setup_telegram_bot", "token": token});
+        let recorded = recorded_arguments(&args, &[token.to_string()]);
+        assert!(
+            !recorded.contains(&token[..4]),
+            "not even the prefix of a handed-over secret may survive: {recorded}"
+        );
+    }
+
     /// Both states of the sole remaining optional filter (`search`) in
     /// [`ToolErrorQuery`].
     ///
@@ -727,7 +795,13 @@ mod tests {
 
         // Flush the batch
         store
-            .flush_batch("test-agent", "Engineer", "my-workspace", &records)
+            .flush_batch(
+                "test-agent",
+                "Engineer",
+                "my-workspace",
+                CallSource::Agent,
+                &records,
+            )
             .await
             .expect("flush_batch");
 
@@ -796,7 +870,13 @@ mod tests {
             },
         ];
         store
-            .flush_batch("test-agent", "Engineer", "my-workspace", &records)
+            .flush_batch(
+                "test-agent",
+                "Engineer",
+                "my-workspace",
+                CallSource::Agent,
+                &records,
+            )
             .await
             .expect("flush_batch");
 

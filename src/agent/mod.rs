@@ -182,10 +182,6 @@ tokio::task_local! {
 /// Value last intentionally reviewed: 2026-07-11
 const MAX_TOOL_ROUNDS: usize = 1000;
 
-/// Maximum length of serialized arguments stored in per-call stats.
-/// Longer arguments are truncated at a UTF-8-safe boundary.
-const MAX_STATS_ARG_LENGTH: usize = 500;
-
 /// Retry-exhaustion marker shared by the producer contexts
 /// (`llm_call`/`summarize`) and the `engineer_failure_comment` match; drift is
 /// cosmetic-only (typed classification uses `RetryExhausted`).
@@ -728,6 +724,7 @@ impl Agent {
                     &self.agent_id,
                     self.role.as_str(),
                     &self.workspace.path,
+                    crate::stats::CallSource::Agent,
                     &stats,
                 )
                 .await
@@ -1635,8 +1632,9 @@ impl Agent {
     }
 
     /// Record one tool invocation into the agent's in-memory stats (flushed to
-    /// the logs store on session finalization). The arguments are serialized,
-    /// credential-scrubbed, and length-truncated to the stats budget.
+    /// the logs store on session finalization). The argument text is built by
+    /// [`crate::stats::recorded_arguments`] — serialized, redacted, scrubbed and
+    /// truncated to the stats budget.
     fn push_tool_call_record(
         &self,
         tool_name: String,
@@ -1645,10 +1643,7 @@ impl Agent {
         success: bool,
         error_message: Option<String>,
     ) {
-        let args_str = serde_json::to_string(arguments).expect("Value is always serializable");
-        let args_scrubbed = scrub_credentials(&args_str);
-        let arguments =
-            crate::util::truncate_bytes(&args_scrubbed, MAX_STATS_ARG_LENGTH).to_string();
+        let arguments = crate::stats::recorded_arguments(arguments, &[]);
         let mut guard = self.tool_stats.lock().unwrap_poison();
         guard.push(crate::ToolCallRecord {
             tool_name,
@@ -3867,10 +3862,9 @@ mod tests {
         );
     }
 
-    /// Dedup is purely content-based (the ticket's rule): a comment authored by
-    /// the agent's own role is NOT special-cased — it is injected when its
-    /// content is absent from the loaded history (only content-in-history
-    /// dedup suppresses it).
+    /// Dedup is purely content-based: a comment authored by the agent's own role
+    /// is NOT special-cased — it is injected when its content is absent from the
+    /// loaded history (only content-in-history dedup suppresses it).
     #[tokio::test]
     async fn test_inject_outstanding_comments_does_not_special_case_own_role() {
         crate::util::test::init_management_test_stores().await;

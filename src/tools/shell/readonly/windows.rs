@@ -2104,7 +2104,10 @@ mod tests {
         assert_rejected(r"C:\tools\rm.exe C:\ws\x.txt");
         ok(r#"rm.exe "%TEMP%\x.txt""#);
         // A quoted absolute executable path is a command word cmd.exe runs, so it
-        // is admitted too.
+        // is admitted too — here it is the product's own binary, whose `--version`
+        // is one of the read-only second words the shared dispatch leaves it (the
+        // row proves the folded basename reaches that rule; it is no longer a
+        // row about an unmodelled verb falling through).
         ok(r#""C:\Program Files\mahbot\mahbot.exe" --version"#);
     }
 

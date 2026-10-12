@@ -2256,9 +2256,12 @@ impl ShellTool {
                 anyhow::bail!("{rejection}");
             }
             if let Some(rewritten) = grep_serve.rewritten.as_deref() {
-                // The engine verb is an unlisted literal and passes validation; on the
-                // off chance it does not, `exec_str` keeps the reading of the line it
-                // was seeded with (on Windows the refusal below reports it instead).
+                // The engine verb is one of the product binary's read-only second
+                // words (see `readonly::PRODUCT_READ_ONLY_SUBCOMMANDS`), so the
+                // rewrite passes validation; on the off chance a rewrite does not
+                // (an argument spelling the rule refuses), `exec_str` keeps the
+                // reading of the line it was seeded with (on Windows the refusal
+                // below reports it instead).
                 if check_command(rewritten, &ctx).is_ok() {
                     exec_str = rewritten.to_string();
                 }
@@ -5032,6 +5035,28 @@ mod tests {
         assert!(
             result.contains(&envelope),
             "envelope line must survive intact"
+        );
+
+        // The one profile now covers the `config`/`workspace` families too,
+        // whose answers are prose and can be just as long a single line (a role
+        // or key listing): it must come through intact as well.
+        let prose = format!("custom-role `{}`: write, read, verify", "x".repeat(600));
+        let result = process_shell_output(
+            "mahbot config list-custom-roles",
+            &prose,
+            "",
+            0,
+            Duration::from_secs_f64(1.0),
+        );
+        assert_contains_not_contains(
+            "mahbot config answer",
+            &result,
+            &["custom-role"],
+            &["more chars on this line"],
+        );
+        assert!(
+            result.contains(&prose),
+            "config answer line must survive intact"
         );
     }
 
